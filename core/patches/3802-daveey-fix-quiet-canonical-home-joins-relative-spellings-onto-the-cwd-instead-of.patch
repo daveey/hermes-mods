@@ -1,0 +1,114 @@
+From 9715502dea2f3fe35ec9f5b2cdfa43866dcef542 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 19:42:54 +0000
+Subject: [PATCH] [daveey] fix(quiet): canonical_home joins relative spellings
+ onto the cwd instead of abspath (symlink/.. follows the link)
+
+Review 5896966671 of #2576 @dc17690039 (request_changes): os.path.abspath normpath-collapses
+`link/..` as text before realpath, so with x/link -> y/z the spelling x/link/../h resolved to
+x/h while realpath, Path.resolve (hermes_home_key) and the pre-PR code give y/h. The cache key is
+now the expanded spelling, joined onto os.getcwd()/os.getcwdb() only when relative, with no
+normalization; realpath then follows the link before `..`.
+
+Also the reviewer's cosmetic nit: a negative cross-boot cooldown age is "start-permissive",
+not "admission-open" (skipping the cooldown lets a quiet lease start, which pauses admission).
+
+Proof:
+- RED on dc17690039: test_canonical_home_follows_a_symlink_before_dotdot_like_hermes_home_key
+  (got .../x/h, expected .../y/h).
+- GREEN: tests/hermes_cli/test_local_work.py + tests/agent/test_claim_quiet.py 106 passed, 1 skipped;
+  test_backup, test_gateway_runtime_home_identity, test_quiet_membership_seeding,
+  test_quiet_control 152 passed.
+---
+ agent/claim_quiet.py                |  4 ++--
+ hermes_cli/local_work.py            | 10 +++++++++-
+ tests/agent/test_claim_quiet.py     |  2 +-
+ tests/hermes_cli/test_local_work.py | 20 ++++++++++++++++++++
+ 4 files changed, 32 insertions(+), 4 deletions(-)
+
+diff --git a/agent/claim_quiet.py b/agent/claim_quiet.py
+index dabde39991..302922ca03 100644
+--- a/agent/claim_quiet.py
++++ b/agent/claim_quiet.py
+@@ -533,8 +533,8 @@ def _check_cooldown(dir_fd: int, wall: float, ns: int, boot: str) -> None:
+     # Same boot: the monotonic age alone is authoritative, so a wall clock that was ahead when the
+     # record was written (and later corrected) cannot refuse every start until real time catches up.
+     # Other boot: only the wall age exists. A negative one means the record was written while the
+-    # wall clock was ahead before the reboot; it counts as elapsed (admission-open, like crash,
+-    # unlock and expiry), since refusing would wedge every start until real time caught up.
++    # wall clock was ahead before the reboot; it counts as elapsed (start-permissive), since refusing
++    # would wedge every start until real time caught up.
+     if last.boot_id == boot:
+         age = (ns - last.started_ns) / _NS
+         if age < 0:
+diff --git a/hermes_cli/local_work.py b/hermes_cli/local_work.py
+index 2ae4430343..9b8a2ccc12 100644
+--- a/hermes_cli/local_work.py
++++ b/hermes_cli/local_work.py
+@@ -28,10 +28,18 @@ def canonical_home(home):
+     expanduser + realpath + normcase. Only an existing directory's answer is cached, because a
+     path that does not exist yet can resolve differently once created. The cache is keyed on the
+     absolute spelling, so a relative spelling is resolved against the current directory every time.
++    That spelling is joined onto the cwd, never ``abspath``-normalized: normpath collapses
++    ``link/..`` as text, while realpath follows the link first.
+     """
+     if home is None:
+         return None
+-    spelling = os.path.abspath(os.path.expanduser(os.fspath(home)))
++    spelling = os.path.expanduser(os.fspath(home))
++    if os.path.isabs(spelling):
++        pass
++    elif isinstance(spelling, bytes):
++        spelling = os.path.join(os.getcwdb(), spelling)
++    else:
++        spelling = os.path.join(os.getcwd(), spelling)
+     cached = _HOME_KEYS.get(spelling)
+     if cached is not None:
+         return cached
+diff --git a/tests/agent/test_claim_quiet.py b/tests/agent/test_claim_quiet.py
+index 5902a3bd53..4a49ec17ef 100644
+--- a/tests/agent/test_claim_quiet.py
++++ b/tests/agent/test_claim_quiet.py
+@@ -309,7 +309,7 @@ def test_corrected_future_wall_time_does_not_wedge_cooldown_on_same_boot(home):
+ def test_future_wall_record_from_before_a_reboot_does_not_wedge_starts(home):
+     """Cross-boot only the wall age exists. A record written while the wall clock was ahead (then a
+     reboot with a corrected clock) gives a negative age; refusing it would wedge every start until
+-    real time catches up, so a negative cross-boot age counts as elapsed (admission-open).
++    real time catches up, so a negative cross-boot age counts as elapsed (start-permissive).
+     RED on dd75da236b: refused as "cooldown clocks are incoherent"."""
+     clock = FakeClock()
+     clock.now_wall += 10 * 24 * 3600  # wall clock 10 days ahead at the first start
+diff --git a/tests/hermes_cli/test_local_work.py b/tests/hermes_cli/test_local_work.py
+index 585553b6a2..91d6df2576 100644
+--- a/tests/hermes_cli/test_local_work.py
++++ b/tests/hermes_cli/test_local_work.py
+@@ -49,6 +49,26 @@ def test_canonical_home_relative_spelling_follows_the_current_directory(tmp_path
+     assert os.path.abspath(absolute) in module._HOME_KEYS
+ 
+ 
++def test_canonical_home_follows_a_symlink_before_dotdot_like_hermes_home_key(tmp_path, monkeypatch):
++    """``x/link/../h`` with ``x/link -> y/z`` names ``y/h``: realpath follows the link before
++    ``..``. A textual normpath (os.path.abspath) collapsed it to ``x/h`` first, disagreeing with
++    hermes_home_key. Checked for absolute and relative spellings."""
++    import hermes_cli.local_work as module
++    from hermes_constants import hermes_home_key
++    monkeypatch.setattr(module, "_HOME_KEYS", {})
++    (tmp_path / "x" / "h").mkdir(parents=True)
++    (tmp_path / "y" / "z").mkdir(parents=True)
++    (tmp_path / "y" / "h").mkdir()
++    (tmp_path / "x" / "link").symlink_to(tmp_path / "y" / "z")
++    expected = os.path.normcase(os.path.realpath(tmp_path / "y" / "h"))
++    absolute = os.path.join(str(tmp_path), "x", "link", "..", "h")
++    assert module.canonical_home(absolute) == expected
++    assert module.canonical_home(absolute) == expected  # the cached answer agrees
++    assert module.canonical_home(absolute) == str(hermes_home_key(absolute))
++    monkeypatch.chdir(tmp_path)
++    assert module.canonical_home(os.path.join("x", "link", "..", "h")) == expected
++
++
+ def test_install_is_explicit_and_snapshot_is_detached(tmp_path, monkeypatch):
+     import hermes_cli.local_work as module
+     monkeypatch.setattr(module, "_registry", None)
+-- 
+2.43.0
+

@@ -1,0 +1,1134 @@
+From 707cac9f6e2dee8b8225189687972f5f84adf7bd Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 20:57:17 +0000
+Subject: [PATCH] [daveey] scratch archive: archive the shapes it refused
+ forever (promisor tags, bare repos, linked worktrees, fifos)
+
+worker-2 kept 54 aged scratch trees (37.8 GiB) because every retry of the
+archive failed the same way (t_01a1d67a853b3b97). Now:
+
+- unpushed detection leaves out refs whose tip the remote holds: contained in
+  refs/remotes, or fetched from a promisor pack (rev-list
+  --exclude-promisor-objects). Remaining refs are bundled only when every
+  object is local; a ref needing promisor-vouched objects is recorded in
+  promised_refs (its local objects are in the payload); objects nothing vouches
+  for refuse as `unrecoverable_objects`. An empty remainder writes meta.json only.
+- bare repositories bundle their refs (--all minus remotes), meta `bare: true`.
+- linked worktrees/submodules: gitdir inside the tree archives as a nested repo;
+  outside, worktree diff + untracked + HEAD/branch through a private index copy
+  so git never writes to the outside gitdir. Missing/empty/non-dir gitdirs and
+  .git symlinks still refuse.
+- fifos/sockets are recorded (path, type, mode) without content; device nodes
+  still refuse.
+
+All removal guards are unchanged (terminal-owner recheck, custody fail-closed,
+owned-job veto, rename fence). RED on base: 15 of 20 new tests fail.
+---
+ hermes_cli/kanban_scratch_archive.py          | 217 +++++++---
+ hermes_cli/kanban_scratch_archive_shapes.py   | 156 ++++++++
+ .../test_kanban_scratch_archive_shapes.py     | 373 ++++++++++++++++++
+ .../hermes_cli/test_kanban_scratch_custody.py |   4 +-
+ .../test_kanban_scratch_custody_backoff.py    |   4 +-
+ .../test_kanban_scratch_gc_archive.py         |  32 +-
+ .../test_kanban_scratch_gc_backoff.py         |  20 +-
+ 7 files changed, 722 insertions(+), 84 deletions(-)
+ create mode 100644 hermes_cli/kanban_scratch_archive_shapes.py
+ create mode 100644 tests/hermes_cli/test_kanban_scratch_archive_shapes.py
+
+diff --git a/hermes_cli/kanban_scratch_archive.py b/hermes_cli/kanban_scratch_archive.py
+index a8aff9141a..2db2f78d38 100644
+--- a/hermes_cli/kanban_scratch_archive.py
++++ b/hermes_cli/kanban_scratch_archive.py
+@@ -42,13 +42,26 @@ the repo's meta.json says ``objects_omitted: "remote"`` with the restore steps,
+ and ``kanban_scratch_archive_omit.restore`` rebuilds the tree from the remote.
+ A full core clone archived to 0.7 % of its bytes this way (was 57-80 %).
+ 
+-Anything it cannot prove safe keeps the workspace: a linked worktree or
+-submodule (a ``.git`` gitlink file or symlink: the worktree GC owns those; a
+-regular ``.git`` file with no ``gitdir:`` line, such as uv's empty cache
+-marker, is plain data), a bare repository,
+-a special file (fifo/socket/device), any scan error, source mutation during
+-the archive, or any failed archive step. Symlinks are recorded, never
+-followed.
++Shapes that used to refuse forever archive too (``kanban_scratch_archive_shapes``):
++
++* a bare repository: its refs (``--all`` minus remote-tracking refs) are
++  bundled like any repo's, and its meta.json says ``bare: true``;
++* a linked worktree or submodule (a ``.git`` gitlink file): a gitdir inside the
++  tree is archived as a nested repo; a gitdir outside it gets ``tracked.diff``,
++  ``untracked.tar`` and HEAD/branch in meta.json, read through a private copy of
++  its index so git never writes to the outside gitdir;
++* a fifo or socket: the manifest records its path, type and mode; it has no
++  content to archive;
++* refs whose tip the remote already holds (tags fetched from a promisor remote)
++  are no longer bundled, and a ref needing objects the promisor remote vouches
++  for is left to the payload (``promised_refs``).
++
++Anything it cannot prove safe keeps the workspace: a ``.git`` symlink, a gitlink
++whose gitdir is missing or empty, a device node, unpushed objects that are
++missing locally and vouched for by no promisor remote (reason
++``unrecoverable_objects``), any scan error, source mutation during the archive,
++or any failed archive step. A regular ``.git`` file with no ``gitdir:`` line
++(uv's empty cache marker) is plain data. Symlinks are recorded, never followed.
+ """
+ from __future__ import annotations
+ 
+@@ -77,11 +90,13 @@ class ArchiveRefused(Exception):
+ def find_repos(root: Path) -> list[Path]:
+     """Standalone repos (a ``.git`` directory) below *root*, *root* included.
+ 
+-    Raises :class:`ArchiveRefused` for a linked worktree/submodule, a bare
+-    repository, a non-directory root, or any scan error. Traverses by directory
+-    descriptor (never follows symlinks, ancestors included). A regular ``.git``
+-    file that is not a ``gitdir:`` pointer (uv writes an empty one in each cache
+-    dir) is plain data, archived in the payload like any other file.
++    Bare repositories and gitlinked worktrees are found by :func:`_discover`.
++    Raises :class:`ArchiveRefused` for a gitlink it cannot archive (missing or
++    empty gitdir, a ``.git`` symlink), a non-directory root, or any scan error.
++    Traverses by directory descriptor (never follows symlinks, ancestors
++    included). A regular ``.git`` file that is not a ``gitdir:`` pointer (uv
++    writes an empty one in each cache dir) is plain data, archived in the
++    payload like any other file.
+     """
+     return _find_repos(root)[0]
+ 
+@@ -90,8 +105,9 @@ _GITLINK_PREFIX = b"gitdir:"
+ _GITLINK_PROBE = 4096
+ 
+ 
+-def _is_gitlink(dfd: int, directory: Path, st: os.stat_result) -> bool:
+-    """True unless the regular file ``.git`` under *dfd* (lstat *st*) is provably not a gitlink.
++def _is_gitlink(dfd: int, directory: Path, st: os.stat_result):
++    """The pointer's bytes (truthy) unless the regular file ``.git`` under *dfd* (lstat *st*) is
++    provably not a gitlink, then False.
+ 
+     Handles regular files only: the caller treats any other ``.git`` type
+     (symlink, fifo, ...) as a gitlink without calling this. *dfd* is the scan's
+@@ -107,23 +123,40 @@ def _is_gitlink(dfd: int, directory: Path, st: os.stat_result) -> bool:
+         fst = os.fstat(fh.fileno())
+         if not stat.S_ISREG(fst.st_mode) or _signature(fst) != _signature(st):
+             raise ArchiveRefused(f"{directory / '.git'} changed during scan")
+-        head = fh.read(_GITLINK_PROBE)
+-    return head.lstrip().startswith(_GITLINK_PREFIX)
++        head = fh.read(_GITLINK_PROBE).lstrip()
++    return head if head.startswith(_GITLINK_PREFIX) else False
+ 
+ 
+ def _in_git_metadata(rel: str) -> bool:
+     return rel == ".git" or rel.endswith("/.git") or rel.startswith(".git/") or "/.git/" in rel
+ 
+ 
++class _Layout:
++    """What :func:`_discover` found: repos by shape, plus the judged ``.git`` files' signatures."""
++
++    def __init__(self):
++        self.repos: list[Path] = []  # standalone (a .git directory)
++        self.bare: list[Path] = []
++        self.linked: dict[Path, tuple[str, bool]] = {}  # worktree -> (gitdir as written, inside the tree)
++        self.markers: dict[str, list[int]] = {}  # every regular .git file judged (data or gitlink)
++
++
+ def _find_repos(root: Path) -> tuple[list[Path], dict[str, list[int]]]:
+-    """``find_repos`` plus the signatures of the ``.git`` data files it judged.
++    """``find_repos`` plus the signatures of the ``.git`` files it judged."""
++    layout = _discover(root)
++    return layout.repos, layout.markers
++
++
++def _discover(root: Path) -> _Layout:
++    """Every repo below *root* by shape, never descending into repository metadata.
+ 
+-    The caller re-checks those signatures against the payload snapshot, so a
+-    marker rewritten into a gitlink after this judgement is refused. Each
+-    regular ``.git`` file is judged during the scan, through the scan's own
+-    descriptor for its directory.
++    The caller re-checks the judged ``.git`` files' signatures against the payload
++    snapshot, so a marker rewritten into a gitlink (or a pointer retargeted)
++    after this judgement is refused. Each regular ``.git`` file is judged during
++    the scan, through the scan's own descriptor for its directory.
+     """
+-    verdicts: dict[str, bool] = {}
++    from hermes_cli.kanban_scratch_archive_shapes import parse_gitlink
++    verdicts: dict[str, object] = {}
+ 
+     def judge(dfd: int, gitrel: str, st: os.stat_result) -> None:
+         rel = gitrel.rpartition("/")[0] or "."
+@@ -131,7 +164,7 @@ def _find_repos(root: Path) -> tuple[list[Path], dict[str, list[int]]]:
+             verdicts[gitrel] = _is_gitlink(dfd, root if rel == "." else root / rel, st)
+ 
+     found = _scan(root, on_git_file=judge)
+-    markers: dict[str, list[int]] = {}
++    layout = _Layout()
+     kids: dict[str, set[str]] = {".": set()}
+     for rel, st in found.items():
+         if rel == ".":
+@@ -140,24 +173,37 @@ def _find_repos(root: Path) -> tuple[list[Path], dict[str, list[int]]]:
+         kids.setdefault(parent or ".", set()).add(name)
+         if stat.S_ISDIR(st.st_mode):
+             kids.setdefault(rel, set())
+-    repos: list[Path] = []
++    bare = sorted(rel for rel, names in kids.items() if not _in_git_metadata(rel) and ".git" not in names
++                  and {"HEAD", "objects"} <= names and names & {"refs", "reftable"})
++
++    def in_bare(rel: str) -> bool:
++        return any((b == "." and rel != ".") or rel.startswith(b + "/") for b in bare)
++
+     for rel, names in kids.items():
+-        if _in_git_metadata(rel):
+-            continue  # never descend into repository metadata
++        if _in_git_metadata(rel) or in_bare(rel):
++            continue  # never descend into repository metadata (a bare repo's included)
+         directory = root if rel == "." else root / rel
++        if rel in bare:
++            layout.bare.append(directory)
++            continue
+         if ".git" in names:
+             gitrel = ".git" if rel == "." else f"{rel}/.git"
+             gst = found[gitrel]
+             if stat.S_ISDIR(gst.st_mode):
+-                repos.append(directory)
++                layout.repos.append(directory)
+                 continue
+-            # A marker the scan never judged counts as a gitlink (fail closed).
+-            if not stat.S_ISREG(gst.st_mode) or verdicts.get(gitrel, True):
+-                raise ArchiveRefused(f"linked worktree or submodule at {directory / '.git'} (left to the worktree GC)")
+-            markers[gitrel] = _signature(gst)  # plain data (e.g. uv's empty cache marker)
+-        if {"HEAD", "objects"} <= names and names & {"refs", "reftable"}:
+-            raise ArchiveRefused(f"bare repository at {directory}")
+-    return sorted(repos), markers
++            # A marker the scan never judged counts as a gitlink nobody read (fail closed).
++            verdict = verdicts.get(gitrel, True) if stat.S_ISREG(gst.st_mode) else True
++            if verdict is True:
++                raise ArchiveRefused(f"linked worktree or submodule at {directory / '.git'} "
++                                     "(not a gitlink file the scan read)")
++            layout.markers[gitrel] = _signature(gst)
++            if verdict:  # a gitdir pointer: archived by its own shape
++                layout.linked[directory] = parse_gitlink(root, rel, verdict, found)
++            # else plain data (e.g. uv's empty cache marker)
++    layout.repos.sort()
++    layout.bare.sort()
++    return layout
+ 
+ 
+ def _env(repo: Path) -> dict[str, str]:
+@@ -179,10 +225,12 @@ def _env(repo: Path) -> dict[str, str]:
+     return env
+ 
+ 
+-def _git(repo: Path, env: dict[str, str], *args: str, ok=(0,)) -> subprocess.CompletedProcess:
++def _git(repo: Path, env: dict[str, str], *args: str, ok=(0,), stdin: Optional[bytes] = None
++         ) -> subprocess.CompletedProcess:
++    feed = {"input": stdin} if stdin is not None else {"stdin": subprocess.DEVNULL}
+     proc = subprocess.run(
+         ["git", "-C", str(repo), *args], capture_output=True, timeout=_GIT_TIMEOUT,
+-        check=False, stdin=subprocess.DEVNULL, env=env,
++        check=False, env=env, **feed,
+     )
+     if proc.returncode not in ok:
+         err = proc.stderr.decode("utf-8", "replace").strip()[:500]
+@@ -262,13 +310,18 @@ def _write_remote_base(repo: Path, dest: Path, entries: list[dict]) -> list[str]
+ 
+ 
+ def archive_repo(repo: Path, dest: Path, *, task_id: str, completed_at: Optional[int],
+-                 omitted: Optional[dict] = None) -> dict:
++                 omitted: Optional[dict] = None, bare: bool = False,
++                 gitdir: Optional[tuple[str, bool]] = None) -> dict:
+     """Write one repo's archive into *dest* (created). Raises on any failure.
+ 
+     *omitted* is this repo's ``kanban_scratch_archive_omit`` record when the
+     payload leaves out objects the remote holds; meta.json then says so and
+-    lists the restore steps.
++    lists the restore steps. *bare* archives a bare repository (refs only).
++    *gitdir* ``(pointer, inside)`` marks a gitlinked worktree: inside the tree it
++    archives like a standalone repo; outside it, only the worktree diff,
++    untracked files and HEAD/branch are recorded, and git never writes there.
+     """
++    from hermes_cli import kanban_scratch_archive_shapes as shapes
+     env = _env(repo)
+     dest.mkdir(parents=True, exist_ok=True)  # the root repo archives into the fresh partial dir
+     head = _text(_git(repo, env, "rev-parse", "--verify", "-q", "HEAD^{commit}", ok=(0, 1))) or None
+@@ -279,20 +332,55 @@ def archive_repo(repo: Path, dest: Path, *, task_id: str, completed_at: Optional
+         if len(parts) >= 2:
+             remotes.setdefault(parts[0], parts[1])
+ 
+-    # Commits not reachable from any remote-tracking ref.
+-    refs = [r for r in _text(_git(repo, env, "for-each-ref", "--format=%(refname)")).splitlines()
+-            if r and not r.startswith("refs/remotes/")]
+-    if head:
+-        refs.append("HEAD")
+-    unpushed = [r for r in refs
+-                if _text(_git(repo, env, "rev-list", "-n1", r, "--not", "--remotes"))]
+     files = ["meta.json"]
++    extra: dict = {}
++    outside = gitdir is not None and not gitdir[1]
++    if gitdir is not None:
++        extra.update(linked_gitdir=gitdir[0], gitdir_inside=gitdir[1])
++    if bare:
++        extra["bare"] = True
++        gitdir_of = _text(_git(repo, env, "rev-parse", "--absolute-git-dir"))
++        if os.path.normpath(gitdir_of) != os.path.normpath(os.path.abspath(repo)):
++            raise ArchiveRefused(f"{repo} looks like a bare repository but git resolves {gitdir_of}")
++    if omitted is not None:
++        from hermes_cli.kanban_scratch_archive_omit import RESTORE_STEPS
++        extra.update(objects_omitted=omitted["reason"], objects_restore=RESTORE_STEPS,
++                     omitted_remote_refs=omitted["remote_refs"], supplement_pack=omitted["pack"])
++    unpushed: list[str] = []
++    if not outside:  # an outside gitdir's commits stay in that repository
++        # Commits neither reachable from a remote-tracking ref nor fetched from a promisor remote.
++        unpushed, more = shapes.select_unpushed(repo, env, _git, head, partial=_is_partial_clone(repo, env))
++        extra.update(more)
+     if unpushed:
+         bundle = dest / "commits.bundle"
+         _git(repo, env, "bundle", "create", str(bundle), *unpushed, "--not", "--remotes")
+         _git(repo, env, "bundle", "verify", str(bundle))
+         files.append(bundle.name)
++    if bare:
++        return _write_meta(dest, task_id, completed_at, repo, head, branch, remotes, unpushed, 0, files, extra)
++    if outside:
++        with shapes.private_index(repo, env, _git, dest) as private:
++            untracked = _archive_worktree(repo, dest, private, head, files, extra)
++    else:
++        untracked = _archive_worktree(repo, dest, env, head, files, extra)
++    return _write_meta(dest, task_id, completed_at, repo, head, branch, remotes, unpushed, len(untracked),
++                       files, extra)
++
+ 
++def _write_meta(dest: Path, task_id: str, completed_at: Optional[int], repo: Path, head, branch, remotes,
++                unpushed: list[str], untracked_count: int, files: list[str], extra: dict) -> dict:
++    meta = {
++        "task_id": task_id, "completed_at": completed_at, "source": str(repo),
++        "head": head, "branch": branch, "remotes": remotes, "unpushed_refs": unpushed,
++        "untracked_count": untracked_count, "files": files, "archived_at": int(time.time()), **extra,
++    }
++    (dest / "meta.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
++    return meta
++
++
++def _archive_worktree(repo: Path, dest: Path, env: dict[str, str], head: Optional[str],
++                      files: list[str], extra: dict) -> list[str]:
++    """``tracked.diff``, remote-base records and ``untracked.tar`` of *repo*'s worktree; the untracked paths."""
+     base = head or _text(_git(repo, env, "hash-object", "-t", "tree", "--stdin"))
+     changes = _raw_changes(repo, env, base) if head and _is_partial_clone(repo, env) else []
+     missing = _missing_objects(repo, env) if changes else set()
+@@ -310,11 +398,6 @@ def archive_repo(repo: Path, dest: Path, *, task_id: str, completed_at: Optional
+     if diff:
+         (dest / "tracked.diff").write_bytes(diff)
+         files.append("tracked.diff")
+-    extra: dict = {}
+-    if omitted is not None:
+-        from hermes_cli.kanban_scratch_archive_omit import RESTORE_STEPS
+-        extra.update(objects_omitted=omitted["reason"], objects_restore=RESTORE_STEPS,
+-                     omitted_remote_refs=omitted["remote_refs"], supplement_pack=omitted["pack"])
+     if remote_base:
+         files.extend(_write_remote_base(repo, dest, remote_base))
+         extra["remote_base_count"] = len(remote_base)
+@@ -327,14 +410,7 @@ def archive_repo(repo: Path, dest: Path, *, task_id: str, completed_at: Optional
+                 # Embedded repos are listed as directories; they are archived on their own.
+                 tar.add(str(repo / rel.rstrip("/")), arcname=rel.rstrip("/"), recursive=False)
+         files.append("untracked.tar")
+-
+-    meta = {
+-        "task_id": task_id, "completed_at": completed_at, "source": str(repo),
+-        "head": head, "branch": branch, "remotes": remotes, "unpushed_refs": unpushed,
+-        "untracked_count": len(untracked), "files": files, "archived_at": int(time.time()), **extra,
+-    }
+-    (dest / "meta.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+-    return meta
++    return untracked
+ 
+ 
+ PAYLOAD_DIR = ".hermes-complete-archive-v1"
+@@ -351,6 +427,10 @@ _MANIFEST = "manifest.json"
+ _GZIP_LEVEL = 1
+ 
+ 
++# Entries the manifest records (path, type, mode) with no tar member: they hold no content.
++_CONTENTLESS = ("fifo", "socket")
++
++
+ def _kind(mode: int) -> str:
+     if stat.S_ISREG(mode):
+         return "file"
+@@ -358,7 +438,11 @@ def _kind(mode: int) -> str:
+         return "dir"
+     if stat.S_ISLNK(mode):
+         return "symlink"
+-    raise ArchiveRefused("special file in workspace (fifo/socket/device)")
++    if stat.S_ISFIFO(mode):
++        return "fifo"
++    if stat.S_ISSOCK(mode):
++        return "socket"
++    raise ArchiveRefused("special file in workspace (device node)")
+ 
+ 
+ def _signature(st: os.stat_result) -> list[int]:
+@@ -449,6 +533,9 @@ def _scan(root: Path, tar: Optional[tarfile.TarFile] = None,
+                     tar.addfile(info)
+                     rec["link"] = info.linkname
+                     entries[erel] = rec
++            elif kind in _CONTENTLESS:
++                if rec is not None:
++                    entries[erel] = rec  # recorded, never opened: reading a fifo could block or drain it
+             elif info is not None:
+                 if omit is not None and omit(dfd, name, erel, st):
+                     continue
+@@ -590,7 +677,7 @@ def verify_complete_archive(archive: Path) -> dict:
+                         digest.update(block)
+                     if digest.hexdigest() != rec["sha256"] or m.size != rec["size"]:
+                         raise ArchiveRefused(f"payload content mismatch for {m.name!r}")
+-        if seen != set(want):
++        if seen != {name for name, rec in want.items() if rec.get("type") not in _CONTENTLESS}:
+             raise ArchiveRefused("payload is missing members")
+     except (OSError, ValueError, KeyError, TypeError, tarfile.TarError, EOFError) as exc:
+         raise ArchiveRefused(f"payload unreadable: {exc!r}") from exc
+@@ -739,7 +826,8 @@ def archive_workspace(workspace: Path, archive_dir: Path, *, task_id: str,
+     no half archive that looks complete. Raises :class:`ArchiveRefused` (or
+     ``OSError``) on any failure; the caller then keeps the workspace.
+     """
+-    repos, markers = _find_repos(workspace)
++    layout = _discover(workspace)
++    repos, markers = layout.repos, layout.markers
+     try:
+         reserved = os.path.lexists(workspace / PAYLOAD_DIR)
+     except OSError as exc:
+@@ -757,6 +845,11 @@ def archive_workspace(workspace: Path, archive_dir: Path, *, task_id: str,
+             rel = repo.relative_to(workspace)
+             archive_repo(repo, partial / rel if rel.parts else partial,
+                          task_id=task_id, completed_at=completed_at, omitted=records.get(repo))
++        for repo, kwargs in ([(r, {"bare": True}) for r in layout.bare]
++                             + [(w, {"gitdir": g}) for w, g in sorted(layout.linked.items())]):
++            rel = repo.relative_to(workspace)
++            archive_repo(repo, partial / rel if rel.parts else partial,
++                         task_id=task_id, completed_at=completed_at, **kwargs)
+         omitter = None
+         if plans:
+             from hermes_cli.kanban_scratch_archive_omit import Omitter
+@@ -765,7 +858,7 @@ def archive_workspace(workspace: Path, archive_dir: Path, *, task_id: str,
+         snapshot = (_write_payload(workspace, payload, omitter, [records[r] for r in repos if r in records])
+                     if plans else _write_payload(workspace, payload))
+         if any(snapshot.get(rel) != sig for rel, sig in markers.items()):
+-            raise ArchiveRefused("a .git data file changed after it was judged not a gitlink")
++            raise ArchiveRefused("a .git file changed after it was judged (data marker or gitlink)")
+         if plans:
+             from hermes_cli.kanban_scratch_archive_omit import check_files_unchanged
+             check_files_unchanged(plans, snapshot)
+diff --git a/hermes_cli/kanban_scratch_archive_shapes.py b/hermes_cli/kanban_scratch_archive_shapes.py
+new file mode 100644
+index 0000000000..99c8563bf5
+--- /dev/null
++++ b/hermes_cli/kanban_scratch_archive_shapes.py
+@@ -0,0 +1,156 @@
++"""Git shapes the scratch archive used to refuse forever, archived instead. [daveey]
++
++worker-2 (2026-11-13) kept 54 aged scratch trees (37.8 GiB) because each retry of
++``kanban_scratch_archive`` failed the same way. This module holds the pieces that
++let those shapes archive, while anything still unsafe keeps refusing:
++
++* :func:`select_unpushed` picks the refs ``commits.bundle`` carries. A ref whose
++  tip the remote already holds is left out: one contained in ``refs/remotes``
++  (as before) or one whose tip came from a promisor pack (``rev-list
++  --exclude-promisor-objects``), such as the tags a ``blob:none`` clone fetched,
++  whose bundle needed blobs that were never local (``fatal: unable to read``).
++  A remaining ref is bundled only when every object it adds is local. A ref
++  that needs objects the promisor remote vouches for is recorded and left to the
++  complete payload (its local objects are in ``.git``); a ref needing objects
++  nothing vouches for refuses with reason ``unrecoverable_objects``.
++* :func:`parse_gitlink` reads a ``.git`` gitlink file (linked worktree or
++  submodule). A gitdir inside the scanned tree is archived as a nested repo; a
++  gitdir outside it gets the worktree diff plus HEAD/branch, read through
++  :func:`private_index` so git never writes there. A gitdir that is missing,
++  empty, or inside the tree but not a real directory there still refuses.
++"""
++from __future__ import annotations
++
++import os
++import shutil
++import stat
++import tempfile
++from contextlib import contextmanager
++from pathlib import Path
++from typing import Iterator
++
++UNRECOVERABLE = "unrecoverable_objects"
++
++
++def _refused(message: str) -> Exception:
++    from hermes_cli.kanban_scratch_archive import ArchiveRefused
++    return ArchiveRefused(message)
++
++
++def parse_gitlink(root: Path, rel: str, head: bytes, found: dict[str, os.stat_result]) -> tuple[str, bool]:
++    """(gitdir as written, inside *root*) for the gitlink at ``<rel>/.git`` whose first bytes are *head*.
++
++    Git resolves a relative pointer against the directory holding the ``.git``
++    file. Containment is lexical on absolute, already symlink-free paths (the
++    scan opens every component without following links), and an inside target
++    must be a directory the scan itself recorded at every component, so a
++    pointer through a symlink inside the tree is refused rather than followed.
++    """
++    directory = root if rel == "." else root / rel
++    where = f"linked worktree or submodule at {directory / '.git'}"
++    line = head.lstrip()[len(b"gitdir:"):].split(b"\n", 1)[0].strip()
++    if not line:
++        raise _refused(f"{where}: empty gitdir pointer")
++    pointer = os.fsdecode(line)
++    top = os.path.normpath(os.path.abspath(root))
++    target = os.path.normpath(os.path.join(os.path.abspath(directory), pointer))
++    if target == top or target.startswith(top.rstrip(os.sep) + os.sep):
++        sub = os.path.relpath(target, top).replace(os.sep, "/")
++        parts = [] if sub == "." else sub.split("/")
++        for i in range(len(parts) + 1):
++            st = found.get("/".join(parts[:i]) or ".")
++            if st is None or not stat.S_ISDIR(st.st_mode):
++                raise _refused(f"{where}: gitdir {pointer} is not a directory in the workspace")
++        return pointer, True
++    if not os.path.isdir(target):  # reads outside the tree only to look; never writes there
++        raise _refused(f"{where}: gitdir {pointer} is missing")
++    return pointer, False
++
++
++def _commit_tips(repo: Path, env: dict, git, head: str | None) -> tuple[dict[str, str], set[str], list[str]]:
++    """({local ref: peeled commit}, remote-tracking tips, refs needing a per-ref walk)."""
++    fmt = "%(objectname) %(objecttype) %(*objectname) %(*objecttype) %(refname)"
++    out = git(repo, env, "for-each-ref", f"--format={fmt}").stdout.decode("utf-8", "replace")
++    tips: dict[str, str] = {}
++    remote: set[str] = set()
++    nested: list[str] = []
++    for line in out.splitlines():
++        parts = line.split(" ", 4)
++        if len(parts) != 5:
++            continue
++        oid, kind, peeled, peeled_kind, ref = parts
++        if ref.startswith("refs/remotes/"):
++            remote.add(oid)
++        elif kind == "commit":
++            tips[ref] = oid
++        elif kind == "tag" and peeled_kind == "commit":
++            tips[ref] = peeled
++        elif kind == "tag" and peeled_kind == "tag":
++            nested.append(ref)  # tag of a tag: walked on its own below
++        # a ref to a tree or blob names no commit, so nothing of it is unpushed history
++    if head:
++        tips["HEAD"] = head
++    return tips, remote, nested
++
++
++def _rev_list(repo: Path, env: dict, git, args: list[str], positive: list[str], negative: set[str],
++              ok=(0,)):
++    stdin = "".join(f"{o}\n" for o in positive) + "".join(f"^{o}\n" for o in sorted(negative))
++    return git(repo, env, "rev-list", *args, "--stdin", ok=ok, stdin=stdin.encode())
++
++
++def _missing(proc) -> list[str]:
++    return [line[1:].split()[0] for line in proc.stdout.decode("ascii", "replace").splitlines()
++            if line.startswith("?")]
++
++
++def select_unpushed(repo: Path, env: dict, git, head: str | None, *, partial: bool) -> tuple[list[str], dict]:
++    """(refs to bundle, meta additions); raises ``ArchiveRefused`` (``unrecoverable_objects``).
++
++    Every walk is offline and over local objects only (the archive env forbids
++    lazy fetches). Commit walks only, except the object walks that prove a
++    bundle can be written, which a ref no longer needing a bundle never pays.
++    """
++    tips, remote, nested = _commit_tips(repo, env, git, head)
++    local = _rev_list(repo, env, git, ["--exclude-promisor-objects"], sorted(set(tips.values())), remote)
++    unpushed = {line[:40] for line in local.stdout.decode("ascii", "replace").split()}
++    refs = [r for r, oid in tips.items() if oid in unpushed]
++    for ref in nested:
++        walk = git(repo, env, "rev-list", "-n1", "--exclude-promisor-objects", ref, "--not", "--remotes")
++        if walk.stdout.strip():
++            refs.append(ref)
++    refs.sort(key=lambda r: (r != "HEAD", r))
++    if not refs:
++        return [], {}
++    if not _missing(_rev_list(repo, env, git, ["--objects", "--missing=print"], refs, remote)):
++        return refs, {}
++    bundle, promised = [], []
++    for ref in refs:
++        gone = _missing(_rev_list(repo, env, git, ["--objects", "--missing=print"], [ref], remote))
++        if not gone:
++            bundle.append(ref)
++            continue
++        vouched = partial and not _rev_list(repo, env, git, ["--objects", "--missing=allow-promisor"], [ref],
++                                            remote, ok=(0, 1, 128)).returncode
++        if not vouched:
++            raise _refused(f"{UNRECOVERABLE}: {ref} in {repo} needs {len(gone)} missing object(s) no "
++                           f"promisor remote vouches for (e.g. {gone[0]})")
++        promised.append(ref)
++    return bundle, {"promised_refs": promised}
++
++
++@contextmanager
++def private_index(repo: Path, env: dict, git, scratch: Path) -> Iterator[dict]:
++    """*env* with ``GIT_INDEX_FILE`` on a private copy of the worktree's index, under *scratch*.
++
++    ``git diff`` refreshes and rewrites a stat-dirty index, and that index lives
++    in the gitdir; for a gitdir outside the scratch tree every such write would
++    land in someone else's repository. The copy takes them all instead.
++    """
++    source = git(repo, env, "rev-parse", "--path-format=absolute", "--git-path", "index").stdout
++    source = Path(os.fsdecode(source.rstrip(b"\r\n")))
++    with tempfile.TemporaryDirectory(prefix=".index-", dir=scratch) as tmp:
++        copy = Path(tmp) / "index"
++        if source.is_file():
++            shutil.copyfile(source, copy)
++        yield dict(env, GIT_INDEX_FILE=str(copy), GIT_OPTIONAL_LOCKS="0")
+diff --git a/tests/hermes_cli/test_kanban_scratch_archive_shapes.py b/tests/hermes_cli/test_kanban_scratch_archive_shapes.py
+new file mode 100644
+index 0000000000..e60b695dc9
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_scratch_archive_shapes.py
+@@ -0,0 +1,373 @@
++"""Scratch shapes the archive refused forever now archive, then get removed. [daveey]
++
++worker-2 (2026-11-13): 54 aged trees / 37.8 GiB were kept because every retry of
++the archive failed the same way: bundles of promisor-fetched tags ("unable to
++read"), linked worktrees and submodules, bare repositories and fifos/sockets.
++Each shape below must archive and be removed through the normal guarded path,
++while objects that are really missing still refuse (``unrecoverable_objects``).
++"""
++import json
++import os
++import shutil
++import socket
++import stat
++import subprocess
++import tarfile
++
++import pytest
++
++from tests.hermes_cli import test_kanban_scratch_gc_archive as base
++
++board = base.board
++remote = base.remote
++_run = base._run
++_task = base._task
++_gc = base._gc
++_archive = base._archive
++PAYLOAD = base.PAYLOAD
++
++
++def _meta(tid, rel):
++    return json.loads((_archive(tid) / rel / "meta.json").read_text())
++
++
++def _bundle_heads(bundle, cwd):
++    return {line.split()[1] for line in _run("bundle", "list-heads", str(bundle), cwd=cwd).splitlines()}
++
++
++def _manifest(tid):
++    return json.loads((_archive(tid) / PAYLOAD / "manifest.json").read_text())
++
++
++def _tree(tid):
++    with tarfile.open(_archive(tid) / PAYLOAD / "tree.tar.gz") as tar:
++        return {m.name: m for m in tar.getmembers()}
++
++
++# --- 1. unpushed detection ---------------------------------------------------------------
++
++@pytest.fixture
++def tagged_promisor(tmp_path):
++    """Filter-serving bare remote: main = c1, c2; tag ``archive-2023`` on a side commit main lacks."""
++    src = tmp_path / "tseed"
++    src.mkdir()
++    _run("init", "-q", cwd=src)
++    (src / "a.txt").write_text("one\n")
++    _run("add", ".", cwd=src)
++    _run("commit", "-q", "-m", "c1", cwd=src)
++    _run("checkout", "-q", "-b", "side", cwd=src)
++    (src / "side.txt").write_text("first side version\n")
++    _run("add", ".", cwd=src)
++    _run("commit", "-q", "-m", "side 1", cwd=src)
++    (src / "side.txt").write_text("tagged side version\n")
++    _run("commit", "-q", "-am", "side 2", cwd=src)
++    _run("tag", "-a", "-m", "old", "archive-2023", cwd=src)
++    _run("checkout", "-q", "main", cwd=src)
++    _run("branch", "-q", "-D", "side", cwd=src)
++    (src / "a.txt").write_text("two\n")
++    _run("commit", "-q", "-am", "c2", cwd=src)
++    bare = tmp_path / "tagged.git"
++    _run("clone", "-q", "--bare", str(src), str(bare))
++    _run("config", "uploadpack.allowFilter", "true", cwd=bare)
++    return bare
++
++
++def _blobless(remote_path, dest):
++    _run("clone", "-q", "--filter=blob:none", f"file://{remote_path}", str(dest))
++    assert "refs/tags/archive-2023" in _run("for-each-ref", "--format=%(refname)", cwd=dest)
++
++
++def test_promisor_fetched_tag_is_not_bundled_and_the_tree_is_removed(board, tagged_promisor, tmp_path):
++    tid, path = _task()
++    repo = path / "repo"
++    _blobless(tagged_promisor, repo)
++    (repo / "a.txt").write_text("local\n")
++    _run("commit", "-q", "-am", "local work", cwd=repo)
++    head = _run("rev-parse", "HEAD", cwd=repo)
++    shutil.move(tagged_promisor, tagged_promisor.with_name("gone.git"))  # no lazy fetch can rescue it
++    assert _gc() == 0
++    assert not path.exists()
++    meta = _meta(tid, "repo")
++    assert meta["unpushed_refs"] == ["HEAD", "refs/heads/main"]  # the tag's tip is the remote's
++    assert "promised_refs" not in meta
++    check = tmp_path / "check"
++    _run("init", "-q", str(check))
++    bundle = _archive(tid) / "repo" / "commits.bundle"
++    assert _bundle_heads(bundle, check) == {"HEAD", "refs/heads/main"}
++    assert head in _run("bundle", "list-heads", str(bundle), cwd=check)
++
++
++def test_local_clone_of_a_blobless_clone_leaves_promisor_tags_out(board, tagged_promisor, tmp_path):
++    """The 10 GiB rv3/corerepo shape: a local clone of a blobless clone, no promisor config of its own."""
++    seed = tmp_path / "partial"
++    _blobless(tagged_promisor, seed)
++    tid, path = _task()
++    repo = path / "corerepo"
++    _run("clone", "-q", str(seed), str(repo))
++    promisor = subprocess.run(["git", "config", "--get-regexp", "promisor"], cwd=repo, capture_output=True, check=False)
++    assert promisor.returncode == 1  # not a partial clone by config: nothing "promised"
++    (repo / "a.txt").write_text("local\n")
++    _run("commit", "-q", "-am", "local work", cwd=repo)
++    assert _gc() == 0
++    assert not path.exists()
++    assert _meta(tid, "corerepo")["unpushed_refs"] == ["HEAD", "refs/heads/main"]
++
++
++def test_clean_blobless_clone_with_only_promisor_tags_writes_meta_only(board, tagged_promisor):
++    tid, path = _task()
++    _blobless(tagged_promisor, path / "repo")
++    assert _gc() == 0
++    assert not path.exists()
++    assert sorted(os.listdir(_archive(tid) / "repo")) == ["meta.json"]
++    assert _meta(tid, "repo")["unpushed_refs"] == []
++
++
++def test_ref_needing_promised_objects_is_left_to_the_payload(board, tagged_promisor, tmp_path):
++    tid, path = _task()
++    repo = path / "repo"
++    _blobless(tagged_promisor, repo)
++    _run("checkout", "-q", "-b", "feat", "archive-2023", cwd=repo)  # fetches the tag's tree blobs only
++    (repo / "feat.txt").write_text("feature work\n")
++    _run("add", "feat.txt", cwd=repo)
++    _run("commit", "-q", "-m", "feature", cwd=repo)
++    feat = _run("rev-parse", "HEAD", cwd=repo)
++    _run("checkout", "-q", "main", cwd=repo)
++    # feat's bundle would need "side 1"'s blob below the tag: promised by the remote, never local.
++    shutil.move(tagged_promisor, tagged_promisor.with_name("gone.git"))
++    assert _gc() == 0
++    assert not path.exists()
++    meta = _meta(tid, "repo")
++    assert meta["promised_refs"] == ["refs/heads/feat"]
++    assert meta["unpushed_refs"] == []
++    # The feature commit itself is still archived: the payload carries the repo's local objects.
++    restored = tmp_path / "restored"
++    with tarfile.open(_archive(tid) / PAYLOAD / "tree.tar.gz", "r:gz") as tar:
++        tar.extractall(restored, filter="tar")
++    assert _run("cat-file", "-t", feat, cwd=restored / "repo") == "commit"
++
++
++def test_really_missing_unpushed_object_refuses_as_unrecoverable(board, remote):
++    from hermes_cli import kanban_scratch_archive as sa
++    from hermes_cli import kanban_scratch_backoff as bo
++
++    tid, path = _task(remote=remote)
++    repo = path / "repo"
++    (repo / "new.txt").write_text("written once, then lost\n")
++    _run("add", "new.txt", cwd=repo)
++    _run("commit", "-q", "-m", "unpushed", cwd=repo)
++    blob = _run("rev-parse", "HEAD:new.txt", cwd=repo)
++    loose = repo / ".git" / "objects" / blob[:2] / blob[2:]
++    loose.chmod(0o600)
++    loose.unlink()  # no promisor remote vouches for it: the work is gone
++    with pytest.raises(sa.ArchiveRefused, match="^unrecoverable_objects: .* 1 missing object"):
++        sa.archive_workspace(path, _archive(tid), task_id=tid, completed_at=base.OLD)
++    assert _gc() == 0
++    assert (repo / "new.txt").exists() and not _archive(tid).exists()
++    assert bo.Refusals("default").entries[tid]["reason"].startswith("unrecoverable_objects:")
++
++
++def test_select_unpushed_handles_nested_and_non_commit_tags(board, remote, tmp_path):
++    from hermes_cli import kanban_scratch_archive as sa
++    from hermes_cli import kanban_scratch_archive_shapes as shapes
++
++    repo = tmp_path / "r"
++    _run("clone", "-q", str(remote), str(repo))
++    (repo / "tracked.txt").write_text("two\n")
++    _run("commit", "-q", "-am", "local", cwd=repo)
++    _run("tag", "-a", "-m", "inner", "inner", cwd=repo)
++    _run("tag", "-a", "-m", "outer", "outer", "inner", cwd=repo)
++    _run("tag", "-a", "-m", "pushed", "pushed-outer", "origin/main", cwd=repo)
++    _run("tag", "-a", "-m", "wrap", "pushed-nested", "pushed-outer", cwd=repo)
++    _run("tag", "tree-tag", "HEAD^{tree}", cwd=repo)  # names no commit: nothing unpushed
++    env = sa._env(repo)
++    refs, extra = shapes.select_unpushed(repo, env, sa._git, _run("rev-parse", "HEAD", cwd=repo), partial=False)
++    assert refs == ["HEAD", "refs/heads/main", "refs/tags/inner", "refs/tags/outer"]
++    assert extra == {}
++
++
++# --- 2. bare repositories ------------------------------------------------------------------
++
++def test_bare_repo_is_bundled_with_bare_meta_and_removed(board, remote, tmp_path):
++    tid, path = _task(remote=remote)
++    _run("clone", "-q", "--bare", str(remote), str(path / "mirror.git"))
++    tip = _run("rev-parse", "refs/heads/main", cwd=path / "mirror.git")
++    assert _gc() == 0
++    assert not path.exists()
++    meta = _meta(tid, "mirror.git")
++    assert meta["bare"] is True and meta["head"] == tip
++    assert meta["unpushed_refs"] == ["HEAD", "refs/heads/main"]  # a bare clone has no refs/remotes
++    assert "tracked.diff" not in meta["files"] and meta["untracked_count"] == 0
++    check = tmp_path / "check"
++    _run("init", "-q", str(check))
++    bundle = _archive(tid) / "mirror.git" / "commits.bundle"
++    _run("bundle", "verify", str(bundle), cwd=check)
++    assert _bundle_heads(bundle, check) == {"HEAD", "refs/heads/main"}
++    assert _meta(tid, "repo").get("bare") is None
++
++
++def test_workspace_root_that_is_a_bare_repo(board, remote):
++    tid, path = _task()
++    (path / "notes.txt").unlink()
++    path.rmdir()
++    _run("clone", "-q", "--bare", str(remote), str(path))
++    assert _gc() == 0
++    assert not path.exists()
++    assert _meta(tid, ".")["bare"] is True
++
++
++def test_directory_that_only_looks_bare_refuses(board):
++    from hermes_cli import kanban_scratch_archive as sa
++
++    def build(p):
++        fake = p / "fixture"
++        (fake / "objects").mkdir(parents=True)
++        (fake / "refs").mkdir()
++        (fake / "HEAD").write_text("not a ref\n")
++
++    tid, path = base._plain_task(build)
++    with pytest.raises(sa.ArchiveRefused):
++        sa.archive_workspace(path, _archive(tid), task_id=tid, completed_at=base.OLD)
++    assert _gc() == 0 and (path / "fixture" / "HEAD").exists()
++
++
++# --- 3. linked worktrees and submodules ----------------------------------------------------
++
++def test_linked_worktree_with_gitdir_inside_is_archived_as_a_nested_repo(board, remote, tmp_path):
++    tid, path = _task(remote=remote)
++    _run("worktree", "add", "-q", "-b", "side", str(path / "wt"), cwd=path / "repo")
++    (path / "wt" / "tracked.txt").write_text("side work\n")
++    _run("commit", "-q", "-am", "side commit", cwd=path / "wt")
++    (path / "wt" / "tracked.txt").write_text("side work\nuncommitted\n")
++    assert _gc() == 0
++    assert not path.exists()
++    meta = _meta(tid, "wt")
++    assert meta["gitdir_inside"] is True and meta["linked_gitdir"].endswith(".git/worktrees/wt")
++    assert meta["branch"] == "side" and "refs/heads/side" in meta["unpushed_refs"]
++    assert "+uncommitted" in (_archive(tid) / "wt" / "tracked.diff").read_text()
++    check = tmp_path / "check"
++    _run("clone", "-q", str(remote), str(check))
++    _run("bundle", "verify", str(_archive(tid) / "wt" / "commits.bundle"), cwd=check)
++
++
++def test_submodule_with_gitdir_inside_is_archived(board, remote, tmp_path):
++    (tmp_path / "subseed").mkdir()
++    sub_remote = base._seed_remote(tmp_path / "subseed")
++    tid, path = _task(remote=remote)
++    repo = path / "repo"
++    _run("-c", "protocol.file.allow=always", "submodule", "add", "-q", str(sub_remote), "sub", cwd=repo)
++    assert (repo / "sub" / ".git").is_file()
++    (repo / "sub" / "tracked.txt").write_text("submodule edit\n")
++    assert _gc() == 0
++    assert not path.exists()
++    meta = _meta(tid, "repo/sub")
++    assert meta["gitdir_inside"] is True and meta["linked_gitdir"] == "../.git/modules/sub"
++    assert "+submodule edit" in (_archive(tid) / "repo" / "sub" / "tracked.diff").read_text()
++
++
++def _fingerprint(root):
++    """Every entry's bytes and stat below *root* (the outside gitdir must not change at all)."""
++    out = {}
++    for current, dirs, files in os.walk(root):
++        for name in dirs + files:
++            full = os.path.join(current, name)
++            st = os.lstat(full)
++            data = None
++            if stat.S_ISREG(st.st_mode):
++                with open(full, "rb") as fh:
++                    data = fh.read()
++            out[os.path.relpath(full, root)] = (st.st_mode, st.st_size, st.st_mtime_ns, data)
++    return out
++
++
++def test_linked_worktree_with_gitdir_outside_records_diff_and_never_writes_there(board, remote):
++    outside = board / "outside-repo"
++    _run("clone", "-q", str(remote), str(outside))
++    tid, path = _task()
++    wt = path / "wt"
++    _run("worktree", "add", "-q", "-b", "wt-branch", str(wt), cwd=outside)
++    (wt / "tracked.txt").write_text("one\nworktree edit\n")
++    (wt / "fresh.txt").write_text("untracked\n")
++    (wt / "same.txt").write_text("x\n")
++    _run("add", "same.txt", cwd=wt)
++    # Stat-dirty but unchanged: a plain `git diff` would rewrite the outside index to refresh it.
++    st = (wt / "same.txt").stat()
++    os.utime(wt / "same.txt", ns=(st.st_atime_ns, st.st_mtime_ns + 5_000_000_000))
++    before = _fingerprint(outside / ".git")
++    assert _gc() == 0
++    assert not path.exists()
++    assert _fingerprint(outside / ".git") == before
++    meta = _meta(tid, "wt")
++    assert meta["gitdir_inside"] is False and meta["linked_gitdir"] == str(outside / ".git" / "worktrees" / "wt")
++    assert meta["branch"] == "wt-branch" and meta["head"] == _run("rev-parse", "main", cwd=outside)
++    assert meta["unpushed_refs"] == [] and "commits.bundle" not in meta["files"]
++    diff = (_archive(tid) / "wt" / "tracked.diff").read_text()
++    assert "+worktree edit" in diff and "+x" in diff
++    with tarfile.open(_archive(tid) / "wt" / "untracked.tar") as tar:
++        assert tar.getnames() == ["fresh.txt"]
++    assert not [p for p in (_archive(tid) / "wt").iterdir() if p.name.startswith(".index-")]
++
++
++@pytest.mark.parametrize("shape", ["missing", "empty", "inside_file", "inside_symlink"])
++def test_gitlink_it_cannot_archive_still_refuses(board, shape):
++    from hermes_cli import kanban_scratch_archive as sa
++
++    def build(p):
++        (p / "wt").mkdir()
++        (p / "target-file").write_text("not a gitdir\n")
++        (p / "real").mkdir()
++        (p / "via-link").symlink_to("real")
++        pointer = {"missing": f"gitdir: {p.parent / 'no-such-gitdir'}", "empty": "gitdir:   ",
++                   "inside_file": "gitdir: ../target-file", "inside_symlink": "gitdir: ../via-link"}[shape]
++        (p / "wt" / ".git").write_text(pointer + "\n")
++
++    _tid, path = base._plain_task(build)
++    with pytest.raises(sa.ArchiveRefused, match="linked worktree or submodule"):
++        sa.find_repos(path)
++    assert _gc() == 0 and (path / "wt" / ".git").is_file()
++
++
++# --- 4. fifos, sockets, devices ------------------------------------------------------------
++
++def test_fifo_and_socket_are_recorded_without_content_and_removed(board, monkeypatch):
++    from hermes_cli import kanban_scratch_archive as sa
++
++    def build(p):
++        os.mkfifo(p / "pipe")
++        (p / "run").mkdir()
++        monkeypatch.chdir(p / "run")  # AF_UNIX paths are short: bind relative to the directory
++        sock = socket.socket(socket.AF_UNIX)
++        sock.bind("agent.sock")
++        sock.close()
++
++    tid, path = base._plain_task(build)
++    monkeypatch.chdir(board)
++    assert _gc() == 0
++    assert not path.exists()
++    entries = _manifest(tid)["entries"]
++    assert entries["pipe"]["type"] == "fifo" and entries["run/agent.sock"]["type"] == "socket"
++    assert "sha256" not in entries["pipe"]
++    members = _tree(tid)
++    assert "pipe" not in members and "run/agent.sock" not in members and "run" in members
++    sa.verify_complete_archive(_archive(tid))
++
++
++def test_verify_still_requires_every_member_with_content(board):
++    from hermes_cli import kanban_scratch_archive as sa
++
++    tid, _ = base._plain_task(lambda p: os.mkfifo(p / "pipe"))
++    assert _gc() == 0
++    manifest_path = _archive(tid) / PAYLOAD / "manifest.json"
++    manifest = json.loads(manifest_path.read_text())
++    manifest["entries"]["ghost.txt"] = {"type": "file", "mode": 0o644, "size": 1, "sha256": "0" * 64}
++    manifest_path.write_text(json.dumps(manifest))
++    with pytest.raises(sa.ArchiveRefused, match="missing members"):
++        sa.verify_complete_archive(_archive(tid))
++
++
++@pytest.mark.parametrize("mode", [stat.S_IFCHR, stat.S_IFBLK])
++def test_device_node_is_still_refused(mode):
++    from hermes_cli import kanban_scratch_archive as sa
++
++    with pytest.raises(sa.ArchiveRefused, match="device node"):
++        sa._kind(mode | 0o600)
++    assert sa._kind(stat.S_IFIFO | 0o600) == "fifo" and sa._kind(stat.S_IFSOCK | 0o600) == "socket"
+diff --git a/tests/hermes_cli/test_kanban_scratch_custody.py b/tests/hermes_cli/test_kanban_scratch_custody.py
+index ea9d685fc6..e6886b970b 100644
+--- a/tests/hermes_cli/test_kanban_scratch_custody.py
++++ b/tests/hermes_cli/test_kanban_scratch_custody.py
+@@ -271,7 +271,7 @@ def test_local_dependents_keep_custody_without_sync_events(env, control):
+     assert before == [tuple(r) for r in env.conn.execute("SELECT * FROM kanban_sync_outbox")]
+ 
+ 
+-def test_clone_archives_and_bare_is_preserved(env, remote):
++def test_clone_archives_and_unarchivable_tree_is_preserved(env, remote):
+     tid, path, _ = evicted(env)
+     helpers._run("clone", "-q", str(remote), str(path / "repo"))
+     (path / "repo" / "tracked.txt").write_text("local change\n")
+@@ -279,7 +279,7 @@ def test_clone_archives_and_bare_is_preserved(env, remote):
+     dest = env.home / "archive" / "scratch" / "default" / tid / "repo"
+     assert "local change" in (dest / "tracked.diff").read_text()
+     _, path, _ = evicted(env)
+-    helpers._run("clone", "-q", "--bare", str(remote), str(path / "bare"))
++    helpers.refuse_forever(path)
+     assert gc.gc_task_scratch(env.conn, older_than_days=7) == 0
+     assert path.exists()
+ 
+diff --git a/tests/hermes_cli/test_kanban_scratch_custody_backoff.py b/tests/hermes_cli/test_kanban_scratch_custody_backoff.py
+index d31db79395..32d4a6a07b 100644
+--- a/tests/hermes_cli/test_kanban_scratch_custody_backoff.py
++++ b/tests/hermes_cli/test_kanban_scratch_custody_backoff.py
+@@ -27,13 +27,13 @@ def archives(monkeypatch):
+ 
+ def test_custody_refusal_backs_off_then_retries_a_changed_tree(env, remote, archives):
+     tid, path, _ = evicted(env)
+-    helpers._run("clone", "-q", "--bare", str(remote), str(path / "bare"))
++    helpers.refuse_forever(path)
+     assert gc.gc_task_scratch(env.conn, older_than_days=7) == 0
+     assert gc.gc_task_scratch(env.conn, older_than_days=7) == 0
+     assert archives == [path], "refused custody tree re-archived inside its backoff"
+     assert bo.Refusals("default").entries[f"custody:{tid}"]["count"] == 1
+     import shutil
+-    shutil.rmtree(path / "bare")
++    shutil.rmtree(path / "wt")
+     helpers._run("clone", "-q", str(remote), str(path / "repo"))
+     assert gc.gc_task_scratch(env.conn, older_than_days=7) == 1
+     assert archives == [path, path] and not path.exists()
+diff --git a/tests/hermes_cli/test_kanban_scratch_gc_archive.py b/tests/hermes_cli/test_kanban_scratch_gc_archive.py
+index 6bb370810e..ba6e733c64 100644
+--- a/tests/hermes_cli/test_kanban_scratch_gc_archive.py
++++ b/tests/hermes_cli/test_kanban_scratch_gc_archive.py
+@@ -216,20 +216,35 @@ def test_live_sharer_on_another_board_keeps_it(board, remote):
+     assert not _archive(tid).exists()
+ 
+ 
+-def test_linked_worktree_inside_keeps_it(board, remote):
++def refuse_forever(path):
++    """Give *path* a shape the archive always refuses: a gitlink whose gitdir does not exist."""
++    (path / "wt").mkdir()
++    (path / "wt" / ".git").write_text("gitdir: /nonexistent/hermes-test-gitdir\n")
++
++
++def test_linked_worktree_inside_is_archived(board, remote):
++    # Used to be kept forever ("left to the worktree GC", which never visits scratch).
+     tid, path = _task(remote=remote)
+     _run("worktree", "add", "-q", "-b", "side", str(path / "wt"), cwd=path / "repo")
+     assert (path / "wt" / ".git").is_file()
+     assert _gc() == 0
+-    assert (path / "repo" / ".git").is_dir() and (path / "wt").is_dir()
+-    assert not _archive(tid).exists()
++    assert not path.exists()
++    assert (_archive(tid) / "wt" / "meta.json").is_file()
+ 
+ 
+-def test_bare_repo_inside_keeps_it(board, remote):
++def test_bare_repo_inside_is_archived(board, remote):
+     tid, path = _task(remote=remote)
+     _run("clone", "-q", "--bare", str(remote), str(path / "mirror.git"))
+     assert _gc() == 0
+-    assert (path / "repo" / ".git").is_dir()
++    assert not path.exists()
++    assert json.loads((_archive(tid) / "mirror.git" / "meta.json").read_text())["bare"] is True
++
++
++def test_dangling_gitlink_keeps_it(board, remote):
++    tid, path = _task(remote=remote)
++    refuse_forever(path)
++    assert _gc() == 0
++    assert (path / "repo" / ".git").is_dir() and (path / "wt" / ".git").is_file()
+     assert not _archive(tid).exists()
+ 
+ 
+@@ -389,11 +404,12 @@ def test_payload_write_failure_keeps_workspace(board, monkeypatch):
+     assert not parent.exists() or list(parent.iterdir()) == []
+ 
+ 
+-def test_special_file_keeps_workspace(board):
++def test_fifo_is_recorded_and_workspace_removed(board):
+     tid, path = _plain_task(lambda p: os.mkfifo(p / "pipe"))
+     assert _gc() == 0
+-    assert (path / "notes.txt").exists()
+-    assert not _archive(tid).exists()
++    assert not path.exists()
++    manifest = json.loads((_archive(tid) / PAYLOAD / "manifest.json").read_text())
++    assert manifest["entries"]["pipe"]["type"] == "fifo"
+ 
+ 
+ def test_reserved_metadata_name_collision_keeps_workspace(board):
+diff --git a/tests/hermes_cli/test_kanban_scratch_gc_backoff.py b/tests/hermes_cli/test_kanban_scratch_gc_backoff.py
+index cb8f80feb1..00a319bce7 100644
+--- a/tests/hermes_cli/test_kanban_scratch_gc_backoff.py
++++ b/tests/hermes_cli/test_kanban_scratch_gc_backoff.py
+@@ -40,9 +40,9 @@ def archives(monkeypatch):
+     return calls
+ 
+ 
+-def _bare_refused(remote):
++def _refused(remote):
+     tid, path = _task(remote=remote)
+-    _run("clone", "-q", "--bare", str(remote), str(path / "mirror.git"))
++    helpers.refuse_forever(path)
+     return tid, path
+ 
+ 
+@@ -57,11 +57,11 @@ def _expire(key):
+ 
+ 
+ def test_refused_tree_is_not_rearchived_until_backoff_passes(remote, archives, caplog):
+-    tid, path = _bare_refused(remote)
++    tid, path = _refused(remote)
+     assert helpers._gc() == 0
+     assert archives == [path]
+     entry = _state()[tid]
+-    assert entry["count"] == 1 and "bare repository" in entry["reason"]
++    assert entry["count"] == 1 and "linked worktree or submodule" in entry["reason"]
+     assert entry["retry_at"] - entry["last_at"] == bo.BASE_S
+ 
+     caplog.set_level(logging.INFO, logger="hermes_cli.kanban_scratch_backoff")
+@@ -78,10 +78,10 @@ def test_refused_tree_is_not_rearchived_until_backoff_passes(remote, archives, c
+ 
+ 
+ def test_changed_tree_is_retried_at_once_and_success_clears_the_entry(remote, archives):
+-    tid, path = _bare_refused(remote)
++    tid, path = _refused(remote)
+     assert helpers._gc() == 0
+     import shutil
+-    shutil.rmtree(path / "mirror.git")  # the root's mtime moves: a new fingerprint
++    shutil.rmtree(path / "wt")  # the root's mtime moves: a new fingerprint
+     assert helpers._gc() == 0
+     assert archives == [path, path]
+     assert not path.exists()
+@@ -137,7 +137,7 @@ def test_refusal_count_resets_when_the_refused_tree_changes(tmp_path, change):
+ def test_unreadable_state_is_empty_and_never_blocks(remote, archives):
+     bo._path("default").parent.mkdir(parents=True, exist_ok=True)
+     bo._path("default").write_text("{not json")
+-    tid, path = _bare_refused(remote)
++    tid, path = _refused(remote)
+     assert helpers._gc() == 0
+     assert archives == [path] and _state()[tid]["count"] == 1
+ 
+@@ -150,9 +150,9 @@ def _write_entries(entries):
+ def test_malformed_memo_entry_is_dropped_and_the_aged_pass_completes(remote, archives, caplog, capsys):
+     """A JSON-valid memo whose entry has ``retry_at: "x"`` / ``count: null`` must not abort the pass."""
+     import time
+-    tid, path = _bare_refused(remote)
++    tid, path = _refused(remote)
+     fp = bo.fingerprint(path, OLD)
+-    good_tid, good_path = _bare_refused(remote)
++    good_tid, good_path = _refused(remote)
+     now = time.time()
+     _write_entries({
+         tid: {"fingerprint": fp, "count": None, "last_at": now, "retry_at": "x", "reason": "r"},
+@@ -163,7 +163,7 @@ def test_malformed_memo_entry_is_dropped_and_the_aged_pass_completes(remote, arc
+     assert helpers._gc() == 0
+     assert "GC complete" in capsys.readouterr().out
+     assert archives == [path], "the malformed entry is no refusal; the valid one still backs off"
+-    assert good_path.exists() and path.exists()  # bare repo: refused again, kept
++    assert good_path.exists() and path.exists()  # dangling gitlink: refused again, kept
+     entry = _state()[tid]
+     assert entry["count"] == 1 and isinstance(entry["retry_at"], float)
+     assert caplog.text.count("dropped 1 malformed") == 1
+-- 
+2.43.0
+

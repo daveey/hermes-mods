@@ -1,5 +1,23 @@
 # push-guard
 
+## Repository-aware PR-only policy
+
+The built-in policy covers `daveey/hermes-mods`. Add other repositories with a host
+`$HERMES_HOME/ship-only-guard.json` with a separate `"pr_landing_repos": ["example/service"]`
+key. Preserve the existing `repos` list: it selects the core-only ship path and is not
+extended by this policy. Existing fleet delivery of this file also delivers the new key.
+Profiles without their own file inherit the host file. Invalid/unreadable policy refuses
+merge admission, not an empty allowlist. Keep this file in private host configuration;
+it does not change `ship-only-guard` or select the core/state shipping path.
+
+For configured repos use `python3 plugins/push-guard/land.py --repo example/service --pr N --head SHA`.
+The helper refuses unconfigured repositories before any GitHub I/O; the default remains
+hermes-mods for existing callers. Repo is passed explicitly through every PR, CI, review
+validator, CAS merge and readback, not inferred from cwd or mutable global state.
+Configuration must be deployed on every agent host that may land these repos and
+push-guard must be enabled in that profile. Missing configuration protects only the
+built-in repo; external clients and missing/disabled hooks are outside this boundary.
+
 ## hermes-mods PR-only policy
 
 `daveey/hermes-mods` PRs use `python3 plugins/push-guard/land.py --pr N --head SHA`.
@@ -18,7 +36,10 @@ Where the same account implements and reviews, add `--review-task <done-card> --
 The installed `hermes-core-wt-land` review validator must be present; its read-only `review_gate` validates
 the completed run/session evidence, locally or through authenticated Board execution records. There is
 no caller-supplied receipt file, approval carry or fallback to prose. Missing/incompatible validation holds.
-Reviews with unanswered non-blocking points are conservatively held; obtain a clean follow-up review.
+A review card listing non-blocking points is held until a non-bot PR comment containing
+`<!-- hermes-review-reply -->` is posted after the review completed ("fixed in <sha>", "declined: <reason>",
+"follow-up <card>" or "refuted: <evidence>"), the same rule as `hermes-core-wt-land`'s `review_reply_guard`.
+That installed guard also runs (it never posts), so points in GitHub review bodies need the same answer.
 
 Raw `gh pr merge`, REST PUT (gh/curl/Python), GraphQL merge and auto-merge requests are refused even with
 no `push-guards.json`; `PUSH_GUARD=off` does not bypass this PR-only policy. Cancel-auto and GET remain reads.

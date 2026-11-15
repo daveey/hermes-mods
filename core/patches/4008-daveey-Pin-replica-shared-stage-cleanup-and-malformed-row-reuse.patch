@@ -1,0 +1,124 @@
+From dc6fd9de4ddada7801cc4c61b5b4aa205134cfdc Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 01:43:50 +0000
+Subject: [PATCH] [daveey] Pin replica shared-stage cleanup and malformed-row
+ reuse
+
+Add test-only regressions for last-state eviction, interrupted new/existing state advancement, and malformed-row decode sharing across origins. Keep an unrelated live replica as a cleanup control and verify repaired rows recover.
+
+Proof: isolated HOME/HERMES_HOME scripts/run_tests.sh: 29 passed, zero skipped across shared_lifecycle, profile_states, scope_controls and incremental. Individually removing eviction cleanup (M14), exception cleanup (M15), or malformed-stage sharing (M9) fails respectively 1, 2, and 1 new cases with behavioral assertions. scripts/check --base origin/main passes.
+---
+ .../test_kanban_replica_shared_lifecycle.py   | 101 ++++++++++++++++++
+ 1 file changed, 101 insertions(+)
+ create mode 100644 tests/hermes_cli/test_kanban_replica_shared_lifecycle.py
+
+diff --git a/tests/hermes_cli/test_kanban_replica_shared_lifecycle.py b/tests/hermes_cli/test_kanban_replica_shared_lifecycle.py
+new file mode 100644
+index 0000000000..f6f405c47e
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_replica_shared_lifecycle.py
+@@ -0,0 +1,101 @@
++"""Shared stages must not outlive their replica's last projection state. [daveey]"""
++import json
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_replica_projection as projection
++from hermes_cli import kanban_session_activity as activity
++from tests.hermes_cli.test_kanban_replica_read_memo import card
++
++
++@pytest.fixture(autouse=True)
++def isolated_projection(monkeypatch):
++    monkeypatch.setattr('hermes_cli.profiles.get_active_profile_name', lambda: 'reader')
++    projection.reset()
++    yield
++    projection.reset()
++
++
++def _view(path, *records, gen=1):
++    rows = [('owner', f'work/build/{tid}', data, 1000000, gen) for tid, data in records]
++    return SimpleNamespace(path=str(path), gen=gen, base_gen=None,
++                           by_key={(row[0], row[1]): row for row in rows})
++
++
++def _row(tid):
++    return tid, json.dumps(card(tid, sessions=[]))
++
++
++def _read(view):
++    return projection.project(view, 1000, 'origin', [], 1000, None, fresh=frozenset())
++
++
++def test_last_state_eviction_immediately_drops_only_its_replica_shared_stages(tmp_path):
++    # Distinct replica paths matter: evicting one of many profiles of the same
++    # replica must retain its shared rows until that replica's LAST state leaves.
++    views = [_view(tmp_path / f'replica-{i}.db', _row(f't_{i}'))
++             for i in range(projection._MAX_STATES + 2)]
++    for view in views:
++        assert _read(view) == []
++        live_paths = {slot[0] for slot in projection._states}
++        # Inspect immediately, without another project or a manual cleanup call.
++        assert set(projection._shared) == live_paths
++        assert all(len(stages) == 1 for stages in projection._shared.values())
++    assert len(projection._states) == projection._MAX_STATES
++    assert views[0].path not in projection._shared
++    assert views[-1].path in projection._shared
++
++
++@pytest.mark.parametrize('existing_state', [False, True])
++def test_failed_advance_drops_orphan_shared_stages_but_preserves_other_replica(
++        tmp_path, monkeypatch, existing_state):
++    survivor = _view(tmp_path / 'survivor.db', _row('t_survivor'))
++    failed = _view(tmp_path / 'failed.db', _row('t_kept'))
++    assert _read(survivor) == []
++    if existing_state:
++        assert _read(failed) == []
++    failed = _view(failed.path, _row('t_kept'), _row('t_new'), _row('t_boom'), gen=2)
++    decode = activity._decode_replica_task
++    decoded = []
++
++    def raising_decode(key, data):
++        decoded.append(key)
++        if key == 'work/build/t_boom':
++            raise RuntimeError('read interrupted after staging a row')
++        return decode(key, data)
++
++    monkeypatch.setattr(activity, '_decode_replica_task', raising_decode)
++    with pytest.raises(RuntimeError, match='read interrupted after staging a row'):
++        _read(failed)
++    assert 'work/build/t_new' in decoded  # the failure occurred after populating shared
++    assert set(projection._shared) == {survivor.path}
++    assert {slot[0] for slot in projection._states} == {survivor.path}
++    decoded.clear()
++    assert _read(survivor) == []
++    assert decoded == []  # cleanup must not discard an unrelated live replica
++
++
++def test_malformed_row_is_decoded_once_across_origins_and_recovers(tmp_path, monkeypatch):
++    view = _view(tmp_path / 'replica.db', ('t_bad', '{not json'))
++    decode = activity._decode_replica_task
++    decoded = []
++
++    def counting_decode(key, data):
++        decoded.append((key, data))
++        return decode(key, data)
++
++    monkeypatch.setattr(activity, '_decode_replica_task', counting_decode)
++    errors = []
++    for profile in ('a', 'b', 'a'):
++        monkeypatch.setattr('hermes_cli.profiles.get_active_profile_name', lambda: profile)
++        with pytest.raises(ValueError) as exc:
++            _read(view)
++        errors.append(str(exc.value))
++    assert errors[0] == errors[1] == errors[2]
++    assert decoded == [('work/build/t_bad', '{not json')]
++    repaired = _view(view.path, _row('t_bad'), gen=2)
++    for profile in ('b', 'a'):
++        monkeypatch.setattr('hermes_cli.profiles.get_active_profile_name', lambda: profile)
++        assert _read(repaired) == []
++    assert len(decoded) == 2
+-- 
+2.43.0
+

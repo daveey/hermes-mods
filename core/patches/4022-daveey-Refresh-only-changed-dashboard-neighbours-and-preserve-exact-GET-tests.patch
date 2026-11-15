@@ -1,0 +1,633 @@
+From 1d7e1e391d08c48722fec89d834b1badd3482a05 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 00:43:12 +0000
+Subject: [PATCH] [daveey] Refresh only changed dashboard neighbours and
+ preserve exact GET tests
+
+Two new retained-membership and narrowed-aggregate tests fail on previous WIP then pass. Full Kanban plugin suite: 220 tests passed across 23 files. Synthetic scale and reconstructed historical-event replay recorded separately; not yet live budget proof.
+---
+ plugins/kanban/dashboard/board_incremental.py |  56 ++++-
+ plugins/kanban/dashboard/board_read.py        |   6 +-
+ tests/plugins/test_kanban_board_delta.py      |  31 +++
+ tests/plugins/test_kanban_board_read_cache.py | 203 ++++++++++--------
+ tests/plugins/test_kanban_board_rows_cache.py |  41 ++--
+ tests/plugins/test_kanban_cold_start_reads.py |  14 +-
+ 6 files changed, 227 insertions(+), 124 deletions(-)
+
+diff --git a/plugins/kanban/dashboard/board_incremental.py b/plugins/kanban/dashboard/board_incremental.py
+index 0a77eaba9b..5ff56aa992 100644
+--- a/plugins/kanban/dashboard/board_incremental.py
++++ b/plugins/kanban/dashboard/board_incremental.py
+@@ -49,9 +49,9 @@ def _fetch(conn, filters: dict, ids: list) -> dict:
+     return {kanban_db._lossy_text(r["id"]): r for r in rows}
+ 
+ 
+-def _extras(conn, cards: dict, board_read) -> dict[str, dict]:
+-    """Full-path aggregates, restricted to displayed IDs (including unmarked run changes)."""
+-    ids = list(cards)
++def _rollups(conn, ids) -> dict[str, dict]:
++    """Content-only aggregates for invalidated displayed tasks."""
++    ids = list(ids)
+     if not ids:
+         return {}
+     ph, params = _ph(ids), tuple(ids)
+@@ -71,6 +71,27 @@ def _extras(conn, cards: dict, board_read) -> dict[str, dict]:
+         p = progress.setdefault(pid, {"done": 0, "total": 0})
+         p["total"] += 1
+         p["done"] += status == "done"
++    return {tid: {"link_counts": counts[tid], "comment_count": comments.get(tid, 0),
++                  "progress": progress.get(tid)} for tid in ids}
++
++
++def _affected(conn, cards, pcards, changed):
++    """P2 marks both deleted-link endpoints; surviving edges add direct neighbours."""
++    affected = set(changed) | (set(cards) - set(pcards))
++    if changed:
++        ph, params = _ph(changed), tuple(changed)
++        for own, other in (("parent_id", "child_id"), ("child_id", "parent_id")):
++            affected.update(r[0] for r in conn.execute(
++                f"SELECT {other} FROM task_links WHERE {own} IN ({ph})", params))
++    return affected & set(cards)
++
++
++def _extras(conn, cards, pcards, affected, board_read):
++    ids = list(cards)
++    if not ids:
++        return {}
++    rollups = _rollups(conn, sorted(affected)) if affected else {}
++    ph, params = _ph(ids), tuple(ids)
+     summaries = kanban_db.latest_summaries(conn, ids)
+     starts = kanban_db.current_run_started_ats(conn, ids)
+     try:
+@@ -81,15 +102,19 @@ def _extras(conn, cards: dict, board_read) -> dict[str, dict]:
+         managers = {}
+     cap = board_read._CARD_SUMMARY_PREVIEW_CHARS
+     return {tid: {
++        **(rollups[tid] if tid in rollups else pcards[tid][2]),
+         "latest_summary": summaries[tid][:cap] if summaries.get(tid) else None,
+         "current_run_started_at": starts.get(tid),
+-        "link_counts": counts[tid], "comment_count": comments.get(tid, 0), "progress": progress.get(tid),
+         "managing_session_id": managers.get(tid) or cards[tid][0].session_id or None} for tid in ids}
+ 
+ 
+ def _done_window(inc, by_id, changed, cap):
+     """Update the retained ranking; decline whenever an unseen card might enter the window."""
+-    done_ids = set(inc["done_ids"])
++    done_ids = inc["done_ids"]
++    membership_changes = {tid for tid in changed
++                          if (tid in done_ids) != (tid in by_id and by_id[tid]["status"] == "done")}
++    if membership_changes:
++        done_ids = set(done_ids)
+     entries = dict(inc["window"])
+     truncated = len(done_ids) > cap
+     cutoff = inc["window"][-1] if inc["window"] else ("", None)
+@@ -99,7 +124,8 @@ def _done_window(inc, by_id, changed, cap):
+             if tid in entries and truncated:
+                 return None
+             entries.pop(tid, None)
+-            done_ids.discard(tid)
++            if tid in membership_changes:
++                done_ids.discard(tid)
+             continue
+         item = (tid, done_epoch(row))
+         if tid in entries and truncated and _cmp(item, cutoff) > 0:
+@@ -108,7 +134,8 @@ def _done_window(inc, by_id, changed, cap):
+             return None
+         if tid in entries or not truncated or _cmp(item, cutoff) < 0:
+             entries[tid] = item[1]
+-        done_ids.add(tid)
++        if tid in membership_changes:
++            done_ids.add(tid)
+     window = tuple(sorted(entries.items(), key=rank_key)[:cap])
+     if any(tid not in by_id or by_id[tid]["status"] != "done" for tid, _ep in window):
+         return None
+@@ -148,14 +175,20 @@ def _parse_cards(by_id, order, memo):
+     return cards, parsed, raws
+ 
+ 
+-def _diagnostics(conn, cards, by_id, old_memo, diagnostic_inputs, br):
++def _diagnostics(conn, cards, by_id, prev, affected, diagnostic_inputs, br):
+     """Use the freshly read task rows even for unmarked ready/done bookkeeping."""
+     diag_rows = [by_id[tid] for tid, (task, _fields) in cards.items() if task.status != "archived"]
+     if not diag_rows:
+         return None, {}
+     # All displayed marks/runs and graph contexts are bounded by open rows plus
+     # the done cap. Event histories alone are selectively re-read.
+-    return br._incremental_diag_inputs(conn, diag_rows, old_memo, diagnostic_inputs)
++    old_graph = prev["diag_inputs"][3] if prev["diag_inputs"] else {}
++    ids = [r["id"] for r in diag_rows]
++    refresh = [tid for tid in ids if tid in affected or tid not in old_graph]
++    graphs = {tid: old_graph[tid] for tid in ids if tid not in refresh}
++    if refresh:
++        graphs.update(kanban_db.task_graph_contexts(conn, refresh))
++    return br._incremental_diag_inputs(conn, diag_rows, prev["_memo"]["diag"], diagnostic_inputs, graphs=graphs)
+ 
+ 
+ def _pickers(conn, prev, changed):
+@@ -200,8 +233,9 @@ def delta(conn, filters: dict, done_limit, diagnostic_inputs: Callable, prev: di
+     if parsed_cards is None:
+         return None
+     cards, parsed, raws = parsed_cards
+-    extras = _extras(conn, cards, br)
+-    diag_inputs, memo_diag = _diagnostics(conn, cards, by_id, memo["diag"], diagnostic_inputs, br)
++    affected = _affected(conn, cards, pcards, changed)
++    extras = _extras(conn, cards, pcards, affected, br)
++    diag_inputs, memo_diag = _diagnostics(conn, cards, by_id, prev, affected, diagnostic_inputs, br)
+     latest = conn.execute("SELECT COALESCE(MAX(id), 0) AS m FROM task_events").fetchone()["m"]
+     tenants, assignees = _pickers(conn, prev, changed)
+     return {
+diff --git a/plugins/kanban/dashboard/board_read.py b/plugins/kanban/dashboard/board_read.py
+index e7f318e258..04c739017d 100644
+--- a/plugins/kanban/dashboard/board_read.py
++++ b/plugins/kanban/dashboard/board_read.py
+@@ -163,7 +163,7 @@ def _diag_memo(rows, events_by_task, runs_by_task, marks) -> dict:
+                       events_by_task.get(r["id"], ())) for r in rows}
+ 
+ 
+-def _incremental_diag_inputs(conn, diag_rows: list, prev: dict, diagnostic_inputs: Callable) -> tuple:
++def _incremental_diag_inputs(conn, diag_rows: list, prev: dict, diagnostic_inputs: Callable, *, graphs=None) -> tuple:
+     """``(diagnostic inputs, memo)`` re-reading events only for tasks whose row, runs or event
+     count/max id moved. A heartbeat touches one task: its row (``last_heartbeat_at``), its run
+     and one event, so a refresh re-reads that task's events, not the board's ~50k. Runs and the
+@@ -185,7 +185,9 @@ def _incremental_diag_inputs(conn, diag_rows: list, prev: dict, diagnostic_input
+         else:  # vanished between reads: no events held, so never vouch for a mark
+             events[tid] = ()
+             memo[tid] = (tuple(r), _raw(runs[tid]), None, ())
+-    inputs = (tuple(diag_rows), events, runs, kanban_db.task_graph_contexts(conn, ids), _wake_states(conn, ids))
++    if graphs is None:
++        graphs = kanban_db.task_graph_contexts(conn, ids)
++    inputs = (tuple(diag_rows), events, runs, graphs, _wake_states(conn, ids))
+     return inputs, memo
+ 
+ 
+diff --git a/tests/plugins/test_kanban_board_delta.py b/tests/plugins/test_kanban_board_delta.py
+index 52e43c9a15..f0dbc54f09 100644
+--- a/tests/plugins/test_kanban_board_delta.py
++++ b/tests/plugins/test_kanban_board_delta.py
+@@ -331,6 +331,37 @@ def test_out_of_filter_waiter_priority_reorders_displayed_ancestors(conn):
+     assert [t.id for t, _f, _e in board.rows["cards"]] == [parent, rival]
+ 
+ 
++def test_unchanged_and_nondone_changes_retain_done_membership(conn):
++    ids = _seed(conn)
++    board = Board(conn)
++    old = board.full()["_memo"]["inc"]["done_ids"]
++    board.refresh()
++    assert board.rows["_memo"]["inc"]["done_ids"] is old
++    kb.add_comment(conn, ids[4], "me", "unrelated to done history")
++    board.refresh()
++    assert board.rows["_memo"]["inc"]["done_ids"] is old
++    _same(board)
++
++
++def test_rollups_and_graphs_only_refresh_changed_neighbours(conn, monkeypatch):
++    ids = _seed(conn)
++    board = Board(conn)
++    board.full()
++    from plugins.kanban.dashboard import board_incremental as inc
++    real = kb.task_graph_contexts
++    calls = []
++    monkeypatch.setattr(kb, "task_graph_contexts", lambda c, tids: calls.append(set(tids)) or real(c, tids))
++    with mock.patch.object(inc, "_rollups", wraps=getattr(inc, "_rollups", None), create=True) as rollups:
++        board.refresh()
++        assert not calls and not rollups.called
++        conn.execute("UPDATE tasks SET title='renamed child' WHERE id=?", (ids[1],))
++        conn.commit()
++        board.refresh()
++        assert set().union(*calls) == {ids[0], ids[1]}
++        assert set(rollups.call_args.args[1]) == {ids[0], ids[1]}
++    _same(board)
++
++
+ def test_a_delta_chain_stays_exact(conn):
+     ids = _seed(conn)
+     board = Board(conn)
+diff --git a/tests/plugins/test_kanban_board_read_cache.py b/tests/plugins/test_kanban_board_read_cache.py
+index 230c47cb19..91c37a7753 100644
+--- a/tests/plugins/test_kanban_board_read_cache.py
++++ b/tests/plugins/test_kanban_board_read_cache.py
+@@ -1,8 +1,7 @@
+-"""Kanban dashboard plugin: GET /board reuses its last snapshot.
++"""GET /board projects exact next-GET state over retained, incremental SQL rows.
+ 
+-Desktop polls the board continuously. An unchanged board is read once. A write
+-is visible once the off-request refresh finishes; a poll that arrives while that
+-refresh is still running gets the previous snapshot instead of waiting it out.
++Desktop polls must see committed writes, heartbeats and clock changes immediately,
++without repeating a full board materialization on every poll.
+ """
+ 
+ from __future__ import annotations
+@@ -58,95 +57,121 @@ def _create(title: str) -> None:
+         conn.close()
+ 
+ 
+-def test_unchanged_board_is_read_once_and_a_write_is_seen(board, monkeypatch):
+-    from plugins.kanban.dashboard.board_snapshot import MIN_REFRESH_S, join_refresh
++def _full_reads(monkeypatch):
++    reads = []
++    real = kb.list_tasks
++    monkeypatch.setattr(kb, "list_tasks", lambda *a, **k: reads.append(1) or real(*a, **k))
++    return reads
++
+ 
+-    mod, client, reads = board
++def test_unchanged_board_materializes_once_and_write_is_seen_on_next_get(board, monkeypatch):
++    mod, client, _reads = board
++    sql_reads = _full_reads(monkeypatch)
+     monkeypatch.setattr(mod.time, "monotonic", lambda: 1000.0)
+     _create("first")
+     one = client.get("/api/plugins/kanban/board").json()
+     two = client.get("/api/plugins/kanban/board").json()
+-    assert len(reads) == 1 and _titles(one) == _titles(two) == {"first"}
++    assert _titles(one) == _titles(two) == {"first"}
+     assert two["now"] >= one["now"]
+     _create("second")
+-    clock = {"t": 1000.0 + MIN_REFRESH_S + 1}
+-    monkeypatch.setattr(mod.time, "monotonic", lambda: clock["t"])
+     three = client.get("/api/plugins/kanban/board").json()
+-    assert _titles(three) == {"first"}
+-    join_refresh()
+-    four = client.get("/api/plugins/kanban/board").json()
+-    assert len(reads) == 2 and _titles(four) == {"first", "second"}
+-
+-
+-def test_query_params_are_cached_separately(board):
+-    _mod, client, reads = board
+-    client.get("/api/plugins/kanban/board")
+-    client.get("/api/plugins/kanban/board?include_archived=true")
+-    assert len(reads) == 2
++    assert _titles(three) == {"first", "second"}
++    assert _titles(client.get("/api/plugins/kanban/board").json()) == {"first", "second"}
++    assert len(sql_reads) == 1
+ 
+ 
+-def test_cache_expires_after_ttl(board, monkeypatch):
+-    from plugins.kanban.dashboard.board_snapshot import CACHE_TTL_S, join_refresh
++def test_query_params_are_cached_separately(board, monkeypatch):
++    _mod, client, _reads = board
++    sql_reads = _full_reads(monkeypatch)
++    conn = kbc.connect()
++    try:
++        tid = kb.create_task(conn, title="archived", assignee="worker")
++        conn.execute("UPDATE tasks SET status = 'archived' WHERE id = ?", (tid,))
++        conn.commit()
++    finally:
++        conn.close()
++    _create("live")
++    assert _titles(client.get("/api/plugins/kanban/board").json()) == {"live"}
++    assert _titles(client.get("/api/plugins/kanban/board?include_archived=true").json()) == {"live", "archived"}
++    assert _titles(client.get("/api/plugins/kanban/board").json()) == {"live"}
++    assert len(sql_reads) == 2
+ 
+-    mod, client, reads = board
+-    clock = {"t": 1000.0}
+-    monkeypatch.setattr(mod.time, "monotonic", lambda: clock["t"])
+-    client.get("/api/plugins/kanban/board")
+-    clock["t"] += CACHE_TTL_S - 1
+-    client.get("/api/plugins/kanban/board")
+-    assert len(reads) == 1
+-    clock["t"] += 2
+-    client.get("/api/plugins/kanban/board")
+-    join_refresh()
+-    assert len(reads) == 2
+ 
++def test_clock_changes_are_projected_on_next_get_without_ttl_wait(board, monkeypatch):
++    mod, client, _reads = board
++    sql_reads = _full_reads(monkeypatch)
++    monkeypatch.setattr(mod.time, "monotonic", lambda: 1000.0)
++    clock = {"t": float(int(mod.time.time()))}
++    monkeypatch.setattr(mod.time, "time", lambda: clock["t"])
++    _create("first")
++    one = client.get("/api/plugins/kanban/board").json()
++    clock["t"] += 1
++    two = client.get("/api/plugins/kanban/board").json()
++    first = next(t for c in one["columns"] for t in c["tasks"])
++    later = next(t for c in two["columns"] for t in c["tasks"])
++    assert later["age"]["created_age_seconds"] == first["age"]["created_age_seconds"] + 1
++    assert two["now"] > one["now"]
++    assert len(sql_reads) == 1
+ 
+-def test_poll_returns_last_snapshot_while_refresh_is_blocked(board, monkeypatch):
+-    from plugins.kanban.dashboard.board_snapshot import MIN_REFRESH_S, join_refresh
+ 
++def test_poll_waits_for_exact_read_instead_of_serving_stale_snapshot(board, monkeypatch):
+     mod, client, _reads = board
+-    clock = {"t": 1000.0}
+-    monkeypatch.setattr(mod.time, "monotonic", lambda: clock["t"])
+     _create("first")
+     client.get("/api/plugins/kanban/board")
+-    clock["t"] += MIN_REFRESH_S + 1
+-    started = threading.Event()
+-    release = threading.Event()
++    started, release = threading.Event(), threading.Event()
+     real = mod._get_board_uncached
+ 
+     def blocked(*args):
+         started.set()
+-        release.wait(10)
++        assert release.wait(10), "test did not release exact board read"
+         return real(*args)
+ 
+     monkeypatch.setattr(mod, "_get_board_uncached", blocked)
+     _create("second")
+-    body = client.get("/api/plugins/kanban/board").json()
+-    assert _titles(body) == {"first"}
+-    assert started.wait(2)
+-    release.set()
+-    join_refresh()
+-    assert _titles(client.get("/api/plugins/kanban/board").json()) == {"first", "second"}
+-
++    got = {}
++    poll = threading.Thread(target=lambda: got.update(client.get("/api/plugins/kanban/board").json()))
++    poll.start()
++    try:
++        assert started.wait(5)
++        assert poll.is_alive()
++        assert got == {}
++    finally:
++        release.set()
++        poll.join(10)
++    assert not poll.is_alive()
++    assert _titles(got) == {"first", "second"}
+ 
+-def test_busy_board_is_not_reread_more_often_than_min_refresh(board, monkeypatch):
+-    """Every kanban commit moves the db signature; a poll must not turn each into a ~1.3s read."""
+-    from plugins.kanban.dashboard.board_snapshot import MIN_REFRESH_S, join_refresh
+ 
+-    mod, client, reads = board
+-    clock = {"t": 1000.0}
+-    monkeypatch.setattr(mod.time, "monotonic", lambda: clock["t"])
+-    client.get("/api/plugins/kanban/board")
+-    for i in range(5):
++def test_busy_board_sees_every_write_without_full_rematerialization(board, monkeypatch):
++    mod, client, _reads = board
++    sql_reads = _full_reads(monkeypatch)
++    monkeypatch.setattr(mod.time, "monotonic", lambda: 1000.0)
++    _create("busy0")
++    assert _titles(client.get("/api/plugins/kanban/board").json()) == {"busy0"}
++    for i in range(1, 6):
+         _create(f"busy{i}")
+-        clock["t"] += 2
+-        client.get("/api/plugins/kanban/board")
+-        join_refresh()
+-    assert len(reads) == 1
+-    clock["t"] += MIN_REFRESH_S
+-    client.get("/api/plugins/kanban/board")
+-    join_refresh()
+-    assert len(reads) == 2
++        assert _titles(client.get("/api/plugins/kanban/board").json()) == {f"busy{j}" for j in range(i + 1)}
++    assert len(sql_reads) == 1
++
++
++def test_heartbeat_is_visible_on_next_get_without_refresh_wait(board, monkeypatch):
++    mod, client, _reads = board
++    sql_reads = _full_reads(monkeypatch)
++    monkeypatch.setattr(mod.time, "monotonic", lambda: 1000.0)
++    _create("heartbeat")
++    one = client.get("/api/plugins/kanban/board").json()
++    card = next(t for c in one["columns"] for t in c["tasks"])
++    assert card["last_heartbeat_at"] is None
++    conn = kbc.connect()
++    try:
++        conn.execute("UPDATE tasks SET last_heartbeat_at = 1234567 WHERE id = ?", (card["id"],))
++        conn.commit()
++    finally:
++        conn.close()
++    two = client.get("/api/plugins/kanban/board").json()
++    later = next(t for c in two["columns"] for t in c["tasks"])
++    assert later["last_heartbeat_at"] == 1234567
++    assert len(sql_reads) == 1
+ 
+ 
+ from plugins.kanban.dashboard.board_prewarm import prewarm_boards as _prewarm, start_board_prewarm
+@@ -188,38 +213,48 @@ def test_cold_read_computes_diagnostics_only_for_cards_in_the_payload(board, mon
+ 
+ def test_first_read_runs_once_when_prewarm_and_poll_overlap(board, monkeypatch):
+     """The boot prewarm owns the cold read; the Desktop's first poll joins it instead of repeating it."""
+-    mod, client, reads = board
++    mod, client, _reads = board
+     _create("first")
+     started, release = threading.Event(), threading.Event()
+-    real = mod._get_board_uncached
++    sql_reads = []
++    real = kb.list_tasks
+ 
+-    def slow(*args):
++    def slow(*args, **kwargs):
++        sql_reads.append(1)
+         started.set()
+-        release.wait(10)
+-        return real(*args)
++        assert release.wait(10), "test did not release prewarm materialization"
++        return real(*args, **kwargs)
+ 
+-    monkeypatch.setattr(mod, "_get_board_uncached", slow)
++    monkeypatch.setattr(kb, "list_tasks", slow)
+     warm = threading.Thread(target=lambda: _prewarm(mod))
+-    warm.start()
+-    assert started.wait(5)
+     got = {}
+     poll = threading.Thread(target=lambda: got.update(client.get("/api/plugins/kanban/board").json()))
+-    poll.start()
+-    poll.join(0.5)
+-    assert poll.is_alive()  # waiting on the warm read, not reading
+-    release.set()
+-    warm.join(10)
+-    poll.join(10)
+-    assert len(reads) == 1 and _titles(got) == {"first"}
++    warm.start()
++    try:
++        assert started.wait(5)
++        poll.start()
++        poll.join(0.5)
++        assert poll.is_alive()  # waiting on the warm rows, not materializing again
++    finally:
++        release.set()
++        warm.join(10)
++        if poll.ident is not None:
++            poll.join(10)
++    assert not warm.is_alive() and not poll.is_alive()
++    assert len(sql_reads) == 1 and _titles(got) == {"first"}
+ 
+ 
+-def test_prewarm_makes_the_first_poll_a_snapshot_hit(board):
+-    mod, client, reads = board
++def test_prewarm_makes_the_first_poll_reuse_materialized_rows(board, monkeypatch):
++    mod, client, _reads = board
++    sql_reads = _full_reads(monkeypatch)
+     _create("first")
+     _prewarm(mod)
+-    assert len(reads) == 1
++    assert len(sql_reads) == 1
+     assert _titles(client.get("/api/plugins/kanban/board").json()) == {"first"}
+-    assert len(reads) == 1
++    assert len(sql_reads) == 1
++    _create("second")
++    assert _titles(client.get("/api/plugins/kanban/board").json()) == {"first", "second"}
++    assert len(sql_reads) == 1
+ 
+ 
+ def test_prewarm_thread_is_skipped_under_test_isolation(board, monkeypatch):
+diff --git a/tests/plugins/test_kanban_board_rows_cache.py b/tests/plugins/test_kanban_board_rows_cache.py
+index 4c9ecfef5b..c0354ae566 100644
+--- a/tests/plugins/test_kanban_board_rows_cache.py
++++ b/tests/plugins/test_kanban_board_rows_cache.py
+@@ -1,10 +1,8 @@
+ """GET /board keeps its SQL rows while the database is unchanged.
+ 
+-The board snapshot re-reads an unchanged board every CACHE_TTL_S so clock-driven
+-diagnostics, ages, config and profiles stay current. Only that projection has to run
+-again: the materialized rows (the bulk of the read) are reused until a retained read-only
+-observer's ``PRAGMA data_version`` moves, which any commit by another connection does,
+-bookkeeping-only writes included.
++Every GET reprojects clock-driven diagnostics, ages, config and profiles. Retained
++rows avoid full materialization: commits patch changed rows incrementally, including
++bookkeeping-only writes observed through ``PRAGMA data_version``.
+ """
+ 
+ from __future__ import annotations
+@@ -115,7 +113,7 @@ def test_unchanged_board_materializes_rows_once(env, monkeypatch):
+     assert all(_strip_now(b) == _strip_now(bodies[0]) for b in bodies[1:])
+ 
+ 
+-def test_local_commit_is_read_on_the_next_refresh(env):
++def test_local_commit_is_read_on_the_next_read_without_full_materialization(env):
+     mod, sql_reads, _home = env
+     _create("first")
+     _read(mod)
+@@ -123,12 +121,12 @@ def test_local_commit_is_read_on_the_next_refresh(env):
+     second = _create("second")
+     body = _read(mod)
+     assert second in _cards(body)
+-    assert len(sql_reads) == 2
++    assert len(sql_reads) == 1
+     _read(mod)
+-    assert len(sql_reads) == 2
++    assert len(sql_reads) == 1
+ 
+ 
+-def test_external_process_commit_is_read_on_the_next_refresh(env):
++def test_external_process_commit_is_read_on_the_next_read_without_full_materialization(env):
+     mod, sql_reads, _home = env
+     tid = _create("before")
+     _read(mod)
+@@ -137,20 +135,22 @@ def test_external_process_commit_is_read_on_the_next_refresh(env):
+     subprocess.run([sys.executable, "-c", code, str(kb.kanban_db_path()), tid], check=True)
+     body = _read(mod)
+     assert _cards(body)[tid]["title"] == "after"
+-    assert len(sql_reads) == 2
++    assert len(sql_reads) == 1
+ 
+ 
+-def test_heartbeat_only_write_is_read_on_the_next_refresh(env):
++def test_heartbeat_only_write_is_read_on_the_next_read_without_full_materialization(env):
+     """Bookkeeping columns (excluded from the activity revision) are in the payload."""
+     mod, sql_reads, _home = env
+     tid = _create("hb")
+     assert _cards(_read(mod))[tid]["last_heartbeat_at"] is None
+     _raw("UPDATE tasks SET last_heartbeat_at = 1234567 WHERE id = ?", (tid,))
+     assert _cards(_read(mod))[tid]["last_heartbeat_at"] == 1234567
+-    assert len(sql_reads) == 2
++    assert len(sql_reads) == 1
++
+ 
++def test_wake_check_only_write_is_read_on_the_next_read_without_full_materialization(env, monkeypatch):
++    from plugins.kanban.dashboard import board_read
+ 
+-def test_wake_check_only_write_is_read_on_the_next_refresh(env):
+     mod, sql_reads, _home = env
+     tid = _create("parked")
+     _read(mod)
+@@ -158,8 +158,12 @@ def test_wake_check_only_write_is_read_on_the_next_refresh(env):
+     assert len(sql_reads) == 1
+     _raw("INSERT INTO task_wake_checks (task_id, cmd, every, next_at, fails, generation) "
+          "VALUES (?, 'true', 60, 1, 0, 'g')", (tid,))
++    seen = []
++    real = board_read._wake_states
++    monkeypatch.setattr(board_read, "_wake_states", lambda *a: seen.append(real(*a)) or seen[-1])
+     _read(mod)
+-    assert len(sql_reads) == 2
++    assert len(seen) == 1 and tid in seen[0]
++    assert len(sql_reads) == 1
+ 
+ 
+ def test_commit_during_the_row_read_is_read_again(env, monkeypatch):
+@@ -379,10 +383,8 @@ def test_observer_never_writes_or_holds_a_snapshot(env):
+     assert busy == 0
+ 
+ 
+-def test_snapshot_refresh_cadence_reprojects_unchanged_board(env, monkeypatch):
+-    """Through GET /board: the TTL refresh re-runs only the projection."""
+-    from plugins.kanban.dashboard.board_snapshot import CACHE_TTL_S, join_refresh
+-
++def test_each_get_reprojects_unchanged_board_without_sql(env, monkeypatch):
++    """Through GET /board: age changes appear without waiting for a snapshot TTL."""
+     mod, sql_reads, _home = env
+     app = FastAPI()
+     app.include_router(mod.router, prefix="/api/plugins/kanban")
+@@ -394,9 +396,6 @@ def test_snapshot_refresh_cadence_reprojects_unchanged_board(env, monkeypatch):
+     monkeypatch.setattr(time, "time", lambda: wall["t"])
+     one = _cards(client.get("/api/plugins/kanban/board").json())[tid]["age"]["created_age_seconds"]
+     wall["t"] += 600
+-    mono["t"] += CACHE_TTL_S + 1
+-    client.get("/api/plugins/kanban/board")  # stale snapshot served, refresh scheduled
+-    join_refresh()
+     two = _cards(client.get("/api/plugins/kanban/board").json())[tid]["age"]["created_age_seconds"]
+     assert two == one + 600
+     assert len(sql_reads) == 1
+diff --git a/tests/plugins/test_kanban_cold_start_reads.py b/tests/plugins/test_kanban_cold_start_reads.py
+index f0c06925f1..a338eff025 100644
+--- a/tests/plugins/test_kanban_cold_start_reads.py
++++ b/tests/plugins/test_kanban_cold_start_reads.py
+@@ -6,7 +6,7 @@ import pytest
+ 
+ from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
+ from plugins.kanban.dashboard.board_prewarm import prewarm_boards
+-from tests.plugins.test_kanban_board_read_cache import _create, _titles
++from tests.plugins.test_kanban_board_read_cache import _create, _full_reads, _titles
+ 
+ pytest_plugins = ["tests.plugins.test_kanban_board_read_cache"]
+ 
+@@ -50,8 +50,9 @@ def test_counts_accept_legacy_status_only_schema_and_do_not_create(board, tmp_pa
+     assert not missing.exists()
+ 
+ 
+-def test_prewarm_covers_blocked_board_poll_without_warming_every_board(board):
++def test_prewarm_covers_blocked_board_poll_without_warming_every_board(board, monkeypatch):
+     mod, client, reads = board
++    sql_reads = _full_reads(monkeypatch)
+     _create("default")
+     for slug in ("waiting", "quiet"):
+         kb.create_board(slug)
+@@ -61,9 +62,9 @@ def test_prewarm_covers_blocked_board_poll_without_warming_every_board(board):
+                 conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (tid,))
+     prewarm_boards(mod)
+     assert {args[2] for args in reads} == {"default", "waiting"}
+-    before = len(reads)
++    assert len(sql_reads) == 2
+     assert _titles(client.get("/api/plugins/kanban/board?board=waiting").json()) == {"waiting"}
+-    assert len(reads) == before
++    assert len(sql_reads) == 2
+ 
+ 
+ def test_failed_prewarm_is_observable(board, monkeypatch, caplog):
+@@ -101,7 +102,8 @@ def test_counts_connection_is_query_only_and_closed(board, monkeypatch):
+ 
+ 
+ def test_discovery_failure_preserves_default_warmup(board, monkeypatch, caplog):
+-    mod, client, reads = board
++    mod, client, _reads = board
++    sql_reads = _full_reads(monkeypatch)
+     _create("default")
+ 
+     def fail(*args, **kwargs):
+@@ -112,4 +114,4 @@ def test_discovery_failure_preserves_default_warmup(board, monkeypatch, caplog):
+         prewarm_boards(mod)
+     assert "kanban board prewarm discovery failed" in caplog.text
+     assert _titles(client.get("/api/plugins/kanban/board").json()) == {"default"}
+-    assert len(reads) == 1
++    assert len(sql_reads) == 1
+-- 
+2.43.0
+

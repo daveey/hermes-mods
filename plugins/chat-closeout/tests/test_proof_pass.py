@@ -80,12 +80,13 @@ def test_the_waiting_source_runs_its_pass_inside_one_proof_pass(world, tmp_path,
     led = core.Ledger(tmp_path / 'ledger.db')
     seen = []
 
-    def pending(ledger, read, proof=None):
+    def pending(ledger, read, proof=None, **_incremental):
         seen.append(plugin._pass_local.res is not None)
         return {sid: [tid] for sid, tid in PROOFS if proof(sid, tid, {'completed_at': 100})}
 
     monkeypatch.setattr(plugin, 'ledger', lambda: led)
     monkeypatch.setattr(core, 'pending_closeouts', pending)
+    monkeypatch.setattr(plugin, 'hub_db_path', lambda: None)  # no replica: only the state.db is opened
     monkeypatch.delenv('CHAT_CLOSEOUT_OFF', raising=False)
     monkeypatch.delitem(plugin._state, 'waiting_cache', raising=False)
     assert plugin.waiting_source() == {'root': ['t_acked']}

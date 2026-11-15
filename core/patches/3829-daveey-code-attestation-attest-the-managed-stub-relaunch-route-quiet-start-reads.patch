@@ -1,0 +1,1091 @@
+From 93a2c11ee815e6e429637aa5de14d296dcce7c05 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 19:29:13 +0000
+Subject: [PATCH] [daveey] code attestation: attest the managed-stub relaunch
+ route; quiet start reads the code ledger; quiet-hold --check
+
+The MacBook gateway always runs as the child `venv_sync.relaunch_command` builds
+(`python -I -I -c "<relaunch prefix> exec('<managed stub>')"`). `_detect_route` refused it
+outright (`relaunched-launch`), so the <=10% idle proof could neither pass nor fail there.
+
+New route `managed-stub-relaunch` (reported under that name), same invariant as the direct
+route: every byte of Python that runs before the audit hook is identified byte-exact and
+nothing the process says about itself (flags, env, sys.orig_argv) is evidence on its own.
+- Accept only `sys.orig_argv == [exe, "-I" x>=1 (nothing else), "-c", src]` with
+  `src == relaunch_prefix(core_root, sys.argv) + "exec(" + repr(script) + ")"` byte for byte.
+  The prefix text now lives once in stdlib-only `_launch_template.relaunch_prefix`, used by
+  both `venv_sync.relaunch_command` and attestation (attestation never imports venv_sync).
+- `script` is recovered with `ast.literal_eval` and passes the unchanged managed-stub checks
+  (pin marker, reviewed head digest set, byte-exact tail, root).
+- Frame chain (verified in a real subprocess): install <- hermes_bootstrap <module> <-
+  importlib frames only (the prefix's spec.loader.exec_module) <- the outermost __main__
+  <string> frame, whose code must be `_same` as compile(src), at its single line.
+- After the hook, the prefix's one exec() of exactly compile(script), from exactly that
+  proven frame, is attributed to the trusted launcher (one-shot); any other string exec is
+  observed as before (`unrooted-exec`), a different code object latches
+  `relaunch-exec-mismatch`.
+- Pre-hook prefix imports (runpy, importlib.util, pathlib): a finite seed for this route
+  only, each required to be an installed-stdlib source file and reported with its digest.
+  The direct route's seed is unchanged.
+- HERMES_LAUNCH_CURRENT_HANDOFF trace: `venv_sync.exec_launch` sets it for the exec'd child;
+  the child's bootstrap installs attestation (hermes_bootstrap `_install_code_attestation`)
+  BEFORE `prepare_launch` -> `_take_handoff` pops it, so a POSIX relaunch always installs with
+  it set. It carries a currency verdict (`<verdict>:<pid>:<root>`), never code, so the
+  relaunch route accepts it and reports `launch_handoff_env`; the direct route still refuses
+  it (`relaunched-launch`).
+- Still refused, each by a real-subprocess test: run_module body, run_path body, any other
+  interpreter option, argv mismatch, a prefix differing in any byte, extra statements, a
+  non-canonical exec literal, a tampered embedded script, a different root, and a process
+  that rewrites sys.orig_argv to the genuine relaunch (frame-code).
+
+`test_relaunch_prefix_script_refuses` changes meaning: it pinned the blanket refusal of this
+exact launch. It is replaced by the accept test (through an interpreter path containing a
+space, `-I -I` like the Mac) plus one refusal test per near-miss above
+(tests/hermes_cli/test_code_attestation_relaunch.py).
+
+Gate: before this change nothing in production read the code-attestation ledger into the
+quiet gate (bootstrap installed it; `quiet-observe-start` never consulted it), so even an
+unsupported route did not refuse start. `quiet_control` now captures the bootstrap-installed
+ledger with the registry: start refuses `code_attestation_missing` (coverage pending) and any
+ledger unknown as `unknown:code:<reason>` after a module inventory; snapshots read only the
+latched set (no inventory while the gateway is measured).
+
+Preflight: bookkeeping verb `quiet-observe-check` (never reserved, so the registry epoch does
+not move) and `hermes kanban quiet-hold --check`: one JSON document (registry unknowns, route,
+refusal reasons), exit 0 when start would be admitted apart from the lease, 3 otherwise. It
+takes no lease and writes no cooldown record.
+---
+ gateway/control_dispatch.py                   |   3 +-
+ gateway/quiet_control.py                      |  80 ++++-
+ hermes_cli/_launch_template.py                |  26 ++
+ hermes_cli/code_attestation.py                | 168 ++++++++-
+ hermes_cli/kanban_parser.py                   |   7 +-
+ hermes_cli/kanban_quiet.py                    |  34 ++
+ hermes_cli/venv_sync.py                       |  20 +-
+ tests/gateway/test_quiet_control.py           |  24 +-
+ .../gateway/test_quiet_membership_seeding.py  |   3 +-
+ .../test_code_attestation_relaunch.py         | 327 ++++++++++++++++++
+ .../hermes_cli/test_code_attestation_route.py |  12 +-
+ 11 files changed, 650 insertions(+), 54 deletions(-)
+ create mode 100644 tests/hermes_cli/test_code_attestation_relaunch.py
+
+diff --git a/gateway/control_dispatch.py b/gateway/control_dispatch.py
+index acff271f27..3ea1548f17 100644
+--- a/gateway/control_dispatch.py
++++ b/gateway/control_dispatch.py
+@@ -7,7 +7,8 @@ import json
+ from typing import Callable
+ 
+ 
+-QUIET_BOOKKEEPING_VERBS = ('quiet-observe-start', 'quiet-observe-snapshot', 'quiet-observe-end')
++QUIET_BOOKKEEPING_VERBS = ('quiet-observe-start', 'quiet-observe-snapshot', 'quiet-observe-end',
++                           'quiet-observe-check')
+ # Read-only identity/status/list polling: passive, never reserved (and never suppressed).
+ PASSIVE_VERBS = frozenset({
+     'identify', 'status', 'profile', 'resolve-profile', 'session-ticket', 'active-work',
+diff --git a/gateway/quiet_control.py b/gateway/quiet_control.py
+index 468b4646d4..6cbdd5770f 100644
+--- a/gateway/quiet_control.py
++++ b/gateway/quiet_control.py
+@@ -29,7 +29,7 @@ from gateway.control_dispatch import QUIET_BOOKKEEPING_VERBS
+ logger = logging.getLogger(__name__)
+ 
+ SCHEMA = 1
+-START, SNAPSHOT, END = QUIET_BOOKKEEPING_VERBS
++START, SNAPSHOT, END, CHECK = QUIET_BOOKKEEPING_VERBS
+ UPDATE_WINDOW_MAX_AGE_S = 120  # stricter than hermes_cli.kanban_deploy_window.FRESH_SECONDS (1200)
+ # quiet-hold's preflight wants this much freshness left for the observer's spawn + handshake.
+ START_PREFLIGHT_MARGIN_S = 30
+@@ -43,7 +43,7 @@ _FOLLOW_KEYS = {"schema", "episode_id", "observer_token", "expected_gateway", "d
+ 
+ # Process-wide bootstrap capture: ``capture_bootstrap_registry`` runs at the earliest gateway launch
+ # boundary; the runner (and its constructor) read the same instance from here.
+-_boot: dict[str, Any] = {"registry": None, "captured": False}
++_boot: dict[str, Any] = {"registry": None, "captured": False, "code": None}
+ 
+ 
+ # ---- bootstrap binding ---------------------------------------------------------------------
+@@ -61,9 +61,21 @@ def capture_bootstrap_registry():
+     except RuntimeError:
+         registry = None
+     _boot["registry"], _boot["captured"] = registry, True
++    _boot["code"] = _installed_code_ledger()
+     return registry
+ 
+ 
++def _installed_code_ledger():
++    """The bootstrap-installed executed-code ledger (``hermes_cli.code_attestation``), or None.
++
++    Its unknowns (an unsupported launch route included) refuse ``quiet-observe-start``; a missing
++    ledger is pending coverage. Read here, never installed here (a late install has no provenance).
++    """
++    from hermes_cli import code_attestation
++
++    return code_attestation._installed
++
++
+ def bootstrap_registry():
+     return _boot["registry"]
+ 
+@@ -85,6 +97,7 @@ def bind_registry(runner, registry=None) -> None:
+         except RuntimeError:
+             registry = None
+     runner._quiet_registry = registry
++    runner._quiet_code = _boot["code"] if _boot["captured"] else _installed_code_ledger()
+     runner._quiet_bootstrap_provenance = provenance
+     runner._quiet_attested = False
+     runner._quiet_local_unknowns = set()
+@@ -115,6 +128,7 @@ def register_quiet_control(runner, server) -> QuietControl:
+     server.private_handlers[START] = control.start
+     server.private_handlers[SNAPSHOT] = control.snapshot
+     server.private_handlers[END] = control.end
++    server.private_handlers[CHECK] = control.check
+     return control
+ 
+ 
+@@ -271,14 +285,30 @@ class QuietControl:
+                 reasons.append("coverage_unreadable")
+         if registry is not None and not callable(getattr(registry, "membership_generation", None)):
+             reasons.append("membership_unsupported")
++        if getattr(runner, "_quiet_code", None) is None:
++            reasons.append("code_attestation_missing")
+         return reasons
+ 
+-    def _registry_view(self, registry) -> tuple[dict[str, Any], list[str]]:
++    def _code_unknowns(self, *, inventory: bool) -> set[str]:
++        """The executed-code ledger's unknowns as ``code:<reason>``. Snapshots read only the latched
++        set (no module inventory while the gateway is being measured); start and check inventory
++        first. An unreadable ledger is itself an unknown."""
++        ledger = getattr(self._runner, "_quiet_code", None)
++        if ledger is None:
++            return set()
++        try:
++            found = ledger.unknowns() if inventory else ledger.latched_unknowns()
++        except Exception:  # health: allow BLE001 -- an unreadable ledger is unknown, never clean
++            return {"code:unreadable"}
++        return {f"code:{reason}" for reason in found}
++
++    def _registry_view(self, registry, *, inventory: bool = False) -> tuple[dict[str, Any], list[str]]:
+         snap = registry.snapshot()
+         gen = None
+         if callable(getattr(registry, "membership_generation", None)):
+             gen = registry.membership_generation()
+-        unknowns = sorted(set(snap.unknowns) | set(getattr(self._runner, "_quiet_local_unknowns", ())))
++        unknowns = sorted(set(snap.unknowns) | set(getattr(self._runner, "_quiet_local_unknowns", ()))
++                          | self._code_unknowns(inventory=inventory))
+         view = {"activity_epoch": snap.epoch, "active_count": snap.active,
+                 "per_kind": dict(snap.per_kind), "unknowns": unknowns,
+                 "membership_generation": gen,
+@@ -449,14 +479,9 @@ class QuietControl:
+         reasons += self._lease_reasons(params, now)
+         if reasons:
+             return self._refuse(episode_id, "refused", reasons)
+-        view, _ = self._registry_view(registry)
+-        if view["unknowns"]:
+-            return self._refuse(episode_id, "refused", [f"unknown:{u}" for u in view["unknowns"]])
+-        update, update_reasons = self._update_status()
+-        if update_reasons:
+-            return self._refuse(episode_id, "refused", [f"update:{r}" for r in update_reasons])
+-        if update["window_age_s"] is None or update["window_age_s"] > UPDATE_WINDOW_MAX_AGE_S:
+-            return self._refuse(episode_id, "refused", ["update_window_stale"])
++        for reasons in self._state_gates(registry):
++            if reasons:
++                return self._refuse(episode_id, "refused", reasons)
+         now = self._mono()  # deadline re-checked immediately before the episode is armed
+         if now is None or now >= params["deadline_mono_ns"]:
+             return self._refuse(episode_id, "refused", ["deadline_reached"])
+@@ -477,6 +502,37 @@ class QuietControl:
+         result["observer_token"] = token
+         return result
+ 
++    def _state_gates(self, registry):
++        """Start's lease-independent gates after coverage, in start's order (one list each)."""
++        view, _ = self._registry_view(registry, inventory=True)
++        yield [f"unknown:{u}" for u in view["unknowns"]]
++        update, update_reasons = self._update_status()
++        yield [f"update:{r}" for r in update_reasons]
++        stale = update["window_age_s"] is None or update["window_age_s"] > UPDATE_WINDOW_MAX_AGE_S
++        yield ["update_window_stale"] if stale else []
++
++    def check(self, params, peer):
++        """Read-only preflight (``hermes kanban quiet-hold --check``): what ``start`` would refuse
++        apart from the lease and the observer's identity, without arming an episode, reading or
++        taking a lease, or reserving work (a bookkeeping verb: the registry epoch does not move)."""
++        if not isinstance(params, dict) or set(params) != {"schema"} or params["schema"] != SCHEMA:
++            raise ValueError(f"params fields must be exactly: schema (= {SCHEMA})")
++        registry = self._registry()
++        reasons = self._pending(registry)
++        unknowns: list[str] = []
++        if registry is not None:
++            for gate in self._state_gates(registry):
++                reasons += gate
++            unknowns = [r[len("unknown:"):] for r in reasons if r.startswith("unknown:")]
++        ledger = getattr(self._runner, "_quiet_code", None)
++        try:
++            route = ledger.route_report().get("route") if ledger is not None else None
++        except Exception:  # health: allow BLE001 -- an unreadable route is reported as none, never invented
++            route = None
++        return {"schema": SCHEMA, "phase": "check", "admitted": not reasons, "reasons": reasons,
++                "registry_unknowns": unknowns, "route": route,
++                "activity_epoch": registry.snapshot().epoch if registry is not None else None}
++
+     def _follow(self, params, peer, phase):
+         _check_params(params, _FOLLOW_KEYS)
+         return self._authenticate(params, peer)
+diff --git a/hermes_cli/_launch_template.py b/hermes_cli/_launch_template.py
+index 4c0a8c3afd..8efab2d151 100644
+--- a/hermes_cli/_launch_template.py
++++ b/hermes_cli/_launch_template.py
+@@ -189,6 +189,32 @@ def render(root: str, module: str, func: str) -> str:
+     )
+ 
+ 
++def relaunch_prefix(root: str, argv: list[str]) -> str:
++    """The single-line source ``venv_sync.relaunch_command`` puts before the re-entry body.
++
++    One stdlib-only definition shared by the producer (``venv_sync``) and the bootstrap-time
++    attestation, which compares a relaunched child's ``-c`` source to it byte for byte.
++    Selects deps before run_path: ``__setitem__`` returns None, so the ``or`` still execs the
++    module; registering it first keeps a later import from re-entering prepare_launch under a
++    HERMES_HOME the script has not set yet. ``_hermes_relaunched`` marks the child this starts
++    (not processes it spawns) for ``venv_sync._relaunch_target``.
++    """
++    return (
++        f"import sys, runpy; sys.path.insert(0, {root!r}); sys.argv = {argv!r}; "
++        "sys._hermes_relaunched = True; "
++        "import importlib.util as _iu, pathlib as _pl; "
++        f"_bp = _pl.Path({root!r}) / 'hermes_bootstrap.py'; "
++        "_spec = _iu.spec_from_file_location('hermes_bootstrap', _bp) if _bp.is_file() else None; "
++        "_mod = _iu.module_from_spec(_spec) if _spec is not None else None; "
++        "(sys.modules.__setitem__('hermes_bootstrap', _mod) or _spec.loader.exec_module(_mod)) "
++        "if _mod is not None else None; "
++    )
++
++
++# The fixed start of every relaunch source (the root literal follows it).
++RELAUNCH_HEAD = "import sys, runpy; sys.path.insert(0, "
++
++
+ def split_pin_marker(script: str) -> tuple[str, str] | None:
+     """Split at the single pin marker: (head, tail) both excluding the marker, else None."""
+     if script.count(PIN_MARKER) != 1:
+diff --git a/hermes_cli/code_attestation.py b/hermes_cli/code_attestation.py
+index e691537a5b..809cc7531e 100644
+--- a/hermes_cli/code_attestation.py
++++ b/hermes_cli/code_attestation.py
+@@ -39,6 +39,11 @@ SEED_MAIN = {"hermes_cli.main": "hermes_cli/main.py"}
+ SEED = {**SEED_COMMON, **SEED_MAIN}
+ ROUTE_MANAGED_STUB = "managed-stub"
+ ROUTE_CONSOLE = "console-main-first"
++# A ``venv_sync.relaunch_command`` child of the managed stub (the MacBook gateway).
++ROUTE_MANAGED_STUB_RELAUNCH = "managed-stub-relaunch"
++STUB_ROUTES = (ROUTE_MANAGED_STUB, ROUTE_MANAGED_STUB_RELAUNCH)
++# Seed for the relaunch route ONLY: the stdlib modules its prefix imports before the hook.
++RELAUNCH_PREFIX_MODULES = ("runpy", "importlib.util", "pathlib")
+ # Reviewed launcher-head digests (sha256 of the script before the pin marker with the
+ # checkout-root literal replaced by ``@ROOT@``). Anything else => unsupported-stub-head.
+ # Reproduce: split a stub's script at ``sys._hermes_pin_default_home = True\n``, replace
+@@ -363,10 +368,14 @@ def _detect_route(core_root, template, own_file):
+     """Derive the launch route from evidence only: argv, the __main__ frame, template.
+ 
+     Nothing the caller passes (or any ``sys`` flag such as the pin marker) participates.
+-    Returns a dict for the supported managed-stub route; raises ``_Refuse`` otherwise.
++    Returns a dict for a supported managed-stub route; raises ``_Refuse`` otherwise.
+     """
+     orig = list(getattr(sys, "orig_argv", ()))
+     argv = list(sys.argv)
++    if _relaunch_shaped(orig, template):
++        # A ``venv_sync.relaunch_command`` child: its own route, proven byte-exact below.
++        # The routing test reads argv bytes only; everything it admits is re-proven in full.
++        return _detect_relaunch_route(core_root, template, own_file, orig, argv)
+     if getattr(sys, "_hermes_relaunched", False) or LAUNCH_HANDOFF_ENV in os.environ:
+         raise _Refuse("relaunched-launch")
+     if len(orig) < 4 or orig[1:3] != ["-I", "-c"]:
+@@ -381,6 +390,19 @@ def _detect_route(core_root, template, own_file):
+     script = orig[3]
+     if argv[:1] != ["-c"] or argv[1:] != orig[4:]:
+         raise _Refuse("unsupported-route:argv-mismatch")
++    head, tail, head_digest, current_digest = _check_stub_script(core_root, template, script, argv)
++    if "hermes_cli.main" in sys.modules:
++        raise _Refuse("unexpected-prehook:hermes_cli.main")
++    frame = _verify_frame_chain(core_root, own_file, script, head)
++    return {"route": ROUTE_MANAGED_STUB, "stub_head_digest": head_digest,
++            "head_sha256": head_digest, "tail_sha256": _sha(tail.encode()),
++            "script_sha256": _sha(script.encode()), "launcher_argv0": orig[0],
++            "current_template_head_digest": current_digest, "code": frame.f_code}
++
++
++def _check_stub_script(core_root, template, script, argv):
++    """The managed stub script's identity, shared unchanged by both stub routes: argv
++    refusals, pin marker, byte-exact tail, root literal, reviewed head digest."""
+     if argv[1:2] == ["--run-module"]:
+         raise _Refuse("unsupported-route:run-module")
+     if argv[1:2] == ["--print-runtime-command"]:
+@@ -402,19 +424,91 @@ def _detect_route(core_root, template, own_file):
+     head_digest = _sha(template.normalized_head(head, root).encode())
+     if head_digest not in STUB_HEAD_DIGESTS | {current_digest}:
+         raise _Refuse("unsupported-stub-head")
++    return head, tail, head_digest, current_digest
++
++
++def _relaunch_shaped(orig, template):
++    """Routing only: the source after the first ``-c`` starts with the relaunch head."""
++    if "-c" not in orig[1:]:
++        return False
++    index = orig.index("-c", 1)
++    source = orig[index + 1] if index + 1 < len(orig) else None
++    return isinstance(source, str) and source.startswith(template.RELAUNCH_HEAD)
++
++
++def _detect_relaunch_route(core_root, template, own_file, orig, argv):
++    """Route ``managed-stub-relaunch``: ``orig_argv == [exe, "-I" (one or more, nothing else),
++    "-c", src]`` with ``src == relaunch_prefix(core_root, sys.argv) + "exec(" + repr(script) + ")"``
++    byte for byte, and ``script`` passing the unchanged managed-stub checks. Flags and env are
++    never evidence; ``_hermes_relaunched`` is set by these very bytes."""
++    index = orig.index("-c", 1)
++    options = orig[1:index]
++    if not options or any(option != "-I" for option in options):
++        raise _Refuse("unsupported-route:relaunch-options")
++    if len(orig) != index + 2 or argv[:1] != ["-c"]:
++        raise _Refuse("unsupported-route:relaunch-argv")
++    source = orig[index + 1]
++    if len(source) > MAX_SOURCE:
++        raise _Refuse("unsupported-route:relaunch-source")
++    # Byte-exact: the prefix for (core_root, sys.argv), then exactly the canonical exec body.
++    prefix = template.relaunch_prefix(str(core_root), argv)
++    if not source.startswith(prefix):
++        raise _Refuse("unsupported-route:relaunch-source")
++    script = _relaunch_embedded_script(source[len(prefix):])
++    if source != prefix + "exec(" + repr(script) + ")":
++        raise _Refuse("unsupported-route:relaunch-source")
++    _, tail, head_digest, current_digest = _check_stub_script(core_root, template, script, argv)
+     if "hermes_cli.main" in sys.modules:
+         raise _Refuse("unexpected-prehook:hermes_cli.main")
+-    frame = _verify_frame_chain(core_root, own_file, script, head)
+-    return {"route": ROUTE_MANAGED_STUB, "stub_head_digest": head_digest,
++    prefix_modules = _relaunch_prefix_modules()
++    frame = _verify_relaunch_frames(core_root, own_file, source)
++    return {"route": ROUTE_MANAGED_STUB_RELAUNCH, "stub_head_digest": head_digest,
+             "head_sha256": head_digest, "tail_sha256": _sha(tail.encode()),
+             "script_sha256": _sha(script.encode()), "launcher_argv0": orig[0],
+-            "current_template_head_digest": current_digest, "code": frame.f_code}
++            "current_template_head_digest": current_digest, "code": frame.f_code,
++            "relaunch_source_sha256": _sha(source.encode()), "relaunch_options": len(options),
++            "prefix_modules": prefix_modules, "script_code": _compile(script, "<string>"),
++            # Data, not evidence (traced): venv_sync.exec_launch sets it for the exec'd child
++            # and prepare_launch pops it after this install, so a POSIX relaunch has it here.
++            "launch_handoff_env": LAUNCH_HANDOFF_ENV in os.environ}
++
++
++def _relaunch_embedded_script(body):
++    """The literal inside ``exec(...)``, recovered by ``ast.literal_eval`` (never evaluated)."""
++    if not (body.startswith("exec(") and body.endswith(")")):
++        raise _Refuse("unsupported-route:relaunch-body")
++    try:
++        script = ast.literal_eval(body[len("exec("):-1])
++    except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
++        raise _Refuse("unsupported-route:relaunch-body") from None
++    if not isinstance(script, str):
++        raise _Refuse("unsupported-route:relaunch-body")
++    return script
++
++
++def _relaunch_prefix_modules():
++    """Finite seed for this route only: the stdlib modules the relaunch prefix imports before
++    the hook must be installed-stdlib source files; each is reported with its content digest."""
++    stdlib = Path(sysconfig.get_path("stdlib")).resolve()
++    found = []
++    for name in RELAUNCH_PREFIX_MODULES:
++        filename = getattr(sys.modules.get(name), "__file__", None)
++        path = Path(filename).resolve() if filename else None
++        if (path is None or not path.is_relative_to(stdlib) or path.suffix != ".py"
++                or "site-packages" in path.parts or "dist-packages" in path.parts):
++            raise _Refuse("unsupported-route:relaunch-prefix-module:" + name)
++        try:
++            digest = _sha(_read_bounded(path, MAX_SOURCE))
++        except (OSError, ValueError):
++            raise _Refuse("unsupported-route:relaunch-prefix-module:" + name) from None
++        found.append({"module": name, "path": str(path), "sha256": digest,
++                      "kind": "relaunch_prefix_stdlib"})
++    return found
+ 
+ 
+-def _verify_frame_chain(core_root, own_file, script, head):
+-    """Return the outermost ``<string>`` frame proven to be ``script``; raise ``_Refuse`` otherwise."""
+-    # Frame chain: install <- (one bootstrap helper) <- hermes_bootstrap module frame <-
+-    # importlib frames only <- the outermost ``<string>`` frame that is this script.
++def _outer_launch_frame(core_root, own_file):
++    """install <- (one bootstrap helper) <- hermes_bootstrap module frame <- importlib frames
++    only <- the outermost ``__main__`` ``<string>`` frame, which is returned."""
+     frame = _caller_frames(own_file)
+     boot_file = str(core_root / "hermes_bootstrap.py")
+     if (frame is not None and frame.f_code.co_name == "_install_code_attestation"
+@@ -432,6 +526,12 @@ def _verify_frame_chain(core_root, own_file, script, head):
+     if (frame is None or frame.f_back is not None or frame.f_code.co_filename != "<string>"
+             or frame.f_code.co_name != "<module>" or frame.f_globals.get("__name__") != "__main__"):
+         raise _Refuse("unsupported-route:frame-chain")
++    return frame
++
++
++def _verify_frame_chain(core_root, own_file, script, head):
++    """Return the outermost ``<string>`` frame proven to be ``script``; raise ``_Refuse`` otherwise."""
++    frame = _outer_launch_frame(core_root, own_file)
+     if not _same(frame.f_code, _compile(script, "<string>")):
+         raise _Refuse("unsupported-route:frame-code")
+     marker_line = head.count("\n") + 1  # the pin marker line; try: and import follow
+@@ -442,6 +542,17 @@ def _verify_frame_chain(core_root, own_file, script, head):
+     return frame
+ 
+ 
++def _verify_relaunch_frames(core_root, own_file, source):
++    """Relaunch: the prefix ran the bootstrap through ``spec.loader.exec_module``, so the outermost
++    frame must be exactly ``compile(source)`` at its single line."""
++    frame = _outer_launch_frame(core_root, own_file)
++    if not _same(frame.f_code, _compile(source, "<string>")):
++        raise _Refuse("unsupported-route:frame-code")
++    if "\n" in source or "\r" in source or frame.f_lineno != 1:
++        raise _Refuse("unsupported-route:frame-line")
++    return frame
++
++
+ _INSTALL_KEY = object()  # private: only install() constructs a route-deriving Attestation
+ 
+ 
+@@ -454,6 +565,7 @@ class Attestation:
+         self.route = None
+         self.stub_head_digest = None
+         self._launcher = None
++        self._launcher_exec = None  # relaunch: (prefix frame code, embedded script code), one-shot
+         self._refused = False
+         self._pid = os.getpid()
+         self._lock = threading.RLock()
+@@ -518,6 +630,15 @@ class Attestation:
+                 "script_sha256": route["script_sha256"],
+                 "orig_argv0": route["launcher_argv0"],
+                 "interpreter_binary_sha256": self.interpreter_identity["binary_sha256"]}
++            if route["route"] == ROUTE_MANAGED_STUB_RELAUNCH:
++                self._launcher.update(
++                    relaunch_source_sha256=route["relaunch_source_sha256"],
++                    relaunch_options=route["relaunch_options"],
++                    launch_handoff_env=route["launch_handoff_env"])
++                # The prefix later exec()s the embedded script: exactly that code object, from
++                # exactly the proven prefix frame, is the trusted launcher (_launcher_event).
++                self._launcher_exec = (route["code"], route["script_code"])
++                self._seed.extend(route["prefix_modules"])
+             self._seed.append(dict(self._launcher))
+         # Reviewed stdlib generator descriptors must exist before the hook sees the
+         # first post-hook namedtuple/dataclass generation (e.g. concurrent.futures).
+@@ -818,6 +939,20 @@ class Attestation:
+                      interpreter_sha256=descriptor.distribution.get("binary_sha256"))
+         return True
+ 
++    def _launcher_event(self, code, frame):
++        """Relaunch route: the one ``exec`` the proven prefix frame makes is the embedded stub
++        script, attributed to the trusted launcher only when it is that exact code object."""
++        pending = self._launcher_exec
++        if pending is None or frame is None or frame.f_code is not pending[0]:
++            return False
++        self._launcher_exec = None  # one-shot: any later exec from that frame is observed as usual
++        if not _same(code, pending[1]):
++            self.mark_unknown("relaunch-exec-mismatch")
++            return True
++        self._generation += 1
++        self._launcher["script_exec_observed"] = True  # route_report's launcher, not the seed copy
++        return True
++
+     def _module_file(self, name, filename):
+         if not filename:
+             return
+@@ -867,6 +1002,8 @@ class Attestation:
+                     return
+                 if self._generated_event(event, args, sys._getframe(1)):
+                     return
++                if event == "exec" and self._launcher_event(args[0], sys._getframe(1)):
++                    return
+                 if event == "exec":
+                     self._observe(args[0], sys._getframe(1))
+         except Exception as exc:  # health: allow BLE001 -- diagnostic boundary latches unknown; must never alter observed execution
+@@ -1218,7 +1355,7 @@ class Attestation:
+         return {"route": self.route, "stub_head_digest": self.stub_head_digest,
+                 "launcher": dict(self._launcher) if self._launcher else None,
+                 "seed_required": sorted(SEED_COMMON if self.route else SEED),
+-                "main_is_seed": False if self.route == ROUTE_MANAGED_STUB else None,
++                "main_is_seed": False if self.route in STUB_ROUTES else None,
+                 "interpreter": dict(self.interpreter_identity)}
+ 
+     def unknowns(self):
+@@ -1226,6 +1363,11 @@ class Attestation:
+             self._inventory_modules()
+             return tuple(sorted(self._unknown))
+ 
++    def latched_unknowns(self):
++        """The latched unknowns without a module inventory (cheap: polled while measuring)."""
++        with self._lock:
++            return tuple(sorted(self._unknown))
++
+     def generation(self):
+         with self._lock:
+             return self._generation
+@@ -1240,9 +1382,11 @@ def install(core_root, boot_sha):
+     The route comes only from ``sys.orig_argv``/``sys.argv``, the ``__main__`` frame
+     chain and the boot-tree blobs; no parameter, environment value or ``sys`` flag
+     participates. Provenance-pending is cleared only by this function's own path when
+-    the supported route was verified and the seed inventory is clean. Any other launch
+-    (console, ``-m``, relaunch, ``--run-module``, runtime_command ``-c`` ...) latches a
+-    sticky ``unsupported-route:*`` unknown and installs no hook.
++    the supported route was verified and the seed inventory is clean. Supported routes: the
++    direct managed stub and its ``venv_sync.relaunch_command`` child (``managed-stub-relaunch``,
++    proven byte-exact). Any other launch (console, ``-m``, a relaunch differing in any byte,
++    ``--run-module``, runtime_command ``-c`` ...) latches a sticky ``unsupported-route:*`` (or
++    ``relaunched-launch``) unknown and installs no hook.
+     """
+     global _installed
+     if _installed is None:
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index 0cd7bb6bd7..ab7af770ed 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -217,8 +217,11 @@ _SPECS = [
+         _arg("--json", action="store_true", help="Return structured receipt (always JSON)"),
+     ], help="Accept a courier origin obligation and read back its durable receipt"),
+     _cmd("quiet-hold", [
+-        _arg("--max-s", type=int, required=True, metavar="N", help="Lease length in seconds (1..480, no renewal)"),
+-        _arg("--reason", required=True, help="Why local automatic claims should pause (nonempty text)"),
++        _arg("--check", action="store_true",
++             help="Read-only preflight: print what quiet-observe-start would refuse (JSON) without taking a "
++                  "lease or starting a cooldown; exit 0 when admitted apart from the lease, 3 otherwise"),
++        _arg("--max-s", type=int, metavar="N", help="Lease length in seconds (1..480, no renewal)"),
++        _arg("--reason", help="Why local automatic claims should pause (nonempty text)"),
+         _arg("observer_argv", nargs=argparse.REMAINDER, metavar="-- OBSERVER_COMMAND",
+              help="Observer argv, after a literal '--'; run without a shell in its own process group"),
+     ], help="Pause local automatic claims for a bounded, non-renewable observer run (root-scoped)"),
+diff --git a/hermes_cli/kanban_quiet.py b/hermes_cli/kanban_quiet.py
+index 5a6d81bd7d..497491d618 100644
+--- a/hermes_cli/kanban_quiet.py
++++ b/hermes_cli/kanban_quiet.py
+@@ -1,5 +1,9 @@
+ """``hermes kanban quiet-hold --max-s N --reason TEXT -- OBSERVER_COMMAND...``
+ 
++``hermes kanban quiet-hold --check`` is the read-only preflight: it asks the gateway what
++``quiet-observe-start`` would refuse apart from the lease and prints one JSON document; it takes no
++lease and writes no cooldown record (exit 0 admitted, 3 refused or gateway unavailable).
++
+ Takes the root-scoped claim-quiet lease (:mod:`agent.claim_quiet`), runs the observer command under
+ it and releases the lease on every path. Root-scoped: it never opens or initialises a Kanban board
+ and never writes configuration; ``--board`` has no effect here.
+@@ -51,6 +55,7 @@ from collections.abc import Sequence
+ 
+ EXIT_OK = 0
+ EXIT_USAGE = 2
++EXIT_CHECK_REFUSED = 3  # --check: start would refuse (apart from the lease)
+ EXIT_UNAVAILABLE = 69
+ EXIT_OBSERVER_FAILED = 70
+ EXIT_RELEASE_FAILED = 71
+@@ -260,9 +265,38 @@ def _kill_leftovers(pgid: int) -> bool:
+     return True
+ 
+ 
++def check(home=None, *, query=None) -> int:
++    """``--check``: one JSON document on stdout with what ``quiet-observe-start`` would refuse
++    apart from the lease (registry unknowns, launch route, reasons). Takes no lease, writes no
++    cooldown record and reserves no work (``quiet-observe-check`` is a bookkeeping verb)."""
++    import json
++    from pathlib import Path
++
++    if query is None:
++        from gateway.control_socket import query_gateway_control as query
++    if home is None:
++        from gateway.status import _get_process_hermes_home
++        home = _get_process_hermes_home()
++    result = query(Path(home), "quiet-observe-check", params={"schema": 1}, report_unsupported=True)
++    if isinstance(result, dict) and result.get("unsupported"):
++        doc = {"admitted": False, "reasons": ["check_unsupported_by_gateway"]}
++    elif not isinstance(result, dict) or type(result.get("admitted")) is not bool:
++        doc = {"admitted": False, "reasons": ["gateway_unavailable"]}
++    else:
++        doc = result
++    doc = {"home": str(home), **doc}
++    print(json.dumps(doc, sort_keys=True, default=str))
++    return EXIT_OK if doc["admitted"] is True and not doc.get("reasons") else EXIT_CHECK_REFUSED
++
++
+ def cmd_quiet_hold(args) -> int:
+     """Entry point from the ``hermes kanban`` parser."""
+     argv = list(getattr(args, "observer_argv", None) or [])
++    if getattr(args, "check", False):
++        if argv or getattr(args, "max_s", None) is not None or getattr(args, "reason", None) is not None:
++            _err("usage: hermes kanban quiet-hold --check  (takes no lease arguments or observer)")
++            return EXIT_USAGE
++        return check()
+     if not argv or argv[0] != "--":
+         _err("usage: hermes kanban quiet-hold --max-s N --reason TEXT -- OBSERVER_COMMAND...")
+         return EXIT_USAGE
+diff --git a/hermes_cli/venv_sync.py b/hermes_cli/venv_sync.py
+index 45719a031a..85bfdeb95e 100644
+--- a/hermes_cli/venv_sync.py
++++ b/hermes_cli/venv_sync.py
+@@ -932,21 +932,11 @@ def relaunch_command(
+         if option in ("-W", "-X") and index < len(original):
+             options.append(original[index])
+             index += 1
+-    # Select deps before run_path. ``__setitem__`` returns None, so the ``or``
+-    # still execs the module; registering it first keeps a later import from
+-    # re-entering prepare_launch under a HERMES_HOME the script has not set yet.
+-    # _hermes_relaunched marks the child this starts (not processes it spawns) for _relaunch_target;
+-    # a restore re-execs sys.orig_argv and keeps it, which is why that guard re-checks currency.
+-    prefix = (
+-        f"import sys, runpy; sys.path.insert(0, {str(root)!r}); sys.argv = {argv!r}; "
+-        "sys._hermes_relaunched = True; "
+-        "import importlib.util as _iu, pathlib as _pl; "
+-        f"_bp = _pl.Path({str(root)!r}) / 'hermes_bootstrap.py'; "
+-        "_spec = _iu.spec_from_file_location('hermes_bootstrap', _bp) if _bp.is_file() else None; "
+-        "_mod = _iu.module_from_spec(_spec) if _spec is not None else None; "
+-        "(sys.modules.__setitem__('hermes_bootstrap', _mod) or _spec.loader.exec_module(_mod)) "
+-        "if _mod is not None else None; "
+-    )
++    # The prefix text is shared with bootstrap attestation (byte-compared there). A restore
++    # re-execs sys.orig_argv and keeps _hermes_relaunched, which is why _relaunch_target re-checks.
++    from hermes_cli._launch_template import relaunch_prefix
++
++    prefix = relaunch_prefix(str(root), argv)
+     if argv[0] == "-c":
+         body = f"exec({original[index + 1]!r})"
+     elif module and module != "__main__":
+diff --git a/tests/gateway/test_quiet_control.py b/tests/gateway/test_quiet_control.py
+index 423e973980..e177ec3f4e 100644
+--- a/tests/gateway/test_quiet_control.py
++++ b/tests/gateway/test_quiet_control.py
+@@ -23,6 +23,7 @@ from gateway.run import GatewayRunner
+ from gateway.runtime_ownership import ProfileOwnership
+ from gateway.turn_lease import SessionTurnLeaseRegistry
+ from hermes_cli import kanban_deploy_window as window
++from hermes_cli import code_attestation
+ from hermes_cli import local_work
+ from tests.waiting import wait_until
+ 
+@@ -33,6 +34,23 @@ class Runner(GatewayRunner):
+     session_runtime_descriptor = {"instance_id": "inst-1", "state": "ready"}
+ 
+ 
++class CleanLedger:
++    """A code-attestation ledger with no unknowns on the direct managed-stub route."""
++
++    def __init__(self, unknowns=(), route="managed-stub"):
++        self._unknowns = tuple(unknowns)
++        self._route = route
++
++    def unknowns(self):
++        return self._unknowns
++
++    def latched_unknowns(self):
++        return self._unknowns
++
++    def route_report(self):
++        return {"route": self._route}
++
++
+ @pytest.fixture
+ def env(tmp_path, monkeypatch):
+     root = tmp_path / "hermes"
+@@ -46,6 +64,10 @@ def env(tmp_path, monkeypatch):
+     ownership.reserve([root])
+     monkeypatch.setitem(quiet_control._boot, "registry", None)
+     monkeypatch.setitem(quiet_control._boot, "captured", False)
++    # The executed-code ledger the bootstrap installs beside the registry: clean on a supported
++    # route (route-specific ledgers are exercised from real launches in
++    # tests/hermes_cli/test_code_attestation_relaunch.py).
++    monkeypatch.setattr(code_attestation, "_installed", CleanLedger())
+     quiet_control.capture_bootstrap_registry()  # the registry predates every runner: bootstrap provenance
+     runner = object.__new__(Runner)
+     runner._turn_leases = SessionTurnLeaseRegistry()
+@@ -115,7 +137,7 @@ def attest(env):
+ 
+ def test_three_private_handlers_registered_and_authenticated(env):
+     assert set(env.server.private_handlers) == {
+-        "quiet-observe-start", "quiet-observe-snapshot", "quiet-observe-end"}
++        "quiet-observe-start", "quiet-observe-snapshot", "quiet-observe-end", "quiet-observe-check"}
+     response = call(env, "quiet-observe-start", start_params(env), peer=None)
+     assert not response["ok"] and "authenticated private request required" in response["error"]
+ 
+diff --git a/tests/gateway/test_quiet_membership_seeding.py b/tests/gateway/test_quiet_membership_seeding.py
+index 1d8a545d71..27bdbdc4bc 100644
+--- a/tests/gateway/test_quiet_membership_seeding.py
++++ b/tests/gateway/test_quiet_membership_seeding.py
+@@ -138,7 +138,8 @@ def test_launch_lock_acquisition_seeds_the_installed_registry(registry, homes, m
+ def test_quiet_control_pending_reads_the_real_registry(registry, homes):
+     real, _link = homes
+     runner = types.SimpleNamespace(_quiet_registry=registry, _quiet_bootstrap_provenance=True,
+-                                   _quiet_attested=True)
++                                   _quiet_attested=True, _quiet_code=types.SimpleNamespace(
++                                       unknowns=tuple, latched_unknowns=tuple))
+     control = quiet_control.QuietControl(runner)
+     pending = control._pending(registry)
+     assert "membership_unsupported" not in pending and "membership_unseeded" in pending
+diff --git a/tests/hermes_cli/test_code_attestation_relaunch.py b/tests/hermes_cli/test_code_attestation_relaunch.py
+new file mode 100644
+index 0000000000..3de82b50d3
+--- /dev/null
++++ b/tests/hermes_cli/test_code_attestation_relaunch.py
+@@ -0,0 +1,327 @@
++"""Route ``managed-stub-relaunch``: the ``venv_sync.relaunch_command`` child of the managed stub.
++
++The MacBook gateway always runs as this child, so before this route existed ``_detect_route``
++refused it outright (``relaunched-launch``; the old ``test_relaunch_prefix_script_refuses`` pinned
++that). The route is now supported with the direct route's invariant: every byte of Python that
++runs before the audit hook is identified byte-exact, and nothing the process says about itself
++(flags, env, ``sys.orig_argv``) is evidence by itself. Every case below is a REAL subprocess
++launched through the real stub/bootstrap/main (fixtures shared with test_code_attestation_route),
++except the one-shot hook attribution unit and the gateway gate, which consumes recorded ledgers
++from those real launches.
++"""
++import json
++from pathlib import Path
++import sys
++import types
++
++import pytest
++
++from tests.gateway import test_quiet_control as _quiet
++from tests.hermes_cli import test_code_attestation_route as _route
++from tests.hermes_cli.test_code_attestation_route import (
++    ARGS, assert_supported, current_script, refused, run, run_stub)
++from tests.gateway.test_quiet_control import CleanLedger, attest, ok, start_params, write_window
++
++pytestmark = pytest.mark.live_system_guard_bypass
++
++# Shared fixtures (real committed core copy, the test interpreter, the quiet-control env).
++core = _route.core
++python = _route.python
++env = _quiet.env
++
++RELAUNCH = "managed-stub-relaunch"
++
++
++def relaunch_command(interpreter, root, script, *, options=("-I",), args=ARGS):
++    """Exactly what the parent stub's bootstrap execs: ``venv_sync.relaunch_command``."""
++    from hermes_cli import venv_sync
++    original = [str(interpreter), *options, "-c", script, *args]
++    return venv_sync.relaunch_command(Path(interpreter), root, ["-c", *args], original, None)
++
++
++def spaced_python(tmp_path):
++    """The test venv reached through a directory whose name has a space (the Mac's interpreter is
++    ``.../Hermes Python.app/Contents/MacOS/python3.14``); the venv itself is unchanged."""
++    link = tmp_path / "Hermes Python.app"
++    link.symlink_to(Path(sys.prefix), target_is_directory=True)
++    interpreter = link / "bin" / Path(sys.executable).name
++    assert " " in str(interpreter) and interpreter.exists()
++    return interpreter
++
++
++def launcher(probe):
++    found = [s for s in probe["seed"] if s["kind"] == "trusted_launcher_script"]
++    assert len(found) == 1
++    return found[0]
++
++
++# ---- accept -------------------------------------------------------------------------------
++
++def test_relaunch_of_the_current_stub_is_attested_through_a_spaced_interpreter(tmp_path, core):
++    from hermes_cli import code_attestation
++    interpreter = spaced_python(tmp_path)
++    command = relaunch_command(interpreter, core, current_script(core))
++    # The Mac's live shape: the stub's own -I plus the relaunch's -I, then one -c source.
++    assert command[0] == str(interpreter) and command[1:4] == ["-I", "-I", "-c"] and len(command) == 5
++    probe = run(tmp_path, command)
++    assert_supported(probe, core, code_attestation.CURRENT_TEMPLATE_HEAD_DIGEST, route=RELAUNCH)
++    record = launcher(probe)
++    assert record["route"] == RELAUNCH and record["relaunch_options"] == 2
++    assert record["orig_argv0"] == str(interpreter)
++    # The embedded stub script ran through the prefix's exec() AFTER the hook: attributed to the
++    # trusted launcher (no unrooted-exec:<string>), and only that one code object.
++    assert probe["report"]["launcher"]["script_exec_observed"] is True
++    prefix = {s["module"] for s in probe["seed"] if s["kind"] == "relaunch_prefix_stdlib"}
++    assert prefix == {"runpy", "importlib.util", "pathlib"}
++
++
++def test_launch_handoff_env_is_traced_data_not_evidence(tmp_path, core, python):
++    """``venv_sync.exec_launch`` hands the exec'd child its verdict in the environment; the child's
++    ``prepare_launch`` pops it only after bootstrap installed attestation, so a POSIX relaunch
++    always installs with it set. It selects a currency verdict, never code: accepted, reported."""
++    from hermes_cli import code_attestation
++    command = relaunch_command(python, core, current_script(core))
++    probe = run(tmp_path, command, extra_env={code_attestation.LAUNCH_HANDOFF_ENV: f"current:1:{core}"})
++    assert_supported(probe, core, code_attestation.CURRENT_TEMPLATE_HEAD_DIGEST, route=RELAUNCH)
++    assert launcher(probe)["launch_handoff_env"] is True
++
++
++def test_handoff_env_on_a_direct_launch_still_refuses(tmp_path, core, python):
++    from hermes_cli import code_attestation
++    probe = run_stub(tmp_path, python, current_script(core),
++                     extra_env={code_attestation.LAUNCH_HANDOFF_ENV: f"current:1:{core}"})
++    refused(probe, "relaunched-launch")
++
++
++# ---- near misses: each a real subprocess ----------------------------------------------------
++
++def _prefix(core):
++    from hermes_cli import _launch_template
++    return _launch_template.relaunch_prefix(str(core), ["-c", *ARGS])
++
++
++def test_module_body_refuses(tmp_path, core, python):
++    source = _prefix(core) + "runpy.run_module('hermes_cli.main', run_name='__main__', alter_sys=True)"
++    refused(run(tmp_path, [str(python), "-I", "-I", "-c", source]), "unsupported-route:relaunch-body")
++
++
++def test_run_path_body_refuses(tmp_path, core, python):
++    stub = tmp_path / "stub.py"
++    stub.write_text(current_script(core))
++    source = _prefix(core) + f"runpy.run_path({str(stub)!r}, run_name='__main__')"
++    refused(run(tmp_path, [str(python), "-I", "-I", "-c", source]), "unsupported-route:relaunch-body")
++
++
++def test_other_interpreter_option_refuses(tmp_path, core, python):
++    command = relaunch_command(python, core, current_script(core), options=("-X", "utf8", "-I"))
++    assert command[1:5] == ["-X", "utf8", "-I", "-I"]
++    refused(run(tmp_path, command), "unsupported-route:relaunch-options")
++
++
++def test_argv_mismatch_refuses(tmp_path, core, python):
++    command = relaunch_command(python, core, current_script(core)) + ["--extra"]
++    refused(run(tmp_path, command), "unsupported-route:relaunch-argv")
++
++
++def test_prefix_differing_in_one_byte_refuses(tmp_path, core, python):
++    command = relaunch_command(python, core, current_script(core))
++    # Same length, same behaviour: only the bytes differ.
++    changed = command[-1].replace("_iu, pathlib as _pl;", "_iu,pathlib as _pl ;", 1)
++    assert changed != command[-1] and len(changed) == len(command[-1])
++    refused(run(tmp_path, [*command[:-1], changed]), "unsupported-route:relaunch-source")
++
++
++def test_extra_statements_refuse(tmp_path, core, python):
++    command = relaunch_command(python, core, current_script(core))
++    prefix = _prefix(core)
++    body = command[-1][len(prefix):]
++    before = [*command[:-1], prefix + "pass; " + body]
++    refused(run(tmp_path, before), "unsupported-route:relaunch-body")
++    second = tmp_path / "second"
++    second.mkdir()
++    refused(run(second, [*command[:-1], command[-1] + "; pass"]), "unsupported-route:relaunch-body")
++
++
++def test_tampered_embedded_script_refuses(tmp_path, core, python):
++    script = current_script(core)
++    changed = script.replace("sys.exit(main())\n", "sys.exit(main() or 0)\n")
++    assert changed != script
++    refused(run(tmp_path, relaunch_command(python, core, changed)), "unsupported-route:stub-tail")
++
++
++def test_relaunch_for_another_root_refuses(tmp_path, core, python):
++    alias = tmp_path / "alias-root"
++    alias.symlink_to(core, target_is_directory=True)
++    command = relaunch_command(python, alias, current_script(core))
++    refused(run(tmp_path, command), "unsupported-route:relaunch-source")
++
++
++def test_non_canonical_exec_literal_refuses(tmp_path, core, python):
++    """Same script, same prefix, an equivalent but non-canonical literal: not the producer's bytes."""
++    command = relaunch_command(python, core, current_script(core))
++    prefix = _prefix(core)
++    assert command[-1].startswith(prefix + "exec(") and command[-1].endswith(")")
++    loose = prefix + "exec( " + command[-1][len(prefix) + len("exec("):-1] + " )"
++    refused(run(tmp_path, [*command[:-1], loose]), "unsupported-route:relaunch-source")
++
++
++def test_rewritten_orig_argv_is_not_evidence(tmp_path, core, python):
++    """A different -c program that rewrites ``sys.orig_argv`` to the genuine relaunch before the
++    bootstrap: every argv check passes, the executing frame's code does not."""
++    genuine = relaunch_command(python, core, current_script(core))
++    lie = f"import sys; sys.orig_argv[:] = {genuine!r}; " + genuine[-1]
++    refused(run(tmp_path, [str(python), "-I", "-I", "-c", lie]), "unsupported-route:frame-code")
++
++
++# ---- hook attribution of the embedded script (in-process unit) -----------------------------
++
++def _bare_ledger(expected_frame_code, script_code):
++    import threading
++    from hermes_cli.code_attestation import Attestation
++    ledger = object.__new__(Attestation)  # no hook installed into the test process
++    ledger._lock = threading.RLock()
++    ledger._unknown = set()
++    ledger._generation = 0
++    ledger._launcher = {}
++    ledger._launcher_exec = (expected_frame_code, script_code)
++    return ledger
++
++
++def test_only_the_embedded_script_code_from_the_prefix_frame_is_the_launcher():
++    frame = sys._getframe()
++    script = compile("value = 1\n", "<string>", "exec")
++    ledger = _bare_ledger(frame.f_code, script)
++    assert ledger._launcher_event(compile("value = 1\n", "<string>", "exec"), frame) is True
++    assert ledger._unknown == set() and ledger._launcher["script_exec_observed"] is True
++    # One-shot: a second exec from the same frame is observed as any other string exec.
++    assert ledger._launcher_event(script, frame) is False
++
++    tampered = _bare_ledger(frame.f_code, script)
++    assert tampered._launcher_event(compile("value = 2\n", "<string>", "exec"), frame) is True
++    assert tampered._unknown == {"relaunch-exec-mismatch"}
++
++    other = _bare_ledger(compile("pass", "<string>", "exec"), script)
++    assert other._launcher_event(script, frame) is False and other._unknown == set()
++
++
++# ---- the gateway gate consumes the ledger ---------------------------------------------------
++
++class Recorded(CleanLedger):
++    """A ledger as recorded from a real launch's probe (unknowns and route, nothing invented)."""
++
++    def __init__(self, probe):
++        super().__init__(probe["unknowns"], probe["report"]["route"])
++
++
++@pytest.fixture(scope="module")
++def recorded(tmp_path_factory, core):
++    interpreter = Path(sys.executable)
++    script = current_script(core)
++    out = {}
++    for name, command in (
++            ("direct", [str(interpreter), "-I", "-c", script, *ARGS]),
++            ("relaunch", relaunch_command(interpreter, core, script)),
++            ("near_miss", relaunch_command(interpreter, core, script) + ["--extra"])):
++        out[name] = Recorded(run(tmp_path_factory.mktemp(name), command))
++    assert out["direct"]._route == "managed-stub" and out["relaunch"]._route == RELAUNCH
++    return out
++
++
++def _use(env, ledger):
++    env.runner._quiet_code = ledger
++    attest(env)
++
++
++def test_quiet_start_admits_the_relaunch_route_where_it_admits_the_direct_route(env, recorded):
++    _use(env, recorded["near_miss"])
++    refused_start = ok(env, "quiet-observe-start", start_params(env))
++    assert refused_start["valid"] is False and "observer_token" not in refused_start
++    assert "unknown:code:unsupported-route:relaunch-argv" in refused_start["reasons"]
++    for name in ("direct", "relaunch"):
++        _use(env, recorded[name])
++        started = ok(env, "quiet-observe-start", start_params(env))
++        assert started.get("observer_token"), (name, started)
++
++
++def test_missing_code_ledger_is_pending_coverage(env):
++    env.runner._quiet_code = None
++    attest(env)
++    result = ok(env, "quiet-observe-start", start_params(env))
++    assert result["phase"] == "coverage_pending" and "code_attestation_missing" in result["reasons"]
++
++
++def test_snapshot_reads_latched_code_unknowns_without_an_inventory(env):
++    class Latched(CleanLedger):
++        def unknowns(self):
++            raise AssertionError("snapshots must not inventory modules")
++    attest(env)
++    token = ok(env, "quiet-observe-start", start_params(env))["observer_token"]
++    env.runner._quiet_code = Latched(["unrooted-exec:<string>"])
++    from tests.gateway.test_quiet_control import follow_params
++    snap = ok(env, "quiet-observe-snapshot", follow_params(env, token))
++    assert snap["valid"] is False and "unknown:code:unrooted-exec:<string>" in snap["reasons"]
++
++
++# ---- --check: no lease, no cooldown, no epoch move, agrees with start -----------------------
++
++def _tree(root):
++    return {str(p): (p.read_bytes(), p.stat().st_mtime_ns) for p in sorted(Path(root).rglob("*")) if p.is_file()}
++
++
++def _check(env, capsys):
++    from hermes_cli import kanban_quiet
++
++    def query(home, verb, *, params=None, report_unsupported=False, timeout=None):
++        raw = json.dumps({"protocol": 1, "verb": verb, "id": 1, "params": params}).encode()
++        response = json.loads(env.server.handle_request_line(raw, "uid:1000"))
++        return response.get("result") if response.get("ok") else None
++
++    code = kanban_quiet.check(env.root, query=query)
++    lines = capsys.readouterr().out.strip().splitlines()
++    assert len(lines) == 1
++    return code, json.loads(lines[0])
++
++
++def test_check_takes_no_lease_writes_nothing_and_does_not_move_the_epoch(env, recorded, capsys):
++    from gateway.control_dispatch import verb_is_work_bearing
++    assert not verb_is_work_bearing("quiet-observe-check")  # never reserved in the registry
++    _use(env, recorded["relaunch"])
++    before = (_tree(env.root), env.registry.snapshot().epoch, env.registry.membership_generation())
++    code, doc = _check(env, capsys)
++    assert code == 0 and doc["admitted"] is True and doc["reasons"] == []
++    assert doc["route"] == RELAUNCH and doc["registry_unknowns"] == []
++    after = (_tree(env.root), env.registry.snapshot().epoch, env.registry.membership_generation())
++    assert after == before
++    started = ok(env, "quiet-observe-start", start_params(env))
++    assert started.get("observer_token")  # start then agrees
++
++
++def test_check_reports_the_route_refusal_and_start_agrees(env, recorded, capsys):
++    _use(env, recorded["near_miss"])
++    code, doc = _check(env, capsys)
++    assert code == 3 and doc["admitted"] is False and doc["route"] is None
++    assert "unsupported-route:relaunch-argv" in "".join(doc["registry_unknowns"])
++    started = ok(env, "quiet-observe-start", start_params(env))
++    assert "observer_token" not in started and set(started["reasons"]) <= set(doc["reasons"])
++
++
++def test_check_and_start_agree_on_a_stale_update_window(env, recorded, capsys):
++    _use(env, recorded["relaunch"])
++    write_window(env.root, "idle", age=600)
++    code, doc = _check(env, capsys)
++    assert code == 3 and "update_window_stale" in doc["reasons"]
++    started = ok(env, "quiet-observe-start", start_params(env))
++    assert started["reasons"] == ["update_window_stale"]
++
++
++def test_check_without_a_gateway_is_refused(tmp_path, capsys):
++    from hermes_cli import kanban_quiet
++    code = kanban_quiet.check(tmp_path, query=lambda *a, **k: None)
++    doc = json.loads(capsys.readouterr().out)
++    assert code == 3 and doc["reasons"] == ["gateway_unavailable"]
++
++
++def test_check_cli_rejects_lease_arguments():
++    from hermes_cli import kanban_quiet
++    args = types.SimpleNamespace(check=True, max_s=5, reason=None, observer_argv=None)
++    assert kanban_quiet.cmd_quiet_hold(args) == kanban_quiet.EXIT_USAGE
+diff --git a/tests/hermes_cli/test_code_attestation_route.py b/tests/hermes_cli/test_code_attestation_route.py
+index daba3e2e28..bc9d78c455 100644
+--- a/tests/hermes_cli/test_code_attestation_route.py
++++ b/tests/hermes_cli/test_code_attestation_route.py
+@@ -153,10 +153,10 @@ def refused(probe, reason):
+     assert probe["report"]["route"] is None and probe["report"]["launcher"] is None
+ 
+ 
+-def assert_supported(probe, core, digest):
++def assert_supported(probe, core, digest, route="managed-stub"):
+     from hermes_cli.code_attestation import SEED_COMMON
+     report = probe["report"]
+-    assert report["route"] == "managed-stub" and report["stub_head_digest"] == digest
++    assert report["route"] == route and report["stub_head_digest"] == digest
+     assert report["main_is_seed"] is False
+     seeds = {s["module"]: s for s in probe["seed"] if s["kind"] == "trusted_bootstrap_seed"}
+     assert set(seeds) == set(SEED_COMMON) and "hermes_cli.main" not in seeds
+@@ -267,14 +267,6 @@ def test_post_swap_refuses(tmp_path, core, python):
+     refused(probe, "unsupported-route:post-swap")
+ 
+ 
+-def test_relaunch_prefix_script_refuses(tmp_path, core, python):
+-    from hermes_cli import venv_sync
+-    original = [str(python), "-I", "-c", current_script(core), *ARGS]
+-    command = venv_sync.relaunch_command(python, core, ["-c", *ARGS], original, None)
+-    probe = run(tmp_path, command)
+-    refused(probe, "relaunched-launch")
+-
+-
+ def test_runtime_command_c_form_refuses(tmp_path, core, python):
+     from hermes_cli import _launchers
+     command = _launchers.runtime_command(core, ARGS, python=python)
+-- 
+2.43.0
+

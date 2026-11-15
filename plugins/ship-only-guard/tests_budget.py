@@ -22,8 +22,8 @@ def test_registered_callback_has_finite_budget():
     hooks = []
     p.register(SimpleNamespace(register_hook=lambda *args: hooks.append(args)))
     assert hooks == [("pre_tool_call", p._pre_tool_call)]
-    assert p.guard.PREFLIGHT_TIMEOUT == 120
-    assert p._pre_tool_call.hermes_hook_timeout == 150
+    assert p.guard.PREFLIGHT_TIMEOUT == 18
+    assert p._pre_tool_call.hermes_hook_timeout == 30
 
 
 def test_aggregate_budget_clips_each_probe_and_never_allows_late(monkeypatch):
@@ -103,7 +103,7 @@ def test_real_dispatch_honors_callback_budget_and_timeout_stays_closed(monkeypat
         return None
     monkeypatch.setattr(p.guard, "check_tool", slow)
     assert not manager.invoke_hook("pre_tool_call", tool_name="terminal", args={})
-    assert observed == [150]
+    assert observed == [30]
     assert not manager._hook_timeout_suppressed_until
     # Scale only this fixture's declared budget down; exercise real abandonment.
     release = threading.Event()

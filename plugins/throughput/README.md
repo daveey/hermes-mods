@@ -63,6 +63,22 @@ gateway only; cards cover every gateway.
 `cache/throughput/sampler.lock` keeps one sampler per Hermes root; the others wait and take over if it exits.
 The REST API also starts one if the process has none.
 
+Token sampling uses message/session watermarks and refreshes active sessions; deletions,
+rewinds and periodic full reads retain the full-snapshot fallback. Snapshot SELECTs transfer
+numeric/text rows through SQLite JSON aggregation and one Python decode, avoiding per-row
+GIL handoffs when other threads read SQLite. SQLite builds without JSON functions and
+legacy BLOB values use the original row reader. This does not change read-only connections,
+watermarks, token normalization or fallback rules. Full reads still allocate O(state) memory,
+including a temporary JSON string; incremental query batches remain bounded by the existing
+ID chunk size.
+
+`test_sample_local_tokens_replay_budget` measures sampler **thread CPU** with a 0.3%-of-one-core
+budget per 60-second tick. Its busy stress replay includes 23k sessions, about 1.28M messages,
+31.7k model rows, six sampler initializations over 46 ticks, and four concurrent SQLite readers.
+It models observed busy-reader concurrency and reload frequency, not an exact production trace
+or all profile files. Relative speedup compares with the legacy full-row reader; the absolute
+budget is unchanged. Live process accounting remains the deployment acceptance check.
+
 ## API
 
 `GET /api/plugins/throughput/v1/series?range=1h|6h|24h|7d[&by=gateway|model]` (buckets 1/5/15/60 min):

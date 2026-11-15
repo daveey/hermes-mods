@@ -1,0 +1,175 @@
+From 5e64a77b96674f725190789c27bfe09ab0657b23 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 16:21:55 +0000
+Subject: [PATCH] [daveey] origin-work snapshot: use WAL so a save never locks
+ out the remote-links cold read
+
+kanban-ec72354e6b (hermes-hub, 2026-11-14 03:06/05:04/09:01 UTC): the remote-links background rebuild
+failed with 'database is locked' at kanban_lockguard._apply PRAGMA journal_mode while opening
+~/.hermes/origin-work.db for its cold-start snapshot read, and was dropped ('background rebuild failed;
+serving the previous projection'). The same file logged 27 'origin-work snapshot not saved: database is
+locked' in errors.log. origin-work.db was the one kanban store still in the rollback journal
+(PRAGMA journal_mode -> delete, 23 MB, multi-MB row per scope rewritten by every process), so a
+commit's EXCLUSIVE lock refused every reader for longer than the 0.5 s open budget, and any reader's
+SHARED lock failed the writers.
+
+The save path now upgrades the file through apply_wal_with_fallback (keeps its WAL-reset-bug gate,
+network/cross-VM fallbacks and never-live-downgrade invariant), bounds the -wal file and re-applies
+the OFD lock guard, like kanban_db_connect does for boards.
+
+Proof: tests/hermes_cli/test_kanban_origin_snapshot_wal.py fails 3/4 on the base (cold read raises
+'database is locked' at kanban_lockguard.py:140 while another connection holds BEGIN EXCLUSIVE; save
+raises under an open reader; existing delete-mode file stays delete) and passes 5/5 with the fix;
+mutants (drop guard / journal_size_limit / WAL condition / WAL upgrade) are all killed. 42 kanban
+activity/origin/remote/lockguard/generation files: 772 passed.
+---
+ ...kanban_session_activity_origin_snapshot.py | 20 ++++
+ .../test_kanban_origin_snapshot_wal.py        | 98 +++++++++++++++++++
+ 2 files changed, 118 insertions(+)
+ create mode 100644 tests/hermes_cli/test_kanban_origin_snapshot_wal.py
+
+diff --git a/hermes_cli/kanban_session_activity_origin_snapshot.py b/hermes_cli/kanban_session_activity_origin_snapshot.py
+index 1ecfcd7398..b6229efd85 100644
+--- a/hermes_cli/kanban_session_activity_origin_snapshot.py
++++ b/hermes_cli/kanban_session_activity_origin_snapshot.py
+@@ -7,6 +7,21 @@ import json
+ from typing import Any
+ 
+ 
++def _use_wal(conn) -> None:
++    """Every process on the host reads and rewrites this file (a multi-MB row per scope). In a rollback journal a
++    commit locks out every reader and any open reader fails the commit, so the remote-links rebuild's cold read
++    died with ``database is locked`` (kanban-ec72354e6b). WAL lets reads proceed during a write. The shared helper
++    keeps its policy: never on WAL-reset-vulnerable SQLite or WAL-hostile filesystems, never a live downgrade. [daveey]
++    """
++    from hermes_cli import kanban_lockguard
++    from hermes_state_wal import apply_wal_with_fallback
++
++    if apply_wal_with_fallback(conn, db_label="origin-work.db") == "wal":
++        # Bound the -wal file: each save appends the whole scope row.
++        conn.execute("PRAGMA journal_size_limit=8388608")
++        kanban_lockguard.guard(conn)  # a file that only became WAL now gets its OFD lock guard
++
++
+ def remote_snapshot(cards: list[dict[str, Any]] | None = None) -> list[dict[str, Any]] | None:
+     """Durable last-known origin obligations, separate from the replaceable hub replica.
+ 
+@@ -24,6 +39,11 @@ def remote_snapshot(cards: list[dict[str, Any]] | None = None) -> list[dict[str,
+     else:
+         path.parent.mkdir(parents=True, exist_ok=True)
+         conn = _ksa._kanban_lockguard.connect(path, timeout=0.5)
++        try:
++            _use_wal(conn)
++        except BaseException:
++            conn.close()
++            raise
+     try:
+         scope = json.dumps(_ksa._origin_scope())
+         if cards is not None:
+diff --git a/tests/hermes_cli/test_kanban_origin_snapshot_wal.py b/tests/hermes_cli/test_kanban_origin_snapshot_wal.py
+new file mode 100644
+index 0000000000..9395fae052
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_origin_snapshot_wal.py
+@@ -0,0 +1,98 @@
++"""The origin-work snapshot is shared by every process on a host: a write must never lock out a reader.
++
++kanban-ec72354e6b (hub, 2026-11-14): ``origin-work.db`` stayed in the rollback journal, so while any process
++committed its multi-MB snapshot the remote-links rebuild's cold read failed at ``PRAGMA journal_mode`` with
++``database is locked`` and the whole rebuild was dropped ("background rebuild failed; serving the previous
++projection"); the converse (a reader's SHARED lock) failed the writers' saves ("origin-work snapshot not saved"). [daveey]
++"""
++import sqlite3
++
++import pytest
++
++import hermes_state_wal
++from hermes_cli import kanban_db, profiles
++from hermes_cli import kanban_session_activity as activity
++
++
++@pytest.fixture
++def home(tmp_path, monkeypatch):
++    monkeypatch.setattr(profiles, 'get_active_profile_name', lambda: 'default')
++    monkeypatch.setattr(kanban_db, 'kanban_home', lambda: tmp_path)
++    activity._reset_cache_for_tests()
++    yield tmp_path
++    activity._reset_cache_for_tests()
++
++
++def card(n=0):
++    return {'session': f's{n}', 'id': f't{n}', 'key': f'owner/work/default/t{n}',
++            'status': 'running', 'gateway': 'owner', 'profile': 'work'}
++
++
++def journal_mode(path):
++    with sqlite3.connect(f'file:{path}?mode=ro', uri=True) as db:
++        return db.execute('PRAGMA journal_mode').fetchone()[0]
++
++
++def test_cold_read_succeeds_while_another_process_commits(home):
++    activity._remote_snapshot([card()])
++    writer = sqlite3.connect(home / 'origin-work.db', isolation_level=None)
++    try:
++        # A foreign process mid-commit of its own snapshot (EXCLUSIVE in a rollback journal).
++        writer.execute('BEGIN EXCLUSIVE')
++        writer.execute('INSERT OR REPLACE INTO scoped_snapshot VALUES (?, ?)', ('other', '[]'))
++        assert activity._remote_snapshot() == [card()]
++    finally:
++        writer.execute('ROLLBACK')
++        writer.close()
++
++
++def test_save_succeeds_while_another_process_reads(home):
++    activity._remote_snapshot([card()])
++    reader = sqlite3.connect(home / 'origin-work.db', isolation_level=None)
++    try:
++        reader.execute('BEGIN')
++        assert reader.execute('SELECT count(*) FROM scoped_snapshot').fetchone()[0] == 1
++        assert activity._remote_snapshot([card(1)]) == [card(1)]
++    finally:
++        reader.execute('COMMIT')
++        reader.close()
++    assert activity._remote_snapshot() == [card(1)]
++
++
++def test_existing_rollback_journal_snapshot_is_upgraded_on_the_next_save(home):
++    path = home / 'origin-work.db'
++    with sqlite3.connect(path) as db:
++        db.execute('CREATE TABLE scoped_snapshot (scope TEXT PRIMARY KEY, data TEXT NOT NULL)')
++    db.close()
++    assert journal_mode(path) == 'delete'
++    activity._remote_snapshot([card()])
++    assert journal_mode(path) == 'wal'
++    assert activity._remote_snapshot() == [card()]
++
++
++def guard_spy(monkeypatch):
++    from hermes_cli import kanban_lockguard
++    seen = []
++    real = kanban_lockguard.guard
++
++    def spy(conn, **kw):
++        seen.append((conn.execute('PRAGMA journal_mode').fetchone()[0],
++                     conn.execute('PRAGMA journal_size_limit').fetchone()[0], kw))
++        return real(conn, **kw)
++    monkeypatch.setattr(kanban_lockguard, 'guard', spy)
++    return seen
++
++
++def test_save_guards_the_wal_connection_with_a_bounded_wal(home, monkeypatch):
++    seen = guard_spy(monkeypatch)
++    activity._remote_snapshot([card()])
++    assert ('wal', 8388608, {}) in seen
++
++
++def test_wal_reset_vulnerable_sqlite_keeps_the_rollback_journal(home, monkeypatch):
++    monkeypatch.setattr(hermes_state_wal, 'is_sqlite_wal_reset_vulnerable', lambda: True)
++    seen = guard_spy(monkeypatch)
++    activity._remote_snapshot([card()])
++    assert journal_mode(home / 'origin-work.db') == 'delete'
++    assert not [s for s in seen if s[2] == {}]  # the post-upgrade guard runs only on WAL
++    assert activity._remote_snapshot() == [card()]
+-- 
+2.43.0
+

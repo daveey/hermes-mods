@@ -1410,6 +1410,90 @@ def file_path_cards(home: Path, host: str, now: datetime, rep: dict, probe: dict
     return out
 
 
+# One active file plus three backups, each <= 64 KiB. No log text, paths,
+# hostnames, probe output or owner IDs are copied into this diagnostic sink.
+SCAN_RECEIPT_BYTES = 64 * 1024
+SCAN_RECEIPT_BACKUPS = 3
+SCAN_RECEIPT_READY_LIMIT = 128
+
+
+def persist_scan_receipt(home: Path, res: dict) -> None:
+    """Bounded, private, cross-process serialized JSONL; not a health receipt.
+
+    Filing has already finished. A sink failure is reported on stderr by main,
+    never retried by filing again or substituted with a healthy receipt.
+    """
+    import fcntl
+    from logging.handlers import RotatingFileHandler
+    import logging
+
+    class PrivateRotatingFileHandler(RotatingFileHandler):
+        def _open(self):
+            # Also used by doRollover: never expose a newly created 0644 inode.
+            fd = os.open(self.baseFilename, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
+            try:
+                os.fchmod(fd, 0o600)
+                return os.fdopen(fd, "a", encoding="utf-8")
+            except BaseException:
+                os.close(fd)
+                raise
+
+    cold = res.get("backend_cold_start") or {}
+    by_conn = cold.get("by_conn") or {}
+    readies = cold.get("readies") or []
+    actions = Counter()
+    allowed = {"created", "commented", "comment_failed", "throttled", "owned", "create_failed"}
+    for card in res["cards"]:
+        action = card.get("action")
+        actions[action if action in allowed else "other"] += 1
+    row = {
+        "schema": "coach.backend-timeouts.scan.v1",
+        "scope": "retained-log-scan; correlation-only; not API readiness or recovery",
+        "window_start": res["window_start"], "window_end": res["window_end"],
+        "coverage_start": res["clock"]["coverage_start"],
+        "raw_count": res["count"], "awake_count": res["awake_count"],
+        "fail_fast_awake_count": res["fail_fast"]["awake_count"],
+        "residual_count": residual_count(res), "over_threshold": res["over_threshold"],
+        "startup_correlation": {
+            "count": cold.get("count", 0), "local_count": by_conn.get("local", 0),
+            "primary_count": by_conn.get("primary", 0),
+            "explicit_local_without_conn_count": by_conn.get("?", 0),
+            "ready_times": readies[:SCAN_RECEIPT_READY_LIMIT],
+            "ready_times_omitted": max(0, len(readies) - SCAN_RECEIPT_READY_LIMIT)},
+        "owner_actions": dict(actions),
+    }
+    line = json.dumps(row, separators=(",", ":"), ensure_ascii=True)
+    if len(line.encode("utf-8")) + 1 > SCAN_RECEIPT_BYTES:
+        raise ValueError("scan receipt exceeds size bound")
+    directory = home / "coach"
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "backend-timeouts-scans.jsonl"
+    # Lock a stable inode, not the rotating data file. Never truncate a peer's lock.
+    with os.fdopen(os.open(str(path) + ".lock", os.O_CREAT | os.O_RDWR, 0o600), "a") as lock:
+        deadline = time.monotonic() + 2
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise OSError("scan receipt lock busy") from None
+                time.sleep(0.02)
+        handler = PrivateRotatingFileHandler(path, maxBytes=SCAN_RECEIPT_BYTES,
+                                             backupCount=SCAN_RECEIPT_BACKUPS, encoding="utf-8")
+        try:
+            record = logging.LogRecord("coach.scan", logging.INFO, "", 0, line, (), None)
+            if handler.shouldRollover(record):
+                handler.doRollover()
+                os.chmod(path, 0o600)
+            # Write directly so logging's handleError cannot swallow I/O failure.
+            assert handler.stream is not None
+            handler.stream.write(line + "\n")
+            handler.flush()
+        finally:
+            handler.close()
+
+
 def main(argv=None, runner: Optional[Callable] = None, now: Optional[datetime] = None,
          probe: Optional[Callable] = None, power_probe: Optional[Callable] = None) -> int:
     ap = argparse.ArgumentParser(description=(__doc__ or "").split("\n\n")[0])
@@ -1483,6 +1567,14 @@ def main(argv=None, runner: Optional[Callable] = None, now: Optional[datetime] =
                 if owners:
                     host_card["path_owners"] = owners
                 res["cards"].append(host_card)
+    receipt_failed = False
+    if not a.dry_run:
+        try:
+            persist_scan_receipt(home, res)
+        except (OSError, ValueError):
+            # Do not include exception text: filesystem paths may contain private data.
+            print("backend timeout scan receipt persistence failed", file=sys.stderr)
+            receipt_failed = True
     if a.json or a.dry_run:
         print(json.dumps(res))
     elif res["over_threshold"]:  # cron no-agent: stdout is delivered, so stay silent when healthy
@@ -1490,7 +1582,7 @@ def main(argv=None, runner: Optional[Callable] = None, now: Optional[datetime] =
         top = ", ".join(f"{p} {n}" for p, n in list(rep["by_path"].items())[:3])
         print(f"backend timeouts on {host}: {rep['count']} in {window} min (threshold {threshold}); top: {top}; "
               f"card {c.get('task_id', '?')} {c.get('action', '')}")
-    return 0
+    return 1 if receipt_failed else 0
 
 
 if __name__ == "__main__":

@@ -1,0 +1,153 @@
+From eb31e0ed13130fd76a0b8199f4c7c7ec90061cb7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 19:09:33 +0000
+Subject: [PATCH] [daveey] awaited-card wake: pin five #2432 conditions no test
+ reached
+
+Post-merge check t_01a1d615bdcca774 of #2432 (fb2398dd9b) found five mutants
+that survive tests/hermes_cli/test_kanban_awaited_card_wake.py. One test per
+mutant; tests only, no mutant exposed a behaviour bug.
+
+- E3 pull loop `acw.changes_page(...)` -> `hub.changes(...)`: page 1 applies
+  the review's done, page 2 raises Resync, the rebuild must still wake the park
+  (its pre-read already holds done, so only the carried changes see it).
+- E13 rebuild pre-read `acw.statuses(replica, ...)` -> `(None, ...)`: a rebuild
+  that leaves the awaited card unchanged must not re-probe its park.
+- E10 reconcile expedite `except (sqlite3.Error, OSError)` -> `except ()`: a
+  sqlite error expediting parks logs a warning and reconcile completes.
+- E8 `_replica_finished` no replica `return None` -> `return {}`: the scan keeps
+  existing warned marks without a replica.
+- E9 warned-mark drop loop -> `for k in []`: a warned park whose awaited card
+  reopens is forgotten, and warned again when the card finishes again.
+
+Proof: each mutant applied alone -> exactly its new test fails (29 passed,
+1 failed) on the intended assertion; unmutated -> 30 passed.
+---
+ .../test_kanban_awaited_card_wake.py          | 114 ++++++++++++++++++
+ 1 file changed, 114 insertions(+)
+
+diff --git a/tests/hermes_cli/test_kanban_awaited_card_wake.py b/tests/hermes_cli/test_kanban_awaited_card_wake.py
+index 12ccaaaebf..d18c1fd594 100644
+--- a/tests/hermes_cli/test_kanban_awaited_card_wake.py
++++ b/tests/hermes_cli/test_kanban_awaited_card_wake.py
+@@ -582,3 +582,117 @@ def test_changes_page_attaches_the_pull_s_applied_changes_to_a_resync():
+     with pytest.raises(ksc.Resync) as info:
+         acw.changes_page(Hub(), BOARD, 7, {REVIEW: "done"})
+     assert info.value.status_changed == {REVIEW: "done"}
++
++
++# --- g. the pull loop, rebuild pre-read, reconcile expedite errors and the warned-mark scan (post-merge #2432) -
++
++class _ResyncAfterFirstPage:
++    """The hub, except its feed serves one page (claiming more) and then raises Resync: the replica cursor fell
++    below the retention floor in the middle of a pull."""
++
++    def __init__(self, hub):
++        self._hub, self.calls = hub, 0
++
++    def __getattr__(self, name):
++        return getattr(self._hub, name)
++
++    def changes(self, board, cursor, *a, **kw):
++        self.calls += 1
++        if self.calls == 1:
++            return {**self._hub.changes(board, cursor, *a, **kw), "more": True}
++        if self.calls == 2:
++            raise ksc.Resync("below the floor")
++        return self._hub.changes(board, cursor, *a, **kw)
++
++
++def test_a_status_applied_by_a_page_before_the_resync_wakes_the_owner_after_the_rebuild(
++        live, svc, kanban_home, probes, monkeypatch):
++    """The pull loop hands its applied changes to the Resync (``changes_page``): page 1 applies the review's done,
++    so the rebuild's pre-read already holds done and its diff alone would not see it."""
++    _confirmed(monkeypatch)
++    owner, t0 = _setup(live, svc, kanban_home, probes, f"hermes kanban wait-check task {REVIEW}")
++    rebuilds = []
++    real = ksc.resync
++    monkeypatch.setattr(ksc, "resync", lambda conn, *a, **kw: rebuilds.append(kw) or real(conn, *a, **kw))
++    _other(svc, REVIEW, {"status": "done"})
++    hub = _ResyncAfterFirstPage(svc.hub(ME))
++    ksc.sync_board(BOARD, kanban_home / "kanban.db", hub, ME)
++    assert hub.calls >= 2 and rebuilds  # page 1 applied, page 2 raised Resync, the replica was rebuilt
++    _woke_within_a_minute(live, owner, t0)  # before: page 1's done was lost to the rebuild's diff
++
++
++def test_a_rebuild_that_leaves_the_awaited_card_unchanged_does_not_re_probe_its_park(
++        live, svc, kanban_home, probes, monkeypatch):
++    """The rebuild diffs against the replica read before it drops the file: only cards whose status moved count."""
++    owner, t0 = _setup(live, svc, kanban_home, probes, f"hermes kanban wait-check task {REVIEW}")
++    rebuilds = []
++    real = ksc.resync
++    monkeypatch.setattr(ksc, "resync", lambda conn, *a, **kw: rebuilds.append(kw) or real(conn, *a, **kw))
++    _other(svc, UNRELATED, {"status": "done"})  # another card moves; the review stays running
++    svc.compact(BOARD)
++    _round(kanban_home, svc)
++    assert rebuilds
++    assert _next_at(live, owner) == t0 + EVERY  # without the pre-read: every card counts, the park re-probes now
++    kwc.run_due_wake_checks(live, now=t0 + 60, wait=True)
++    assert _status(live, owner) == "scheduled" and probes[owner] == 1
++
++
++def test_a_sqlite_error_expediting_the_parks_during_reconcile_is_logged_and_reconcile_completes(
++        live, svc, kanban_home, probes, monkeypatch, caplog):
++    import sqlite3
++    from hermes_cli import kanban_sync_backlog as backlog
++    _confirmed(monkeypatch)
++    owner, _t0 = _setup(live, svc, kanban_home, probes, f"hermes kanban wait-check task {REVIEW}")
++    _other(svc, REVIEW, {"status": "done"})
++
++    def locked(conn, changed, **kw):
++        raise sqlite3.OperationalError("database is locked")
++
++    monkeypatch.setattr(acw, "expedite", locked)
++    caplog.set_level("WARNING", logger=backlog.__name__)
++    got = ksc.reconcile(BOARD, kanban_home / "kanban.db", svc.hub(ME))  # before: the error ends the reconcile
++    assert got["board"] == BOARD
++    assert [r for r in caplog.records if "not re-probed" in r.getMessage() and "database is locked" in r.getMessage()]
++    assert _status(live, owner) == "scheduled"
++
++
++def test_the_scan_keeps_warned_marks_when_there_is_no_replica(live):
++    """No replica file: nothing to judge by, so a warned park keeps its mark (it is not warned again)."""
++    from hermes_cli.kanban_foreign_card import replica_path
++    assert replica_path(acw._db_key(live)) is None  # no sync round ran: no replica
++    key = acw._db_key(live)
++    acw._WARNED[(key, "t_0000000000000def")] = (REVIEW, 7)
++    acw.report_lag(live, now=time.time())
++    assert acw._WARNED[(key, "t_0000000000000def")] == (REVIEW, 7)
++
++
++def test_a_warned_park_whose_awaited_card_reopens_is_forgotten_and_warned_again_when_it_finishes(
++        live, svc, kanban_home, probes, caplog):
++    """Same park episode throughout: only the scan that no longer finds it on a finished card drops its mark."""
++    caplog.set_level("WARNING", logger=acw.__name__)
++    owner, t0 = _setup(live, svc, kanban_home, probes, f"hermes kanban wait-check task {REVIEW} --until review")
++    key = acw._db_key(live)
++
++    def pull():
++        ksc._pull_replica(BOARD, svc.hub(ME), ME, kanban_home / "kanban.db", diagnostic=True)
++
++    def lags():
++        return [r.getMessage() for r in caplog.records if "awaited_card_done_park_lag" in r.getMessage()]
++
++    _other(svc, REVIEW, {"status": "done"})
++    pull()
++    scanned = t0 + acw._SCAN_SECONDS
++    acw.report_lag(live, now=scanned)
++    assert acw.report_lag(live, now=scanned + acw.LAG_WARN_SECONDS + 1) == [owner]
++    assert (key, owner) in acw._WARNED
++    _other(svc, REVIEW, {"status": "running"})  # the review reopens on worker-1
++    pull()
++    reopened = scanned + acw.LAG_WARN_SECONDS + acw._SCAN_SECONDS + 1
++    assert acw.report_lag(live, now=reopened) == []
++    assert (key, owner) not in acw._WARNED  # before: the stale mark stayed
++    _other(svc, REVIEW, {"status": "done"})  # it finishes again; the park (same episode) still cannot see it
++    pull()
++    again = reopened + acw._SCAN_SECONDS
++    assert acw.report_lag(live, now=again) == []
++    assert acw.report_lag(live, now=again + acw.LAG_WARN_SECONDS + 1) == [owner]  # before: [] (never again)
++    assert len(lags()) == 2
+-- 
+2.43.0
+

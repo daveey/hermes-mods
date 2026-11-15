@@ -265,9 +265,11 @@ def test_new_holder_takes_relays_the_old_holder_posted_for_its_live_chats(tmp_pa
 
 # ---- reload (N3): the previous module's lease is released, not left to core's watchdog -------------------------
 def _fresh_module(name):
-    s = importlib.util.spec_from_file_location(name, ROOT / '__init__.py')
+    # Reloads own distinct core modules: unloading one must not retire the suite's reader.
+    s = importlib.util.spec_from_file_location(name, ROOT / '__init__.py',
+                                              submodule_search_locations=[str(ROOT)])
     m = importlib.util.module_from_spec(s)
-    m.__package__ = ''
+    sys.modules[name] = m
     s.loader.exec_module(m)
     return m
 

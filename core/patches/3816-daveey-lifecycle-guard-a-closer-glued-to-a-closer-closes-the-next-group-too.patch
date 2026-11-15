@@ -1,0 +1,120 @@
+From ad364cfa3c162d1a277651c7754e82ea4bccfa53 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 19:17:52 +0000
+Subject: [PATCH] [daveey] lifecycle guard: a closer glued to a closer closes
+ the next group too
+
+`{ bash; { true; } } < f.sh` ran f.sh on bash's stdin, but the guard
+returned (False, None): fail-open. `_LineWalk.word` recognised a closer
+only at the start of a segment, so the second `}` right after the inner
+`}` was kept as a word. The outer group never closed, and the probe walk
+credited `< f.sh` to the inner group, so the outer group's `bash` kept
+its old feed. bash ends a compound command at its closer, so a closer
+glued to the one before it (`} }`, `} fi`, `} done`, `} esac`, `fi }`)
+closes the next group as well; `bash -n` accepts and bash runs them all.
+
+Fix: while the segment holds only the run of closers that just closed
+groups (`closing[1]` words), a matching closer pops the next group too.
+The closed group's output is routed into its enclosing group first, and
+the trailing redirection is keyed to the outermost group closed in the
+run (skip = run length).
+
+Found in exact-head review of PR #2442 @1bd85160ea (card t_01a1d64520dee76f);
+fix card t_01a1d64a6e506db4.
+
+Proof:
+- RED on base (fix reverted, new tests kept):
+  test_lifecycle_guard_group_redirections.py 52 passed, 9 failed (every
+  glued-closer redirection case, incl. `} fi`/`} done`/`} esac`/`fi }`).
+- GREEN: same file 61/61; all 21 test files importing lifecycle_guard:
+  1208 passed, 0 failed.
+- Mutants (each killed by the file): old `not self.segment` condition
+  (9 fail), skip fixed at 1 (3 fail), dropped output routing (3 fail),
+  `if run:` -> `if True:` (1 fail, `{ ( cat f.sh ) } | bash`).
+- Allowed cases pinned: the run's redirection feeds only the groups it
+  closes (`{ { true; } } < f.sh; bash clean.sh`), `{ echo }; } < f.sh`.
+- scripts/check --base origin/main: 20 checks ok.
+---
+ cron/lifecycle_guard_groups.py                | 11 ++++++--
+ ...test_lifecycle_guard_group_redirections.py | 25 +++++++++++++++++++
+ 2 files changed, 34 insertions(+), 2 deletions(-)
+
+diff --git a/cron/lifecycle_guard_groups.py b/cron/lifecycle_guard_groups.py
+index b48c9ac95c..a8c6b86886 100644
+--- a/cron/lifecycle_guard_groups.py
++++ b/cron/lifecycle_guard_groups.py
+@@ -162,12 +162,19 @@ class _LineWalk:
+         self.feed = group.feed
+ 
+     def word(self, token: str) -> None:
+-        if not self.segment and token in _CLOSERS and self.groups \
++        # A closer right after the closers that started this segment closes the next group too
++        # (`{ bash; { true; } } < f`, `… { true; } fi`): bash ends a compound command at its
++        # closer, so the run's redirection belongs to the outermost group it closed.
++        run = self.closing[1] if self.closing is not None else 0
++        if len(self.segment) == run and token in _CLOSERS and self.groups \
+                 and self.groups[-1].closer == token:
++            if run:
++                # What the group closed just before wrote is its enclosing group's output.
++                self.pending = self.closed or []
+             self.route()
+             group = self.groups.pop()
+             self.closed = group.output
+-            self.closing = (group.ordinal, 1)
++            self.closing = (group.ordinal, run + 1)
+             self.feed = self.enclosing_feed()
+         self.segment.append(token)
+ 
+diff --git a/tests/cron/test_lifecycle_guard_group_redirections.py b/tests/cron/test_lifecycle_guard_group_redirections.py
+index 736409cd39..d87d8c58a4 100644
+--- a/tests/cron/test_lifecycle_guard_group_redirections.py
++++ b/tests/cron/test_lifecycle_guard_group_redirections.py
+@@ -9,6 +9,9 @@ Each case below ran a lifecycle ``.py``/``.sh`` on stdin the guard never opened:
+    closer, after the group's commands were read, and fed none of them.
+ 4. An environment assignment glued to ``<`` (``X=1<f.py python3``): the assignment pattern took
+    the whole word, so the redirection was never split off.
++5. A closer glued to the closer before it (``{ bash; { true; } } < f.sh``, ``… { true; } fi``):
++   only the inner group closed, so the redirection was credited to it and the outer
++   group's commands kept their old feed.
+ """
+ 
+ from __future__ import annotations
+@@ -68,6 +71,23 @@ def files(tmp_path) -> dict[str, str]:
+         "{{ true; bash; }} > /dev/null < {sh}",
+         "true; {{ bash; }} < {sh}",
+         "cat {clean_sh} | {{ bash; }} < {sh}",
++        # 5. A closer glued to the closer before it closes the next group too, so the
++        #    redirection after the run belongs to the outermost group closed in it.
++        "{{ bash; {{ true; }} }} < {sh}",
++        "{{ {{ bash; }} }} < {sh}",
++        "{{ python3; {{ {{ true; }} }} }} < {py}",
++        "{{ bash; {{ {{ true; }} }} }} < {sh}",
++        "{{ bash; if true; then {{ true; }} fi }} < {sh}",
++        "if true; then bash; {{ true; }} fi < {sh}",
++        "while read l; do bash; {{ true; }} done < {sh}",
++        "for x in 1; do bash; {{ true; }} done < {sh}",
++        "case x in *) bash; {{ true; }} esac < {sh}",
++        "{{ bash; if true; then true; fi }} < {sh}",
++        "cat {sh} | {{ {{ {{ true; }} }}; bash; }}",
++        "{{ {{ cat {sh}; }} }} | bash",
++        "{{ {{ {{ cat {py}; }} }} }} | python3",
++        "if true; then {{ cat {sh}; }} fi | bash",
++        "{{ ( cat {sh} ) }} | bash",
+         # 4. An environment assignment glued to `<`.
+         "X=1<{py} python3",
+         "X=1 Y=2<{py} python3",
+@@ -92,6 +112,11 @@ def test_group_and_glued_stdin_feeds_are_scanned(files, template):
+         "(true) 2< {sh}",
+         "while read l; do echo $l; done < {sh}",
+         "{{ cat; }} < {clean_sh} | bash",
++        # A glued closer run's redirection feeds the groups it closes, nothing after them.
++        "{{ {{ true; }} }} < {sh}; bash {clean_sh}",
++        "{{ bash {clean_sh}; {{ true; }} }} < {sh}",
++        "{{ {{ true; }} }} < {sh}; bash < {clean_sh}",
++        "{{ echo }}; }} < {sh}",
+         # Data: the redirection names the file, nothing runs it.
+         "echo '{{ bash; }} < {sh}'",
+         "grep -c x < {sh}",
+-- 
+2.43.0
+

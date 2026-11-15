@@ -1,0 +1,378 @@
+From b1f611bc3b0943bdd182f501ce5e7ff0ec48235d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 18:10:42 +0000
+Subject: [PATCH] [daveey] kanban sync: a 410 on a primary board's live file
+ sweeps this gateway's rows the snapshot lacks
+
+When the live pull of a primary board raised Resync, sync_board resynced the live file in place
+(partition=gateway). A snapshot carries only live rows and resync only upserts, so a row of this
+gateway's cards that the Board deleted below its retention floor stayed in the live file forever.
+The replica path is safe (it unlinks and rebuilds its file); the live file cannot be unlinked: it
+holds unpushed local cards, local tombstones and picked-up copies of other gateways' cards.
+
+New hermes_cli/kanban_sync_resync_sweep.py: resync_live() runs the same resync through a hub proxy
+that records each snapshot table's uids, then sweep_absent() deletes only rows that are
+- in this gateway's partition: a card created_on this gateway (or unset), a link whose child is
+  such a card, a child row of such a card (picked-up foreign copies are never swept);
+- absent from a snapshot table read to its last page (an aborted resync sweeps nothing);
+- not held locally: no outbox op for the row (pending or rejected) or for its card, no tombstone;
+- not created after the rebuild began; task_events older than the Board's event retention are
+  kept (the Board drops those without a delete).
+The deletes go through apply_remote_changes (feed delete handlers, tombstones, observers),
+children before cards. apply_remote_changes gains keep=, asked about each change inside its
+transaction, so every candidate is re-checked atomically with its delete. sync_board already
+holds board_sync_lock for the round.
+
+Dormant: no Board has advanced a retention floor yet. Follow-up of t_01a1d5d6e37eafd6 (the
+install-boards replica sweep in state); card t_01a1d5f9de4020fa.
+
+Proof: tests/hermes_cli/test_kanban_sync_live_resync_sweep.py. The round test pushes two own
+cards and two comments, has the Board delete one card and one comment, advances the floor, then
+runs a round with /ops down (a new local card stays pending) and a picked-up foreign copy in the
+file. RED on main at `assert gone not in tasks`; GREEN with the fix: the deleted card and comment
+are gone (with tombstones), the kept card, its kept comment, the unpushed local card (outbox
+still pending) and the foreign copy remain, cursor at the head. Two unit tests cover the
+rejected-outbox, tombstone, written-after-start and incomplete-snapshot guards.
+---
+ hermes_cli/kanban_db_sync.py                  |   9 +-
+ hermes_cli/kanban_sync_client.py              |   4 +-
+ hermes_cli/kanban_sync_resync_sweep.py        | 132 ++++++++++++++++++
+ .../test_kanban_sync_live_resync_sweep.py     | 130 +++++++++++++++++
+ 4 files changed, 271 insertions(+), 4 deletions(-)
+ create mode 100644 hermes_cli/kanban_sync_resync_sweep.py
+ create mode 100644 tests/hermes_cli/test_kanban_sync_live_resync_sweep.py
+
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index 539b48b29e..539e6475b3 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -32,7 +32,7 @@ import sqlite3
+ import threading
+ import time
+ from dataclasses import dataclass, field
+-from typing import Any, Mapping, Optional, Protocol, Sequence
++from typing import Any, Callable, Mapping, Optional, Protocol, Sequence
+ 
+ from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
+ 
+@@ -1280,6 +1280,7 @@ _CLAIMABLE = ("ready", "review")
+ def apply_remote_changes(
+     conn: sqlite3.Connection, changes: Sequence[RemoteChange], *, new_cursor: int, board: Optional[str] = None,
+     observers: bool = True, local_pending_wins: bool = False,
++    keep: Optional[Callable[[sqlite3.Connection, RemoteChange], bool]] = None,
+ ) -> ApplyResult:
+     """Apply one feed page in ONE transaction, then fire local observers.
+ 
+@@ -1291,7 +1292,8 @@ def apply_remote_changes(
+     ``origin_gateway``; a page that makes work claimable wakes the dispatcher.
+     ``observers=False`` (a shadow copy) applies the rows and fires nothing. ``local_pending_wins`` (the feed
+     pull and the snapshot rebuild) keeps every task field that has an unanswered local edit in the outbox, read
+-    in the same transaction as the apply. [daveey]"""
++    in the same transaction as the apply. ``keep`` (the live-file rebuild sweep) is asked about each change inside
++    that transaction; a change it refuses is skipped. [daveey]"""
+     from hermes_cli.kanban_db_connect import write_txn
+     result = ApplyResult(cursor=new_cursor, local_pending_wins=local_pending_wins)
+     with write_txn(conn):
+@@ -1304,6 +1306,9 @@ def apply_remote_changes(
+             conn.execute("UPDATE kanban_sync_state SET applying = 1")
+             own = _state(conn)["gateway_id"]
+             for change in changes:
++                if keep is not None and not keep(conn, change):
++                    result.skipped += 1
++                    continue
+                 _apply_one(conn, change, own, result)
+             if result.left_terminal or result.reopened:  # a wake never reopens a done card [daveey]
+                 from hermes_cli.kanban_terminal_guard import enforce_after_apply
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index aec5507fe8..ad56c090cf 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -1042,9 +1042,9 @@ def _sync_board_locked(slug: str, path: Path, hub: Hub, gateway: str) -> RoundRe
+                     with credited(live):
+                         result.behind |= pull(live, hub, slug, observers=True, partition=gateway).more
+                 except Resync:
+-                    _log.warning("kanban sync: %s live cursor below the retention floor; rebuilding from a snapshot", slug)
++                    from hermes_cli.kanban_sync_resync_sweep import resync_live  # also sweeps the Board's deletes
+                     applies = None
+-                    resync(live, hub, slug, observers=True, partition=gateway)
++                    resync_live(live, hub, slug, gateway)
+             from hermes_cli.kanban_sync_repair_revision import ensure_revision
+             ensure_revision(live)
+             inputs = _repair_inputs(path, replica, mode, gateway)
+diff --git a/hermes_cli/kanban_sync_resync_sweep.py b/hermes_cli/kanban_sync_resync_sweep.py
+new file mode 100644
+index 0000000000..54d47ba0a1
+--- /dev/null
++++ b/hermes_cli/kanban_sync_resync_sweep.py
+@@ -0,0 +1,132 @@
++"""Rebuild a primary board's LIVE file from a snapshot after a 410, then sweep this gateway's rows it lacks.
++
++A snapshot carries only live rows and :func:`kanban_sync_client.resync` only upserts, so a row of this gateway's
++cards that the Board deleted below its retention floor would stay in the live file forever. The replica is rebuilt
++into a fresh file (``_pulled_replica`` unlinks it); the live file cannot be: it holds unpushed local cards (outbox),
++local tombstones and picked-up copies of other gateways' cards. So the sweep deletes only a row that is
++
++- in this gateway's partition: a card ``created_on`` this gateway (or unset, a local card the Board never
++  stamped here), a link whose child is such a card, a child row of such a card;
++- absent from a snapshot table read to its last page;
++- not held locally: no outbox op for the row (pending or refused) or, for a child row, for its card, and no local
++  tombstone;
++- not written after the rebuild began (its creation time, in whole seconds, is not after ``since``; a local
++  write in that same second has an outbox op).
++
++The deletes go through the feed apply (the same handlers and tombstones as a feed delete, observers fired), children
++before cards, and each candidate is re-checked inside that apply transaction. The caller holds the round's
++``board_sync_lock`` (``sync_board``), so no push of this board runs meanwhile. [daveey] t_01a1d5f9de4020fa
++"""
++
++from __future__ import annotations
++
++import logging
++import sqlite3
++import time
++from typing import Any, Mapping, Optional
++
++from hermes_cli import kanban_db_sync as sync
++
++_log = logging.getLogger(__name__)
++
++_OWN = "(t.created_on IS NULL OR t.created_on = :gw)"
++_CARD_FREE = "NOT EXISTS (SELECT 1 FROM kanban_sync_outbox o WHERE o.table_name = 'tasks' AND o.row_uid = t.id)"
++# Child rows of this gateway's cards: (uid expression, creation-time column or None).
++_CHILDREN: dict[str, tuple[str, Optional[str]]] = {
++    "task_links": ("x.parent_id || '>' || x.child_id", None),
++    "task_runs": ("x.uid", "started_at"),
++    "task_comments": ("x.uid", "created_at"),
++    "task_events": ("x.uid", "created_at"),
++    "task_attachments": ("x.uid", "created_at"),
++    "task_chat_links": ("x.uid", "created_at"),
++}
++
++
++def _row_free(table: str, uid: str) -> str:
++    return (f"NOT EXISTS (SELECT 1 FROM kanban_sync_outbox o WHERE o.table_name = '{table}' AND o.row_uid = {uid}) "
++            f"AND NOT EXISTS (SELECT 1 FROM kanban_sync_tombstones d WHERE d.table_name = '{table}' "
++            f"AND d.row_uid = {uid})")
++
++
++def _candidates_sql(table: str) -> str:
++    """Rows of ``table`` the sweep may delete (before the snapshot comparison); ``:uid`` NULL selects all."""
++    if table == "tasks":
++        return (f"SELECT t.id FROM tasks t WHERE {_OWN} AND COALESCE(t.created_at, 0) <= :since "
++                f"AND {_row_free('tasks', 't.id')} AND (:uid IS NULL OR t.id = :uid)")
++    uid, born = _CHILDREN[table]
++    task = "x.child_id" if table == "task_links" else "x.task_id"
++    where = [_OWN, _CARD_FREE, _row_free(table, uid), f"(:uid IS NULL OR {uid} = :uid)"]
++    if born:
++        where.append(f"COALESCE(x.{born}, 0) <= :since")
++    if table == "task_events":  # the Board drops older events without a delete: their absence is no deletion
++        where.append("COALESCE(x.created_at, 0) >= :window")
++    if table != "task_links":
++        where.append("x.uid IS NOT NULL")
++    return f"SELECT {uid} FROM {table} x JOIN tasks t ON t.id = {task} WHERE " + " AND ".join(where)
++
++
++def _params(gateway: str, since: int, uid: Optional[str] = None) -> dict[str, Any]:
++    from hermes_cli.kanban_sync_client import EVENT_IMPORT_WINDOW_S
++    return {"gw": gateway, "since": since, "uid": uid, "window": int(time.time()) - EVENT_IMPORT_WINDOW_S}
++
++
++def sweep_absent(conn: sqlite3.Connection, seen: Mapping[str, set[str]], board: str, gateway: str, *,
++                 since: int, observers: bool = True) -> dict[str, int]:
++    """Delete this gateway's rows that the snapshot did not return (``seen``: uids per table read to its last page;
++    a table not in it is not swept). Returns the count deleted per table."""
++    from hermes_cli.kanban_sync_client import IMPORT_ORDER
++    deletes: list[sync.RemoteChange] = []
++    for table in reversed(IMPORT_ORDER):  # children before cards: a card's delete cascades its own rows
++        if table not in seen:
++            continue
++        uids = sorted(str(r[0]) for r in conn.execute(_candidates_sql(table), _params(gateway, since)))
++        deletes += [sync.RemoteChange(seq=0, table=table, uid=uid, op="delete", fields={}, version=0, hlc="",
++                                      origin_gateway="", client_op_id=None)
++                    for uid in uids if uid not in seen[table]]
++    if not deletes:
++        return {}
++
++    swept: dict[str, int] = {}
++
++    def still_sweepable(c: sqlite3.Connection, ch: sync.RemoteChange) -> bool:  # inside the apply transaction
++        if c.execute(_candidates_sql(ch.table), _params(gateway, since, ch.uid)).fetchone() is None:
++            return False
++        swept[ch.table] = swept.get(ch.table, 0) + 1
++        return True
++
++    cursor = int((sync.sync_state(conn) or {}).get("cursor") or 0)
++    sync.apply_remote_changes(conn, deletes, new_cursor=cursor, board=board, observers=observers,
++                              keep=still_sweepable)
++    return swept
++
++
++class _SeenHub:
++    """Hub proxy that records the uids each snapshot table returned, and which tables were read to the end."""
++
++    def __init__(self, hub: Any) -> None:
++        self._hub = hub
++        self.seen: dict[str, set[str]] = {}
++        self.complete: set[str] = set()
++
++    def __getattr__(self, name: str) -> Any:
++        return getattr(self._hub, name)
++
++    def snapshot_page(self, board: str, table: str, after: str = "") -> dict:
++        page = self._hub.snapshot_page(board, table, after)
++        self.seen.setdefault(table, set()).update(str(r["uid"]) for r in page.get("rows", []))
++        if not page.get("more"):
++            self.complete.add(table)
++        return page
++
++
++def resync_live(conn: sqlite3.Connection, hub: Any, board: str, gateway: str) -> dict[str, int]:
++    """``resync`` a primary board's live file (``partition=gateway``), then :func:`sweep_absent`."""
++    from hermes_cli.kanban_sync_client import resync
++    _log.warning("kanban sync: %s live cursor below the retention floor; rebuilding from a snapshot", board)
++    since = int(time.time())
++    seeing = _SeenHub(hub)
++    resync(conn, seeing, board, observers=True, partition=gateway)
++    swept = sweep_absent(conn, {t: seeing.seen.get(t, set()) for t in seeing.complete}, board, gateway, since=since)
++    if swept:
++        _log.warning("kanban sync: %s live rebuild removed rows the Board deleted: %s", board, swept)
++    return swept
+diff --git a/tests/hermes_cli/test_kanban_sync_live_resync_sweep.py b/tests/hermes_cli/test_kanban_sync_live_resync_sweep.py
+new file mode 100644
+index 0000000000..d1bbc688e0
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sync_live_resync_sweep.py
+@@ -0,0 +1,130 @@
++"""A 410 on a primary board's LIVE file rebuilds it in place from a snapshot (t_01a1d5f9de4020fa).
++
++A snapshot carries only live rows and ``resync`` only upserts, so a row of this gateway's cards that the Board deleted
++below its retention floor stayed in the live file forever. The rebuild now sweeps such rows, and only those: rows of
++this gateway's cards (``created_on`` this gateway, or unset), absent from the snapshot, with no outbox op (an unpushed
++or refused local write), no local tombstone, and not written after the rebuild began. A picked-up copy of another
++gateway's card is another partition's row and is never swept. The replica path already unlinks and rebuilds its file.
++"""
++from __future__ import annotations
++
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_sync_client as ksc
++from hermes_cli import kanban_sync_resync_sweep as sweep
++from tests.hermes_cli import kanban_sync_support as support
++from tests.hermes_cli.kanban_sync_fake_board import FakeHub, FakeService
++
++ME, OTHER, BOARD = "macbook", "mini", "default"
++
++
++@pytest.fixture
++def kanban_home(tmp_path, monkeypatch):
++    return support.kanban_home(tmp_path, monkeypatch)
++
++
++@pytest.fixture
++def svc():
++    return FakeService()
++
++
++@pytest.fixture
++def live(kanban_home):
++    support.write_sync_config(kanban_home, True)
++    conn = kbc.connect(kanban_home / "kanban.db")
++    ksc.ensure_identity(conn, BOARD, ME)
++    sync.set_mode(conn, "primary")
++    try:
++        yield conn
++    finally:
++        conn.close()
++
++
++class OpsDown(FakeHub):
++    """/ops answers 503 while /changes and the snapshot keep working: a local write stays in the outbox."""
++
++    def ops(self, board, ops):
++        raise ksc.HubError(503, "service unavailable")
++
++
++def _round(kanban_home, hub):
++    return ksc.sync_board(BOARD, kanban_home / "kanban.db", hub, ME)
++
++
++def _board_deletes(svc, *rows):
++    hlc = f"{time.time_ns() // 1_000_000:013d}-0000-{OTHER}"
++    res = svc.hub(OTHER).ops(BOARD, [{"client_op_id": f"del-{i}", "op": "delete", "table": table, "uid": uid,
++                                      "hlc": hlc, "fields": {}} for i, (table, uid) in enumerate(rows)])
++    assert [r["status"] for r in res["results"]] == ["applied"] * len(rows)
++
++
++def _ids(conn, table="tasks", key="id"):
++    return {r[0] for r in conn.execute(f"SELECT {key} FROM {table}")}
++
++
++def _picked_up_foreign_copy(conn, task_id):
++    """A copy of another gateway's card in this file (pickup), which the Board no longer holds."""
++    with kbc.write_txn(conn):
++        conn.execute("UPDATE kanban_sync_state SET applying = 1")
++        conn.execute("INSERT INTO tasks (id, title, status, created_at, created_on) VALUES (?, 'foreign', 'ready', 1, ?)",
++                     (task_id, OTHER))
++        conn.execute("UPDATE kanban_sync_state SET applying = 0")
++
++
++def test_a_410_on_the_live_file_sweeps_own_rows_the_board_deleted_and_keeps_local_work(live, svc, kanban_home):
++    gone = kb.create_task(live, title="deleted on the Board")
++    kept = kb.create_task(live, title="still on the Board")
++    kb.add_comment(live, kept, "me", "a comment the Board deleted")
++    kb.add_comment(live, kept, "me", "a comment the Board keeps")
++    assert _round(kanban_home, svc.hub(ME)).error is None
++    assert not live.execute("SELECT 1 FROM kanban_sync_outbox").fetchone()  # everything acked
++    dropped, comment_kept = [r[0] for r in live.execute("SELECT uid FROM task_comments ORDER BY id")]
++    _board_deletes(svc, ("task_comments", dropped), ("tasks", gone))
++    svc.compact(BOARD)  # the deletes are below the floor now: the live cursor gets 410
++    assert int(sync.sync_state(live)["cursor"]) < svc.board(BOARD)["floor"]
++
++    local = kb.create_task(live, title="unpushed local card")  # its op waits in the outbox
++    _picked_up_foreign_copy(live, "t_foreign_copy")
++    with pytest.raises(ksc.HubError):  # the send after the pulls fails: the local card stays unpushed
++        _round(kanban_home, OpsDown(svc, ME))
++
++    tasks = _ids(live)
++    assert gone not in tasks  # RED before: the snapshot only upserts, the Board's delete never reached this file
++    assert dropped not in _ids(live, "task_comments", "uid")
++    assert {kept, local, "t_foreign_copy"} <= tasks
++    assert comment_kept in _ids(live, "task_comments", "uid")
++    assert live.execute("SELECT 1 FROM kanban_sync_outbox WHERE row_uid = ? AND state = 'pending'",
++                        (local,)).fetchone()
++    assert live.execute("SELECT 1 FROM kanban_sync_tombstones WHERE table_name = 'tasks' AND row_uid = ?",
++                        (gone,)).fetchone()  # a feed delete's tombstone: a stale copy can never bring it back
++    assert int(sync.sync_state(live)["cursor"]) == svc.board(BOARD)["seq"]
++
++
++def test_the_sweep_skips_rows_held_by_the_outbox_a_tombstone_or_written_after_the_rebuild_began(live, svc):
++    held = kb.create_task(live, title="refused edit")
++    stone = kb.create_task(live, title="tombstoned")
++    fresh = kb.create_task(live, title="written during the rebuild")
++    absent = kb.create_task(live, title="really gone")
++    with kbc.write_txn(live):
++        live.execute("DELETE FROM kanban_sync_outbox WHERE row_uid != ?", (held,))
++        live.execute("UPDATE kanban_sync_outbox SET state = 'rejected'")  # still a local write the Board never took
++        live.execute("INSERT INTO kanban_sync_tombstones (table_name, row_uid, deleted_at) VALUES ('tasks', ?, 1)",
++                     (stone,))
++        live.execute("UPDATE tasks SET created_at = ? WHERE id = ?", (int(time.time()) + 60, fresh))
++    swept = sweep.sweep_absent(live, {t: set() for t in ksc.IMPORT_ORDER}, BOARD, ME, since=int(time.time()))
++    assert swept.get("tasks") == 1
++    assert _ids(live) == {held, stone, fresh}
++    assert absent not in _ids(live)
++
++
++def test_an_incomplete_snapshot_sweeps_nothing(live, svc):
++    tid = kb.create_task(live, title="acked")
++    with kbc.write_txn(live):
++        live.execute("DELETE FROM kanban_sync_outbox")
++    assert sweep.sweep_absent(live, {}, BOARD, ME, since=int(time.time()) + 60) == {}
++    assert tid in _ids(live)
+-- 
+2.43.0
+

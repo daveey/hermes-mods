@@ -98,6 +98,12 @@ HINTS = {
     "metric_split": ("{where} reports {hits} with no split. Name the split and metric with every score (\"1.787 val "
                      "BPB\", \"test acc 91.3%\"), reading it from the source table or README, so the next reader "
                      "doesn't assume one and table a val score beside test baselines. {fix}"),
+    "search_cap": ("This GitHub read printed a count of exactly 1000 (`{shown}`). GitHub search (REST search/*, "
+                   "GraphQL `search`, `gh search`, `merged:` queries) and Actions run lists stop at 1000 results, and "
+                   "`--paginate` ends there without an error, so the list is almost certainly truncated. Before any "
+                   "\"none\"/\"all\" claim from it, select `issueCount` (GraphQL) or `total_count` (REST) and split the "
+                   "window until each part is under 1000; PRs merged in a window: "
+                   "github-ci-wait `scripts/merged_since.py` (exits 3 at the cap)."),
 }
 
 # plan_first: a new build ask (a build verb plus a real spec), not a fix/bug report and not already a go.
@@ -1813,6 +1819,42 @@ def worker_ssh_refused(tool: str, args: dict, result: Any) -> Optional[str]:
     return None
 
 
+# search_cap (agent-321e1c0705): GitHub search and Actions run lists stop at 1000 results and `--paginate` ends there
+# quietly. A GitHub read (gh, a github-scoped token-broker run, GraphQL, api.github.com) whose successful output prints
+# a COUNT of exactly 1000 (`n=1000`, `total: 1000`, `runs 1000`, a bare `1000` line from wc -l / jq length) gets one hint.
+# Numbers inside other numbers (431000, 1000.5) and prose about the cap ("is 1000 results") are not counts.
+SEARCH_CAP_GH_RE = re.compile(r"(?<![\w.-])gh(?![\w.-])|github|graphql", re.I)
+_CAP_N = r"1,?000(?![\d.,]\d|\d)"
+SEARCH_CAP_COUNT_RE = re.compile(
+    r"(?:[=:]\s*" + _CAP_N + r")"                                                   # n=1000, total: 1000
+    r"|(?:^[ \t]*" + _CAP_N + r"[ \t]*$)"                                           # a bare `1000` line
+    r"|(?:\b(?:total|count|length|len|n|merged|results?|prs?|runs?|items?|nodes?|issues?|rows?)[ \t]+"
+    + _CAP_N + r")", re.I | re.M)
+
+
+def search_cap(tool: str, args: dict, result: Any) -> Optional[str]:
+    """The line of a successful GitHub read's output that shows a count of exactly 1000, else None."""
+    if tool not in ("terminal", "execute_code"):
+        return None
+    text = str(args.get("command") or "") if tool == "terminal" else str(args.get("code") or "")
+    if not SEARCH_CAP_GH_RE.search(text):
+        return None
+    d = _as_dict(result)
+    if d is not None:
+        if d.get("exit_code") not in (None, 0) or d.get("status") not in (None, "success"):
+            return None
+        out = str(d.get("output") or "")
+    else:
+        out = str(result or "")
+    m = SEARCH_CAP_COUNT_RE.search(out)
+    if not m:
+        return None
+    start = out.rfind("\n", 0, m.start()) + 1
+    end = out.find("\n", m.end())
+    line = out[start:end if end >= 0 else len(out)].strip()
+    return line[:120] or "1000"
+
+
 _HEAVY_EXEC = {"pytest", "py.test", "run_tests.sh", "test-all", "vitest", "wait_for_ci.py"}
 # A command whose program only reads or edits text: `sed -n 1,90p scripts/run_tests.sh`, `rg -n "pytest"`.
 _READERS = {"sed", "cat", "rg", "grep", "egrep", "head", "tail", "less", "wc", "git", "ls", "echo", "printf", "cmp",
@@ -2604,11 +2646,48 @@ def strip_injected_preamble(command: str) -> str:
     return INJECTED_PREAMBLE_RE.sub("", command) if isinstance(command, str) else command
 
 
+# agent-017050f699: the read ran as `G pr view $n` through `G() { timeout 60 $TB exec --scope user/github ... -- gh
+# "$@" | grep -v <secrets>; }` (a token-broker wrapper), so no `gh pr view` text existed and pr_state_claim flagged a
+# reply whose claim the turn had just read. A PR read is keyed on the gh invocation, not its spelling: gh wrappers
+# defined in the same command (a function forwarding "$@"/$* to gh, an alias for gh, a variable whose value ends in
+# gh) have their calls rewritten to `gh ...` before PR_READ_RE runs, and every such read gets its own line (the `->`
+# line shows the wrapper's name, which no rule reads).
+_GH_FUNC_RE = re.compile(r"(?:\bfunction\s+)?(?<![\w$-])([A-Za-z_][\w-]*)\s*\(\)\s*\{([^{}]*)\}")
+_GH_FORWARD_RE = re.compile(r"(?<![\w-])gh\s+[\"']?\$(?:@|\*|\{@\}|\{\*\})")
+_GH_ALIAS_RE = re.compile(r"\balias\s+([A-Za-z_][\w-]*)=([\"']?)([^\"'\n;]*?(?<![\w-])gh)\2(?=[\s;&|)]|$)")
+_GH_VAR_RE = re.compile(r"(?<![\w$])([A-Za-z_]\w*)=([\"'])([^\"'\n]*?(?<![\w-])gh)\2")
+_GH_SUBCMD = r"(pr|api)\b"
+
+
+def expand_gh_wrappers(command: str) -> str:
+    """`command` with calls of gh wrappers it defines (`G pr view 1`, `g api ...`, `$GH pr checks 1`) spelled as
+    `gh ...`; unchanged when it defines none."""
+    if not isinstance(command, str) or "gh" not in command:
+        return command
+    names = {m.group(1) for m in _GH_FUNC_RE.finditer(command) if _GH_FORWARD_RE.search(m.group(2))}
+    names |= {m.group(1) for m in _GH_ALIAS_RE.finditer(command)}
+    names.discard("gh")
+    variables = {m.group(1) for m in _GH_VAR_RE.finditer(command)}
+    out = command
+    for n in sorted(names, key=len, reverse=True):
+        out = re.sub(r"(?<![\w$/.-])" + re.escape(n) + r"\s+" + _GH_SUBCMD, r"gh \1", out)
+    for v in sorted(variables, key=len, reverse=True):
+        out = re.sub(r"\"?\$(?:\{" + re.escape(v) + r"\}|" + re.escape(v) + r"(?!\w))\"?\s+" + _GH_SUBCMD,
+                     r"gh \1", out)
+    return out
+
+
 def pr_read_lines(arg: str, cap: int = TURN_LOG_ARG_CAP) -> list[str]:
     """`   <- PR read: <the read>` for each PR-state read that starts past the `->` line's `cap` chars (none
-    otherwise: the `->` line shows it). `--help` calls are not reads."""
+    otherwise: the `->` line shows it), and for every read made through a gh wrapper the command defines
+    (expand_gh_wrappers). `--help` calls are not reads."""
     out: list[str] = []
-    if not isinstance(arg, str) or len(arg) <= cap:
+    if not isinstance(arg, str):
+        return out
+    expanded = expand_gh_wrappers(arg)
+    if expanded != arg:
+        arg, cap = expanded, 0
+    if len(arg) <= cap:
         return out
     for m in PR_READ_RE.finditer(arg):
         if m.start() < cap and m.end() <= cap:
@@ -4310,6 +4389,16 @@ class AgentCoach:
         if hit:
             self._fire(s, sid, "cleanup_sweeper", "session", what=hit.replace("{", "(").replace("}", ")"))
 
+    def check_search_cap(self, sid: str, tool: str, args: Any, result: Any) -> None:
+        """search_cap rule (once per session): a GitHub read that printed a count of exactly 1000 (the search cap).
+        Also run from transform_tool_result so the hint lands on the result that showed the count."""
+        if not sid:
+            return
+        shown = search_cap(tool, args if isinstance(args, dict) else {}, result)
+        if shown:
+            self._fire(self._s(sid), sid, "search_cap", "session",
+                       shown=shown.replace("{", "(").replace("}", ")").replace("`", "'"))
+
     def check_metric_split(self, sid: str, tool: str, args: Any) -> None:
         """metric_split rule (once per number per session): a kanban_complete/comment/create text with a metric score
         and no val/test split. Also run from transform_tool_result so the hint lands on the handoff call itself."""
@@ -4467,6 +4556,7 @@ class AgentCoach:
         self.check_empty_wait(sid, tool, args, result)
         self.check_cleanup_sweeper(sid, tool, args, result, status)
         self.check_metric_split(sid, tool, args)
+        self.check_search_cap(sid, tool, args, result)
         # plan_first (once per session). A clarify the user answered showed them the plan: that counts as a reply.
         if tool == "clarify":
             d = _as_dict(result) or {}

@@ -1,0 +1,151 @@
+From 356d10cd1abc9638836f66eba75f719c16b70980 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 21:31:28 +0000
+Subject: [PATCH] [daveey] lifecycle guard tests: pin `--`/lone `-` option end
+ and the rcfile-scan bound at a clustered -c payload
+
+Test-only. Post-merge check t_01a1d697acbb03f7 found three exact-anchor mutants of PR #2494
+(915aebe6ac, cron/lifecycle_guard.py) that survived all 76 cases of
+tests/cron/test_lifecycle_guard_shell_command_clusters.py (gap card t_01a1d6cc459b565d):
+
+- M5a `if argument in ("--", "-"):` -> `("-",)`   (`--` no longer ends the options)
+- M5b the same anchor -> `("--",)`                 (a lone `-` no longer ends the options)
+- M7b in `_references_at`, `if command_string:\n return\n if operand_index ...` with
+      `if command_string` -> `if False` (the operand scan runs past a clustered -c payload)
+
+Equivalence check. None of the three is equivalent, but M5a/M5b are invisible to the shapes the
+card suggested. Without the end-marker branch, `--` falls to the unknown-long-option branch and a
+lone `-` to the short-cluster branch; both just skip one word and keep reading. When the next word
+is a plain operand (`bash -c -- 'x'`, `bash -e -- run.sh`) the loop then breaks on it at the same
+index, so the payload/script index is identical and no verdict can differ. The reads diverge only
+when the word after the marker itself starts with `-` or `+`: the mutant parses it as one more
+option cluster, so a script named `-restart.sh` (bash/dash run `./-restart.sh` for
+`bash -- -restart.sh` and `sh - -restart.sh`; checked on this host) is never scanned, and a `-c`
+payload `-a` after `--`/`-` is never yielded for walking. Those are the shapes pinned here.
+
+M7b: at main a `-c` payload is inline source, so after the rc-file scan the function returns. The
+mutant also yields the payload word as a script path anchored on cwd, so
+`bash --rcfile rc.sh -ec deploy` with a `./deploy` holding a lifecycle command is refused although
+bash never runs `./deploy`, and `bash --rcfile restart-rc.sh -ec true` reports `<cwd>/true` as a scanned
+reference. The wider reading (the three anchor lines replaced by `if False:`) is already killed by
+41 existing cases.
+
+Tests added (18 cases):
+- test_double_dash_ends_options_before_a_dashed_script (4): killed by M5a
+- test_lone_dash_ends_options_before_a_dashed_script (4): killed by M5b
+- test_option_end_marks_a_dashed_payload (4): `--` rows killed by M5a, `-` rows by M5b
+- test_dashed_clean_script_after_the_option_end_stays_allowed (2): control
+- test_rcfile_scan_stops_at_a_clustered_c_payload (3): killed by M7b (verdict + references)
+- test_restart_rcfile_before_a_clustered_c_payload_is_scanned (1): killed by M7b (references)
+
+Proof (sdlc-review scripts/mutants.py, scripts/run_tests.sh, this worktree):
+- new file: baseline 94 passed; M5a killed (6 failed), M5b killed (6 failed), M7b killed
+  (4 failed), M7b-wide killed (49 failed)
+- origin/main copy of the file: baseline 76 passed; M5a, M5b, M7b SURVIVED; M7b-wide killed (41)
+- scripts/check --base origin/main: 20 checks ok
+---
+ ..._lifecycle_guard_shell_command_clusters.py | 91 +++++++++++++++++++
+ 1 file changed, 91 insertions(+)
+
+diff --git a/tests/cron/test_lifecycle_guard_shell_command_clusters.py b/tests/cron/test_lifecycle_guard_shell_command_clusters.py
+index 031ca80d73..472bb78c17 100644
+--- a/tests/cron/test_lifecycle_guard_shell_command_clusters.py
++++ b/tests/cron/test_lifecycle_guard_shell_command_clusters.py
+@@ -114,3 +114,94 @@ def test_inline_source_and_mentions_stay_allowed(paths, template):
+ )
+ def test_payload_extraction(command, payloads):
+     assert list(lifecycle_guard._iter_shell_command_payloads(command)) == payloads
++
++
++# `--` and a lone `-` end a shell's options, so the next word is the operand even when it starts
++# with `-` or `+` (bash and dash run `./-x.sh` for `bash -- -x.sh` / `sh - -x.sh`). Read as an
++# unknown long option or an empty cluster instead, the end marker is skipped and the dashed word
++# parsed as one more option cluster: the script (or `-c` payload) is then never read. A plain
++# word after the marker (`bash -c -- 'x'`, `bash -e -- run.sh`) cannot tell the two reads apart.
++@pytest.fixture
++def dashed_scripts(tmp_path) -> str:
++    (tmp_path / "-restart.sh").write_text(f"#!/bin/sh\n{LIFECYCLE}\n", encoding="utf-8")
++    (tmp_path / "+restart.sh").write_text(f"#!/bin/sh\n{LIFECYCLE}\n", encoding="utf-8")
++    (tmp_path / "-clean.sh").write_text("echo ok\n", encoding="utf-8")
++    return str(tmp_path)
++
++
++@pytest.mark.parametrize(
++    "command",
++    [
++        "bash -- -restart.sh",
++        "bash -e -- -restart.sh",
++        "bash -e -- +restart.sh",
++        "sh -- -restart.sh",
++    ],
++)
++def test_double_dash_ends_options_before_a_dashed_script(dashed_scripts, command):
++    assert scan_gateway_lifecycle(command, cwd=dashed_scripts) == (True, None)
++
++
++@pytest.mark.parametrize(
++    "command",
++    [
++        "bash - -restart.sh",
++        "bash -e - -restart.sh",
++        "bash -e - +restart.sh",
++        "sh - -restart.sh",
++    ],
++)
++def test_lone_dash_ends_options_before_a_dashed_script(dashed_scripts, command):
++    assert scan_gateway_lifecycle(command, cwd=dashed_scripts) == (True, None)
++
++
++@pytest.mark.parametrize("marker", ["--", "-"])
++def test_dashed_clean_script_after_the_option_end_stays_allowed(dashed_scripts, marker):
++    assert scan_gateway_lifecycle(f"bash -e {marker} -clean.sh", cwd=dashed_scripts) == (
++        False, None)
++
++
++@pytest.mark.parametrize(
++    ("command", "payloads"),
++    [
++        ("bash -c -- '-a'", ["-a"]),
++        ("bash -ec -- '+a'", ["+a"]),
++        ("bash -c - '-a'", ["-a"]),
++        ("bash -ec - '+a'", ["+a"]),
++    ],
++)
++def test_option_end_marks_a_dashed_payload(command, payloads):
++    assert list(lifecycle_guard._iter_shell_command_payloads(command)) == payloads
++
++
++# An rc file before a clustered `-c` is scanned like the shell's script, but the `-c` payload is
++# inline source: it is walked as commands, never opened as a file. Here the payload word `deploy`
++# also names a file in the cwd that holds a lifecycle command; bash runs `deploy` from PATH (or
++# fails), never `./deploy`, so the rc file is the only reference.
++@pytest.fixture
++def rcfile_dir(tmp_path) -> str:
++    (tmp_path / "deploy").write_text(f"#!/bin/sh\n{LIFECYCLE}\n", encoding="utf-8")
++    (tmp_path / "rc.sh").write_text("echo rc\n", encoding="utf-8")
++    (tmp_path / "restart-rc.sh").write_text(f"{LIFECYCLE}\n", encoding="utf-8")
++    return str(tmp_path)
++
++
++@pytest.mark.parametrize(
++    "command",
++    [
++        "bash --rcfile rc.sh -ec deploy",
++        "bash --init-file rc.sh -lc deploy",
++        "bash --rcfile rc.sh -c -e deploy",
++    ],
++)
++def test_rcfile_scan_stops_at_a_clustered_c_payload(rcfile_dir, command):
++    assert scan_gateway_lifecycle(command, cwd=rcfile_dir) == (False, None)
++    references = set(lifecycle_guard._iter_referenced_shell_scripts(command, cwd=rcfile_dir))
++    assert {path.name for path in references} == {"rc.sh"}
++
++
++def test_restart_rcfile_before_a_clustered_c_payload_is_scanned(rcfile_dir):
++    command = "bash --rcfile restart-rc.sh -ec true"
++    assert scan_gateway_lifecycle(command, cwd=rcfile_dir) == (True, None)
++    references = set(lifecycle_guard._iter_referenced_shell_scripts(command, cwd=rcfile_dir))
++    assert {path.name for path in references} == {"restart-rc.sh"}
+-- 
+2.43.0
+

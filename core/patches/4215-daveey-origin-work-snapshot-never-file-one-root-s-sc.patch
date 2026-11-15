@@ -1,0 +1,199 @@
+From c5a77d34d55b9b7cf63567996427b7c54b0a2cf8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 16:44:10 +0000
+Subject: [PATCH] [daveey] origin-work snapshot: never file one root's scope in
+ another root's file; tests cannot write the live one
+
+hermes-hub, 2026-11-14 (card t_01a1dadf165f8c53): the live ~/.hermes/origin-work.db was 23 MB. 38 of its 49
+scoped_snapshot rows (19.7 MB) were keyed by test or scratch homes, about 20 of them pytest tmp homes from the
+hermes-mods coach suite (test_session_cron_other_runtim0, test_invalid_owner_cannot_cert20, ...), each a ~1 MB
+projection of the hub replica. Every save and cold read paid for them.
+
+Five whys:
+1. Why do pytest scopes sit in the live file? remote_snapshot() read kanban_home() twice: once for the file
+   path, once inside _origin_scope(). Every such row has scope[2] (the kanban home) = a pytest tmp dir while the
+   file is the real root's, so the two reads disagreed.
+2. Why did they disagree? The save runs on a process-lifetime background thread (kanban-remote-links). Until
+   hermes-mods 97cfdc52 (2026-11-01) the coach suite's autouse fixture set only HERMES_KANBAN_HOME=tmp_path per
+   test and left HERMES_HOME at the real ~/.hermes (its rows carry scope[0]=/home/ubuntu/.hermes). Between tests
+   kanban_home() was the real root, so a save straddling a test boundary took the real path and the next test's
+   tmp scope.
+3. Why did nothing stop a test process writing the live file? The board has a no-conftest choke point
+   (ensure_kanban_test_isolation) but origin-work.db had none; core's conftest only covers tests/ in core.
+4. Why did it matter? Each stale scope keeps ~1 MB forever (no expiry for scopes), and the file is rewritten
+   and read by every process on the host.
+
+Fix:
+- remote_snapshot() resolves the root once, computes the scope, and refuses the save (RuntimeError; the caller
+  logs and retries on the next change) when kanban_home() moved meanwhile. Path and scope now always name the
+  same root. The read path computes its scope before opening, same values as before.
+- hermes_state_guard.ensure_origin_work_test_isolation(): a pytest-context process (env or ancestry, as the
+  board guard) may not write <account root>/origin-work.db. Called before mkdir/connect.
+
+Proof: tests/hermes_cli/test_kanban_origin_snapshot_isolation.py. On origin/main 2 of 4 fail: the env-swap
+race files the test root's scope in the session root's file (the live symptom) and the live-root write is not
+refused. With the fix all 4 pass; 369 tests across the 20 files touching remote_snapshot/hermes_state_guard pass.
+
+The live file's dead rows are pruned separately on the hub after the WAL change (PR #3028) is installed.
+---
+ ...kanban_session_activity_origin_snapshot.py | 13 ++-
+ hermes_state_guard.py                         | 14 +++
+ .../test_kanban_origin_snapshot_isolation.py  | 85 +++++++++++++++++++
+ 3 files changed, 110 insertions(+), 2 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_origin_snapshot_isolation.py
+
+diff --git a/hermes_cli/kanban_session_activity_origin_snapshot.py b/hermes_cli/kanban_session_activity_origin_snapshot.py
+index b6229efd85..0b0716b49e 100644
+--- a/hermes_cli/kanban_session_activity_origin_snapshot.py
++++ b/hermes_cli/kanban_session_activity_origin_snapshot.py
+@@ -31,12 +31,22 @@ def remote_snapshot(cards: list[dict[str, Any]] | None = None) -> list[dict[str,
+     from hermes_cli import kanban_db
+     from hermes_cli import kanban_session_activity as _ksa  # lazy: that module imports this one; tests spy its seams
+ 
+-    path = kanban_db.kanban_home() / "origin-work.db"
++    root = kanban_db.kanban_home()
++    path = root / "origin-work.db"
+     if cards is None:
+         if not path.exists():
+             return None
++        scope = json.dumps(_ksa._origin_scope())
+         conn = _ksa._open_ro(path)
+     else:
++        # The scope re-reads kanban_home(). A save racing an env swap (a test fixture moving HERMES_KANBAN_HOME)
++        # filed one root's scope in another root's file: 20 pytest rows of ~1 MB in the hub's live file. [daveey]
++        scope = json.dumps(_ksa._origin_scope())
++        if kanban_db.kanban_home() != root:
++            raise RuntimeError("kanban home moved while resolving the origin-work scope; not saving across roots")
++        import hermes_state_guard
++
++        hermes_state_guard.ensure_origin_work_test_isolation(path)
+         path.parent.mkdir(parents=True, exist_ok=True)
+         conn = _ksa._kanban_lockguard.connect(path, timeout=0.5)
+         try:
+@@ -45,7 +55,6 @@ def remote_snapshot(cards: list[dict[str, Any]] | None = None) -> list[dict[str,
+             conn.close()
+             raise
+     try:
+-        scope = json.dumps(_ksa._origin_scope())
+         if cards is not None:
+             with conn:
+                 conn.execute("CREATE TABLE IF NOT EXISTS scoped_snapshot (scope TEXT PRIMARY KEY, data TEXT NOT NULL)")
+diff --git a/hermes_state_guard.py b/hermes_state_guard.py
+index fdb2432279..770a12a28f 100644
+--- a/hermes_state_guard.py
++++ b/hermes_state_guard.py
+@@ -176,6 +176,20 @@ def ensure_kanban_test_isolation(db_path: Path) -> None:
+         )
+ 
+ 
++def ensure_origin_work_test_isolation(path: Path) -> None:
++    """Raise before a pytest-context process (env OR ancestry) writes the account's live ``<root>/origin-work.db``.
++    Plugin suites with their own conftest swap HERMES_KANBAN_HOME per test; background saves landed ~20 MB of
++    test-scope rows in the hub's live file (t_01a1dadf165f8c53). Needs no conftest, like the board guard. [daveey]"""
++    if not _in_test_context():
++        return
++    root = _account_hermes_root()
++    if root is not None and Path(path).expanduser().resolve() == root / "origin-work.db":
++        raise RuntimeError(
++            f"live-system guard: a test resolved the production origin-work snapshot {path} (under the account's "
++            f"Hermes root {root}). Isolate HERMES_KANBAN_HOME in the fixture."
++        )
++
++
+ # Test-only SessionDB instance registry. Under the hermetic suite every
+ # successfully constructed SessionDB is added to this WeakSet so the autouse
+ # teardown in tests/conftest.py (_close_leaked_session_dbs) can close whatever
+diff --git a/tests/hermes_cli/test_kanban_origin_snapshot_isolation.py b/tests/hermes_cli/test_kanban_origin_snapshot_isolation.py
+new file mode 100644
+index 0000000000..8362d63096
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_origin_snapshot_isolation.py
+@@ -0,0 +1,85 @@
++"""Test processes must never write the live ``<root>/origin-work.db``.
++
++hermes-hub, 2026-11-14 (t_01a1dadf165f8c53): the live origin-work.db had grown to 23 MB. Two thirds of its
++``scoped_snapshot`` rows were keyed by pytest tmp homes (``.../pytest-of-ubuntu/pytest-4237/test_session_cron_other_runtim0``),
++each holding a ~1 MB projection of the hub replica. A background snapshot save resolved ``kanban_home()`` twice: once
++for the file path, once inside ``_origin_scope()``. A suite whose per-test fixture swaps ``HERMES_KANBAN_HOME`` between
++those reads saved the next test's scope into the session root's file (here the live one). No guard refused a test
++process writing the account's live file either. [daveey]
++"""
++import json
++import sqlite3
++
++import pytest
++
++import hermes_state_guard
++from hermes_cli import kanban_db, profiles
++from hermes_cli import kanban_session_activity as activity
++
++
++def card(n=0):
++    return {'session': f's{n}', 'id': f't{n}', 'key': f'owner/work/default/t{n}',
++            'status': 'running', 'gateway': 'owner', 'profile': 'work'}
++
++
++@pytest.fixture(autouse=True)
++def _profile(monkeypatch):
++    monkeypatch.setattr(profiles, 'get_active_profile_name', lambda: 'default')
++    activity._reset_cache_for_tests()
++    yield
++    activity._reset_cache_for_tests()
++
++
++def rows(root):
++    path = root / 'origin-work.db'
++    if not path.exists():
++        return []
++    with sqlite3.connect(f'file:{path}?mode=ro', uri=True) as db:
++        return [json.loads(s) for (s,) in db.execute('SELECT scope FROM scoped_snapshot')]
++
++
++def test_save_never_files_one_roots_scope_in_another_roots_file(tmp_path, monkeypatch):
++    """The live symptom: a row whose scope names kanban home B inside A's origin-work.db."""
++    session_root, test_root = tmp_path / 'session', tmp_path / 'test'
++    session_root.mkdir()
++    test_root.mkdir()
++    # A per-test env fixture runs between the path read and the scope read of a background save.
++    homes = iter([session_root])
++    monkeypatch.setattr(kanban_db, 'kanban_home', lambda: next(homes, test_root))
++    try:
++        activity._remote_snapshot([card()])
++    except RuntimeError:
++        pass  # refusing the save is fine; the caller retries on the next change
++    for root in (session_root, test_root):
++        assert [scope[2] for scope in rows(root)] in ([], [str(root)]), f'foreign scope filed under {root}'
++
++
++def test_test_process_cannot_write_the_live_origin_work_db(tmp_path, monkeypatch):
++    live = tmp_path / 'live-root'
++    live.mkdir()
++    monkeypatch.setattr(hermes_state_guard, '_account_hermes_root', lambda: live.resolve())
++    monkeypatch.setattr(kanban_db, 'kanban_home', lambda: live)
++    with pytest.raises(RuntimeError, match='live-system guard'):
++        activity._remote_snapshot([card()])
++    assert not (live / 'origin-work.db').exists()
++
++
++def test_production_process_still_writes_its_own_root(tmp_path, monkeypatch):
++    live = tmp_path / 'live-root'
++    live.mkdir()
++    monkeypatch.setattr(hermes_state_guard, '_account_hermes_root', lambda: live.resolve())
++    monkeypatch.setattr(hermes_state_guard, '_in_test_context', lambda: False)
++    monkeypatch.setattr(kanban_db, 'kanban_home', lambda: live)
++    assert activity._remote_snapshot([card()]) == [card()]
++    assert activity._remote_snapshot() == [card()]
++    assert [scope[2] for scope in rows(live)] == [str(live)]
++
++
++def test_test_process_may_write_a_sandboxed_root(tmp_path, monkeypatch):
++    live, sandbox = tmp_path / 'live-root', tmp_path / 'sandbox'
++    live.mkdir()
++    sandbox.mkdir()
++    monkeypatch.setattr(hermes_state_guard, '_account_hermes_root', lambda: live.resolve())
++    monkeypatch.setattr(kanban_db, 'kanban_home', lambda: sandbox)
++    assert activity._remote_snapshot([card()]) == [card()]
++    assert not (live / 'origin-work.db').exists()
+-- 
+2.43.0
+

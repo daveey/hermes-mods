@@ -1,0 +1,241 @@
+From 915aebe6ac752bf1d39562ac581a4e820e914183 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 17:39:49 +0000
+Subject: [PATCH] [daveey] lifecycle guard: walk the payload of a clustered
+ shell -c (`bash -ec`, `-lc`, `-xc`, `-c -e`)
+
+The guard read only the exact word `-c` (or `--command`) as a shell's command-string option.
+`bash -ec '...'`, `bash -lc '...'`, `bash -xc '...'`, `zsh -lc '...'` and `sh -c -e '...'` were
+read as plain options, so the payload was never walked for the scripts it runs: an oversize,
+live-SQLite or cloud-placeholder target, or a script that restarts the gateway, passed unread
+(fail-open). `_direct_lifecycle_scan` still caught a literal lifecycle command in the payload
+text; the gap was the referenced-script walk.
+
+Repro on main (2 MB script):
+  scan_gateway_lifecycle("bash -c 'bash big.sh'")   -> (True, scan-cap refusal)
+  scan_gateway_lifecycle("bash -ec 'bash big.sh'")  -> (False, None)
+  scan_gateway_lifecycle("bash -lc 'bash big.sh'")  -> (False, None)
+  same for -xc, -ce, -euc, `-c -e`, `-c --`, zsh -lc, ksh -xc.
+
+Fix: `_shell_options_end` counts a `c` anywhere in a `-` short-option cluster as the
+command-string flag and keeps reading options after it, as bash/sh/dash/ksh/zsh do; the first
+operand past the options is the payload (`-o`, and `-O` outside zsh, still consume their value;
+`--`/`-` still end the options). `_iter_shell_command_payloads` yields that operand; the old
+next-word-after-`-c` read is kept for a `-c` word past a script operand (`bash run.sh -c 'x'`),
+so no payload the old code scanned goes unscanned. `_references_at`'s rcfile scan (bounded by
+the operand since #2388) now ends at a clustered `-c`'s payload as it did at a plain `-c`.
+
+Tests: tests/cron/test_lifecycle_guard_shell_command_clusters.py (76 cases). RED on main
+dc671254d6: 40 fail (every clustered/after-`-c` shape); `-c` and `-euo pipefail -c` pass on both
+as pins. GREEN: 1184 tests across the 19 files that import the guard pass.
+
+Replay over 27917 unique real terminal commands from worker-1's state.db (base dc671254d6 vs
+head, state.db and kanban.db held open as a gateway holds them; 17 use a clustered `-c`):
+0 verdicts change, 25 refused on both, 0 errors.
+
+Card: t_01a1d5dbf9e6753a
+---
+ cron/lifecycle_guard.py                       |  33 +++--
+ ..._lifecycle_guard_shell_command_clusters.py | 116 ++++++++++++++++++
+ 2 files changed, 141 insertions(+), 8 deletions(-)
+ create mode 100644 tests/cron/test_lifecycle_guard_shell_command_clusters.py
+
+diff --git a/cron/lifecycle_guard.py b/cron/lifecycle_guard.py
+index 78706e582b..c6631a90e3 100644
+--- a/cron/lifecycle_guard.py
++++ b/cron/lifecycle_guard.py
+@@ -1073,9 +1073,11 @@ def _iter_command_segment_views(command: str) -> Iterator[list[str]]:
+ 
+ def _shell_options_end(arguments: list[str], shell: str) -> tuple[int, bool, bool]:
+     """``(operand_index, command_string, reads_stdin)`` for a POSIX *shell*'s *arguments*: the
+-    index of the first operand past the options, whether a ``-c``/``--command`` flag ends them
+-    (inline source follows), and whether a short-option cluster holds ``s`` (commands come from
+-    stdin). Each ``o`` in a short-option cluster (``-o x``, ``-euo pipefail``) consumes the next
++    index of the first operand past the options, whether a ``-c`` option is among them (that
++    operand is then the inline source, not a script), and whether a short-option cluster holds
++    ``s`` (commands come from stdin). ``c`` counts anywhere in a ``-`` cluster (``-ec``, ``-lc``,
++    ``-xc``, ``-ce``), and the options go on after it (``-c -e 'cmd'``) as the shell reads them.
++    Each ``o`` in a short-option cluster (``-o x``, ``-euo pipefail``) consumes the next
+     token, as does each ``O`` (``+O extglob``) except under zsh, whose ``-O`` is the valueless
+     CORRECT flag; ``--rcfile`` and ``--init-file`` consume one too; a lone ``-`` ends the options
+     like ``--``. Shells without a ``-O`` (dash) reject it, so reading its value there only skips
+@@ -1083,12 +1085,15 @@ def _shell_options_end(arguments: list[str], shell: str) -> tuple[int, bool, boo
+     value_letters = "o" if shell == "zsh" else "oO"
+     index = 0
+     reads_stdin = False
++    command_string = False
+     while index < len(arguments):
+         argument = arguments[index]
+         if argument in ("--", "-"):
+-            return index + 1, False, reads_stdin
++            return index + 1, command_string, reads_stdin
+         if argument in _SHELL_COMMAND_FLAGS:
+-            return index, True, reads_stdin
++            command_string = True
++            index += 1
++            continue
+         if argument in _SHELL_LONG_OPTIONS_WITH_VALUES:
+             index += 2
+             continue
+@@ -1096,11 +1101,13 @@ def _shell_options_end(arguments: list[str], shell: str) -> tuple[int, bool, boo
+             index += 1
+             continue
+         if argument.startswith(("-", "+")):
+-            reads_stdin = reads_stdin or (argument[0] == "-" and "s" in argument[1:])
++            if argument[0] == "-":
++                reads_stdin = reads_stdin or "s" in argument[1:]
++                command_string = command_string or "c" in argument[1:]
+             index += 1 + sum(letter in value_letters for letter in argument[1:])
+             continue
+         break
+-    return index, False, reads_stdin
++    return index, command_string, reads_stdin
+ 
+ 
+ def _shell_script_operand(arguments: list[str], shell: str) -> Optional[str]:
+@@ -1453,9 +1460,19 @@ def _iter_shell_command_payloads(command: str) -> Iterator[str]:
+         for option in _STRING_COMMAND_OPTIONS.get(_executable_name(segment[index]), ()):
+             yield from _iter_option_values(segment, index, option)
+         index = _executed_command_index(segment)
+-        if index is None or _executable_name(segment[index]) not in _SHELL_EXECUTABLES:
++        if index is None:
++            continue
++        shell = _executable_name(segment[index])
++        if shell not in _SHELL_EXECUTABLES:
+             continue
+         arguments = segment[index + 1 :]
++        payload_index, command_string, _ = _shell_options_end(arguments, shell)
++        if command_string:
++            if payload_index < len(arguments):
++                yield arguments[payload_index]
++            continue
++        # Kept from the plain `-c` read, fail closed: a `-c` word past the script operand
++        # (`bash run.sh -c 'x'`) still has its next word scanned.
+         for arg_index, argument in enumerate(arguments[:-1]):
+             if argument in _SHELL_COMMAND_FLAGS:
+                 yield arguments[arg_index + 1]
+diff --git a/tests/cron/test_lifecycle_guard_shell_command_clusters.py b/tests/cron/test_lifecycle_guard_shell_command_clusters.py
+new file mode 100644
+index 0000000000..031ca80d73
+--- /dev/null
++++ b/tests/cron/test_lifecycle_guard_shell_command_clusters.py
+@@ -0,0 +1,116 @@
++"""A shell's ``-c`` inside a short-option cluster (``bash -ec``, ``-lc``, ``-xc``, ``-ce``).
++
++The guard read only the exact word ``-c`` as the command-string option, so the payload of
++``bash -ec '…'`` / ``bash -lc '…'`` was never walked: a script it runs, an oversize or live-SQLite
++target, or a script past the walk budget all passed unread (fail-open). Options after ``-c``
++(``-c -e '…'``, ``-c -- '…'``) ended the read the same way.
++"""
++
++from __future__ import annotations
++
++import shlex
++
++import pytest
++
++from cron import lifecycle_guard
++from cron.lifecycle_guard import scan_gateway_lifecycle
++
++# Assembled so this file's own text never carries the literal command.
++LIFECYCLE = " ".join(["hermes", "gateway", "re" + "start"])
++
++CLUSTERED_PAYLOAD_SHAPES = [
++    "bash -c {payload}",
++    "bash -ec {payload}",
++    "bash -lc {payload}",
++    "bash -xc {payload}",
++    "bash -euc {payload}",
++    "bash -ce {payload}",
++    "bash -euo pipefail -c {payload}",
++    "bash -euo pipefail -lc {payload}",
++    "bash -c -e {payload}",
++    "bash -c -- {payload}",
++    "bash -lc -o pipefail {payload}",
++    "sh -ec {payload}",
++    "dash -ec {payload}",
++    "zsh -lc {payload}",
++    # zsh's `-O` takes no value, so the next word is the payload.
++    "zsh -Oc {payload}",
++    "ksh -xc {payload}",
++    "sudo bash -lc {payload}",
++    "time bash -ec {payload}",
++    "if true; then bash -ec {payload}; fi",
++]
++
++
++@pytest.fixture
++def paths(tmp_path) -> dict[str, str]:
++    restart = tmp_path / "restart.sh"
++    restart.write_text(f"#!/bin/sh\necho hi\n{LIFECYCLE}\n", encoding="utf-8")
++    big = tmp_path / "big.sh"
++    big.write_text("#" * (lifecycle_guard._MAX_REFERENCED_SCRIPT_BYTES + 1), encoding="utf-8")
++    clean = tmp_path / "clean.sh"
++    clean.write_text("echo ok\n", encoding="utf-8")
++    return {name: str(path) for name, path in
++            {"restart": restart, "big": big, "clean": clean}.items()}
++
++
++@pytest.mark.parametrize("shape", CLUSTERED_PAYLOAD_SHAPES)
++def test_clustered_c_payload_walks_the_script_it_runs(paths, shape):
++    payload = shlex.quote(f"bash {shlex.quote(paths['restart'])}")
++    assert scan_gateway_lifecycle(shape.format(payload=payload)) == (True, None)
++
++
++@pytest.mark.parametrize("shape", CLUSTERED_PAYLOAD_SHAPES)
++def test_clustered_c_payload_fails_closed_on_an_oversize_script(paths, shape):
++    payload = shlex.quote(f"bash {shlex.quote(paths['big'])}")
++    blocked, reason = scan_gateway_lifecycle(shape.format(payload=payload))
++    assert blocked is True
++    assert reason is not None and "scan cap" in reason
++
++
++@pytest.mark.parametrize("shape", CLUSTERED_PAYLOAD_SHAPES)
++def test_clustered_c_payload_running_a_clean_script_stays_allowed(paths, shape):
++    payload = shlex.quote(f"bash {shlex.quote(paths['clean'])}")
++    assert scan_gateway_lifecycle(shape.format(payload=payload)) == (False, None)
++
++
++@pytest.mark.parametrize(
++    "template",
++    [
++        # The payload is inline source, so the shell reads no script and no stdin program.
++        "bash -ec 'echo hi' < {restart}",
++        "bash -lc 'echo hi' < {restart}",
++        "cat {restart} | bash -xc 'cat >/dev/null'",
++        # A mention inside the payload is not a run.
++        "bash -lc 'echo {restart}'",
++        "bash -ec 'grep restart {restart}'",
++        # `-o`/`O` values and `+` options hold no `c` flag.
++        "bash -o noclobber {clean}",
++        "bash +O checkwinsize {clean}",
++    ],
++)
++def test_inline_source_and_mentions_stay_allowed(paths, template):
++    quoted = {name: shlex.quote(path) for name, path in paths.items()}
++    assert scan_gateway_lifecycle(template.format(**quoted)) == (False, None)
++
++
++@pytest.mark.parametrize(
++    ("command", "payloads"),
++    [
++        ("bash -c 'a'", ["a"]),
++        ("bash -ec 'a'", ["a"]),
++        ("bash -lc 'a' arg0 arg1", ["a"]),
++        ("bash -euo pipefail -c 'a'", ["a"]),
++        ("bash -c -e 'a'", ["a"]),
++        ("bash -c -- 'a'", ["a"]),
++        ("bash -o errexit -xc 'a'", ["a"]),
++        ("zsh -lc 'a'", ["a"]),
++        # Still read after a script operand, as before: fail closed on the next word.
++        ("bash run.sh -c 'a'", ["a"]),
++        ("bash -e run.sh", []),
++        ("bash -o c run.sh", []),
++        ("bash +c run.sh", []),
++    ],
++)
++def test_payload_extraction(command, payloads):
++    assert list(lifecycle_guard._iter_shell_command_payloads(command)) == payloads
+-- 
+2.43.0
+

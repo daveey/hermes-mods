@@ -43,6 +43,9 @@ plan-less request. When revising a request that was published with `decisionCard
 `aliases` holding that card's `kanban` ref (else 422 "must retain exact producer card aliases") and keep
 `scope.sourceRefs` (dropping it gives 422 "Invalid object fields"). Before saying nothing waits on the user, read the canonical list in full: when the injected
 note says it was truncated, parse the saved file it names, because the head/tail preview can hide an open request.
+Also list the blocked cards linked to this chat: ask-gate refuses the claim while any is blocked on the user. Answer
+each one the user's standing approvals cover yourself (comment the decision, unblock, read back) instead of
+reporting it as theirs.
 Never tell the user a choice tile "is in your panel" because a user-steps row or `/requests` 200 exists: a blocked card's ask projects only when its owner chat reads its queue, and Desktop renders it later still. Say it will appear there; claim visible only after a read-only renderer check, or after the user's click is recorded. Publish acceptance fixtures (test tiles) from a disposable scratch chat, never a persistent one (user-steps README, live-fixture rule).
 When told “do it yourself,” remove discretionary blockers, not identity or explicit-deny boundaries. For an
 ambiguous acceptance tolerance, test a stricter sufficient bound without redefining the requirement to fit results.
@@ -74,7 +77,7 @@ ask only once its prerequisite is verifiably in place. If an early one is alread
   "from your own Hermes chat open the owner-terminal flow" and this chat IS the user's Desktop chat, the launch is
   yours: run the reviewed recipe through `run_in_user_terminal`, comment the job id and log path, and unblock the
   card; don't relay the ask. Re-read the job's log tail, then post both in one command (`test -s <note> &&
-  hermes kanban comment <id> "$(cat <note>)" && hermes kanban unblock <id>`): a worker picks the unblocked card
+  hermes kanban comment <id> -- "$(cat <note>)" && hermes kanban unblock <id>`): a worker picks the unblocked card
   up within a minute, so an unblock that outlives a failed comment starts it without the job id, and a note
   drafted before a failed post can call a check running after it passed.
   "Approved, unblock" on such a card means run it, then unblock: unblocking alone runs
@@ -91,6 +94,13 @@ ask only once its prerequisite is verifiably in place. If an early one is alread
   apply refuses once any row changed, and on a live queue it goes stale within minutes. Scope it as a fresh capture
   immediately followed by apply, and first check (code or runbook) whether apply tolerates ordinary churn; if it
   doesn't, fix the tool before asking.
+- An approval is not used up by a refusal before any write. Write retry terms into its limits ("a refusal before
+  anything changes doesn't use this approval up: I fix the cause and rerun under it"), never "no rerun without
+  asking you". New paths, checkouts, file hashes or launchers are execution details, not a new decision: when the
+  run stops before writing, fix it and rerun under the approval David gave, and tell him so in one line. Ask again
+  only when a permission limit widens (more targets, data or spend), and name it in a scope line
+  `New since your approval: <limit key>: <what widened>`. ask-gate enforces both (`approval_single_use`,
+  `approval_reuse` in `plugins/ask-gate/approval_reuse.py`).
 - Serialize owner-context tests too, and give each attempt a unique log directory: isolated HOME/board fixtures
   still overwrite evidence when two chats share output paths. If that happened, hash the retained coherent logs
   and count them as one proof, not two independent runs; do not rerun merely to recreate overwritten evidence.
@@ -245,7 +255,7 @@ ask only once its prerequisite is verifiably in place. If an early one is alread
   "Decision for you:" header, and is not restated next turn. user-steps drops it, so no For-you request opens and the
   chat is not painted red. A choice that really blocks you gets a direct question instead ("Should I add it? yes/no").
 - [ ] No reply asks the user to paste or run a command; `run_in_user_terminal` was used instead.
-- [ ] No reply restates an open ask as a bare reminder sentence ('… still need you') outside the ask itself; leave it out, since the open tile already shows it. user-steps holds such a reply once and names the open request: delete the restatement, or re-send unchanged only if it is a different decision.
+- [ ] No reply restates an open ask outside the ask itself, as a bare reminder ('… still need you') or as a line in a status or batch reply's 'waiting on you' list: the open tile already shows it. ask-gate refuses such a reply and user-steps holds it once; delete the line (or re-send unchanged only if it is a different decision), and mention the ask again only with a new fact: a status change, deadline or cost.
 - [ ] Every Chrome ask came after a `browser_focus` that returned that tab shown on the user's display (else the noVNC view was opened).
 - [ ] Every other-Mac GUI ask tried `remote_approve_dialog` first (for prompts) and carries a verified `::screenshare` button.
 - [ ] Every Inbox post is a user-only decision with `ask` set; agent-fixable work went to a Kanban card.

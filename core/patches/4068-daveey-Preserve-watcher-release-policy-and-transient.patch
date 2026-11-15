@@ -1,0 +1,441 @@
+From ce8e71237a940f4b1dae20959ef16de17ba929c9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 00:46:41 +0000
+Subject: [PATCH] [daveey] Preserve watcher release policy and transient
+ signatures
+
+Released roots and all-release state outlive connection LRU eviction; genuine tracked owners reactivate only their path. Transient observations bypass connection-key memos and read semantic revisions/rows. Only the due missing-session-table fallback fingerprints the SQLite snapshot; normal stores never serialize unrelated pages.
+
+Proof: 5 final regression failures on base, 84 tests pass across six focused files, scripts/check all 20 checks pass. Same-mtime commit, restore, WAL next-pass, owner reopening, LRU/root/all-release, reset and due-edge regressions. Missing-table fingerprint is snapshot-bound and throttled. Existing retained-reader budget unchanged. Combined deployed P1 acceptance remains with card J.
+---
+ tests/tui_gateway/test_watch_store_release.py | 256 ++++++++++++++++++
+ tui_gateway/change_watcher.py                 |  13 +-
+ tui_gateway/watch_store.py                    |  60 +++-
+ 3 files changed, 310 insertions(+), 19 deletions(-)
+ create mode 100644 tests/tui_gateway/test_watch_store_release.py
+
+diff --git a/tests/tui_gateway/test_watch_store_release.py b/tests/tui_gateway/test_watch_store_release.py
+new file mode 100644
+index 0000000000..49711717fd
+--- /dev/null
++++ b/tests/tui_gateway/test_watch_store_release.py
+@@ -0,0 +1,256 @@
++"""Released roots outlive observer eviction; transient keys describe content, not connections."""
++import contextlib
++import os
++import shutil
++import sqlite3
++import time
++
++import pytest
++
++from hermes_cli.sqlite_safe_read import has_live_connection
++from hermes_state import _connect_tracked_db
++from hermes_state_registry import close_all, close_all_under
++from tui_gateway import server, watch_store
++
++
++@pytest.fixture(autouse=True)
++def clean():
++    watch_store.reset()
++    server._sessions_db_sig_cache.clear()
++    server._sessions_digest_at.clear()
++    yield
++    watch_store.reset()
++
++
++def create(path, value="A"):
++    path.parent.mkdir(parents=True, exist_ok=True)
++    with contextlib.closing(sqlite3.connect(path)) as conn:
++        conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, title TEXT)")
++        conn.execute("INSERT INTO sessions VALUES ('a', ?)", (value,))
++        conn.commit()
++
++
++def observe(path):
++    with watch_store.observed(path) as (key, conn):
++        assert conn.execute("SELECT title FROM sessions").fetchone()
++        return key
++
++
++@pytest.mark.parametrize("all_roots", [False, True])
++def test_release_before_observation_and_reset(tmp_path, all_roots):
++    inside = tmp_path / "released" / "state.db"
++    outside = tmp_path / "outside" / "state.db"
++    create(inside)
++    create(outside)
++    if all_roots:
++        close_all()
++    else:
++        close_all_under(inside.parent)
++    for _ in range(3):
++        observe(inside)
++        observe(outside)
++        assert not has_live_connection(inside)
++        assert has_live_connection(outside) is not all_roots
++    watch_store.reset()
++    observe(inside)
++    assert has_live_connection(inside)
++
++
++def test_release_covers_evicted_stores_and_reactivation_is_per_path(tmp_path):
++    paths = [tmp_path / f"s{n}.db" for n in range(watch_store.MAX_STORES + 1)]
++    for path in paths:
++        create(path)
++        observe(path)
++    assert not has_live_connection(paths[0])
++    close_all_under(tmp_path)
++    observe(paths[0])
++    assert not has_live_connection(paths[0])
++    with contextlib.closing(_connect_tracked_db(paths[0], tracking_path=paths[0])):
++        observe(paths[0])
++        assert str(paths[0]) in watch_store._held
++        observe(paths[1])
++        assert not has_live_connection(paths[1])
++    close_all_under(tmp_path)
++    observe(paths[0])
++    assert not has_live_connection(paths[0])
++
++
++def content(path, cache):
++    def read(conn, _key):
++        return conn.execute("SELECT title FROM sessions").fetchone()[0], False
++    return server._db_content_sig(path, cache, read)
++
++
++def test_transient_content_stable_and_same_mtime_commit_seen(tmp_path):
++    path = tmp_path / "state.db"
++    create(path)
++    observe(path)
++    close_all_under(tmp_path)
++    cache = {}
++    first = content(path, cache)
++    assert content(path, cache) == first
++    stamp = path.stat()
++    with contextlib.closing(sqlite3.connect(path)) as conn:
++        conn.execute("UPDATE sessions SET title='B'")
++        conn.commit()
++    os.utime(path, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
++    assert content(path, cache) != first
++    assert not has_live_connection(path)
++
++
++def test_transient_restore_equal_mtime(tmp_path):
++    path, other = tmp_path / "state.db", tmp_path / "copy.db"
++    create(path)
++    create(other, "B")
++    observe(path)
++    close_all_under(tmp_path)
++    cache = {}
++    before = content(path, cache)
++    stamp = path.stat()
++    shutil.copyfile(other, path)
++    os.utime(path, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
++    assert content(path, cache) != before
++
++
++def test_transient_missing_table_does_not_broadcast_each_throttle(tmp_path, monkeypatch):
++    path = tmp_path / "state.db"
++    with contextlib.closing(sqlite3.connect(path)) as conn:
++        conn.execute("CREATE TABLE unrelated(v)")
++    with watch_store.observed(path):
++        pass
++    close_all_under(tmp_path)
++    clock = [1000.0]
++    monkeypatch.setattr(server.time, "monotonic", lambda: clock[0])
++    before = server._session_db_content_sig(path)
++    for _ in range(4):
++        clock[0] += server.SESSION_DIGEST_MIN_S + 1
++        assert server._session_db_content_sig(path) == before
++        assert not has_live_connection(path)
++
++
++def test_transient_due_trailing_edge(tmp_path, monkeypatch):
++    path = tmp_path / "state.db"
++    create(path)
++    observe(path)
++    close_all_under(tmp_path)
++    clock = [1000.0]
++    monkeypatch.setattr(server.time, "monotonic", lambda: clock[0])
++    before = server._session_db_content_sig(path)
++    with contextlib.closing(sqlite3.connect(path)) as conn:
++        conn.execute("UPDATE sessions SET title='B'")
++        conn.commit()
++    clock[0] += 0.5
++    assert server._session_db_content_sig(path) == before
++    clock[0] += server.SESSION_DIGEST_MIN_S
++    assert server._session_db_content_sig(path) != before
++    assert not has_live_connection(path)
++
++
++def test_transient_wal_commit_is_seen_next_pass_without_stat_change(tmp_path, monkeypatch):
++    path = tmp_path / "state.db"
++    create(path)
++    observe(path)
++    close_all_under(tmp_path)
++    cache = {}
++    reads = []
++
++    def read(conn, _key):
++        reads.append(1)
++        return conn.execute("SELECT title FROM sessions").fetchone()[0], False
++
++    # An untracked external writer does not reactivate this process's owner.
++    with contextlib.closing(sqlite3.connect(path)) as writer:
++        writer.execute("PRAGMA journal_mode=WAL")
++        assert server._db_content_sig(path, cache, read) == "A"
++        assert server._db_content_sig(path, cache, read) == "A"
++        assert len(reads) == 2
++        stamp = os.stat
++        frozen = {str(p): stamp(p) for p in (path, path.with_name("state.db-wal"))}
++        writer.execute("UPDATE sessions SET title='B'")
++        writer.commit()
++        monkeypatch.setattr(watch_store.os, "stat", lambda p, *a, **k: frozen.get(str(p)) or stamp(p, *a, **k))
++        assert server._db_content_sig(path, cache, read) == "B"
++        assert len(reads) == 3
++        assert not has_live_connection(path)
++
++
++def test_transient_normal_store_never_serializes(tmp_path, monkeypatch):
++    from hermes_state import SessionDB
++    path = tmp_path / "state.db"
++    with contextlib.closing(SessionDB(path)) as db:
++        db.create_session("a", source="cli")
++    with watch_store.observed(path) as (_key, conn):
++        connection_type = type(conn)
++    close_all_under(tmp_path)
++
++    def reject(*_args, **_kwargs):
++        pytest.fail("normal sessions must not serialize unrelated database pages")
++
++    monkeypatch.setattr(connection_type, "serialize", reject)
++    first = server._session_db_content_sig(path)
++    assert first[0] == "revision"
++    assert server._session_db_content_sig(path) == first
++    with contextlib.closing(sqlite3.connect(path)) as writer:
++        writer.execute("UPDATE sessions SET title='new' WHERE id='a'")
++        writer.commit()
++    assert server._session_db_content_sig(path) != first
++    assert not has_live_connection(path)
++
++
++def test_missing_table_fingerprint_is_throttled_and_snapshot_bound(tmp_path, monkeypatch):
++    path = tmp_path / "state.db"
++    writer = sqlite3.connect(path)
++    try:
++        writer.execute("PRAGMA journal_mode=WAL")
++        writer.execute("CREATE TABLE unrelated(v)")
++        writer.execute("INSERT INTO unrelated VALUES (1)")
++        writer.commit()
++        with watch_store.observed(path) as (_key, conn):
++            connection_type = type(conn)
++        close_all_under(tmp_path)
++        clock = [1000.0]
++        monkeypatch.setattr(server.time, "monotonic", lambda: clock[0])
++        first = server._session_db_content_sig(path)
++        serialize = connection_type.serialize
++        calls = []
++
++        def concurrent_commit(conn, *args, **kwargs):
++            assert conn.in_transaction
++            calls.append(1)
++            if len(calls) == 1:
++                stamp = path.with_name("state.db-wal").stat()
++                writer.execute("UPDATE unrelated SET v=2")
++                writer.commit()
++                os.utime(path.with_name("state.db-wal"), ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
++            return serialize(conn, *args, **kwargs)
++
++        monkeypatch.setattr(connection_type, "serialize", concurrent_commit)
++        clock[0] += 0.5
++        assert server._session_db_content_sig(path) == first
++        assert calls == []
++        clock[0] += server.SESSION_DIGEST_MIN_S
++        assert server._session_db_content_sig(path) == first, "fingerprint remains in the pre-commit snapshot"
++        clock[0] += server.SESSION_DIGEST_MIN_S
++        assert server._session_db_content_sig(path) != first
++        assert len(calls) == 2
++        assert not has_live_connection(path)
++    finally:
++        writer.close()
++
++
++def test_transient_replay_cost(tmp_path, record_property):
++    path = tmp_path / "state.db"
++    create(path)
++    with contextlib.closing(sqlite3.connect(path)) as conn:
++        conn.executemany("INSERT INTO sessions VALUES (?, ?)", [(str(n), "title") for n in range(200)])
++        conn.commit()
++    observe(path)
++    close_all_under(tmp_path)
++    before = server._session_db_content_sig(path)
++    start = time.thread_time()
++    for _ in range(60):
++        assert server._session_db_content_sig(path) == before
++    elapsed = time.thread_time() - start
++    record_property("ms_per_pass", elapsed / 60 * 1000)
++    record_property("db_bytes", path.stat().st_size)
++    assert not has_live_connection(path)
+diff --git a/tui_gateway/change_watcher.py b/tui_gateway/change_watcher.py
+index ab054b6da6..ef61ee6096 100644
+--- a/tui_gateway/change_watcher.py
++++ b/tui_gateway/change_watcher.py
+@@ -224,7 +224,7 @@ def _db_content_sig(db_path: Path, cache: dict, read, *, fallback=lambda mtime:
+         return None
+     try:
+         with watch_store.observed(db_path) as (key, conn):
+-            if cached is not None and cached[0] == key:
++            if key is not watch_store.TRANSIENT and cached is not None and cached[0] == key:
+                 return cached[1]
+             signature, is_fallback = read(conn, key)
+     except Exception:  # health: allow BLE001 -- any failed read (busy, locked, foreign schema) falls back like a busy one
+@@ -241,9 +241,12 @@ def _session_digest(conn, available: set, mtime) -> tuple:
+     import hashlib
+     fields = tuple(field for field in _SESSION_SIGNATURE_FIELDS if field in available)
+     if not fields:
+-        # A state.db without a readable sessions table (foreign schema, legacy
+-        # or transient file): keep the old mtime contract so any move still
+-        # wakes the sidebar instead of silently never broadcasting.
++        from tui_gateway import watch_store
++        if mtime is watch_store.TRANSIENT:
++            # No durable revision and no sessions to digest. Only this foreign-schema
++            # fallback scans the full image, within the caller's snapshot and throttle.
++            # Connection generations churn; fresh data_version counters miss commits.
++            mtime = hashlib.blake2b(conn.serialize(), digest_size=32).digest()
+         return ("mtime-fallback", mtime)
+     order = " ORDER BY id" if "id" in available else ""
+     digest = hashlib.blake2b(digest_size=16)
+@@ -283,7 +286,7 @@ def _session_db_content_sig(db_path: Path):
+     key = None
+     try:
+         with watch_store.observed(db_path) as (key, conn):
+-            if cached is not None and cached[0] == key:
++            if key is not watch_store.TRANSIENT and cached is not None and cached[0] == key:
+                 return cached[1]
+             if (not revision_cached and cached is not None and cached[1] is not None
+                     and now - _sessions_digest_at.get(cache_key, -SESSION_DIGEST_MIN_S) < SESSION_DIGEST_MIN_S):
+diff --git a/tui_gateway/watch_store.py b/tui_gateway/watch_store.py
+index 6e29ca5424..1c968dc27d 100644
+--- a/tui_gateway/watch_store.py
++++ b/tui_gateway/watch_store.py
+@@ -22,12 +22,16 @@ from collections import OrderedDict
+ from pathlib import Path
+ 
+ MAX_STORES = 32
++# No cross-connection data_version comparison: consumers must read semantic content.
++TRANSIENT = object()
+ _lock = threading.RLock()
+ # path -> [(dev, ino), conn, generation, {sidecar suffix: (dev, ino)}]. A new generation never equals an old key,
+ # so a reopened store re-reads.
+ _held: OrderedDict[str, list] = OrderedDict()
+ _generation = 0
+-_released: set[str] = set()
++_released_roots: set[Path] = set()
++_release_all = False
++_reactivated: set[str] = set()
+ 
+ 
+ def _sidecars(path: str) -> dict:
+@@ -44,10 +48,13 @@ def _drop(path: str) -> None:
+ 
+ def reset() -> None:
+     """Close every kept connection (tests, and a process forgetting its memos)."""
++    global _release_all
+     with _lock:
+         while _held:
+             _drop(next(iter(_held)))
+-        _released.clear()
++        _released_roots.clear()
++        _reactivated.clear()
++        _release_all = False
+ 
+ 
+ def forget(db_path) -> None:
+@@ -61,15 +68,39 @@ def release_under(root=None) -> int:
+     ``hermes_state_registry.close_all``/``close_all_under`` before the header probes are released, so a profile
+     delete's rmtree meets no kept descriptor. Later idle passes use transient readers until
+     another tracked owner has reopened the store."""
++    global _release_all
+     from hermes_state_common import path_is_under
+     with _lock:
+-        doomed = [path for path in _held if root is None or path_is_under(Path(path), Path(root))]
++        if root is None:
++            _release_all = True
++            _released_roots.clear()
++            _reactivated.clear()
++        else:
++            root = Path(root).resolve()
++            _reactivated.difference_update({p for p in _reactivated if path_is_under(Path(p), root)})
++            if not _release_all:
++                _released_roots.difference_update({p for p in _released_roots if path_is_under(p, root)})
++                if not any(path_is_under(root, p) for p in _released_roots):
++                    _released_roots.add(root)
++        doomed = [path for path in _held if root is None or path_is_under(Path(path), root)]
+         for path in doomed:
+-            _released.add(path)
+             _drop(path)
+     return len(doomed)
+ 
+ 
++def _transient(path: str) -> bool:
++    from hermes_state_common import path_is_under
++    from hermes_cli.sqlite_safe_read import has_live_connection
++    released = _release_all or any(path_is_under(Path(path), root) for root in _released_roots)
++    if not released or path in _reactivated:
++        return False
++    # Check before opening our own tracked observer, which must never reactivate itself.
++    if has_live_connection(path):
++        _reactivated.add(path)
++        return False
++    return True
++
++
+ def _open(path: str, ident: tuple[int, int]) -> list:
+     global _generation
+     from hermes_state import _connect_tracked_db
+@@ -105,18 +136,15 @@ def _stranded(held: list, path: str) -> bool:
+ 
+ @contextlib.contextmanager
+ def observed(db_path):
+-    """``(key, conn)`` for ``db_path`` under the module lock: equal keys mean no commit was published between them.
++    """``(key, conn)`` under the module lock; non-TRANSIENT equal keys permit signature reuse.
++    Retained readers use connection-local commit counters. Released ownerless readers yield
++    TRANSIENT: consumers read semantic content, never compare counters across fresh connections.
+     ``conn`` is autocommit; a caller wanting one snapshot over several statements wraps them in BEGIN/COMMIT and
+     must not leave a transaction open. Raises OSError/sqlite3.Error when the store cannot be read; any error
+-    inside the block drops the connection, so the next call reopens (a new generation: no stale key matches)."""
++    inside the block drops the connection."""
+     path = str(db_path)
+     with _lock:
+-        transient = path in _released
+-        if transient:
+-            from hermes_cli.sqlite_safe_read import has_live_connection
+-            if has_live_connection(path):
+-                _released.discard(path)
+-                transient = False
++        transient = _transient(path)
+         try:
+             st = os.stat(path)
+             ident = (st.st_dev, st.st_ino)
+@@ -129,12 +157,16 @@ def observed(db_path):
+                 held = _open(path, ident)
+             _held.move_to_end(path)
+             conn = held[1]
+-            version = conn.execute("PRAGMA data_version").fetchone()[0]
++            if transient:
++                key = TRANSIENT
++            else:
++                version = conn.execute("PRAGMA data_version").fetchone()[0]
++                key = (*ident, held[2], st.st_size, st.st_mtime_ns, version)
+         except BaseException:
+             _drop(path)
+             raise
+         try:
+-            yield (*ident, held[2], st.st_size, st.st_mtime_ns, version), conn
++            yield key, conn
+         except BaseException:
+             _drop(path)
+             raise
+-- 
+2.43.0
+

@@ -1,0 +1,96 @@
+From 62377fc1dab80759c2af1a2b9bb3a765c6124336 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 23:00:59 +0000
+Subject: [PATCH] [daveey] preserve effective retry deadlines in unloaded
+ guarantee gate
+
+Use the consumer notice_retry.effective_due helper rather than the stored wall deadline, preserving code-change recovery and the GRACE floor. Proof: real host/SessionDB regressions RED 2 failed 22 passed before fix; GREEN focused suites 175 passed plus retry-successor 22 passed. Covers different/same/unknown build provenance and exact grace/short deadline boundaries without writes or live-set changes.
+---
+ .../tui_gateway/test_kanban_unloaded_gates.py | 54 +++++++++++++++++++
+ tui_gateway/kanban_unloaded_gates.py          |  5 +-
+ 2 files changed, 58 insertions(+), 1 deletion(-)
+
+diff --git a/tests/tui_gateway/test_kanban_unloaded_gates.py b/tests/tui_gateway/test_kanban_unloaded_gates.py
+index 92049824e4..1fac24c168 100644
+--- a/tests/tui_gateway/test_kanban_unloaded_gates.py
++++ b/tests/tui_gateway/test_kanban_unloaded_gates.py
+@@ -108,6 +108,60 @@ def test_host_deferred_guarantee_skips_only_until_backoff_expires(host, monkeypa
+         db.close()
+ 
+ 
++@pytest.mark.parametrize(('booked_sha', 'current_sha', 'timestamp', 'deadline'), [
++    ('old-build', 'new-build', 1.0, 1500.0),
++    ('old-build', 'old-build', 1.0, 9000.0),
++    (None, 'new-build', 1.0, 9000.0),
++    ('old-build', '', 1.0, 9000.0),
++    ('old-build', 'new-build', 1400.0, 1700.0),
++])
++def test_host_guarantee_uses_effective_retry_deadline(
++        host, monkeypatch, tmp_path, booked_sha, current_sha, timestamp, deadline):
++    import json
++    from hermes_state import SessionDB
++    from hermes_cli import host_loop_lease
++    from tui_gateway import kanban_unloaded_gates as gates
++
++    monkeypatch.setattr(host_loop_lease, '_core_sha', lambda: current_sha)
++    with contextlib.closing(SessionDB(tmp_path / 'state.db')) as db:
++        db.create_session('chat', 'desktop')
++        db.append_message('chat', 'user', 'work')
++        msg = db.append_kanban_notice('chat', 'done', {'notice_id': 'effective-due'})
++        closeout = {'state': 'deferred', 'retry_at': 9000,
++                    'retry_short_at': 1500, 'retry_code_sha': booked_sha}
++        db._write_rowcount('UPDATE messages SET timestamp=?, display_metadata=? WHERE id=?',
++                          (timestamp, json.dumps({'closeout': closeout}), msg))
++        monkeypatch.setattr(gates, '_profile_paths', lambda every_store=True: [db.db_path])
++        clock, calls, wakes = [1000.0], [], []
++        monkeypatch.setattr(gates.time, 'time', lambda: clock[0])
++
++        @contextlib.contextmanager
++        def opener(sid):
++            yield db, sid
++
++        def guarantee():
++            calls.append(clock[0])
++            return REAL_GUARANTEE(
++                now=clock[0], stores=lambda: iter([db]), holders=list, session_db=opener,
++                wake=lambda *args: wakes.append(args) or 'started', spawn=lambda job: job())
++
++        monkeypatch.setattr(ng, 'guarantee_pass', guarantee)
++        ku.host_pass()
++        before = db._read_one('SELECT display_metadata FROM messages WHERE id=?', (msg,))[0]
++        clock[0] = deadline - 1
++        ku.host_pass()
++        assert calls == [1000.0]
++        assert not wakes
++        assert db._read_one('SELECT display_metadata FROM messages WHERE id=?', (msg,))[0] == before
++        clock[0] = deadline
++        assert len(ng.candidates(db, clock[0])) == 1
++        ku.host_pass()
++        assert calls == [1000.0, deadline]
++        assert len(wakes) == 1
++        after = json.loads(db._read_one('SELECT display_metadata FROM messages WHERE id=?', (msg,))[0])
++        assert after['closeout']['state'] == 'started'
++
++
+ def test_independent_empty_subpasses_skip_but_fanout_stays_hot(host, monkeypatch, tmp_path):
+     import sqlite3
+     from tui_gateway import kanban_unloaded_gates as gates
+diff --git a/tui_gateway/kanban_unloaded_gates.py b/tui_gateway/kanban_unloaded_gates.py
+index affd588513..74bae51f64 100644
+--- a/tui_gateway/kanban_unloaded_gates.py
++++ b/tui_gateway/kanban_unloaded_gates.py
+@@ -153,7 +153,10 @@ def _guarantee() -> Inputs:
+                     # Admission can recover without a database revision.
+                     if closeout.get('busy_attempts'):
+                         return Inputs()
+-                    retry = closeout.get('retry_at')
++                    # Match the consumer's code-change recovery deadline; a
++                    # persisted wall backoff can shorten after a new build.
++                    from tui_gateway.notice_retry import effective_due
++                    retry = effective_due(closeout)
+                     timestamp = row['timestamp']
+                     if (not isinstance(retry, (int, float)) or isinstance(retry, bool)
+                             or not isinstance(timestamp, (int, float))
+-- 
+2.43.0
+

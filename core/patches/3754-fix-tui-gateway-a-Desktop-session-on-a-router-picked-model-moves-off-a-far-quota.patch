@@ -1,0 +1,214 @@
+From 783ba138437664111c062937c3de5475bca04d0c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 09:57:20 -0800
+Subject: [PATCH] fix(tui-gateway): a Desktop session on a router-picked model
+ moves off a far quota wall [daveey]
+
+Hub Desktop chats 20261031_222913_405ade and 20261031_064851_d0f106 (2026-11-13): the router had put both on
+openai-codex/gpt-6-astra. The Codex subscription walled until 11-17 and every turn failed at agent build with
+"Subscription quota unavailable for openai-codex/gpt-6-astra" (187 times in the hub's errors.log; the same on
+the MacBook) although claude-opus-5-5 and claude-fable-5-2 in the same class were available.
+
+Five whys:
+1. Why did the turn fail? tui_gateway.agent_factory._resolve_agent_model_runtime raised the wall.
+2. Why did it not reroute? The reroute (agent/model_routing_walls.py, 11-02) runs in the agent build, under the
+   session's durable route; a pre-build lookup has to defer to it. Only the messaging gateway's lookup
+   (gateway/session_worker_construct.route_runtime) did. The Desktop/TUI resolver has no session identity, so
+   resolve_managed_runtime saw a non-durable request and re-raised.
+3. Why was that path missed? The 11-02 fix and its tests named the MacBook Desktop chat but exercised
+   gateway.run_turn_prepare only; nothing built a session through tui_gateway.
+4. Why was it not caught since? Astra's wall had not been far enough (>= 6 h) while Desktop sessions were
+   pinned to it; "0 reroutes logged" was indistinguishable from "no walls".
+5. Root: two agent-build entry points share the routing policy but not the deferral, and the test covered one.
+
+Fix: _resolve_runtime_or_defer_wall wraps the Desktop resolver; on SubscriptionQuotaUnavailable it asks
+model_routing_walls.gateway_deferral (the same decision the messaging gateway uses) under the session being
+built and returns the deferred runtime, with the one-line notice on _fallback_notice. _make_agent passes the
+session id. David's own switch, a wall under 6 h, a build with no session identity (the readiness probe), a
+session that overrides its endpoint or key, and a class with nothing else available all still refuse.
+
+Tests (tests/agent/test_walled_default_pin.py): a legacy Astra row and a current router-picked row both build
+an AIAgent on Opus through the tui_gateway resolver, the notice shows once and the next build follows the
+reroute silently; each of the five refusals above still raises. _make_agent itself is too heavy to run there:
+that it passes the session id is pinned by source text, not executed.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ tests/agent/test_walled_default_pin.py | 77 ++++++++++++++++++++++++++
+ tui_gateway/agent_factory.py           | 27 ++++++++-
+ tui_gateway/class_routing.py           | 22 ++++++++
+ 3 files changed, 123 insertions(+), 3 deletions(-)
+
+diff --git a/tests/agent/test_walled_default_pin.py b/tests/agent/test_walled_default_pin.py
+index 24c5853f1b..df4cc7af38 100644
+--- a/tests/agent/test_walled_default_pin.py
++++ b/tests/agent/test_walled_default_pin.py
+@@ -368,3 +368,80 @@ def test_walled_pin_with_nothing_else_in_its_class_logs_no_target(home, monkeypa
+ @pytest.mark.parametrize('hours', [1, None], ids=['short-wall', 'unknown-reset'])
+ def test_a_short_or_unknown_wall_refuses_quietly(home, monkeypatch, caplog, hours):
+     assert _injected_wall_refusal(home, monkeypatch, caplog, key='***', hours=hours) == []
++
++
++# --- Desktop/TUI gateway (tui_gateway.agent_factory): the same reroute, on its own agent-build path -------------
++# Hub Desktop chats 20261031_222913_405ade and 20261031_064851_d0f106 (11-13): router-picked Astra pins, Codex
++# walled until 11-17, 187 failed builds, because only the messaging gateway's pre-build lookup deferred to the
++# agent build's reroute.
++
++DESKTOP_ROW = {'model': ASTRA, 'provider': 'openai-codex'}  # what a resumed Desktop session row carries
++
++
++def _desktop_agent(model, runtime):
++    from run_agent import AIAgent
++    return AIAgent(model=model, session_id=SID, quiet_mode=True, skip_memory=True, skip_context_files=True,
++                   **{k: runtime.get(k) for k in ('provider', 'api_key', 'base_url', 'api_mode')})
++
++
++def test_desktop_session_with_legacy_astra_pin_builds_on_opus(home):
++    from tui_gateway.server import _resolve_agent_model_runtime  # agent_factory binds into the server namespace
++    _legacy_row(home, LEGACY_ECHO)
++    _wall(home, 'openai-codex', ASTRA, 33)
++    model, runtime = _resolve_agent_model_runtime(DESKTOP_ROW, None, SID)
++    assert model == ASTRA and runtime['provider'] == 'auto' and not runtime['api_key'], runtime
++    assert 'class_deferred' not in runtime and 'walled_notice' not in runtime, runtime
++    notice = runtime.pop('_fallback_notice')  # what _make_agent pops and shows once
++    assert 'quota is out until' in notice and 'PT' in notice and OPUS in notice, notice
++    agent = _desktop_agent(model, runtime)
++    assert (agent.model, agent.provider) == (OPUS, 'anthropic')
++    assert agent.model_routing['walled_from']['model'] == ASTRA
++    # The next build of this session follows the reroute without announcing it again.
++    model, runtime = _resolve_agent_model_runtime(DESKTOP_ROW, None, SID)
++    assert '_fallback_notice' not in runtime, runtime
++    again = _desktop_agent(model, runtime)
++    assert (again.model, again.provider) == (OPUS, 'anthropic')
++
++
++def test_desktop_session_with_router_picked_astra_builds_on_opus(home):
++    """A row written by the current allocator (``pin_source: default``), not only a legacy one."""
++    from tui_gateway.server import _resolve_agent_model_runtime  # agent_factory binds into the server namespace
++    _router_picks_astra(home)
++    _wall(home, 'openai-codex', ASTRA, 33)
++    model, runtime = _resolve_agent_model_runtime(DESKTOP_ROW, None, SID)
++    runtime.pop('_fallback_notice')
++    agent = _desktop_agent(model, runtime)
++    assert (agent.model, agent.provider) == (OPUS, 'anthropic')
++
++
++@pytest.mark.parametrize('case', ['explicit switch', 'short wall', 'no session id', 'own endpoint'])
++def test_desktop_wall_still_refuses_when_the_pin_must_not_move(home, case):
++    """Controls: David's own switch, a wall under the reroute threshold, a build with no session identity
++    (the readiness probe) and a session that overrides its endpoint all keep the refusal."""
++    from agent.model_routing_unavailable import SubscriptionQuotaUnavailable
++    from tui_gateway.server import _resolve_runtime_or_defer_wall
++    _legacy_row(home, dict(LEGACY_ECHO, reason='explicit-switch') if case == 'explicit switch' else LEGACY_ECHO)
++    _wall(home, 'openai-codex', ASTRA, 2 if case == 'short wall' else 33)
++    overrides = {'base_url': 'https://proxy.example/v1'} if case == 'own endpoint' else {}
++    session = None if case == 'no session id' else SID
++    with pytest.raises(SubscriptionQuotaUnavailable):
++        _resolve_runtime_or_defer_wall({'requested': 'openai-codex', 'target_model': ASTRA}, ASTRA,
++                                       'openai-codex', overrides, session)
++
++
++def test_desktop_wall_refuses_when_nothing_else_in_the_class_can_serve(home):
++    from agent.model_routing_unavailable import SubscriptionQuotaUnavailable
++    from tui_gateway.server import _resolve_agent_model_runtime  # agent_factory binds into the server namespace
++    _legacy_row(home, LEGACY_ECHO)
++    _wall(home, 'openai-codex', ASTRA, 33)
++    _wall(home, 'anthropic', OPUS, 33)
++    with pytest.raises(SubscriptionQuotaUnavailable):
++        _resolve_agent_model_runtime(DESKTOP_ROW, None, SID)
++
++
++def test_make_agent_resolves_under_the_session_it_builds():
++    """_make_agent is too heavy to run here; it must hand the resolver the id the route store is keyed by."""
++    import inspect
++    from tui_gateway import server
++    source = inspect.getsource(server._make_agent)
++    assert '_resolve_agent_model_runtime(model_override, provider_override, session_id or key)' in source
+diff --git a/tui_gateway/agent_factory.py b/tui_gateway/agent_factory.py
+index 83d95895a8..9a648a01ca 100644
+--- a/tui_gateway/agent_factory.py
++++ b/tui_gateway/agent_factory.py
+@@ -532,7 +532,28 @@ def _resolve_runtime_with_fallback(resolve_kwargs: dict | None = None) -> _Runti
+         raise
+ 
+ 
+-def _resolve_agent_model_runtime(model_override, provider_override) -> tuple[str, dict]:
++def _resolve_runtime_or_defer_wall(resolve_kwargs, model, provider, overrides, session_id) -> _RuntimeFallbackResolution:
++    """[daveey] The primary runtime, or a deferral when the session's router-picked model is behind a far
++    subscription quota wall.
++
++    Desktop chats 20261031_222913_405ade and 20261031_064851_d0f106 (hub, 11-13): the router had put both on
++    openai-codex/gpt-6-astra; when the Codex subscription walled until 11-17 every turn failed at agent build
++    ("Subscription quota unavailable ... gpt-6-astra", 187 times) although claude-opus-5-5 and claude-fable-5-2
++    in the same class were available. The reroute for that case (agent/model_routing_walls.py) was wired into
++    the messaging gateway's pre-build lookup only; this resolver has no session identity, so the wall was
++    final here. A session's own override of endpoint or key is never deferred, like the gateway's."""
++    from agent.model_routing_unavailable import SubscriptionQuotaUnavailable
++    try:
++        return _resolve_runtime_with_fallback(resolve_kwargs)
++    except SubscriptionQuotaUnavailable as wall:
++        from tui_gateway.class_routing import walled_pin_deferral
++        deferred = None if any(overrides.values()) else walled_pin_deferral(wall, model, provider, session_id)
++        if deferred is None:
++            raise
++        return _RuntimeFallbackResolution(deferred, None, False)
++
++
++def _resolve_agent_model_runtime(model_override, provider_override, routing_session_id=None) -> tuple[str, dict]:
+     """(model, runtime) for a new agent; a per-session override (/model switch or a resumed row's persisted
+     runtime) wins over global config/env. Older rows stored the resolved provider "custom" (no named entry
+     matches) — recover the identity from the persisted base_url or the rebuild fails "No LLM provider
+@@ -570,7 +591,7 @@ def _resolve_agent_model_runtime(model_override, provider_override) -> tuple[str
+     from tui_gateway.class_routing import deferred_runtime
+     if (deferred := deferred_runtime(model, requested_provider, _load_cfg())) is not None:
+         return model, deferred
+-    resolution = _resolve_runtime_with_fallback(resolve_kwargs)
++    resolution = _resolve_runtime_or_defer_wall(resolve_kwargs, model, requested_provider, overrides, routing_session_id)
+     if resolution.used_fallback:
+         if not resolution.selected_model:
+             raise RuntimeError("Auth fallback resolved without a model")
+@@ -656,7 +677,7 @@ def _make_agent(
+     from agent.shell_hooks import register_from_config
+     register_from_config(cfg)
+     system_prompt = _startup_system_prompt(cfg, session_id or key)
+-    model, runtime = _resolve_agent_model_runtime(model_override, provider_override)
++    model, runtime = _resolve_agent_model_runtime(model_override, provider_override, session_id or key)
+     fallback_notice = runtime.pop("_fallback_notice", None)
+     _pr = _load_provider_routing()
+     platform = _resolve_agent_platform(platform_override)
+diff --git a/tui_gateway/class_routing.py b/tui_gateway/class_routing.py
+index bfc1fcef1d..c82f2aea50 100644
+--- a/tui_gateway/class_routing.py
++++ b/tui_gateway/class_routing.py
+@@ -12,6 +12,28 @@ def deferred_runtime(model, provider, config):
+     return {"provider": requested, "requested_provider": requested}
+ 
+ 
++def walled_pin_deferral(wall, model, provider, session_id):
++    """A runtime that leaves the route to the agent build, or None when the quota *wall* must stand.
++
++    The agent build owns the session's durable route and moves a router-picked pin off a far wall within its
++    class (``resolve_managed_runtime``); David's own pins and short walls still refuse
++    (``model_routing_walls.gateway_deferral`` decides, from the session's standing route). The one chat line
++    naming the reroute rides ``_fallback_notice``, which ``_make_agent`` already shows once."""
++    if not session_id:
++        return None
++    from agent.model_routing_runtime import routing_session
++    from agent.model_routing_walls import gateway_deferral
++    with routing_session(session_id):
++        deferred = gateway_deferral(wall, model, provider, None)
++    if deferred is None:
++        return None
++    notice = deferred.pop("walled_notice", None)
++    deferred.pop("class_deferred", None)
++    if notice:
++        deferred["_fallback_notice"] = notice
++    return deferred
++
++
+ def child_class_kwargs(agent):
+     """Independent side jobs inherit the workload class, not a paid-capable concrete pin."""
+     route = getattr(agent, "model_routing", None)
+-- 
+2.43.0
+

@@ -1,0 +1,320 @@
+From f63c16cf5035f24b05261c757aaef949bb91fdbd Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 18:36:54 +0000
+Subject: [PATCH] [daveey] cron: a requested stop (cancel, Stop, remove) logs a
+ WARNING, not 'Job failed' (cron-7c04faf754)
+
+remove_job / hermes cron cancel / Desktop Stop write the execution's cancel
+marker; the run's stop check raised a plain RuntimeError for anything but
+this gateway's shutdown, so run_job logged ERROR 'Job ... failed:' with a
+traceback and the coach filed a self-heal defect for a deliberate stop.
+
+_abort_if_fire_claim_lost now raises CronRunCancelled when the marker exists
+(whichever latch fired first: remove_job also drops the claim) and names the
+marker's reason; _log_shutdown_stop -> _log_expected_stop logs one WARNING
+'Job <name> stopped on request: ...'. A claim lost with no marker stays a
+RuntimeError logged at ERROR with its traceback.
+
+Regression: tests/cron/test_requested_stop_logging.py (red on 5ecbb476e20).
+---
+ cron/cancellation.py                      |  22 ++++
+ cron/scheduler.py                         |  44 +++++---
+ tests/cron/test_requested_stop_logging.py | 124 ++++++++++++++++++++++
+ tests/cron/test_shutdown_interrupt.py     |   6 +-
+ tests/gateway/test_session_cron.py        |   2 +-
+ 5 files changed, 178 insertions(+), 20 deletions(-)
+ create mode 100644 tests/cron/test_requested_stop_logging.py
+
+diff --git a/cron/cancellation.py b/cron/cancellation.py
+index 81565e3424..06d8b9717d 100644
+--- a/cron/cancellation.py
++++ b/cron/cancellation.py
+@@ -144,6 +144,15 @@ class _CombinedCancelEvent:
+                 return cancel_is_shutdown(event)
+         return False
+ 
++    @property
++    def cancel_request(self) -> Optional[CancelRequest]:
++        """The execution's cancel marker when one was written, whichever source latched first:
++        ``remove_job`` writes the marker AND drops the claim, so the claim latch can fire first."""
++        for event in self._events:
++            if (request := requested_cancel(event)) is not None:
++                return request
++        return None
++
+ 
+ class CancelRequest:
+     """``_CancelEventLike`` view of one execution's cancel marker.
+@@ -187,6 +196,19 @@ def cancel_is_shutdown(cancel_event: Any) -> bool:
+     return bool(getattr(cancel_event, "shutdown_interrupted", False))
+ 
+ 
++class CronRunCancelled(RuntimeError):
++    """A run stopped because someone asked (``hermes cron cancel``, Desktop Stop, ``remove_job``):
++    the execution's cancel marker exists. An expected stop booked ``cancelled``, not a failed job;
++    ``run_job`` logs it without a traceback (cron-7c04faf754)."""
++
++
++def requested_cancel(cancel_event: Any) -> Optional[CancelRequest]:
++    """The cancel request behind ``cancel_event`` when its execution's marker exists, else None."""
++    if isinstance(cancel_event, CancelRequest):
++        return cancel_event if cancel_event.is_set() else None
++    return getattr(cancel_event, "cancel_request", None)
++
++
+ class ShutdownAwareCancel:
+     """``_CancelEventLike`` around a fire-claim latch that knows when THIS process's shutdown fired it.
+ 
+diff --git a/cron/scheduler.py b/cron/scheduler.py
+index a20b782eda..b0b3fe0c8f 100644
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -534,9 +534,10 @@ from cron.executions import (
+     recover_interrupted_executions, settle_unstarted_execution, terminalize_dead_owner)
+ from cron.scheduler_liveness import ExecutionProgressStamper, _inactivity_watchdog_loop
+ from cron.scheduler_bookkeeping import _classify_delivery_outcome
+-from cron.cancellation import (CancelRequest, CronShutdownInterrupted, ShutdownAwareCancel,
+-                               _CancelEventLike, _CombinedCancelEvent, cancel_is_shutdown,
+-                               cancel_reason, clear_cancel, finish_lost_execution,
++from cron.cancellation import (CancelRequest, CronRunCancelled, CronShutdownInterrupted,
++                               ShutdownAwareCancel, _CancelEventLike, _CombinedCancelEvent,
++                               cancel_is_shutdown, cancel_reason, clear_cancel,
++                               finish_lost_execution, requested_cancel,
+                                run_job_unless_cancelled as _run_job_unless_cancelled)
+ 
+ # Response marker that suppresses delivery (output is still saved locally for audit).
+@@ -2056,11 +2057,18 @@ def _run_agent_with_watchdog(
+     def _abort_if_fire_claim_lost() -> None:
+         if cancel_event is None or not cancel_event.is_set():
+             return
+-        reason = cancel_reason(cancel_event)
++        # A cancel marker wins over whichever latch fired first: remove_job writes the marker AND
++        # drops the claim, so the claim latch can read "ownership was lost" for a requested stop.
++        request = requested_cancel(cancel_event)
++        reason = request.reason if request is not None else cancel_reason(cancel_event)
+         if agent is not None and hasattr(agent, "interrupt"):
+             agent.interrupt(f"Cron run stopped: {reason}")
+-        # This gateway's own shutdown is an expected stop, not a lost claim (cron-7c04faf754).
+-        error = CronShutdownInterrupted if cancel_is_shutdown(cancel_event) else RuntimeError
++        # Shutdown and a requested stop are expected stops; only a real takeover stays a plain
++        # RuntimeError that run_job logs as a failed job (cron-7c04faf754).
++        if cancel_is_shutdown(cancel_event):
++            error = CronShutdownInterrupted
++        else:
++            error = CronRunCancelled if request is not None else RuntimeError
+         raise error(f"Cron job '{job_name}' was stopped: {reason}")
+ 
+     def _heartbeat_run_claim_if_due():
+@@ -2871,7 +2879,7 @@ def run_job(
+ 
+     except (Exception, ConfigBackendUnavailable) as e:  # the plane being down fails THIS fire only
+         error_msg = _job_error_message(e)
+-        if not _log_shutdown_stop(job_name, error_msg, e):
++        if not _log_expected_stop(job_name, error_msg, e):
+             logger.exception("Job '%s' failed: %s", job_name, error_msg)
+         # Cowork-style unreachable-model re-run (cron/unreachable_retry.py): flag failures where
+         # the model was never reached (transient network/DNS, zero API calls) so the bookkeeping
+@@ -2960,15 +2968,19 @@ def _teardown_cron_agent(
+         timeout_seconds=timeout_seconds)
+ 
+ 
+-def _log_shutdown_stop(job_name: str, error_msg: str, exc: BaseException) -> bool:
+-    """``run_job``'s failure log for a stop by this gateway's own shutdown: expected (shutdown already
+-    wrote the interrupted ``last_status``), so one WARNING without traceback and not the coach's
+-    "Job '<name>' failed:" defect line. False for everything else, real ownership loss included,
+-    which ``run_job`` keeps logging at ERROR with its traceback (cron-7c04faf754)."""
+-    if not isinstance(exc, CronShutdownInterrupted):
+-        return False
+-    logger.warning("Job '%s' stopped by gateway shutdown: %s", job_name, error_msg)
+-    return True
++def _log_expected_stop(job_name: str, error_msg: str, exc: BaseException) -> bool:
++    """``run_job``'s failure log for an expected stop: this gateway's own shutdown (which already
++    wrote the interrupted ``last_status``) or a stop someone asked for (``hermes cron cancel``,
++    Desktop Stop, ``remove_job``; booked ``cancelled``). One WARNING without traceback, never the
++    coach's "Job '<name>' failed:" defect line. False for everything else, real ownership loss
++    included, which ``run_job`` keeps logging at ERROR with its traceback (cron-7c04faf754)."""
++    if isinstance(exc, CronShutdownInterrupted):
++        logger.warning("Job '%s' stopped by gateway shutdown: %s", job_name, error_msg)
++        return True
++    if isinstance(exc, CronRunCancelled):
++        logger.warning("Job '%s' stopped on request: %s", job_name, error_msg)
++        return True
++    return False
+ 
+ 
+ def _run_with_fire_claim_heartbeat(job: dict, run, *, execution_token: Optional[object] = None) -> bool:
+diff --git a/tests/cron/test_requested_stop_logging.py b/tests/cron/test_requested_stop_logging.py
+new file mode 100644
+index 0000000000..47530d1379
+--- /dev/null
++++ b/tests/cron/test_requested_stop_logging.py
+@@ -0,0 +1,124 @@
++"""A stop someone asked for is not a failed job (cron-7c04faf754, third source).
++
++Removing a running job (``remove_job``) or cancelling its run (``hermes cron cancel`` / Desktop
++Stop) writes the execution's cancel marker; the run then stops at its next cancel check. That stop
++is expected, so ``run_job`` logs one WARNING without a traceback, never the
++``Job '<name>' failed:`` ERROR the self-heal detector files as a defect. A claim lost with no
++cancel marker is a real ownership loss and keeps the ERROR with its traceback.
++
++Composed through the real ``run_job`` with a fake agent, the real job store, execution ledger and
++cancel markers.
++"""
++
++from __future__ import annotations
++
++import logging
++import threading
++from types import SimpleNamespace
++from unittest.mock import patch
++
++import pytest
++
++from cron import executions, jobs, scheduler
++from cron.cancellation import CancelRequest, cancel_run
++
++_RUNTIME = {
++    "api_key": "test-key",
++    "base_url": "https://example.invalid/v1",
++    "provider": "openrouter",
++    "api_mode": "chat_completions",
++}
++
++
++@pytest.fixture
++def store(tmp_path):
++    with jobs.use_cron_store(tmp_path / "cron"):
++        yield tmp_path
++
++
++def _run_and_stop(tmp_path, stop):
++    """Start a real run of a real job; the fake agent's turn performs ``stop`` mid-run."""
++    from gateway import session_cron
++    from hermes_state import SessionDB
++
++    job = jobs.create_job(prompt="hello", schedule="every 1h", name="stop-probe", deliver="local")
++    execution_id = executions.create_execution(job["id"], source="test")["id"]
++    executions.mark_execution_running(execution_id)
++    claim_lost = threading.Event()
++    fence = scheduler._FireOwnership(job, claim_lost, None, CancelRequest(execution_id))
++
++    class _Agent:
++        def __init__(self, *args, session_id=None, session_db=None, **kwargs):
++            self.session_id = session_id
++
++        def interrupt(self, message=None):
++            pass
++
++        def run_conversation(self, user_message, conversation_history=None, task_id=None):
++            stop(job["id"], claim_lost)
++            return {"final_response": "ok"}
++
++    db = SessionDB(db_path=tmp_path / "state.db")
++    token = session_cron._execution.set(
++        (SimpleNamespace(db=db), f"cron_{job['id']}_owned", job["id"], execution_id))
++    try:
++        with patch("cron.scheduler._hermes_home", tmp_path), \
++             patch("cron.scheduler_delivery._resolve_origin", return_value=None), \
++             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
++             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
++             patch("hermes_state_registry.acquire", return_value=db), \
++             patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value=_RUNTIME), \
++             patch("run_agent.AIAgent", _Agent):
++            return scheduler.run_job(
++                dict(job, execution_id=execution_id), cancel_event=fence.cancel_event,
++                execution_id=execution_id)
++    finally:
++        session_cron._execution.reset(token)
++        db.close()
++
++
++def _failed_errors(caplog):
++    return [r for r in caplog.records if r.levelno >= logging.ERROR and "failed:" in r.getMessage()]
++
++
++def _stop_warnings(caplog):
++    return [r for r in caplog.records if r.levelno == logging.WARNING
++            and "stopped on request" in r.getMessage()]
++
++
++def _remove_mid_run(job_id, claim_lost):
++    assert jobs.remove_job(job_id)
++    claim_lost.set()  # removal also drops the fire claim; the heartbeat latches the loss
++
++
++def _cancel_mid_run(job_id, claim_lost):
++    assert cancel_run(job_id, reason="operator asked")["cancelled"]
++
++
++@pytest.mark.parametrize("stop, reason", [
++    (_remove_mid_run, "job removed while running"),
++    (_cancel_mid_run, "operator asked"),
++], ids=["remove_job", "cancel_run"])
++def test_a_requested_stop_logs_one_warning_not_a_failed_job(store, caplog, stop, reason):
++    caplog.set_level(logging.DEBUG, logger="cron.scheduler")
++
++    success, _output, _final, error = _run_and_stop(store, stop)
++
++    assert success is False
++    assert reason in (error or "")
++    assert _failed_errors(caplog) == []
++    warnings = _stop_warnings(caplog)
++    assert len(warnings) == 1, [r.getMessage() for r in caplog.records]
++    assert warnings[0].exc_info is None
++    assert reason in warnings[0].getMessage()
++
++
++def test_a_lost_claim_without_a_cancel_marker_still_logs_a_failed_job(store, caplog):
++    caplog.set_level(logging.DEBUG, logger="cron.scheduler")
++
++    success, _output, _final, _error = _run_and_stop(store, lambda job_id, lost: lost.set())
++
++    assert success is False
++    failed = _failed_errors(caplog)
++    assert len(failed) == 1 and failed[0].exc_info is not None
++    assert _stop_warnings(caplog) == []
+diff --git a/tests/cron/test_shutdown_interrupt.py b/tests/cron/test_shutdown_interrupt.py
+index 56fd35b35a..a673bda7fd 100644
+--- a/tests/cron/test_shutdown_interrupt.py
++++ b/tests/cron/test_shutdown_interrupt.py
+@@ -847,7 +847,7 @@ class TestOwnerStopWhileDraining:
+             # run_job's own stop + failure-log path (_abort_if_fire_claim_lost, run_job's except).
+             error = CronShutdownInterrupted if cancel_is_shutdown(cancel_event) else RuntimeError
+             exc = error(f"Cron job 'drain-job' was stopped: {reason}")
+-            if not sched._log_shutdown_stop("drain-job", str(exc), exc):
++            if not sched._log_expected_stop("drain-job", str(exc), exc):
+                 try:
+                     raise exc
+                 except RuntimeError:
+@@ -951,7 +951,7 @@ class TestShutdownStopLogging:
+         from cron.cancellation import CronShutdownInterrupted
+ 
+         caplog.set_level(logging.DEBUG, logger="cron.scheduler")
+-        assert sched._log_shutdown_stop("job", "stopped", CronShutdownInterrupted("stopped")) is True
++        assert sched._log_expected_stop("job", "stopped", CronShutdownInterrupted("stopped")) is True
+         records = [r for r in caplog.records if r.name == "cron.scheduler"]
+         assert [(r.levelno, r.exc_info) for r in records] == [(logging.WARNING, None)]
+         assert not records[0].getMessage().startswith("Job 'job' failed: ")
+@@ -964,5 +964,5 @@ class TestShutdownStopLogging:
+ 
+         caplog.set_level(logging.DEBUG, logger="cron.scheduler")
+         exc = RuntimeError("Cron job 'job' was stopped: cron fire ownership was lost")
+-        assert sched._log_shutdown_stop("job", str(exc), exc) is False
++        assert sched._log_expected_stop("job", str(exc), exc) is False
+         assert [r for r in caplog.records if r.name == "cron.scheduler"] == []
+diff --git a/tests/gateway/test_session_cron.py b/tests/gateway/test_session_cron.py
+index be3f8ea75f..0fd6c4ef9c 100644
+--- a/tests/gateway/test_session_cron.py
++++ b/tests/gateway/test_session_cron.py
+@@ -310,7 +310,7 @@ async def test_forwarded_cancel_during_owner_restart_stays_a_restart_cut_after_t
+         seen['shutdown'] = cancel_is_shutdown(cancel_event)
+         error = CronShutdownInterrupted if seen['shutdown'] else RuntimeError
+         exc = error(f"Cron job 'job' was stopped: {reason}")
+-        if not scheduler._log_shutdown_stop('job', str(exc), exc):
++        if not scheduler._log_expected_stop('job', str(exc), exc):
+             scheduler.logger.error("Job '%s' failed: %s", 'job', str(exc))
+         return (False, 'doc', '', str(exc))
+     monkeypatch.setattr(scheduler, 'run_job', run_job)
+-- 
+2.43.0
+

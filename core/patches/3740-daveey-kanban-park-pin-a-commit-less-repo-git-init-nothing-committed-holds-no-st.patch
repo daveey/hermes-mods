@@ -1,0 +1,228 @@
+From 54df91428447ea2693855199092b4d5053103142 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 18:23:44 +0000
+Subject: [PATCH] [daveey] kanban park pin: a commit-less repo (git init,
+ nothing committed) holds no state
+
+Card t_01a1d61af141c135. Pooled card t_01a1d5e41b24e463 parked on worker-6 at 11-13 17:53Z with a
+scratch fixture `core-fixture` (git init, no commits, no remotes, clean) in its workspace. The park pin
+read it as "unpushed commits" and moved the card from pool:worker to machine:worker-6, though its real
+tree had every commit on a remote.
+
+Five whys:
+1. kanban_park_pin.plan -> card_trees_state -> tree_state said "unpushed commits in .../core-fixture".
+2. card_trees counts every git repo directly under the workspace, fixtures included.
+3. _worktree_has_unpushed_commits runs `git log HEAD --not <trunk>` on an unborn HEAD; git fails and the
+   helper's fail-safe answers True. "No commits at all" reads like "git failed".
+Root: tree_state has no case for a repo without commits. Not caught: no test put a commit-less repo
+among a card's trees.
+
+Fix: tree_state skips a clean tree that has no commits at all: `git rev-parse --verify -q HEAD` exits 1
+AND `git for-each-ref --count=1` exits 0 with no output. Both timeouts come from the scan's budget; any
+other answer (git error, timeout, a detached commit with no ref, an unborn branch beside another branch)
+keeps today's path and fail-safe. _worktree_has_unpushed_commits is unchanged (worktree GC, exit and
+archive rely on its fail-safe).
+
+Proof:
+- New tests/hermes_cli/test_kanban_tree_state_unborn.py, base: 3 failed / 6 passed (empty git init
+  tree_state; plan() pins the pool card; a card pinned by such a tree is not unpinned), head: 10 passed.
+- Mutants (sdlc-review mutants.py, 6): skip dropped, rev-parse rc check dropped, for-each-ref rc check
+  dropped, empty-refs check dropped, except fails open, skip moved before the dirty check: all killed.
+- Regression: test_kanban_pool_queue.py, test_kanban_move_guard_{budget,review_nits,timeout_cause}.py,
+  test_kanban_move_unpushed_followups.py: 137 passed.
+- Replay over 339 real trees on worker-5 (kanban workspaces + ~/code/_wt): 0 verdict changes.
+- scripts/check --base origin/main: 19 checks ok.
+---
+ hermes_cli/kanban_move_pool.py                |  24 +++-
+ .../test_kanban_tree_state_unborn.py          | 132 ++++++++++++++++++
+ 2 files changed, 155 insertions(+), 1 deletion(-)
+ create mode 100644 tests/hermes_cli/test_kanban_tree_state_unborn.py
+
+diff --git a/hermes_cli/kanban_move_pool.py b/hermes_cli/kanban_move_pool.py
+index 31a297761b..a51c0b2598 100644
+--- a/hermes_cli/kanban_move_pool.py
++++ b/hermes_cli/kanban_move_pool.py
+@@ -234,12 +234,32 @@ def _clock() -> float:
+     return time.monotonic()
+ 
+ 
++def _commit_less(tree: str, budget: Callable[[float], float]) -> bool:
++    """Whether a clean ``tree`` has no commits at all: HEAD is unborn and the repo has no ref. A scratch fixture
++    (``git init``, nothing committed) then holds nothing another worker would miss, though the unpushed check's
++    fail-safe reads its unborn HEAD as unpushed (11-13: it pinned t_01a1d5e41b24e463 to worker-6). Any other
++    answer, a git error included, is False: the unpushed check and its fail-safe decide. Timeouts come from
++    ``budget``, whose end raises ``GitUnchecked``."""
++    from hermes_cli.git_budget import timeout_for
++    from hermes_cli.worktree_ops import _git
++    try:
++        head = _git(["rev-parse", "--verify", "-q", "HEAD"], tree, timeout=timeout_for(budget, 10),
++                    stdin=subprocess.DEVNULL)
++        if head.returncode != 1:
++            return False
++        refs = _git(["for-each-ref", "--count=1"], tree, timeout=timeout_for(budget, 10), stdin=subprocess.DEVNULL)
++        return refs.returncode == 0 and not refs.stdout.strip()
++    except (OSError, subprocess.SubprocessError, ValueError):
++        return False
++
++
+ def tree_state(trees: Iterable[str], *, budget: float = STATE_BUDGET_S,
+                refresh: bool = True) -> Optional[str]:
+     """``dirty worktree <p>`` / ``unpushed commits in <p>`` for the first tree with state, else None. Git runs at
+     most ``budget`` seconds in all (per-call timeouts shrink to the time left); a tree it could not check (budget
+     spent, git timed out) reads ``unchecked worktree <p> (<cause>)``, which callers treat as state (fail safe).
+-    ``refresh`` goes to :func:`pushed_on_remote` (a create probes with ``refresh=False`` and a short ``budget``)."""
++    ``refresh`` goes to :func:`pushed_on_remote` (a create probes with ``refresh=False`` and a short ``budget``).
++    A clean tree with no commits at all (:func:`_commit_less`) has no state."""
+     from hermes_cli.git_budget import BUDGET_SPENT, GitUnchecked, deadline_budget
+     from hermes_cli.worktree_ops import _worktree_has_unpushed_commits, _worktree_is_dirty
+     timeouts = deadline_budget(budget, clock=lambda: _clock())
+@@ -249,6 +269,8 @@ def tree_state(trees: Iterable[str], *, budget: float = STATE_BUDGET_S,
+         try:
+             if _worktree_is_dirty(tree, tree, timeout=10, budget=timeouts):
+                 return f"{_DIRTY}{tree}"
++            if _commit_less(tree, timeouts):
++                continue
+             if (_worktree_has_unpushed_commits(tree, timeout=10, budget=timeouts)
+                     and not pushed_on_remote(tree, budget=timeouts, refresh=refresh)):
+                 return f"{_UNPUSHED}{tree}"
+diff --git a/tests/hermes_cli/test_kanban_tree_state_unborn.py b/tests/hermes_cli/test_kanban_tree_state_unborn.py
+new file mode 100644
+index 0000000000..029d1af1a4
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_tree_state_unborn.py
+@@ -0,0 +1,132 @@
++"""A commit-less repo (``git init``, nothing committed) among a card's trees holds no state to carry. [daveey]
++
++11-13: pooled card t_01a1d5e41b24e463 parked on worker-6 with a scratch fixture ``core-fixture`` (``git init``, no
++commits, no remotes, clean) in its workspace. ``tree_state`` called it "unpushed commits" (the unpushed check's
++fail-safe treats ``git log HEAD`` on an unborn HEAD as a git error) and the park pinned the card to worker-6,
++though no other worker would miss anything. A commit-less tree with files in it is still dirty, and a tree whose
++branch ref names a missing object is still state.
++"""
++from __future__ import annotations
++
++import json
++import subprocess
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_move_pool as kmp
++from hermes_cli import kanban_park_pin as kpp
++from tests.hermes_cli import test_kanban_pool_queue as pq
++
++svc = pq.svc
++w2 = pq.w2
++POOL = pq.POOL
++
++
++def _init(tree):
++    tree.mkdir(parents=True)
++    subprocess.run(["git", "init", "-q", str(tree)], check=True, capture_output=True)
++    return tree
++
++
++def test_an_empty_git_init_tree_has_no_state(tmp_path):
++    tree = _init(tmp_path / "core-fixture")
++    assert kmp.tree_state([str(tree)]) is None
++
++
++def test_a_commit_less_tree_with_an_untracked_file_is_dirty(tmp_path):
++    tree = _init(tmp_path / "core-fixture")
++    (tree / "notes.txt").write_text("work\n")
++    assert kmp.tree_state([str(tree)]) == f"dirty worktree {tree}"
++
++
++def test_a_commit_less_tree_with_a_staged_file_is_dirty(tmp_path):
++    tree = _init(tmp_path / "core-fixture")
++    (tree / "fix.py").write_text("x = 1\n")
++    pq._git(tree, "add", "fix.py")
++    assert kmp.tree_state([str(tree)]) == f"dirty worktree {tree}"
++
++
++def test_a_branch_ref_holding_a_missing_object_is_still_state(tmp_path):
++    tree = _init(tmp_path / "core-fixture")
++    branch = subprocess.run(["git", "symbolic-ref", "HEAD"], cwd=tree, check=True, capture_output=True,
++                            text=True).stdout.strip()
++    ref = tree / ".git" / branch
++    ref.parent.mkdir(parents=True, exist_ok=True)
++    ref.write_text("1" * 40 + "\n")
++    assert kmp.tree_state([str(tree)]) is not None
++
++
++def test_a_detached_commit_no_ref_holds_is_still_unpushed(tmp_path):
++    """No refs at all, but HEAD names a commit: that commit is work another worker would miss."""
++    tree = _init(tmp_path / "core-fixture")
++    pq._commit(tree, "a.txt")
++    pq._git(tree, "checkout", "-q", "--detach")
++    branch = subprocess.run(["git", "for-each-ref", "--format=%(refname:short)"], cwd=tree, check=True,
++                            capture_output=True, text=True).stdout.split()
++    pq._git(tree, "branch", "-qD", *branch)
++    assert kmp.tree_state([str(tree)]) == f"unpushed commits in {tree}"
++
++
++def test_an_unborn_branch_beside_an_unpushed_branch_is_still_unpushed(tmp_path):
++    """HEAD is unborn (an orphan branch), but another local branch holds a commit no remote has."""
++    tree = _init(tmp_path / "core-fixture")
++    pq._commit(tree, "a.txt")
++    pq._git(tree, "switch", "-q", "--orphan", "fresh")
++    assert kmp.tree_state([str(tree)]) == f"unpushed commits in {tree}"
++
++
++def test_a_failing_ref_listing_keeps_the_fail_safe(tmp_path, monkeypatch):
++    """``for-each-ref`` exiting non-zero with no output is no proof of an empty repo."""
++    from hermes_cli import worktree_ops
++    real = worktree_ops._git
++
++    def git(args, cwd, *a, **kw):
++        if args and args[0] == "for-each-ref" and "refs/remotes" not in args:
++            return subprocess.CompletedProcess(["git", *args], 128, "", "fatal: broken\n")
++        return real(args, cwd, *a, **kw)
++    monkeypatch.setattr(worktree_ops, "_git", git)
++    tree = _init(tmp_path / "core-fixture")
++    assert kmp.tree_state([str(tree)]) == f"unpushed commits in {tree}"
++
++
++def test_a_head_probe_that_times_out_keeps_the_fail_safe(tmp_path, monkeypatch):
++    from hermes_cli import worktree_ops
++    real = worktree_ops._git
++
++    def git(args, cwd, *a, **kw):
++        if args[:2] == ["rev-parse", "--verify"]:
++            raise subprocess.TimeoutExpired(["git", *args], 10)
++        return real(args, cwd, *a, **kw)
++    monkeypatch.setattr(worktree_ops, "_git", git)
++    tree = _init(tmp_path / "core-fixture")
++    assert kmp.tree_state([str(tree)]) is not None
++
++
++def _card_with_fixture(w2, tmp_path, monkeypatch, *, runs_on):
++    conn = w2.conn
++    tid = kb.create_task(conn, title="pool card with a scratch fixture", assignee="default", runs_on=[POOL])
++    ws = tmp_path / "ws"
++    ws.mkdir()
++    fixture = _init(ws / "core-fixture")
++    repo = pq._pushed_clone(tmp_path, ws / "repo")
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET workspace_path = ?, runs_on = ? WHERE id = ?",
++                     (str(ws), json.dumps(runs_on), tid))
++    return conn, tid, fixture, repo
++
++
++def test_park_keeps_a_card_whose_only_unpushed_looking_tree_is_commit_less_on_the_pool(w2, tmp_path, monkeypatch):
++    conn, tid, _fixture, _repo = _card_with_fixture(w2, tmp_path, monkeypatch, runs_on=[POOL])
++    pq._run(w2, monkeypatch, tid)
++    assert kpp.plan(conn, tid, "waiting on CI") is None
++
++
++def test_a_card_pinned_by_a_commit_less_tree_is_unpinned_at_the_next_park(w2, tmp_path, monkeypatch):
++    conn, tid, fixture, repo = _card_with_fixture(w2, tmp_path, monkeypatch, runs_on=["machine:worker-2"])
++    with kb.write_txn(conn):
++        kb._append_event(conn, tid, "pool_pinned", {
++            "from_machine": "worker-2", "runs_on": ["machine:worker-2"], "previous_runs_on": [POOL],
++            "unpushed_state": f"unpushed commits in {fixture.resolve()}",
++            "trees": [str(fixture.resolve()), str(repo.resolve())]})
++    pq._run(w2, monkeypatch, tid)
++    step = kpp.plan(conn, tid, "waiting on CI")
++    assert step is not None and step["op"] == "unpin" and step["restore"] == [POOL], step
+-- 
+2.43.0
+

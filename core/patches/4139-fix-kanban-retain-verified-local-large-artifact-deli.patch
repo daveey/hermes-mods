@@ -1,0 +1,131 @@
+From 852a83cfc6d1351cd4acaf18e1fadb239bc4f264 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 04:54:06 +0000
+Subject: [PATCH] fix(kanban): retain verified local large artifact delivery
+ [daveey]
+
+Restore same-executor native delivery without trusting foreign paths; require recorded digest and current delivery policy. Align schema/docs with requested missing-path warnings and document small-file replicated storage. Two local/retained-path regressions fail before repair; add notifier integration coverage.
+---
+ hermes_cli/kanban_artifact_delivery.py        | 15 +++++++
+ .../test_kanban_artifact_delivery.py          | 40 +++++++++++++++++++
+ tools/kanban_tools_schemas.py                 | 13 +++---
+ website/docs/user-guide/features/kanban.md    |  2 +-
+ 4 files changed, 64 insertions(+), 6 deletions(-)
+
+diff --git a/hermes_cli/kanban_artifact_delivery.py b/hermes_cli/kanban_artifact_delivery.py
+index 38aa983e03..a94a8abde7 100644
+--- a/hermes_cli/kanban_artifact_delivery.py
++++ b/hermes_cli/kanban_artifact_delivery.py
+@@ -17,6 +17,21 @@ def receipt_delivery_paths(conn, task_id: str, records: list) -> list[str]:
+         if not isinstance(record, dict) or record.get("warning") or not record.get("sha256"):
+             continue
+         uid = record.get("attachment_uid")
++        # Large files have no replicated attachment. Only their writer may use
++        # the original (or scratch-GC-retained) path, with the recorded digest.
++        if not uid and not record.get("attachment_id") and record.get("machine") == machine:
++            from gateway.platforms.base import validate_media_delivery_path
++
++            raw = record.get("retained_path") or record.get("path")
++            if isinstance(raw, str) and validate_media_delivery_path(raw) is not None:
++                path = Path(raw).expanduser()
++                try:
++                    with path.open("rb") as stream:
++                        digest = hashlib.file_digest(stream, "sha256").hexdigest()
++                except OSError:
++                    continue
++                if digest == record["sha256"] and str(path) not in paths:
++                    paths.append(str(path))
+         for row in rows:
+             matches = (uid and row.get("uid") == uid) or (
+                 not uid and record.get("machine") == machine
+diff --git a/tests/hermes_cli/test_kanban_artifact_delivery.py b/tests/hermes_cli/test_kanban_artifact_delivery.py
+index 4c63ebd141..cb61238d27 100644
+--- a/tests/hermes_cli/test_kanban_artifact_delivery.py
++++ b/tests/hermes_cli/test_kanban_artifact_delivery.py
+@@ -15,6 +15,46 @@ from tests.hermes_cli import test_kanban_artifact_machine as support
+ stores = support.stores
+ 
+ 
++@pytest.mark.parametrize("retained", [False, True])
++def test_large_local_artifact_delivery_checks_identity_digest_and_policy(stores, monkeypatch, retained):
++    from gateway.platforms import base
++
++    _, worker, home_conn, conn, _, tid, _ = stores
++    source = worker / "large.bin"
++    source.write_bytes(b"larger than fixture cap")
++    monkeypatch.setattr(kb, "KANBAN_ATTACHMENT_MAX_BYTES", 1)
++    record = support.complete(conn, tid, [str(source)])["artifact_receipt"][0]
++    if retained:
++        target = worker / "retained.bin"
++        source.rename(target)
++        record["retained_path"] = str(target)
++    else:
++        target = source
++    assert delivery.receipt_delivery_paths(conn, tid, [record]) == [str(target)]
++    assert delivery.receipt_delivery_paths(home_conn, tid, [record]) == []
++    assert delivery.receipt_delivery_paths(conn, tid, [{**record, "sha256": "bad"}]) == []
++    monkeypatch.setattr(base, "validate_media_delivery_path", lambda p: None)
++    assert delivery.receipt_delivery_paths(conn, tid, [record]) == []
++
++
++@pytest.mark.asyncio
++async def test_notifier_uploads_large_artifact_on_writer(stores, monkeypatch):
++    from gateway.kanban_watchers import GatewayKanbanWatchersMixin
++
++    _, worker, _, conn, _, tid, _ = stores
++    report = worker / "large-report.bin"
++    report.write_bytes(b"large report")
++    monkeypatch.setattr(kb, "KANBAN_ATTACHMENT_MAX_BYTES", 1)
++    payload = support.complete(conn, tid, [str(report)])
++    adapter = SimpleNamespace(extract_local_files=lambda text: ([], []), send_document=AsyncMock())
++    monkeypatch.setattr(delivery, "delivery_paths", lambda task_id, records, board: delivery.receipt_delivery_paths(conn, task_id, records))
++    await GatewayKanbanWatchersMixin._deliver_kanban_artifacts(
++        None, adapter=adapter, chat_id="chat", metadata={},
++        event_payload=payload, task=SimpleNamespace(id=tid, result="done"),
++    )
++    assert adapter.send_document.await_args.kwargs["file_path"] == str(report)
++
++
+ @pytest.mark.parametrize("symlink", [False, True])
+ def test_denied_source_is_not_laundered_into_attachment(stores, monkeypatch, symlink):
+     from gateway.platforms import base
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index 05002be738..8ce980697b 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -254,11 +254,14 @@ KANBAN_COMPLETE_SCHEMA = _schema(
+                 "else uploads as a file) so the deliverable "
+                 "lands with the completion notification. Skip "
+                 "intermediate scratch files and references that "
+-                "are not the deliverable. The path must exist "
+-                "on disk at completion. Files inside a managed scratch "
+-                "workspace are copied to durable task attachments before "
+-                "cleanup; a missing declared scratch artifact keeps the "
+-                "task in-flight so you can fix the path and retry."
++                "are not the deliverable. Completion records the executing "
++                "machine, path and SHA256. Existing files up to 25 MB are "
++                "copied to card attachments and replicated to the home board; "
++                "larger scratch files are retained on the executing machine. "
++                "Missing paths (including scratch paths) produce visible "
++                "receipt warnings, not successful file-delivery claims. "
++                "Failures preserving existing scratch bytes keep the task "
++                "in-flight. Native chat uploads depend on local byte availability."
+             ),
+         },
+     },
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index 74ddaf32f7..3a146c9477 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -213,7 +213,7 @@ They also coexist inside one run. A kanban task executes in an isolated managed
+ - **Link** — `task_links` row recording a parent → child dependency. The dispatcher promotes `todo → ready` when all parents are `done`. Adding a link to a running child is rejected because it cannot gate work already claimed; the one exception is an active worker linking its own card, with dispatcher-provided run ownership, immediately before a dependency-block handoff.
+ - **Comment** — the inter-agent protocol. Agents and humans append comments; when a worker is (re-)spawned it reads the full comment thread as part of its context.
+ - **Workspace** — the directory a worker operates in. Three kinds:
+-  - `scratch` (default) — fresh tmp dir under `~/.hermes/kanban/workspaces/<id>/` (or `~/.hermes/kanban/boards/<slug>/workspaces/<id>/` on non-default boards). **Deleted when the task completes** — scratch is ephemeral by design. Files explicitly declared through `kanban_complete(artifacts=[...])` or `kanban_request_review(artifacts=[...])` are copied into durable per-task attachment storage before cleanup (a review handoff stages them at handoff time, since the reviewer's later completion is what deletes the scratch workspace); existing deliverable paths in legacy completion summaries receive the same treatment. Other scratch files are removed. A missing declared scratch artifact keeps the task in-flight so the worker can correct the path and retry. Use `worktree:` or `dir:<path>` when the whole workspace should remain available. The first time a scratch workspace is created on an install, the dispatcher logs a warning and emits a `tip_scratch_workspace` event on the task (visible via `hermes kanban show <id>`).
++  - `scratch` (default) — fresh tmp dir under `~/.hermes/kanban/workspaces/<id>/` (or `~/.hermes/kanban/boards/<slug>/workspaces/<id>/` on non-default boards). **Deleted when the task completes** — scratch is ephemeral by design. Files explicitly declared through `kanban_complete(artifacts=[...])` or `kanban_request_review(artifacts=[...])` are copied into durable per-task attachment storage before cleanup (a review handoff stages them at handoff time, since the reviewer's later completion is what deletes the scratch workspace); existing deliverable paths in legacy completion summaries receive the same treatment. Other scratch files are removed. Completion records a machine-qualified `artifact_receipt` for declared artifacts and absolute file paths in completion evidence. Missing paths, including scratch paths, produce visible warnings rather than a file-delivery claim; failures preserving existing scratch bytes still keep the task in-flight. Files up to 25 MB are copied into card attachments even when outside scratch and replicated to the home board, increasing storage on the executor and receiving replicas by the declared file sizes (declare only evidence you intend to retain). Larger files retain a machine-qualified path and SHA256; large scratch files receive a durable executor-local copy before cleanup. Native chat uploads use verified local bytes: replicated attachments on receivers, or digest-checked large files only on their executing machine. Use `worktree:` or `dir:<path>` when the whole workspace should remain available. The first time a scratch workspace is created on an install, the dispatcher logs a warning and emits a `tip_scratch_workspace` event on the task (visible via `hermes kanban show <id>`).
+   - `dir:<path>` — an existing shared directory (Obsidian vault, mail ops dir, per-account folder). **Must be an absolute path.** Relative paths like `dir:../tenants/foo/` are rejected at dispatch because they'd resolve against whatever CWD the dispatcher happens to be in, which is ambiguous and a confused-deputy escape vector. The path is otherwise trusted — it's your box, your filesystem, the worker runs with your uid. This is the trusted-local-user threat model; kanban is single-host by design. **Preserved on completion.**
+   - `worktree` — a git worktree under `.worktrees/<id>/` for coding tasks. Use `worktree:<path>` to pin the exact target path. Worker-side `git worktree add` creates it, using `--branch` when provided. **Preserved on completion.**
+ - **Dispatcher** — a long-lived loop that, every N seconds (default 60): reclaims stale claims, reclaims crashed workers (PID gone but TTL not yet expired), reaps workers that outlived their finished run (a worker still alive after its own `kanban_complete`/`kanban_block` is terminated once its run has been closed for two minutes, leaving it time to finish its final turn — matched by PID *and* spawn-time fingerprint, so a recycled PID is never signalled; recorded as a `terminal_worker_reaped` event), promotes ready tasks, atomically claims, spawns assigned profiles. Runs **inside the gateway** by default (`kanban.dispatch_in_gateway: true`). One dispatcher sweeps all boards per tick; workers are spawned with `HERMES_KANBAN_BOARD` pinned so they can't see other boards. After `kanban.failure_limit` consecutive spawn failures on the same task (default: 2) the dispatcher auto-blocks it with the last error as the reason — prevents thrashing on tasks whose profile doesn't exist, workspace can't mount, etc.
+-- 
+2.43.0
+

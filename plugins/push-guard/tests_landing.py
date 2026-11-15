@@ -27,6 +27,7 @@ class GitHub:
         self.runs = [{'id': 1, 'name': 'tests', 'head_sha': HEAD, 'app': {'id': 9},
                       'check_suite': {'id': 101}, 'status': 'completed', 'conclusion': 'success'}]
         self.statuses = []
+        self.comments = []
         self.reviews = [{'id': 1, 'state': 'APPROVED', 'commit_id': HEAD,
                          'user': {'login': 'reviewer', 'type': 'User'},
                          'submitted_at': '2026-01-01T00:00:00Z'}]
@@ -47,6 +48,8 @@ class GitHub:
             self.pr['merged'] = True
             self.pr['state'] = 'closed'
             return {'merged': True}
+        if '/issues/7/comments?' in endpoint:
+            return copy.deepcopy(self.comments)
         if '/pulls/7/reviews?' in endpoint:
             return copy.deepcopy(self.reviews)
         if endpoint.endswith('/pulls/7'):
@@ -62,6 +65,9 @@ class GitHub:
             return {'check_runs': copy.deepcopy(self.runs)}
         if '/statuses?' in endpoint:
             return self.statuses
+        if endpoint == 'graphql':
+            return {'data': {'repository': {'pullRequest': {'reviewThreads': {
+                'nodes': [], 'pageInfo': {'hasNextPage': False, 'endCursor': None}}}}}}
         if endpoint == 'user':
             return {'login': 'lander'}
         raise AssertionError(args)
@@ -131,6 +137,203 @@ def test_same_named_jobs_in_distinct_workflows_do_not_hide_failure():
     api.runs.append({**api.runs[0], 'id': 2, 'check_suite': {'id': 102}, 'conclusion': 'success'})
     with pytest.raises(land.Refused): land.land(7, HEAD, read=api)
     assert not api.writes
+
+
+@pytest.mark.parametrize('case', ['failure', 'pending', 'distinct-suite'])
+def test_configured_required_non_success_never_writes(case):
+    api = GitHub()
+    api.required = ['tests']
+    if case == 'pending':
+        api.runs[0].update(status='in_progress', conclusion=None)
+    else:
+        api.runs[0]['conclusion'] = 'failure'
+    if case == 'distinct-suite':
+        api.runs.append({**api.runs[0], 'id': 2, 'check_suite': {'id': 102},
+                         'conclusion': 'success'})
+    with pytest.raises(land.Refused, match='Required check'):
+        land.land(7, HEAD, read=api)
+    assert not api.writes
+
+
+@pytest.mark.parametrize('case', ['valid', 'different-pr', 'outstanding-points'])
+def test_kanban_receipt_pr_and_points(monkeypatch, tmp_path, case):
+    monkeypatch.setattr(land.Path, 'home', lambda: tmp_path)
+    path = tmp_path / '.hermes/lib/core-tools/hermes-core-wt-land'
+    path.parent.mkdir(parents=True)
+    path.write_text('# fixture validator')
+    receipt = {'verdict': 'approve', 'reviewed_sha': HEAD,
+               'reviewed_pr': f'https://github.com/{land.REPO}/pull/7',
+               'completed_at': 1767312000, 'non_blocking': []}
+    if case == 'different-pr':
+        receipt['reviewed_pr'] = f'https://github.com/{land.REPO}/pull/8'
+    if case == 'outstanding-points':
+        receipt['non_blocking'] = ['Explain the remaining review point']
+    monkeypatch.setattr(land.runpy, 'run_path', lambda *a, **k: {
+        'review_gate': lambda *a, **k: receipt})
+    api = GitHub()
+    api.reviews = []  # Only the Kanban receipt supplies approval.
+    if case == 'valid':
+        assert land.land(7, HEAD, 'review', 'implementation', read=api)['merged']
+        assert len(api.writes) == 1
+    else:
+        match = 'Invalid review receipt' if case == 'different-pr' else 'Unanswered review points'
+        with pytest.raises(land.Refused, match=match):
+            land.land(7, HEAD, 'review', 'implementation', read=api)
+        assert not api.writes
+
+
+# The review card completed at 2026-01-02T00:00:00Z (Kanban ended_at, epoch seconds).
+DONE = 1767312000
+MARKER = '<!-- hermes-review-reply -->'
+
+
+def reply(created_at, body=MARKER + '\ndeclined: wording only', login='implementer', kind='User'):
+    return {'id': 1, 'user': {'login': login, 'type': kind}, 'created_at': created_at, 'body': body}
+
+
+def points_fixture(monkeypatch, tmp_path, comments, completed_at=DONE, extra=None, points=None):
+    monkeypatch.setattr(land.Path, 'home', lambda: tmp_path)
+    path = tmp_path / '.hermes/lib/core-tools/hermes-core-wt-land'
+    path.parent.mkdir(parents=True)
+    path.write_text('# fixture validator')
+    receipt = {'verdict': 'approve', 'reviewed_sha': HEAD, 'completed_at': completed_at,
+               'reviewed_pr': f'https://github.com/{land.REPO}/pull/7',
+               'non_blocking': ['Nit (non-blocking): rename the helper'] if points is None else points}
+    monkeypatch.setattr(land.runpy, 'run_path', lambda *a, **k: {
+        'review_gate': lambda *a, **k: receipt, **(extra or {})})
+    api = GitHub()
+    api.reviews = []
+    api.comments = comments
+    return api, api
+
+
+@pytest.mark.parametrize('points', ['rename helper', {'nit': 'rename helper'}, ('rename helper',), True, 1])
+def test_malformed_points_refused_despite_valid_late_reply(monkeypatch, tmp_path, points):
+    api, read = points_fixture(monkeypatch, tmp_path, [reply('2026-01-02T00:00:01Z')], points=points)
+    with pytest.raises(land.Refused, match='Malformed review points'):
+        land.land(7, HEAD, 'review', 'implementation', read=read)
+    assert not api.writes
+
+
+@pytest.mark.parametrize('login', ['', ' ', '\t\n'])
+def test_invalid_reply_identity_refused_despite_marked_late_reply(monkeypatch, tmp_path, login):
+    # Strings keep the removed identity check from failing incidentally in endswith.
+    api, read = points_fixture(monkeypatch, tmp_path, [reply('2026-01-02T00:00:01Z', login=login)])
+    with pytest.raises(land.Refused, match='Unanswered review points'):
+        land.land(7, HEAD, 'review', 'implementation', read=read)
+    assert not api.writes
+
+
+@pytest.mark.parametrize('completed_at', [DONE, DONE * 1000, str(DONE), '2026-01-02T00:00:00Z'])
+def test_points_answered_after_review_land(monkeypatch, tmp_path, completed_at):
+    api, read = points_fixture(monkeypatch, tmp_path, [reply('2026-01-02T00:00:01Z')], completed_at)
+    assert land.land(7, HEAD, 'review', 'implementation', read=read)['merged']
+    assert len(api.writes) == 1 and any('/issues/7/comments?' in r for r in api.reads)
+
+
+@pytest.mark.parametrize('case', ['before', 'same-second', 'bot-type', 'bot-login', 'unmarked', 'no-comments',
+                                  'bad-time', 'no-user', 'organization'])
+def test_points_unanswered_refused(monkeypatch, tmp_path, case):
+    comment = {
+        'before': reply('2026-01-01T23:59:59Z'),
+        'same-second': reply('2026-01-02T00:00:00Z'),
+        'bot-type': reply('2026-01-02T00:00:01Z', kind='Bot'),
+        'bot-login': reply('2026-01-02T00:00:01Z', login='ci-review[bot]'),
+        'unmarked': reply('2026-01-02T00:00:01Z', body='declined: wording only'),
+        'bad-time': reply('2026-01-02 00:00:01'),
+        'no-user': {**reply('2026-01-02T00:00:01Z'), 'user': None},
+        'organization': reply('2026-01-02T00:00:01Z', kind='Organization'),
+    }.get(case)
+    api, read = points_fixture(monkeypatch, tmp_path, [comment] if comment else [])
+    with pytest.raises(land.Refused, match='Unanswered review points'):
+        land.land(7, HEAD, 'review', 'implementation', read=read)
+    assert not api.writes
+
+
+@pytest.mark.parametrize('completed_at', [None, '', 'soon', True, 0, '2026-01-02T00:00:00'])
+def test_points_with_unreadable_completion_refused(monkeypatch, tmp_path, completed_at):
+    api, read = points_fixture(monkeypatch, tmp_path, [reply('2030-01-01T00:00:00Z')], completed_at)
+    with pytest.raises(land.Refused, match='completion time is unreadable'):
+        land.land(7, HEAD, 'review', 'implementation', read=read)
+    assert not api.writes
+
+
+def test_points_with_unreadable_comments_refused(monkeypatch, tmp_path):
+    api, read = points_fixture(monkeypatch, tmp_path, [reply('2026-01-02T00:00:01Z')])
+    api.error = '/issues/7/comments'
+    with pytest.raises(land.Refused, match='unreadable'):
+        land.land(7, HEAD, 'review', 'implementation', read=read)
+    assert not api.writes
+
+
+def test_installed_thread_guard_is_honored_and_never_posts(monkeypatch, tmp_path, capsys):
+    calls = []
+
+    def thread_guard(gh, slug, pr, review, text, record=None):
+        calls.append((slug, pr, review['non_blocking'], text))
+        assert gh.json('api', 'user') == ({'login': 'lander'}, None)
+        print('core-wt land: progress line')
+        return (1, 'review 9 @aaaaaaaaaa: "body point"') if len(calls) > 1 else (None, '')
+
+    extra = {'review_reply_guard': thread_guard}
+    api, read = points_fixture(monkeypatch, tmp_path, [reply('2026-01-02T00:00:01Z')], extra=extra)
+    assert land.land(7, HEAD, 'review', 'implementation', read=read)['merged']
+    assert calls[0] == (land.REPO, {'number': 7}, ['Nit (non-blocking): rename the helper'], '')
+    out = capsys.readouterr()
+    assert 'progress line' in out.err and 'progress line' not in out.out
+    api, read = points_fixture(monkeypatch, tmp_path / 'again', [reply('2026-01-02T00:00:01Z')], extra=extra)
+    with pytest.raises(land.Refused, match='body point'):
+        land.land(7, HEAD, 'review', 'implementation', read=read)
+    assert not api.writes
+
+
+INSTALLED = Path.home() / '.hermes/lib/core-tools/hermes-core-wt-land'
+
+
+@pytest.mark.skipif(not INSTALLED.is_file(), reason='installed hermes-core-wt-land validator absent (CI: no core)')
+@pytest.mark.parametrize('case', ['after', 'before', 'bot'])
+def test_installed_review_reply_guard_parity(monkeypatch, tmp_path, case):
+    """The real installed review_reply_guard agrees with points_answered on the same thread."""
+    real = land.runpy.run_path(str(INSTALLED), run_name='push_guard_review_validator')
+    comment = {'after': reply('2026-01-02T00:00:01Z'), 'before': reply('2026-01-01T23:59:59Z'),
+               'bot': reply('2026-01-02T00:00:01Z', login='ci-review[bot]', kind='Bot')}[case]
+    extra = {'review_reply_guard': real['review_reply_guard']}
+    api, read = points_fixture(monkeypatch, tmp_path, [comment], extra=extra)
+
+    class Reader:
+        def json(self, *args, **kwargs):
+            return read(*args), None
+
+    receipt = {'id': 'review', 'completed_at': DONE, 'non_blocking': ['Nit (non-blocking): rename the helper']}
+    code, _ = real['review_reply_guard'](Reader(), land.REPO, {'number': 7}, receipt, '')
+    assert (code is None) == (case == 'after')
+    if case == 'after':
+        assert land.land(7, HEAD, 'review', 'implementation', read=read)['merged']
+    else:
+        with pytest.raises(land.Refused, match='Unanswered review points'):
+            land.land(7, HEAD, 'review', 'implementation', read=read)
+        assert not api.writes
+
+
+@pytest.mark.parametrize('case', ['not-merged', 'changed-head'])
+def test_successful_put_requires_verified_readback(case):
+    api = GitHub()
+
+    def read(*args):
+        result = api(*args)
+        # Leave both preflight reads and the successful PUT untouched.
+        if api.writes and args[1] == f'repos/{land.REPO}/pulls/7':
+            if case == 'not-merged':
+                result['merged'] = False
+            else:
+                result['head']['sha'] = 'c' * 40
+        return result
+
+    with pytest.raises(land.Refused, match='exact PR readback is unverified; do not retry blindly'):
+        land.land(7, HEAD, read=read)
+    assert len(api.writes) == 1
+    assert f'sha={HEAD}' in api.writes[0]
+    assert api.reads[-1] == f'repos/{land.REPO}/pulls/7'
 
 
 def test_newer_failure_wins_over_old_success():
@@ -285,6 +488,7 @@ def test_malformed_evidence_names_never_write(field, value):
     assert not api.writes
 
 
-def test_graphql_held_without_config(monkeypatch):
-    monkeypatch.setattr(guard, '_gql_repo', lambda *_: land.REPO)
+@pytest.mark.parametrize('repo', [land.REPO, None])
+def test_graphql_held_without_config(monkeypatch, repo):
+    monkeypatch.setattr(guard, '_gql_repo', lambda *_: repo)
     assert guard.check_shell("gh api graphql -f 'query=mutation{mergePullRequest(input:{pullRequestId: \"PR_test123\"}){clientMutationId}}'", '/', guards=[])

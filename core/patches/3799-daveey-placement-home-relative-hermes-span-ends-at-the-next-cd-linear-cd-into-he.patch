@@ -1,0 +1,339 @@
+From c0bf2d0f0b3be68c44e8d948c575bb6cae936c3a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 19:15:33 +0000
+Subject: [PATCH] [daveey] placement: home-relative .hermes span ends at the
+ next cd (linear); cd into ~/.hermes pins
+
+PR #2463 review 5895947424 nits, applied to main's HERMES_STATE_PATH (907d09c9f6b):
+
+1. Over-match: the `_CD_HOME + [\s\S]*?` span ran to the end of the card, so
+   `cd ~ && git clone x repo && cd repo && write .hermes/plans/p.md` pinned as
+   state-path and the pool verdict read it as ~/.hermes/plans/p.md. The span is
+   now tempered: it stops at the next `cd`/`pushd`/`popd` (lowercase only, so
+   prose "CI/CD" does not end it; a `cd .hermes` itself does not end it).
+2. Performance: with no match that span made the search quadratic in
+   (cd count) x (text length). Each start now reads only to the next directory
+   change: 334 KB / 5000 `cd ~` lines 18.3 s -> 0.05 s.
+3. Fail-open: `cd ~/.hermes && cat .env` (any home spelling, quoted, trailing
+   slash, `pushd`, or `cd .hermes` after a cd home) named no state marker. A
+   cd/pushd into the state directory now pins. A bare `~/.hermes` elsewhere
+   still does not: 9328cbc2d9b made "the hermes-agent tree under ~/.hermes"
+   worker-first (test_ordinary_repo_work_enrolls_worker_first goes RED if it
+   pins). `_strip_read_paths` already keeps text with such a cd (`_CHDIR`), so a
+   declared hub:read never clears it; comment + rows say so.
+
+Also closes the residual gaps #2463's rows found on main: `./.hermes/` after a
+cd home, and the pool verdict now reads every home-relative hit as
+`~/.hermes/<p>`, so a worker's own artifact named after `cd ~` keeps the card
+(class a-artifact) instead of going to hub-write.
+
+Rebased onto 49f0ccd4a5e (PR #2460 nits: pushd home, commented/redirected cd,
+lowercase cd, span stopping at the next cd HOME): its `_CD_HOME`, `_REL_STATE`
+and fallback naming are kept; this commit widens the span stop to ANY
+cd/pushd/popd, which is what fixes nit 1 (49f0ccd4a5e kept the over-match).
+
+Tests: #2463's rows (test_kanban_placement_home_spellings.py new, hunks in
+test_kanban_hub_read_roots.py / test_kanban_pool_queue.py) plus new rows for the
+three nits, incl. a timing bound on a 334 KB no-match body.
+RED on base: 34 failed / 272 passed across the 4 placement-path files (timing
+row: 16.7 s against a 1 s bound). GREEN: 96 files importing kanban_placement,
+2652 passed, 0 failed.
+---
+ hermes_cli/kanban_home_marker_placement.py    | 16 ++--
+ hermes_cli/kanban_placement.py                | 30 ++++---
+ hermes_cli/kanban_placement_coordination.py   |  2 +
+ .../hermes_cli/test_kanban_hub_read_roots.py  | 44 +++++++++-
+ .../test_kanban_placement_home_spellings.py   | 86 +++++++++++++++++++
+ tests/hermes_cli/test_kanban_pool_queue.py    | 33 +++++++
+ 6 files changed, 194 insertions(+), 17 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_placement_home_spellings.py
+
+diff --git a/hermes_cli/kanban_home_marker_placement.py b/hermes_cli/kanban_home_marker_placement.py
+index 39d45dd664..9d587b873e 100644
+--- a/hermes_cli/kanban_home_marker_placement.py
++++ b/hermes_cli/kanban_home_marker_placement.py
+@@ -120,12 +120,18 @@ def _worktree(pattern, match, gateway, probe):
+ 
+ def _state_path(pattern, match, gateway, probe):
+     from hermes_cli import kanban_placement as kp
+-    # ``$HOME``/``${HOME}`` prefixes too (kp.HOME_PREFIX). A relative path after a cd home is named as its ``~/``
+-    # path, not the whole cd..path span the hit covers (review 5895876398).
++    # ``$HOME``/``${HOME}`` prefixes too (kp.HOME_PREFIX). Every relative ``.hermes/<p>`` after a cd home reads as
++    # ``~/.hermes/<p>``, so a worker's own artifact named that way still keeps the card; a fallback hit is named as
++    # its ``~/`` path, not the whole cd..path span it covers (review 5895876398).
++    text = match.string
+     state = re.compile(kp.HOME_PREFIX + _STATE.pattern[len(_HOME):])
+-    paths = [p for p in (_clean(m.group(0)) for m in state.finditer(match.string))
+-             if re.match(kp.HERMES_STATE_PATH, p)]
+-    rel = _REL_STATE.match(match.string, match.start() + match.group(0).lower().rfind(".hermes/"))
++    found = [m.group(0) for m in state.finditer(text)]
++    for m in re.finditer(kp.HERMES_STATE_PATH, text, re.IGNORECASE):
++        if re.match(kp._CD_HOME, m.group(0)) and (rel := _REL_STATE.match(
++                text, m.start() + m.group(0).lower().rfind(".hermes/"))):
++            found.append("~/" + rel.group(0))
++    paths = [p for p in map(_clean, found) if re.match(kp.HERMES_STATE_PATH, p)]
++    rel = _REL_STATE.match(text, match.start() + match.group(0).lower().rfind(".hermes/"))
+     for raw in dict.fromkeys(paths) or [_clean("~/" + rel.group(0)) if rel else match.group(0)]:
+         if art := _ARTIFACT.search(raw):
+             # health: allow HX001 -- the card text names ~/.hermes literally; probe that same path on this worker
+diff --git a/hermes_cli/kanban_placement.py b/hermes_cli/kanban_placement.py
+index 7f239b2622..9fdc7e910f 100644
+--- a/hermes_cli/kanban_placement.py
++++ b/hermes_cli/kanban_placement.py
+@@ -575,18 +575,26 @@ def _heavy_marker(title: str, body: str, cfg: _Cfg) -> Optional[str]:
+ # ``requires: [host_repo]`` or a ``dir``/``worktree`` workspace. On the hub these markers only nominate a
+ # card for the hub admission judge (see the module docstring): a denied card goes to the worker pool with
+ # ``requires: [hub:write]``, so a mention of a hub path no longer holds a hub slot by itself.
+-# The home prefix also takes ``$HOME``/``${HOME}``, bare or double-quoted, and a relative ``.hermes/`` path counts after
+-# a ``cd`` to home (``cd``, ``cd ~``, ``cd $HOME``, ``cd /home/<u>``) anywhere earlier in the text (PR #2405 review
+-# 5894942332 nit). A later cd elsewhere is not tracked: such text still pins (fails toward the home gateway).
+-# ``pushd <home>`` counts too, and the cd may end in a shell comment; ``cd``/``pushd`` are lowercase words (a prose
+-# "CD" is not one) and a bare ``pushd`` only swaps the stack (review 5895876398). The scan from a cd home stops at
+-# the next cd home (that one starts its own scan), so a transcript of N ``cd ~`` lines costs O(length), not
+-# O(N x length): 20000 such lines took 37 s per search before.
++# The home prefix also takes ``$HOME``/``${HOME}``, bare or double-quoted, and a relative ``.hermes`` path (``./``
++# optional) counts after a ``cd`` to home (``cd``, ``cd ~``, ``cd $HOME``, ``cd /home/<u>``) (PR #2405 review
++# 5894942332 nit). ``pushd <home>`` counts too, and the cd may end in a shell comment or redirect; ``cd``/``pushd``
++# are lowercase words (a prose "CD" is not one) and a bare ``pushd`` only swaps the stack (review 5895876398).
++# The relative span ends at the next ``cd``/``pushd``/``popd`` (one into ``.hermes`` itself excepted), so
++# ``cd ~ && cd repo && cat .hermes/x`` names the repo's own dir (PR #2463 review 5895947424). That also keeps the
++# scan linear: each start reads only to the next directory change (20000 ``cd ~`` lines took 37 s per search when
++# the span ran to the end of the text). A cd/pushd into the state directory itself (``cd ~/.hermes && cat .env``,
++# or ``cd .hermes`` after a cd home) counts too (review 5895947424). A bare ``~/.hermes`` anywhere else does not:
++# "the hermes-agent tree under ~/.hermes" is ordinary repo work and must reach the worker pool (9328cbc2d9b).
+ HOME_PREFIX = r"(?:~|/home/[^/\s]+|\$HOME\b|\$\{HOME\}|\"\$HOME\"|\"\$\{HOME\}\")"
+-_CD_HOME = (r"(?<![\w./-])(?-i:cd(?:[ \t]+" + HOME_PREFIX + r"/?)?|pushd[ \t]+" + HOME_PREFIX + r"/?)"
+-            r"(?=[ \t]*(?:$|[\n;&|)>])|[ \t]+#)")
+-HERMES_STATE_PATH = (r"(?:" + HOME_PREFIX + r"/|" + _CD_HOME + r"(?:(?!" + _CD_HOME + r")[\s\S])*?(?<![\w./~$}-]))"
+-                     r"\.hermes/(?!(?:hermes-agent|repos|bin)(?:/|\b))[\w.-]")
++_CMD_END = r"(?=[ \t]*(?:$|[\n;&|)>])|[ \t]+#)"
++_CD_HOME = (r"(?<![\w./-])(?-i:cd(?:[ \t]+" + HOME_PREFIX + r"/?)?|pushd[ \t]+" + HOME_PREFIX + r"/?)" + _CMD_END)
++_CHDIR = r"(?<![\w./-])(?-i:cd|pushd|popd)(?![\w.-])(?![ \t]+[\"']?(?:\./)?\.hermes(?![\w.-]))"
++_CD_INTO = r"(?<![\w./-])(?-i:cd|pushd)[ \t]+[\"']?"
++_STATE_SUB = r"\.hermes/(?!(?:hermes-agent|repos|bin)(?:/|\b))[\w.-]"
++_STATE_DIR = r"\.hermes/?[\"']?" + _CMD_END
++HERMES_STATE_PATH = (r"(?:" + HOME_PREFIX + r"/" + _STATE_SUB + r"|" + _CD_INTO + HOME_PREFIX + r"/" + _STATE_DIR +
++                     r"|" + _CD_HOME + r"(?:(?!" + _CHDIR + r")[\s\S])*?"
++                     r"(?:(?<![\w./~$}-])(?:\./)?" + _STATE_SUB + r"|" + _CD_INTO + r"(?:\./)?" + _STATE_DIR + r"))")
+ HOST_WORKTREE_PATH = r"(?:~|/home/[^/\s]+)/code/_wt(?:-[\w-]+)?(?:/|\b)"
+ # Any home-rooted ``<dir>/.worktrees`` (``~/code/<repo>/.worktrees/t_*``, ``~/.hermes/hermes-agent/.worktrees``):
+ # kanban worktrees there hold host-only commits and dirty files. ``.worktrees-notes.md`` and ``/tmp/.../.worktrees``
+diff --git a/hermes_cli/kanban_placement_coordination.py b/hermes_cli/kanban_placement_coordination.py
+index 32a6a20cd6..4c1c682e18 100644
+--- a/hermes_cli/kanban_placement_coordination.py
++++ b/hermes_cli/kanban_placement_coordination.py
+@@ -100,6 +100,8 @@ _HUB_READ_SSH = re.compile(r"\bssh[ \t]+hermes-hub[ \t]+(?:" + "|".join(HUB_READ
+                            re.IGNORECASE)
+ # A Hermes state path (same roots as ``kanban_placement.HERMES_STATE_PATH``). The path is an allow-list of path
+ # characters, so a shell operator glued to it (``&&``, ``;``, ``:``, ``|``, ``$(``) ends it and stays in the text.
++# Text with ``cd ~/.hermes`` (the state directory itself) keeps every path (:data:`_CHDIR`), so it keeps pinning
++# (PR #2463 review 5895947424 nit).
+ # The match must also end its shell word (:func:`_ends_word`), or a quoted, brace, ``$``, ``\\`` or glob remainder
+ # (``logs/'..'``, ``logs/{..,x}``, ``logs/$(echo ..)``) would hide a ``..`` from :func:`_under_roots`
+ # (reviews 5877418508, 5877782890). ``%`` is literal in shell (``%2e%2e`` is a directory name, not ``..``).
+diff --git a/tests/hermes_cli/test_kanban_hub_read_roots.py b/tests/hermes_cli/test_kanban_hub_read_roots.py
+index 2854b5e221..be1e412ea7 100644
+--- a/tests/hermes_cli/test_kanban_hub_read_roots.py
++++ b/tests/hermes_cli/test_kanban_hub_read_roots.py
+@@ -10,6 +10,35 @@ fleet = helpers.fleet
+ ROOTS = ["logs", "cron", "kanban", "cache/core-update", "core-update", "cache/hermes-sync", "cache/delegation",
+          "config.yaml", "coach", "user-steps", "inbox"]
+ STEP = "Step 1: ssh hermes-hub grep X ~/.hermes/logs/hermes-sync.log and report the matches."
++# ``$HOME`` spellings and a home-relative path after a cd home are state paths too (review 5894942332 nit). The
++# roots clear only ``~``/``/home/<u>`` spellings, so a declared hub:read keeps these pinned even under a root.
++HOME_SPELLINGS = [
++    "ssh hermes-hub cat $HOME/.hermes/logs/x.log",
++    "ssh hermes-hub cat ${HOME}/.hermes/logs/x.log",
++    'ssh hermes-hub cat "$HOME"/.hermes/logs/x.log',
++    'ssh hermes-hub cat "${HOME}/.hermes/logs/x.log"',
++    "cat $HOME/.hermes/.env",
++    "cd ~ && cat .hermes/.env",
++    "cd ~ && cat .hermes/logs/x.log",
++    "cd $HOME && cat ./.hermes/logs/x.log",
++    'cd "${HOME}"; cat .hermes/logs/x.log',
++    "cd\ncat .hermes/.env",
++    "ssh hermes-hub cat ~/.hermes/logs/x.log; cd ~ && cat .hermes/.env",
++    "cd ~ && ssh hermes-hub cat ~/.hermes/logs/x.log && cat '.hermes/.env'",
++    # The state directory itself (PR #2463 review 5895947424 nit): a cd into it. No root clears it:
++    # _strip_read_paths keeps any text with such a cd.
++    "cd ~/.hermes && cat .env",
++    "cd $HOME/.hermes; cat .env",
++    'cd "${HOME}/.hermes" && cat logs/x.log',
++    "cd ~/.hermes/ && cat logs/x.log",
++    "pushd /home/ubuntu/.hermes && cat logs/x.log",
++    "cd ~ && cd .hermes && cat logs/x.log",
++]
++# A later cd elsewhere ends the home-relative span (review 5895947424 nit): a repo's own .hermes is no marker.
++REPO_RELATIVE = [
++    "cd ~ && git clone x repo && cd repo && cat .hermes/plans/p.md",
++    "cd $HOME\ncd code/x\ncat .hermes/notes.md",
++]
+ 
+ 
+ @pytest.fixture(autouse=True)
+@@ -169,12 +198,25 @@ def test_malformed_roots_clear_nothing(attested, roots):
+     "echo 'a '/home/ubuntu/.hermes/logs/' b/'.''.'/'.''.'/state.db'",
+     "cat ~/.hermes/logs/x; D=~/.hermes/logs/; cat ${D%logs/}.env",
+     "D=$(dirname ~/.hermes/logs/x); cat $(dirname $D)/.env",
+-])
++] + HOME_SPELLINGS)
+ def test_controls_still_pin(attested, body):
+     cfg, _, _ = attested
+     assert reason(body, cfg) == "home gateway marker"
+ 
+ 
++@pytest.mark.parametrize("body", HOME_SPELLINGS)
++def test_home_spellings_pin_an_undeclared_card(attested, body):
++    cfg, _, _ = attested
++    assert reason(body, cfg, requires=()) == "home gateway marker"
++
++
++@pytest.mark.parametrize("body", REPO_RELATIVE)
++def test_a_repo_relative_hermes_after_a_later_cd_does_not_pin(attested, body):
++    cfg, _, _ = attested
++    assert reason(body, cfg, requires=()) is None
++    assert reason(body, cfg) is None
++
++
+ @pytest.mark.parametrize("body", [
+     # A whole backtick span is a name to marker_work_text (main fdd26189801), so main already ignores these with or
+     # without hub:read; the declaration must not change the answer either way.
+diff --git a/tests/hermes_cli/test_kanban_placement_home_spellings.py b/tests/hermes_cli/test_kanban_placement_home_spellings.py
+new file mode 100644
+index 0000000000..e8d6bb0291
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_placement_home_spellings.py
+@@ -0,0 +1,86 @@
++"""Every spelling of a home-rooted ``~/.hermes`` state path pins a hub-origin card (review 5894942332 nit).
++
++Before this only ``~/`` and ``/home/<u>/`` pinned, so ``cat $HOME/.hermes/.env`` and ``cd ~ && cat .hermes/.env``
++named hub state yet routed heavy work to the worker. [daveey]"""
++import re
++import time
++
++import pytest
++
++from tests.hermes_cli import test_kanban_placement as helpers
++
++
++@pytest.mark.parametrize("body", [
++    "Run pytest, then cat $HOME/.hermes/.env",
++    "Run pytest, then cat ${HOME}/.hermes/.env",
++    'Run pytest, then cat "$HOME"/.hermes/.env',
++    'Run pytest, then cat "${HOME}/.hermes/.env"',
++    "Run pytest, then cd ~ && cat .hermes/.env",
++    "Run pytest, then cd $HOME; cat ./.hermes/.env",
++    'Run pytest, then cd "$HOME"\ncat .hermes/.env',
++    "Run pytest, then cd && cat .hermes/.env",
++    "Run pytest, then cd /home/ubuntu/ && cat .hermes/.env",
++    "Run pytest, then pushd ~ && cat .hermes/.env",
++])
++def test_home_spellings_of_state_paths_stay_local(body):
++    d = helpers._hub({"title": "Maintenance", "body": body})
++    assert d["where"] == "local" and "runs_on" not in d, d
++
++
++@pytest.mark.parametrize("body", [
++    "Run pytest, then cat $HOME/.hermes/hermes-agent/README.md",   # the code checkout is not state
++    "Run pytest, then cd ~/code/x && cat .hermes/notes.md",         # a repo's own .hermes dir, not home
++    "Run pytest, then cd ~ && cat code/x/.hermes/notes.md",
++    "Run pytest, then cd ~ && cat .hermes/repos/x",
++    "Run pytest in CI/CD; see .hermes/notes.md in the repo",
++])
++def test_home_spellings_of_code_paths_stay_portable(body):
++    assert helpers._hub({"title": "Maintenance", "body": body})["runs_on"] == ["machine:worker-1"]
++
++
++# PR #2463 review 5895947424 nits. (1) A later ``cd`` elsewhere ends the home-relative span: a repo's own
++# ``.hermes`` after ``cd repo`` is not home state. (3) A ``cd``/``pushd`` into the state directory itself (any home
++# spelling) names it.
++@pytest.mark.parametrize("body", [
++    "Run pytest, then cd ~/.hermes && cat .env",
++    "Run pytest, then cd $HOME/.hermes; cat .env",
++    'Run pytest, then cd "${HOME}/.hermes" && cat auth.json',
++    'Run pytest, then cd "$HOME"/.hermes/\ncat auth.json',
++    "Run pytest, then cd /home/ubuntu/.hermes/ && cat .env",
++    "Run pytest, then pushd ~/.hermes && cat .env",
++    "Run pytest, then cd ~ && cd .hermes && cat .env",
++    "Run pytest, then cd ~ && cd ./.hermes/ && cat .env",
++    "Run pytest, then cd ~ && cd repo && cd ~ && cat .hermes/.env",
++])
++def test_the_state_directory_itself_stays_local(body):
++    d = helpers._hub({"title": "Maintenance", "body": body})
++    assert d["where"] == "local" and "runs_on" not in d, d
++
++
++@pytest.mark.parametrize("body", [
++    "Run pytest, then cd ~ && git clone x repo && cd repo && write .hermes/plans/p.md",
++    "Run pytest, then cd ~\ngit clone x repo\ncd repo\ncat .hermes/notes.md",
++    "Run pytest, then pushd ~ && cd code/x && cat .hermes/notes.md",
++    "Run pytest, then cd ~ && cd /tmp/x && cat .hermes/notes.md",
++    "Run pytest, then cd ~/.hermes/hermes-agent && cat README.md",
++    "Run pytest, then cd ~/.hermesrc && ls",
++    # A bare ~/.hermes outside a cd is ordinary repo work (9328cbc2d9b: "the hermes-agent tree under ~/.hermes").
++    "Run pytest, then read the hermes-agent tree under ~/.hermes",
++    "Run pytest, then ls ~/.hermes/hermes-agent/",
++])
++def test_a_later_cd_elsewhere_ends_the_home_relative_span(body):
++    assert helpers._hub({"title": "Maintenance", "body": body})["runs_on"] == ["machine:worker-1"]
++
++
++def test_a_large_no_match_body_is_linear():
++    """(2) Before, each qualifying cd ran a lazy span to the end of the text: 16.9 s at 180 KB / 5000 cd lines."""
++    from hermes_cli import kanban_placement as kp
++    body = "Run pytest, then\n" + "".join(
++        f"cd ~ && echo step {i} padded out to a realistic shell line length\n" for i in range(5000))
++    assert len(body) > 180_000
++    start = time.monotonic()
++    assert re.search(kp.HERMES_STATE_PATH, body, re.IGNORECASE) is None
++    assert time.monotonic() - start < 1.0
++    start = time.monotonic()
++    assert helpers._hub({"title": "Maintenance", "body": body})["runs_on"] == ["machine:worker-1"]
++    assert time.monotonic() - start < 5.0
+diff --git a/tests/hermes_cli/test_kanban_pool_queue.py b/tests/hermes_cli/test_kanban_pool_queue.py
+index a5c67a6e4d..105c15bb49 100644
+--- a/tests/hermes_cli/test_kanban_pool_queue.py
++++ b/tests/hermes_cli/test_kanban_pool_queue.py
+@@ -1351,6 +1351,39 @@ def test_a_worker_keeps_a_card_naming_its_own_artifact(on_w2, tmp_path, home):
+     assert _home_marker(on_w2.conn, out["task_id"])["class"] == "a-artifact"
+ 
+ 
++@pytest.mark.parametrize("title", [
++    "read $HOME/.hermes/kanban/workspaces/t_0000000000000003/log.txt",
++    'read "${HOME}"/.hermes/kanban/workspaces/t_0000000000000003/log.txt',
++    "cd ~ && cat .hermes/kanban/workspaces/t_0000000000000003/log.txt",
++])
++def test_a_worker_keeps_a_card_naming_its_own_artifact_by_a_home_spelling(on_w2, tmp_path, title):
++    """``$HOME`` and a home-relative path after a cd home probe the same artifact (review 5894942332 nit)."""
++    log = tmp_path / ".hermes" / "kanban" / "workspaces" / "t_0000000000000003" / "log.txt"
++    log.parent.mkdir(parents=True)
++    log.write_text("x\n")
++    out = _kept(on_w2.conn, _create(title=title))
++    assert "exists only on this worker" in out["note"], out
++    assert _home_marker(on_w2.conn, out["task_id"])["class"] == "a-artifact"
++
++
++def test_a_repo_relative_hermes_after_a_later_cd_is_no_home_marker(on_w2, tmp_path):
++    """A later cd elsewhere ends the home-relative span (PR #2463 review 5895947424 nit): the repo's own
++    ``.hermes/kanban/...`` is not read as this worker's ``~/.hermes/kanban/...`` artifact."""
++    log = tmp_path / ".hermes" / "kanban" / "workspaces" / "t_0000000000000004" / "log.txt"
++    log.parent.mkdir(parents=True)
++    log.write_text("x\n")
++    out = _create(title="cd ~ && git clone x repo && cd repo && cat .hermes/kanban/workspaces/t_0000000000000004/log")
++    assert out.get("ok"), out
++    assert _home_marker(on_w2.conn, out["task_id"]) is None, out
++
++
++@pytest.mark.parametrize("title", ['pushd "$HOME/.hermes" && cat .env', "cd $HOME/.hermes && cat .env"])
++def test_the_state_directory_itself_joins_the_pool_with_hub_write(on_w2, title):
++    """A cd into ``~/.hermes`` names hub state (PR #2463 review 5895947424 nit)."""
++    out = _queued(on_w2.conn, _create(title=title), [HUB_WRITE])
++    assert _home_marker(on_w2.conn, out["task_id"])["class"] == "b", out
++
++
+ def test_a_worker_keeps_a_this_host_card(on_w2):
+     out = _kept(on_w2.conn, _create(title="apply the next hermes update on this host"))
+     assert "'this host' names this worker" in out["note"], out
+-- 
+2.43.0
+

@@ -16,7 +16,7 @@ metadata:
 
 - The user reports being "out of Claude usage", or desktop sessions stick on "rate limited — resets in ~X" and endlessly retry.
 - New Hermes sessions silently fall back to another provider (e.g. codex) instead of using Claude.
-- Kanban workers fail before starting with `Worker could not start: ModelRouting…` and errors.log says `No eligible <class> routes under billing/capability policy` (step 3).
+- Kanban workers fail before starting with `Worker could not start: ModelRouting…` and errors.log says `No eligible <class> routes under billing/capability policy` (step 3), or pool cards sit `ready` with free slots while workers log `llm_paced` events (`references/pacing-governor.md`).
 - A Claude account "should have plenty left" per the usage modal but calls still 429 — the contradiction needs reconciling with evidence.
 
 Diagnose from **evidence, in this order**: (1) the verbatim API error in session transcripts, (2) a live model×account probe **calibrated against a known-good client**, (3) the running session inventory. Consult the usage modal last, and never rely on it alone. Every claim you report must point to a verified measurement. If the claim can't be measured, say it's unverified.
@@ -128,6 +128,10 @@ The steps below cover the revoked-token producer and residual provider/card hold
 
 Grep transcripts for 429 `task-notification` storms — each names a dead subagent and its model. A parallel subagent fleet pinned to one model can drain that model's weekly bucket in a day. `ps aux` shows which desktop sessions are open and their `--model` flags; an idle session spends nothing, so only sessions actively retrying or spawning count.
 
+**Fleet attribution (Kanban era).** Every host's `~/.hermes/state.db` `sessions` row carries `model`, `billing_provider`, `source` (kanban/desktop/subagent/cron/oneshot), `title` (Kanban: card title plus ` #N` per extra run) and token columns. Dump rows from the hub and each worker (`ssh hub-admin`, then `ssh hermes-worker-N` from the hub) with `sqlite3 -readonly`, and aggregate locally from script files. Single-query workers block `python3 -c` and execute_code. Cache reads dominate (≈200× in+out), so rank by a weighted sum (in + 5×out + 1.25×cache_write + 0.1×cache_read), not in+out. Join to `task_runs` (hub kanban.db) by title prefix + start time within 3 min to cost run transitions (continued→continued, scheduled→scheduled). Per day, compare against the pool's sustainable rate before blaming any single family: a worker-pool scale-up multiplies burn.
+
+**Read `seven_day` first.** When it is 100% with `seven_day_opus`/`seven_day_sonnet` null, the account-wide bucket is spent, and short Sonnet/Haiku cooldowns on that account will 429 again. A `[disabled]` row with no cooldowns is not capacity.
+
 ### 5. Fixes, in order of speed
 
 1. Switch affected sessions to a model that passes the probe matrix.
@@ -151,6 +155,7 @@ Grep transcripts for 429 `task-notification` storms — each names a dead subage
 - **Grey / "0/N" usage chips (any usage widget) usually mean expired tokens, not no capacity.** The pool only refreshes a token when it selects that entry, and every usage fetcher (core and community plugins alike) is read-only, so idle accounts' ~8h access tokens lapse → state `unknown`. Check `expires_at_ms` in auth.json first; `hermes auth refresh anthropic <n>` fixes it now (model cooldowns survive the refresh). The `oauth-keepalive` user plugin (`~/.hermes/plugins/oauth-keepalive`) prevents recurrence; if chips grey out again, confirm it's enabled (`hermes plugins list`).
 
 - **`hermes usage` reads only the currently selected account, never the pool.** "N% weekly left" from it can be the one account with headroom, even a user-disabled one (`[disabled]` in `hermes auth list`), while every enabled account sits at 100%. A disabled row is not capacity. For pool headroom, read every account's `/api/oauth/usage` (step 2) next to the `hermes auth list` markers before calling an outage "not quota".
+- **`Subscription OAuth credential is unavailable; no selected pool entry`** had three causes, fixed by #2970 (rotation re-admitted a walled row after a Codex 429; early lifts log `bench lifted early`), #2821 (disabled rows read as room) and #3007 (a model-scoped 429 waited 600 s). On a core with all three, read the session's preceding lines for a new cause.
 - **Never argue from the usage modal** — it shows session limit, weekly all-models, and only *some* per-model buckets; per-model weekly caps and request-rate throttles can be invisible while calls still 429. Quote the transcript error, then verify live.
 - **When the user's direct observation contradicts your measurement, distrust the measurement first.** "It works in the desktop app on account X" while your probe says X is 429 means your probe differs from the real client. Find that difference. Don't invent a server-side theory (per-token buckets, hidden throttles) to explain away what the user is seeing.
 - **Never kill processes on a theory.** Before killing anything as "feeding the rate limit", confirm it actually calls the Anthropic API: check its command line for `claude`, an SDK, or an API host. SSH/staging loops and watchers don't consume quota. Killing them destroys the user's work and helps nothing.

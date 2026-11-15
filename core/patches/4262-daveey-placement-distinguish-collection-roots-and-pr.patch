@@ -1,0 +1,243 @@
+From d9b8a6eac76d0cb1420915c6f35129831fddcfed Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 22:44:03 +0000
+Subject: [PATCH] [daveey] placement: distinguish collection roots and preserve
+ artifact custody
+
+Keep bare roots queued, preserve foreign-home and board artifact identity, and cache by requires/config. Shared-deadline probes already exist; pin two slow remotes. RED: 11 failures. GREEN: 173 tests across all four requested/new suites.
+---
+ hermes_cli/kanban_home_marker_placement.py    |  26 +++-
+ hermes_cli/kanban_placement.py                |   4 +
+ .../test_kanban_home_marker_nits.py           | 132 ++++++++++++++++++
+ 3 files changed, 155 insertions(+), 7 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_home_marker_nits.py
+
+diff --git a/hermes_cli/kanban_home_marker_placement.py b/hermes_cli/kanban_home_marker_placement.py
+index 3501b5ff55..fec0246909 100644
+--- a/hermes_cli/kanban_home_marker_placement.py
++++ b/hermes_cli/kanban_home_marker_placement.py
+@@ -18,6 +18,7 @@ decision that placed the card, without probing again.
+ """
+ from __future__ import annotations
+ 
++import json
+ import re
+ import subprocess
+ import time
+@@ -33,7 +34,9 @@ _CLAUDE_WT_ROOT = re.compile(r"(?:~|/)[^\s`'\"]*/\.claude/worktrees/[\w-]+(?:\.[
+ _STATE = re.compile(_HOME + r"/\.hermes/[^\s`'\"<>()\[\]]*")
+ _REL_STATE = re.compile(r"\.hermes/[^\s`'\"<>()\[\]]*", re.IGNORECASE)
+ # This worker's own unpublished files: a card's workspace, evidence or attachments, or a scratch file.
+-_ARTIFACT = re.compile(r"/\.hermes/(kanban/(?:workspaces|evidence|attachments)|cache/scratch)/([^/\s]+)")
++_ARTIFACT = re.compile(
++    r"/\.hermes/(kanban/(?:workspaces|evidence|attachments|boards/[^/\s]+/(?:workspaces|attachments))|cache/scratch)"
++    r"/([^/\s]+)")
+ 
+ KEEP_TAIL = ("Push the branch, or attach the files with kanban_attach and drop the path, to let any pool worker "
+              "run it.")
+@@ -49,8 +52,8 @@ NOTES = {
+ 
+ def _local_path(raw: str) -> Path:
+     """``raw`` on this host: ``~`` and ``/home/<this user>`` expand against ``Path.home()``."""
+-    if raw.startswith("~/"):
+-        return Path.home() / raw[2:]
++    if home := re.match(r'(?:~|\$HOME|\$\{HOME\}|"\$HOME"|"\$\{HOME\}")/', raw):
++        return Path.home() / raw[home.end():]
+     m = re.match(r"/home/([^/]+)/(.*)", raw)
+     if m and m.group(1) == Path.home().name:
+         return Path.home() / m.group(2)
+@@ -115,7 +118,9 @@ def _worktree(pattern, match, gateway, probe):
+         if state:
+             yield "keep", "a-worktree", root, (), state
+         else:
+-            yield "queue", "worktree-not-here", root, (), NOTES["path"].format(hit=root, gateway=gateway)
++            note = (NOTES["path"].format(hit=root, gateway=gateway) if root in found else
++                    f"{root} names the worktree collection, not one tree; name the tree to keep the card here.")
++            yield "queue", "worktree-not-here", root, (), note
+ 
+ 
+ def _last_rel_state(match):
+@@ -141,7 +146,7 @@ def _state_path(pattern, match, gateway, probe):
+     for raw in dict.fromkeys(paths) or [_clean("~/" + rel.group(0)) if rel else match.group(0)]:
+         if art := _ARTIFACT.search(raw):
+             # health: allow HX001 -- the card text names ~/.hermes literally; probe that same path on this worker
+-            if (Path.home() / ".hermes" / art.group(1) / art.group(2)).exists():
++            if _local_path(raw[:art.end()]).exists():
+                 yield "keep", "a-artifact", raw, (), f"{raw} exists only on this worker"
+             else:
+                 yield ("queue", "artifact-not-here", raw, (kp.HOME_CLASS_LABELS["b"],),
+@@ -168,9 +173,16 @@ def classify(args: dict, cfg, gateway: str):
+     their labels and one note sentence per class. Reused for the rest of the create. [daveey]"""
+     from hermes_cli.kanban_placement_diagnostics import home_marker_hits
+     cache = _cache()
+-    key = (gateway, *_key(args))
++    requires = args.get("requires") or []
++    requires = (requires,) if isinstance(requires, str) else tuple(requires)
++    # Snapshot all hit-filtering config (including extra_home_markers and hub_read_roots): callers may mutate
++    # lists in place. The audit's text-only identity below deliberately survives derived requires additions.
++    key = (gateway, *_key(args), requires, json.dumps(cfg, sort_keys=True, default=repr))
+     if cache is not None and key in cache:
+-        return cache[key]
++        result = cache[key]
++        if result is not None:
++            remember(args, {"decision": result["decision"], "class": result["class"], "hit": result["hit"]})
++        return result
+     hits = home_marker_hits(args, cfg)
+     result = None
+     if hits:
+diff --git a/hermes_cli/kanban_placement.py b/hermes_cli/kanban_placement.py
+index 94e92464ed..25bd14867e 100644
+--- a/hermes_cli/kanban_placement.py
++++ b/hermes_cli/kanban_placement.py
+@@ -678,6 +678,10 @@ HOME_GATEWAY_MARKERS = (
+ # Kanban/scratch artifact that exists here, keeps the card. ``a`` ('this host' names the creating worker) keeps it.
+ # ``b`` (hub or fleet state), ``c`` (Mac work) and ``d`` (a tool every pool worker carries) queue it for the pool,
+ # with :data:`HOME_CLASS_LABELS`. Operator ``extra_home_markers`` still keep it.
++# Generic systemctl/journalctl, gateway restart and config phrases remain class b even on a worker: they do not
++# identify whose unit/config is intended. Say 'this host' to bind worker-self work (class a); do not infer custody
++# from the command alone. The follow-up live-window audit found no worker-self unit/config request to justify
++# another implicit class-a phrase.
+ HOME_MARKER_CLASSES = {
+     HOST_WORKTREE_PATH: "worktree", LOCAL_WORKTREE_PATH: "worktree", HERMES_STATE_PATH: "state-path",
+     r"\bthis host\b": "a",
+diff --git a/tests/hermes_cli/test_kanban_home_marker_nits.py b/tests/hermes_cli/test_kanban_home_marker_nits.py
+new file mode 100644
+index 0000000000..32488252e1
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_home_marker_nits.py
+@@ -0,0 +1,132 @@
++"""Home-marker create regressions: collection hints, artifact custody and cache identity."""
++from __future__ import annotations
++
++from pathlib import Path
++import subprocess
++import threading
++import time
++
++import pytest
++
++from hermes_cli import kanban_home_marker_placement as khm
++from tests.hermes_cli import test_kanban_pool_queue as helpers
++
++svc = helpers.svc
++w2 = helpers.w2
++on_w2 = helpers.on_w2
++
++
++@pytest.mark.parametrize("path", ["~/code/_wt", "~/code/_wt/", "~/code/repo/.worktrees"])
++def test_collection_path_queues_with_actionable_note(on_w2, tmp_path, path):
++    (tmp_path / path.removeprefix("~/")).mkdir(parents=True, exist_ok=True)
++    out = helpers._queued(on_w2.conn, helpers._create(title=f"Inspect {path}"), [])
++    assert helpers._home_marker(on_w2.conn, out["task_id"]) == {
++        "decision": "queue", "class": "worktree-not-here", "hit": path}
++    assert out["note"] == (
++        f"{path} names the worktree collection, not one tree; name the tree to keep the card here.")
++
++
++@pytest.mark.parametrize("prefix", ["~", "$HOME", "${HOME}", '"$HOME"', '"${HOME}"', "own", "foreign"])
++def test_artifact_checks_preserve_home_identity(on_w2, tmp_path, monkeypatch, prefix):
++    rel = ".hermes/kanban/workspaces/t_0000000000000042"
++    (tmp_path / rel).mkdir(parents=True)
++    home = f"/home/{tmp_path.name}" if prefix == "own" else (
++        "/home/someoneelse" if prefix == "foreign" else prefix)
++    raw = f"{home}/{rel}/log.txt"
++    # Never depend on a real foreign account's filesystem in this regression.
++    real_exists, checked = Path.exists, []
++
++    def exists(path):
++        checked.append(path)
++        return False if str(path).startswith("/home/someoneelse/") else real_exists(path)
++
++    monkeypatch.setattr(Path, "exists", exists)
++    out = helpers._create(title=f"Inspect {raw}")
++    if prefix == "foreign":
++        helpers._queued(on_w2.conn, out, [helpers.HUB_WRITE])
++        expected = "artifact-not-here"
++        assert Path(f"/home/someoneelse/{rel}") in checked
++    else:
++        helpers._kept(on_w2.conn, out)
++        expected = "a-artifact"
++        assert tmp_path / rel in checked
++    assert helpers._home_marker(on_w2.conn, out["task_id"])["class"] == expected
++
++
++@pytest.mark.parametrize("kind", ["workspaces", "attachments"])
++@pytest.mark.parametrize("present", [False, True])
++def test_board_scoped_artifact_custody(on_w2, tmp_path, kind, present):
++    rel = f".hermes/kanban/boards/research/{kind}/t_0000000000000043"
++    if present:
++        (tmp_path / rel).mkdir(parents=True)
++    raw = f"~/{rel}/report.txt"
++    out = helpers._create(title=f"Inspect {raw}")
++    if present:
++        helpers._kept(on_w2.conn, out)
++    else:
++        helpers._queued(on_w2.conn, out, [helpers.HUB_WRITE])
++    assert helpers._home_marker(on_w2.conn, out["task_id"]) == {
++        "decision": "keep" if present else "queue",
++        "class": "a-artifact" if present else "artifact-not-here", "hit": raw}
++
++
++@pytest.mark.parametrize("change", ["requires", "config", "replay"])
++def test_create_cache_rechecks_changed_inputs_and_records_actual_decision(w2, monkeypatch, change):
++    cfg = {"worker_queue": {"worker-2": helpers.POOL}, "extra_home_markers": []}
++    machines = helpers._pool_machines()
++    for name in ("worker-1", "worker-2"):
++        machines[name] = {**machines[name], "labels": [*machines[name]["labels"], "capability:hub-read"]}
++    helpers._on(monkeypatch, "worker-2", cfg, machines)
++    original, warmed = khm.classify, []
++
++    def classify(args, config, gateway):
++        if not warmed:
++            warmed.append(True)
++            if change == "requires":
++                prior = original({**args, "requires": ["hub:read"]}, config, gateway)
++                assert prior["class"] == "d", prior  # hub:read clears 'on the hub', not bare ssh
++            else:
++                if change == "replay":
++                    assert original(args, config, gateway)["decision"] == "queue"
++                # Mutate the same list in place: the cache must snapshot configuration, not retain its identity.
++                config["extra_home_markers"] = [r"\bgrafana\b"]
++                prior = original(args, config, gateway)
++                assert prior["class"] == "operator", prior
++                config["extra_home_markers"].clear()
++        return original(args, config, gateway)
++
++    monkeypatch.setattr(khm, "classify", classify)
++    out = helpers._queued(w2.conn, helpers._create(title="Inspect grafana on the hub via ssh"), [helpers.HUB_WRITE])
++    assert warmed
++    marker = helpers._home_marker(w2.conn, out["task_id"])
++    assert marker == {"decision": "queue", "class": "b", "hit": "on the hub"}
++
++
++def test_two_slow_remotes_share_create_probe_deadline(on_w2, tmp_path, monkeypatch):
++    from hermes_cli import worktree_ops
++    tree = helpers._pushed_clone(tmp_path, tmp_path / "code/_wt/slow")
++    helpers._git(tree, "commit", "--allow-empty", "-m", "unpublished")
++    helpers._git(tree, "remote", "add", "second", str(tmp_path / "remote.git"))
++    original = worktree_ops._git_out
++    calls = []
++    budget = 0.8
++    monkeypatch.setattr(khm, "PROBE_BUDGET_S", budget)
++
++    def git_out(args, *pos, **kw):
++        if args[0] != "ls-remote":
++            return original(args, *pos, **kw)
++        calls.append((args[-1], kw["timeout"]))
++        if len(calls) == 1:
++            threading.Event().wait(0.2)  # health: allow HX013 -- elapsed remote latency is the behavior under test
++            return ""
++        threading.Event().wait(kw["timeout"])  # health: allow HX013 -- emulate a remote consuming its timeout
++        raise subprocess.TimeoutExpired(args, kw["timeout"])
++
++    monkeypatch.setattr(worktree_ops, "_git_out", git_out)
++    started = time.monotonic()
++    state = khm._Probe().tree("~/code/_wt/slow")
++    elapsed = time.monotonic() - started
++    assert state and state.startswith("unchecked worktree"), state  # caller keeps unverified state
++    assert len(calls) == 2, calls
++    assert calls[1][1] < calls[0][1] - 0.15, calls
++    assert elapsed < budget + 0.3, elapsed
+-- 
+2.43.0
+

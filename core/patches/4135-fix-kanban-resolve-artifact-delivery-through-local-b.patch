@@ -1,0 +1,246 @@
+From 96c8a08f7dc89c0ad09525cee6d1f702b11fc83f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 03:21:24 +0000
+Subject: [PATCH] fix(kanban): resolve artifact delivery through local byte
+ custody [daveey]
+
+---
+ gateway/kanban_watchers.py                    |  9 +-
+ gateway/kanban_watchers_notifier.py           |  2 +-
+ hermes_cli/kanban_artifact_delivery.py        | 47 ++++++++++
+ hermes_cli/kanban_artifact_receipt.py         |  8 ++
+ hermes_cli/kanban_metadata_files.py           |  5 ++
+ .../test_kanban_artifact_delivery.py          | 85 +++++++++++++++++++
+ 6 files changed, 154 insertions(+), 2 deletions(-)
+ create mode 100644 hermes_cli/kanban_artifact_delivery.py
+ create mode 100644 tests/hermes_cli/test_kanban_artifact_delivery.py
+
+diff --git a/gateway/kanban_watchers.py b/gateway/kanban_watchers.py
+index c277fb5d90..dbbe6cf534 100644
+--- a/gateway/kanban_watchers.py
++++ b/gateway/kanban_watchers.py
+@@ -232,7 +232,7 @@ class GatewayKanbanWatchersMixin:
+         """Undo a claimed notification cursor after send failure."""
+         self._kanban_sub_op(board, "rewind_notify_cursor", sub, claimed_cursor=claimed_cursor, old_cursor=old_cursor)
+ 
+-    async def _deliver_kanban_artifacts(self, *, adapter, chat_id: str, metadata: dict, event_payload: Optional[dict], task) -> None:
++    async def _deliver_kanban_artifacts(self, *, adapter, chat_id: str, metadata: dict, event_payload: Optional[dict], task, board=None) -> None:
+         """Upload artifact files referenced by a completed kanban task.
+ 
+         Sources, in priority order: ``event_payload['artifacts']``,
+@@ -256,6 +256,13 @@ class GatewayKanbanWatchersMixin:
+         # prose mentions of it must not upload the file a second time.
+         staged_names = {os.path.basename(p) for p in raw_paths}
+         raw_paths += [p for p in prose_paths if os.path.basename(p) not in staged_names]
++        if isinstance(event_payload, dict) and "artifact_receipt" in event_payload:
++            # New completions have explicit custody. Never fall back to prose or
++            # writer-local paths, even when blob synchronization is still pending.
++            from hermes_cli.kanban_artifact_delivery import delivery_paths
++
++            records = event_payload["artifact_receipt"]
++            raw_paths = delivery_paths(task.id, records, board) if task is not None and isinstance(records, list) else []
+         candidates: list[str] = []
+         for path in raw_paths:
+             expanded = os.path.expanduser(path) if path else ""
+diff --git a/gateway/kanban_watchers_notifier.py b/gateway/kanban_watchers_notifier.py
+index b8617e3d94..faefac792b 100644
+--- a/gateway/kanban_watchers_notifier.py
++++ b/gateway/kanban_watchers_notifier.py
+@@ -931,7 +931,7 @@ class _KanbanNotification:
+             try:
+                 await self.runner._deliver_kanban_artifacts(
+                     adapter=adapter, chat_id=sub["chat_id"], metadata=metadata,
+-                    event_payload=getattr(ev, "payload", None), task=self.task,
++                    event_payload=getattr(ev, "payload", None), task=self.task, board=self.board_slug,
+                 )
+             except Exception as art_exc:
+                 logger.debug("kanban notifier: artifact delivery for %s failed: %s", self.task_id, art_exc)
+diff --git a/hermes_cli/kanban_artifact_delivery.py b/hermes_cli/kanban_artifact_delivery.py
+new file mode 100644
+index 0000000000..38aa983e03
+--- /dev/null
++++ b/hermes_cli/kanban_artifact_delivery.py
+@@ -0,0 +1,47 @@
++"""Resolve custody through receiver-local attachment rows, never foreign paths."""
++from __future__ import annotations
++
++import hashlib
++from pathlib import Path
++
++
++def receipt_delivery_paths(conn, task_id: str, records: list) -> list[str]:
++    from hermes_cli.kanban_artifact_receipt import executing_machine
++
++    rows = [dict(row) for row in conn.execute(
++        "SELECT * FROM task_attachments WHERE task_id=?", (task_id,),
++    )]
++    machine = executing_machine(conn)
++    paths = []
++    for record in records:
++        if not isinstance(record, dict) or record.get("warning") or not record.get("sha256"):
++            continue
++        uid = record.get("attachment_uid")
++        for row in rows:
++            matches = (uid and row.get("uid") == uid) or (
++                not uid and record.get("machine") == machine
++                and record.get("attachment_id") == row["id"]
++            )
++            if not matches:
++                continue
++            path = Path(row["stored_path"])
++            try:
++                with path.open("rb") as stream:
++                    digest = hashlib.file_digest(stream, "sha256").hexdigest()
++            except OSError:
++                continue  # Blob sync may not have fetched bytes yet.
++            if digest == record["sha256"] and str(path) not in paths:
++                paths.append(str(path))
++    return paths
++
++
++def delivery_paths(task_id: str, records: list, board=None) -> list[str]:
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect
++
++    with kb.pin_first_board_resolution():
++        conn = kanban_db_connect.connect(board=board)
++        try:
++            return receipt_delivery_paths(conn, task_id, records)
++        finally:
++            conn.close()
+diff --git a/hermes_cli/kanban_artifact_receipt.py b/hermes_cli/kanban_artifact_receipt.py
+index 24bd876280..5a9c27fb4e 100644
+--- a/hermes_cli/kanban_artifact_receipt.py
++++ b/hermes_cli/kanban_artifact_receipt.py
+@@ -51,6 +51,9 @@ def declared_files(metadata: dict) -> list[str]:
+     receipt = metadata.get("completion_receipt")
+     if isinstance(receipt, dict):
+         for item in receipt.get("items", []):
++            superseded = item.get("superseded_by", "")
++            if isinstance(superseded, str) and superseded.startswith(("/", "~/")):
++                paths.append(superseded)
+             for evidence in item.get("evidence", []):
+                 ref = evidence.get("ref", "")
+                 if isinstance(ref, str) and ref.startswith(("/", "~/")):
+@@ -90,6 +93,11 @@ def record_files(conn, task_id: str, metadata: dict, originals: list[str], now:
+             if not source.is_file():
+                 record["warning"] = "File missing or not a regular file on executing machine"
+                 continue
++            from gateway.platforms.base import validate_media_delivery_path
++
++            if validate_media_delivery_path(str(source)) is None:
++                record["warning"] = "Artifact denied by delivery policy on executing machine"
++                continue
+             size = source.stat().st_size
+             record["size"] = size
+             if size <= kb.KANBAN_ATTACHMENT_MAX_BYTES:
+diff --git a/hermes_cli/kanban_metadata_files.py b/hermes_cli/kanban_metadata_files.py
+index 8d25909317..042ca0c335 100644
+--- a/hermes_cli/kanban_metadata_files.py
++++ b/hermes_cli/kanban_metadata_files.py
+@@ -197,6 +197,11 @@ def preserve_metadata_files(
+         if not src.is_file():
+             skipped[raw] = "not a regular file"
+             continue
++        from gateway.platforms.base import validate_media_delivery_path
++
++        if validate_media_delivery_path(str(src)) is None:
++            skipped[raw] = "denied by delivery policy"
++            continue
+         size = src.stat().st_size
+         if total + size > budget:
+             skipped[raw] = (
+diff --git a/tests/hermes_cli/test_kanban_artifact_delivery.py b/tests/hermes_cli/test_kanban_artifact_delivery.py
+new file mode 100644
+index 0000000000..cb1961bbd3
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_artifact_delivery.py
+@@ -0,0 +1,85 @@
++"""Receiver-local byte custody and source policy regression tests."""
++if not __name__.startswith("tests."):
++    raise ImportError("Use scripts/run_tests.sh; unittest discovery bypasses test isolation")
++
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import AsyncMock
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_artifact_delivery as delivery
++from tests.hermes_cli import test_kanban_artifact_machine as support
++
++stores = support.stores
++
++
++@pytest.mark.parametrize("symlink", [False, True])
++def test_denied_source_is_not_laundered_into_attachment(stores, monkeypatch, symlink):
++    from gateway.platforms import base
++
++    _, worker, _, conn, _, tid, _ = stores
++    secret = worker / "credential"
++    secret.write_text("not for delivery")
++    source = worker / "alias" if symlink else secret
++    if symlink:
++        source.symlink_to(secret)
++    monkeypatch.setattr(base, "_path_under_denied_prefix", lambda p: p == secret.resolve())
++    monkeypatch.setattr(base, "_media_delivery_allowed_roots", list)
++    record = support.complete(conn, tid, [str(source)])["artifact_receipt"][0]
++    assert "denied" in record["warning"]
++    assert not kb.list_attachments(conn, tid)
++
++
++@pytest.mark.parametrize("missing", [False, True])
++def test_superseding_file_has_custody(stores, missing):
++    from tests.hermes_cli.test_kanban_receipt_artifacts import receipt
++
++    _, worker, _, conn, _, tid, _ = stores
++    source = worker / "replacement.md"
++    if not missing:
++        source.write_text("replacement")
++    value = receipt("commit abc")
++    value["items"][0].update(disposition="superseded", superseded_by=str(source))
++    record = support.complete(conn, tid, [], {"completion_receipt": value})["artifact_receipt"][0]
++    assert record["path"] == str(source)
++    assert record["machine"] == "worker"
++    assert ("warning" in record) == missing
++    assert bool(kb.list_attachments(conn, tid)) != missing
++
++
++@pytest.mark.asyncio
++async def test_notifier_uses_replicated_attachment_and_not_foreign_paths(stores, monkeypatch):
++    from gateway.kanban_watchers import GatewayKanbanWatchersMixin
++
++    home, worker, home_conn, conn, _, tid, round_at = stores
++    report = worker / "proof.md"
++    report.write_bytes(b"worker proof")
++    payload = support.complete(conn, tid, [str(report)])
++    payload["summary"] = str(report)
++    task = SimpleNamespace(id=tid, result=str(report))
++    adapter = SimpleNamespace(extract_local_files=lambda text: ([text], []), send_document=AsyncMock())
++    monkeypatch.setattr(delivery, "delivery_paths", lambda task_id, records, board: delivery.receipt_delivery_paths(home_conn, task_id, records))
++    call = dict(adapter=adapter, chat_id="chat", metadata={}, event_payload=payload, task=task)
++    # Both writer-local paths exist here: receiver must not use either before sync.
++    await GatewayKanbanWatchersMixin._deliver_kanban_artifacts(None, **call)
++    adapter.send_document.assert_not_awaited()
++    round_at(worker, "worker")
++    round_at(home, "hub")
++    await GatewayKanbanWatchersMixin._deliver_kanban_artifacts(None, **call)
++    uploaded = Path(adapter.send_document.await_args.kwargs["file_path"])
++    assert uploaded.read_bytes() == b"worker proof"
++    assert uploaded != report
++    assert str(uploaded) != payload["artifacts"][0]
++    adapter.send_document.reset_mock()
++    # Corrupt local bytes, warnings, wrong UID, and foreign integer IDs fail closed.
++    uploaded.write_bytes(b"unrelated")
++    await GatewayKanbanWatchersMixin._deliver_kanban_artifacts(None, **call)
++    adapter.send_document.assert_not_awaited()
++    uploaded.write_bytes(b"worker proof")
++    record = payload["artifact_receipt"][0]
++    for changes in ({"warning": "missing"}, {"attachment_uid": "wrong"}, {"attachment_uid": None}):
++        changed = {**record, **changes}
++        assert delivery.receipt_delivery_paths(home_conn, tid, [changed]) == []
++    assert delivery.receipt_delivery_paths(home_conn, "other-task", [record]) == []
+-- 
+2.43.0
+

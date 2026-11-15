@@ -1,0 +1,74 @@
+From 63fce7a9209e9c9090275537ff890d03c1939d6d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 23:02:04 +0000
+Subject: [PATCH] [daveey] Test pacing dispatch read-interval cache budget
+
+Cover repeated dispatch at 0, 1 and 59 seconds and refresh at 60 seconds, with writable shared state and naturally unavailable persistence. Isolate homes, module clock and caches. No production or configuration changes.
+
+Proof: exact M05 cache-condition deletion fails the producer-read count (21 passed, 1 failed); restored production passes 22 tests with zero skips. scripts/check: 20 checks ok.
+---
+ tests/hermes_cli/test_kanban_llm_pacing.py | 41 ++++++++++++++++++++++
+ 1 file changed, 41 insertions(+)
+
+diff --git a/tests/hermes_cli/test_kanban_llm_pacing.py b/tests/hermes_cli/test_kanban_llm_pacing.py
+index 71e8129250..7fb4a4a221 100644
+--- a/tests/hermes_cli/test_kanban_llm_pacing.py
++++ b/tests/hermes_cli/test_kanban_llm_pacing.py
+@@ -3,6 +3,7 @@ from __future__ import annotations
+ 
+ import pathlib
+ import time
++from types import SimpleNamespace
+ 
+ import pytest
+ 
+@@ -183,6 +184,46 @@ def test_held_pool_names_the_reset_and_repeats_no_event(paced_board, monkeypatch
+     assert abs(result.clock_held[tid][1] - (time.time() + 9 * HOUR)) < 120
+ 
+ 
++@pytest.mark.parametrize("persisted", [True, False], ids=["shared-state", "memory-only"])
++def test_dispatch_reuses_usage_until_read_interval_expires(paced_board, monkeypatch, persisted):
++    monkeypatch.setenv("HOME", str(paced_board.parent))
++    monkeypatch.setattr(pd, "_CLASS_CACHE", {})
++    monkeypatch.setattr(pd, "_WARNED", {})
++    interval = 60
++    _write_cfg(paced_board, llm_pacing={"enabled": True, "read_interval_seconds": interval})
++    assert pd.load_config().read_interval == interval
++    start = time.time()
++    clock = SimpleNamespace(now=start)
++    monkeypatch.setattr(pd, "time", SimpleNamespace(time=lambda: clock.now, monotonic=lambda: clock.now))
++    path = paced_board / ("shared" if persisted else "unavailable") / "llm_pacing.json"
++    if persisted:
++        path.parent.mkdir()
++    # A failed shared-state save must not defeat the in-process read budget.
++    monkeypatch.setattr(pd, "state_path", lambda: path)
++    reads = []
++
++    def read(provider, now):
++        reads.append((provider, now))
++        used = 90 if len(reads) == 1 else 5
++        return [_r("account", lp.SEVEN_DAY, used, 6 * DAY, now)]
++
++    monkeypatch.setattr(pd, "read_pool", read)
++    with kbc.connect() as conn:
++        tid = _opus_card(conn)
++        for offset in (0, 1, interval - 1):
++            clock.now = start + offset
++            seen, result = _dispatch(conn)
++            assert reads == [("anthropic", start)]
++            assert seen == []
++            assert (tid, lp.GUARD_REASON) in result.respawn_guarded
++        assert path.exists() is persisted
++        # Expiry is measured from the producer read, not the latest cache hit.
++        clock.now = start + interval
++        seen, _ = _dispatch(conn)
++        assert reads == [("anthropic", start), ("anthropic", start + interval)]
++        assert seen == [tid]
++
++
+ def test_governor_off_is_todays_behaviour(paced_board, monkeypatch):
+     _write_cfg(paced_board, llm_pacing={"enabled": False})
+     _usage(monkeypatch, 99, 9 * HOUR)
+-- 
+2.43.0
+

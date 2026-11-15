@@ -1,0 +1,582 @@
+From 0eec04e7d7aa3653765266fbfaaf69c5673e9cc3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 01:58:21 +0000
+Subject: [PATCH] [daveey] Fence stale quota assertions and persist portable
+ cheap-check recovery
+
+Recover interrupted worker-3 work: portable assertion cohort identity, episode-scoped errors, configuration aliases and historical alias event reads. Fence pre-clear GitHub runs, including workers admitted during the check. Keep durable success when older assertions age out. Proof: 93 focused tests; two independent-review regression tests RED before fixes, 1371 focused and subprocess scanner tests GREEN after fixes.
+---
+ docs/shared-blocker-recovery.md               |  39 ++++++
+ hermes_cli/config_defaults.py                 |   7 +-
+ hermes_cli/kanban_shared_blocker_checks.py    |  85 +++++++++---
+ hermes_cli/kanban_shared_blocker_fence.py     |  47 +++++++
+ hermes_cli/kanban_shared_blockers.py          |  40 ++++--
+ .../test_kanban_shared_blocker_checks.py      | 125 ++++++++++++++++++
+ .../test_kanban_shared_blocker_livelock.py    |  46 +++++++
+ 7 files changed, 350 insertions(+), 39 deletions(-)
+ create mode 100644 docs/shared-blocker-recovery.md
+ create mode 100644 hermes_cli/kanban_shared_blocker_fence.py
+
+diff --git a/docs/shared-blocker-recovery.md b/docs/shared-blocker-recovery.md
+new file mode 100644
+index 0000000000..02b8c56e82
+--- /dev/null
++++ b/docs/shared-blocker-recovery.md
+@@ -0,0 +1,39 @@
++# Shared blocker recovery
++
++Shared walls are derived from run history. Repeating a wall does not postpone
++its worker probe: the interval starts at the latest probe start, or the oldest
++assertion still behind the wall when no probe has started.
++
++`kanban.shared_blocker_checks` maps canonical blocker ids to shell commands.
++The built-in `github-rest-quota` check is
++`<Hermes home>/bin/github_quota.py --reserve-ok`. Install the companion quota
++helper with that flag before relying on this check. Override a command with an
++empty string to disable it. Commands run as the dispatcher account, outside
++SQLite write transactions, with a ten-second timeout. Configure only trusted,
++read-only commands; their bounded output tail is retained in task events.
++
++For an open wall with a home-owned carrier card, the dispatcher schedules a
++check every 120 seconds, including while an agent probe is running. Exit 0
++records recovery and wakes held cards in the same maintenance pass. Exit 1
++means the wall still stands. Three consecutive errors fall back to the normal
++worker probe interval. Reassertions don't reset this error budget or postpone
++checks. A command change or a new episode after recovery resets the budget.
++The check scheduler cannot promise a two-minute wall-clock bound if the
++machine/dispatcher itself is stopped or its maintenance loop is delayed.
++
++`kanban.shared_blocker_aliases` adds one-hop `alias: canonical-id` mappings.
++Targets should be canonical slugs, not other aliases. Built-in GitHub REST/core
++quota spellings always collapse to `github-rest-quota`; config cannot split
++that family. Historical run and event payloads are normalized on read.
++
++Workers with a registered check are told to run it when their next action
++needs that capability, rather than blindly repeat context. A GitHub quota
++assertion from a run started at or before the last verified recovery cannot
++reopen the wall after that recovery. It remains eligible for release. A new
++run after the recovery can report a new outage. Other blocker families retain
++their existing assertion semantics.
++
++Check events use a fingerprint of portable run identities, not local integer
++row ids. This fences results racing new assertions and survives synced id
++remapping and import order. Recovery is not inferred from a failed command,
++and commands never run under the board's writer lock.
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index af52fdda83..b0e404d05c 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -1970,10 +1970,9 @@ DEFAULT_CONFIG = {
+         "soft_deadline_fraction": 0.85,
+         # Bound on back-to-back kanban_continue runs without a completion; past it the worker must complete or block.
+         "max_continuations": 12,
+-        # Shared external blockers (kanban_block/kanban_continue blocker_id): while one is open,
+-        # the dispatcher spawns at most one card behind it per this many seconds (one probe at a
+-        # time either way); a human unblock lets that card probe at once. [daveey]
+-        "shared_blocker_probe_seconds": 1800,
++        "shared_blocker_probe_seconds": 1800,  # One worker probe per interval; see docs/shared-blocker-recovery.md.
++        "shared_blocker_checks": {},  # Command overrides; empty string disables a built-in check.
++        "shared_blocker_aliases": {},  # One-hop aliases; built-in GitHub aliases cannot be split.
+         # Default model tier [daveey] (hermes_cli/kanban_model_tier.py): model (+ optional provider) the
+         # dispatcher runs a card on when the card pins no model. "" = upstream (the profile's own model).
+         # Cards keep the profile model when pinned, in the review lane, retried after a failed run or
+diff --git a/hermes_cli/kanban_shared_blocker_checks.py b/hermes_cli/kanban_shared_blocker_checks.py
+index 0746c8f231..e817088c6b 100644
+--- a/hermes_cli/kanban_shared_blocker_checks.py
++++ b/hermes_cli/kanban_shared_blocker_checks.py
+@@ -5,6 +5,7 @@ at the end of blocker_states. No subprocess runs under a SQLite write lock.
+ """
+ from __future__ import annotations
+ 
++import hashlib
+ import logging
+ import shlex
+ import subprocess
+@@ -35,49 +36,81 @@ def registered_checks(cfg=None) -> dict[str, str]:
+     overrides = (cfg.get("kanban") or {}).get("shared_blocker_checks") or {}
+     if isinstance(overrides, dict):
+         for raw, command in overrides.items():
+-            bid = normalize_blocker_id(raw)
++            bid = normalize_blocker_id(raw, cfg=cfg)
+             if bid:
+                 commands[bid] = command.strip() if isinstance(command, str) else ""
+     return {bid: cmd for bid, cmd in commands.items() if cmd}
+ 
+ 
+-def _assertion_tokens(conn) -> dict[str, int]:
+-    """Run ids fence same-second reassertions and results racing a worker's park."""
++def _lookback(now) -> int:
++    from hermes_cli.kanban_shared_blockers import _LOOKBACK_SECONDS
++
++    return (int(time.time()) if now is None else int(now)) - _LOOKBACK_SECONDS
++
++
++def _assertion_tokens(conn, now=None) -> dict[str, str]:
++    """Portable fingerprint of the latest assertion timestamp's complete cohort.
++
++    Synced run UIDs survive integer-id remapping and same-second runs. Sorting
++    identities also survives opposite import order. Older assertions aging out
++    must not revoke a successful check. Unsynced legacy schemas use task/time.
++    """
++    from hermes_cli import kanban_db as kb
+     from hermes_cli.kanban_shared_blockers import run_effect
+ 
+-    tokens = {}
+-    for row in conn.execute("SELECT id, outcome, metadata FROM task_runs WHERE ended_at IS NOT NULL "
+-                            "AND metadata LIKE '%\"blocker_id\"%' ORDER BY id"):
++    tokens, newest = {}, {}
++    columns = {row[1] for row in conn.execute('PRAGMA table_info(task_runs)')}
++    identity = 'uid' if 'uid' in columns else 'NULL AS uid'
++    for row in conn.execute(
++            f"SELECT id, {identity}, task_id, started_at, ended_at, outcome, metadata FROM task_runs "
++            "WHERE ended_at IS NOT NULL AND ended_at >= ? AND metadata LIKE '%\"blocker_id\"%' "
++            "ORDER BY ended_at, id", (_lookback(now),)):
+         effect, bid = run_effect(row["outcome"], row["metadata"])
+         if effect == "assert":
+-            tokens[bid] = int(row["id"])
+-    return tokens
++            raw = str(row['uid'] or (f"{row['task_id']}|{kb._to_epoch(row['started_at']) or 0}|"
++                                     f"{kb._to_epoch(row['ended_at']) or 0}|{bid}"))
++            ended = kb._to_epoch(row['ended_at']) or 0
++            if ended > newest.get(bid, -1):
++                newest[bid], tokens[bid] = ended, []
++            if ended == newest[bid]:
++                tokens[bid].append(raw)
++    return {bid: hashlib.sha256('\n'.join(sorted(ids)).encode()).hexdigest()
++            for bid, ids in tokens.items()}
++
++
++def _checked(payload) -> int:
++    try:
++        return int(payload.get("checked_at") or 0)
++    except (TypeError, ValueError):
++        return 0
+ 
+ 
+-def _latest_results(conn) -> dict[str, dict]:
++def _latest_results(conn, now=None) -> dict[str, dict]:
+     from hermes_cli import kanban_db as kb
+     from hermes_cli.kanban_shared_blockers import normalize_blocker_id
+ 
+     results = {}
+-    for row in conn.execute("SELECT payload FROM task_events WHERE kind=? ORDER BY id", (CHECK_EVENT,)):
++    for row in conn.execute("SELECT payload FROM task_events WHERE kind=? AND created_at >= ? ORDER BY id",
++                            (CHECK_EVENT, _lookback(now))):
+         payload = kb._json_dict(row["payload"])
+         bid = normalize_blocker_id(payload.get("blocker_id"))
+-        if bid:
++        if bid and (bid not in results or _checked(payload) >= _checked(results[bid])):
+             results[bid] = payload
+     return results
+ 
+ 
+-def apply_check_clears(conn, states) -> None:
++def apply_check_clears(conn, states, now=None) -> None:
+     """Fold durable success into derived states; the event carrier is NOT the clearer."""
+     from hermes_cli.kanban_shared_blockers import _mark_cleared
+ 
+-    results = _latest_results(conn)
++    results = _latest_results(conn, now)
+     if not results:
+         return
+-    tokens = _assertion_tokens(conn)
++    tokens = _assertion_tokens(conn, now)
+     for bid, result in results.items():
+         st = states.get(bid)
+-        if st is not None and result.get("rc") == 0 and result.get("assertion_run_id") == tokens.get(bid):
++        if (st is not None and result.get("rc") == 0 and result.get("assertion_id")
++                and result.get("assertion_id") == tokens.get(bid)):
+             _mark_cleared(st, "", None, max(int(result["checked_at"]), st.asserted_at + 1), via="check")
+ 
+ 
+@@ -122,9 +155,9 @@ def run_due_checks(conn, *, cfg=None, now=None, due_out=None) -> list[str]:
+     ts = int(time.time()) if now is None else int(now)
+     commands = registered_checks(cfg)
+     states = blocker_states(conn, now=ts)
+-    apply_check_clears(conn, states)
++    apply_check_clears(conn, states, ts)
+     foreign = foreign_ids(conn)
+-    tokens, previous = _assertion_tokens(conn), _latest_results(conn)
++    tokens, previous = _assertion_tokens(conn, ts), _latest_results(conn, ts)
+     cleared = []
+     for bid, st in states.items():
+         command = commands.get(bid)
+@@ -132,25 +165,33 @@ def run_due_checks(conn, *, cfg=None, now=None, due_out=None) -> list[str]:
+         homes = sorted(set(st.behind) - foreign)
+         if not st.is_open or not command or not homes:
+             continue
+-        token = tokens[bid]
++        token = tokens.get(bid)
++        if token is None:
++            continue
+         last = previous.get(bid, {})
+-        if last.get("assertion_run_id") != token or last.get("command") != command:
++        # Backoff belongs to the open episode, not the newest assertion: a worker re-park must
++        # neither reset the error count nor postpone the check. A success, a command change
++        # or a clear since the last result starts a new episode.
++        if last.get("command") != command or last.get("rc") == 0 or _checked(last) < st.cleared_at:
+             last = {}
+         fails = int(last.get("fails", 0))
+         if fails >= BROKEN_AFTER:
+             continue
+-        due = int(last.get("checked_at", ts - CHECK_EVERY_SECONDS)) + CHECK_EVERY_SECONDS
++        due = int(last.get("started_at", last.get("checked_at", ts - CHECK_EVERY_SECONDS))) + CHECK_EVERY_SECONDS
+         if due > ts:
+             if due_out is not None:
+                 due_out.append(due)
+             continue
+         rc, output = _run_check(command)
++        # Fence workers admitted while the command was in flight as well. An
++        # explicit now is the caller's deterministic clock for replay/tests.
++        checked_at = int(time.time()) if now is None else ts
+         fails = 0 if rc in (0, 1) else fails + 1
+         payload = {"blocker_id": bid, "command": command, "rc": rc, "output": output,
+-                   "checked_at": ts, "assertion_run_id": token, "fails": fails}
++                   "started_at": ts, "checked_at": checked_at, "assertion_id": token, "fails": fails}
+         with kb.write_txn(conn):
+             # A shell check can overlap a new assertion or a home ownership change.
+-            if _assertion_tokens(conn).get(bid) != token or homes[0] in foreign_ids(conn):
++            if _assertion_tokens(conn, ts).get(bid) != token or homes[0] in foreign_ids(conn):
+                 continue
+             kb._append_event(conn, homes[0], CHECK_EVENT, payload)
+         if rc == 0:
+diff --git a/hermes_cli/kanban_shared_blocker_fence.py b/hermes_cli/kanban_shared_blocker_fence.py
+new file mode 100644
+index 0000000000..6dd6eb44c0
+--- /dev/null
++++ b/hermes_cli/kanban_shared_blocker_fence.py
+@@ -0,0 +1,47 @@
++"""Prevent old GitHub-quota context from undoing a verified recovery."""
++from __future__ import annotations
++
++
++def fence_stale_quota_assertions(conn, states, asserting, *, now):
++    """Keep stale cards releasable, but don't treat their old runs as new evidence.
++
++    Only the GitHub quota family opts into this policy. A run that began before
++    recovery cannot reopen it; the dispatcher can discover a genuinely new wall
++    on its next cheap check or a newly started worker can report it.
++    """
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_shared_blockers import _LOOKBACK_SECONDS, _mark_cleared, run_effect
++    from hermes_cli.kanban_shared_blocker_checks import CHECK_EVENT
++
++    st = states.get('github-rest-quota')
++    if st is None:
++        return
++    # Keep successful check evidence even when a delayed assertion supersedes
++    # its race token. Token validation at write time already fenced concurrent
++    # assertions. Legacy integer-token events are deliberately not accepted.
++    for row in conn.execute(
++            'SELECT payload FROM task_events WHERE kind=? AND created_at>=?',
++            (CHECK_EVENT, now - _LOOKBACK_SECONDS)):
++        payload = kb._json_dict(row['payload'])
++        if (payload.get('blocker_id') == st.blocker_id and payload.get('rc') == 0
++                and isinstance(payload.get('assertion_id'), str)):
++            checked = kb._to_epoch(payload.get('checked_at')) or 0
++            if checked <= now:
++                _mark_cleared(st, '', None, checked, via='check')
++    if not st.cleared_at:
++        return
++    eligible = []
++    for row in asserting:
++        effect, bid = run_effect(row['outcome'], row['metadata'])
++        if effect != 'assert' or bid != st.blocker_id:
++            continue
++        started = kb._to_epoch(row['started_at']) or 0
++        ended = kb._to_epoch(row['ended_at']) or 0
++        if started <= st.cleared_at < ended:
++            if st.behind.get(row['task_id']) == ended:
++                st.behind[row['task_id']] = st.cleared_at
++        else:
++            eligible.append(ended)
++    st.asserted_at = max(eligible, default=0)
++    if st.cleared_at > st.asserted_at and not st.first_cleared_at:
++        st.first_cleared_at = st.cleared_at
+diff --git a/hermes_cli/kanban_shared_blockers.py b/hermes_cli/kanban_shared_blockers.py
+index ae7c62f222..848657204d 100644
+--- a/hermes_cli/kanban_shared_blockers.py
++++ b/hermes_cli/kanban_shared_blockers.py
+@@ -113,13 +113,25 @@ def run_effect(outcome: Optional[str], metadata) -> tuple[str, Optional[str]]:
+ _ID_RE = re.compile(r"[^a-z0-9._-]+")
+ 
+ 
+-def normalize_blocker_id(raw) -> Optional[str]:
+-    """Canonical external-wall slug, including historical GitHub quota aliases."""
++def normalize_blocker_id(raw, *, cfg=None) -> Optional[str]:
++    """Canonical slug; configured aliases augment (never split) built-in families."""
+     if not isinstance(raw, str):
+         return None
+     slug = _ID_RE.sub("-", raw.strip().lower()).strip("-._")[:MAX_BLOCKER_ID_CHARS]
+     if re.fullmatch(r"github(-(shared|rest|core))*-quota(-reserve)?", slug):
+         return "github-rest-quota"
++    if cfg is None:
++        from hermes_cli.config import load_config_readonly
++        from hermes_cli.config_backend import ConfigBackendUnavailable
++        try:
++            cfg = load_config_readonly()
++        except ConfigBackendUnavailable:
++            return slug or None
++    aliases = (cfg.get("kanban") or {}).get("shared_blocker_aliases", {})
++    target = aliases.get(slug) if isinstance(aliases, dict) else None
++    if isinstance(target, str) and target.strip():
++        # One hop only: cycles cannot recurse; targets must be canonical ids.
++        return normalize_blocker_id(target, cfg={})
+     return slug or None
+ 
+ 
+@@ -301,7 +313,7 @@ def blocker_states(conn: sqlite3.Connection, *, now: Optional[int] = None,
+ 
+     now = int(time.time()) if now is None else int(now)
+     asserting = conn.execute(
+-        "SELECT id, task_id, ended_at, outcome, metadata, summary FROM task_runs "
++        "SELECT id, task_id, started_at, ended_at, outcome, metadata, summary FROM task_runs "
+         "WHERE ended_at IS NOT NULL AND ended_at >= ? AND metadata LIKE '%\"blocker_id\"%' "
+         "ORDER BY id",
+         (now - _LOOKBACK_SECONDS,),
+@@ -382,7 +394,9 @@ def blocker_states(conn: sqlite3.Connection, *, now: Optional[int] = None,
+         # Probe starts only count once the card is (still) behind the blocker.
+         st.probe_starts = {t: s for t, s in st.probe_starts.items() if t in st.behind}
+     from hermes_cli.kanban_shared_blocker_checks import apply_check_clears
+-    apply_check_clears(conn, states)
++    apply_check_clears(conn, states, now=now)
++    from hermes_cli.kanban_shared_blocker_fence import fence_stale_quota_assertions
++    fence_stale_quota_assertions(conn, states, asserting, now=now)
+     return states
+ 
+ 
+@@ -451,18 +465,18 @@ def _unblocked_since_assertion(conn: sqlite3.Connection, task_id: str, blocker_i
+     (event ids, not seconds: a bulk unblock and a re-assertion often share a second)."""
+     from hermes_cli import kanban_db as kb
+ 
+-    newest = 0
++    unblocked = conn.execute(
++        "SELECT MAX(id) FROM task_events WHERE task_id=? AND kind='unblocked'", (task_id,)
++    ).fetchone()[0]
++    if unblocked is None:
++        return False
+     for row in conn.execute(
+-        "SELECT id, payload FROM task_events WHERE kind IN ('blocked', 'scheduled', 'continued', 'block_loop_detected') "
+-        "AND payload LIKE ? ORDER BY id DESC LIMIT 50", (f'%"{blocker_id}"%',),
++        "SELECT payload FROM task_events WHERE kind IN ('blocked', 'scheduled', 'continued', 'block_loop_detected') "
++        "AND id>=? AND payload LIKE '%\"blocker_id\"%' ORDER BY id DESC", (unblocked,),
+     ):
+         if normalize_blocker_id(kb._json_dict(row["payload"]).get("blocker_id")) == blocker_id:
+-            newest = int(row["id"])
+-            break
+-    return conn.execute(
+-        "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'unblocked' AND id > ? LIMIT 1",
+-        (task_id, newest),
+-    ).fetchone() is not None
++            return False
++    return True
+ 
+ 
+ def shared_blocker_guard(
+diff --git a/tests/hermes_cli/test_kanban_shared_blocker_checks.py b/tests/hermes_cli/test_kanban_shared_blocker_checks.py
+index c1b4028b69..b42086719f 100644
+--- a/tests/hermes_cli/test_kanban_shared_blocker_checks.py
++++ b/tests/hermes_cli/test_kanban_shared_blocker_checks.py
+@@ -34,6 +34,49 @@ def test_success_is_durable_even_with_worker_probe_running(kanban_home):
+         assert event.payload["output"] == "récovered"
+ 
+ 
++def test_success_survives_older_assertion_aging_out(kanban_home, monkeypatch):
++    from hermes_cli import kanban_shared_blocker_checks as checks
++
++    clock = [1800000000]
++    monkeypatch.setattr(blockers.time, 'time', lambda: clock[0])
++    with kbc.connect_closing() as conn:
++        _blocked_behind(conn, 'old assertion', blocker_id='test-wall')
++        clock[0] += blockers._LOOKBACK_SECONDS - 10
++        _blocked_behind(conn, 'recent assertion', blocker_id='test-wall')
++        assert checks.run_due_checks(conn, cfg=_cfg('exit 0')) == ['test-wall']
++        clock[0] += 11
++        assert not blockers.blocker_states(conn)['test-wall'].is_open
++
++
++def test_worker_started_during_successful_check_is_stale(kanban_home, monkeypatch):
++    from hermes_cli import kanban_shared_blocker_checks as checks
++
++    clock = [1800000000]
++    monkeypatch.setattr(blockers.time, 'time', lambda: clock[0])
++    with kbc.connect_closing() as conn:
++        _blocked_behind(conn, 'quota', blocker_id='github-rest-quota')
++        stale = kb.create_task(conn, title='spawned during check', assignee='default')
++        clock[0] += 30
++
++        def recover(command):
++            clock[0] += 3
++            assert kb.claim_task(conn, stale)
++            clock[0] += 3
++            return 0, ''
++
++        monkeypatch.setattr(checks, '_run_check', recover)
++        cfg = {'kanban': {'shared_blocker_checks': {'github-rest-quota': 'unused'}}}
++        assert checks.run_due_checks(conn, cfg=cfg) == ['github-rest-quota']
++        recovered = clock[0]
++        clock[0] += 3
++        assert kb.block_task(conn, stale, reason='old context', kind='capability',
++                             blocker_id='github-shared-rest-quota')
++        state = blockers.blocker_states(conn)['github-rest-quota']
++        assert state.cleared_at == recovered
++        assert not state.is_open
++        assert stale in blockers.release_cleared_blockers(conn)
++
++
+ def _cfg(command):
+     return {"kanban": {"shared_blocker_checks": {"test-wall": command}}}
+ 
+@@ -181,3 +224,85 @@ def test_check_refuses_caller_write_transaction(kanban_home):
+     with kbc.connect_closing() as conn, kb.write_txn(conn):
+         with pytest.raises(ValueError, match="outside a write transaction"):
+             checks.run_due_checks(conn, cfg=_cfg("exit 0"))
++
++
++def _check_events(conn, tid, checks):
++    return [e for e in kb.list_events(conn, tid) if e.kind == checks.CHECK_EVENT]
++
++
++def _all_check_fails(conn, checks):
++    """Fail counts in append order across every home card (home choice is by sorted id)."""
++    return [json.loads(r[0])["fails"] for r in conn.execute(
++        "SELECT payload FROM task_events WHERE kind=? ORDER BY id", (checks.CHECK_EVENT,))]
++
++
++def test_assertion_identity_survives_remapped_run_ids(kanban_home):
++    """A synced database renumbers task_runs.id; the durable success must still match."""
++    from hermes_cli import kanban_shared_blocker_checks as checks
++
++    with kbc.connect_closing() as conn:
++        _blocked_behind(conn, "first", blocker_id="test-wall")
++        token = checks._assertion_tokens(conn)["test-wall"]
++        assert isinstance(token, str)
++        assert checks.run_due_checks(conn, cfg=_cfg("exit 0")) == ["test-wall"]
++        with kb.write_txn(conn):
++            conn.execute("PRAGMA foreign_keys=OFF")
++            conn.execute("UPDATE task_runs SET id = id + 1000")
++            conn.execute("UPDATE tasks SET current_run_id = current_run_id + 1000 "
++                         "WHERE current_run_id IS NOT NULL")
++        assert checks._assertion_tokens(conn)["test-wall"] == token
++        states = blockers.blocker_states(conn)
++        checks.apply_check_clears(conn, states)
++        assert not states["test-wall"].is_open
++
++
++def test_assertion_scan_is_bounded_by_lookback(kanban_home):
++    from hermes_cli import kanban_shared_blocker_checks as checks
++
++    with kbc.connect_closing() as conn:
++        _blocked_behind(conn, "old", blocker_id="test-wall")
++        asserted = blockers.blocker_states(conn)["test-wall"].asserted_at
++        assert "test-wall" in checks._assertion_tokens(conn, asserted)
++        assert checks._assertion_tokens(conn, asserted + blockers._LOOKBACK_SECONDS + 5) == {}
++
++
++def test_non_probe_reassertion_neither_resets_errors_nor_postpones(kanban_home, caplog):
++    from hermes_cli import kanban_shared_blocker_checks as checks
++
++    with kbc.connect_closing() as conn:
++        _blocked_behind(conn, "broken checker", blocker_id="test-wall")
++        now = blockers.blocker_states(conn)["test-wall"].asserted_at + 10
++        checks.run_due_checks(conn, cfg=_cfg("exit 2"), now=now)
++        _blocked_behind(conn, "re-park", blocker_id="test-wall")     # new assertion, no probe
++        due = []
++        checks.run_due_checks(conn, cfg=_cfg("exit 2"), now=now + 60, due_out=due)
++        assert due == [now + 120]                                    # not run early
++        checks.run_due_checks(conn, cfg=_cfg("exit 2"), now=now + 120)
++        _blocked_behind(conn, "re-park again", blocker_id="test-wall")
++        checks.run_due_checks(conn, cfg=_cfg("exit 2"), now=now + 240)
++        # errors counted across reassertions, whichever card was home
++        assert _all_check_fails(conn, checks) == [1, 2, 3]
++        assert "falling back to worker probes" in caplog.text
++        due = []
++        checks.run_due_checks(conn, cfg=_cfg("exit 2"), now=now + 400, due_out=due)
++        assert due == [] and _all_check_fails(conn, checks) == [1, 2, 3]
++
++
++def test_new_episode_after_clear_recovers_from_broken_checker(kanban_home):
++    from hermes_cli import kanban_shared_blocker_checks as checks
++
++    with kbc.connect_closing() as conn:
++        first = _blocked_behind(conn, "broken", blocker_id="test-wall")
++        base = blockers.blocker_states(conn)["test-wall"].asserted_at
++        for offset in (-300, -180, -60):
++            checks.run_due_checks(conn, cfg=_cfg("exit 2"), now=base + offset)
++        assert [e.payload["fails"] for e in _check_events(conn, first, checks)] == [1, 2, 3]
++        assert checks.run_due_checks(conn, cfg=_cfg("exit 2"), now=base + 5) == []
++        # A worker run clears the wall, then it is asserted afresh.
++        assert kb.unblock_task(conn, first) and kb.claim_task(conn, first)
++        assert kb.complete_task(conn, first, result="wall gone")
++        second = _blocked_behind(conn, "again", blocker_id="test-wall")
++        with kb.write_txn(conn):
++            conn.execute("UPDATE task_runs SET ended_at = ended_at + 30 WHERE task_id = ?", (second,))
++        assert blockers.blocker_states(conn, now=base + 40)["test-wall"].is_open
++        assert checks.run_due_checks(conn, cfg=_cfg("exit 0"), now=base + 40) == ["test-wall"]
+diff --git a/tests/hermes_cli/test_kanban_shared_blocker_livelock.py b/tests/hermes_cli/test_kanban_shared_blocker_livelock.py
+index cbddb5b652..95095baa1d 100644
+--- a/tests/hermes_cli/test_kanban_shared_blocker_livelock.py
++++ b/tests/hermes_cli/test_kanban_shared_blocker_livelock.py
+@@ -19,6 +19,22 @@ def test_github_wall_has_one_identity(alias):
+     assert blockers.normalize_blocker_id(alias) == 'github-rest-quota'
+ 
+ 
++def test_config_alias_and_legacy_event_reader(kanban_home, monkeypatch):
++    from hermes_cli import config
++    cfg = {'kanban': {'shared_blocker_aliases': {'quota-limited': 'github-quota-reserve'}}}
++    monkeypatch.setattr(config, 'load_config_readonly', lambda: cfg)
++    assert blockers.normalize_blocker_id('quota-limited') == ALIASES[0]
++    assert blockers.normalize_blocker_id('unknown-wall') == 'unknown-wall'
++    with kbc.connect_closing() as conn:
++        tid = helpers._blocked_behind(conn, 'wall', blocker_id=ALIASES[0])
++        assert kb.unblock_task(conn, tid)
++        assert blockers._unblocked_since_assertion(conn, tid, ALIASES[0])
++        # Persist an old spelling, not the current writer's normalized spelling.
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, 'scheduled', {'blocker_id': ALIASES[2]})
++        assert not blockers._unblocked_since_assertion(conn, tid, ALIASES[0])
++
++
+ def test_new_assertions_do_not_postpone_oldest_probe(kanban_home, monkeypatch):
+     with kbc.connect_closing() as conn:
+         tids = []
+@@ -51,6 +67,36 @@ def test_dispatch_tick_clears_all_aliases_and_carrier(kanban_home, monkeypatch):
+             assert events[-1].payload['cleared_via'] == 'check'
+ 
+ 
++@pytest.mark.parametrize('via_check', [False, True])
++def test_pre_clear_run_cannot_reopen_quota_wall(kanban_home, monkeypatch, via_check):
++    from hermes_cli import kanban_shared_blocker_checks as checks
++
++    clock = [1800000000]
++    monkeypatch.setattr(blockers.time, 'time', lambda: clock[0])
++    with kbc.connect_closing() as conn:
++        carrier = helpers._blocked_behind(conn, 'carrier', blocker_id=ALIASES[0])
++        stale = kb.create_task(conn, title='already running with old context', assignee='default')
++        assert kb.claim_task(conn, stale)
++        clock[0] += 30
++        if via_check:
++            checks.run_due_checks(conn, cfg={'kanban': {'shared_blocker_checks': {ALIASES[0]: 'exit 0'}}})
++        else:
++            assert kb.unblock_task(conn, carrier)
++            assert kb.claim_task(conn, carrier)
++            assert kb.block_task(conn, carrier, reason='other wait', kind='time', clear_blocker=True, clock_only=True)
++        cleared_at = clock[0]
++        clock[0] += 30
++        assert kb.block_task(conn, stale, reason='stale quota context', kind='capability', blocker_id=ALIASES[2])
++        state = blockers.blocker_states(conn)[ALIASES[0]]
++        assert not state.is_open
++        assert state.cleared_at == cleared_at
++        assert stale in blockers.release_cleared_blockers(conn)
++        # A genuinely new run after the clear may still report a new outage.
++        clock[0] += 30
++        helpers._blocked_behind(conn, 'new outage', blocker_id=ALIASES[3])
++        assert blockers.blocker_states(conn)[ALIASES[0]].is_open
++
++
+ def test_non_probe_context_requires_live_check(kanban_home):
+     with kbc.connect_closing() as conn:
+         helpers._blocked_behind(conn, 'quota', blocker_id='github-quota-reserve')
+-- 
+2.43.0
+

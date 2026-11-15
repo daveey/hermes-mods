@@ -1,0 +1,1237 @@
+From 35904cf2b17f24f3d87d1f7edd71c16b4d2ec9ae Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 01:57:48 +0000
+Subject: [PATCH] [daveey] retain scalar evidence for session replica
+ bystanders
+
+---
+ hermes_cli/kanban_replica_aggregates.py       | 110 +++++
+ hermes_cli/kanban_replica_memo.py             |  28 ++
+ hermes_cli/kanban_replica_projection.py       |  65 ++-
+ hermes_cli/kanban_replica_relevance.py        |  46 ++
+ hermes_cli/kanban_replica_rows.py             |  32 +-
+ hermes_cli/kanban_replica_scalar_rows.py      | 199 ++++++++
+ hermes_cli/kanban_replica_transport.py        |  59 +++
+ hermes_cli/kanban_session_activity.py         |  37 +-
+ .../test_kanban_replica_bystander_memory.py   | 427 ++++++++++++++++++
+ 9 files changed, 951 insertions(+), 52 deletions(-)
+ create mode 100644 hermes_cli/kanban_replica_aggregates.py
+ create mode 100644 hermes_cli/kanban_replica_memo.py
+ create mode 100644 hermes_cli/kanban_replica_relevance.py
+ create mode 100644 hermes_cli/kanban_replica_scalar_rows.py
+ create mode 100644 hermes_cli/kanban_replica_transport.py
+ create mode 100644 tests/hermes_cli/test_kanban_replica_bystander_memory.py
+
+diff --git a/hermes_cli/kanban_replica_aggregates.py b/hermes_cli/kanban_replica_aggregates.py
+new file mode 100644
+index 0000000000..7f9698fd6f
+--- /dev/null
++++ b/hermes_cli/kanban_replica_aggregates.py
+@@ -0,0 +1,110 @@
++"""Generation-bound aggregate views over derived bystander scalars. [daveey]"""
++from __future__ import annotations
++
++import marshal
++from collections.abc import Mapping, Set as AbstractSet
++
++
++class EvidenceSet(AbstractSet):
++    def __init__(self, relevant, scalars, kind, stale, fresh):
++        self.relevant = frozenset(relevant)
++        self.scalars, self.kind, self.stale, self.fresh = scalars, kind, stale, fresh
++
++    def _keys(self):
++        if self.stale:
++            return
++        for (gw, key), packed in self.scalars.items():
++            profile, board, tid = key.split('/')
++            if self.kind == 'owners':
++                yield gw, board, tid
++            elif (gw, profile, board) in self.fresh and marshal.loads(packed)[6] & 2:
++                yield gw, profile, board, tid
++
++    def __iter__(self):
++        yield from self.relevant
++        seen = set(self.relevant)
++        for key in self._keys():
++            if key not in seen:
++                seen.add(key)
++                yield key
++
++    def __len__(self):
++        return sum(1 for _ in self)
++
++    def __contains__(self, key):
++        if key in self.relevant:
++            return True
++        if self.stale:
++            return False
++        if self.kind == 'closed' and isinstance(key, tuple) and len(key) == 4:
++            gw, profile, board, tid = key
++            packed = self.scalars.get((gw, f'{profile}/{board}/{tid}'))
++            return packed is not None and (gw, profile, board) in self.fresh and bool(marshal.loads(packed)[6] & 2)
++        return any(candidate == key for candidate in self._keys())
++
++
++class BorrowedSet:
++    """An output sink that borrows immutable projection sets, but accepts full-read adds."""
++    def __init__(self):
++        self.value = set()
++
++    def update(self, value):
++        self.value = value
++
++    def add(self, value):
++        self.value.add(value)
++
++    def __contains__(self, value):
++        return value in self.value
++
++
++def remembered_publications(moved, previous):
++    published = moved.get('published')
++    if isinstance(published, Published):
++        keys = {(c.get('board'), c.get('id'), c.get('created_at')) for c in previous or ()}
++        moved['published'] = published.lookup_many(keys)
++
++
++class Published(Mapping):
++    def __init__(self, relevant, scalars):
++        self.relevant, self.scalars = dict(relevant), scalars
++
++    def lookup_many(self, keys):
++        """Resolve remembered publications in one scan, not one scan per card."""
++        out = {key: set(self.relevant.get(key, ())) for key in keys}
++        for (gw, key), packed in self.scalars.items():
++            _, board, tid = key.split('/')
++            created = marshal.loads(packed)[4]
++            publication = (board, tid, created)
++            if created is not None and publication in out:
++                out[publication].add(gw)
++        return {key: frozenset(gws) for key, gws in out.items() if gws}
++
++    def __getitem__(self, key):
++        return self.lookup_many((key,))[key]
++
++    def __iter__(self):
++        seen = set(self.relevant)
++        yield from seen
++        for (_, key), packed in self.scalars.items():
++            _, board, tid = key.split('/')
++            created = marshal.loads(packed)[4]
++            publication = (board, tid, created)
++            if created is not None and publication not in seen:
++                seen.add(publication)
++                yield publication
++
++    def __len__(self):
++        return sum(1 for _ in self)
++
++
++def snapshot(state):
++    stale, fresh = state.key[2:]
++    scalars = state.bystanders
++    seen = dict(state.seen)
++    for (gw, _), packed in scalars.items():
++        updated = marshal.loads(packed)[3]
++        seen[gw] = max(seen.get(gw, 0.0), (updated or 0) / 1000.0)
++    return {'owners': EvidenceSet(() if stale else state.owners, scalars, 'owners', stale, fresh),
++            'closed': EvidenceSet(state.closed, scalars, 'closed', stale, fresh), 'seen': seen,
++            'moved': {} if stale else {'published': Published(state.published_out, scalars), 'live_scopes': fresh}}
+diff --git a/hermes_cli/kanban_replica_memo.py b/hermes_cli/kanban_replica_memo.py
+new file mode 100644
+index 0000000000..dac2ed99c2
+--- /dev/null
++++ b/hermes_cli/kanban_replica_memo.py
+@@ -0,0 +1,28 @@
++"""Publish a live replica read without duplicating its all-row aggregates. [daveey]"""
++
++
++def finish(view, now, me, info_rows, last_ok, offline, key, stale, *, qualified_out, owners_out,
++           moved_out, closed_out):
++    from hermes_cli import kanban_session_activity as a
++    from hermes_cli import kanban_replica_projection as projection
++
++    aggregates = {}
++    cards = projection.project(view, now, me, info_rows, last_ok, offline, fresh=key[3],
++                               aggregates_out=aggregates)
++    qualified = aggregates.get('qualified', frozenset())
++    owners = aggregates.get('owners', frozenset())
++    closed = aggregates.get('closed', frozenset())
++    moved = aggregates.get('moved', {})
++    seen_at = aggregates.get('seen', {})
++    memos = dict(a._remote_read_memo or {})
++    memos.pop((key[0], me, key[6]), None)
++    memos[(key[0], me, key[6])] = (key, now, None, list(cards), qualified, owners, stale,
++                                   a._replica_synced(seen_at, last_ok), seen_at, moved, closed)
++    while len(memos) > a._REMOTE_READ_MEMOS:
++        del memos[next(iter(memos))]
++    a._remote_read_memo = memos
++    for target, value in ((qualified_out, qualified), (owners_out, owners), (moved_out, moved),
++                          (closed_out, closed)):
++        if target is not None:
++            target.update(value)
++    return cards
+diff --git a/hermes_cli/kanban_replica_projection.py b/hermes_cli/kanban_replica_projection.py
+index be4a38aec2..50c2b617a4 100644
+--- a/hermes_cli/kanban_replica_projection.py
++++ b/hermes_cli/kanban_replica_projection.py
+@@ -26,7 +26,8 @@ is decoded for that state, which keeps its whole record.
+ from __future__ import annotations
+ 
+ import threading
+-from dataclasses import dataclass
++from collections import ChainMap
++from dataclasses import dataclass, field
+ from typing import Any
+ 
+ from hermes_cli.kanban_session_activity_records import _fold_legacy_aliases
+@@ -241,6 +242,7 @@ class _State:
+     linked: set
+     order: dict  # tkey -> its (gw, key) in ``stages``
+     closed: set  # released tkeys whose owner verified the completion
++    bystanders: dict = field(default_factory=dict)
+ 
+ 
+ _MAX_STATES = 16
+@@ -249,7 +251,7 @@ _lock = threading.Lock()
+ _states: dict[tuple, _State] = {}
+ # replica path -> (gw, key) -> the stage of a row that links no session of the origin it was staged for, shared by
+ # every state of that replica whose origin it does not link either (``_shareable``). Dropped with the path's last state.
+-_shared: dict[str, dict[tuple, _Stage]] = {}
++_shared: dict[str, ChainMap] = {}
+ stats = {"projected": 0, "rebuilt": 0, "historical": 0, "considered": 0, "rehydrated": 0, "shared": 0}
+ 
+ 
+@@ -342,21 +344,33 @@ def _settle_seen(s: _State) -> None:
+ 
+ def _advance(s: _State, view, me: str, origin_profile: str) -> None:
+     """Bring ``s`` to ``view``'s rows, re-projecting only rows whose stored text changed."""
++    rows = view.relevant if view.me is not None else view.by_key
++    shared_view = _shared.setdefault(s.tag, ChainMap({}, {}))
++    # Count actual reuse of scalar projections, just as _stage counts reused stages.
++    prior = shared_view.maps[1]
++    stats['shared'] += sum(1 for rk, value in view.bystanders.items()
++                           if s.bystanders.get(rk) != value and prior.get(rk) == value)
++    shared_view.maps[1] = view.bystanders
++    s.bystanders = view.bystanders
+     if s.gen is not None and view.base_gen == s.gen:
+         removed, candidates = view.removed, view.changed
+     else:  # not the view ``s`` was advanced from: compare every row (no decode for unchanged ones)
+-        removed = s.stages.keys() - view.by_key.keys()
+-        candidates = view.by_key.keys()
+-    shared = _shared.setdefault(s.tag, {})
++        removed = s.stages.keys() - rows.keys()
++        candidates = rows.keys()
++    shared = shared_view.maps[0]
+     # A new scope has no removed rows of its own. Reconcile the shared cache against the replica itself,
+     # or deleted rows survive indefinitely when their older scopes are evicted before reading again.
+-    for rk in shared.keys() - view.by_key.keys():
++    for rk in shared.keys() - rows.keys():
+         del shared[rk]
+     for rk in removed:
+         if rk in s.stages:
+             _unapply(s, rk)
+     for rk in candidates:
+-        row = view.by_key[rk]
++        if rk not in rows:
++            if rk in s.stages:
++                _unapply(s, rk)
++            continue
++        row = rows[rk]
+         old = s.stages.get(rk)
+         if old is not None and (old.row is row or old.row == row):  # (gw, profile) is in the state's key
+             continue
+@@ -373,23 +387,33 @@ def _rekeyed(old: _State, key: tuple) -> _State:
+     for rk, st in old.stages.items():
+         _apply(s, rk, st)
+     s.gen = old.gen
++    s.bystanders = old.bystanders
+     return s
+ 
+ 
+ def project(view, now: float, me: str, info_rows: list, last_ok: float | None, offline: float | None, *,
+             fresh: frozenset, qualified_out: set | None = None, owners_out: set | None = None,
+             seen_out: dict | None = None, moved_out: dict | None = None,
+-            closed_out: set | None = None) -> list[dict[str, Any]]:
++            closed_out: set | None = None, aggregates_out: dict | None = None) -> list[dict[str, Any]]:
+     """``_project_replica(path, now, me, view.rows(), info_rows, last_ok, offline, ...)``, incrementally.
+     ``fresh`` is ``fresh_scopes`` of ``info_rows``' heartbeats at ``now``: all the projection reads of them."""
+     from hermes_cli.profiles import get_active_profile_name
+ 
++    from hermes_cli.kanban_replica_scalar_rows import SnapshotRows
++    if isinstance(view, SnapshotRows):
++        view = view.consume()
+     origin_profile = get_active_profile_name()
+     stale = offline is not None or last_ok is None or now - last_ok > _hub_stale_after()
+     key = (me, origin_profile, stale, fresh)
+     slot = (view.path, me, origin_profile)
+     with _lock:
+         s = _states.pop(slot, None)
++        # A profile that is not polled again must not pin a now-bystander payload.
++        # Keep its generation unchanged so its next read still reconciles normally.
++        for other in _states.values():
++            if other.tag == view.path and other.key[0] == me:
++                for rk in other.stages.keys() & view.bystanders.keys():
++                    _unapply(other, rk)
+         try:
+             if s is None:
+                 s = _new_state(view.path, key)
+@@ -404,7 +428,8 @@ def project(view, now: float, me: str, info_rows: list, last_ok: float | None, o
+             _states.pop(next(iter(_states)))
+         _forget_unused_shared()
+         return _emit(s, me, origin_profile, last_ok, stale, fresh, qualified_out=qualified_out,
+-                     owners_out=owners_out, seen_out=seen_out, moved_out=moved_out, closed_out=closed_out)
++                     owners_out=owners_out, seen_out=seen_out, moved_out=moved_out, closed_out=closed_out,
++                     aggregates_out=aggregates_out)
+ 
+ 
+ def _forget_unused_shared() -> None:
+@@ -420,18 +445,22 @@ def _hub_stale_after() -> float:
+ 
+ 
+ def _emit(s: _State, me: str, origin_profile: str, last_ok, stale: bool, fresh: frozenset, *, qualified_out,
+-          owners_out, seen_out, moved_out, closed_out=None) -> list[dict[str, Any]]:
++          owners_out, seen_out, moved_out, closed_out=None, aggregates_out=None) -> list[dict[str, Any]]:
+     if s.errors:
+         raise s.errors[min(s.errors, key=lambda rk: s.errors[rk].order)].error
+     _settle_seen(s)
++    from hermes_cli.kanban_replica_aggregates import snapshot
++    aggregates = snapshot(s)
+     if seen_out is not None:
+-        seen_out.update(s.seen)
+-    if owners_out is not None and not stale:
+-        owners_out.update(s.owners)
++        seen_out.update(aggregates['seen'])
++    if owners_out is not None:
++        owners_out.update(aggregates['owners'])
+     if closed_out is not None:  # ``s.closed`` is empty on a stale replica (``_apply``)
+-        closed_out.update(s.closed)
+-    if moved_out is not None and not stale:
+-        moved_out.update({'published': dict(s.published_out), 'live_scopes': fresh})
++        closed_out.update(aggregates['closed'])
++    if moved_out is not None:
++        moved_out.update(aggregates['moved'])
++    if aggregates_out is not None:
++        aggregates_out.update(aggregates)
+     # Fold only the legacy records and every qualified record sharing their (gw, board, id): exactly the inputs
+     # ``_fold_legacy_aliases`` reads for them when given every record.
+     sub = {tk: s.tasks[tk] for tk in s.legacy_keys}
+@@ -443,6 +472,8 @@ def _emit(s: _State, me: str, origin_profile: str, last_ok, stale: bool, fresh:
+     folded = {tk for tk in before if tk not in sub}
+     if qualified_out is not None:
+         qualified_out.update((gw, board, tid) for gw, _, board, tid in folded)
++    if aggregates_out is not None:
++        aggregates_out['qualified'] = frozenset((gw, board, tid) for gw, _, board, tid in folded)
+     changed = {tk for tk, t in sub.items() if t is not before[tk]}
+     found: dict[tuple, dict] = {}
+     for tk in sorted((s.linked | changed) - folded, key=lambda tk: s.stages[s.order[tk]].order):
+@@ -459,7 +490,7 @@ def _emit(s: _State, me: str, origin_profile: str, last_ok, stale: bool, fresh:
+         if st.historical is None:
+             stats["historical"] += 1
+             st.historical = historical_fields(record, tk)
+-        owner_seen = s.seen.get(gw) or None
++        owner_seen = aggregates['seen'].get(gw) or None
+         synced = min(owner_seen, last_ok) if (owner_seen and last_ok) else (owner_seen or last_ok)
+         inputs = (t, sids, tk in s.released, synced, stale, me, origin_profile)
+         cached = st.cards
+diff --git a/hermes_cli/kanban_replica_relevance.py b/hermes_cli/kanban_replica_relevance.py
+new file mode 100644
+index 0000000000..48f7a7d466
+--- /dev/null
++++ b/hermes_cli/kanban_replica_relevance.py
+@@ -0,0 +1,46 @@
++"""Which replica tasks cannot affect this gateway's emitted cards. [daveey]"""
++from __future__ import annotations
++
++import itertools
++from hermes_cli.kanban_replica_transport import iter_page
++
++
++def fetch_payloads(conn, identities, version_column: str, page_size: int = 100):
++    """Yield raw seven-tuples for identities inside the caller's open read snapshot.
++
++    Does not begin, commit or close the transaction. Each page is one SQLite result,
++    avoiding per-task GIL handoffs. The only interpolated column is allowlisted.
++    """
++    if version_column not in ('version', 'NULL'):
++        raise ValueError('invalid replica version column')
++    if type(page_size) is not int or not 1 <= page_size <= 100:
++        raise ValueError('replica refetch page size must be between 1 and 100')
++    encoding = conn.execute('PRAGMA encoding').fetchone()[0]
++    pending = iter(identities)
++    while batch := tuple(itertools.islice(pending, page_size)):
++        where = ' OR '.join('(gw = ? AND key = ?)' for _ in batch)
++        args = tuple(value for pair in batch for value in pair)
++        packed = conn.execute(
++            'SELECT CAST(json_group_array(json_array(gw, key, data, updated_at, '
++            f"{version_column}, seq, octet_length(data))) AS BLOB) FROM replica WHERE coll = 'tasks' AND ({where})",
++            args,
++        ).fetchone()[0]
++        yield from iter_page(packed, encoding)
++        del packed
++
++
++def is_bystander(record: dict, key: str, me: str, legacy_keys) -> bool:
++    """Conservative gateway-wide relevance; ``legacy_keys`` belongs to the row's gateway.
++
++    A qualified twin of any legacy row remains relevant: alias folding may add local
++    links without changing the qualified row's seq. No profile/rel filter is safe here.
++    """
++    parts = key.split('/')
++    if len(parts) != 3 or not all(parts) or '/'.join(parts[1:]) in legacy_keys:
++        return False
++    if record.get('origin_bindings'):
++        return False
++    sessions = record.get('sessions')
++    if not isinstance(sessions, list):
++        return True
++    return not any(isinstance(link, dict) and link.get('gw') == me for link in sessions)
+diff --git a/hermes_cli/kanban_replica_rows.py b/hermes_cli/kanban_replica_rows.py
+index 2be0fff842..966a75ca67 100644
+--- a/hermes_cli/kanban_replica_rows.py
++++ b/hermes_cli/kanban_replica_rows.py
+@@ -29,7 +29,7 @@ _COLUMNS = "gw, key, data, updated_at, {version}, seq, octet_length(data)"
+ # every row was a 256 MB string (UCS-4) plus its decode, a ~400 MB peak per full read on the mini.
+ _PAGE = 1000
+ _PAGE_BYTES = 2 << 20
+-_PAGE_SQL = (f"SELECT json_group_array(json_array({_COLUMNS})), max(rowid) FROM (SELECT rowid, * FROM replica"
++_PAGE_SQL = (f"SELECT CAST(json_group_array(json_array({_COLUMNS})) AS BLOB), max(rowid) FROM (SELECT rowid, * FROM replica"
+              " WHERE coll = 'tasks' AND rowid > ? {where} ORDER BY rowid LIMIT ?)")
+ _FULL_SQL = _PAGE_SQL.format(version="{version}", where="")
+ _DELTA_SQL = _PAGE_SQL.format(version="{version}", where="AND seq > ?")
+@@ -55,9 +55,18 @@ class Rows:
+     base_gen: int | None = None  # the view ``changed``/``removed`` are relative to (None: a full read)
+     changed: frozenset = field(default_factory=frozenset)
+     removed: frozenset = field(default_factory=frozenset)
++    bystanders: dict = field(default_factory=dict)
++    relevant: dict = field(default_factory=dict)
++    me: str | None = None
+ 
+     def rows(self) -> list[tuple]:
+-        """Every row as ``_read_remote_links`` reads it, ``(gw, key, data, updated_at, version)``, in key order."""
++        """Raw rows for unfiltered views; filtered payloads exist only in the read snapshot.
++
++        Use ``SnapshotRows.rows()`` instead of ``consume()`` inside that snapshot when
++        raw payloads are required. Consumed scalar views deliberately cannot rehydrate.
++        """
++        if self.me is not None:
++            raise RuntimeError('raw rows require the unconsumed replica snapshot')
+         by_key = self.by_key
+         return [_unpacked(by_key[k]) for k in sorted(by_key, key=_sort_key)]
+ 
+@@ -110,12 +119,18 @@ def page_rows(probe) -> int:
+ 
+ def _paged(conn: sqlite3.Connection, sql: str, probe, args: tuple = ()):
+     """Every row ``sql`` (``_FULL_SQL``/``_DELTA_SQL``) selects, one page decoded at a time."""
++    from hermes_cli.kanban_replica_transport import iter_page
++
+     size, after = page_rows(probe), -1 << 63
++    encoding = conn.execute('PRAGMA encoding').fetchone()[0]
+     while True:
+         packed, last = conn.execute(sql, (after, *args, size)).fetchone()
+-        rows = _decode(packed) if last is not None else []
+-        yield from rows
+-        if len(rows) < size:  # a short page is the last: no extra query to find the end
++        count = 0
++        for row in iter_page(packed, encoding):
++            count += 1
++            yield row
++        del packed
++        if count < size:  # a short page is the last: no extra query to find the end
+             return
+         after = last
+ 
+@@ -187,17 +202,20 @@ def _delta(conn: sqlite3.Connection, base: Rows, probe) -> Rows | None:
+                 base.gen, frozenset(changed), frozenset(removed))
+ 
+ 
+-def read(conn: sqlite3.Connection, path, version_column: str, probe, ident) -> Rows:
++def read(conn: sqlite3.Connection, path, version_column: str, probe, ident, *, me: str | None = None):
+     """The task rows in ``conn``'s open read transaction. ``probe`` is ``_REPLICA_PROBE`` read in that same
+     transaction, ``ident`` the file identity taken before ``conn`` was opened. The caller reads here only a replica
+     whose every task row carries a ``seq`` (``probe[0] == probe[1]``) and that has a ``version`` column."""
++    if me is not None:
++        from hermes_cli.kanban_replica_scalar_rows import SnapshotRows
++        return SnapshotRows(conn, path, version_column, probe, ident, me)
+     tag = str(path)
+     if ident is None:  # no file identity, so no base to trust
+         return _full(conn, tag, None, version_column, probe)
+     with _lock:
+         base = _views.get(tag)
+     view = None
+-    if base is not None and base.ident == ident:
++    if base is not None and base.ident == ident and base.me is None and base.version_column == version_column:
+         view = _delta(conn, base, probe)
+     if view is None:
+         view = _full(conn, tag, ident, version_column, probe)
+diff --git a/hermes_cli/kanban_replica_scalar_rows.py b/hermes_cli/kanban_replica_scalar_rows.py
+new file mode 100644
+index 0000000000..6aa38797d0
+--- /dev/null
++++ b/hermes_cli/kanban_replica_scalar_rows.py
+@@ -0,0 +1,199 @@
++"""Snapshot-scoped row consumption with payload-free bystander evidence. [daveey]"""
++from __future__ import annotations
++
++import hashlib
++import json
++import marshal
++from collections.abc import Mapping
++
++from hermes_cli.kanban_replica_relevance import is_bystander
++
++# Scalars are process-local, generated here, never loaded from a database as marshal.
++# seq, octets, version, updated, created, text digest, terminal/verified flags
++
++
++class ScalarRows(Mapping):
++    """All-identity compatibility view; only relevant rows have payload slots."""
++    def __init__(self, relevant, bystanders, *, meta=False):
++        self.relevant, self.bystanders, self.meta = relevant, bystanders, meta
++
++    def __len__(self):
++        return len(self.relevant) + len(self.bystanders)
++
++    def __iter__(self):
++        yield from self.relevant
++        yield from self.bystanders
++
++    def __getitem__(self, key):
++        if key in self.relevant:
++            return self.relevant[key]
++        seq, size, version, updated, *_ = marshal.loads(self.bystanders[key])
++        return (seq, size) if self.meta else (*key, b'', updated, version)
++
++
++def derive(raw, me, legacy):
++    """Return derived scalar bytes, or None for a relevant/invalid record."""
++    from hermes_cli.kanban_session_activity import _decode_replica_task
++    from hermes_cli.kanban_session_activity_release import record_attests_terminal
++
++    gw, key, data, updated, version, seq, size = raw
++    try:
++        task, _, evidence = _decode_replica_task(key, data)
++        if not is_bystander(task, key, me, legacy.get(gw, ())):
++            return None
++        profile, board, tid = key.split('/')
++        if tid != str(task['id']):
++            return None
++    except ValueError:
++        return None  # the ordinary stage retains sorted malformed-row errors
++    # Preserve eager aggregate errors rather than moving them to a later facade probe.
++    (updated or 0) / 1000.0
++    created = task.get('created_at')
++    if created is not None:
++        hash((board, tid, created))
++    attest = record_attests_terminal(task, str(gw), profile, board, evidence)
++    flags = int(attest) | (2 if attest and evidence.get('verified') is True else 0)
++    digest = hashlib.blake2b(data.encode('utf-8', 'surrogatepass'), digest_size=16).digest()
++    return marshal.dumps((seq or 0, size or 0, version, updated, created, digest, flags))
++
++
++class SnapshotRows:
++    """Single-use adapter; the caller keeps the connection open until consumption."""
++    def __init__(self, conn, path, version_column, probe, ident, me):
++        self.conn, self.path, self.version_column = conn, str(path), version_column
++        self.probe, self.ident, self.me = probe, ident, me
++
++    def _take(self):
++        conn, self.conn = self.conn, None
++        if conn is None:
++            raise RuntimeError('replica snapshot already consumed')
++        return conn
++
++    def rows(self):
++        from hermes_cli import kanban_replica_rows as r
++        conn = self._take()
++        return sorted((row[:5] for row in r._paged(conn, r._FULL_SQL.format(version=self.version_column), self.probe)),
++                      key=lambda row: r._sort_key(row[:2]))
++
++    def consume(self):
++        from hermes_cli import kanban_replica_rows as r
++        conn = self._take()
++        packed = conn.execute("SELECT json_group_array(json_array(gw,key)) FROM replica WHERE coll='tasks' "
++                              "AND length(key)-length(replace(key,'/',''))=1").fetchone()[0]
++        legacy = {}
++        for gw, key in json.loads(packed):
++            legacy.setdefault(gw, set()).add(key)
++        with r._lock:
++            base = r._views.get(self.path)
++        if base is not None and (self.ident is None or base.ident != self.ident or base.me != self.me
++                                 or base.version_column != self.version_column):
++            base = None
++        builder = _Builder(self, legacy, base)
++        view = builder.delta(conn) if base is not None else None
++        if view is None:
++            builder = _Builder(self, legacy, base, full=True)
++            r.stats['full'] += 1
++            if self.probe[0] <= r._PAGE and self.probe[5] <= r._PAGE_BYTES:
++                sql = r._DELTA_ONE_SQL.format(version=self.version_column).removesuffix(' AND seq > ?')
++                fresh = r._decode(conn.execute(sql).fetchone()[0])
++            else:
++                fresh = r._paged(conn, r._FULL_SQL.format(version=self.version_column), self.probe)
++            for raw in fresh:
++                builder.put(raw)
++            view = builder.finish()
++        if self.ident is not None:
++            with r._lock:
++                if len(r._views) >= 16 and self.path not in r._views:
++                    r._views.pop(next(iter(r._views)))
++                r._views[self.path] = view
++        return view
++
++
++class _Builder:
++    """Private mutable candidate; only a reconciled generation is published."""
++    def __init__(self, snapshot, legacy, base, full=False):
++        self.snapshot, self.legacy, self.base, self.full = snapshot, legacy, base, full
++        keep = base is not None and not full
++        self.relevant = dict(base.relevant) if keep else {}
++        self.meta = dict(base.meta.relevant) if keep else {}
++        self.scalars = dict(base.bystanders) if keep else {}
++        self.rows = ScalarRows(self.relevant, self.scalars)
++        self.metadata = ScalarRows(self.meta, self.scalars, meta=True)
++        self.sums = base.sums if keep else (0, 0, 0, 0)
++        self.top = base.last_seq if keep else 0
++        self.changed, self.removed, self.gateways = set(), set(), {}
++        self.projected = 0
++
++    def drop(self, rk):
++        from hermes_cli import kanban_replica_rows as r
++        self.sums = r._plus(self.sums, r._terms(self.rows[rk], self.metadata[rk]), -1)
++        self.relevant.pop(rk, None)
++        self.meta.pop(rk, None)
++        self.scalars.pop(rk, None)
++
++    def put(self, raw):
++        from hermes_cli import kanban_replica_rows as r
++        gw, key, data, updated, version, seq, size = raw
++        gw = self.gateways.setdefault(gw, gw)
++        rk, m = (gw, key), (seq or 0, size or 0)
++        scalar = derive(raw, self.snapshot.me, self.legacy)
++        if rk in self.rows:
++            self.drop(rk)
++        if scalar is None:
++            self.relevant[rk], self.meta[rk] = (gw, key, r.pack(data), updated, version), m
++        else:
++            self.scalars[rk] = scalar
++            old = self.base.bystanders.get(rk) if self.base is not None else None
++            if old is None or marshal.loads(old)[2:6] != marshal.loads(scalar)[2:6]:
++                self.projected += 1
++        self.sums = r._plus(self.sums, (1, m[0], version if type(version) is int else 0, m[1]))
++        self.top = max(self.top, m[0])
++        if not self.full:
++            self.changed.add(rk)
++
++    def delta(self, conn):
++        from hermes_cli import kanban_replica_rows as r
++        from hermes_cli.kanban_replica_relevance import fetch_payloads
++        base = self.base
++        r.stats['delta'] += 1
++        count, octets = conn.execute(r._DELTA_SIZE_SQL, (base.last_seq,)).fetchone()
++        if count <= r._PAGE and octets <= r._PAGE_BYTES:
++            fresh = r._decode(conn.execute(r._DELTA_ONE_SQL.format(version=base.version_column),
++                                          (base.last_seq,)).fetchone()[0])
++        else:
++            fresh = r._paged(conn, r._DELTA_SQL.format(version=base.version_column), self.snapshot.probe,
++                             (base.last_seq,))
++        for raw in fresh:
++            r.stats['delta_rows'] += 1
++            self.put(raw)
++        if not r._matches(self.sums, self.snapshot.probe):
++            r.stats['identity'] += 1
++            present = {(gw, key): seq for gw, key, seq in r._decode(conn.execute(r._IDENTITY_SQL).fetchone()[0])}
++            self.removed = set(self.rows) - present.keys()
++            for rk in self.removed:
++                self.drop(rk)
++            if any(present.get(rk) != m[0] for rk, m in self.metadata.items()):
++                return None
++            if not r._matches(self.sums, self.snapshot.probe):
++                return None
++        promotions = [rk for rk in self.scalars if rk[1].split('/', 1)[1] in self.legacy.get(rk[0], ())]
++        for raw in fetch_payloads(conn, promotions, base.version_column):
++            self.put(raw)
++        # An unchanged qualified twin may lose its legacy alias; classify its kept text.
++        for rk in list(self.relevant):
++            if (rk not in self.changed and rk[1].count('/') == 2
++                    and (rk[0], rk[1].split('/', 1)[1]) in self.removed):
++                row, m = self.relevant[rk], self.meta[rk]
++                raw = (*row[:2], r.text(row[2]), *row[3:], *m)
++                if derive(raw, self.snapshot.me, self.legacy) is not None:
++                    self.put(raw)
++        return self.finish()
++
++    def finish(self):
++        from hermes_cli import kanban_replica_rows as r
++        from hermes_cli import kanban_replica_projection as p
++        p.stats['projected'] += self.projected
++        s = self.snapshot
++        return r.Rows(s.path, s.ident, s.version_column, self.rows, self.metadata, self.sums, self.top,
++                      r._next_gen(), None if self.full or self.base is None else self.base.gen,
++                      frozenset(self.changed), frozenset(self.removed), self.scalars, self.relevant, s.me)
+diff --git a/hermes_cli/kanban_replica_transport.py b/hermes_cli/kanban_replica_transport.py
+new file mode 100644
+index 0000000000..cf0b9de24b
+--- /dev/null
++++ b/hermes_cli/kanban_replica_transport.py
+@@ -0,0 +1,59 @@
++"""Bounded decoding of SQLite's JSON-array replica pages. [daveey]"""
++from __future__ import annotations
++
++import codecs
++import json
++import re
++import sqlite3
++
++_TOKENS = re.compile(r'\\.|\\$|["\[\]{}]', re.DOTALL)
++_CHUNK = 16 << 10
++
++
++def iter_page(packed: bytes, encoding: str = 'utf-8'):
++    """Yield seven-tuples from a SQLite-generated array without decoding a whole page.
++
++    Scan delimiters once, then JSON-decode each complete row once. Fragments contain
++    at most one row, so an oversized row does not cause repeated prefix parsing.
++    Encoding is the caller's PRAGMA encoding (SQLite CAST(TEXT AS BLOB) uses it).
++    """
++    decoder = codecs.getincrementaldecoder(encoding)()
++    depth, quoted, escaped = 0, False, False
++    fragments = []
++    try:
++        for offset in range(0, len(packed), _CHUNK):
++            chunk = decoder.decode(packed[offset:offset + _CHUNK], final=offset + _CHUNK >= len(packed))
++            start = 0 if depth >= 2 else None
++            scan_start = 0
++            if escaped and chunk:
++                scan_start, escaped = 1, False
++            for match in _TOKENS.finditer(chunk, scan_start):
++                token = match.group()
++                pos = match.start()
++                if quoted:
++                    if token == '"':
++                        quoted = False
++                    elif token == '\\':
++                        escaped = True
++                    continue
++                if token == '"':
++                    quoted = True
++                elif token in ('[', '{'):
++                    if depth == 1:
++                        start = pos
++                    depth += 1
++                elif token in (']', '}'):
++                    depth -= 1
++                    if depth == 1:
++                        fragments.append(chunk[start:match.end()])
++                        row = ''.join(fragments)
++                        fragments.clear()
++                        start = None
++                        yield tuple(json.loads(row))
++                        del row
++            if start is not None:
++                fragments.append(chunk[start:])
++    except UnicodeDecodeError as exc:
++        raise sqlite3.OperationalError('Could not decode replica page as text') from exc
++    if depth or quoted or fragments:
++        raise ValueError('incomplete replica JSON page')
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 2f5f3186f8..f8ea547069 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -643,7 +643,11 @@ def _read_remote_links(path: Path, now: float | None = None, *,
+                     closed_out.update(memo[10])
+                 return list(memo[3])  # cards are read-only, as in ``_links_cache``
+         if key is not None:  # [daveey] a miss reads and re-projects only the rows whose seq moved
+-            view = _replica_rows.read(conn, path, version_column, probe, ident)
++            from hermes_cli.kanban_replica_memo import finish
++            view = _replica_rows.read(conn, path, version_column, probe, ident, me=me)
++            return finish(view, now, me, info_rows, last_ok, offline, key, stale,
++                          qualified_out=qualified_out, owners_out=owners_out,
++                          moved_out=moved_out, closed_out=closed_out)
+         else:
+             # Aggregate raw text, not json(data): malformed task JSON retains its per-row decode semantics.
+             # sqlite3 releases/reacquires the GIL per fetched row; under contention 12k rows can stall for 90s.
+@@ -656,32 +660,7 @@ def _read_remote_links(path: Path, now: float | None = None, *,
+         return _project_replica(path, now, me, rows, info_rows, last_ok, offline,
+                                 qualified_out=qualified_out, owners_out=owners_out, moved_out=moved_out,
+                                 closed_out=closed_out)
+-    qualified: set = set()
+-    owners: set = set()
+-    moved: dict = {}
+-    closed: set = set()
+-    seen_at: dict[str, float] = {}
+-    cards = _replica_projection.project(view, now, me, info_rows, last_ok, offline, fresh=key[3],
+-                                        qualified_out=qualified, owners_out=owners, seen_out=seen_at,
+-                                        moved_out=moved, closed_out=closed)
+-    # Heartbeat cut-offs are the live verdicts in ``key``, hub staleness the ``stale`` check; a clock step back rereads.
+-    memos = dict(_remote_read_memo or {})
+-    memos.pop((key[0], me, key[6]), None)
+-    memos[(key[0], me, key[6])] = (key, now, None, list(cards),
+-                                   frozenset(qualified), frozenset(owners), stale, _replica_synced(seen_at, last_ok),
+-                                   dict(seen_at), dict(moved), frozenset(closed))
+-    while len(memos) > _REMOTE_READ_MEMOS:
+-        del memos[next(iter(memos))]
+-    _remote_read_memo = memos
+-    if qualified_out is not None:
+-        qualified_out.update(qualified)
+-    if owners_out is not None:
+-        owners_out.update(owners)
+-    if moved_out is not None:
+-        moved_out.update(moved)
+-    if closed_out is not None:
+-        closed_out.update(closed)
+-    return cards
++
+ 
+ 
+ def _replica_synced(seen_at: dict[str, float], last_ok: float | None) -> tuple:
+@@ -1107,9 +1086,11 @@ def _legacy_remote_links() -> list[dict[str, Any]]:
+         if path is None:
+             raise FileNotFoundError("no hub.db")
+         qualified: set[tuple[str, str, str]] = set()
+-        closed: set[tuple[str, str | None, str, str]] = set()
++        from hermes_cli.kanban_replica_aggregates import BorrowedSet, remembered_publications
++        closed = BorrowedSet()
+         moved: dict[str, Any] = {}
+         cards = _read_remote_links(path, qualified_out=qualified, closed_out=closed, moved_out=moved)
++        remembered_publications(moved, previous)
+     except Exception as exc:  # a broken replica must never break the sidebar
+         if previous is None:
+             if path is not None:
+diff --git a/tests/hermes_cli/test_kanban_replica_bystander_memory.py b/tests/hermes_cli/test_kanban_replica_bystander_memory.py
+new file mode 100644
+index 0000000000..89cb69b24f
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_replica_bystander_memory.py
+@@ -0,0 +1,427 @@
++"""Bystanders retain only derived evidence, never task payloads. [daveey]"""
++import importlib
++import importlib.util
++import sqlite3
++
++import pytest
++
++from tests.hermes_cli import test_kanban_replica_read_memo as _memo_tests
++
++hub = _memo_tests.hub
++
++
++def _relevance():
++    name = 'hermes_cli.kanban_replica_relevance'
++    assert importlib.util.find_spec(name) is not None, 'shared replica relevance definition is missing'
++    return importlib.import_module(name)
++
++
++def test_bystander_definition_is_gateway_wide_and_conservative():
++    is_bystander = _relevance().is_bystander
++    key = 'worker/build/t_one'
++    assert is_bystander({}, key, 'mini', set())
++    assert is_bystander({'sessions': [{'gw': 'other'}]}, key, 'mini', set())
++    # Any local gateway link matters, even another profile or an unrecognized rel.
++    assert not is_bystander({'sessions': [{'gw': 'mini', 'profile': 'other', 'rel': 'new'}]},
++                            key, 'mini', set())
++    assert not is_bystander({'origin_bindings': [{'binding': 'opaque'}]}, key, 'mini', set())
++    assert not is_bystander({}, key, 'mini', {'build/t_one'})
++    assert is_bystander({}, key, 'mini', {'build/t_other'})
++    for bindings in (None, [], {}):
++        assert is_bystander({'origin_bindings': bindings}, key, 'mini', set())
++    for sessions in (None, {}, 'mini', [None, 'mini', 7]):
++        assert is_bystander({'sessions': sessions}, key, 'mini', set())
++    for malformed in ('build/t_one', 'worker/build/t_one/extra', '/build/t_one', 'worker//t_one',
++                      'worker/build/', ''):
++        assert not is_bystander({}, malformed, 'mini', set())
++
++
++def test_payload_refetch_is_paged_parameterized_and_uses_callers_snapshot(tmp_path):
++    relevance = _relevance()
++    assert hasattr(relevance, 'fetch_payloads'), 'same-snapshot payload refetch is missing'
++    path = tmp_path / 'replica.db'
++    with sqlite3.connect(path) as writer:
++        writer.execute('PRAGMA journal_mode=WAL')
++        writer.execute('CREATE TABLE replica (gw, coll, key, data, updated_at, version, seq)')
++        identities = [('owner', f"p/b/t_{i}'") for i in range(5)]
++        writer.executemany('INSERT INTO replica VALUES (?, ?, ?, ?, ?, ?, ?)',
++                           [(gw, 'tasks', key, 'original 😀', 1000, 4, i)
++                            for i, (gw, key) in enumerate(identities)])
++    reader = sqlite3.connect(path)
++    try:
++        reader.execute('BEGIN')
++        reader.execute('SELECT count(*) FROM replica').fetchone()
++        with sqlite3.connect(path) as writer:
++            writer.execute("UPDATE replica SET data='new'")
++        statements = []
++        reader.set_trace_callback(statements.append)
++        rows = list(relevance.fetch_payloads(reader, identities, 'version', page_size=2))
++        assert len(rows) == 5
++        assert {(r[0], r[1]) for r in rows} == set(identities)
++        assert all(r[2:5] == ('original 😀', 1000, 4) for r in rows)
++        assert all(r[6] == len('original 😀'.encode()) for r in rows)
++        assert len([s for s in statements if s.startswith('SELECT')]) == 3
++        assert reader.in_transaction
++        assert list(relevance.fetch_payloads(reader, [], 'version')) == []
++        with pytest.raises(ValueError):
++            list(relevance.fetch_payloads(reader, identities, 'version; DROP TABLE replica'))
++        with pytest.raises(ValueError):
++            list(relevance.fetch_payloads(reader, identities, 'version', page_size=0))
++    finally:
++        reader.close()
++
++
++@pytest.mark.parametrize('encoding', ['utf-8', 'utf-16le', 'utf-16be'])
++def test_page_decoder_streams_one_row_without_widening_whole_page(encoding):
++    import gc
++    import json
++    import tracemalloc
++
++    name = 'hermes_cli.kanban_replica_transport'
++    assert importlib.util.find_spec(name) is not None, 'bounded replica page decoder is missing'
++    transport = importlib.import_module(name)
++    row = ['owner', 'p/b/t', ('x' * 20000) + '\\"😀[]', 1000, 1, 1, 20000]
++    packed = json.dumps([row] * 100, ensure_ascii=False).encode(encoding)
++    gc.collect()
++    tracemalloc.start()
++    try:
++        count = 0
++        for decoded in transport.iter_page(packed, encoding):
++            assert decoded == tuple(row)
++            count += 1
++        current, peak = tracemalloc.get_traced_memory()
++    finally:
++        tracemalloc.stop()
++    assert count == 100
++    assert peak < 400_000, (current, peak)
++
++
++def test_refetch_transport_has_one_page_peak(tmp_path):
++    import gc
++    import tracemalloc
++    path = tmp_path / 'refetch.db'
++    payload = 'x' * 20000 + '😀'
++    with sqlite3.connect(path) as conn:
++        conn.execute('CREATE TABLE replica (gw, coll, key, data, updated_at, version, seq)')
++        identities = [('owner', f'p/b/t_{i}') for i in range(100)]
++        conn.executemany('INSERT INTO replica VALUES (?,?,?,?,?,?,?)',
++                         [(gw, 'tasks', key, payload, 1000, 1, i)
++                          for i, (gw, key) in enumerate(identities)])
++        fetch = _relevance().fetch_payloads
++        gc.collect()
++        tracemalloc.start()
++        try:
++            count = sum(1 for _ in fetch(conn, identities, 'version'))
++            _, peak = tracemalloc.get_traced_memory()
++        finally:
++            tracemalloc.stop()
++    assert count == 100
++    assert peak < 1.25 * 100 * len(payload.encode()), peak
++
++
++def test_cold_row_transport_has_one_page_peak(tmp_path):
++    import gc
++    import json
++    import tracemalloc
++    from hermes_cli import kanban_replica_rows as rows
++
++    path = tmp_path / 'pages.db'
++    payload = json.dumps({'body': 'x' * 20000 + '😀'}, ensure_ascii=False)
++    with sqlite3.connect(path) as conn:
++        conn.execute('CREATE TABLE replica (gw, coll, key, data, updated_at, version, seq)')
++        conn.executemany('INSERT INTO replica VALUES (?, ?, ?, ?, ?, ?, ?)',
++                         [('owner', 'tasks', f'p/b/t_{i}', payload, 1000, 1, i) for i in range(200)])
++        probe = (200, 200, 199, 19900, 200, 200 * len(payload.encode()))
++        page_bytes = rows.page_rows(probe) * len(payload.encode())
++        gc.collect()
++        tracemalloc.start()
++        try:
++            count = sum(1 for _ in rows._paged(conn, rows._FULL_SQL.format(version='version'), probe))
++            current, peak = tracemalloc.get_traced_memory()
++        finally:
++            tracemalloc.stop()
++    assert count == 200
++    assert peak < 1.25 * page_bytes, (current, peak, page_bytes)
++
++
++def test_snapshot_reader_retains_only_scalars_for_bystanders(tmp_path):
++    import gc
++    import json
++    import tracemalloc
++    from hermes_cli import kanban_replica_rows as rows
++    from tests.hermes_cli.test_kanban_replica_read_memo import card
++
++    path = tmp_path / 'scalars.db'
++    with sqlite3.connect(path) as conn:
++        conn.execute('CREATE TABLE replica (gw, coll, key, data, updated_at, version, seq)')
++        for i in range(2020):
++            task = card(f't_{i}', body='x' * 20000)
++            task['sessions'] = [{'gw': 'mini' if i < 20 else 'elsewhere'}]
++            conn.execute('INSERT INTO replica VALUES (?,?,?,?,?,?,?)',
++                         ('owner', 'tasks', f'work/build/t_{i}', json.dumps(task), 1000000, 1, i + 1))
++        probe = conn.execute("SELECT count(*),count(seq),max(seq),total(seq),total(version),"
++                             "total(octet_length(data)) FROM replica").fetchone()
++        rows.reset()
++        gc.collect()
++        tracemalloc.start()
++        try:
++            snapshot = rows.read(conn, path, 'version', probe, rows.file_ident(path), me='mini')
++            view = snapshot.consume()
++            gc.collect()
++            current, peak = tracemalloc.get_traced_memory()
++        finally:
++            tracemalloc.stop()
++        assert len(view.bystanders) == 2000
++        assert len(view.relevant) == 20
++        assert len(view.by_key) == 2020
++        assert all(row[2] == b'' for rk, row in view.by_key.items() if rk in view.bystanders)
++        assert current < 400 * 2000 + 100_000, (current, peak)
++        assert peak < current + 1.25 * rows.page_rows(probe) * (probe[5] / probe[0]), (current, peak)
++        assert snapshot.conn is None
++        with pytest.raises(RuntimeError, match='consumed'):
++            snapshot.consume()
++    rows.reset()
++
++
++def test_live_projection_bystander_retention_is_below_400_bytes_each(hub, monkeypatch):
++    import gc
++    import json
++    import tracemalloc
++    from hermes_cli import kanban_session_activity as activity
++    from hermes_cli import kanban_replica_projection as projection
++    from hermes_cli import kanban_replica_rows as rows
++    from tests.hermes_cli.test_kanban_replica_rows_memory import _task
++
++    path, _, statements, _ = hub
++    traced_open = activity._open_ro
++    def untraced_open(*args, **kwargs):
++        conn = traced_open(*args, **kwargs)
++        conn.set_trace_callback(None)
++        return conn
++    monkeypatch.setattr(activity, '_open_ro', untraced_open)
++    def measure():
++        statements.clear()
++        gc.collect()
++        tracemalloc.start()
++        try:
++            cards = activity._read_remote_links(path)
++            statements.clear()  # observer SQL strings are not replica state
++            gc.collect()
++            retained, peak = tracemalloc.get_traced_memory()
++        finally:
++            tracemalloc.stop()
++        return retained, peak, len(cards)
++
++    with sqlite3.connect(path) as conn:
++        for i in range(20):
++            conn.execute("INSERT INTO replica VALUES (?,'tasks',?,1,?,?,1000000)",
++                         ('owner', f'work/build/t_{i * 100}', i + 1, json.dumps(_task(i * 100))))
++    baseline, _, count = measure()
++    assert count == 20
++    activity._remote_read_memo = None
++    projection.reset()
++    rows.reset()
++    with sqlite3.connect(path) as conn:
++        for i in range(2000):
++            task = _task(i * 100 + 1)
++            conn.execute("INSERT INTO replica VALUES (?,'tasks',?,1,?,?,1000000)",
++                         ('owner', f"work/build/{task['id']}", i + 21, json.dumps(task)))
++    retained, peak, count = measure()
++    assert count == 20
++    assert retained - baseline < 400 * 2000, (retained, baseline, peak)
++    with sqlite3.connect(path) as conn:
++        probe = conn.execute(activity._REPLICA_PROBE).fetchone()
++    assert peak < retained + 1.25 * rows.page_rows(probe) * (probe[5] / probe[0]), (retained, peak)
++    view = rows._views[str(path)]
++    assert len(view.bystanders) == 2000
++    for state in projection._states.values():
++        assert not (state.stages.keys() & view.bystanders.keys())
++    shared = projection._shared.get(str(path), {})
++    assert all(isinstance(shared[rk], bytes) for rk in view.bystanders)
++    forbidden = {_task(i * 100 + 1)['body'] for i in range(2000)}
++    _assert_payload_unreachable((rows._views, projection._states, projection._shared,
++                                 activity._remote_read_memo), forbidden)
++
++
++def _assert_payload_unreachable(roots, forbidden):
++    import zlib
++    stack, seen = list(roots), set()
++    while stack:
++        value = stack.pop()
++        if id(value) in seen:
++            continue
++        seen.add(id(value))
++        if isinstance(value, str):
++            assert value not in forbidden
++        elif isinstance(value, bytes):
++            try:
++                text = zlib.decompress(value).decode('utf-8', 'surrogatepass')
++            except (zlib.error, UnicodeError):
++                continue
++            import json
++            assert json.loads(text).get('body') not in forbidden
++        elif isinstance(value, dict):
++            stack.extend(value.keys())
++            stack.extend(value.values())
++        elif isinstance(value, (tuple, list, set, frozenset)):
++            stack.extend(value)
++        elif type(value).__module__.startswith(('hermes_cli.', 'collections')):
++            stack.extend(vars(value).values() if hasattr(value, '__dict__') else ())
++            stack.extend(getattr(value, name) for name in getattr(type(value), '__slots__', ())
++                         if hasattr(value, name))
++
++
++def test_unfiltered_read_after_filtered_snapshot_restores_real_payloads(hub):
++    from hermes_cli import kanban_replica_rows as rows
++    from hermes_cli import kanban_session_activity as activity
++    path, put, _, _ = hub
++    put('t_one', sessions=[])
++    activity._read_remote_links(path)
++    with sqlite3.connect(path) as conn:
++        conn.execute('BEGIN')
++        probe = conn.execute(activity._REPLICA_PROBE).fetchone()
++        view = rows.read(conn, path, 'version', probe, rows.file_ident(path))
++        assert 't_one' in view.rows()[0][2]
++
++
++def test_alias_insert_and_delete_reclassify_unchanged_seq(hub):
++    import json
++    from hermes_cli import kanban_replica_rows as rows
++    from hermes_cli import kanban_session_activity as activity
++    from tests.hermes_cli.test_kanban_replica_read_memo import card, live_and_fresh
++    path, put, _, clock = hub
++    rk = ('owner', 'work/build/t_one')
++    from tests.hermes_cli.test_kanban_remote_terminal_release import observed
++    from tests.hermes_cli.test_kanban_replica_read_memo_heartbeat import set_info, ok
++    put('t_one', **{k: v for k, v in observed(card('t_one', sessions=[], created_at=10,
++                                                  status='done')).items() if k != 'id'})
++    set_info(path, [ok(1000.0)])
++    assert activity._read_remote_links(path) == []
++    assert rk in rows._views[str(path)].bystanders
++    with sqlite3.connect(path) as conn:
++        seq = conn.execute('SELECT seq FROM replica WHERE key=?', (rk[1],)).fetchone()[0]
++        conn.execute("INSERT INTO replica VALUES ('owner','tasks','build/t_one',1,102,?,1000000)",
++                     (json.dumps({k: v for k, v in card('t_one', status='done', created_at=10).items()
++                                  if k not in ('gateway', 'profile')}),))
++    live, full, owners, full_owners = live_and_fresh(path, clock)
++    assert live == full and owners == full_owners
++    assert [(c['key'], c['legacy_key'], c['released']) for c in live] == [
++        ('owner/work/build/t_one', 'owner/build/t_one', True)]
++    assert rk in rows._views[str(path)].relevant
++    with sqlite3.connect(path) as conn:
++        assert conn.execute('SELECT seq FROM replica WHERE key=?', (rk[1],)).fetchone()[0] == seq
++        conn.execute("DELETE FROM replica WHERE key='build/t_one'")
++    live, full, owners, full_owners = live_and_fresh(path, clock)
++    assert live == full == [] and owners == full_owners
++    assert rk in rows._views[str(path)].bystanders
++
++
++def test_scalar_closed_membership_does_not_stringify_identity_parts():
++    import marshal
++    from hermes_cli.kanban_replica_aggregates import EvidenceSet
++    packed = marshal.dumps((1, 1, 1, 1000, 10, b'digest', 3))
++    closed = EvidenceSet((), {('owner', 'None/build/t_one'): packed}, 'closed', False,
++                         frozenset({('owner', 'None', 'build')}))
++    assert ('owner', 'None', 'build', 't_one') in closed
++    assert ('owner', None, 'build', 't_one') not in closed
++
++
++def test_filtered_rows_raw_access_is_explicitly_rejected(hub):
++    from hermes_cli import kanban_replica_rows as rows
++    from hermes_cli import kanban_session_activity as activity
++    path, put, _, _ = hub
++    put('t_one', sessions=[])
++    activity._read_remote_links(path)
++    with pytest.raises(RuntimeError, match='snapshot'):
++        rows._views[str(path)].rows()
++
++
++def test_unchanged_relevant_rows_are_not_decoded_again(hub, monkeypatch):
++    from hermes_cli import kanban_replica_scalar_rows as scalar
++    from hermes_cli import kanban_session_activity as activity
++    path, put, _, _ = hub
++    put('t_one')
++    assert len(activity._read_remote_links(path)) == 1
++    original = scalar.derive
++    decoded = []
++    def tracked(raw, *args):
++        decoded.append(raw[1])
++        return original(raw, *args)
++    monkeypatch.setattr(scalar, 'derive', tracked)
++    put('t_two', sessions=[])
++    assert len(activity._read_remote_links(path)) == 1
++    assert decoded == ['work/build/t_two']
++
++
++def test_last_link_demotion_releases_all_profiles_payloads(hub, monkeypatch):
++    from hermes_cli import kanban_replica_projection as projection
++    from hermes_cli import kanban_replica_rows as rows
++    from hermes_cli import kanban_session_activity as activity
++    path, put, _, _ = hub
++    rk = ('owner', 'work/build/t_one')
++    put('t_one', body='payload-sentinel' * 2000)
++    for profile in ('default', 'other'):
++        monkeypatch.setattr('hermes_cli.profiles.get_active_profile_name', lambda: profile)
++        activity._read_remote_links(path)
++    put('t_one', sessions=[], body='payload-sentinel' * 2000)
++    assert activity._read_remote_links(path) == []
++    assert rk in rows._views[str(path)].bystanders
++    assert all(rk not in state.stages for state in projection._states.values())
++
++
++def test_legacy_reader_borrows_closed_and_bulk_resolves_publications(hub, monkeypatch):
++    from hermes_cli import kanban_session_activity as activity
++    from hermes_cli import kanban_replica_aggregates as aggregates
++    path, put, _, _ = hub
++    put('t_one', sessions=[], created_at=10)
++    activity._read_remote_links(path)
++    monkeypatch.setattr(activity, '_hub_db_path', lambda: path)
++    monkeypatch.setattr(activity, '_remote_snapshot', lambda *args: [])
++    def no_scan(*args):
++        pytest.fail('remembered-card path scanned an all-row aggregate')
++    monkeypatch.setattr(aggregates.EvidenceSet, '__iter__', no_scan)
++    monkeypatch.setattr(aggregates.Published, '__getitem__', no_scan)
++    activity._remote_last = [{'id': 't_one', 'key': 'other/work/build/t_one', 'gateway': 'other',
++                              'profile': 'work', 'owner_profile': 'work', 'board': 'build',
++                              'session': 's1', 'created_at': 10, 'ownership_state': 'qualified'}]
++    activity._remote_scope = activity._origin_scope()
++    activity._legacy_remote_links()
++
++
++@pytest.mark.parametrize('outcome', ['closed', 'moved', 'same-gateway-profile'])
++def test_remembered_bystander_retirement_matches_full_reader(hub, monkeypatch, outcome):
++    import json
++    from hermes_cli import kanban_session_activity as activity
++    from tests.hermes_cli.test_kanban_replica_read_memo import card
++    from tests.hermes_cli.test_kanban_remote_terminal_release import observed
++    from tests.hermes_cli.test_kanban_replica_read_memo_heartbeat import set_info, ok
++    path, put, _, clock = hub
++    monkeypatch.setattr(activity, '_hub_db_path', lambda: path)
++    monkeypatch.setattr(activity, '_remote_snapshot', lambda *args: [])
++    put('t_one', created_at=10)
++    previous = activity._legacy_remote_links()
++    assert len(previous) == 1
++    set_info(path, [ok(1000.0)])
++    target_gw = 'elsewhere' if outcome == 'moved' else 'owner'
++    profile = 'new' if outcome == 'same-gateway-profile' else 'work'
++    task = card('t_one', gateway=target_gw, profile=profile, sessions=[], created_at=10,
++                status='done' if outcome == 'closed' else 'running')
++    task = observed(task)
++    task['origin_observation']['verified'] = True
++    with sqlite3.connect(path) as conn:
++        conn.execute("DELETE FROM replica WHERE coll='tasks'")
++        conn.execute("INSERT INTO replica VALUES (?,'tasks',?,2,103,?,1000000)",
++                     (target_gw, f'{profile}/build/t_one', json.dumps(task)))
++    scope = activity._origin_scope()
++    activity._remote_last, activity._remote_scope = previous, scope
++    live = activity._legacy_remote_links()
++    original = activity._read_remote_links
++    def full(path, **kwargs):
++        return original(path, now=clock['now'], **kwargs)
++    monkeypatch.setattr(activity, '_read_remote_links', full)
++    activity._remote_last, activity._remote_scope = previous, scope
++    explicit = activity._legacy_remote_links()
++    assert live == explicit
++    assert len(live) == (1 if outcome == 'same-gateway-profile' else 0)
++
++
+-- 
+2.43.0
+

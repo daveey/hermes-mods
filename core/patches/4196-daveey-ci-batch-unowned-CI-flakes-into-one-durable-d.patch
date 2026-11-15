@@ -1,0 +1,2999 @@
+From 15c81a3cb28172b1aabe00a3e3c3b26c41d0f347 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 05:24:10 +0000
+Subject: [PATCH] [daveey] ci: batch unowned CI flakes into one durable daily
+ intake card
+
+Why: on 2026-11-13 UTC the ci-flaky-cards producer created 35 cards (one per
+first flake of each test id) and the cards spent 146 runs / 13.0 clipped
+worker slot-hours (hub task_runs query, created_by=ci-flaky-cards). Card
+fan-out per test id, not the fixes themselves, drives the cost.
+
+What: new UNOWNED flake occurrences go into a durable SQLite queue
+(<state>.intake.sqlite3) with full provenance. Each repo gets ONE intake card
+per UTC day (idempotency key ci-flaky-intake:<owner/repo>:<YYYY-MM-DD>), and
+immutable, size-bounded JSON manifest pages give every occurrence a
+needs_triage status. Existing open exact-test/job owners, local or foreign,
+still get deduplicated comments with readback. They are never reassigned or
+archived. This is admission batching only: the red-main, retry, grace and
+threshold policy is unchanged.
+
+Durability: the queue needs an explicit one-time --initialize-intake, with a
+SQLite UUID plus a separately retained identity anchor. Normal runs never
+auto-create the queue, so losing or replacing it fails closed. Pages are
+committed before any external write, ambiguous create/comment attempts stay
+immutable, and an exact readback decides delivery. FIFO tickets rotate
+retries fairly. A drain runs before discovery with half the budget. HTTP has
+an absolute deadline across retries, pagination and signed artifact hops.
+A done intake is reopened. An archived intake carries forward to the next UTC
+day. Closed-foreign-owner history is used only when the replica's comment
+count is complete and nothing is clipped. A clipped closed candidate no
+longer strands the row: the row is admitted with an owner_check entry that
+names the candidate for triage.
+
+Ownership coverage contract (docs/ci-flaky-intake.md): no-match absence is
+checked against this board plus fresh hub-replica scopes. That is not a
+global certificate; unsynced legacy profile boards are not inventoried
+(same exposure as the baseline create-overlap guard). The intake card owns
+final dedupe.
+
+Proof:
+- Spec cases (CLI, isolated HOME/HERMES_HOME, fake Board/hub effects):
+  30 distinct occurrences => 1 card + 30 durable rows; same-run replay =>
+  no duplicate; existing local/foreign owner => comment+readback; failed
+  delivery stays retryable; UTC rollover; state loss/recovery; pagination
+  keeps counts; closed intake reopens or carries forward.
+- Historical replay (read-only capture of the metadata artifacts for all 32
+  source runs behind the 35 cards created 2026-11-13; 35 occurrences, 34
+  tests): baseline file_cards => 34 new cards; this change => 1 intake card,
+  35 durable+delivered rows, no duplicates after full replay (also via 32
+  real CLI invocations). Cohort = sources of Nov13-created cards, not every
+  flake that day. No slot-hour savings claimed until measured live.
+- RED->GREEN and behavioral mutants for each fix are recorded on Kanban
+  t_01a1d7718abcfb81 (e.g. dropping owner_check notes or re-stranding clipped
+  closed candidates fails 11 tests).
+
+Journal mode retires a stored run whose data stays unavailable once a
+successful listing no longer includes it and it has reached the FAILED
+threshold: one terminal "FAILED ... retired=unlisted" line, then complete.
+A failed listing never retires. (Review t_01a1d88fc18f9c02 blocker.)
+
+Rollback: revert this commit. The old per-test producer ignores the queue
+file. Keep <state>.intake.sqlite3 and its identity anchor until every
+undelivered row has an owner (see docs/ci-flaky-intake.md for backlog export).
+---
+ docs/ci-flaky-intake.md                    | 150 ++++++
+ scripts/ci/flaky_artifact.py               |  16 +-
+ scripts/ci/flaky_artifact_poll.py          |   6 +-
+ scripts/ci/flaky_http.py                   |  59 +++
+ scripts/ci/flaky_intake.py                 | 383 ++++++++++++++
+ scripts/ci/flaky_kanban.py                 | 373 +++++++++++--
+ tests/ci/test_flaky_artifact_poll.py       |   5 +-
+ tests/ci/test_flaky_daily_intake_cli.py    | 158 ++++++
+ tests/ci/test_flaky_exit_policy.py         |  14 +-
+ tests/ci/test_flaky_http_deadlines.py      | 149 ++++++
+ tests/ci/test_flaky_intake.py              | 589 +++++++++++++++++++++
+ tests/ci/test_flaky_intake_fairness.py     | 220 ++++++++
+ tests/ci/test_flaky_intake_freshness.py    | 139 +++++
+ tests/ci/test_flaky_intake_recovery.py     |  65 +++
+ tests/ci/test_flaky_kanban_github_retry.py |   7 +-
+ tests/ci/test_flaky_kanban_overlap.py      |  17 +-
+ tests/ci/test_flaky_poll_budget.py         |   7 +-
+ tests/ci/test_flaky_protocol_boundaries.py |   7 +-
+ tests/ci/test_flaky_run_retirement.py      |  97 ++++
+ 19 files changed, 2403 insertions(+), 58 deletions(-)
+ create mode 100644 docs/ci-flaky-intake.md
+ create mode 100644 scripts/ci/flaky_http.py
+ create mode 100644 scripts/ci/flaky_intake.py
+ create mode 100644 tests/ci/test_flaky_daily_intake_cli.py
+ create mode 100644 tests/ci/test_flaky_http_deadlines.py
+ create mode 100644 tests/ci/test_flaky_intake.py
+ create mode 100644 tests/ci/test_flaky_intake_fairness.py
+ create mode 100644 tests/ci/test_flaky_intake_freshness.py
+ create mode 100644 tests/ci/test_flaky_intake_recovery.py
+ create mode 100644 tests/ci/test_flaky_run_retirement.py
+
+diff --git a/docs/ci-flaky-intake.md b/docs/ci-flaky-intake.md
+new file mode 100644
+index 0000000000..b10d2d75eb
+--- /dev/null
++++ b/docs/ci-flaky-intake.md
+@@ -0,0 +1,150 @@
++# Daily CI flake intake
++
++The producer retains metadata-only occurrences in a SQLite journal beside its JSON cursor:
++`ci-flaky-cards.json` → `ci-flaky-cards.intake.sqlite3`. The journal, not the bounded cursor
++or the card thread, is backlog truth. Its sibling `.intake.lock` serializes producers and
++contains an initialization marker. Production additionally requires a UUID stored in SQLite
++and in a separately retained identity anchor. Never delete these files to reset a stuck poll.
++
++## One-time bootstrap
++
++Before deploying the new producer, run the new script once with the existing cursor path:
++
++```sh
++python scripts/ci/flaky_kanban.py --state /absolute/path/ci-flaky-cards.json --initialize-intake
++```
++
++This only initializes the journal; it never polls or calls Board. A legacy JSON cursor is
++preserved. Existing queue/anchor/initialized-lock state refuses initialization. Normal polling
++never auto-creates a journal, even if every state file has disappeared. By default the anchor
++lives under `$HERMES_HOME/intake-identities/<sha256-of-absolute-queue-path>.uuid`
++(`~/.hermes` when HERMES_HOME is unset), separately from the queue directory. An explicit
++`--intake-identity /independently/retained/path.uuid` overrides it and must be passed on every
++poll. Back up that anchor independently and retain its configured path. Moving the queue
++changes the default anchor key; pass the original explicit anchor rather than reinitializing.
++A crash during bootstrap can leave partial state: stop and reconcile the files, never blindly
++rerun initialization or delete evidence. The deployment owner must finish bootstrap before
++claiming the naturally scheduled producer is working.
++
++New unowned occurrences are grouped under
++`ci-flaky-intake:<owner/repo>:<UTC-observation-day>`. Existing exact-test/job owners retain
++ownership; confirmed owner comments do not create intake duplicates. Matching foreign and
++cached foreign owners require their canonical gateway/profile/board scope heartbeat to be
++fresh (the shared scope-heartbeat helper honors the owner's published collection period).
++Missing, stale, future, ambiguous or unknown proof leaves the occurrence queued for retry;
++no sleeping Mac is woken to satisfy this check. Individual task timestamps are not liveness.
++A closed foreign owner with a visible exact-job citation owns that occurrence (skipped, as
++before). Foreign candidates use the same precedence as local discovery: open exact-job owner,
++closed exact-job owner, then open exact-test owner. Candidate ordering in the replica cannot
++change that precedence; equal ranks use the stable owner reference. An unreadable or stale
++matching candidate never establishes absence and cannot hide a known positive owner elsewhere;
++with no positive owner the occurrence stays queued for retry.
++
++**Ownership coverage contract (no-match).** Admission inventories this board plus every
++hermes-hub replica card on a fresh scope. That is not a certificate of global absence: the
++replica clips titles/bodies/comments, and unsynced legacy profile boards (for example
++per-profile `bb-tuner`/`ci-sweeper` boards, MacBook-only boards) are not inventoried. The
++baseline per-test producer had the same exposure through the create-overlap guard. A
++no-match occurrence is therefore admitted to the daily intake rather than held, and the intake
++card owns final deduplication during triage. A closed foreign candidate whose history is
++incomplete (published total differs from the visible tail, or any field is at the clipping
++limit) cannot prove it never cited this job; holding the row would strand every recurrence of a
++test whose old card is closed with more than three comments. Such rows are admitted with an
++`owner_check` list naming each candidate (`candidate`, `status`,
++`reason=closed_history_incomplete`) so triage checks them first. The worst case is a
++duplicate triage row, never a dropped occurrence. To revert to holding these rows, restore
++the `RuntimeError("closed foreign owner history unavailable")` branch in `_foreign_owner`.
++
++Intake manifest pages
++are bounded to 6000 UTF-8 bytes and contain `needs_triage` status and run/attempt/job/test/SHA
++provenance. A page is marked delivered only after exact content readback. Delivery does not
++mean a test is fixed: the intake worker records per-test dispositions and named follow-up
++owners, grouping related fixes rather than automatically creating one card per test.
++
++Unattempted pages are rechecked against exact owners before each drain. Once create or
++comment delivery has been attempted, the page remains immutable so an ambiguous response
++cannot change its replay identity. A definitive `create_overlap` refusal is different:
++read back every named match, route exact-test owners through the existing owner path, and
++retry unrelated matches only with supported `distinct_from` evidence. A refusal after an
++earlier ambiguous attempt cannot dissolve that earlier page. Unreadable overlap matches
++remain retryable, never an excuse to declare unknown work distinct. The shared polling budget also stops starting new owner
++resolutions and page deliveries; deferred rows remain durable and the poll reports failure.
++Board/courier operations already started may still consume their existing transport timeout.
++Before GitHub discovery, a drain gets half the invocation budget and checkpoints the JSON
++cursor; a slow discovery cannot prevent already queued delivery on every invocation.
++Within a drain, ownership resolution delivers each admitted occurrence immediately in a
++bounded one-occurrence page. Half the drain window is reserved for prior attempted pages.
++Durable FIFO tickets are assigned transactionally when occurrences, pages and run attempts
++are enqueued. Replay preserves the original ticket; attempts rotate to the tail before external
++calls, surviving process death. Older unscheduled rows are backfilled on journal open before
++new admission, and recreated pages receive a new ticket even when SQLite reuses a deleted ID.
++Thus sustained new arrivals cannot perpetually outrank an already-enqueued retry. Actual failed
++run observations have durable persistence counts, so rotation does not reset the red-CI threshold.
++GitHub discovery, retry backoff and both artifact download hops share the poll's absolute
++monotonic deadline. Each HTTP read additionally has a 60-second cap. The existing socket-owning
++transfer primitive cancels trickling headers/body, proxy CONNECT and TLS handshake at expiry;
++an idle socket timeout alone is insufficient. DNS itself cannot be interrupted, but a connection
++finishing after expiry is closed before credentials can be sent. Transport errors retain fixed
++diagnostics and retryable descriptors. GitHub JSON responses are capped at 16 MiB; oversized
++responses fail closed rather than advancing the cursor.
++Run descriptors retain branch/workflow identity for supersession, with bounded metadata
++validation. Malformed report input fails with a fixed diagnostic, not raw payload output.
++
++A done intake is reopened through the supported Board command. An archived intake is not
++reopened or replaced on the same day: undelivered occurrences retain their original observed
++day and move to the next day's intake. Until then they remain visible as pending. No retry
++threshold, cadence, red-main handling or self-heal policy changes are part of batching.
++
++Run attempts are replayed from the journal, so a run whose artifact is permanently
++unavailable (expired, invalid, missing) would otherwise log `FAILED` on every poll. Once a
++successful GitHub listing no longer includes such a run and it has reached the usual
++`FAILED` threshold, it is retired with one terminal
++`FAILED run=<k> code=<c> polls=<n> retired=unlisted` line and marked complete, matching the
++per-test producer, which dropped runs that left the lookback listing. A failed listing never
++retires anything, and a still-listed run stays `FAILED` until its data becomes readable.
++Retired runs remain queryable with `SELECT repo,key FROM runs WHERE complete=1`.
++
++## Read-only backlog and export
++
++On the producer host, set `QUEUE` to the journal's absolute path. Inspect with SQLite in
++read-only mode (do not point these examples at the Kanban database):
++
++```sh
++sqlite3 -readonly "$QUEUE" 'SELECT repo,day,target_day,delivered,count(*) FROM occurrences GROUP BY repo,day,target_day,delivered ORDER BY repo,day;'
++sqlite3 -readonly "$QUEUE" 'SELECT repo,key FROM runs WHERE complete=0 ORDER BY repo,key;'
++sqlite3 -readonly "$QUEUE" 'SELECT id,repo,day,card FROM pages WHERE delivered=0 ORDER BY id;'
++sqlite3 -readonly -json "$QUEUE" 'SELECT id,repo,identity,day,target_day,metadata,delivered,owner,page FROM occurrences ORDER BY id;' > intake-occurrences.json
++```
++
++The JSON export contains metadata, never failure output. Keep exports private with the
++producer state. Count exported rows and compare with `SELECT count(*) FROM occurrences`.
++Use SQLite's online backup API or `.backup` for a consistent whole-journal backup; copying
++an active database file alone is not a consistent backup. Preserve the lock marker with the
++backup, but never replace an actively held lock inode.
++
++## Recovery and rollback
++
++Loss of only the JSON cursor is replay-safe while the journal remains intact. Missing or
++corrupt journal state must not be treated as an empty queue. Missing queue or anchor and a
++mismatched database UUID fail closed before polling or delivery. This detects replacement by
++a different valid journal, not rollback to an older backup of the same journal. Restore a
++consistent backup with the matching independently retained anchor while the producer is not
++running (never replace an actively held lock inode). Verify `SELECT uuid FROM journal_identity`
++against the anchor. Reconcile all later source artifacts and exact delivery receipts before
++resuming: a matching UUID does not prove the backup is current. Bounded card threads cannot
++reconstruct undispatched occurrences. Do not claim recovery when source evidence is unavailable.
++
++Before rollback, capture a consistent backup and export all pending run descriptors,
++occurrences and pages. Reverting admission code alone does not drain the queue and can
++abandon pending work. Keep a named owner responsible for draining/reconciling that snapshot
++through the intake implementation, or transfer each pending occurrence with readback before
++retiring it. Do not delete the journal, archive existing exact-test owners or reset cursor
++history as a rollback shortcut.
++
++## Release verification
++
++Local fixture cardinality proves batching, not production savings. Record the reviewed head,
++required CI result, landed commit and deployed producer revision separately. Read back one
++natural intake and its corresponding queue/cursor records; never manufacture production
++flakes. If no natural occurrence arrives, leave that proof explicitly pending. Slot-hour
++reduction needs a subsequent measured window, not a projection from card counts.
+diff --git a/scripts/ci/flaky_artifact.py b/scripts/ci/flaky_artifact.py
+index 21cf260d54..74c4a99dff 100644
+--- a/scripts/ci/flaky_artifact.py
++++ b/scripts/ci/flaky_artifact.py
+@@ -35,6 +35,11 @@ from pathlib import Path
+ from typing import Any
+ from urllib.parse import urlsplit
+ 
++try:
++    from scripts.ci import flaky_http as transport
++except ImportError:  # direct scripts/ci entry point
++    import flaky_http as transport
++
+ VERSION = 1
+ MEMBER = "flaky-metadata.json"
+ ARTIFACT_PREFIX = "flaky-metadata-v1"
+@@ -258,12 +263,13 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
+ 
+ def _fetch(url: str, headers: dict[str, str], limit: int) -> tuple[int, str | None, bytes]:
+     """One HTTP GET without following redirects: ``(status, Location, body up to limit + 1 bytes)``."""
+-    opener = urllib.request.build_opener(_NoRedirect)
+     try:
+-        with opener.open(urllib.request.Request(url, headers=headers), timeout=60) as resp:
+-            return resp.status, resp.headers.get("Location"), resp.read(limit + 1)
++        return transport.read(urllib.request.Request(url, headers=headers), limit, _NoRedirect())
+     except urllib.error.HTTPError as exc:
+-        return exc.code, exc.headers.get("Location") if exc.headers else None, b""
++        try:
++            return exc.code, exc.headers.get("Location") if exc.headers else None, b""
++        finally:
++            exc.close()
+ 
+ 
+ def _signed_url_ok(url: Any) -> bool:
+@@ -286,11 +292,13 @@ def download_zip(repo: str, artifact_id: int, token: str) -> bytes:
+     headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "hermes-ci-flaky-cards"}
+     try:
++        transport.remaining()
+         status, location, _ = _fetch(api_url, headers, 0)
+         if status == 410:
+             raise ArtifactError("expired")
+         if status not in (301, 302, 303, 307, 308) or location is None or not _signed_url_ok(location):
+             raise ArtifactError("download_unavailable")
++        transport.remaining()
+         status, _, body = _fetch(location, {"User-Agent": "hermes-ci-flaky-cards"}, MAX_ZIP)
+     except (OSError, ValueError, http.client.HTTPException):
+         raise ArtifactError("download_unavailable") from None
+diff --git a/scripts/ci/flaky_artifact_poll.py b/scripts/ci/flaky_artifact_poll.py
+index f35ee190d4..6633929b12 100644
+--- a/scripts/ci/flaky_artifact_poll.py
++++ b/scripts/ci/flaky_artifact_poll.py
+@@ -184,8 +184,10 @@ def _artifact_id(artifacts: list[dict[str, Any]], name: str) -> int:
+     return live[0]["id"]
+ 
+ 
+-def _entries(meta: dict[str, Any]) -> list[dict[str, str]]:
+-    return [{"test_id": e["test_id"], "retried": e["retried"], "first_attempt_excerpt": ""} for e in meta["flaky"]]
++def _entries(meta: dict[str, Any]) -> list[dict[str, Any]]:
++    provenance = {k: meta[k] for k in ("run_attempt", "source_sha", "slice", "slices")}
++    return [{"test_id": e["test_id"], "retried": e["retried"], "first_attempt_excerpt": "", **provenance}
++            for e in meta["flaky"]]
+ 
+ 
+ def assess_run(repo: str, run: dict[str, Any], fetch: FetchJson, token: str) -> RunResult:
+diff --git a/scripts/ci/flaky_http.py b/scripts/ci/flaky_http.py
+new file mode 100644
+index 0000000000..d854dd31c5
+--- /dev/null
++++ b/scripts/ci/flaky_http.py
+@@ -0,0 +1,59 @@
++"""Shared absolute read deadline for CI discovery and metadata downloads."""
++from __future__ import annotations
++
++from contextlib import contextmanager
++from contextvars import ContextVar
++from functools import wraps
++from pathlib import Path
++import sys
++import time
++import urllib.request
++
++# Direct CLI execution starts with scripts/ci on sys.path, not the repository root.
++try:
++    from hermes_cli.kanban_sync_attachment_deadline import Transfer
++except ModuleNotFoundError:
++    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
++    from hermes_cli.kanban_sync_attachment_deadline import Transfer
++
++_deadline: ContextVar[float | None] = ContextVar("ci_http_deadline", default=None)
++
++
++@contextmanager
++def deadline_scope(deadline: float | None):
++    outer = _deadline.get()
++    effective = outer if deadline is None else deadline if outer is None else min(outer, deadline)
++    token = _deadline.set(effective)
++    try:
++        yield
++    finally:
++        _deadline.reset(token)
++
++
++def scoped_poll(fn):
++    @wraps(fn)
++    def wrapped(*args, **kwargs):
++        with deadline_scope(kwargs.get("deadline")):
++            return fn(*args, **kwargs)
++    return wrapped
++
++
++def remaining(cap: float = 60.0) -> float:
++    deadline = _deadline.get()
++    budget = cap if deadline is None else min(cap, deadline - time.monotonic())
++    if budget <= 0:
++        raise TimeoutError("CI read deadline exceeded")
++    return budget
++
++
++def read(request, limit: int, *handlers):
++    budget = remaining()
++    transfer = Transfer(budget)
++
++    def operation():
++        opener = urllib.request.build_opener(*handlers, *transfer.handlers())
++        with opener.open(request, timeout=budget) as response:
++            body = response.read(limit + 1)
++            return response.status, response.headers.get("Location"), body
++
++    return transfer.run(operation)
+diff --git a/scripts/ci/flaky_intake.py b/scripts/ci/flaky_intake.py
+new file mode 100644
+index 0000000000..4ec94966f7
+--- /dev/null
++++ b/scripts/ci/flaky_intake.py
+@@ -0,0 +1,383 @@
++"""Durable metadata-only occurrence journal and bounded daily intake delivery.
++
++The caller holds the journal lock for discovery, delivery and cursor checkpointing.
++SQLite is the backlog truth; the bounded JSON polling cache is expendable.
++"""
++from __future__ import annotations
++
++import datetime as dt
++
++import hashlib
++import json
++import os
++import sqlite3
++import subprocess
++import time
++import uuid
++from pathlib import Path
++from typing import Any
++
++try:
++    from scripts.ci import flaky_artifact as fa
++except ImportError:
++    import flaky_artifact as fa  # type: ignore[no-redef]
++
++PAGE_BYTES = 6000
++
++
++def utc_day() -> str:
++    return time.strftime("%Y-%m-%d", time.gmtime())
++
++
++def occurrence_metadata(entry: dict, run: dict, job: int) -> dict:
++    """Allowlisted, validated metadata only; never persist failure output."""
++    if not isinstance(entry, dict):
++        raise ValueError("invalid intake metadata")
++    meta = {"test_id": entry.get("test_id"), "retried": entry.get("retried", "tests"),
++            "run_id": run.get("id"), "run_attempt": entry.get("run_attempt", run.get("run_attempt", 1)),
++            "job_id": job, "head_sha": run.get("head_sha")}
++    if (not isinstance(meta["test_id"], str)
++            or fa.canonical_test_id(meta["test_id"]) != meta["test_id"]
++            or not isinstance(meta["retried"], str) or meta["retried"] not in fa.RETRIED
++            or not all(fa._int_in(meta[k], 1, fa.MAX_INT) for k in ("run_id", "run_attempt", "job_id"))
++            or not isinstance(meta["head_sha"], str) or not fa._SHA.fullmatch(meta["head_sha"])):
++        raise ValueError("invalid intake metadata")
++    if "source_sha" in entry:
++        if not isinstance(entry["source_sha"], str) or not fa._SHA.fullmatch(entry["source_sha"]):
++            raise ValueError("invalid intake metadata")
++        meta["source_sha"] = entry["source_sha"]
++    if "slice" in entry or "slices" in entry:
++        if not all(fa._int_in(entry.get(k), 1, fa.MAX_SLICES) for k in ("slice", "slices")):
++            raise ValueError("invalid intake metadata")
++        if entry["slice"] > entry["slices"]:
++            raise ValueError("invalid intake metadata")
++        meta.update(slice=entry["slice"], slices=entry["slices"])
++    return meta
++
++
++def run_metadata(run: dict) -> dict:
++    """Bound descriptor values while retaining branch/workflow supersession identity."""
++    if not isinstance(run, dict) or not fa._int_in(run.get("id"), 1, fa.MAX_INT):
++        raise ValueError("invalid intake run")
++    fields = ("id", "run_attempt", "head_sha", "workflow_id", "head_branch", "conclusion",
++              "run_started_at", "updated_at")
++    data = {k: run[k] for k in fields if k in run}
++    for key in ("run_attempt", "workflow_id"):
++        if key in data and not fa._int_in(data[key], 1, fa.MAX_INT):
++            raise ValueError("invalid intake run")
++    if not isinstance(data.get("head_sha"), str) or not fa._SHA.fullmatch(data["head_sha"]):
++        raise ValueError("invalid intake run")
++    branch = data.get("head_branch")
++    if "head_branch" in data and (not isinstance(branch, str) or not 1 <= len(branch) <= 255
++                                   or any(ord(c) < 32 or ord(c) == 127 for c in branch)):
++        raise ValueError("invalid intake run")
++    if "conclusion" in data and data["conclusion"] not in (
++        None, "success", "failure", "neutral", "cancelled", "skipped", "timed_out",
++        "action_required", "stale", "startup_failure",
++    ):
++        raise ValueError("invalid intake run")
++    for key in ("run_started_at", "updated_at"):
++        if key not in data:
++            continue
++        value = data[key]
++        if not isinstance(value, str) or len(value) != 20:
++            raise ValueError("invalid intake run")
++        try:
++            dt.datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
++        except ValueError:
++            raise ValueError("invalid intake run") from None
++    return data
++
++
++class Journal:
++    def __init__(self, path: Path, *, identity_path: Path | None = None, initialize: bool = False):
++        import fcntl
++
++        self.path = path.resolve()
++        self.path.parent.mkdir(parents=True, exist_ok=True)
++        self.lock = self.path.with_suffix(".lock").open("a+")
++        try:
++            fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
++            self.lock.seek(0)
++            initialized = bool(self.lock.read())
++            if identity_path is not None:
++                if initialize:
++                    if initialized or self.path.exists() or identity_path.exists():
++                        raise OSError("intake_already_initialized")
++                elif not self.path.is_file() or not identity_path.is_file():
++                    raise OSError("intake_identity_missing")
++            if initialized and (not self.path.is_file() or self.path.stat().st_size == 0):
++                raise OSError("intake_queue_missing")
++            self.db = sqlite3.connect(self.path)
++        except (OSError, sqlite3.Error):
++            self.lock.close()
++            raise
++        self.db.row_factory = sqlite3.Row
++        try:
++            if identity_path is not None and not initialize:
++                # Validate before schema migration or any discovery/delivery operation.
++                expected = identity_path.read_text(encoding="utf-8-sig").strip()
++                actual = self.db.execute("SELECT uuid FROM journal_identity").fetchall()
++                if (len(actual) != 1 or actual[0][0] != expected
++                        or str(uuid.UUID(expected)) != expected):
++                    raise ValueError("intake_identity_mismatch")
++            self._initialize()
++            if identity_path is not None and initialize:
++                identity = str(uuid.uuid4())
++                with self.db:
++                    self.db.execute("CREATE TABLE journal_identity (uuid TEXT NOT NULL)")
++                    self.db.execute("INSERT INTO journal_identity VALUES (?)", (identity,))
++                identity_path.parent.mkdir(parents=True, exist_ok=True)
++                # Exclusive creation: a partial bootstrap is never silently retried.
++                with identity_path.open("x", encoding="utf-8") as anchor:
++                    anchor.write(identity + "\n")
++                    anchor.flush()
++                    os.fsync(anchor.fileno())
++                for directory in {self.path.parent, identity_path.parent}:
++                    fd = os.open(directory, os.O_RDONLY)
++                    try:
++                        os.fsync(fd)
++                    finally:
++                        os.close(fd)
++            if not initialized:
++                self.lock.write("initialized\n")
++                self.lock.flush()
++                os.fsync(self.lock.fileno())
++        except (ValueError, OSError, sqlite3.Error):
++            self.close()
++            raise
++
++    def _initialize(self):
++        self.db.executescript("""
++            CREATE TABLE IF NOT EXISTS run_failures (
++                repo TEXT, key TEXT, polls INTEGER NOT NULL, PRIMARY KEY(repo,key));
++            CREATE TABLE IF NOT EXISTS scheduling (
++                repo TEXT, kind TEXT, item TEXT, ticket INTEGER NOT NULL,
++                PRIMARY KEY(repo,kind,item));
++            CREATE INDEX IF NOT EXISTS scheduling_ticket ON scheduling(ticket);
++            CREATE TABLE IF NOT EXISTS runs (
++                repo TEXT, key TEXT, descriptor TEXT NOT NULL, complete INTEGER NOT NULL DEFAULT 0,
++                PRIMARY KEY(repo,key));
++            CREATE TABLE IF NOT EXISTS occurrences (
++                id INTEGER PRIMARY KEY, repo TEXT NOT NULL, identity TEXT NOT NULL,
++                day TEXT NOT NULL, target_day TEXT NOT NULL, metadata TEXT NOT NULL,
++                delivered INTEGER NOT NULL DEFAULT 0, owner TEXT, page INTEGER,
++                UNIQUE(repo,identity));
++            CREATE TABLE IF NOT EXISTS pages (
++                id INTEGER PRIMARY KEY, repo TEXT NOT NULL, day TEXT NOT NULL,
++                payload TEXT NOT NULL, card TEXT, delivered INTEGER NOT NULL DEFAULT 0,
++                attempted INTEGER NOT NULL DEFAULT 0);
++        """)
++        columns = {r[1] for r in self.db.execute("PRAGMA table_info(pages)")}
++        if "attempted" not in columns:
++            # Pre-marker pages might already have escaped. Preserve them immutably.
++            self.db.execute("ALTER TABLE pages ADD COLUMN attempted INTEGER NOT NULL DEFAULT 1")
++            self.db.commit()
++
++        # Backfill older queues before admitting new work. Replay preserves tickets.
++        with self.db:
++            for kind, query in (
++                ("run", "SELECT repo,key FROM runs WHERE complete=0 ORDER BY rowid"),
++                ("occurrence", "SELECT repo,id FROM occurrences WHERE delivered=0 ORDER BY id"),
++                ("page", "SELECT repo,id FROM pages WHERE delivered=0 ORDER BY id"),
++            ):
++                for repo, item in self.db.execute(query).fetchall():
++                    self.enqueue(repo, kind, str(item))
++
++    def enqueue(self, repo: str, kind: str, item: str):
++        """Join the FIFO once, in the caller's insertion transaction."""
++        self.db.execute("INSERT INTO scheduling(repo,kind,item,ticket) "
++                        "SELECT ?,?,?,COALESCE(MAX(ticket),0)+1 FROM scheduling WHERE 1 "
++                        "ON CONFLICT(repo,kind,item) DO NOTHING", (repo, kind, str(item)))
++
++    def close(self):
++        self.db.close()
++        self.lock.close()
++
++    def remember_runs(self, repo: str, runs: list[dict]) -> list[dict]:
++        # Validation and writes share one transaction, including the whole listing.
++        with self.db:
++            for run in runs:
++                descriptor = run_metadata(run)
++                key = f"{run['id']}/{run.get('run_attempt', 1)}"
++                self.db.execute("INSERT INTO runs(repo,key,descriptor) VALUES(?,?,?) "
++                                "ON CONFLICT(repo,key) DO UPDATE SET descriptor=excluded.descriptor",
++                                (repo, key, json.dumps(descriptor)))
++                self.enqueue(repo, "run", key)
++        return [json.loads(r[0]) for r in self.db.execute(
++            "SELECT r.descriptor FROM runs r LEFT JOIN scheduling s ON "
++            "s.repo=r.repo AND s.kind='run' AND s.item=r.key WHERE r.repo=? AND r.complete=0 "
++            "ORDER BY COALESCE(s.ticket,0),r.key", (repo,))]
++
++    def note_unavailable(self, repo: str, key: str) -> int:
++        # Count actual failed observations, not invocations skipped by fair rotation.
++        with self.db:
++            return self.db.execute("INSERT INTO run_failures VALUES (?,?,1) "
++                                   "ON CONFLICT(repo,key) DO UPDATE SET polls=polls+1 RETURNING polls",
++                                   (repo, key)).fetchone()[0]
++
++    def finish_run(self, repo: str, key: str):
++        with self.db:
++            self.db.execute("UPDATE runs SET complete=1 WHERE repo=? AND key=?", (repo, key))
++            self.db.execute("DELETE FROM run_failures WHERE repo=? AND key=?", (repo, key))
++
++    def record(self, repo: str, jobs: list[tuple[int, list[dict]]], run: dict):
++        if not isinstance(repo, str) or not fa._REPO.fullmatch(repo):
++            raise ValueError("invalid intake metadata")
++        day = utc_day()
++        with self.db:
++            for job, entries in jobs:
++                for entry in entries:
++                    meta = occurrence_metadata(entry, run, job)
++                    identity = json.dumps([meta[k] for k in ("run_id", "run_attempt", "job_id", "test_id")])
++                    self.db.execute("INSERT OR IGNORE INTO occurrences(repo,identity,day,target_day,metadata) "
++                                    "VALUES(?,?,?,?,?)", (repo, identity, day, day, json.dumps(meta, sort_keys=True)))
++                    row_id = self.db.execute("SELECT id FROM occurrences WHERE repo=? AND identity=?",
++                                             (repo, identity)).fetchone()[0]
++                    self.enqueue(repo, "occurrence", str(row_id))
++
++    def pending(self, repo: str):
++        return self.db.execute("SELECT o.* FROM occurrences o LEFT JOIN scheduling s ON "
++                               "s.repo=o.repo AND s.kind='occurrence' AND s.item=CAST(o.id AS TEXT) "
++                               "WHERE o.repo=? AND o.delivered=0 AND o.page IS NULL "
++                               "ORDER BY COALESCE(s.ticket,0),o.id", (repo,)).fetchall()
++
++    def rotate(self, repo: str, kind: str, item: str):
++        """Persist selection BEFORE external work, including failures and process death."""
++        with self.db:
++            self.db.execute("INSERT INTO scheduling(repo,kind,item,ticket) "
++                            "SELECT ?,?,?,COALESCE(MAX(ticket),0)+1 FROM scheduling WHERE 1 "
++                            "ON CONFLICT(repo,kind,item) DO UPDATE SET ticket=excluded.ticket",
++                            (repo, kind, str(item)))
++
++    def recheck_unattempted(self, repo: str):
++        """Only pages known never to have escaped can be repartitioned for new owners."""
++        with self.db:
++            self.db.execute("UPDATE occurrences SET page=NULL WHERE page IN "
++                            "(SELECT id FROM pages WHERE repo=? AND attempted=0 AND delivered=0)", (repo,))
++            self.db.execute("DELETE FROM pages WHERE repo=? AND attempted=0 AND delivered=0", (repo,))
++
++    def acknowledge(self, row_id: int, owner: str):
++        with self.db:
++            self.db.execute("UPDATE occurrences SET delivered=1,owner=? WHERE id=?", (owner, row_id))
++
++    def plan_pages(self, repo: str, rows: list, owner_check: dict[int, list] | None = None):
++        """Commit immutable pages before any external write; never shorten a manifest.
++
++        ``owner_check`` names unverifiable prior-owner candidates per occurrence
++        (an empty list means none were found in the inventoried scopes)."""
++        groups: list[list] = []
++        for row in rows:
++            item = {**json.loads(row["metadata"]), "occurrence_id": row["id"],
++                    "observed_day": row["day"], "status": "needs_triage"}
++            if owner_check is not None:
++                item["owner_check"] = owner_check.get(row["id"], [])
++            if not groups or groups[-1][0]["target_day"] != row["target_day"] or len(
++                json.dumps([r["item"] for r in groups[-1]] + [item]).encode("utf-8")
++            ) > PAGE_BYTES - 300:
++                groups.append([])
++            groups[-1].append({"id": row["id"], "target_day": row["target_day"], "item": item})
++        with self.db:
++            for group in groups:
++                data = json.dumps({"version": 1, "occurrences": [r["item"] for r in group]}, sort_keys=True)
++                marker = hashlib.sha256(data.encode()).hexdigest()
++                payload = f"<!-- ci-flaky-page:{marker} -->\n```json\n{data}\n```"
++                if len(payload.encode()) > PAGE_BYTES:
++                    raise ValueError("intake_page_oversize")
++                page = self.db.execute("INSERT INTO pages(repo,day,payload,attempted) VALUES(?,?,?,0)",
++                                       (repo, group[0]["target_day"], payload)).lastrowid
++                # IDs may be reused after unplanning; this is a new queue item.
++                self.db.execute("DELETE FROM scheduling WHERE repo=? AND kind='page' AND item=?",
++                                (repo, str(page)))
++                self.enqueue(repo, "page", str(page))
++                self.db.executemany("UPDATE occurrences SET page=? WHERE id=?", [(page, r["id"]) for r in group])
++
++    def unplan_page(self, page_id: int):
++        """Only called after a definitive no-create refusal, never an ambiguous write."""
++        with self.db:
++            self.db.execute("UPDATE occurrences SET page=NULL WHERE page=? AND delivered=0", (page_id,))
++            self.db.execute("DELETE FROM pages WHERE id=?", (page_id,))
++
++    def deliver(self, repo: str, board: Any, *, deadline: float | None = None,
++                create: Any = None, page_ids: set[int] | None = None) -> list[str]:
++        log = []
++        pages = self.db.execute("SELECT p.* FROM pages p LEFT JOIN scheduling s ON "
++                                "s.repo=p.repo AND s.kind='page' AND s.item=CAST(p.id AS TEXT) "
++                                "WHERE p.repo=? AND p.delivered=0 ORDER BY COALESCE(s.ticket,0),p.id",
++                                (repo,)).fetchall()
++        for page in pages:
++            if page_ids is not None and page["id"] not in page_ids:
++                continue
++            if deadline is not None and time.monotonic() >= deadline:
++                log.append("FAILED intake_budget; durable retry pending")
++                break
++            if page["day"] > utc_day():
++                log.append(f"FAILED intake carry-forward pending day={page['day']}")
++                continue
++            self.rotate(repo, "page", str(page["id"]))
++            key = f"ci-flaky-intake:{repo}:{page['day']}"
++            try:
++                cards = [c for c in board.list_cards() if c.get("idempotency_key") == key]
++                card = page["card"] or (cards[0]["id"] if cards else None)
++                # Fence before create as well as comment: either response can be lost.
++                with self.db:
++                    self.db.execute("UPDATE pages SET attempted=1 WHERE id=?", (page["id"],))
++                if card is None:
++                    body = (f"Daily CI flake intake for {repo}, UTC {page['day']}.\n\n"
++                            f"Durable metadata queue on producer host: {self.path}\n"
++                            "Every JSON manifest page lists occurrence provenance and per-test needs_triage status. "
++                            "Triage related fixes together; create named follow-ups only for genuinely distinct fixes. "
++                            "Existing exact-test owners remain owners. Owner inventory before admission: this "
++                            "board plus hermes-hub replica cards on fresh scopes; unsynced legacy profile boards "
++                            "are not inventoried, and rows with owner_check candidates had clipped closed-card "
++                            "history, so check those first. Read the full durable queue before closing; "
++                            "record each test's disposition and follow-up owner. No retry threshold changes.\n"
++                            "Backlog/export: see docs/ci-flaky-intake.md. New arrivals reopen a done intake.")
++                    title = f"CI flaky intake {repo} {page['day']}"
++                    card = create(title, body, key, page) if create else board.create(title, body, key)
++                    if card is None:
++                        log.append(f"FAILED intake ownership changed page={page['id']}; durable retry pending")
++                        continue
++                with self.db:
++                    self.db.execute("UPDATE pages SET card=? WHERE id=?", (card, page["id"]))
++                current = board.card(card)
++                if not current or current.get("idempotency_key") != key:
++                    raise RuntimeError("intake identity readback unavailable")
++                # Reconcile a successful write BEFORE interpreting a later archive/done.
++                if page["payload"] in board.comments(card):
++                    self.acknowledge_page(page["id"], card)
++                    log.append(f"intake delivered {card} page={page['id']}")
++                    continue
++                status = current.get("status")
++                if status == "archived":
++                    tomorrow = str(dt.date.fromisoformat(page["day"]) + dt.timedelta(days=1))
++                    with self.db:
++                        self.db.execute("UPDATE occurrences SET page=NULL,target_day=? WHERE page=? AND delivered=0",
++                                        (tomorrow, page["id"]))
++                        self.db.execute("DELETE FROM pages WHERE id=?", (page["id"],))
++                    log.append(f"FAILED intake archived; durable carry-forward day={tomorrow}")
++                    continue
++                if status == "done":
++                    board.reopen(card)
++                    status = (board.card(card) or {}).get("status")
++                if status not in {"todo", "ready", "running", "scheduled", "blocked", "review", "triage"}:
++                    raise RuntimeError("intake not actionable")
++                if page["payload"] not in board.comments(card):
++                    try:
++                        board.comment(card, page["payload"])
++                    except RuntimeError:
++                        # An ambiguous write may have succeeded: exact readback decides.
++                        if page["payload"] not in board.comments(card):
++                            raise
++                if page["payload"] not in board.comments(card):
++                    raise RuntimeError("intake comment readback unavailable")
++                self.acknowledge_page(page["id"], card)
++                log.append(f"intake delivered {card} page={page['id']}")
++            except (RuntimeError, ValueError, OSError, subprocess.TimeoutExpired):
++                log.append(f"FAILED intake delivery page={page['id']}; durable retry pending")
++        return log
++
++    def acknowledge_page(self, page_id: int, card: str):
++        with self.db:
++            self.db.execute("UPDATE pages SET delivered=1 WHERE id=?", (page_id,))
++            self.db.execute("UPDATE occurrences SET delivered=1,owner=? WHERE page=?", (card, page_id))
+diff --git a/scripts/ci/flaky_kanban.py b/scripts/ci/flaky_kanban.py
+index 8704e7d5d0..4d166d6fb7 100644
+--- a/scripts/ci/flaky_kanban.py
++++ b/scripts/ci/flaky_kanban.py
+@@ -1,28 +1,26 @@
+ #!/usr/bin/env python3
+-"""File ONE Kanban deflake card per flaky test id (t_94f2c8ba).
++"""Journal every CI flake and batch unowned tests into one daily intake.
+ 
+ scripts/run_tests_parallel.py retries a failed test once in the same job. A
+ test that passes only on that retry keeps the job green but must never pass
+ silently: the runner writes it to ``--flaky-report`` JSON, the CI step
+ ``flaky_artifact.py`` exports a metadata-only artifact (bounded test identity plus
+ run provenance, no failure output; scripts/ci/flaky_artifact.py) and the hub cron
+-downloads those artifacts and files one card per test id. ``--annotate`` still prints
+-local warning annotations (``FLAKY (passed only on retry)``) for a report.
+-
+-* first flake of a test id: create a card (idempotency key ``deflake:<id>``)
+-* later flakes while that card is open: append a comment to it
+-* flake after its card was closed (done/archived): open a new card that links
+-  the old one, since the fix did not hold
+-* a card anyone filed (any status) already cites the job URL: never open another;
+-  comment it if open, else record it and skip. An open card about the test id that
+-  this cron did not file gets the comment too (found via ``hermes kanban list``)
+-* the core overlap guard refuses the create (create_overlap): a match owns the flake
+-  only if it is open and about this test id (its title/body names it, or its key is
+-  ``deflake:<id>``). The comment goes to that owner (through ``hermes-hub request``
+-  when it lives on another gateway) and is read back before anything logs "appended"
+-  or records it in state. No qualifying match: create anyway, ``--distinct-from`` the
+-  matches. A delivery that fails or is not confirmed is logged ``FAILED``, its run is
+-  left unprocessed (retried on the next poll) and the script exits 1 (t_01a189b2c78e9005)
++downloads those artifacts into a durable metadata journal. ``--annotate`` still
++prints local warning annotations (``FLAKY (passed only on retry)``) for a report.
++
++* new unowned occurrences: one intake per repo per UTC observation day, keyed
++  ``ci-flaky-intake:<repo>:<day>``, with bounded structured manifest pages
++* existing exact-test/job owners: deduplicated comments, confirmed by readback;
++  batching never reassigns or archives those cards
++* failed/ambiguous delivery: durable retry, never advance delivery acknowledgement
++  on a write receipt alone
++* done intake: supported reopen; archived intake: durable carry to the next day,
++  preserving original occurrence provenance rather than making a same-day replacement
++
++See docs/ci-flaky-intake.md for backlog inspection, recovery and rollback. The
++legacy file_cards helper retains per-test creation for callers without on_unowned;
++production CLI admission uses the journal and daily intake instead.
+ 
+ Modes:
+ 
+@@ -55,8 +53,10 @@ from typing import Any, Callable, Iterable, Protocol
+ 
+ try:
+     from scripts.ci import flaky_artifact_poll as fap
++    from scripts.ci.flaky_intake import Journal
+ except ImportError:  # run as a script: scripts/ci is sys.path[0]
+     import flaky_artifact_poll as fap  # type: ignore[no-redef]
++    from flaky_intake import Journal  # type: ignore[no-redef]
+ 
+ ANNOTATION_TITLE = "FLAKY (passed only on retry)"
+ CLOSED = {"done", "archived"}
+@@ -145,9 +145,17 @@ class CliBoard:
+     def list_cards(self) -> list[dict[str, Any]]:
+         return list(json.loads(self._run("list", "--archived", "--json")))
+ 
++    def reopen(self, card_id: str) -> None:
++        self._run("reopen", card_id)
++
+     def comments(self, card_id: str, board: str | None = None) -> list[str]:
+         data = self._show(card_id, board) or {}
+-        return [str(c.get("body") or "") for c in data.get("comments") or []]
++        comments = data.get("comments")
++        if not isinstance(comments, list) or any(
++            not isinstance(c, dict) or not isinstance(c.get("body"), str) for c in comments
++        ):
++            raise RuntimeError("comments unavailable")
++        return [c["body"] for c in comments]
+ 
+ 
+ class HubRelay:
+@@ -196,6 +204,15 @@ class HubRelay:
+                 break
+         return best
+ 
++    def require_fresh(self, gw: str, data: dict[str, Any]) -> None:
++        from hermes_cli.kanban_scope_heartbeat import fresh_scopes, scope_heartbeats
++
++        parts = str(data.get("_route") or "").split("/")
++        rows = self._query("SELECT gw,data FROM replica WHERE coll='gateway' AND key='info'")
++        scopes = fresh_scopes(scope_heartbeats(rows), time.time())
++        if len(parts) != 3 or (gw, parts[0], parts[1]) not in scopes:
++            raise RuntimeError("owner scope freshness unavailable")
++
+     def comment(self, gw: str, board: str, card_id: str, text: str, marker: list[str]) -> tuple[bool | None, str]:
+         """``(True, how)`` delivered and read back, ``(False, why)`` refused, ``(None, why)`` not confirmed yet."""
+         target = self.card(gw, board, card_id)
+@@ -335,7 +352,9 @@ def _is_about(card: dict[str, Any], test_id: str) -> bool:
+ 
+ 
+ def file_cards(entries: Iterable[dict[str, str]], *, run_url: str, branch: str, board: Board,
+-               state: dict[str, Any], relay: HubRelay | None = None) -> list[str]:
++               state: dict[str, Any], relay: HubRelay | None = None,
++               on_unowned: Callable[[], str] | None = None,
++               owner_notes: dict[str, list[dict[str, str]]] | None = None) -> list[str]:
+     """Open or append one card per distinct test id; returns one log line per id.
+ 
+     Before opening a card it checks the whole board, since other workers (CI watch) file
+@@ -353,10 +372,14 @@ def file_cards(entries: Iterable[dict[str, str]], *, run_url: str, branch: str,
+         if test_id in seen:
+             continue
+         seen.add(test_id)
+-        ctx = _Flake(test_id, run_url, branch, entry.get("first_attempt_excerpt") or "", board, state, relay, self_gw)
++        ctx = _Flake(test_id, run_url, branch, entry.get("first_attempt_excerpt") or "", board, state, relay, self_gw,
++                     require_fresh=on_unowned is not None)
+         known = state["cards"].get(test_id)
+         recorded_generation = (known or {}).get("generation", 0)
+         owner = ctx.resolve(known) if known else None
++        if on_unowned is not None and known and (owner is None or owner.get("status") is None):
++            log.append(f"FAILED {test_id}: cached owner unreadable; durable retry pending")
++            continue
+         if owner is not None and owner.get("status") not in CLOSED | {None}:
+             log.append(_append(ctx, owner, recorded_generation))
+             continue
+@@ -372,6 +395,19 @@ def file_cards(entries: Iterable[dict[str, str]], *, run_url: str, branch: str,
+             state["cards"][test_id] = {"card": owner["id"], "generation": recorded_generation}
+             log.append(f"skipped {test_id}: {run_url} already cited by {owner['id']} ({owner.get('status')})")
+             continue
++        if on_unowned is not None:
++            foreign = _foreign_owner(ctx)
++            if foreign is not None and foreign.get("status") in CLOSED:
++                ctx.record(foreign, recorded_generation)
++                log.append(f"skipped {test_id}: {run_url} already cited by {ctx.ref(foreign)} "
++                           f"({foreign['status']})")
++            elif foreign is not None:
++                log.append(_append(ctx, foreign, recorded_generation, "existing exact owner"))
++            else:
++                if owner_notes is not None:
++                    owner_notes[test_id] = list(ctx.owner_notes)
++                log.append(on_unowned())
++            continue
+         generation = recorded_generation + (1 if known else 0)
+         key = f"deflake:{test_id}" + (f"#{generation}" if generation else "")
+         body = _card_body(entry, run_url, branch, (known or {}).get("card"))
+@@ -383,9 +419,12 @@ class _Flake:
+     """One flaky test id being filed: where its comment goes and how to tell it already landed."""
+ 
+     def __init__(self, test_id: str, run_url: str, branch: str, excerpt: str, board: Board, state: dict[str, Any],
+-                 relay: HubRelay | None, self_gw: str | None) -> None:
++                 relay: HubRelay | None, self_gw: str | None, *, require_fresh: bool = False) -> None:
+         self.test_id, self.run_url, self.board, self.state, self.relay, self.self_gw = (
+             test_id, run_url, board, state, relay, self_gw)
++        self.require_fresh = require_fresh
++        # Unverifiable prior-owner candidates, named in the intake manifest for triage.
++        self.owner_notes: list[dict[str, str]] = []
+         # The test id and job URL lead the comment: a cross-gateway read-back sees only the first 500 chars.
+         self.comment = f"Flaked again: `{test_id}` in {run_url} (branch `{branch}`)." + (
+             f"\n\n```\n{excerpt[-1500:]}\n```" if excerpt else "")
+@@ -404,6 +443,8 @@ class _Flake:
+             data = self.board.card(card_id, slug) if slug else self.board.card(card_id)
+             return {**data, "id": card_id, "board": slug, "gateway": None} if data else None
+         data = self.relay.card(gw, slug or "default", card_id) if self.relay else None
++        if data and self.require_fresh:
++            self.relay.require_fresh(gw, data)
+         return {**data, "id": card_id, "board": slug or "default", "gateway": gw} if data else None
+ 
+     def owns(self, card: dict[str, Any]) -> bool:
+@@ -442,6 +483,180 @@ class _Flake:
+         return f"@task:{card['board']}/{card['id']}" if card.get("board") else card["id"]
+ 
+ 
++def _foreign_owner(ctx: _Flake) -> dict[str, Any] | None:
++    """Enumerate replica owners before batching; retain the exact ownership predicate."""
++    if ctx.relay is None:
++        return None
++    if not ctx.relay.db.is_file():
++        raise RuntimeError("owner inventory unavailable")
++    conn = sqlite3.connect(f"file:{ctx.relay.db}?mode=ro", uri=True, timeout=5)
++    try:
++        refs = conn.execute("SELECT gw,key,data FROM replica WHERE coll='tasks'").fetchall()
++    finally:
++        conn.close()
++    candidates: list[tuple[int, str, dict[str, Any]]] = []
++    uncertain: list[dict[str, str]] = []
++    unavailable: RuntimeError | None = None
++    for gw, key, raw in refs:
++        data = json.loads(raw)
++        if not isinstance(data, dict) or not _is_about(data, ctx.test_id):
++            continue
++        parts = key.split("/")
++        if len(parts) not in (2, 3):
++            continue
++        try:
++            owner = ctx.resolve({"id": parts[-1], "board": parts[-2], "gateway": gw})
++        except RuntimeError as exc:
++            unavailable = exc
++            continue
++        if owner is None or owner.get("status") not in OPEN | CLOSED:
++            unavailable = RuntimeError("owner readback unavailable")
++            continue
++        text = f"{owner.get('title') or ''}\n{owner.get('body') or ''}\n" + "\n".join(
++            str(c.get("body") or "") for c in owner.get("last_comments") or [])
++        cites = _cites_job(text, ctx.run_url)
++        if ctx.owns(owner) or (owner.get("status") in CLOSED and cites):
++            rank = (0 if owner.get("status") in OPEN else 1) if cites else 2
++            candidates.append((rank, ctx.ref(owner), owner))
++        elif owner.get("status") in CLOSED and not _complete_foreign_history(owner):
++            # Clipped history cannot prove this closed card never cited the job.
++            # Holding the row would strand every recurrence of a test whose old
++            # card is closed with >3 comments; the intake names it for triage.
++            uncertain.append({"candidate": ctx.ref(owner), "status": str(owner["status"]),
++                              "reason": "closed_history_incomplete"})
++    # Match local precedence, independent of replica row order. Unknown history
++    # cannot erase a known positive, but it must never become absence evidence.
++    if candidates:
++        return min(candidates, key=lambda candidate: candidate[:2])[2]
++    if unavailable is not None:
++        raise unavailable
++    ctx.owner_notes = sorted(uncertain, key=lambda note: note["candidate"])
++    return None
++
++
++def _complete_foreign_history(owner: dict[str, Any]) -> bool:
++    """Only an untruncated replica can establish absence of a closed-job receipt.
++
++    The producer publishes a total count and last three comments, clips comments
++    at 500 characters, body at 4000 and title at 300. Boundary lengths are
++    deliberately conservative: they cannot prove an untruncated source.
++    """
++    comments, total = owner.get("last_comments"), owner.get("comments")
++    return (type(total) is int and isinstance(comments, list) and total == len(comments)
++            and all(isinstance(c, dict) and isinstance(c.get("body"), str)
++                    and len(c["body"]) < 500 for c in comments)
++            and all(isinstance(owner.get(k), str) and len(owner[k]) < limit
++                    for k, limit in (("body", 4000), ("title", 300))))
++
++
++def drain_intake(journal: Journal, repo: str, board: Board, state: dict, relay: HubRelay | None,
++                 *, deadline: float | None = None) -> list[str]:
++    log = []
++    journal.recheck_unattempted(repo)
++    # Reserve half the remaining drain window for already-attempted pages. Resolve
++    # and deliver one occurrence at a time: a later slow owner cannot strand a
++    # whole newly resolved prefix behind the deadline on every invocation.
++    now = time.monotonic()
++    resolve_deadline = None if deadline is None else now + max(0, deadline - now) / 2
++    old_pages = {r[0] for r in journal.db.execute(
++        "SELECT id FROM pages WHERE repo=? AND delivered=0", (repo,))}
++    def create(title, body, key, page):
++        return _create_intake(journal, repo, board, state, relay, title, body, key, page, deadline)
++    for row in journal.pending(repo):
++        if resolve_deadline is not None and time.monotonic() >= resolve_deadline:
++            log.append("FAILED intake_budget; durable retry pending")
++            break
++        journal.rotate(repo, "occurrence", str(row["id"]))
++        meta = json.loads(row["metadata"])
++        url = f"https://github.com/{repo}/actions/runs/{meta['run_id']}/job/{meta['job_id']}"
++        notes: dict[str, list[dict[str, str]]] = {}
++        try:
++            lines = file_cards([meta], run_url=url, branch=meta["head_sha"], board=board, state=state,
++                               relay=relay, on_unowned=lambda: "queued", owner_notes=notes)
++        except (RuntimeError, subprocess.TimeoutExpired):
++            log.append(f"FAILED {meta['test_id']}: owner delivery unavailable; durable retry pending")
++            continue
++        if lines == ["queued"]:
++            journal.plan_pages(repo, [row], owner_check={row["id"]: notes.get(meta["test_id"], [])})
++            page_id = journal.db.execute("SELECT page FROM occurrences WHERE id=?", (row["id"],)).fetchone()[0]
++            log += journal.deliver(repo, board, deadline=deadline, create=create, page_ids={page_id})
++        elif lines and not any(line.startswith("FAILED") for line in lines):
++            journal.acknowledge(row["id"], json.dumps(state["cards"][meta["test_id"]], sort_keys=True))
++        log += lines
++    return log + journal.deliver(repo, board, deadline=deadline, create=create, page_ids=old_pages)
++
++
++def _create_intake(journal, repo, board, state, relay, title, body, key, page, deadline):
++    """Reconcile definitive overlap refusals without dissolving ambiguous pages."""
++    distinct = []
++    rows = journal.db.execute("SELECT metadata FROM occurrences WHERE page=?", (page["id"],)).fetchall()
++    contexts = []
++    for row in rows:
++        meta = json.loads(row[0])
++        url = f"https://github.com/{repo}/actions/runs/{meta['run_id']}/job/{meta['job_id']}"
++        contexts.append(_Flake(meta["test_id"], url, meta["head_sha"], "", board, state,
++                               relay, relay.self_gateway() if relay else None, require_fresh=True))
++    for _ in range(3):
++        if deadline is not None and time.monotonic() >= deadline:
++            raise RuntimeError("intake_budget")
++        try:
++            with journal.db:
++                journal.db.execute("UPDATE pages SET attempted=1 WHERE id=?", (page["id"],))
++            if not distinct:
++                return board.create(title, body, key)
++            return board.create(title, body, key, distinct_from=distinct,
++                                distinct_reason="Daily intake only admits unowned occurrences; "
++                                "read-back overlap matches do not own any test in this manifest.")
++        except CreateRefused as refused:
++            # A previous lost create response cannot be disproved by this later refusal.
++            if page["attempted"] or not contexts:
++                raise
++            with journal.db:
++                journal.db.execute("UPDATE pages SET attempted=0 WHERE id=?", (page["id"],))
++            fresh = [m for m in refused.matches if m.get("id") and m["id"] not in distinct]
++            if not fresh:
++                raise
++            owners = []
++            for match in fresh:
++                if deadline is not None and time.monotonic() >= deadline:
++                    raise RuntimeError("intake_budget")
++                owner = contexts[0].resolve(match)
++                if owner is None or owner.get("status") not in OPEN | CLOSED:
++                    # Definitive refusal, so a later drain may safely recheck this page.
++                    journal.unplan_page(page["id"])
++                    raise RuntimeError("intake overlap owner unreadable") from None
++                owners.append(owner)
++            exact = [(ctx, owner) for ctx in contexts for owner in owners if _overlap_owns(ctx, owner)]
++            if exact:
++                for ctx, owner in exact:
++                    if ctx.owns(owner):
++                        generation = state["cards"].get(ctx.test_id, {}).get("generation", 0)
++                        ctx.record(owner, generation)
++                journal.unplan_page(page["id"])
++                return None
++            distinct.extend(m["id"] for m in fresh)
++    raise RuntimeError("intake overlap still refused")
++
++
++def _overlap_owns(ctx: _Flake, owner: dict[str, Any]) -> bool:
++    if not _is_about(owner, ctx.test_id):
++        return False
++    if ctx.owns(owner):
++        return True
++    text = f"{owner.get('title') or ''}\n{owner.get('body') or ''}"
++    if _cites_job(text, ctx.run_url):
++        return True
++    if owner.get("gateway"):
++        history = "\n".join(str(c.get("body") or "") for c in owner.get("last_comments") or [])
++        if _cites_job(history, ctx.run_url):
++            return True
++        if not _complete_foreign_history(owner):
++            raise RuntimeError("closed foreign owner history unavailable")
++        return False
++    scope = (owner["board"],) if owner.get("board") else ()
++    return _cites_job("\n".join(ctx.board.comments(owner["id"], *scope)), ctx.run_url)
++
++
+ def _append(ctx: _Flake, card: dict[str, Any], generation: int, why: str = "") -> str:
+     """Comment an owner card; only a read-back comment logs "appended" and enters the state."""
+     ok, detail = ctx.deliver(card)
+@@ -480,9 +695,12 @@ def _create_or_defer(ctx: _Flake, title: str, body: str, key: str, generation: i
+ 
+ def read_report(raw: bytes | str) -> list[dict[str, str]]:
+     data = json.loads(raw)
+-    if data.get("version") != 1:
+-        raise ValueError(f"unknown flaky report version: {data.get('version')!r}")
+-    return list(data.get("flaky") or [])
++    if not isinstance(data, dict) or data.get("version") != 1:
++        raise ValueError("invalid flaky report")
++    entries = data.get("flaky", [])
++    if not isinstance(entries, list) or any(not isinstance(entry, dict) for entry in entries):
++        raise ValueError("invalid flaky report")
++    return entries
+ 
+ 
+ # --- CI side: report -> annotations --------------------------------------------
+@@ -513,12 +731,16 @@ def _gh(url: str, token: str) -> Any:
+     attempts = 4 if req.get_method() == "GET" else 1
+     for attempt in range(attempts):
+         try:
+-            with urllib.request.urlopen(req, timeout=60) as resp:
+-                return json.loads(resp.read())
++            _, _, body = fap.fa.transport.read(req, 16 * 1024 * 1024, fap.fa._NoRedirect())
++            if len(body) > 16 * 1024 * 1024:
++                raise ValueError("GitHub response exceeds size limit")
++            return json.loads(body)
+         except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.HTTPException) as exc:
++            if isinstance(exc, urllib.error.HTTPError):
++                exc.close()
+             if (isinstance(exc, urllib.error.HTTPError) and exc.code < 500) or attempt == attempts - 1:
+                 raise
+-            time.sleep(2 ** attempt)
++            time.sleep(fap.fa.transport.remaining(2 ** attempt))
+ 
+ 
+ def _completed_runs(api: str, token: str, *, since: float, per_page: int = 100) -> list[dict[str, Any]]:
+@@ -565,7 +787,7 @@ def _filing(result: Any, run: dict[str, Any], repo: str, board: Board, state: di
+ 
+ 
+ def _poll_run(repo: str, token: str, run: dict[str, Any], board: Board, state: dict[str, Any],
+-              relay: HubRelay | None) -> tuple[str, list[str], str | None]:
++              relay: HubRelay | None, journal: Journal | None = None) -> tuple[str, list[str], str | None]:
+     """``(outcome, log lines, unavailable code)``; outcome is complete|empty|not_applicable|unavailable
+     (unavailable = retry later). The code is set when the run's data could not be read (``fap.Unavailable``);
+     ``poll_github`` turns it into a RETRY/WAITING/FAILED line by how long it has persisted."""
+@@ -577,7 +799,11 @@ def _poll_run(repo: str, token: str, run: dict[str, Any], board: Board, state: d
+     if result.kind == "not_applicable":
+         state["runs"].append(key)
+         return "not_applicable", [], None
+-    lines = _filing(result, run, repo, board, state, relay)
++    if journal is not None:
++        journal.record(repo, result.jobs, run)
++        lines = []
++    else:
++        lines = _filing(result, run, repo, board, state, relay)
+     if any(line.startswith("FAILED") for line in lines):
+         return "unavailable", lines, None
+     state["runs"].append(key)
+@@ -615,10 +841,11 @@ def _unavailable_line(key: str, code: str, run: dict[str, Any], tracked: dict[st
+     return f"WAITING run={key} code={code} polls={polls}"
+ 
+ 
++@fap.fa.transport.scoped_poll
+ def poll_github(repo: str, token: str, board: Board, state: dict[str, Any], *,
+                 lookback_hours: float = 6.0, relay: HubRelay | None = None,
+                 deadline: float | None = None, checkpoint: Callable[[], None] | None = None,
+-                grace: float = GRACE_SECONDS) -> list[str]:
++                grace: float = GRACE_SECONDS, journal: Journal | None = None) -> list[str]:
+     """File cards from the metadata artifacts of recently completed runs not seen before.
+ 
+     ``lookback_hours`` must outlast the slowest workflow plus any cron outage, and stay
+@@ -635,6 +862,9 @@ def poll_github(repo: str, token: str, board: Board, state: dict[str, Any], *,
+       inside ``grace``.
+     * ``FAILED run=<k> code=<c> polls=<n>``: unavailable in this and the previous poll and
+       completed at least ``grace`` ago. Only this one turns the cron red.
++    * ``FAILED run=<k> code=<c> polls=<n> retired=unlisted`` (journal only): the same, for a stored
++      run that a successful listing no longer includes. The run is marked complete, so this
++      terminal line appears once; a failed listing never retires anything.
+ 
+     Cancelled/timed-out jobs and incomplete reports remain unavailable and unprocessed, except a
+     cancelled run superseded by a newer run of its workflow and branch (``not_applicable``). Every
+@@ -652,11 +882,21 @@ def poll_github(repo: str, token: str, board: Board, state: dict[str, Any], *,
+     api = f"https://api.github.com/repos/{repo}"
+     done = set(state["runs"])
+     since = time.time() - lookback_hours * 3600
++    log: list[str] = []
++    listed: set[str] | None = None      # keys GitHub listed this poll; None when the listing failed
+     try:
+         runs = _completed_runs(api, token, since=since)
++        listed = {f"{r['id']}/{r.get('run_attempt', 1)}" for r in runs}
+     except (OSError, ValueError, http.client.HTTPException):
+-        return ["FAILED runs_unavailable"]
+-    log: list[str] = []
++        if journal is None:
++            return ["FAILED runs_unavailable"]
++        runs = []
++        log.append("FAILED runs_unavailable")
++    if journal is not None:
++        runs = journal.remember_runs(repo, runs)
++        # The durable journal is authoritative. A crash between the JSON checkpoint
++        # and journal completion must not strand an unfinished stored descriptor.
++        done = set()
+     counts = {"complete": 0, "empty": 0, "unavailable": 0, "not_applicable": 0}
+     now = time.time()
+     prior_seq = state.get("poll_seq")
+@@ -664,7 +904,8 @@ def poll_github(repo: str, token: str, board: Board, state: dict[str, Any], *,
+     prior = state.get("unavailable")
+     tracked: dict[str, Any] = prior if isinstance(prior, dict) else {}
+     keys = [f"{r['id']}/{r.get('run_attempt', 1)}" for r in runs]
+-    fresh = [r for r in sorted(runs, key=lambda r: r["id"]) if f"{r['id']}/{r.get('run_attempt', 1)}" not in done]
++    ordered = runs if journal is not None else sorted(runs, key=lambda r: r["id"])
++    fresh = [r for r in ordered if f"{r['id']}/{r.get('run_attempt', 1)}" not in done]
+     # Bounded: only attempts still listed and unprocessed are remembered.
+     state["unavailable"] = tracked = {k: tracked[k] for k in keys if k in tracked and k not in done}
+     for index, run in enumerate(fresh):
+@@ -672,9 +913,22 @@ def poll_github(repo: str, token: str, board: Board, state: dict[str, Any], *,
+             log.append(f"FAILED poll_budget deferred={len(fresh) - index}")
+             break
+         key = f"{run['id']}/{run.get('run_attempt', 1)}"
+-        outcome, lines, code = _poll_run(repo, token, run, board, state, relay)
++        if journal is not None:
++            journal.rotate(repo, "run", key)
++        outcome, lines, code = _poll_run(repo, token, run, board, state, relay, journal)
++        if journal is not None and outcome != "unavailable":
++            journal.finish_run(repo, key)
+         if code is not None:
+-            lines = [_unavailable_line(key, code, run, tracked, seq, now, grace)]
++            if journal is not None:
++                tracked[key] = {"seq": seq - 1, "polls": journal.note_unavailable(repo, key) - 1}
++            line = _unavailable_line(key, code, run, tracked, seq, now, grace)
++            if journal is not None and listed is not None and key not in listed and line.startswith("FAILED"):
++                # A stored run that a successful listing no longer includes, still unavailable past grace,
++                # is retired with one terminal line, as the non-journal path drops it from the listing.
++                line += " retired=unlisted"
++                journal.finish_run(repo, key)
++                tracked.pop(key, None)
++            lines = [line]
+         else:
+             tracked.pop(key, None)
+         log += lines
+@@ -699,6 +953,8 @@ def main(argv: list[str] | None = None) -> int:
+     ap.add_argument("--from-github", action="store_true")
+     ap.add_argument("--repo", default="example-org/hermes")
+     ap.add_argument("--state", type=Path, default=DEFAULT_STATE)
++    ap.add_argument("--initialize-intake", action="store_true", help="one-time journal bootstrap; never polls")
++    ap.add_argument("--intake-identity", type=Path, help="independently retained journal identity anchor")
+     ap.add_argument("--hermes", default=os.environ.get("HERMES_BIN", "hermes"))
+     ap.add_argument("--assignee", default="default")
+     ap.add_argument("--hub-cli", default="hermes-hub", help="hermes-hub CLI, for cards on other gateways")
+@@ -723,20 +979,57 @@ def main(argv: list[str] | None = None) -> int:
+ 
+     board = CliBoard(args.hermes, args.assignee)
+     relay = HubRelay(args.hub_db, args.hub_cli, wait=args.hub_wait)
++    journal = None
++    try:
++        queue = args.state.with_suffix(".intake.sqlite3").resolve()
++        home = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
++        identity = args.intake_identity or (home / "intake-identities" /
++                    (hashlib.sha256(str(queue).encode("utf-8")).hexdigest() + ".uuid"))
++        journal = Journal(queue, identity_path=identity, initialize=args.initialize_intake)
++        if args.initialize_intake:
++            print("Intake initialized; preserve journal and independent identity anchor")
++            return 0
++        return _run_intake(args, board, relay, journal)
++    except (ValueError, OSError, RuntimeError, sqlite3.Error, subprocess.TimeoutExpired):
++        print("FAILED intake unavailable; durable retry pending", file=sys.stderr)
++        return 1
++    finally:
++        if journal is not None:
++            journal.close()
++
++
++def _run_intake(args: argparse.Namespace, board: Board, relay: HubRelay, journal: Journal) -> int:
+     state = load_state(args.state)
++    deadline = time.monotonic() + args.budget
+     if args.from_github:
+         token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+         if not token:
+             print("flaky_kanban: GH_TOKEN/GITHUB_TOKEN not set", file=sys.stderr)
+             return 2
+-        log = poll_github(args.repo, token, board, state, relay=relay,
+-                          deadline=time.monotonic() + args.budget, grace=args.grace_minutes * 60,
+-                          checkpoint=lambda: save_state(args.state, state))
++        # Persisted delivery gets a bounded first turn even when discovery is slow.
++        # The remaining budget still belongs to CI assessment; network failures
++        # remain red and newly discovered rows can drain on the next invocation.
++        log = drain_intake(journal, args.repo, board, state, relay,
++                           deadline=time.monotonic() + max(0, args.budget) / 2)
++        save_state(args.state, state)
++        log += poll_github(args.repo, token, board, state, relay=relay,
++                          deadline=deadline, grace=args.grace_minutes * 60,
++                          checkpoint=lambda: save_state(args.state, state), journal=journal)
+     else:
+         entries: list[dict[str, str]] = []
+         for path in args.report:
+             entries += read_report(Path(path).read_text(encoding="utf-8-sig"))
+-        log = file_cards(entries, run_url=args.run_url, branch=args.branch, board=board, state=state, relay=relay)
++        match = _GH_JOB_URL.fullmatch(args.run_url)
++        if match is None or not args.run_url.startswith(f"https://github.com/{args.repo}/"):
++            raise ValueError("intake requires a repository job URL")
++        if not fap.fa._SHA.fullmatch(args.branch) or any(
++            fap.fa.canonical_test_id(e.get("test_id")) != e.get("test_id") for e in entries
++        ):
++            raise ValueError("invalid intake metadata")
++        run_id = int(match.group(1).rsplit("/", 1)[1])
++        journal.record(args.repo, [(int(match.group(2)), entries)], {"id": run_id, "head_sha": args.branch})
++        log = []
++    log += drain_intake(journal, args.repo, board, state, relay, deadline=deadline)
+     save_state(args.state, state)
+     for line in log:  # silent when nothing flaked (no-agent cron delivers stdout)
+         print(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} {line}")
+diff --git a/tests/ci/test_flaky_artifact_poll.py b/tests/ci/test_flaky_artifact_poll.py
+index 522483ecea..25abc28800 100644
+--- a/tests/ci/test_flaky_artifact_poll.py
++++ b/tests/ci/test_flaky_artifact_poll.py
+@@ -240,6 +240,8 @@ def test_main_exits_one_once_an_unavailable_run_persists(gh, tmp_path, monkeypat
+     monkeypatch.setattr(fk, "CliBoard", lambda *a, **k: FakeBoard())
+     monkeypatch.setattr(fk, "HubRelay", lambda *a, **k: None)
+     argv = ["--from-github", "--repo", "o/r", "--state", str(tmp_path / "s.json")]
++    assert fk.main(["--initialize-intake", "--state", str(tmp_path / "s.json")]) == 0
++    capsys.readouterr()
+     assert fk.main(argv) == 0
+     out = capsys.readouterr().out
+     assert "WAITING run=5/1 code=missing polls=1" in out and "FAILED" not in out and "POLL complete=0" in out
+@@ -329,7 +331,8 @@ def test_assess_run_results_are_card_free(gh):
+     _two_slices(gh)
+     result = fap.assess_run("o/r", gh.runs[0], lambda url: gh.gh(url, "tok"), "tok")
+     assert result.kind == "complete" and [j for j, _ in result.jobs] == [9, 10]
+-    assert result.jobs[0][1] == [{"test_id": A, "retried": "tests", "first_attempt_excerpt": ""}]
++    assert result.jobs[0][1] == [{"test_id": A, "retried": "tests", "first_attempt_excerpt": "",
++                                  "run_attempt": 1, "source_sha": "b" * 40, "slice": 1, "slices": 2}]
+     assert fap.Unavailable("missing").code == "missing"
+ 
+ 
+diff --git a/tests/ci/test_flaky_daily_intake_cli.py b/tests/ci/test_flaky_daily_intake_cli.py
+new file mode 100644
+index 0000000000..814d93dcdb
+--- /dev/null
++++ b/tests/ci/test_flaky_daily_intake_cli.py
+@@ -0,0 +1,158 @@
++"""Daily intake admission exercised through the real script with isolated external effects."""
++from __future__ import annotations
++
++import json
++import sqlite3
++import subprocess
++import sys
++from pathlib import Path
++
++import pytest
++
++from tools.environments.local import build_subprocess_env
++
++ROOT = Path(__file__).resolve().parents[2]
++FAKE_BOARD = r'''
++import json, os, sys
++from pathlib import Path
++path = Path(os.environ["FAKE_BOARD"])
++state = json.loads(path.read_text())
++a = sys.argv[2:]
++verb = a[0]
++if verb == "list":
++    result = list(state["cards"].values())
++elif verb == "create":
++    key = a[a.index("--idempotency-key") + 1]
++    body = sys.stdin.read()
++    existing = [c for c in state["cards"].values() if c["idempotency_key"] == key]
++    if existing:
++        result = existing[0]
++    else:
++        cid = "t_fixture_%d" % len(state["cards"])
++        result = {"id": cid, "title": a[1], "body": body, "status": "ready",
++                  "idempotency_key": key, "comments": []}
++        state["cards"][cid] = result
++        state["creates"] += 1
++elif verb == "show":
++    c = state["cards"][a[1]]
++    result = {"task": c, "comments": [{"body": b} for b in c["comments"]]}
++elif verb == "comment":
++    state["cards"][a[1]]["comments"].append(a[2])
++    result = {}
++elif verb == "reopen":
++    state["cards"][a[1]]["status"] = "ready"
++    result = {}
++else:
++    raise SystemExit("unexpected external command: " + repr(a))
++path.write_text(json.dumps(state))
++print(json.dumps(result))
++'''
++
++
++def initialize_cli(state, env):
++    command = [sys.executable, str(ROOT / "scripts/ci/flaky_kanban.py"),
++               "--state", str(state), "--initialize-intake"]
++    result = subprocess.run(command, env=env, capture_output=True, text=True,
++                            encoding="utf-8", timeout=30, check=False)
++    assert result.returncode == 0, result.stdout + result.stderr
++    again = subprocess.run(command, env=env, capture_output=True, text=True,
++                           encoding="utf-8", timeout=30, check=False)
++    assert again.returncode == 1
++
++
++@pytest.mark.parametrize("payload", [None, [], {"version": 1, "flaky": ["secret-output"]},
++                                    {"version": 1, "flaky": {"secret-output": True}}])
++def test_malformed_cli_report_fails_without_traceback_or_payload(tmp_path, payload):
++    home = tmp_path / "home"
++    home.mkdir()
++    report = tmp_path / "flaky.json"
++    report.write_text(json.dumps(payload), encoding="utf-8")
++    env = build_subprocess_env(extra={"HOME": str(home), "HERMES_HOME": str(home / ".hermes")})
++    initialize_cli(home / "cursor.json", env)
++    result = subprocess.run(
++        [sys.executable, str(ROOT / "scripts/ci/flaky_kanban.py"), "--report", str(report),
++         "--repo", "example/project", "--state", str(home / "cursor.json"),
++         "--run-url", "https://github.com/example/project/actions/runs/5/job/9", "--branch", "a" * 40],
++        env=env, capture_output=True, text=True, encoding="utf-8", timeout=30, check=False)
++    assert result.returncode == 1
++    assert result.stderr == "FAILED intake unavailable; durable retry pending\n"
++    assert "secret-output" not in result.stdout
++    with sqlite3.connect(home / "cursor.intake.sqlite3") as conn:
++        assert conn.execute("SELECT count(*) FROM occurrences").fetchone()[0] == 0
++
++
++@pytest.mark.parametrize("damage", ["none", "all_queue_files", "all_state", "missing_anchor",
++                                    "replacement", "restore"])
++def test_thirty_new_tests_create_one_daily_intake_and_thirty_durable_rows(tmp_path, damage):
++    home = tmp_path / "home"
++    home.mkdir()
++    (home / "hub").mkdir()
++    with sqlite3.connect(home / "hub/hub.db") as replica:
++        replica.execute("CREATE TABLE replica (gw TEXT, key TEXT, coll TEXT, data TEXT)")
++        replica.execute("CREATE TABLE meta (k TEXT, v TEXT)")
++        replica.execute("INSERT INTO meta VALUES ('gateway', 'fixture')")
++    board_path = tmp_path / "board.json"
++    board_path.write_text(json.dumps({"cards": {}, "creates": 0}), encoding="utf-8")
++    fake = tmp_path / "fake-hermes"
++    fake.write_text(f"#!{sys.executable}\n{FAKE_BOARD}", encoding="utf-8")
++    fake.chmod(0o700)
++    report = tmp_path / "flaky.json"
++    report.write_text(json.dumps({"version": 1, "flaky": [
++        {"test_id": f"tests/example.py::test_{i}", "retried": "tests"} for i in range(30)
++    ]}), encoding="utf-8")
++    state = home / "cursor.json"
++    env = build_subprocess_env(extra={
++        "HOME": str(home), "HERMES_HOME": str(home / ".hermes"),
++        "HERMES_HUB_STATE": str(home / "hub"), "FAKE_BOARD": str(board_path),
++    })
++    command = [sys.executable, str(ROOT / "scripts/ci/flaky_kanban.py"),
++               "--report", str(report), "--repo", "example/project", "--state", str(state),
++               "--run-url", "https://github.com/example/project/actions/runs/5/job/9",
++               "--branch", "a" * 40, "--hermes", str(fake)]
++    initialize_cli(state, env)
++    first = subprocess.run(command, env=env, capture_output=True, text=True, encoding="utf-8", timeout=90, check=False)
++    assert first.returncode == 0, first.stdout + first.stderr
++    board = json.loads(board_path.read_text(encoding="utf-8"))
++    assert board["creates"] == 1, f"expected one intake, created {board['creates']} cards"
++    intake = next(iter(board["cards"].values()))
++    assert intake["idempotency_key"].startswith("ci-flaky-intake:example/project:")
++    queue = state.with_suffix(".intake.sqlite3")
++    with sqlite3.connect(queue) as conn:
++        assert conn.execute("SELECT count(*) FROM occurrences").fetchone()[0] == 30
++        assert conn.execute("SELECT count(*) FROM occurrences WHERE delivered = 1").fetchone()[0] == 30
++    second = subprocess.run(command, env=env, capture_output=True, text=True, encoding="utf-8", timeout=90, check=False)
++    assert second.returncode == 0, second.stdout + second.stderr
++    assert json.loads(board_path.read_text(encoding="utf-8")) == board
++    # Exercise actual consistent backup, not a hand-written replacement schema.
++    backup = tmp_path / "backup.sqlite3"
++    with sqlite3.connect(queue) as source, sqlite3.connect(backup) as destination:
++        source.backup(destination)
++    if damage != "none":
++        if damage != "missing_anchor":
++            for path in home.glob("cursor.intake.*"):
++                path.unlink()
++        if damage in {"all_state", "missing_anchor"}:
++            for path in (home / ".hermes/intake-identities").glob("*.uuid"):
++                path.unlink()
++        if damage == "all_state":
++            state.unlink()
++        if damage == "replacement":
++            from scripts.ci.flaky_intake import Journal
++            replacement = Journal(queue, identity_path=tmp_path / "other.uuid", initialize=True)
++            replacement.close()
++        elif damage == "restore":
++            with sqlite3.connect(backup) as source, sqlite3.connect(queue) as destination:
++                source.backup(destination)
++        damaged = subprocess.run(command, env=env, capture_output=True, text=True,
++                                 encoding="utf-8", timeout=90, check=False)
++        assert damaged.returncode == (0 if damage == "restore" else 1), damaged.stdout + damaged.stderr
++        assert json.loads(board_path.read_text(encoding="utf-8")) == board
++        if damage != "restore":
++            return
++        with sqlite3.connect(queue) as conn:
++            assert conn.execute("SELECT count(*) FROM occurrences WHERE delivered=1").fetchone()[0] == 30
++    # Losing only the polling cache must not lose or duplicate durable admission.
++    state.unlink()
++    recovered = subprocess.run(command, env=env, capture_output=True, text=True, encoding="utf-8", timeout=90, check=False)
++    assert recovered.returncode == 0, recovered.stdout + recovered.stderr
++    assert json.loads(board_path.read_text(encoding="utf-8")) == board
+diff --git a/tests/ci/test_flaky_exit_policy.py b/tests/ci/test_flaky_exit_policy.py
+index d8fb47c01f..eb40382bea 100644
+--- a/tests/ci/test_flaky_exit_policy.py
++++ b/tests/ci/test_flaky_exit_policy.py
+@@ -46,10 +46,15 @@ def _cancelled(gh, run_id=43179810118, branch=BRANCH, workflow=WF):
+ 
+ 
+ def _main(tmp_path, monkeypatch, capsys):
++    from tests.ci.test_flaky_intake import Board
++
+     monkeypatch.setenv("GH_TOKEN", "tok")
+-    monkeypatch.setattr(fk, "CliBoard", lambda *a, **k: FakeBoard())
++    board = Board()
++    monkeypatch.setattr(fk, "CliBoard", lambda *a, **k: board)
+     monkeypatch.setattr(fk, "HubRelay", lambda *a, **k: None)
+     argv = ["--from-github", "--repo", "o/r", "--state", str(tmp_path / "s.json")]
++    assert fk.main(["--initialize-intake", "--state", str(tmp_path / "s.json")]) == 0
++    capsys.readouterr()
+ 
+     def run() -> tuple[int, str]:
+         rc = fk.main(argv)
+@@ -129,7 +134,12 @@ def test_fresh_missing_artifact_retries_without_failed_and_is_ingested_next_poll
+     assert rc == 0 and "RETRY run=5/1 code=missing" in out and "FAILED" not in out
+     gh.artifacts[5] = listed
+     rc, out = poll()
+-    assert rc == 0 and "opened" in out and A in out
++    assert rc == 0 and "intake delivered" in out
++    import json
++    import sqlite3
++    with sqlite3.connect(tmp_path / "s.intake.sqlite3") as conn:
++        rows = conn.execute("SELECT metadata,delivered FROM occurrences").fetchall()
++    assert len(rows) == 1 and json.loads(rows[0][0])["test_id"] == A and rows[0][1] == 1
+     state = fk.load_state(tmp_path / "s.json")
+     assert state["runs"] == ["5/1"] and state["unavailable"] == {}
+ 
+diff --git a/tests/ci/test_flaky_http_deadlines.py b/tests/ci/test_flaky_http_deadlines.py
+new file mode 100644
+index 0000000000..e9e69c4f18
+--- /dev/null
++++ b/tests/ci/test_flaky_http_deadlines.py
+@@ -0,0 +1,149 @@
++"""CI read budgets cover retries and both artifact hops, not just idle sockets."""
++import io
++import threading
++import time
++from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++from unittest.mock import Mock
++from urllib.error import URLError
++
++import pytest
++
++from scripts.ci import flaky_artifact as fa
++from scripts.ci import flaky_kanban as fk
++
++
++def test_retry_backoff_cannot_start_another_request_after_deadline(monkeypatch):
++    clock = [100.0]
++    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
++    opening = Mock(side_effect=URLError("unavailable"))
++    monkeypatch.setattr(fk.urllib.request, "build_opener", lambda *a: type("Opener", (), {"open": opening})())
++    monkeypatch.setattr(time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
++    with fa.transport.deadline_scope(100.25), pytest.raises(TimeoutError):
++        fk._gh("https://api.github.com/repos/example/repo/actions/runs", "fixture")
++    assert opening.call_count == 1
++    assert clock[0] == 100.25
++
++
++def test_artifact_redirect_does_not_get_a_fresh_budget(monkeypatch):
++    clock = [100.0]
++    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
++    calls = []
++
++    def hop(url, headers, limit):
++        calls.append((url, headers))
++        clock[0] = 102.0
++        return 302, "https://example.blob.core.windows.net/fixture", b""
++
++    monkeypatch.setattr(fa, "_fetch", hop)
++    with fa.transport.deadline_scope(101.0), pytest.raises(fa.ArtifactError, match="download_unavailable"):
++        fa.download_zip("example/repo", 1, "fixture")
++    assert len(calls) == 1
++
++
++def test_scoped_deadline_restores_outer_scope_after_error():
++    with fa.transport.deadline_scope(time.monotonic() + 30):
++        outer = fa.transport.remaining()
++        with pytest.raises(ValueError), fa.transport.deadline_scope(time.monotonic() + 1):
++            assert fa.transport.remaining() <= 1
++            raise ValueError("fixture")
++        assert fa.transport.remaining() > outer - 1
++
++
++@pytest.mark.parametrize("kind", ["artifact", "github"])
++def test_real_trickling_peer_is_cut_at_absolute_deadline(kind):
++    stopped = threading.Event()
++    closed = threading.Event()
++
++    class Handler(BaseHTTPRequestHandler):
++        def log_message(self, *args):
++            pass
++
++        def do_GET(self):
++            try:
++                self.send_response(200)
++                self.send_header("Content-Length", "100000")
++                self.end_headers()
++                while not stopped.wait(0.01):
++                    self.wfile.write(b" ")
++                    self.wfile.flush()
++            except (BrokenPipeError, ConnectionResetError):
++                closed.set()
++
++    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
++    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01})
++    thread.start()
++    url = f"http://127.0.0.1:{server.server_port}/fixture"
++    try:
++        with fa.transport.deadline_scope(time.monotonic() + 0.2), pytest.raises((TimeoutError, URLError)):
++            if kind == "artifact":
++                fa._fetch(url, {}, 10000)
++            else:
++                fk._gh(url, "fixture")
++        assert closed.wait(2), "timeout must cancel the reader, not merely abandon it"
++    finally:
++        stopped.set()
++        server.shutdown()
++        server.server_close()
++        thread.join(2)
++    assert not thread.is_alive()
++
++
++def test_real_poll_propagates_deadline_and_retains_unfinished_run(monkeypatch, tmp_path):
++    from types import SimpleNamespace
++    from tests.ci.flaky_artifact_fakes import FakeGitHub
++    from tests.ci.test_flaky_kanban import FakeBoard
++    from tests.ci.test_flaky_protocol_boundaries import ReadResponse
++    import json
++
++    fake = FakeGitHub()
++    fake.simple()
++    clock = [100.0]
++    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
++    requests = []
++
++    def opening(req, timeout):
++        requests.append((req.full_url, timeout))
++        if req.full_url.endswith("/zip"):
++            clock[0] = 102.0
++            response = ReadResponse(b"")
++            response.status = 302
++            response.headers = {"Location": "https://example.blob.core.windows.net/fixture"}
++            return response
++        return ReadResponse(json.dumps(fake.gh(req.full_url, "fixture")).encode())
++
++    monkeypatch.setattr(fk.urllib.request, "build_opener", lambda *a: SimpleNamespace(open=opening))
++    state = fk.load_state(tmp_path / "state.json")
++    journal = fk.Journal(tmp_path / "queue.sqlite")
++    try:
++        log = fk.poll_github("o/r", "fixture", FakeBoard(), state, deadline=101.0, journal=journal)
++        assert any("download_unavailable" in line for line in log)
++        assert state["runs"] == []
++        assert len(journal.remember_runs("o/r", [])) == 1
++    finally:
++        journal.close()
++    assert all(timeout <= 1 for _, timeout in requests)
++    assert not any("blob.core" in url for url, _ in requests)
++    assert fa.transport.remaining() == 60  # poll restores the caller's context
++
++
++@pytest.mark.parametrize("nested", [None, 200.0])
++def test_nested_scope_cannot_extend_outer_deadline(monkeypatch, nested):
++    monkeypatch.setattr(time, "monotonic", lambda: 100.0)
++    with fa.transport.deadline_scope(101.0), fa.transport.deadline_scope(nested):
++        assert fa.transport.remaining() == 1
++
++
++def test_github_oversize_response_is_not_parsed_or_retried(monkeypatch):
++    reading = Mock(return_value=(200, None, b" " * (16 * 1024 * 1024 + 1)))
++    monkeypatch.setattr(fa.transport, "read", reading)
++    with pytest.raises(ValueError, match="size limit"):
++        fk._gh("https://api.github.com/repos/example/repo/actions/runs", "fixture")
++    reading.assert_called_once()
++
++
++def test_expired_scope_never_opens_transport(monkeypatch):
++    opening = Mock(return_value=io.BytesIO(b"{}"))
++    monkeypatch.setattr(fk.urllib.request, "build_opener", opening)
++    with fa.transport.deadline_scope(time.monotonic() - 1), pytest.raises(TimeoutError):
++        fk._gh("https://api.github.com/repos/example/repo/actions/runs", "fixture")
++    opening.assert_not_called()
+diff --git a/tests/ci/test_flaky_intake.py b/tests/ci/test_flaky_intake.py
+new file mode 100644
+index 0000000000..7a20bf3f9d
+--- /dev/null
++++ b/tests/ci/test_flaky_intake.py
+@@ -0,0 +1,589 @@
++"""Durable intake failure and rollover controls; external Board is an in-memory fake."""
++import json
++
++import pytest
++
++from scripts.ci import flaky_intake as intake
++
++
++def test_missing_previously_initialized_queue_fails_closed(tmp_path):
++    path = tmp_path / "queue.sqlite3"
++    journal = intake.Journal(path)
++    record(journal, count=1)
++    journal.close()
++    path.unlink()
++    with pytest.raises(OSError, match="intake_queue_missing"):
++        intake.Journal(path)
++    assert not path.exists()
++
++
++def test_lock_is_bounded_and_corruption_fails_closed(tmp_path):
++    import sqlite3
++
++    path = tmp_path / "queue.sqlite3"
++    journal = intake.Journal(path)
++    with pytest.raises(BlockingIOError):
++        intake.Journal(path)
++    journal.close()
++    path.write_bytes(b"corrupted journal")
++    for _ in range(2):
++        with pytest.raises(sqlite3.DatabaseError):
++            intake.Journal(path)
++    assert path.read_bytes() == b"corrupted journal"
++
++
++@pytest.mark.parametrize("field,value", [
++    ("retried", "secret failure output"), ("source_sha", "secret failure output"),
++    ("slice", "secret failure output"), ("slices", True), ("run_attempt", False),
++    ("test_id", "not a test"),
++])
++def test_metadata_validation_is_atomic(tmp_path, field, value):
++    journal = intake.Journal(tmp_path / "queue.sqlite3")
++    good = {"test_id": "tests/a.py::test_a", "retried": "tests"}
++    bad = {**good, field: value}
++    with pytest.raises(ValueError, match="^invalid intake metadata$"):
++        journal.record("o/r", [(1, [good, bad])], {"id": 1, "head_sha": "a" * 40})
++    assert journal.db.execute("SELECT count(*) FROM occurrences").fetchone()[0] == 0
++    journal.close()
++
++
++def test_ambiguous_delivery_then_archive_reconciles_before_carry(tmp_path):
++    journal = intake.Journal(tmp_path / "queue.sqlite3")
++    record(journal, count=1)
++    board = Board()
++    board.fail = True
++    journal.deliver("o/r", board)
++    payload = journal.db.execute("SELECT payload FROM pages").fetchone()[0]
++    board.notes["card0"].append(payload)
++    board.cards["card0"]["status"] = "archived"
++    journal.deliver("o/r", board)
++    assert journal.db.execute("SELECT sum(delivered) FROM occurrences").fetchone()[0] == 1
++    assert journal.pending("o/r") == []
++    assert len(board.cards) == 1
++    journal.close()
++
++@pytest.mark.parametrize("readback", [None, {}, {"comments": "truncated"}])
++def test_unavailable_comment_readback_is_not_empty(readback):
++    from scripts.ci import flaky_kanban as fk
++
++    class Unreadable(fk.CliBoard):
++        def _show(self, card_id, board=None):
++            return readback
++
++    with pytest.raises(RuntimeError, match="comments unavailable"):
++        Unreadable().comments("owner")
++
++
++def test_missing_replica_never_admits_to_intake(tmp_path):
++    from scripts.ci import flaky_kanban as fk
++
++    admitted = []
++    with pytest.raises(RuntimeError, match="owner inventory unavailable"):
++        fk.file_cards([{"test_id": "tests/a.py::test_a"}], run_url="https://github.com/o/r/actions/runs/1/job/9",
++                      branch="a" * 40, board=Board(), state={"cards": {}},
++                      relay=fk.HubRelay(tmp_path / "missing.db"),
++                      on_unowned=lambda: admitted.append(True) or "queued")
++    assert not admitted
++
++
++def test_matching_foreign_owner_unreadable_never_admits(tmp_path):
++    import sqlite3
++    from scripts.ci import flaky_kanban as fk
++
++    path = tmp_path / "hub.db"
++    with sqlite3.connect(path) as conn:
++        conn.execute("CREATE TABLE replica (gw TEXT, key TEXT, coll TEXT, data TEXT)")
++        conn.execute("INSERT INTO replica VALUES (?,?,?,?)", (
++            "peer", "default/default/owner", "tasks", json.dumps({
++                "id": "owner", "title": "Deflake tests/a.py::test_a", "status": "running"})))
++    class Unreadable(fk.HubRelay):
++        def self_gateway(self):
++            return "here"
++        def card(self, gw, board, card_id):
++            return None
++
++    admitted = []
++    with pytest.raises(RuntimeError, match="owner readback unavailable"):
++        fk.file_cards([{"test_id": "tests/a.py::test_a"}], run_url="https://github.com/o/r/actions/runs/1/job/9",
++                      branch="a" * 40, board=Board(), state={"cards": {}}, relay=Unreadable(path),
++                      on_unowned=lambda: admitted.append(True) or "queued")
++    assert not admitted
++
++
++@pytest.mark.parametrize("status", ["done", "archived"])
++@pytest.mark.parametrize("same_job", [True, False])
++@pytest.mark.parametrize("history", ["complete", "missing", "tail", "invalid_count", "clipped_comment", "clipped_body"])
++def test_foreign_closed_owner_preserves_exact_job_ownership(tmp_path, status, same_job, history):
++    import sqlite3
++    import time
++    from scripts.ci import flaky_kanban as fk
++
++    url = "https://github.com/o/r/actions/runs/1/job/9"
++    path = tmp_path / "hub.db"
++    owner = {"id": "owner", "title": "Deflake tests/a.py::test_a", "status": status,
++             "body": "", "comments": 1,
++             "last_comments": [{"body": url if same_job else url.replace("/9", "/8")}]}
++    owner.update({
++        "complete": {}, "missing": {}, "tail": {"comments": 4}, "invalid_count": {"comments": True},
++        "clipped_comment": {"last_comments": [{"body": owner["last_comments"][0]["body"] + "\n" + "x" * 500}]},
++        "clipped_body": {"body": "x" * 4000},
++    }[history])
++    if history == "missing":
++        owner.pop("comments")
++    with sqlite3.connect(path) as conn:
++        conn.execute("CREATE TABLE replica (gw TEXT, key TEXT, coll TEXT, data TEXT)")
++        conn.execute("INSERT INTO replica VALUES (?,?,?,?)", (
++            "peer", "default/default/owner", "tasks", json.dumps(owner)))
++        conn.execute("INSERT INTO replica VALUES (?,?,?,?)", (
++            "peer", "info", "gateway", json.dumps({"gateway": "peer", "task_scopes": [
++                {"profile": "default", "board": "default", "state": "ok", "observed_at": time.time()}]})))
++    class Relay(fk.HubRelay):
++        def self_gateway(self):
++            return "here"
++        def comment(self, *args):
++            pytest.fail("closed exact-job owner must not receive a new comment")
++
++    state = {"cards": {}}
++    notes: dict = {}
++    lines = fk.file_cards([{"test_id": "tests/a.py::test_a"}], run_url=url,
++                          branch="a" * 40, board=Board(), state=state, relay=Relay(path),
++                          on_unowned=lambda: "queued", owner_notes=notes)
++    if same_job:
++        assert len(lines) == 1 and lines[0].startswith("skipped")
++        assert state["cards"]["tests/a.py::test_a"]["gateway"] == "peer"
++        assert notes == {}
++    else:
++        # Unverifiable closed history must not strand the occurrence: it is
++        # admitted to the intake WITH the candidate named for triage.
++        assert lines == ["queued"]
++        assert state == {"cards": {}}
++        expected = [] if history == "complete" else [
++            {"candidate": "@task:default@peer/owner", "status": status, "reason": "closed_history_incomplete"}]
++        assert notes == {"tests/a.py::test_a": expected}
++
++
++def test_complete_foreign_history_empty_is_complete():
++    from scripts.ci import flaky_kanban as fk
++    assert fk._complete_foreign_history({"comments": 0, "last_comments": [], "body": "", "title": ""})
++
++
++@pytest.mark.parametrize("field,value", [
++    ("comments", -1), ("comments", "0"), ("comments", False),
++    ("last_comments", {}), ("last_comments", [None]), ("last_comments", [{"body": None}]),
++    ("last_comments", [{"body": "x" * 500}]), ("body", None), ("body", "x" * 4000),
++    ("title", None), ("title", "x" * 300),
++])
++def test_incomplete_foreign_history_cannot_prove_absence(field, value):
++    from scripts.ci import flaky_kanban as fk
++    owner = {"comments": 0, "last_comments": [], "body": "", "title": ""}
++    if field == "last_comments" and isinstance(value, list):
++        owner["comments"] = len(value)
++    owner[field] = value
++    assert not fk._complete_foreign_history(owner)
++
++
++def test_unreadable_cached_owner_never_admits_to_intake():
++    from scripts.ci import flaky_kanban as fk
++
++    class MissingOwner(Board):
++        def card(self, cid):
++            return None
++
++    state = {"cards": {"tests/a.py::test_a": {"card": "missing", "generation": 0}}}
++    admitted = []
++    lines = fk.file_cards([{"test_id": "tests/a.py::test_a"}], run_url="https://github.com/o/r/actions/runs/1/job/9",
++                          branch="a" * 40, board=MissingOwner(), state=state,
++                          on_unowned=lambda: admitted.append(True) or "queued")
++    assert not admitted
++    assert len(lines) == 1 and lines[0].startswith("FAILED")
++    assert state["cards"]["tests/a.py::test_a"]["card"] == "missing"
++
++
++@pytest.mark.parametrize("field,value", [
++    ("id", True), ("run_attempt", 0), ("workflow_id", "secret"),
++    ("head_sha", "secret"), ("head_branch", "x" * 256),
++    ("head_branch", "bad\nbranch"), ("conclusion", "secret"),
++    ("updated_at", "2026-99-99T00:00:00Z"), ("run_started_at", {"secret": 1}),
++])
++def test_run_descriptor_validation_is_atomic(tmp_path, field, value):
++    journal = intake.Journal(tmp_path / "queue.sqlite3")
++    good = {"id": 1, "head_sha": "a" * 40, "head_branch": "feature/topic"}
++    with pytest.raises(ValueError, match="^invalid intake run$"):
++        journal.remember_runs("o/r", [good, {**good, "id": 2, field: value}])
++    assert journal.remember_runs("o/r", []) == []
++    journal.close()
++
++
++def test_delivery_budget_preserves_every_unsent_page(tmp_path, monkeypatch):
++    journal = intake.Journal(tmp_path / "queue.sqlite3")
++    record(journal)
++    board = Board()
++    monkeypatch.setattr(intake.time, "monotonic", lambda: 10)
++    lines = journal.deliver("o/r", board, deadline=10)
++    assert any(line.startswith("FAILED intake_budget") for line in lines)
++    assert not board.cards
++    assert journal.db.execute("SELECT sum(delivered) FROM occurrences").fetchone()[0] == 0
++    journal.deliver("o/r", board, deadline=11)
++    assert journal.db.execute("SELECT sum(delivered) FROM occurrences").fetchone()[0] == 30
++    journal.close()
++
++
++def test_planned_but_unattempted_page_rechecks_new_exact_owner(tmp_path):
++    from scripts.ci import flaky_kanban as fk
++
++    journal = intake.Journal(tmp_path / "queue.sqlite3")
++    record(journal, count=1)
++    board = Board()
++    owner = board.create("Deflake tests/a.py::test_0", "", "deflake:tests/a.py::test_0")
++    lines = fk.drain_intake(journal, "o/r", board, {"cards": {}}, None)
++    assert len(board.cards) == 1
++    assert len(board.notes[owner]) == 1 and board.notes[owner][0].startswith("Flaked again:")
++    assert journal.db.execute("SELECT sum(delivered) FROM occurrences").fetchone()[0] == 1
++    assert not any(line.startswith("FAILED") for line in lines)
++    journal.close()
++
++
++def test_ambiguous_create_keeps_attempted_page_immutable(tmp_path):
++    from scripts.ci import flaky_kanban as fk
++
++    class LostCreate(Board):
++        def create(self, title, body, key):
++            cid = super().create(title, body, key)
++            if key.startswith("ci-flaky-intake:"):
++                raise RuntimeError("response lost")
++            return cid
++
++    journal = intake.Journal(tmp_path / "queue.sqlite3")
++    record(journal, count=1)
++    board = LostCreate()
++    assert journal.deliver("o/r", board)[0].startswith("FAILED")
++    original = journal.db.execute("SELECT payload FROM pages").fetchone()[0]
++    board.create("Deflake tests/a.py::test_0", "", "deflake:tests/a.py::test_0")
++    fk.drain_intake(journal, "o/r", board, {"cards": {}}, None)
++    assert board.notes["card0"] == [original]
++    assert board.notes["card1"] == []
++    assert journal.db.execute("SELECT sum(delivered) FROM occurrences").fetchone()[0] == 1
++    journal.close()
++
++
++@pytest.mark.parametrize("exact", [True, False])
++def test_intake_create_refusal_resolves_racing_owner_or_distinct_work(tmp_path, exact):
++    from scripts.ci import flaky_kanban as fk
++
++    class Racing(Board):
++        def create(self, title, body, key, **kwargs):
++            if not self.cards:
++                other = "tests/a.py::test_0" if exact else "tests/other.py::test_other"
++                super().create(f"Deflake {other}", "", f"deflake:{other}")
++            if kwargs.get("distinct_from") != ["card0"]:
++                raise fk.CreateRefused("overlap", [{"id": "card0"}])
++            assert not exact, "must not declare an exact owner distinct"
++            return super().create(title, body, key)
++
++    journal = intake.Journal(tmp_path / "queue.sqlite3")
++    record(journal, count=1)
++    board, state = Racing(), {"cards": {}}
++    fk.drain_intake(journal, "o/r", board, state, None)
++    fk.drain_intake(journal, "o/r", board, state, None)
++    assert journal.db.execute("SELECT sum(delivered) FROM occurrences").fetchone()[0] == 1
++    assert len(board.cards) == (1 if exact else 2)
++    if exact:
++        assert len(board.notes["card0"]) == 1
++        assert board.notes["card0"][0].startswith("Flaked again:")
++    else:
++        assert board.notes["card0"] == []
++        assert len(board.notes["card1"]) == 1
++    journal.close()
++
++
++@pytest.mark.parametrize("status", ["done", "archived"])
++@pytest.mark.parametrize("same_job", [True, False])
++def test_closed_overlap_owner_only_blocks_its_own_job(tmp_path, status, same_job):
++    from scripts.ci import flaky_kanban as fk
++
++    class Racing(Board):
++        def create(self, title, body, key, **kwargs):
++            if not self.cards:
++                cid = super().create("Deflake tests/a.py::test_0", "", "deflake:tests/a.py::test_0")
++                self.cards[cid]["status"] = status
++                job = 9 if same_job else 8
++                self.notes[cid].append(f"https://github.com/o/r/actions/runs/1/job/{job}")
++            if kwargs.get("distinct_from") != ["card0"]:
++                raise fk.CreateRefused("overlap", [{"id": "card0"}])
++            assert not same_job, "same job remains owned even when closed"
++            return super().create(title, body, key)
++
++    journal = intake.Journal(tmp_path / "queue.sqlite3")
++    record(journal, count=1)
++    board, state = Racing(), {"cards": {}}
++    fk.drain_intake(journal, "o/r", board, state, None)
++    fk.drain_intake(journal, "o/r", board, state, None)
++    assert journal.db.execute("SELECT sum(delivered) FROM occurrences").fetchone()[0] == 1
++    assert len(board.cards) == (1 if same_job else 2)
++    assert len(board.notes["card0"]) == 1
++    assert board.cards["card0"]["status"] == status
++    journal.close()
++
++
++def test_definitive_refusal_with_missing_readback_remains_retriable(tmp_path):
++    from scripts.ci import flaky_kanban as fk
++
++    class Refusing(Board):
++        def create(self, *args, **kwargs):
++            raise fk.CreateRefused("overlap", [{"id": "unknown"}])
++        def card(self, cid):
++            return None
++
++    journal = intake.Journal(tmp_path / "queue.sqlite3")
++    record(journal, count=1)
++    assert any(line.startswith("FAILED") for line in fk.drain_intake(
++        journal, "o/r", Refusing(), {"cards": {}}, None))
++    assert len(journal.pending("o/r")) == 1
++    board = Board()
++    fk.drain_intake(journal, "o/r", board, {"cards": {}}, None)
++    assert journal.db.execute("SELECT sum(delivered) FROM occurrences").fetchone()[0] == 1
++    journal.close()
++
++
++def test_prior_ambiguous_create_followed_by_refusal_never_repartitions(tmp_path):
++    from scripts.ci import flaky_kanban as fk
++
++    class Refusing(Board):
++        def create(self, *args, **kwargs):
++            raise fk.CreateRefused("overlap", [{"id": "unknown"}])
++
++    journal = intake.Journal(tmp_path / "queue.sqlite3")
++    record(journal, count=1)
++    with journal.db:
++        journal.db.execute("UPDATE pages SET attempted=1")
++    original = tuple(journal.db.execute("SELECT * FROM pages").fetchone())
++    fk.drain_intake(journal, "o/r", Refusing(), {"cards": {}}, None)
++    assert tuple(journal.db.execute("SELECT * FROM pages").fetchone()) == original
++    assert journal.pending("o/r") == []
++    assert journal.db.execute("SELECT sum(delivered) FROM occurrences").fetchone()[0] == 0
++    journal.close()
++
++
++def test_old_page_schema_migrates_conservatively(tmp_path):
++    import sqlite3
++
++    path = tmp_path / "queue.sqlite3"
++    with sqlite3.connect(path) as conn:
++        conn.execute("CREATE TABLE pages (id INTEGER PRIMARY KEY, repo TEXT NOT NULL, day TEXT NOT NULL, "
++                     "payload TEXT NOT NULL, card TEXT, delivered INTEGER NOT NULL DEFAULT 0)")
++        conn.execute("INSERT INTO pages(repo,day,payload) VALUES ('o/r','2026-11-13','old payload')")
++    journal = intake.Journal(path)
++    journal.recheck_unattempted("o/r")
++    assert journal.db.execute("SELECT payload,attempted FROM pages").fetchone()[:] == ("old payload", 1)
++    record(journal, count=1)
++    assert journal.db.execute("SELECT attempted FROM pages WHERE id=2").fetchone()[0] == 0
++    journal.close()
++
++
++def test_owner_resolution_budget_leaves_rows_retryable(tmp_path, monkeypatch):
++    from scripts.ci import flaky_kanban as fk
++
++    journal = intake.Journal(tmp_path / "queue.sqlite3")
++    journal.record("o/r", [(9, [{"test_id": "tests/a.py::test_a"}])], {"id": 1, "head_sha": "a" * 40})
++    monkeypatch.setattr(fk.time, "monotonic", lambda: 10)
++    board = Board()
++    lines = fk.drain_intake(journal, "o/r", board, {"cards": {}}, None, deadline=10)
++    assert any(line.startswith("FAILED intake_budget") for line in lines)
++    assert len(journal.pending("o/r")) == 1
++    assert not board.cards
++    journal.close()
++
++
++def test_unavailable_owner_does_not_abort_other_occurrences(tmp_path, monkeypatch):
++    from scripts.ci import flaky_kanban as fk
++
++    journal = intake.Journal(tmp_path / "queue.sqlite3")
++    record(journal, count=2)
++    original = fk.file_cards
++    def resolve(entries, **kwargs):
++        if entries[0]["test_id"] == "tests/a.py::test_0":
++            raise RuntimeError("owner scope freshness unavailable")
++        return original(entries, **kwargs)
++    monkeypatch.setattr(fk, "file_cards", resolve)
++    board, state = Board(), {"cards": {}}
++    for _ in range(2):
++        lines = fk.drain_intake(journal, "o/r", board, state, None)
++        assert any(line.startswith("FAILED") for line in lines)
++        assert journal.db.execute("SELECT delivered FROM occurrences ORDER BY id").fetchone()[0] == 0
++        assert journal.db.execute("SELECT sum(delivered) FROM occurrences").fetchone()[0] == 1
++    assert len(board.cards) == 1 and len(board.notes["card0"]) == 1
++    journal.close()
++
++
++class Board:
++    def __init__(self):
++        self.cards = {}
++        self.notes = {}
++        self.fail = False
++        self.ambiguous = False
++
++    def list_cards(self):
++        return list(self.cards.values())
++
++    def create(self, title, body, key):
++        existing = [c for c in self.cards.values() if c["idempotency_key"] == key]
++        if existing:
++            return existing[0]["id"]
++        cid = f"card{len(self.cards)}"
++        self.cards[cid] = dict(id=cid, title=title, body=body, idempotency_key=key, status="ready")
++        self.notes[cid] = []
++        return cid
++
++    def card(self, cid):
++        return self.cards[cid]
++
++    def comments(self, cid):
++        return self.notes[cid]
++
++    def comment(self, cid, body):
++        if self.fail:
++            raise RuntimeError("unavailable")
++        self.notes[cid].append(body)
++        if self.ambiguous:
++            raise RuntimeError("response lost")
++
++    def reopen(self, cid):
++        self.cards[cid]["status"] = "ready"
++
++
++def record(journal, run=1, count=30):
++    journal.record("o/r", [(9, [{"test_id": f"tests/a.py::test_{i}", "retried": "tests"}
++                                for i in range(count)])], {"id": run, "head_sha": "a" * 40})
++    journal.plan_pages("o/r", journal.pending("o/r"))
++
++
++def test_failure_restart_immutable_pages_and_ambiguous_comment(tmp_path):
++    path = tmp_path / "queue.sqlite3"
++    j = intake.Journal(path)
++    record(j)
++    board = Board()
++    board.fail = True
++    assert all(line.startswith("FAILED") for line in j.deliver("o/r", board))
++    assert j.db.execute("SELECT sum(delivered) FROM occurrences").fetchone()[0] == 0
++    payloads = [r[0] for r in j.db.execute("SELECT payload FROM pages ORDER BY id")]
++    j.close()
++    j = intake.Journal(path)
++    board.fail = False
++    board.ambiguous = True
++    assert all(not line.startswith("FAILED") for line in j.deliver("o/r", board))
++    assert j.db.execute("SELECT sum(delivered) FROM occurrences").fetchone()[0] == 30
++    assert len(board.cards) == 1
++    assert board.notes["card0"] == payloads
++    assert j.deliver("o/r", board) == []
++    items = []
++    for payload in payloads:
++        assert len(payload.encode()) <= intake.PAGE_BYTES
++        items += json.loads(payload.split("```json\n")[1].split("\n```")[0])["occurrences"]
++    assert len({i["occurrence_id"] for i in items}) == 30
++    assert len(payloads) > 1
++    j.close()
++
++
++def test_done_reopens_and_archive_carries_forward_without_same_day_duplicate(tmp_path, monkeypatch):
++    monkeypatch.setattr(intake, "utc_day", lambda: "2026-11-13")
++    j = intake.Journal(tmp_path / "queue.sqlite3")
++    board = Board()
++    record(j, count=1)
++    j.deliver("o/r", board)
++    board.cards["card0"]["status"] = "done"
++    record(j, run=2, count=1)
++    j.deliver("o/r", board)
++    assert board.cards["card0"]["status"] == "ready"
++    assert len(board.cards) == 1
++    board.cards["card0"]["status"] = "archived"
++    record(j, run=3, count=1)
++    assert j.deliver("o/r", board)[0].startswith("FAILED")
++    j.plan_pages("o/r", j.pending("o/r"))
++    assert j.deliver("o/r", board)[0].startswith("FAILED")
++    assert len(board.cards) == 1
++    monkeypatch.setattr(intake, "utc_day", lambda: "2026-11-14")
++    j.deliver("o/r", board)
++    assert len(board.cards) == 2
++    assert j.db.execute("SELECT sum(delivered) FROM occurrences").fetchone()[0] == 3
++    assert j.db.execute("SELECT day,target_day FROM occurrences WHERE id=3").fetchone()[:] == (
++        "2026-11-13", "2026-11-14")
++    record(j, run=4, count=1)
++    j.deliver("o/r", board)
++    assert len(board.cards) == 2
++    j.close()
++
++
++def test_pending_run_descriptors_survive_window_and_completion(tmp_path):
++    path = tmp_path / "queue.sqlite3"
++    j = intake.Journal(path)
++    run = {"id": 1, "run_attempt": 2, "head_sha": "a" * 40, "untrusted_output": "not persisted"}
++    assert len(j.remember_runs("o/r", [run])) == 1
++    j.close()
++    j = intake.Journal(path)
++    assert j.remember_runs("o/r", []) == [{k: v for k, v in run.items() if k != "untrusted_output"}]
++    j.finish_run("o/r", "1/2")
++    assert j.remember_runs("o/r", [run]) == []
++    j.close()
++
++
++def test_pending_runs_retried_despite_listing_outage_and_json_done(tmp_path, monkeypatch):
++    from scripts.ci import flaky_kanban as fk
++
++    journal = intake.Journal(tmp_path / "queue.sqlite3")
++    run = {"id": 1, "run_attempt": 2, "head_sha": "a" * 40}
++    journal.remember_runs("o/r", [run])
++    state = {"runs": ["1/2"], "cards": {}}
++    def unavailable(*args, **kwargs):
++        raise OSError("unavailable")
++    monkeypatch.setattr(fk, "_completed_runs", unavailable)
++    seen = []
++    def assess(repo, token, descriptor, board, state, relay, journal):
++        seen.append(descriptor)
++        return "empty", [], None
++    monkeypatch.setattr(fk, "_poll_run", assess)
++    lines = fk.poll_github("o/r", "unused", Board(), state, journal=journal)
++    assert "FAILED runs_unavailable" in lines
++    assert seen == [run]
++    assert journal.remember_runs("o/r", []) == []
++    journal.close()
++
++
++def test_unverifiable_closed_foreign_candidate_is_admitted_with_named_candidate(tmp_path):
++    """A clipped closed foreign history neither strands the row nor hides the candidate."""
++    import sqlite3
++    import time
++    from scripts.ci import flaky_kanban as fk
++
++    path = tmp_path / "hub.db"
++    with sqlite3.connect(path) as conn:
++        conn.execute("CREATE TABLE replica (gw TEXT, key TEXT, coll TEXT, data TEXT)")
++        conn.execute("INSERT INTO replica VALUES (?,?,?,?)", ("peer", "default/default/old", "tasks", json.dumps({
++            "id": "old", "title": "Deflake tests/a.py::test_0", "status": "done", "body": "",
++            "comments": 9, "last_comments": [{"body": "another job"}]})))
++        conn.execute("INSERT INTO replica VALUES (?,?,?,?)", ("peer", "info", "gateway", json.dumps({
++            "gateway": "peer", "task_scopes": [
++                {"profile": "default", "board": "default", "state": "ok", "observed_at": time.time()}]})))
++
++    class Relay(fk.HubRelay):
++        def self_gateway(self):
++            return "here"
++
++        def comment(self, *args):
++            pytest.fail("a closed candidate never receives the comment")
++
++    journal = intake.Journal(tmp_path / "queue.sqlite3")
++    journal.record("o/r", [(9, [{"test_id": "tests/a.py::test_0", "retried": "tests"}])],
++                   {"id": 1, "head_sha": "a" * 40})
++    board = Board()
++    lines = fk.drain_intake(journal, "o/r", board, {"cards": {}}, Relay(path))
++    assert not any(line.startswith("FAILED") for line in lines), lines
++    assert journal.pending("o/r") == []
++    assert journal.db.execute("SELECT sum(delivered) FROM occurrences").fetchone()[0] == 1
++    [card] = board.cards.values()
++    assert card["idempotency_key"].startswith("ci-flaky-intake:o/r:")
++    assert "not inventoried" in card["body"]
++    [payload] = board.notes[card["id"]]
++    item = json.loads(payload.split("```json\n", 1)[1].split("\n```", 1)[0])["occurrences"][0]
++    assert item["status"] == "needs_triage"
++    assert item["owner_check"] == [
++        {"candidate": "@task:default@peer/old", "status": "done", "reason": "closed_history_incomplete"}]
+diff --git a/tests/ci/test_flaky_intake_fairness.py b/tests/ci/test_flaky_intake_fairness.py
+new file mode 100644
+index 0000000000..e13acc7ec8
+--- /dev/null
++++ b/tests/ci/test_flaky_intake_fairness.py
+@@ -0,0 +1,220 @@
++"""Deterministic budget exhaustion across real journal reopen boundaries."""
++import json
++
++from scripts.ci import flaky_intake as intake
++from scripts.ci import flaky_kanban as fk
++from tests.ci.test_flaky_intake import Board
++
++
++def test_enqueued_retries_precede_sustained_new_arrivals(tmp_path):
++    path = tmp_path / "queue.sqlite3"
++    run = {"id": 1, "head_sha": "a" * 40}
++    journal = intake.Journal(path)
++    journal.record("o/r", [(9, [{"test_id": "tests/a.py::test_old"}])], run)
++    journal.remember_runs("o/r", [run])
++    old = journal.pending("o/r")[0]
++    journal.rotate("o/r", "occurrence", str(old["id"]))
++    journal.rotate("o/r", "run", "1/1")
++    journal.close()
++    for i in range(2, 7):
++        journal = intake.Journal(path)
++        new_run = {"id": i, "head_sha": "a" * 40}
++        journal.record("o/r", [(9, [{"test_id": f"tests/a.py::test_new_{i}"}])], new_run)
++        pending_runs = journal.remember_runs("o/r", [new_run, run])
++        assert pending_runs[0]["id"] == 1
++        assert journal.pending("o/r")[0]["id"] == old["id"]
++        journal.close()
++
++
++def test_failed_page_precedes_new_pages_after_restart(tmp_path, monkeypatch):
++    path = tmp_path / "queue.sqlite3"
++    clock, attempted = [0.0], []
++    monkeypatch.setattr(intake.time, "monotonic", lambda: clock[0])
++    class Unavailable(Board):
++        def list_cards(self):
++            clock[0] += 20
++            raise RuntimeError("unavailable")
++    for i in range(1, 5):
++        journal = intake.Journal(path)
++        journal.record("o/r", [(9, [{"test_id": f"tests/a.py::test_{i}"}])],
++                       {"id": i, "head_sha": "a" * 40})
++        journal.plan_pages("o/r", journal.pending("o/r"))
++        before = dict(journal.db.execute("SELECT item,ticket FROM scheduling WHERE kind='page'"))
++        journal.deliver("o/r", Unavailable(), deadline=clock[0] + 10)
++        after = dict(journal.db.execute("SELECT item,ticket FROM scheduling WHERE kind='page'"))
++        attempted.extend(int(k) for k, v in after.items() if before.get(k) != v)
++        journal.close()
++    assert attempted == [1, 1, 2, 1]
++
++
++def test_legacy_missing_tickets_backfill_before_new_arrivals(tmp_path):
++    path = tmp_path / "queue.sqlite3"
++    journal = intake.Journal(path)
++    run = {"id": 9, "head_sha": "a" * 40}
++    journal.remember_runs("o/r", [run])
++    journal.record("o/r", [(9, [{"test_id": "tests/a.py::test_old"}])], run)
++    journal.plan_pages("o/r", journal.pending("o/r"))
++    with journal.db:
++        journal.db.execute("DELETE FROM scheduling")
++    journal.close()
++    journal = intake.Journal(path)
++    before = [tuple(r) for r in journal.db.execute("SELECT * FROM scheduling ORDER BY ticket")]
++    assert {r[1] for r in before} == {"run", "occurrence", "page"}
++    assert [r["id"] for r in journal.remember_runs("o/r", [{"id": 1, "head_sha": "a" * 40}])] == [9, 1]
++    journal.close()
++    journal = intake.Journal(path)
++    assert [tuple(r) for r in journal.db.execute("SELECT * FROM scheduling ORDER BY ticket LIMIT 3")] == before
++    journal.close()
++
++
++def test_reused_page_id_gets_new_enqueue_ticket(tmp_path):
++    journal = intake.Journal(tmp_path / "queue.sqlite3")
++    journal.record("o/r", [(9, [{"test_id": "tests/a.py::test_old"}])],
++                   {"id": 1, "head_sha": "a" * 40})
++    journal.plan_pages("o/r", journal.pending("o/r"))
++    page_id = journal.db.execute("SELECT id FROM pages").fetchone()[0]
++    journal.rotate("o/r", "page", str(page_id))
++    ticket = journal.db.execute("SELECT ticket FROM scheduling WHERE kind='page'").fetchone()[0]
++    journal.unplan_page(page_id)
++    journal.rotate("o/r", "occurrence", "1")
++    journal.plan_pages("o/r", journal.pending("o/r"))
++    assert journal.db.execute("SELECT id FROM pages").fetchone()[0] == page_id
++    assert journal.db.execute("SELECT ticket FROM scheduling WHERE kind='page'").fetchone()[0] > ticket
++    journal.close()
++
++
++def test_main_drains_durable_backlog_before_slow_discovery(tmp_path, monkeypatch):
++    home = tmp_path / "isolated-home"
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("GH_TOKEN", "fixture-not-a-secret")
++    state_path = tmp_path / "cursor.json"
++    argv = ["--state", str(state_path), "--repo", "o/r", "--from-github", "--budget", "10"]
++    assert fk.main([*argv, "--initialize-intake"]) == 0
++    journal = intake.Journal(state_path.with_suffix(".intake.sqlite3"))
++    journal.record("o/r", [(9, [{"test_id": "tests/a.py::test_pending"}])],
++                   {"id": 1, "head_sha": "a" * 40})
++    journal.close()
++    board = Board()
++    monkeypatch.setattr(fk, "CliBoard", lambda *a: board)
++    monkeypatch.setattr(fk, "HubRelay", lambda *a, **kw: None)
++    clock, observed = [0.0], []
++    monkeypatch.setattr(fk.time, "monotonic", lambda: clock[0])
++    def discover(*args, **kwargs):
++        observed.append(len(board.notes.get("card0", [])))
++        assert state_path.is_file(), "delivery must checkpoint before network"
++        clock[0] += 20
++        raise OSError("fixture network unavailable")
++    monkeypatch.setattr(fk, "_completed_runs", discover)
++    assert fk.main(argv) == 1  # network failure remains red, not hidden by delivery
++    assert observed == [1]
++    journal = intake.Journal(state_path.with_suffix(".intake.sqlite3"))
++    assert journal.db.execute("SELECT sum(delivered) FROM occurrences").fetchone()[0] == 1
++    journal.close()
++    assert fk.main(argv) == 1
++    assert observed == [1, 1]
++    assert len(board.cards) == 1
++
++
++
++def test_budgeted_owner_scan_eventually_delivers_whole_backlog(tmp_path, monkeypatch):
++    path = tmp_path / "queue.sqlite3"
++    clock = [0.0]
++    monkeypatch.setattr(fk.time, "monotonic", lambda: clock[0])
++    original = fk.file_cards
++    def resolve(*args, **kwargs):
++        clock[0] += 1
++        return original(*args, **kwargs)
++    monkeypatch.setattr(fk, "file_cards", resolve)
++    board, state = Board(), {"cards": {}}
++    with_journal = intake.Journal(path)
++    with_journal.record("o/r", [(9, [{"test_id": f"tests/a.py::test_{i}"} for i in range(40)])],
++                        {"id": 1, "head_sha": "a" * 40})
++    with_journal.close()
++    for _ in range(12):
++        journal = intake.Journal(path)
++        fk.drain_intake(journal, "o/r", board, state, None, deadline=clock[0] + 10)
++        journal.close()
++    journal = intake.Journal(path)
++    assert journal.db.execute("SELECT sum(delivered) FROM occurrences").fetchone()[0] == 40
++    assert len(board.cards) == 1
++    items = [item for payload in board.notes["card0"] for item in
++             json.loads(payload.split("```json\n")[1].split("\n```")[0])["occurrences"]]
++    assert len(items) == len({item["occurrence_id"] for item in items}) == 40
++    journal.close()
++
++
++def test_pending_run_retry_rotates_after_budget_exhaustion(tmp_path, monkeypatch):
++    path = tmp_path / "queue.sqlite3"
++    clock, seen = [0.0], []
++    monkeypatch.setattr(fk.time, "monotonic", lambda: clock[0])
++    runs = [{"id": i, "head_sha": "a" * 40} for i in (1, 2)]
++    monkeypatch.setattr(fk, "_completed_runs", lambda *a, **kw: runs)
++    def poll(repo, token, run, board, state, relay, journal):
++        seen.append(run["id"])
++        clock[0] += 20
++        return "unavailable", [], "missing"
++    monkeypatch.setattr(fk, "_poll_run", poll)
++    state = {"cards": {}, "runs": []}
++    receipts = []
++    for _ in range(4):
++        journal = intake.Journal(path)
++        receipts += fk.poll_github("o/r", "unused", Board(), state, journal=journal, deadline=clock[0] + 10)
++        journal.close()
++    assert seen == [1, 2, 1, 2]
++    assert sum(line.startswith("FAILED run=") for line in receipts) == 2
++    journal = intake.Journal(path)
++    assert len(journal.remember_runs("o/r", [])) == 2
++    journal.close()
++
++
++def test_retry_pages_rotate_after_slow_failure(tmp_path, monkeypatch):
++    path = tmp_path / "queue.sqlite3"
++    clock = [0.0]
++    monkeypatch.setattr(intake.time, "monotonic", lambda: clock[0])
++    class Slow(Board):
++        def comment(self, cid, body):
++            if '"test_id": "tests/a.py::test_0"' in body:
++                clock[0] += 20
++                raise RuntimeError("delivery unavailable")
++            super().comment(cid, body)
++    journal = intake.Journal(path)
++    journal.record("o/r", [(9, [{"test_id": f"tests/a.py::test_{i}"} for i in range(2)])],
++                   {"id": 1, "head_sha": "a" * 40})
++    for row in journal.pending("o/r"):
++        journal.plan_pages("o/r", [row])
++    journal.close()
++    board = Slow()
++    for _ in range(2):
++        journal = intake.Journal(path)
++        journal.deliver("o/r", board, deadline=clock[0] + 10)
++        journal.close()
++    journal = intake.Journal(path)
++    assert [r[0] for r in journal.db.execute("SELECT delivered FROM occurrences ORDER BY id")] == [0, 1]
++    assert len(board.notes["card0"]) == 1
++    journal.close()
++
++
++def test_slow_unavailable_owner_rotates_past_prefix_after_restart(tmp_path, monkeypatch):
++    path = tmp_path / "queue.sqlite3"
++    clock = [0.0]
++    monkeypatch.setattr(fk.time, "monotonic", lambda: clock[0])
++    original = fk.file_cards
++    def resolve(entries, **kwargs):
++        if entries[0]["test_id"].endswith("test_0"):
++            clock[0] += 20
++            raise RuntimeError("owner unavailable")
++        return original(entries, **kwargs)
++    monkeypatch.setattr(fk, "file_cards", resolve)
++    journal = intake.Journal(path)
++    journal.record("o/r", [(9, [{"test_id": f"tests/a.py::test_{i}"} for i in range(2)])],
++                   {"id": 1, "head_sha": "a" * 40})
++    journal.close()
++    board, state = Board(), {"cards": {}}
++    for _ in range(3):
++        journal = intake.Journal(path)
++        fk.drain_intake(journal, "o/r", board, state, None, deadline=clock[0] + 10)
++        journal.close()
++    journal = intake.Journal(path)
++    assert [r[0] for r in journal.db.execute("SELECT delivered FROM occurrences ORDER BY id")] == [0, 1]
++    assert len(board.cards) == 1
++    journal.close()
+diff --git a/tests/ci/test_flaky_intake_freshness.py b/tests/ci/test_flaky_intake_freshness.py
+new file mode 100644
+index 0000000000..a550708f31
+--- /dev/null
++++ b/tests/ci/test_flaky_intake_freshness.py
+@@ -0,0 +1,139 @@
++"""Intake admission must not turn stale foreign ownership into absence."""
++import json
++import sqlite3
++import time
++
++import pytest
++
++from scripts.ci import flaky_kanban as fk
++from tests.ci import test_flaky_kanban_overlap as helpers
++
++env = helpers.env
++
++
++@pytest.mark.parametrize("cached", [False, True])
++@pytest.mark.parametrize("proof", ["missing", "stale", "future", "unknown", "duplicate", "wrong-profile",
++                                  "wrong-board", "wrong-gateway", "fresh", "published-period"])
++def test_intake_foreign_scope_proof(env, cached, proof):
++    env.remote("macbook", "default/default/t_owner", "running", f"Deflake {helpers.TEST}")
++    path = env.tmp / "hub" / "hub.db"
++    now = time.time()
++    scope = {"profile": "default", "board": "default", "state": "ok", "observed_at": now}
++    if proof == "stale":
++        scope["observed_at"] = now - 1801
++    if proof == "future":
++        scope["observed_at"] = now + 3600
++    if proof == "unknown":
++        scope["state"] = "unknown"
++    if proof == "wrong-profile":
++        scope["profile"] = "other"
++    if proof == "wrong-board":
++        scope["board"] = "other"
++    if proof == "published-period":
++        scope["observed_at"] = now - 600
++    with sqlite3.connect(path) as conn:
++        conn.execute("DELETE FROM replica WHERE coll='gateway'")
++        if proof != "missing":
++            info = {"gateway": "macbook", "task_scopes": [scope] * (2 if proof == "duplicate" else 1)}
++            if proof == "wrong-gateway":
++                info["gateway"] = "other"
++            if proof == "published-period":
++                info["scope_heartbeat_period_s"] = 400
++            conn.execute("INSERT INTO replica VALUES (?, 'gateway', 'info', 1, 1, ?, 0)",
++                         ("macbook", json.dumps(info)))
++    state = {"cards": {}}
++    if cached:
++        state["cards"][helpers.TEST] = {"card": "t_owner", "gateway": "macbook", "board": "default"}
++    admitted = []
++    def invoke():
++        return fk.file_cards([helpers._entry()], run_url=helpers.RUN, branch="a" * 40,
++                             board=fk.CliBoard(env.hermes), state=state, relay=fk.HubRelay(path, wait=0),
++                             on_unowned=lambda: admitted.append(True) or "queued")
++    if proof in ("fresh", "published-period"):
++        assert invoke()[0].startswith("appended")
++        assert len(env.remote_comments("macbook", "default/default/t_owner")) == 1
++    else:
++        with pytest.raises(RuntimeError, match="owner scope freshness unavailable"):
++            invoke()
++        assert env.hub_calls() == []
++    assert not admitted
++    assert not env.kanban()["cards"]
++
++
++@pytest.mark.parametrize("reverse", [False, True])
++@pytest.mark.parametrize("first_status,first_cites,second_cites,expected", [
++    ("done", False, False, "t_second"),  # incomplete history is not proof against a positive owner
++    ("running", False, True, "t_second"),  # exact incident outranks open test-only owner
++    ("done", True, True, "t_second"),  # open incident owner outranks closed incident
++    ("done", True, False, "t_first"),  # closed incident outranks open test-only owner
++])
++def test_foreign_owner_precedence_is_independent_of_replica_order(
++    env, reverse, first_status, first_cites, second_cites, expected,
++):
++    owners = [("t_first", first_status, first_cites), ("t_second", "running", second_cites)]
++    for cid, status, cites in reversed(owners) if reverse else owners:
++        env.remote("macbook", f"default/default/{cid}", status, f"Deflake {helpers.TEST}",
++                   helpers.RUN if cites else "")
++    state = {"cards": {}}
++    admitted = []
++    def invoke():
++        return fk.file_cards([helpers._entry()], run_url=helpers.RUN, branch="a" * 40,
++                             board=fk.CliBoard(env.hermes), state=state,
++                             relay=fk.HubRelay(env.tmp / "hub" / "hub.db", wait=0),
++                             on_unowned=lambda: admitted.append(True) or "queued")
++    result = invoke()
++    assert state["cards"][helpers.TEST]["card"] == expected
++    assert not admitted and not env.kanban()["cards"]
++    if expected == "t_first":
++        assert result[0].startswith("skipped")
++        assert env.hub_calls() == []
++    else:
++        assert result[0].startswith("appended")
++        assert len(env.remote_comments("macbook", "default/default/t_second")) == 1
++        assert env.remote_comments("macbook", "default/default/t_first") == []
++
++
++@pytest.mark.parametrize("unavailable", ["stale", "unreadable"])
++@pytest.mark.parametrize("positive", [False, True])
++def test_unknown_foreign_candidate_does_not_hide_known_positive(env, monkeypatch, unavailable, positive):
++    env.remote("macbook", "default/default/t_unknown", "running", f"Deflake {helpers.TEST}")
++    if positive:
++        env.remote("worker", "default/default/t_known", "running", f"Deflake {helpers.TEST}")
++    relay = fk.HubRelay(env.tmp / "hub" / "hub.db", wait=0)
++    original = relay.card
++    def card(gw, board, cid):
++        return None if gw == "macbook" and unavailable == "unreadable" else original(gw, board, cid)
++    monkeypatch.setattr(relay, "card", card)
++    if unavailable == "stale":
++        with sqlite3.connect(relay.db) as conn:
++            conn.execute("DELETE FROM replica WHERE coll='gateway' AND gw='macbook'")
++    state = {"cards": {}}
++    def invoke():
++        return fk.file_cards([helpers._entry()], run_url=helpers.RUN, branch="a" * 40,
++                             board=fk.CliBoard(env.hermes), state=state, relay=relay,
++                             on_unowned=lambda: pytest.fail("unknown owner must not admit intake"))
++    if positive:
++        assert invoke()[0].startswith("appended")
++        assert state["cards"][helpers.TEST]["card"] == "t_known"
++        assert len(env.remote_comments("worker", "default/default/t_known")) == 1
++    else:
++        with pytest.raises(RuntimeError, match="owner .*unavailable"):
++            invoke()
++        assert env.hub_calls() == []
++    assert env.remote_comments("macbook", "default/default/t_unknown") == []
++
++
++@pytest.mark.parametrize("status", ["done", "archived"])
++@pytest.mark.parametrize("complete", [False, True])
++@pytest.mark.parametrize("same_job", [False, True])
++def test_closed_foreign_overlap_uses_full_history_proof(env, status, complete, same_job):
++    ctx = fk._Flake(helpers.TEST, helpers.RUN, "a" * 40, "", fk.CliBoard(env.hermes),
++                    {"cards": {}}, None, "hub")
++    owner = {"id": "t_closed", "gateway": "macbook", "board": "default", "status": status,
++             "title": f"Deflake {helpers.TEST}", "body": "", "comments": 1 if complete else 10,
++             "last_comments": [{"body": helpers.RUN if same_job else "another job"}]}
++    if same_job or complete:
++        assert fk._overlap_owns(ctx, owner) is same_job
++    else:
++        with pytest.raises(RuntimeError, match="closed foreign owner history unavailable"):
++            fk._overlap_owns(ctx, owner)
+diff --git a/tests/ci/test_flaky_intake_recovery.py b/tests/ci/test_flaky_intake_recovery.py
+new file mode 100644
+index 0000000000..83f58cf995
+--- /dev/null
++++ b/tests/ci/test_flaky_intake_recovery.py
+@@ -0,0 +1,65 @@
++"""Independent journal identity and consistent backup recovery controls."""
++import sqlite3
++
++import pytest
++
++from scripts.ci.flaky_intake import Journal
++
++
++def test_pending_rows_and_immutable_pages_survive_backup_restore(tmp_path):
++    queue, anchor = tmp_path / "queue.sqlite3", tmp_path / "independent/id.uuid"
++    journal = Journal(queue, identity_path=anchor, initialize=True)
++    journal.record("o/r", [(9, [{"test_id": "tests/test_x.py::test_y"}])],
++                   {"id": 5, "head_sha": "a" * 40})
++    journal.plan_pages("o/r", journal.pending("o/r"))
++    with journal.db:
++        journal.db.execute("UPDATE pages SET attempted=1")
++    rows = [tuple(r) for r in journal.db.execute("SELECT * FROM occurrences")]
++    pages = [tuple(r) for r in journal.db.execute("SELECT * FROM pages")]
++    backup = tmp_path / "backup.sqlite3"
++    with sqlite3.connect(backup) as destination:
++        journal.db.backup(destination)
++    journal.close()
++    queue.unlink()
++    with sqlite3.connect(backup) as source, sqlite3.connect(queue) as destination:
++        source.backup(destination)
++    restored = Journal(queue, identity_path=anchor)
++    try:
++        assert [tuple(r) for r in restored.db.execute("SELECT * FROM occurrences")] == rows
++        assert [tuple(r) for r in restored.db.execute("SELECT * FROM pages")] == pages
++        assert rows[0][6] == 0  # still pending, not inferred delivered from the backup
++        restored.recheck_unattempted("o/r")
++        assert [tuple(r) for r in restored.db.execute("SELECT * FROM pages")] == pages
++    finally:
++        restored.close()
++
++
++@pytest.mark.parametrize("damage", ["invalid_uuid", "mismatch", "duplicate", "missing_table"])
++def test_identity_refusal_releases_lock_and_does_not_modify_queue(tmp_path, damage):
++    queue, anchor = tmp_path / "queue.sqlite3", tmp_path / "id.uuid"
++    Journal(queue, identity_path=anchor, initialize=True).close()
++    with sqlite3.connect(queue) as db:
++        if damage == "invalid_uuid":
++            anchor.write_text("not-a-uuid\n", encoding="utf-8")
++            db.execute("UPDATE journal_identity SET uuid='not-a-uuid'")
++        elif damage == "mismatch":
++            anchor.write_text("00000000-0000-0000-0000-000000000000\n", encoding="utf-8")
++        elif damage == "duplicate":
++            db.execute("INSERT INTO journal_identity SELECT uuid FROM journal_identity")
++        else:
++            db.execute("DROP TABLE journal_identity")
++    before = queue.read_bytes()
++    for _ in range(2):
++        with pytest.raises((ValueError, sqlite3.Error)):
++            Journal(queue, identity_path=anchor)
++        assert queue.read_bytes() == before
++
++
++@pytest.mark.parametrize("existing", ["queue", "anchor", "lock"])
++def test_explicit_bootstrap_never_clobbers_existing_evidence(tmp_path, existing):
++    queue, anchor = tmp_path / "queue.sqlite3", tmp_path / "id.uuid"
++    target = {"queue": queue, "anchor": anchor, "lock": queue.with_suffix(".lock")}[existing]
++    target.write_text("retained evidence", encoding="utf-8")
++    with pytest.raises(OSError, match="already_initialized"):
++        Journal(queue, identity_path=anchor, initialize=True)
++    assert target.read_text(encoding="utf-8") == "retained evidence"
+diff --git a/tests/ci/test_flaky_kanban_github_retry.py b/tests/ci/test_flaky_kanban_github_retry.py
+index bc6787a4ee..ef5d033c57 100644
+--- a/tests/ci/test_flaky_kanban_github_retry.py
++++ b/tests/ci/test_flaky_kanban_github_retry.py
+@@ -2,6 +2,7 @@
+ import io
+ from email.message import Message
+ from unittest.mock import Mock
++from types import SimpleNamespace
+ from urllib.error import HTTPError, URLError
+ from urllib.request import Request
+ 
+@@ -20,7 +21,7 @@ def http_error(code):
+ def transport(monkeypatch):
+     opening = Mock()
+     sleeping = Mock()
+-    monkeypatch.setattr(fk.urllib.request, "urlopen", opening)
++    monkeypatch.setattr(fk.urllib.request, "build_opener", lambda *a: SimpleNamespace(open=opening))
+     monkeypatch.setattr(fk.time, "sleep", sleeping)
+     return opening, sleeping
+ 
+@@ -29,7 +30,9 @@ def transport(monkeypatch):
+                                   TimeoutError("timeout"), ConnectionError("reset")])
+ def test_get_recovers_after_transient_error(transport, error):
+     opening, sleeping = transport
+-    opening.side_effect = [error, io.BytesIO(b'{"workflow_runs": []}')]
++    response = io.BytesIO(b'{"workflow_runs": []}')
++    response.status, response.headers = 200, {}
++    opening.side_effect = [error, response]
+     assert fk._gh(URL, "test-token") == {"workflow_runs": []}
+     assert opening.call_count == 2
+     assert [c.args for c in sleeping.call_args_list] == [(1,)]
+diff --git a/tests/ci/test_flaky_kanban_overlap.py b/tests/ci/test_flaky_kanban_overlap.py
+index cd1970e3a2..e64c233204 100644
+--- a/tests/ci/test_flaky_kanban_overlap.py
++++ b/tests/ci/test_flaky_kanban_overlap.py
+@@ -138,10 +138,16 @@ def env(tmp_path, monkeypatch):
+             store.write_text(json.dumps(s))
+ 
+         def remote(self, gw, key, status, title, body=""):
++            import time
+             c = sqlite3.connect(hub / "hub.db")
+             data = {"id": key.rsplit("/", 1)[-1], "board": key.split("/")[-2], "status": status, "title": title,
+                     "body": body, "gateway": gw, "last_comments": []}
+             c.execute("INSERT INTO replica VALUES (?, 'tasks', ?, 1, 1, ?, 0)", (gw, key, json.dumps(data)))
++            parts = key.split("/")
++            info = {"gateway": gw, "task_scopes": [{"profile": parts[0] if len(parts) == 3 else "default",
++                    "board": parts[-2], "state": "ok", "observed_at": time.time()}]}
++            c.execute("INSERT OR REPLACE INTO replica VALUES (?, 'gateway', 'info', 1, 1, ?, 0)",
++                      (gw, json.dumps(info)))
+             c.commit()
+             c.close()
+ 
+@@ -221,8 +227,10 @@ def test_cross_gateway_owner_with_failed_delivery_is_not_appended_not_recorded_a
+     env.refuse({"id": "t_remote", "gateway": "macbook", "board": "hermes", "status": "ready", "title": "z"})
+     monkeypatch.setenv("FAKE_HUB_MODE", "reject")
+     state_path = env.tmp / "state.json"
++    assert fk.main(["--initialize-intake", "--state", str(state_path)]) == 0
+ 
+-    rc = fk.main(["--report", str(_report(env)), "--run-url", RUN, "--hermes", env.hermes, "--state", str(state_path)])
++    rc = fk.main(["--report", str(_report(env)), "--run-url", RUN, "--repo", "o/r", "--branch", "a" * 40,
++                  "--hermes", env.hermes, "--state", str(state_path)])
+ 
+     out = capsys.readouterr().out
+     assert rc != 0
+@@ -253,8 +261,10 @@ def test_cross_gateway_owner_gets_the_comment_and_it_is_read_back(env, capsys):
+     env.remote("macbook", key, "ready", f"Deflake {TEST}", f"Flaky test: `{TEST}`")
+     env.refuse({"id": "t_remote", "gateway": "macbook", "board": "hermes", "status": "ready", "title": "z"})
+     state_path = env.tmp / "state.json"
++    assert fk.main(["--initialize-intake", "--state", str(state_path)]) == 0
+ 
+-    rc = fk.main(["--report", str(_report(env)), "--run-url", RUN, "--hermes", env.hermes, "--state", str(state_path)])
++    rc = fk.main(["--report", str(_report(env)), "--run-url", RUN, "--repo", "o/r", "--branch", "a" * 40,
++                  "--hermes", env.hermes, "--state", str(state_path)])
+ 
+     out = capsys.readouterr().out
+     assert rc == 0, out
+@@ -266,7 +276,8 @@ def test_cross_gateway_owner_gets_the_comment_and_it_is_read_back(env, capsys):
+     assert not env.kanban()["cards"]                                 # no local duplicate
+ 
+     # The next flake of the same test goes straight to the recorded remote owner, also read back.
+-    rc = fk.main(["--report", str(_report(env)), "--run-url", RUN + "0", "--hermes", env.hermes,
++    rc = fk.main(["--report", str(_report(env)), "--run-url", RUN + "0", "--repo", "o/r", "--branch", "a" * 40,
++                  "--hermes", env.hermes,
+                   "--state", str(state_path)])
+     assert rc == 0 and f"appended @task:hermes@macbook/t_remote {TEST}" in capsys.readouterr().out
+     assert len(env.hub_calls()) == 2
+diff --git a/tests/ci/test_flaky_poll_budget.py b/tests/ci/test_flaky_poll_budget.py
+index ad88261d05..e4526a1156 100644
+--- a/tests/ci/test_flaky_poll_budget.py
++++ b/tests/ci/test_flaky_poll_budget.py
+@@ -65,18 +65,21 @@ def test_main_saves_each_finished_run_before_a_kill(gh, monkeypatch, tmp_path):
+     monkeypatch.setattr(fa, "download_zip", download)
+     monkeypatch.setenv("GH_TOKEN", "tok")
+     path = tmp_path / "state.json"
++    assert fk.main(["--initialize-intake", "--state", str(path)]) == 0
+     with pytest.raises(Killed):
+         fk.main(["--from-github", "--repo", "o/r", "--state", str(path)])
+-    assert json.loads(path.read_text())["runs"] == ["5/1"]
++    assert json.loads(path.read_text())["runs"] == ["7/1"]
+     monkeypatch.setattr(fa, "download_zip", gh.download)
+     gh.downloads.clear()
+     assert fk.main(["--from-github", "--repo", "o/r", "--state", str(path)]) == 0
+-    assert json.loads(path.read_text())["runs"] == ["5/1", "6/1", "7/1"] and gh.downloads == [101, 102]
++    # FIFO preserves discovery order, then rotates the interrupted run behind queued work.
++    assert json.loads(path.read_text())["runs"] == ["7/1", "5/1", "6/1"] and gh.downloads == [100, 101]
+ 
+ 
+ def test_main_budget_defers_unstarted_runs_and_fails_the_cron(gh, monkeypatch, tmp_path, capsys):
+     monkeypatch.setenv("GH_TOKEN", "tok")
+     path = tmp_path / "state.json"
++    assert fk.main(["--initialize-intake", "--state", str(path)]) == 0
+     assert fk.main(["--from-github", "--repo", "o/r", "--state", str(path), "--budget", "0"]) == 1
+     out = capsys.readouterr().out
+     assert "FAILED poll_budget deferred=3" in out and gh.downloads == []
+diff --git a/tests/ci/test_flaky_protocol_boundaries.py b/tests/ci/test_flaky_protocol_boundaries.py
+index de4265a9e5..2d3d63ffbe 100644
+--- a/tests/ci/test_flaky_protocol_boundaries.py
++++ b/tests/ci/test_flaky_protocol_boundaries.py
+@@ -3,6 +3,7 @@ from __future__ import annotations
+ 
+ import http.client
+ import json
++from types import SimpleNamespace
+ import pytest
+ 
+ from scripts.ci import flaky_artifact as fa
+@@ -46,7 +47,7 @@ def test_api_get_retries_http_read_failures(monkeypatch, kind):
+         calls.append(req.get_method())
+         return replies.pop(0)
+ 
+-    monkeypatch.setattr(fk.urllib.request, "urlopen", open_response)
++    monkeypatch.setattr(fk.urllib.request, "build_opener", lambda *a: SimpleNamespace(open=open_response))
+     monkeypatch.setattr(fk.time, "sleep", lambda _: None)
+     assert fk._gh("https://api.github.com/repos/o/r/actions/runs", "tok") == {"jobs": []}
+     assert calls == ["GET", "GET"]
+@@ -72,12 +73,14 @@ def test_exhausted_http_reads_have_fixed_receipts_and_persist_retryable_state(tm
+             return ReadResponse(_read_error(kind))
+         return ReadResponse(json.dumps(fake.gh(url, "tok")).encode())
+ 
+-    monkeypatch.setattr(fk.urllib.request, "urlopen", open_response)
++    monkeypatch.setattr(fk.urllib.request, "build_opener", lambda *a: SimpleNamespace(open=open_response))
+     monkeypatch.setattr(fk.time, "sleep", lambda _: None)
+     monkeypatch.setattr(fk, "CliBoard", lambda *a, **k: FakeBoard())
+     monkeypatch.setattr(fk, "HubRelay", lambda *a, **k: None)
+     monkeypatch.setenv("GH_TOKEN", "tok")
+     path = tmp_path / "state.json"
++    assert fk.main(["--initialize-intake", "--state", str(path)]) == 0
++    capsys.readouterr()
+     initial = {"cards": {"tests/old.py": {"card": "t_old", "generation": 0}}, "runs": ["4/1"]}
+     fk.save_state(path, initial)
+     # A run-listing failure is red at once; an unreadable run waits one poll, then turns red if it persists.
+diff --git a/tests/ci/test_flaky_run_retirement.py b/tests/ci/test_flaky_run_retirement.py
+new file mode 100644
+index 0000000000..f2cfd19f71
+--- /dev/null
++++ b/tests/ci/test_flaky_run_retirement.py
+@@ -0,0 +1,97 @@
++"""Journal mode retires a permanently unavailable run once GitHub no longer lists it.
++
++Without the journal a run drops out of ``poll_github`` when it leaves the lookback
++listing. The journal replays stored runs, so it needs an explicit, single terminal
++FAILED line instead of logging FAILED on every poll forever.
++"""
++from __future__ import annotations
++
++import urllib.error
++from pathlib import Path
++
++import pytest
++
++from scripts.ci import flaky_artifact as fa
++from scripts.ci import flaky_intake as intake
++from scripts.ci import flaky_kanban as fk
++from tests.ci.flaky_artifact_fakes import FakeGitHub, artifact
++from tests.ci.test_flaky_kanban import FakeBoard
++
++
++@pytest.fixture
++def gh(monkeypatch):
++    fake = FakeGitHub()
++    monkeypatch.setattr(fk, "_gh", fake.gh)
++    monkeypatch.setattr(fa, "download_zip", fake.download)
++    return fake
++
++
++def _setup(gh, tmp_path):
++    gh.simple(tests=("tests/x.py::test_a",))
++    gh.artifacts[5] = [artifact(100, expired=True)]
++    journal = intake.Journal(tmp_path / "queue.sqlite3")
++    state = fk.load_state(Path("/nonexistent/state.json"))
++    board = FakeBoard()
++    return journal, state, board
++
++
++def _poll(board, state, journal):
++    return fk.poll_github("o/r", "tok", board, state, grace=0, journal=journal)
++
++
++def _pending(journal):
++    return [r[0] for r in journal.db.execute("SELECT key FROM runs WHERE complete=0")]
++
++
++def test_unlisted_permanently_unavailable_run_is_retired_once(gh, tmp_path):
++    journal, state, board = _setup(gh, tmp_path)
++    assert _poll(board, state, journal)[0] == "WAITING run=5/1 code=expired polls=1"
++    assert _poll(board, state, journal)[0] == "FAILED run=5/1 code=expired polls=2"
++    gh.runs.clear()                                   # left the lookback listing
++    log = _poll(board, state, journal)
++    assert log[0] == "FAILED run=5/1 code=expired polls=3 retired=unlisted"
++    assert _pending(journal) == []
++    assert _poll(board, state, journal) == []         # silent afterwards
++    assert _poll(board, state, journal) == []
++    assert not board.cards
++
++
++def test_listing_failure_never_retires(gh, tmp_path):
++    journal, state, board = _setup(gh, tmp_path)
++    _poll(board, state, journal)
++    _poll(board, state, journal)
++    gh.fail["actions/runs?"] = urllib.error.URLError("down")
++    log = _poll(board, state, journal)
++    assert "FAILED runs_unavailable" in log
++    assert "FAILED run=5/1 code=expired polls=3" in log
++    assert not any("retired" in line for line in log)
++    assert _pending(journal) == ["5/1"]
++
++
++def test_still_listed_run_stays_failed_and_unretired(gh, tmp_path):
++    journal, state, board = _setup(gh, tmp_path)
++    for polls in (1, 2, 3, 4):
++        log = _poll(board, state, journal)
++    assert log[0] == "FAILED run=5/1 code=expired polls=4"
++    assert _pending(journal) == ["5/1"]
++
++
++def test_unlisted_run_on_first_failure_waits_before_retiring(gh, tmp_path):
++    journal, state, board = _setup(gh, tmp_path)
++    _poll(board, state, journal)
++    gh.runs.clear()
++    assert _poll(board, state, journal)[0] == "FAILED run=5/1 code=expired polls=2 retired=unlisted"
++    assert _pending(journal) == []
++
++
++def test_unlisted_run_that_recovers_is_still_processed(gh, tmp_path):
++    journal, state, board = _setup(gh, tmp_path)
++    gh.artifacts[5] = [artifact(100)]
++    gh.fail["/artifacts"] = urllib.error.URLError("down")
++    _poll(board, state, journal)
++    gh.runs.clear()
++    gh.fail.clear()
++    log = _poll(board, state, journal)
++    assert not any(line.startswith("FAILED") for line in log)
++    assert _pending(journal) == []
++    assert journal.db.execute("SELECT COUNT(*) FROM occurrences").fetchone()[0] == 1
+-- 
+2.43.0
+

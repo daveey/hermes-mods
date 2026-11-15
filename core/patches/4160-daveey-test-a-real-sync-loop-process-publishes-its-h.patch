@@ -1,0 +1,133 @@
+From 55f52a9506bd2016f4f850e6443abdbb1a3e7269 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 05:23:30 +0000
+Subject: [PATCH] [daveey] test a real sync-loop process publishes its held
+ claim record before its first round
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Post-merge audit t_01a1d839f0aa6622 of PR #2715 (landed 9435baf78d, owner t_01a1d6c4e700958e) found that
+`hermes_cli/kanban_sync_claims.py:176` `temp.replace(target)` -> `temp.unlink()` (the held record is never
+published) survives all 111 tests of the claim-gate / sync-client / singleton-lease family with zero skips. The
+split-process tests hand-write the `.sync-claims.json` record themselves, so nothing checks that a real loop
+produces it, and the after-stop "record absent" assertion is vacuous when no record was ever written.
+
+New test: a child process runs the real `kanban_sync_stop.run_loop` (loop_started -> _write, note_round,
+loop_stopped) and pauses inside its first round. This process has no sync loop (a profile gateway's dispatcher
+or a shell `hermes kanban claim`) and must:
+- defer the claim during that initial sync (real `dispatch_once`: claim_deferred sync_first_round, card ready),
+- claim once the producer's round reaches the head (record lists the board open),
+- see the record removed after the producer's tenure ends.
+
+Test-only change; no production code touched.
+
+Mutation proof (sdlc-review mutants.py, 3-file family claim_gate + sync_client + singleton_lease, scratch
+HOME/HERMES_HOME, no board env pins):
+- kanban_sync_claims.py:176 persist omitted: killed (was SURVIVED on 111 tests)
+- loop_stopped unlink omitted: killed
+- _write "open" always {}: killed
+- control: gateway/kanban_watchers.py:469 loop_expected() omitted (sibling gap t_01a1d87d1a960fd1): survives this
+  family, as predicted — owned separately.
+
+Card: t_01a1d87d194d4887
+---
+ .../hermes_cli/test_kanban_sync_claim_gate.py | 74 +++++++++++++++++++
+ 1 file changed, 74 insertions(+)
+
+diff --git a/tests/hermes_cli/test_kanban_sync_claim_gate.py b/tests/hermes_cli/test_kanban_sync_claim_gate.py
+index d0051539f0..227a2d6674 100644
+--- a/tests/hermes_cli/test_kanban_sync_claim_gate.py
++++ b/tests/hermes_cli/test_kanban_sync_claim_gate.py
+@@ -15,7 +15,11 @@ import argparse
+ import json
+ import logging
+ import os
++import select
++import subprocess
++import sys
+ import time
++from pathlib import Path
+ 
+ import pytest
+ 
+@@ -198,6 +202,76 @@ def test_another_live_process_loop_record_holds_and_opens_claims(live, kanban_ho
+     assert not claims.held(live)
+ 
+ 
++_PRODUCER = """
++import sys
++from hermes_cli import kanban_sync_claims as claims
++from hermes_cli.kanban_sync_stop import run_loop
++
++
++def loop(*_):
++    print("started", flush=True)  # the loop runs; no round of it has completed
++    sys.stdin.readline()
++    claims.note_round("default", sys.argv[1], at_head=True)
++    print("at-head", flush=True)
++    sys.stdin.readline()
++
++
++run_loop(loop, lambda: True, 1)
++print("stopped", flush=True)
++"""
++
++
++def _expect(proc, line):
++    ready, _, _ = select.select([proc.stdout], [], [], 60)
++    assert ready, f"the producer never printed {line!r}"
++    assert proc.stdout.readline().strip() == line
++
++
++def _status(conn, tid):
++    return conn.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()[0]
++
++
++def _send(proc):
++    proc.stdin.write("go\n")
++    proc.stdin.flush()
++
++
++def test_a_real_sync_loop_in_another_process_holds_this_processes_claims_until_its_round_reaches_the_head(
++        live, kanban_home, tmp_path):
++    """The split-process gate with a real producer: another process runs the sync loop (``run_loop``), which must
++    publish its held record when the loop starts, before any round. This process has no loop (a profile gateway's
++    dispatcher, or ``hermes kanban claim`` from a shell): during that initial sync it claims nothing, once the
++    producer's round reaches the head it claims, and when the producer's tenure ends its record goes away."""
++    db = kanban_home / "kanban.db"
++    tid = kb.create_task(live, title="foreign", assignee="default")
++    script = tmp_path / "producer.py"
++    script.write_text(_PRODUCER)
++    root = Path(__file__).resolve().parents[2]
++    env = {**os.environ, "HERMES_KANBAN_HOME": str(kb.kanban_home()),
++           "PYTHONPATH": os.pathsep.join(filter(None, [str(root), os.environ.get("PYTHONPATH")]))}
++    producer = subprocess.Popen([sys.executable, "-u", str(script), str(db)], cwd=root, env=env, text=True,
++                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
++    try:
++        _expect(producer, "started")
++        tick = _tick(live)
++        assert (tick.claim_deferred, _status(live, tid)) == ([(tid, claims.DEFERRAL)], "ready")
++        assert claims.describe(db, "primary") == claims.HELD
++        _send(producer)
++        _expect(producer, "at-head")
++        assert claims.describe(db, "primary") == "open"
++        _tick(live)
++        assert _status(live, tid) == "running"
++        _send(producer)
++        _expect(producer, "stopped")
++        assert producer.wait(timeout=60) == 0
++    finally:
++        if producer.poll() is None:
++            producer.kill()
++            producer.wait(timeout=60)
++    assert not claims.state_path().exists()  # the ended tenure removed its record
++    assert claims.describe(db, "primary") == "no live sync loop recorded"
++
++
+ @pytest.mark.parametrize("previous_tenure", [False, True])
+ def test_waiting_sync_gateway_uses_current_lock_owners_record(live, kanban_home, previous_tenure):
+     """A watcher waiting for .sync.lock must not override the root loop's readiness."""
+-- 
+2.43.0
+

@@ -1,0 +1,117 @@
+From 5cf6f649f050d2de750e88f22f842f7dd83b3755 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 21:28:05 +0000
+Subject: [PATCH] [daveey] Fingerprint crash errors after PID normalization,
+ not before the 80-char cut
+
+error_fingerprint truncated the text to 80 chars and only then replaced
+`pid <n>` with `pid N`. A dead-worker error runs past 80 chars once the
+worker's last output is appended, so each missing PID digit kept one more
+char of that output: three workers of one systemic batch straddling a
+digit boundary (pid 99999 / 100000) got different fingerprints, never
+reached the same-fingerprint count of 3, and none tripped.
+
+That is the CI flake of test_kanban_run_finalizer::
+test_systemic_batch_preserves_one_fix_owner_inside_transaction (run
+43497889713: auto_blocked == set()); it does not reproduce under a
+SIGSTOP duty cycle (54/54 green), only with PIDs of mixed width.
+
+Normalize the whole text, then keep 80 chars. New
+test_kanban_error_fingerprint_width.py fails 2/3 on the old code.
+---
+ hermes_cli/kanban_db_values.py                | 11 +++-
+ .../test_kanban_error_fingerprint_width.py    | 62 +++++++++++++++++++
+ 2 files changed, 70 insertions(+), 3 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_error_fingerprint_width.py
+
+diff --git a/hermes_cli/kanban_db_values.py b/hermes_cli/kanban_db_values.py
+index 1ae61800af..0f878184d2 100644
+--- a/hermes_cli/kanban_db_values.py
++++ b/hermes_cli/kanban_db_values.py
+@@ -37,7 +37,12 @@ def _json_or_null(obj: Any) -> Optional[str]:
+ 
+ 
+ def error_fingerprint(error_text: str) -> str:
+-    """Normalize an error message (strip PIDs, timestamps) so same-root-cause errors group."""
+-    fp = re.sub(r'\bpid \d+\b', 'pid N', error_text[:80])
++    """Normalize an error message (strip PIDs, timestamps) so same-root-cause errors group.
++
++    Normalize BEFORE keeping 80 chars: truncating first let the PID's digit count move the cut, so
++    ``pid 99999`` and ``pid 100000`` dying of the same error kept different tails of the worker's
++    output and never reached the systemic same-fingerprint count. [daveey]
++    """
++    fp = re.sub(r'\bpid \d+\b', 'pid N', error_text)
+     fp = re.sub(r'\b\d{10,}\b', '<TS>', fp)
+-    return fp.lower().strip()
++    return fp[:80].lower().strip()
+diff --git a/tests/hermes_cli/test_kanban_error_fingerprint_width.py b/tests/hermes_cli/test_kanban_error_fingerprint_width.py
+new file mode 100644
+index 0000000000..0bb205a099
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_error_fingerprint_width.py
+@@ -0,0 +1,62 @@
++"""Same-error crashes group whatever their PIDs' digit counts. [daveey]
++
++``error_fingerprint`` used to cut the text to 80 chars BEFORE replacing ``pid <n>``: a crash
++text that runs past 80 chars (``pid <n> exited with code 1`` + the worker's last output) kept
++one more output char per missing PID digit. Three workers of one systemic batch straddling a
++digit boundary (pid 99999 / 100000) got different fingerprints, the batch never reached the
++systemic count of 3, and nothing tripped: CI flake of
++test_kanban_run_finalizer::test_systemic_batch_preserves_one_fix_owner_inside_transaction.
++"""
++import itertools
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli.kanban_db_values import error_fingerprint
++from tests.hermes_cli import test_kanban_failed_result_reconcile as fixtures
++
++board = fixtures.board
++
++_TEXT = "pid {} exited with code 1 Worker's last output: 'fixture worker_receipt_timeout'"
++
++
++def test_fingerprint_ignores_pid_width_past_the_cut():
++    prints = {error_fingerprint(_TEXT.format(pid)) for pid in (9999, 10000, 99999, 100000, 2156134)}
++    assert prints == {"pid n exited with code 1 worker's last output: 'fixture worker_receipt_timeout'"}
++    longer = _TEXT.replace("timeout'", "timeout and a much longer tail'")
++    prints = {error_fingerprint(longer.format(pid)) for pid in (9, 99999, 100000, 2156134)}
++    assert len(prints) == 1 and len(prints.pop()) == 80
++
++
++def test_fingerprint_still_separates_different_errors_and_timestamps():
++    assert error_fingerprint('pid 1 exited with code 1') != error_fingerprint('pid 1 exited with code 2')
++    assert error_fingerprint('x' * 75 + ' 1794603625123') == error_fingerprint('x' * 75 + ' 1794603625')
++    assert len(error_fingerprint('y' * 500)) == 80
++
++
++def test_systemic_batch_trips_across_a_pid_digit_boundary(board, monkeypatch):
++    conn, context = board
++    contexts = [context]
++    for index in range(2):
++        tid = kb.create_task(conn, title=f'additional failed result {index}', assignee='default')
++        task = kb.claim_task(conn, tid, claimer=kb._claimer_id())
++        assert task is not None
++        contexts.append({**context, 'task_id': tid, 'run_id': task.current_run_id,
++                         'claim_lock': task.claim_lock})
++    for item in contexts:
++        fixtures._failed_child(conn, item)
++    # The real children's PIDs share a width here; give the batch the widths CI's did.
++    widths = itertools.cycle((99999, 100000, 100001))
++    real = kbd._classify_dead_worker
++
++    def straddle(pid, *args, **kwargs):
++        dead = real(pid, *args, **kwargs)
++        dead.error_text = dead.error_text.replace(f'pid {pid} ', f'pid {next(widths)} ', 1)
++        return dead
++
++    monkeypatch.setattr(kbd, '_classify_dead_worker', straddle)
++    sweep = kbd._reclaim_dead_workers(conn, failed_results_only=True)
++    assert len(sweep.crash_details) == 3
++    assert len({error_fingerprint(d.error_text) for *_, d in sweep.crash_details}) == 1
++    assert set(sweep.auto_blocked) == {item['task_id'] for item in contexts}
++    fixes = conn.execute("SELECT id FROM tasks WHERE idempotency_key LIKE 'systemic-crash:%'").fetchall()
++    assert len(fixes) == 1
+-- 
+2.43.0
+

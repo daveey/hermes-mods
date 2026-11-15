@@ -114,3 +114,6 @@ def register(ctx) -> None:
     _session_env("HERMES_SESSION_ID")  # resolve the session-context getter now, not on the first tool call
     store.host_name()  # and the host label (one scutil call)
     ctx.register_hook("post_tool_call", _post_tool_call)
+    on_unload = getattr(ctx, "on_unload", None)
+    if callable(on_unload):
+        on_unload(WRITER.shutdown)

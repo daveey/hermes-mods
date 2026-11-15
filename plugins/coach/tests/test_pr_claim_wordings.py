@@ -14,6 +14,8 @@ import importlib.util
 import json
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -245,3 +247,96 @@ def test_live_outcome_respects_disabled_pr_rules(tmp_path, monkeypatch):
     outs = [r for r in rows if r["event"] == "reply_nudge_outcome"]
     assert len(outs) == 1 and outs[0]["rule"] == "confirm" and outs[0]["resolved"] is True
     assert [r for r in rows if r["event"] == "reply_nudge_outcome_new_claim"] == []
+
+
+# ── agent-aeca43a867: a PR the sentence itself calls merged is provenance, not the subject of the state claim ─────
+# On Nov 13 17:55 PST a chat reported two Kanban reviews approving an Ask Eve artifact built on merged state PR #2532.
+# The draft "The capsule-import fix (#2532) is approved by both reviewers." was nudged (fair: it reads as PR #2532 is
+# approved); the revision "... (from merged state change #2532) ... is approved by both of its new reviewers." was
+# true, said #2532 had merged, and still failed the outcome check, so the incident filed as a defect.
+AECA_REVISED = ("The update that adds the capsule-import fix (from merged state change #2532) to Ask Eve is approved "
+                "by both of its new reviewers.")
+AECA_DRAFT = "The capsule-import fix (#2532) is approved by both reviewers."
+
+
+def test_aeca43a867_merged_provenance_ref_is_not_a_state_claim():
+    assert rc.pr_state_claim(AECA_REVISED, NO_READ_LOG) is None
+    for reply in ("The build on top of merged PR #2532 is approved by both reviewers.",
+                  "The canary (built from #2532, merged at 19:33Z) is approved.",
+                  "The successor that carries #2532 (merged) is approved by review A.",
+                  "The artifact built from PR #2532, which merged at 19:33Z, is approved.",
+                  "The capsule update (from the already-merged #2532) is still in review."):
+        assert rc.pr_state_claim(reply, NO_READ_LOG) is None, reply
+
+
+def test_aeca43a867_unmarked_or_other_pr_still_fires():
+    # the ambiguous draft still gets the nudge, and a second, unmarked PR in the sentence keeps the claim live
+    assert rc.pr_state_claim(AECA_DRAFT, NO_READ_LOG)
+    for reply in ("PR #2533, which builds on merged PR #2532, is approved.",
+                  "Merged PR #2532 has a follow-up, #2540, which is approved.",
+                  "#1187 is approved and waiting for its macOS check, after #1100 merged."):
+        assert rc.pr_state_claim(reply, NO_READ_LOG), reply
+
+
+def test_aeca43a867_nudge_outcome_resolves_on_the_merged_provenance_revision():
+    res = rc.nudge_outcome("pr_state_claim", AECA_REVISED, "Kanban t_01a1d7688923ddcf done", NO_READ_LOG, _no_judge)
+    assert res.get("resolved") is True, res
+    assert "new_claim" not in res
+
+
+@pytest.mark.parametrize("prefix", ["unmerged", "not-yet-merged", "premerged"])
+def test_merged_provenance_requires_a_word_boundary(prefix):
+    reply = f"The artifact based on {prefix} PR #42 is approved."
+    assert rc.pr_state_claim(reply, NO_READ_LOG) == reply
+    assert rc.pr_state_claim(reply, [PR_READ]) is None
+
+
+@pytest.mark.parametrize("words, exempt", [
+    ("", True),
+    ("state change ", True),
+    ("the state change ", True),
+    ("the previous state change ", False),
+    ("the previous reviewed and tested canonical state change ", False),
+])
+def test_merged_provenance_before_reference_has_a_three_word_limit(words, exempt):
+    reply = f"The artifact based on merged {words}#42 is approved."
+    assert rc.pr_state_claim(reply, NO_READ_LOG) == (None if exempt else reply)
+
+
+@pytest.mark.parametrize("provenance", [
+    "#42, which landed yesterday",
+    "#42, which was merged yesterday",
+    "#42, which has been merged",
+    "#42, which already merged yesterday",
+    "#42, which was already landed yesterday",
+])
+def test_merged_provenance_after_reference_grammar(provenance):
+    reply = f"The artifact based on {provenance}, is approved."
+    assert rc.pr_state_claim(reply, NO_READ_LOG) is None
+    # The exemption belongs only to the explicitly merged reference, not another PR in the same sentence.
+    current = f"PR #43 based on {provenance}, is approved."
+    assert rc.pr_state_claim(current, NO_READ_LOG) == current
+
+
+def test_merged_provenance_empty_refs_are_unreachable_from_the_public_caller(monkeypatch):
+    """D3's removal of bool(refs) changes only the helper's empty-list result.
+
+    pr_state_claim short-circuits both the whole reply and each sentence on _MF_PR_RE;
+    pronoun claims short-circuit on _PSC_IT_RE instead. Exercise all three paths and
+    one real helper call, without making an unreachable helper result part of the public contract.
+    """
+    original = rc._psc_only_merged_refs
+    checked = []
+
+    def checked_helper(sentence):
+        assert list(rc._MF_PR_RE.finditer(sentence)), sentence
+        checked.append(sentence)
+        return original(sentence)
+
+    monkeypatch.setattr(rc, "_psc_only_merged_refs", checked_helper)
+    assert rc.pr_state_claim("The artifact is approved.", NO_READ_LOG) is None
+    assert rc.pr_state_claim("PR #42 merged yesterday. The artifact is approved.", NO_READ_LOG) is None
+    assert rc.pr_state_claim("PR #42 merged yesterday. It is approved.", NO_READ_LOG) == "It is approved."
+    assert checked == []
+    assert rc.pr_state_claim(AECA_REVISED, NO_READ_LOG) is None
+    assert checked == [AECA_REVISED]

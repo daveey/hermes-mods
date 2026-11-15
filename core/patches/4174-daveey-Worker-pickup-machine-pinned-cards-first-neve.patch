@@ -1,0 +1,263 @@
+From 954ecf7dd81be4f1eadf87de59c3ee35398c944e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 09:48:56 +0000
+Subject: [PATCH] [daveey] Worker pickup: machine-pinned cards first; never
+ copy a pre-claim pin-walled card
+
+worker-1 2026-11-14 (t_01a1d8ad896977b9 -> root fix t_01a1d95eabbd2b9d): t_01a1d6d855a058a2
+(runs_on machine:worker-1) waited `budget_exhausted` ~6 h (03:33Z-09:22Z) while the pickup copied
+t_01a1d882f58d9df9 ~700 times (every ~18 s).
+
+Five whys:
+1. Why did the pinned card wait? Every pickup batch was full before it was reached.
+2. Why full? (a) t_01a1d882f58d9df9, a fresh require_model card pinned to quota-walled
+   openai-codex/gpt-6-astra, was copied each tick; (b) pool cards were ranked ahead of it.
+3. Why copied each tick? Local dispatch holds it `pinned_quota_wall` pre-claim, eviction drops
+   the held copy, and `_quota_held` only predicted holds for cards WITH a quota episode. A card
+   that never ran has none, so the prediction returned None.
+4. Why pool cards first? `_evaluate` ordered each lane by `order_with_remote_waiters` only; a
+   card pinned to this machine had no precedence over cards any pool worker can take.
+5. Why not caught? The t_01a1cf9f2b838cbb fix covered only the post-run episode hold.
+
+Fix (hermes_cli/kanban_worker_node.py):
+- `_quota_held`: with no episode, predict the pre-claim hold with the dispatcher's own
+  read-only `kanban_dispatch_skip.pinned_quota_hold` on the replica (ready lane only, as
+  `hold_pinned_quota`). Such a card is not copied, spends no budget, and records
+  `quota_hold` "pinned_quota_wall <model> (<provider>) until <reset>Z" (the pickup-stall
+  detector's deadline parser reads it). Failures copy as before.
+- `_evaluate`: within each lane, cards pinned to this machine (`mine`) go first; a stable
+  sort keeps each group's existing order. Review still precedes ready.
+
+Tests (tests/hermes_cli/test_kanban_pickup_pinned_first.py), RED on base 7300ceed9f, GREEN here:
+- a mandatory pin on a walled model with no episode is not copied (budget 1 starts the pinned
+  card; no churn over 3 more ticks; skip reason quota_hold), with dispatcher parity asserted;
+- the same pin with no wall is copied;
+- budget 2 with 3 higher-priority pool cards: the machine-pinned card is picked first.
+
+test_kanban_pickup_held_budget.py: two tests encoded the old order (a pool card ahead of a card
+pinned here); they now pin the competing card too or give the budget room, keeping their intent
+(free held copies bounded by FREE_PER_TICK; an unreadable Board hold takes the budget).
+All 123 test files importing kanban_worker_node / kanban_dispatch_skip / kanban_pickup pass.
+---
+ hermes_cli/kanban_worker_node.py              |  29 ++++-
+ .../test_kanban_pickup_held_budget.py         |  11 +-
+ .../test_kanban_pickup_pinned_first.py        | 112 ++++++++++++++++++
+ 3 files changed, 142 insertions(+), 10 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_pickup_pinned_first.py
+
+diff --git a/hermes_cli/kanban_worker_node.py b/hermes_cli/kanban_worker_node.py
+index e322db903d..1640a6b37f 100644
+--- a/hermes_cli/kanban_worker_node.py
++++ b/hermes_cli/kanban_worker_node.py
+@@ -571,9 +571,11 @@ def _evaluate(conn: sqlite3.Connection, replica: sqlite3.Connection, own: str, *
+     from hermes_cli.kanban_dispatch_priority import order_with_remote_waiters
+     listed = candidates(replica, own)
+     # Apply the executor's authoritative local graph before spending the import
+-    # budget, just as dispatch does after pickup. Keep review ahead of ready.
+-    listed = [row for lane in ("review", "ready") for row in order_with_remote_waiters(
+-        conn, [row for row in listed if row["status"] == lane])]
++    # budget, just as dispatch does after pickup. Keep review ahead of ready. Within a lane, cards pinned here go
++    # first: only this machine can run them, pool cards have other takers (worker-1 2026-11-14: a pinned card
++    # waited budget_exhausted ~6 h behind pool cards, t_01a1d95eabbd2b9d). Stable: each group keeps its order.
++    listed = [row for lane in ("review", "ready") for row in sorted(order_with_remote_waiters(
++        conn, [row for row in listed if row["status"] == lane]), key=lambda row: row["id"] not in mine)]
+     skips: dict[str, tuple[str, Optional[str]]] = {
+         tid: ("parents_incomplete", "a parent is not done") for tid in mine - {c["id"] for c in listed}}
+     picked: list[str] = []
+@@ -615,11 +617,15 @@ def _quota_held(replica: sqlite3.Connection, card: sqlite3.Row) -> Optional[tupl
+     taking the pickup budget: worker-3 2026-11-12, 4 cards walled until 11-17/18 filled the batch and two
+     priority-0 cards pinned to it waited ``budget_exhausted`` (t_01a1cf9f2b838cbb). Not copied, it spends no
+     budget; an episode with a free alternate route (``decision`` -> None) is copied as before. Any failure copies
+-    as before: the local guard still decides after the copy."""
++    as before: the local guard still decides after the copy.
++
++    With no episode (the card never ran), the pre-claim ``pinned_quota_wall`` hold
++    (:func:`kanban_dispatch_skip.pinned_quota_hold`): worker-1 2026-11-14, a fresh mandatory pin on a walled model
++    was copied, held and evicted ~700 times in 3 h while a card pinned here waited (t_01a1d95eabbd2b9d)."""
+     from hermes_cli.kanban_quota_episode import decision, episode, hold_until
+     try:
+         if not episode(replica, card["id"]):
+-            return None
++            return _pin_walled(replica, card)
+         from hermes_cli import kanban_db as kb
+         task = kb.get_task(replica, card["id"])
+         guard = decision(replica, task, lane=card["status"])[0] if task is not None else None
+@@ -635,6 +641,19 @@ def _quota_held(replica: sqlite3.Connection, card: sqlite3.Row) -> Optional[tupl
+     return "quota_hold", f"{guard}{when} (local dispatch would hold it)"
+ 
+ 
++def _pin_walled(replica: sqlite3.Connection, card: sqlite3.Row) -> Optional[tuple[str, Optional[str]]]:
++    """[daveey] ``("quota_hold", detail)`` when local dispatch would hold the never-run ``card`` pre-claim on its
++    pin's live quota wall (``hold_pinned_quota``: ready lane only, read-only, same inputs on the replica)."""
++    from hermes_cli.kanban_dispatch_skip import PINNED_QUOTA_WALL, pinned_quota_hold
++    held = pinned_quota_hold(replica, card["id"]) if card["status"] == "ready" else None
++    if held is None:
++        return None
++    from datetime import UTC, datetime
++    model, provider, until = held
++    return "quota_hold", (f"{PINNED_QUOTA_WALL} {model} ({provider}) until "
++                          f"{datetime.fromtimestamp(until, UTC):%Y-%m-%dT%H:%M:%SZ} (local dispatch would hold it)")
++
++
+ def note_capped(conn: sqlite3.Connection, profile_exists: Optional[Callable[[str], bool]] = None) -> None:
+     """A tick with no spawn budget runs no pickup: record why this machine's pinned cards wait (``budget_exhausted``
+     for the ones a slot would start). Evidence only (``kanban_pickup_stall``); copies nothing."""
+diff --git a/tests/hermes_cli/test_kanban_pickup_held_budget.py b/tests/hermes_cli/test_kanban_pickup_held_budget.py
+index 010ab1d249..5e62220aa7 100644
+--- a/tests/hermes_cli/test_kanban_pickup_held_budget.py
++++ b/tests/hermes_cli/test_kanban_pickup_held_budget.py
+@@ -47,10 +47,11 @@ def imports(monkeypatch):
+     return seen
+ 
+ 
+-def _held_on_board(hub, priority, reason="subscription_quota_reset"):
++def _held_on_board(hub, priority, reason="subscription_quota_reset", runs_on=()):
+     """A hub card another machine's dispatcher holds: its ``respawn_guarded`` event is in the Board history."""
+     hub.enter()
+-    tid = kb.create_task(hub.conn, title=f"held {priority}", assignee="default", priority=priority, runs_on=[])
++    tid = kb.create_task(hub.conn, title=f"held {priority}", assignee="default", priority=priority,
++                         runs_on=list(runs_on))
+     with write_txn(hub.conn):
+         append_event(hub.conn, tid, "respawn_guarded", {"reason": reason})
+     hub.round()
+@@ -124,8 +125,8 @@ def test_the_held_imports_per_tick_are_bounded(gws, monkeypatch):
+     monkeypatch.setattr(kph, "FREE_PER_TICK", 2)
+     held = [_held_on_board(hub, 900 - i) for i in range(3)]
+     plain = support._hub_card(hub, title="plain", priority=0, runs_on=PIN)
+-    got = _pickup(worker, 1)
+-    assert got == held[:2] + [plain]
++    got = _pickup(worker, 2)  # the card pinned here first (t_01a1d95eabbd2b9d), then at most 2 free held copies
++    assert got == [plain] + held[:2]
+ 
+ 
+ def test_a_capped_tick_reports_a_held_pinned_card_as_held(gws):
+@@ -165,7 +166,7 @@ def test_a_stalled_guard_held_card_does_not_file_the_registry_hold_repair(gws):
+ 
+ def test_an_unreadable_board_hold_takes_the_budget_as_before(gws, monkeypatch):
+     hub, worker = gws
+-    tid = _held_on_board(hub, 900)
++    tid = _held_on_board(hub, 900, runs_on=PIN)  # pinned here too: such cards go first (t_01a1d95eabbd2b9d)
+     pinned = support._hub_card(hub, title="pinned", priority=0, runs_on=PIN)
+ 
+     def boom(*a, **kw):
+diff --git a/tests/hermes_cli/test_kanban_pickup_pinned_first.py b/tests/hermes_cli/test_kanban_pickup_pinned_first.py
+new file mode 100644
+index 0000000000..72dd64f3db
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_pickup_pinned_first.py
+@@ -0,0 +1,112 @@
++"""Pickup budget goes to cards only this machine can run (t_01a1d95eabbd2b9d).
++
++worker-1 2026-11-14: t_01a1d6d855a058a2 (``runs_on machine:worker-1``) waited ``budget_exhausted`` for ~6 h. Two
++causes. A fresh ``require_model`` card pinned to a quota-walled openai-codex model (t_01a1d882f58d9df9, never run,
++so no quota episode) was copied, held ``pinned_quota_wall`` by local dispatch, evicted and copied again every ~18 s
++(~700 times), taking the batch each time. And a wide pass of 14 pool cards still left the pinned card exhausted:
++pool cards were ranked ahead of it, although other machines can take them.
++"""
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_dispatch_skip as kds
++from hermes_cli import kanban_pickup_stall as kps
++from hermes_cli import kanban_provider_walls as walls
++from hermes_cli import kanban_worker_node as wn
++from tests.hermes_cli import test_kanban_worker_node as support
++
++svc = support.svc
++gws = support.gws
++PIN = [f"machine:{support.WORKER}"]
++MODEL = ("gpt-6-astra", "openai-codex")
++WALL_S = 6 * 86400
++
++
++@pytest.fixture
++def imports(monkeypatch):
++    seen: list[str] = []
++    real = wn.import_cards
++
++    def counting(conn, replica, ids):
++        done = real(conn, replica, ids)
++        seen.extend(done)
++        return done
++    monkeypatch.setattr(wn, "import_cards", counting)
++    return seen
++
++
++@pytest.fixture
++def walled_model(monkeypatch):
++    until = int(time.time()) + WALL_S
++    monkeypatch.setattr(walls, "live_quota_wall",
++                        lambda provider, model: until if (model, provider) == MODEL else None)
++    return until
++
++
++def _status(conn, tid):
++    t = kb.get_task(conn, tid)
++    return t.status if t else None
++
++
++def test_a_mandatory_pin_on_a_walled_model_with_no_episode_is_not_copied(gws, imports, walled_model):
++    hub, worker = gws
++    # Both pinned to this machine, so ranking alone cannot save the eligible one: the walled card is ahead of it.
++    walled = support._hub_card(hub, title="mandatory pin, walled, never run", priority=1000, runs_on=PIN,
++                               model_override=MODEL[0], provider_override=MODEL[1], pin_mandatory=True)
++    pinned = support._hub_card(hub, title="pinned, eligible", priority=0, runs_on=PIN)
++    worker.round()
++    worker.enter()
++    # Parity: on a copy, the local dispatcher holds the walled card pre-claim (pinned_quota_wall).
++    replica = wn.open_replica(worker.conn)
++    assert replica is not None
++    try:
++        assert wn.import_cards(worker.conn, replica, [walled]) == [walled]
++    finally:
++        replica.close()
++    assert kds.pinned_quota_hold(worker.conn, walled) == (*MODEL, float(walled_model))
++    assert wn.evict(worker.conn) == [walled]
++    imports.clear()
++    # Budget 1: the first tick copies and starts the pinned card, not the walled one.
++    worker.tick(max_spawn=1)
++    assert imports == [pinned]
++    assert _status(worker.conn, pinned) == "running"
++    for _ in range(3):  # and no later tick copies the walled card: no import/evict churn
++        worker.round()
++        worker.tick(max_spawn=2)
++    assert imports == [pinned]
++    assert _status(worker.conn, walled) is None
++    skip = kps.latest(worker.conn, walled)
++    assert skip is not None and skip["reason"] == "quota_hold"
++    assert skip["detail"].startswith("pinned_quota_wall gpt-6-astra (openai-codex) until ")
++
++
++def test_a_fresh_pin_with_no_wall_is_copied(gws, imports, monkeypatch):
++    hub, worker = gws
++    monkeypatch.setattr(walls, "live_quota_wall", lambda provider, model: None)
++    tid = support._hub_card(hub, title="mandatory pin, no wall", priority=10, runs_on=PIN,
++                            model_override=MODEL[0], provider_override=MODEL[1], pin_mandatory=True)
++    worker.round()
++    worker.enter()
++    assert wn.pickup(worker.conn, budget=1) == [tid]
++
++
++def test_a_machine_pinned_card_is_picked_ahead_of_more_pool_cards_than_the_budget(gws, imports):
++    hub, worker = gws
++    pool = [support._hub_card(hub, title=f"pool {i}", priority=1000 - i, runs_on=["linux"]) for i in range(3)]
++    pinned = support._hub_card(hub, title="pinned to this machine", priority=0, runs_on=PIN)
++    worker.round()
++    worker.enter()
++    replica = wn.open_replica(worker.conn)
++    assert replica is not None
++    try:
++        picked, skips = wn._evaluate(worker.conn, replica, support.WORKER, mode="all", limit=2,
++                                     profile_exists=None, full_detail="pickup batch full this tick")
++    finally:
++        replica.close()
++    assert picked == [pinned, pool[0]]  # this machine's card first, then pool cards in their own order
++    assert pinned not in skips
++    worker.tick(max_spawn=2)
++    assert pinned in imports
++    assert _status(worker.conn, pinned) == "running"
+-- 
+2.43.0
+

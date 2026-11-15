@@ -77,6 +77,27 @@ No test executes a restart, SSH signal payload or pause request. Host-specific f
 transcripts belong outside this public repo; replay them as JSON to the configured
 hook command, never as shell input.
 
+## Pool launcher provenance
+
+A local pool daemon borrowing the Hermes Python bootstrap is not a Desktop backend.
+The classifier exempts only the complete canonical default-home bootstrap from the
+sibling `pool-llm` launcher, with its exact sibling script path and `serve [--port N]`
+arguments. It compares bounded ASTs; extra code, other paths, unknown wrappers,
+parse failures and template drift retain the conservative protection. `gateway.pid`
+identity still overrides the exemption. This does not authorize stopping an owned
+pool: verify its owner, birth identity and consumers first.
+
+`tests/test_pool_provenance.py` reproduces the old false protection through discovery
+and the terminal hook, preserves real backend/pidfile protections, and checks that
+parser resource failures cannot erase the gateway census. Both flattened `ps` and
+shell-quoted snapshots are covered. Remote stdin discovery has no installed sibling
+path and remains conservative; remote pool cleanup is not enabled by this change.
+
+Root cause: bootstrap reuse was treated as backend entrypoint provenance. Earlier
+negative tests covered plain helper scripts, not the canonical bootstrap used by a
+non-backend daemon. These regression tests exercise that missing boundary without
+executing any signal or restart command.
+
 ## Boundaries
 
 Broad-signal rules do not depend on a successful process snapshot: broadcast

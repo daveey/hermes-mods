@@ -114,6 +114,7 @@ class _Faulty:
 
 
 def test_transient_event_read_error_is_never_kept(board, monkeypatch):
+    monkeypatch.setattr(core, '_shared_reader', lambda: None)  # fault injection targets the private opener
     ksa, t = board['ksa'], time.time()
     fail = [1]
     real = core.ro_connect
@@ -129,6 +130,7 @@ def test_transient_event_read_error_is_never_kept(board, monkeypatch):
 
 
 def test_board_read_failure_skips_board_like_core(board, monkeypatch):
+    monkeypatch.setattr(core, '_shared_reader', lambda: None)  # fault injection targets the private opener
     ksa, t = board['ksa'], time.time()
 
     def broken(*args, **kwargs):

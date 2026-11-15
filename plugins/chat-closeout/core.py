@@ -125,6 +125,27 @@ def _register_generation_hook(cache: "_StructuralReads") -> None:
     _GENERATION_HOOK = cache.evict
 
 
+def _unregister_generation_hook() -> None:
+    global _GENERATION_HOOK
+    hook, _GENERATION_HOOK = _GENERATION_HOOK, None
+    if hook is not None:
+        try:
+            from hermes_cli import kanban_generation
+        except ImportError:
+            return
+        unregister = getattr(kanban_generation, "unregister_reader_cache", None)
+        if unregister is not None:
+            unregister(hook)
+
+
+def _shared_reader():
+    try:
+        from hermes_cli import kanban_session_activity
+    except ImportError:
+        return None
+    return getattr(kanban_session_activity, "cached_ro", None)
+
+
 def _deleted_generation_error(message: str) -> sqlite3.OperationalError:
     try:
         from hermes_cli.kanban_generation import DeletedWalGenerationError
@@ -134,26 +155,26 @@ def _deleted_generation_error(message: str) -> sqlite3.OperationalError:
 
 
 class _StructuralReads:
-    """One bounded, process-wide pool of read-only observers; data_version is meaningful only on a retained
-    connection.
+    """Per-generation structural memo, borrowing core's process-wide reader when available.
 
     Cache only successful structural reads, never health or clock-derived decisions. No read transaction
     survives a call. A pre-read revision is rechecked after the read, so a concurrent commit cannot label
-    old data with a newer revision. Path identity fences replacement/deletion; failures close and retry.
+    old data with a newer revision. File, connection and WAL identity fence replacement/reopening.
 
-    WAL generations: each entry records its ``-shm`` identity and is dropped when the live one differs (an
-    external process unlinked the sidecars), so a frozen data_version never vouches for old rows. Board
-    observers are core's registered, guarded readers and ``evict`` is registered with core, so core
-    ``recover()`` closes them before any other connect. Entries are ``(identity, conn, cached, lock, shm)``;
-    a connection is used and closed only under its own ``lock``; ``evict`` never waits on a borrowed one.
-    The pool is shared by every thread (bounded descriptors), not per thread.
+    Older cores use private observers. Each entry is ``(identity, conn, cached, lock, shm, last_used)``;
+    a connection is used and closed only under its own lock. Idle observers expire after 300 s and
+    unload permanently retires the pool. Eviction never waits on a borrowed observer.
     """
     MAX_DATABASES = 48  # local boards + sync shadows (~16 + ~10 on the largest host); up to 3 descriptors each
     MAX_QUERIES = 128
+    IDLE_S = 300.0
     _ATTEMPTS = 3
 
     def __init__(self):
         self.entries = OrderedDict()
+        self._shared = OrderedDict()
+        self._closed = False
+        self._timer = None
         self._lock = threading.Lock()
 
     @staticmethod
@@ -173,7 +194,47 @@ class _StructuralReads:
         with self._lock:
             entries = list(self.entries.values())
             self.entries.clear()
+            self._shared.clear()
+            if self._timer is not None:
+                self._timer.cancel()
+                self._timer = None
         self._close(*entries)
+
+    def close(self):
+        """Permanently retire this plugin generation; in-flight reads cannot republish observers."""
+        with self._lock:
+            self._closed = True
+        self.clear()
+        _unregister_generation_hook()
+
+    def _arm_idle(self):
+        """Caller holds _lock. One deadline timer, only on cores with private observers."""
+        if self._timer is not None or self._closed or not self.entries:
+            return
+        delay = max(0.1, min(e[5][0] for e in self.entries.values()) + self.IDLE_S - time.monotonic())
+        timer = threading.Timer(delay, lambda: self._expire_idle(timer))
+        timer.daemon = True
+        self._timer = timer
+        timer.start()
+
+    def _expire_idle(self, timer):
+        retired = []
+        with self._lock:
+            if self._timer is not timer:
+                return  # cancelled timer racing clear/unload
+            self._timer = None
+            now = time.monotonic()
+            for path, entry in list(self.entries.items()):
+                if now - entry[5][0] < self.IDLE_S:
+                    continue
+                if entry[3].acquire(blocking=False):
+                    del self.entries[path]
+                    retired.append(entry)
+                    entry[3].release()
+                else:
+                    entry[5][0] = now  # borrowed is active, not idle; avoid a tight retry loop
+            self._arm_idle()
+        self._close(*retired)  # never close under the pool lock (core lifecycle lock order)
 
     def evict(self, path):
         """Core reader-cache hook (``path`` is a realpath). Raises instead of waiting on a borrowed observer;
@@ -209,6 +270,8 @@ class _StructuralReads:
         identity = self.identity(path)
         shm = _shm_identity(path)
         with self._lock:
+            if self._closed:
+                raise sqlite3.OperationalError("chat-closeout reader is unloaded")
             entry = self.entries.get(path)
             stale = None
             if entry is not None and (entry[0] != identity or entry[4] != shm):
@@ -216,8 +279,11 @@ class _StructuralReads:
         self._close(stale)
         if entry is not None:
             return entry
-        if board:
-            _register_generation_hook(self)
+        with self._lock:
+            if self._closed:
+                raise sqlite3.OperationalError("chat-closeout reader is unloaded")
+            if board:
+                _register_generation_hook(self)
         conn = ro_connect(Path(path), board=board, check_same_thread=False)
         try:
             if self.identity(path) != identity:
@@ -226,21 +292,30 @@ class _StructuralReads:
         except BaseException:
             conn.close()
             raise
-        fresh = (identity, conn, OrderedDict(), threading.Lock(), shm)
+        fresh = (identity, conn, OrderedDict(), threading.Lock(), shm, [time.monotonic()])
         with self._lock:
             entry = self.entries.get(path)
             retired = []
-            if entry is None or entry[0] != identity or entry[4] != shm:
+            if not self._closed and (entry is None or entry[0] != identity or entry[4] != shm):
                 retired.append(self.entries.pop(path, None))
                 self.entries[path] = entry = fresh
                 fresh = None
                 while len(self.entries) > self.MAX_DATABASES:
                     retired.append(self.entries.popitem(last=False)[1])
+                self._arm_idle()
         self._close(fresh, *retired)  # fresh: another thread published a current one first
+        if self._closed:
+            raise sqlite3.OperationalError("chat-closeout reader is unloaded")
         return entry
 
     def read(self, path, key, query, *, board=False):
         path = str(Path(path).absolute())
+        with self._lock:
+            if self._closed:
+                raise OSError("chat-closeout reader is unloaded")
+        shared = _shared_reader()
+        if shared is not None:
+            return self._borrowed_read(shared, path, key, query)
         try:
             for _ in range(self._ATTEMPTS):
                 entry = self._current(path, board)
@@ -249,7 +324,11 @@ class _StructuralReads:
                         if self.entries.get(path) is not entry:
                             continue  # retired (evicted, bounded out, replaced) while we waited
                         self.entries.move_to_end(path)
-                    return self._read(path, entry, key, query)
+                    try:
+                        return self._read(path, entry, key, query)
+                    finally:
+                        with self._lock:
+                            entry[5][0] = time.monotonic()
         except Exception:
             self.drop(path)
             raise
@@ -260,6 +339,36 @@ class _StructuralReads:
             return query(conn)
         finally:
             conn.close()
+
+    def _borrowed_read(self, shared, path, key, query):
+        # Core owns the lifetime and the exclusive lock, including across plugin reloads.
+        # Never close a borrowed connection or keep a cursor/transaction beyond this body.
+        with shared(Path(path)) as conn:
+            identity, shm = self.identity(path), _shm_identity(path)
+            with self._lock:
+                if self._closed:
+                    # Lifecycle refusal is not a SQLite failure: cached_ro evicts on
+                    # sqlite3.Error, which would close another consumer's reader.
+                    raise OSError("chat-closeout reader is unloaded")
+                entry = self._shared.get(path)
+                # data_version is connection-relative: the same inode/revision on a new
+                # connection is NOT a cache hit. Holding the object prevents id reuse.
+                if entry is None or entry[0] != identity or entry[1] is not conn or entry[4] != shm:
+                    entry = (identity, conn, OrderedDict(), None, shm)
+                    self._shared[path] = entry
+                self._shared.move_to_end(path)
+                while len(self._shared) > self.MAX_DATABASES:
+                    self._shared.popitem(last=False)
+            factory = conn.row_factory
+            try:
+                conn.row_factory = sqlite3.Row
+                return self._read(path, entry, key, query)
+            except Exception:
+                with self._lock:
+                    self._shared.pop(path, None)
+                raise
+            finally:
+                conn.row_factory = factory
 
     def _read(self, path, entry, key, query):
         """Caller holds ``entry[3]``."""
@@ -518,9 +627,20 @@ def _board_rows(path: Path, left: list[str], light: bool) -> tuple[list[dict[str
                 read_inventory = None  # old core: acceptance remains unspecified
             board = path.parent.name if path.parent.parent.name == 'boards' else 'default'
             later = _later_comments(conn, left, bool(has_runs), comp)
+            history = None
+            try:
+                from hermes_cli.kanban_completion_receipt_projection import read_completed_many
+                from hermes_cli.kanban_origin import gateway_names
+                gateway = gateway_names()[0]
+                if gateway:
+                    # Same authority rules as read_inventory (created_on wins), one projection per board.
+                    history = read_completed_many(conn, left, board=board, gateway=gateway)
+            except (ValueError, TypeError, ImportError, OSError, sqlite3.Error):
+                pass  # old core/schema: retain the existing per-task optional projection
             for r in conn.execute(full.format(ph=ph), left):
                 try:
-                    historical = read_inventory(conn, r['id'], board=board) if read_inventory else None
+                    historical = (history.get(r['id']) if history is not None else
+                                  read_inventory(conn, r['id'], board=board) if read_inventory else None)
                 except (ValueError, TypeError, ImportError, OSError, sqlite3.Error):
                     historical = None  # optional history cannot change settlement/readability
                 rows.append({**dict(r), 'parents': tuple(parents.get(r['id'], [])), **(historical or {}),
@@ -684,6 +804,25 @@ def ask_candidates(row: dict[str, Any], cards: dict[str, dict[str, Any]]) -> lis
     return out
 
 
+def blocked_since(card: Optional[dict[str, Any]]) -> Optional[float]:
+    """When the card's current block was filed, or None. A local row carries ``blocked_at`` (its newest ``blocked``
+    event). A remote row (hub/worker replica) has no events: its ``park`` record of the run that blocked it does
+    (``outcome`` blocked, ``ended_at``), and only while the card is still blocked. Without this a remote ask the
+    chat already quoted is never learned and its relay retries forever (card t_01a1d95b5eae0f44)."""
+    if not card:
+        return None
+    raw = card.get('blocked_at')
+    if raw is None and card.get('status') in ('blocked', 'triage'):
+        park = card.get('park')
+        if isinstance(park, dict) and park.get('outcome') == 'blocked':
+            raw = park.get('ended_at')
+    try:
+        at = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return at if math.isfinite(at) and at > 0 else None
+
+
 def quoted_ask(state_dbs: Iterable[Path], ids: Iterable[str], card: dict[str, Any],
                pool: Optional[ReadPool] = None) -> bool:
     """Only an assistant's delivered text after this filing proves it was relayed.
@@ -693,11 +832,8 @@ def quoted_ask(state_dbs: Iterable[Path], ids: Iterable[str], card: dict[str, An
     """
     ask = ask_of(card)
     ids = list(dict.fromkeys(i for i in ids if i))
-    try:
-        since = float(card['blocked_at'])
-    except (KeyError, TypeError, ValueError):
-        return False
-    if not ask or not ids or not math.isfinite(since):
+    since = blocked_since(card)
+    if not ask or not ids or since is None:
         return False
     action = _norm(ask['action'])
     for path in state_dbs:
@@ -1591,19 +1727,53 @@ class Ledger:
                 c.close()
 
 
+# What settling one ledger row reads (``reconcile_done``, ``pending_key`` -> ``closeout_key``, ``unlinked_removed``).
+# The sidebar's waiting pass settles from only these, so the waker's bookkeeping writes are no input to it.
+SETTLE_ROW_FIELDS = ("batch", "covered", "unlinked", "done_sig", "done_at", "closing")
+
+
 def pending_closeouts(ledger: "Ledger", read: Callable[[list[str]], dict],
-                      proof: Optional[Callable[[str, str, dict[str, Any]], bool]] = None) -> dict[str, list[str]]:
+                      proof: Optional[Callable[[str, str, dict[str, Any]], bool]] = None, *,
+                      rows: Optional[list[dict[str, Any]]] = None,
+                      row_key: Optional[Callable[[dict[str, Any], Any], Optional[str]]] = None,
+                      cache: Any = None, stats: Optional[dict[str, int]] = None,
+                      fields: Optional[Iterable[str]] = None) -> dict[str, list[str]]:
     """``{session_id: batch ids}`` for chats whose whole batch has settled but whose close-out turn has not run for
     that state: the sidebar keeps them grey "waiting" until the closing answer lands. Read-only; it applies the
-    same reconcile the waker persists, so the sidebar can never wait on a row the waker would skip."""
+    same reconcile the waker persists, so the sidebar can never wait on a row the waker would skip.
+
+    Incremental (``row_key`` and ``cache``, WAITING-INPUTS.md): a row whose key (its fields, its cards as read, its
+    lineage's transcript watermark) equals the one its last answer was computed under keeps that answer without a
+    reconcile or transcript proof. ``rows``: the pending rows already read. ``stats`` counts ``recomputed`` rows.
+    ``fields``: settle each row from only these fields (``SETTLE_ROW_FIELDS``), so writes to any other field are no
+    input."""
     out: dict[str, list[str]] = {}
-    for row in ledger.pending():
+    pending = ledger.pending() if rows is None else rows
+    for row in pending:
         cards = read(row["batch"])
         sid = row["session_id"]
-        fix = reconcile_done(row, cards, (lambda t, c, sid=sid: proof(sid, t, c)) if proof else None)
-        row = {**row, **fix}
-        if (row["batch"] or unlinked_removed(row)) and pending_key(row, cards):
-            out[sid] = sorted(row["batch"]) or unlinked_removed(row)
+        if fields is not None:
+            # Only the fields settlement reads: the waker's bookkeeping (claims, retries, wake results) is no input,
+            # and a field missing here fails the settlement tests instead of going unnoticed.
+            row = {"session_id": sid, **{f: row.get(f) for f in fields}}
+        key = row_key(row, cards) if row_key is not None and cache is not None else None
+        hit = cache.get(sid, key) if key is not None else None
+        if hit is not None:
+            result = hit[1]
+        else:
+            fix = reconcile_done(row, cards, (lambda t, c, sid=sid: proof(sid, t, c)) if proof else None)
+            row = {**row, **fix}
+            result = None
+            if (row["batch"] or unlinked_removed(row)) and pending_key(row, cards):
+                result = sorted(row["batch"]) or unlinked_removed(row)
+            if cache is not None:
+                cache.put(sid, key, result)
+            if stats is not None:
+                stats["recomputed"] = stats.get("recomputed", 0) + 1
+        if result:
+            out[sid] = list(result)
+    if cache is not None:
+        cache.keep(r["session_id"] for r in pending)
     return out
 
 
@@ -1737,14 +1907,14 @@ ASK_RECHECK_S = 12 * 3600
 
 def ask_age_s(c: dict[str, Any], now: Optional[float] = None) -> Optional[float]:
     """Seconds since the card's current block was filed (``blocked_at``, else ``updated_at``); None if unknown."""
-    for field in ("blocked_at", "updated_at"):
-        try:
-            at = float(c.get(field) or 0)
-        except (TypeError, ValueError):
-            continue
-        if at > 0:
-            return max(0.0, (time.time() if now is None else now) - at)
-    return None
+    since = blocked_since(c)
+    if since is not None:
+        return max(0.0, (time.time() if now is None else now) - since)
+    try:
+        at = float(c.get("updated_at") or 0)
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, (time.time() if now is None else now) - at) if at > 0 else None
 
 
 def _age_text(age: float) -> str:

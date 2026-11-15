@@ -1,0 +1,542 @@
+From 08dba620ebd225b27df95f377f982d88923c00a2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 19:59:49 +0000
+Subject: [PATCH] fix(gateway): pending notices ride the turn that starts at a
+ boundary [daveey]
+
+A background-process completion admitted mid-turn waited one full turn per row queued
+ahead of it. On 2026-11-13 proc_467899b1fa1b's completion was admitted at 10:21:51 in
+MacBook chat 20261026_235722_bef6c6 and reached the model at 11:21:07 (59 min). Three
+update-resume continuations and one Kanban batch each started a turn without it
+(t_01a1d663082aa53a).
+
+Five whys:
+1. Completions are delivered at turn boundaries, and the chat was mid-turn.
+2. Four boundaries in a row each started one turn from another queued row, and none of
+   those turns carried the pending completion.
+3. The drain claims exactly one row per turn. The admission-time folds
+   (_admit_folded_completion, kanban_wake_fold) only join a row of the same kind at the
+   queue tail. An update-resume head is a started checkpoint, not a queued row, so
+   nothing could fold into it.
+Root (happened): turn composition never looked past the claimed row.
+Root (not caught): no test had two different kinds of notice queued at one boundary,
+or a notice pending behind an update-resume.
+
+Fix: gateway/session_fold_pending.py. When an update-resume continuation, a completion
+turn or a Kanban-wake turn starts (execute_admission, after the pause note is built),
+every completion and Kanban wake still queued for the session joins it. The scan stops
+at the first human input and skips held notifier wakes, liveness/loop ticks and remote
+notices that carry kanban_event_keys. Rows join in admission order, and each keeps its
+own text (Kanban rows are refreshed from live card state first). A person's message,
+and finite/API/CLI turns, are never extended.
+
+Custody reuses the queued-steer transfer. Each row goes queued -> terminal 'steering',
+bound to the claim's generation, and settles in that claim's own settlement write.
+settle_outcome marks a row delivered only when the claim completed, so it is acked
+exactly once as 'steered'. Any other ending (failed, interrupted, unknown, an
+unstarted requeue) puts it back in its own FIFO place. A turn parking for a Hermes
+update first reverts its folded rows (unfold_for_checkpoint), because a steering
+transfer refuses the checkpoint; the continuation folds them again. The queue's own
+fold rules and stored rows are unchanged.
+
+Proof (tests/gateway/test_fold_pending_admissions.py), RED on origin/main (5 of 6 fail)
+and GREEN here:
+a. a completion admitted while a Kanban turn is paused for an update rides the resume
+   turn: pause_note(paused request) + completion.
+b. Kanban row then completion behind a busy turn: one turn, in admission order.
+c. two completions plus one Kanban row: one turn, with the head completed and the
+   others steered. A failed turn requeues both folded rows and the next turn carries
+   them. A paused turn requeues them and the resume turn carries them. No row is left
+   pending.
+Guard: a queued prompt is never jumped or extended.
+The 177 test files that import the touched modules (kanban_wake_fold, completion_fold,
+process registry, notifications, update pause, steer, local producer admission) pass:
+1500 passed, 13 skipped. scripts/check --base origin/main is ok.
+---
+ gateway/session_fold_pending.py               | 176 +++++++++++++
+ gateway/session_ingress.py                    |   2 +
+ gateway/session_settlement_recovery.py        |   3 +-
+ gateway/session_update_pause.py               |   2 +
+ tests/gateway/test_fold_pending_admissions.py | 247 ++++++++++++++++++
+ 5 files changed, 429 insertions(+), 1 deletion(-)
+ create mode 100644 gateway/session_fold_pending.py
+ create mode 100644 tests/gateway/test_fold_pending_admissions.py
+
+diff --git a/gateway/session_fold_pending.py b/gateway/session_fold_pending.py
+new file mode 100644
+index 0000000000..9ee8acb91b
+--- /dev/null
++++ b/gateway/session_fold_pending.py
+@@ -0,0 +1,176 @@
++"""Notices already pending at a turn boundary ride the turn that starts there. [daveey]
++
++A busy chat ran one turn per queued row: a process completion admitted mid-turn waited behind every
++row ahead of it (an update-resume continuation, a Kanban batch), one full turn each. On 2026-11-13
++proc_467899b1fa1b's completion reached chat 20261026_235722_bef6c6 59 min after admission: three
++update-resume turns and one Kanban batch each started without it (t_01a1d663082aa53a). The
++admission-time folds (``session_automation._admit_folded_completion``, ``kanban_wake_fold``) only join
++a row of the same kind at the queue tail, and an update-resume head is no queued row at all.
++
++So when an automation turn (or any update-resume continuation) starts, every completion and Kanban wake
++still queued behind it, up to the first human input, is handed to that claim and appended to its text,
++each with its own envelope text intact. Custody is the queued-steer transfer
++(``hermes_state_runtime.steer_session_input``): each row goes queued -> terminal ``steering`` bound to
++the claim's generation and settles in the claim's own settlement write. It reads delivered only when the
++claim completed (``steered``, acked once); any other ending (failed, interrupted, unknown, a pause for an
++update, an unstarted requeue) puts it back in its own FIFO place (``_requeue_transfer``), so nothing is
++lost and nothing settles twice. The queue's own fold rules and the rows themselves are unchanged.
++"""
++from __future__ import annotations
++
++import asyncio
++import json
++import logging
++from functools import partial
++
++from hermes_state_runtime import RuntimeStoreError, list_session_admissions
++
++logger = logging.getLogger(__name__)
++
++# The producers whose queued rows join a starting turn: async results and Kanban card events.
++FOLDABLE_PRODUCERS = frozenset({'completion', 'async_delegation', 'kanban-wake'})
++# A turn that runs as one input of its own: never extended.
++_WHOLE_TURN_KEYS = frozenset({'finite', 'api_turn_v1', 'cli_turn_v1'})
++
++
++def _automation(payload):
++    return payload.get('local_automation_v1') or (payload.get('native_text_v1') or {}).get('automation') or {}
++
++
++def _producer(row):
++    try:
++        identity = json.loads(row.get('request_id') or '')
++    except (TypeError, ValueError):
++        return None
++    return identity[0] if isinstance(identity, list) and identity else None
++
++
++def accepts_fold(row):
++    """The head extends: an update-resume continuation, or a completion / Kanban wake turn itself. A person's
++    own message stays as typed (it is the bubble they see), finite/API/CLI turns run their one input only, and
++    a liveness or loop tick keeps its own short turn (its process's later ticks fold into it at admission)."""
++    payload = row.get('payload') or {}
++    if _WHOLE_TURN_KEYS & set(payload) or not isinstance(payload.get('text'), str):
++        return False
++    return bool(row.get('update_resume')) or (bool(_automation(payload)) and _producer(row) in FOLDABLE_PRODUCERS)
++
++
++def _foldable(row):
++    payload = row['payload']
++    descriptor = _automation(payload)
++    if not descriptor or _producer(row) not in FOLDABLE_PRODUCERS or not isinstance(payload.get('text'), str):
++        return False
++    # A remote Kanban notice is acked by the keys its own turn's user row carries: it keeps its own turn.
++    return not descriptor.get('kanban_event_keys')
++
++
++def candidates(authority, ref, head):
++    """Queued rows behind ``head`` that may join it, in admission order. A held notifier wake and other
++    producer rows (liveness ticks, loop ticks) are passed over; the first human input ends the scan, so a
++    notice never jumps a prompt queued before it."""
++    from gateway.session_notifier_drain import eligible
++    picked = []
++    for row in list_session_admissions(authority.db, session_id=ref.session_id):
++        if row['status'] != 'queued' or row['admission_id'] == head['admission_id']:
++            continue
++        if not _automation(row['payload']):
++            break
++        if eligible(row) and _foldable(row):
++            picked.append(row)
++    return picked
++
++
++async def _check(authority, ref, live, row):
++    """The checks the row's own claim would run (route, owner, identity), read-only."""
++    if 'local_automation_v1' in row['payload']:
++        from gateway.session_automation import check_local_automation
++        check_local_automation(authority, ref, row)
++        return
++    from gateway.session_envelope import check_native_route
++    await check_native_route(authority.runner, row['payload'], authority.physical_target(ref), live.source,
++                             authority.runner._adapter_for_source(live.source))
++
++
++def _refresh(payload):
++    from gateway.kanban_wake_fold import refresh_claimed
++    from hermes_cli.kanban_stale_ask import refresh_payload
++    refresh_claimed(payload)
++    refresh_payload(payload)
++
++
++def folded(authority):
++    """session -> (generation, {admission_id}) this module handed to that claim."""
++    return vars(authority).setdefault('folded_transfers', {})
++
++
++async def fold_pending(authority, ref, live, row, event):
++    """Hand every pending notice behind the claimed ``row`` to it and append each one's text to ``event``.
++    Returns the folded admission ids. A row refused by its checks or by the transfer write stays queued."""
++    if not accepts_fold(row) or not isinstance(event.text, str):
++        return []
++    from gateway.session_queued_controls import _register, _unregister
++    from gateway.session_runtime_workers import tracked_write
++    from hermes_state_runtime import steer_session_input
++    generation, sid, taken, texts = row['generation'], ref.session_id, [], []
++    for candidate in await asyncio.to_thread(candidates, authority, ref, row):
++        try:
++            await _check(authority, ref, live, candidate)
++        except RuntimeStoreError:
++            continue  # its own claim refuses it in FIFO order
++        payload = dict(candidate['payload'])
++        await asyncio.to_thread(_refresh, payload)
++        with live.event_stream.lock:
++            _register(authority, sid, generation, candidate['admission_id'])
++        try:
++            _committed, fresh = await tracked_write(authority, partial(
++                steer_session_input, authority.db, epoch=authority.epoch,
++                admission_id=candidate['admission_id'], generation=generation))
++        except RuntimeStoreError:
++            with live.event_stream.lock:
++                _unregister(authority, sid, generation, candidate['admission_id'])
++            continue
++        if not fresh:
++            continue
++        taken.append(candidate['admission_id'])
++        texts.append(payload['text'].strip())
++    if not taken:
++        return []
++    folded(authority)[sid] = (generation, set(taken))
++    event.text = '\n\n'.join([event.text.rstrip(), *texts])
++    logger.info('Folded %d pending admission(s) into turn: session=%s admission=%s generation=%s folded=%s',
++                len(taken), sid, row['admission_id'], generation, ','.join(taken))
++    authority._publish_pending(ref)
++    return taken
++
++
++def settle_outcome(authority, row, transfers, outcome):
++    """``transfers`` for the claim's settlement write: a folded row reads delivered only when the claim
++    completed; under any other outcome it goes back to its own FIFO place."""
++    entry = folded(authority).get(row['target_session_id'])
++    if entry is None or entry[0] != row['generation']:
++        return transfers
++    transfers = dict(transfers or {})
++    for admission_id in entry[1]:
++        transfers[admission_id] = outcome == 'completed'
++    return transfers
++
++
++async def unfold_for_checkpoint(authority, live, ref, row):
++    """A turn parking for a Hermes update gives its folded rows back to their FIFO places first (a steering
++    transfer refuses the checkpoint); the continuation folds them again when it starts."""
++    entry = folded(authority).pop(ref.session_id, None)
++    if entry is None or entry[0] != row['generation']:
++        return
++    from gateway.session_runtime_workers import tracked_write
++    from hermes_state_runtime import revert_steer_input
++    for admission_id in sorted(entry[1]):
++        await tracked_write(authority, partial(revert_steer_input, authority.db, epoch=authority.epoch,
++                                               admission_id=admission_id, generation=row['generation']))
++        with live.event_stream.lock:
++            transfers = authority.steer_transfers.get(ref.session_id)
++            if transfers is not None and transfers[0] == row['generation']:
++                transfers[1].pop(admission_id, None)
++                if not transfers[1]:
++                    authority.steer_transfers.pop(ref.session_id, None)
++    logger.info('Unfolded %d admission(s) for an update pause: session=%s admission=%s',
++                len(entry[1]), ref.session_id, row['admission_id'])
+diff --git a/gateway/session_ingress.py b/gateway/session_ingress.py
+index 2094064619..53476ec30c 100644
+--- a/gateway/session_ingress.py
++++ b/gateway/session_ingress.py
+@@ -322,6 +322,8 @@ async def execute_admission(authority, ref, row):
+         # by get_or_create_session. Strict lookup refuses a route moved since claim.
+         event.metadata.update(gateway_session_key=live.route, gateway_session_strict=True,
+                               gateway_session_id=row['update_resume']['physical_session_id'])
++    from gateway.session_fold_pending import fold_pending
++    await fold_pending(authority, ref, live, row, event)  # [daveey] pending notices ride this turn
+     # The claim's admission gate ran inside its commit, so no drain had begun when this row was
+     # claimed: it is in-flight work the restart drain waits for, not new work its gate refuses.
+     # Without this a drain that flips between the claim and the turn settles it 'completed' unrun.
+diff --git a/gateway/session_settlement_recovery.py b/gateway/session_settlement_recovery.py
+index d322261f58..fb0bcee65f 100644
+--- a/gateway/session_settlement_recovery.py
++++ b/gateway/session_settlement_recovery.py
+@@ -190,7 +190,8 @@ def commit_and_publish(authority, live, ref, row, response, outcome, captured, s
+     # already have dropped it from ``authority.sessions``.
+     with live.event_stream.lock:
+         live.settling[admission_id] = row
+-    transfers = _transfers(authority, live, row)
++    from gateway.session_fold_pending import settle_outcome
++    transfers = settle_outcome(authority, row, _transfers(authority, live, row), prepared[0])
+     try:
+         settlement['settled'], settlement['response'] = finish_result(
+             authority.db, epoch=authority.epoch, row=row, response=response, outcome=outcome,
+diff --git a/gateway/session_update_pause.py b/gateway/session_update_pause.py
+index a21af657d5..fbe179fa6d 100644
+--- a/gateway/session_update_pause.py
++++ b/gateway/session_update_pause.py
+@@ -132,6 +132,8 @@ async def park_or_interrupt(authority, live, ref, row):
+             if requeued is not None:
+                 return requeued
+         try:
++            from gateway.session_fold_pending import unfold_for_checkpoint
++            await unfold_for_checkpoint(authority, live, ref, row)
+             receipt = await tracked_write(authority, partial(checkpoint_session_input, authority.db,
+                 epoch=authority.epoch, admission_id=row['admission_id'], generation=row['generation'],
+                 physical_session_id=authority.physical_target(ref), transcript_mark=row['transcript_mark']))
+diff --git a/tests/gateway/test_fold_pending_admissions.py b/tests/gateway/test_fold_pending_admissions.py
+new file mode 100644
+index 0000000000..0f5f012140
+--- /dev/null
++++ b/tests/gateway/test_fold_pending_admissions.py
+@@ -0,0 +1,247 @@
++"""Every notice pending at a turn boundary rides the turn that starts there (t_01a1d663082aa53a).
++
++A completion admitted mid-turn waited one full turn per row queued ahead of it: an update-resume
++continuation and a Kanban batch each started without it, 59 min in all on the MacBook. The turn that
++starts now carries every completion and Kanban wake already queued for the session, in admission order,
++with each row's own text intact; each row is acked once by the claim's settlement, and an ending other
++than completed (failed, paused for an update) gives every folded row back to its FIFO place.
++"""
++import asyncio
++from types import SimpleNamespace
++
++import pytest
++
++from gateway.session_results import execution_result
++
++
++async def _harness(tmp_path, monkeypatch, behave):
++    from gateway import session_update_pause
++    from gateway.config import GatewayConfig
++    from gateway.run import GatewayRunner
++    from gateway.session_authority import initialize_session_authority
++    from gateway.session_contract import SessionActor
++    from gateway.session_local import create_local_session
++    from hermes_cli import admission_fence
++    from hermes_state import SessionDB
++
++    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
++    runner = GatewayRunner(GatewayConfig(sessions_dir=tmp_path / 'sessions'))
++    db = SessionDB(tmp_path / 'state.db')
++    runner.session_store._db = runner._session_db = db
++    authority = await initialize_session_authority(runner, profile_id='default', instance_id='fold', db=db)
++    held = [False]
++    monkeypatch.setattr(session_update_pause, 'update_held', lambda authority: held[0])
++    monkeypatch.setattr(admission_fence, 'pause_requested', lambda root: held[0])
++    seen = []
++
++    async def turn(event, source, quick_key, run_generation):
++        seen.append(event)
++        return await behave(len(seen), event)
++
++    monkeypatch.setattr(runner, '_handle_message_with_agent', turn)
++    viewer = SessionActor('test-owner', 'default', frozenset(
++        {'session:create', 'session:submit', 'session:read'}), 'viewer')
++    ref = create_local_session(authority, viewer, dict(request_id='cli', source='tui', model='fixture',
++                                                      cwd=str(tmp_path), toolsets=[]))
++    await authority.attach(viewer, ref, history=False)  # viewed: completions run as turns, not notes
++    live = authority.sessions[ref.session_id]
++    adapter = runner._adapter_for_source(live.source)
++
++    async def notice(text, producer):
++        from gateway.session_automation import admit_route_wake
++        assert await admit_route_wake(runner, adapter, live.source, text, producer) is True
++
++    def rows():
++        from hermes_state_runtime import list_session_admissions
++        return {row['payload']['text']: row
++                for row in list_session_admissions(db, session_id=ref.session_id, pending_only=False)}
++
++    async def close():
++        held[0] = False
++        tasks = [entry.task for entry in authority.sessions.values() if entry.task]
++        for task in tasks:
++            if not task.done():
++                task.cancel()
++        await asyncio.gather(*tasks, return_exceptions=True)
++        db.close()
++
++    return SimpleNamespace(authority=authority, ref=ref, live=live, held=held, seen=seen, notice=notice,
++                           rows=rows, close=close, db=db, viewer=viewer)
++
++
++def _completed(text='done'):
++    execution_result.get()['result'] = {'final_response': text, 'messages': []}
++    return text
++
++
++async def _idle(h, turns):
++    from tests.waiting import async_wait_until
++    await async_wait_until(lambda: len(h.seen) >= turns, timeout=10, what=f'{turns} turns')
++    await asyncio.wait_for(h.live.task, 10)
++
++
++def _pause(event):
++    """A turn that reached a completed-tool step boundary and paused for a Hermes update."""
++    from gateway.session_update_pause_hook import installed
++    from agent.turn_iteration_prep import _step_boundary_pause
++    sid = event.metadata['gateway_session_id']
++    history = [{'role': 'user', 'content': event.text},
++               {'role': 'assistant', 'content': '', 'tool_calls': [
++                   {'id': 'k1', 'type': 'function', 'function': {'name': 'kanban_show', 'arguments': '{}'}}]},
++               {'role': 'tool', 'content': 'card', 'tool_call_id': 'k1', 'tool_name': 'kanban_show'}]
++    agent = SimpleNamespace()
++    with installed(agent, message_id=event.message_id):
++        assert _step_boundary_pause(agent, history, 1)
++    execution_result.get()['result'] = {'paused_for_update': True, 'interrupted': True,
++                                        'final_response': '', 'messages': history}
++    return sid, history
++
++
++@pytest.mark.asyncio
++async def test_update_resume_turn_carries_a_completion_admitted_while_paused(tmp_path, monkeypatch):
++    """(a) The completion admitted while the turn was paused rides the resume turn, after the paused request."""
++    from tests.waiting import async_wait_until
++    from tui_gateway.update_pause import pause_note
++    h = None
++
++    async def behave(n, event):
++        if n == 1:
++            sid, history = _pause(event)
++            h.authority.db.append_messages_batch(sid, history)
++            return None
++        return _completed()
++
++    h = await _harness(tmp_path, monkeypatch, behave)
++    try:
++        h.held[0] = True
++        await h.notice('[kanban] Task t_1 blocked.', 'kanban-wake')
++        await async_wait_until(lambda: bool(h.authority.update_parked), timeout=10, what='the wake parked')
++        await h.notice('[IMPORTANT: Background process proc_a completed (exit 0)]', 'completion')
++        h.held[0] = False
++        h.authority._schedule(h.ref)
++        await _idle(h, 2)
++        assert len(h.seen) == 2, [event.text for event in h.seen]
++        assert h.seen[1].text == (pause_note('[kanban] Task t_1 blocked.')
++                                  + '\n\n[IMPORTANT: Background process proc_a completed (exit 0)]')
++        rows = h.rows()
++        assert (rows['[kanban] Task t_1 blocked.']['outcome']) == 'completed'
++        assert rows['[IMPORTANT: Background process proc_a completed (exit 0)]']['outcome'] == 'steered'
++    finally:
++        await h.close()
++
++
++@pytest.mark.asyncio
++async def test_kanban_row_then_completion_run_as_one_turn_in_admission_order(tmp_path, monkeypatch):
++    """(b) Both queued behind a busy turn: the next boundary starts ONE turn carrying both, in order."""
++    gate = asyncio.Event()
++
++    async def behave(n, event):
++        if n == 1:
++            await gate.wait()
++        return _completed()
++
++    h = await _harness(tmp_path, monkeypatch, behave)
++    try:
++        await h.notice('[kanban] Task t_0 completed.', 'kanban-wake')
++        from tests.waiting import async_wait_until
++        await async_wait_until(lambda: len(h.seen) == 1, timeout=10, what='the first turn')
++        await h.notice('[kanban] Task t_1 blocked.', 'kanban-wake')
++        await h.notice('[IMPORTANT: Background process proc_a completed (exit 0)]', 'completion')
++        gate.set()
++        await _idle(h, 2)
++        assert [event.text for event in h.seen] == [
++            '[kanban] Task t_0 completed.',
++            '[kanban] Task t_1 blocked.\n\n[IMPORTANT: Background process proc_a completed (exit 0)]']
++        rows = h.rows()
++        assert rows['[kanban] Task t_1 blocked.']['outcome'] == 'completed'
++        assert rows['[IMPORTANT: Background process proc_a completed (exit 0)]']['outcome'] == 'steered'
++    finally:
++        await h.close()
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize('ending', ['completed', 'failed', 'paused'])
++async def test_two_completions_and_a_kanban_row_fold_and_settle_once(tmp_path, monkeypatch, ending):
++    """(c) One turn carries all three. Each is acked exactly once; a failed or paused turn gives every
++    folded row back to its FIFO place, and the next turn carries them (no loss, no duplicate)."""
++    from tui_gateway.update_pause import pause_note
++    gate = asyncio.Event()
++    c1, k, c2 = ('[IMPORTANT: Background process proc_a completed (exit 0)]', '[kanban] Task t_1 blocked.',
++                 '[IMPORTANT: Background process proc_b completed (exit 1)]')
++    h = None
++
++    async def behave(n, event):
++        if n == 1:
++            await gate.wait()
++            return _completed()
++        if n == 2 and ending == 'failed':
++            execution_result.get()['result'] = {'final_response': '', 'messages': [], 'failed': True,
++                                                'error': 'provider down'}
++            return ''
++        if n == 2 and ending == 'paused':
++            h.held[0] = True
++            sid, history = _pause(event)
++            h.authority.db.append_messages_batch(sid, history)
++            return None
++        return _completed()
++
++    h = await _harness(tmp_path, monkeypatch, behave)
++    try:
++        from tests.waiting import async_wait_until
++        await h.notice('[kanban] Task t_0 completed.', 'kanban-wake')
++        await async_wait_until(lambda: len(h.seen) == 1, timeout=10, what='the first turn')
++        # A paused turn needs a pause-eligible head: a Kanban wake (a local completion turn never parks).
++        order = (k, c1, c2) if ending == 'paused' else (c1, k, c2)
++        for text in order:
++            await h.notice(text, 'kanban-wake' if text == k else 'completion')
++        gate.set()
++        if ending == 'paused':
++            await async_wait_until(lambda: bool(h.authority.update_parked), timeout=10, what='the turn parked')
++            rows = h.rows()
++            # The parked head keeps its checkpoint; the rows it carried are queued again in their places.
++            assert [rows[text]['status'] for text in order] == ['started', 'queued', 'queued']
++            h.held[0] = False
++            h.authority._schedule(h.ref)
++        await _idle(h, 2 if ending == 'completed' else 3)
++        texts = [event.text for event in h.seen]
++        assert texts[1] == '\n\n'.join(order)
++        rows = h.rows()
++        if ending == 'completed':
++            assert len(texts) == 2
++            assert [rows[text]['outcome'] for text in (c1, k, c2)] == ['completed', 'steered', 'steered']
++        elif ending == 'failed':
++            assert len(texts) == 3 and texts[2] == f'{k}\n\n{c2}'
++            assert [rows[text]['outcome'] for text in (c1, k, c2)] == ['failed', 'completed', 'steered']
++        else:
++            assert len(texts) == 3 and texts[2] == pause_note(k) + f'\n\n{c1}\n\n{c2}'
++            assert [rows[text]['outcome'] for text in order] == ['completed', 'steered', 'steered']
++        assert not [row for row in rows.values() if row['status'] != 'terminal']
++    finally:
++        await h.close()
++
++
++@pytest.mark.asyncio
++async def test_a_queued_prompt_is_never_jumped_and_never_extended(tmp_path, monkeypatch):
++    """A notice queued behind a person's message waits for it; the message itself stays as typed."""
++    from gateway.session_contract import Submission
++    gate = asyncio.Event()
++
++    async def behave(n, event):
++        if n == 1:
++            await gate.wait()
++        return _completed()
++
++    h = await _harness(tmp_path, monkeypatch, behave)
++    try:
++        from tests.waiting import async_wait_until
++        await h.notice('[kanban] Task t_0 completed.', 'kanban-wake')
++        await async_wait_until(lambda: len(h.seen) == 1, timeout=10, what='the first turn')
++        await h.notice('[kanban] Task t_1 blocked.', 'kanban-wake')
++        await h.authority.submit(h.viewer, Submission('my question', h.ref, {'text': 'my question'}, 'queue'))
++        await h.notice('[IMPORTANT: Background process proc_a completed (exit 0)]', 'completion')
++        gate.set()
++        await _idle(h, 4)
++        assert [event.text for event in h.seen][1:] == [
++            '[kanban] Task t_1 blocked.', 'my question', '[IMPORTANT: Background process proc_a completed (exit 0)]']
++    finally:
++        await h.close()
+-- 
+2.43.0
+

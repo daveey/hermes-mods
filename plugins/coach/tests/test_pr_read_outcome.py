@@ -128,6 +128,50 @@ def test_turn_log_line_drops_the_preamble_and_keeps_late_reads(tmp_path, monkeyp
     assert ar.PR_READ_RE.pattern == rcm._PSC_READ_RE.pattern
 
 
+# agent-017050f699: the read ran through a token-broker wrapper function, so no `gh pr view` text appeared at all
+# (MacBook state.db msg 923525/923587, repo scrubbed). `G pr view` / `G api .../pulls/...` are the reads.
+WRAPPED = ('TB=$HOME/.local/bin/token-broker; R=example/repo; G() { timeout 60 $TB exec --scope user/github --reason '
+           '"PR blocker check 2748/2670" -- gh "$@" 2>&1 | grep -vE \'gh[ps]_|eyJ\'; }; '
+           'TIP=$(G api repos/$R/branches/state --jq .commit.sha); for n in 2748 2670; do echo "=== #$n"; '
+           'G pr view $n -R $R --json state,mergeStateStatus,mergeable --jq \'.state\'; G pr checks $n -R $R | wc -l; '
+           'G api repos/$R/pulls/$n/reviews --jq \'.[-1].state\'; done; TZ=America/Los_Angeles date \'+%T\'')
+WRAPPED_REPLY = ("**#2748 and #2670 are still unmerged, and the guard fix isn't the only step left** (checked 16:21 PT): "
+                 "both are open.")
+
+
+def test_read_through_a_gh_wrapper_function_holds_no_nudge(tmp_path, monkeypatch):
+    hooks, rows, _ = _hooks(tmp_path, monkeypatch)
+    hooks["pre_llm_call"](session_id=SID, user_message="are 2748 and 2670 merged?", platform="desktop")
+    _tool(hooks, WRAPPED)
+    assert hooks["pre_verify"](session_id=SID, platform="desktop", attempt=0, final_response=WRAPPED_REPLY) is None
+    assert not [r for r in rows() if r["event"] == "reply_nudge"]
+
+
+def test_wrapper_read_after_the_nudge_resolves_the_outcome(tmp_path, monkeypatch):
+    hooks, rows, _ = _hooks(tmp_path, monkeypatch)
+    _nudge(hooks)
+    _tool(hooks, WRAPPED)
+    assert hooks["pre_verify"](session_id=SID, platform="desktop", attempt=1, final_response=FINAL) is None
+    o = _outcome(rows)
+    assert o["rule"] == "pr_state_claim" and o["resolved"] is True, o
+
+
+def test_pr_read_lines_expand_gh_wrappers(tmp_path, monkeypatch):
+    _, _, mod = _hooks(tmp_path, monkeypatch)
+    ar = mod._load("agent_rules")
+    lines = ar.pr_read_lines(WRAPPED)
+    assert any(l.startswith("   <- PR read: gh ") and "gh pr view $n -R $R" in l for l in lines), lines
+    # short wrapper commands (under the 140-char cut) still get a line: the `->` line shows `G pr view`, not gh
+    assert ar.pr_read_lines('G() { gh "$@"; }; G pr view 5 --json state'), "short function wrapper"
+    assert ar.pr_read_lines('alias g="token-broker exec --scope user/github -- gh"; g pr checks 5')
+    assert ar.pr_read_lines('GH="token-broker exec --scope user/github -- gh"; $GH pr view 5')
+    assert ar.pr_read_lines('GH="token-broker exec -- gh"; ${GH} api repos/o/r/pulls/5')
+    # not reads: a function that does not forward to gh, a wrapper never called for a PR, --help
+    assert not ar.pr_read_lines('G() { git "$@"; }; G pr view 5')
+    assert not ar.pr_read_lines('G() { gh "$@"; }; G repo view o/r')
+    assert not ar.pr_read_lines('G() { gh "$@"; }; G pr view --help')
+
+
 def test_the_marker_matches_kanban_worker_nice():
     nice = load("kwn_for_coach_test", ROOT.parent / "kanban-worker-nice" / "__init__.py")
     assert nice._MARKER == NICE.split("\n")[0] + "\n"

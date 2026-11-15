@@ -29,18 +29,26 @@ RETRY_INTERVAL_S = float(os.environ.get('HERMES_USER_STEPS_RETRY_S', '15'))
 RETRY_MAX_ATTEMPTS = 240
 
 
+_LOAD_LOCK = threading.Lock()
+
+
 def _load(name: str):
     key = f"_user_steps_{name}"
     path = Path(__file__).resolve().parents[1] / f"{name}.py"
-    mtime = path.stat().st_mtime_ns
-    mod = sys.modules.get(key)
-    if mod is None or getattr(mod, "_mtime", None) != mtime:
-        spec = importlib.util.spec_from_file_location(key, path)
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        setattr(mod, "_mtime", mtime)
-        sys.modules[key] = mod
-    return mod
+    with _LOAD_LOCK:
+        mtime = path.stat().st_mtime_ns
+        mod = sys.modules.get(key)
+        if mod is None or getattr(mod, "_mtime", None) != mtime:
+            spec = importlib.util.spec_from_file_location(key, path)
+            candidate = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(candidate)
+            setattr(candidate, "_mtime", mtime)
+            # A failed import leaves the old module and its readers usable.
+            sys.modules[key] = candidate
+            if mod is not None and callable(getattr(mod, 'close_pool', None)):
+                mod.close_pool()
+            mod = candidate
+        return mod
 
 
 class DecisionBody(BaseModel):

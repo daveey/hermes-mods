@@ -1,0 +1,99 @@
+From 95dbb119f19408e27d6ae0d908de18a57f80536a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 13:54:27 -0800
+Subject: [PATCH] [daveey] gateway: short Kanban-only wait only for an unfenced
+ checkpoint intent that cuts cron; update the 15 s pin
+
+CI on #2687: tests/gateway/test_instant_update_cron_drain_latency.py pinned the instant grace at 15 s. That is
+the behaviour this change shortens on purpose, so the pin is now 2 s (CORE_UPDATE_CHECKPOINT_KANBAN_WAIT_S).
+_intent_is_checkpoint now requires the same shape gateway.restart.checkpoint_cron_grace_spent does: kind
+"unfenced", "checkpoint": true and "cron_cut": true. A fenced (Mac) intent, a checkpoint without the cron cut
+and non-boolean values keep 15 s.
+
+Tests: 9 parametrized intent shapes; the 40 gateway update/restart/drain/checkpoint/cron test files pass
+locally (394 passed, 2 skipped).
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ gateway/run_shutdown_restart_wait.py                    | 9 ++++++---
+ tests/gateway/test_core_update_kanban_wait.py           | 6 ++++--
+ tests/gateway/test_instant_update_cron_drain_latency.py | 6 ++++--
+ 3 files changed, 14 insertions(+), 7 deletions(-)
+
+diff --git a/gateway/run_shutdown_restart_wait.py b/gateway/run_shutdown_restart_wait.py
+index b8a0c8989e..1dffaadb5e 100644
+--- a/gateway/run_shutdown_restart_wait.py
++++ b/gateway/run_shutdown_restart_wait.py
+@@ -22,7 +22,7 @@ from gateway.session_runtime_workers import cron_turn_count, kanban_managed_coun
+ # Only the update's post-grace Kanban wait: human turns retain their normal budget.
+ CORE_UPDATE_KANBAN_WAIT_S = 15.0
+ CORE_UPDATE_KANBAN_STOP_LEASH_S = 40.0  # 15 wait + 40 stop + 5 poll allowance = 60s admission
+-# Under a checkpoint intent (``"checkpoint": true``) hermes-sync's instant drainer has already spent its own wait
++# Under an unfenced checkpoint intent that cuts cron (``_intent_is_checkpoint``) hermes-sync's instant drainer has already spent its own wait
+ # on this work and decided to apply over it: the cards are preserved by the checkpoint and the cron runs are cut.
+ # hermes-hub 2026-11-13: every instant swap sat the full 15 s here on a managed card that then restarted anyway
+ # (journal 21:06:18 -> 21:06:33). A short settle only; the bounds above stay the upper limit.
+@@ -113,14 +113,17 @@ class GatewayRestartWaitMixin:
+         return False
+ 
+     def _intent_is_checkpoint(self, intent: Optional[Path]) -> bool:
+-        """The update intent is a negotiated checkpoint (``"checkpoint": true``): the drainer already waited and
++        """The update intent is an unfenced instant checkpoint that cuts cron: the drainer already waited and
+         applies over the work left. Re-read each poll like ``_intent_cuts_cron``; missing or unreadable is False,
+         which keeps the full wait."""
+         if intent is None:
+             return False
+         with suppress(Exception):
+             data = json.loads(Path(intent).read_text(encoding="utf-8-sig"))
+-            return isinstance(data, dict) and data.get("checkpoint") is True
++            # The same shape gateway.restart.checkpoint_cron_grace_spent requires: an unfenced instant checkpoint
++            # that also cuts cron. A fenced (Mac) intent or a checkpoint without the cron cut keeps the full wait.
++            return (isinstance(data, dict) and data.get("kind") == "unfenced"
++                    and data.get("checkpoint") is True and data.get("cron_cut") is True)
+         return False
+ 
+     def _log_cut_cron_runs(self) -> None:
+diff --git a/tests/gateway/test_core_update_kanban_wait.py b/tests/gateway/test_core_update_kanban_wait.py
+index cbdaa4337d..4cacc32e56 100644
+--- a/tests/gateway/test_core_update_kanban_wait.py
++++ b/tests/gateway/test_core_update_kanban_wait.py
+@@ -52,8 +52,10 @@ def test_real_managed_counts_reach_the_short_wait(tmp_path):
+ 
+ 
+ @pytest.mark.parametrize('body, expires_at', [
+-    ('{"checkpoint": true, "cron_cut": true}', 2.0),   # the drainer already waited: short settle
+-    ('{"checkpoint": false}', 15.0), ('{"cron_cut": true}', 15.0), ('{"checkpoint": "true"}', 15.0),
++    ('{"kind": "unfenced", "checkpoint": true, "cron_cut": true}', 2.0),   # the drainer already waited: short settle
++    ('{"kind": "fenced", "checkpoint": true, "cron_cut": true}', 15.0),    # a Mac's fenced intent keeps the wait
++    ('{"checkpoint": true, "cron_cut": true}', 15.0), ('{"kind": "unfenced", "checkpoint": true}', 15.0),
++    ('{"kind": "unfenced", "checkpoint": 1, "cron_cut": true}', 15.0), ('{"kind": "unfenced", "cron_cut": true}', 15.0),
+     ('[]', 15.0), ('not json', 15.0), (None, 15.0)])   # anything else keeps the full wait
+ def test_checkpoint_intent_shortens_only_the_kanban_wait(tmp_path, body, expires_at):
+     from gateway.session_managed_worker import ManagedWorker
+diff --git a/tests/gateway/test_instant_update_cron_drain_latency.py b/tests/gateway/test_instant_update_cron_drain_latency.py
+index 7cffbb2e0c..7e5fbab26e 100644
+--- a/tests/gateway/test_instant_update_cron_drain_latency.py
++++ b/tests/gateway/test_instant_update_cron_drain_latency.py
+@@ -23,7 +23,9 @@ async def test_cron_floor_does_not_restore_spent_update_grace(tmp_path, monkeypa
+     clock = cut._virtual_clock(monkeypatch)
+     if mode == "instant":
+         assert await runner._await_active_work_before_restart() is False
+-        assert 15 <= clock[0] < 15.2
++        # An unfenced checkpoint intent that cuts cron: the drainer already waited, so the gateway settles 2 s
++        # (CORE_UPDATE_CHECKPOINT_KANBAN_WAIT_S), not the 15 s Kanban-only wait.
++        assert 2 <= clock[0] < 2.2
+     else:
+         runner._core_update_kanban_cap_spent = mode != "unspent"
+     intent = runner._restart_update_intent
+@@ -58,7 +60,7 @@ async def test_cron_floor_does_not_restore_spent_update_grace(tmp_path, monkeypa
+         # checkpoint/install/restart costs of attempt5. Not live delivery proof.
+         composed = 197 - 30 + observed["cron_timeout"]
+         assert composed <= 180
+-        assert clock[0] < 15.2
++        assert clock[0] < 2.2
+     else:
+         assert 30 <= clock[0] < 30.2
+ 
+-- 
+2.43.0
+

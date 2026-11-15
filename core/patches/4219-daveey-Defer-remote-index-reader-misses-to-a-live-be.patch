@@ -1,0 +1,443 @@
+From d88c507267fa95c43561511c35e515a8f88d7ca6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 09:28:24 +0000
+Subject: [PATCH] [daveey] Defer remote-index reader misses to a live, beating
+ holder
+
+Card J t_01a1d862f6e2fc9e. In P1 run11, a Desktop serve's notification pollers rebuilt the whole remote
+index on ~23 of 202 kanban polls. That cost 5.65 s of the poller's 8.97 s, ~1.03% of a core on its own,
+which is over the 0.7% serve watcher+poller row. Cause: a poll that lands between a replica commit and the
+holder's 1 s republish misses the published copy and runs compute (_index + observe) itself. The gateway
+showed ~78 such misses per hour.
+
+Five whys:
+1. Why is the row over budget? poll_kanban CPU is dominated by remote_index.compute.
+2. Why so many computes? Readers run them, not the holder.
+3. Why do readers compute? A miss computes immediately, even when a live holder is about to publish,
+   because the reader had no notion of the holder.
+4. Also: a miss was memoized per stamp, so the copy the holder then published for that same stamp was
+   never read until the next commit.
+Why it was not caught: the existing component benches measured signatures only, never the poller with a
+moving replica.
+
+Fix (reader side only; the holder, publish format and keys are untouched): for the host's own replica and
+root-home ledger, on a miss that has a change key, if a live holder of lease kanban-remote-index beat
+within 5 s, the poll returns no remote cards (nothing is read, claimed or written).
+- Bound: DEFER_MAX_S = 4 s from a chat's first deferred miss. That is under one 5 s poll, so a deadline
+  poll never defers twice. After the bound, that chat's misses compute until a hit, so a holder that beats
+  but never publishes cannot halve delivery.
+- Any doubt computes at once, as before: no lease, released, dead or stale, a future-dated heartbeat, an
+  unreadable lease dir, a profile home, explicit paths, or no key.
+- Misses are no longer memoized.
+
+Independent design review: APPROVE. Its two findings (an expired slot deferring again, a future-dated
+heartbeat) are fixed in this commit.
+Proof: test_kanban_remote_index_defer.py has 14 passing tests. RED on the base was 10 failed, on the set
+before the review fixes. The consumer suite on the pre-review cut: 42 files, 594 passing.
+---
+ .../test_kanban_remote_index_defer.py         | 225 ++++++++++++++++++
+ tui_gateway/kanban_remote_index.py            |  77 +++++-
+ tui_gateway/kanban_remote_notices.py          |  17 +-
+ 3 files changed, 309 insertions(+), 10 deletions(-)
+ create mode 100644 tests/tui_gateway/test_kanban_remote_index_defer.py
+
+diff --git a/tests/tui_gateway/test_kanban_remote_index_defer.py b/tests/tui_gateway/test_kanban_remote_index_defer.py
+new file mode 100644
+index 0000000000..d1c2926a22
+--- /dev/null
++++ b/tests/tui_gateway/test_kanban_remote_index_defer.py
+@@ -0,0 +1,225 @@
++"""A notice poller defers a published-index miss to a live holder instead of rebuilding the index. [daveey]
++
++Card J (t_01a1d862f6e2fc9e): in P1 run11 ~23 of a Desktop serve's 202 kanban polls missed the host copy between a
++replica commit and the holder's publish (1 s poll + ~0.2 s build) and each rebuilt the whole remote index locally:
++5.65 s of the poller's 8.97 s. A miss also stayed memoized for the replica stamp, so the copy the holder then
++published for that same stamp was never read. Bounds: one extra poll (DEFER_MAX_S) per missing state while a
++holder is live and beating; any doubt about the holder, a profile home or explicit paths compute as before.
++"""
++import json
++import os
++import time
++
++import pytest
++
++from tests.tui_gateway.test_kanban_remote_notices import CHAT, _card, _hub
++from tui_gateway import kanban_remote_index as kri
++from tui_gateway import kanban_remote_notices as krn
++from tui_gateway.kanban_replica_observer import fingerprint
++
++NOW = 1_800_000_000.0
++
++
++@pytest.fixture(autouse=True)
++def _fresh_memos():
++    krn._reset_for_tests()
++    yield
++    krn._reset_for_tests()
++
++
++def _done(tid, at=NOW - 60):
++    return _card(tid, CHAT, status="done", at=at)
++
++
++def _add(replica, card, seq):
++    import sqlite3
++    with sqlite3.connect(replica) as conn:
++        conn.execute("INSERT INTO replica VALUES ('hub','tasks',?,?,?)", (card["key"], json.dumps(card["task"]), seq))
++
++
++@pytest.fixture
++def own(tmp_path, monkeypatch):
++    """The host's own replica and root-home ledger: the paths ``collect`` uses when given none."""
++    home, state = tmp_path / "home", tmp_path / "state"
++    home.mkdir()
++    state.mkdir()
++    (home / "config.yaml").write_text("{}\n")
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("HERMES_HUB_STATE", str(state))
++    replica = _hub(state, [_done("t_seed")])
++    ledger = home / "kanban" / "remote-notices.db"
++    ledger.parent.mkdir()
++    assert krn.hub_db_path() == replica and krn.ledger_path() == ledger
++    return replica, ledger
++
++
++def _lease(held=True, pid=None, age=0.0, interval=5.0, raw=None):
++    from hermes_cli.host_loop_lease import lease_dir
++    path = lease_dir() / f"{kri.LEASE}.lock"
++    path.parent.mkdir(parents=True, exist_ok=True)
++    meta = {"name": kri.LEASE, "held": held, "pid": os.getpid() if pid is None else pid, "start": None,
++            "role": "gateway", "priority": 2, "interval": interval, "heartbeat_at": time.time() - age}
++    path.write_text(raw if raw is not None else json.dumps(meta))
++
++
++def _count_computes(monkeypatch):
++    calls, real = [], kri.compute
++    monkeypatch.setattr(kri, "compute", lambda *a, **k: calls.append(a) or real(*a, **k))
++    return calls
++
++
++def _refs(items):
++    return {item["ref"] for item in items}
++
++
++def _poll():
++    return krn.collect(CHAT, "default", now=NOW)
++
++
++def test_a_miss_is_not_replayed_once_the_copy_for_that_stamp_is_published(tmp_path):
++    replica = _hub(tmp_path, [_done("t_seed")])
++    ledger = tmp_path / "kanban" / "remote-notices.db"
++    ledger.parent.mkdir()
++    stamp = fingerprint(replica)
++    assert kri.lookup(replica, ledger, stamp, "default", (CHAT,)) is None  # nothing published yet
++    assert kri.refresh(replica, ledger, now=NOW)  # the holder publishes the same replica state
++    assert fingerprint(replica) == stamp
++    hit = kri.lookup(replica, ledger, stamp, "default", (CHAT,))
++    assert hit is not None and [c["key"] for c in hit[1][CHAT]] == ["default/default/t_seed"]
++
++
++def test_live_holder_defers_the_miss_and_the_next_poll_reads_its_copy(own, monkeypatch):
++    replica, ledger = own
++    _lease()
++    assert kri.refresh(replica, ledger, now=NOW)
++    assert _refs(_poll()) == {"hub/default/default/t_seed"}
++    _add(replica, _done("t_new"), 50)  # replica commit; the holder has not republished yet
++    computes = _count_computes(monkeypatch)
++    assert _poll() == [] and not computes  # deferred: nothing read, claimed or rebuilt
++    assert kri.stats["deferred"] == 1
++    assert kri.refresh(replica, ledger, now=NOW)  # the holder's next pass (it computes; the reader must not)
++    computes.clear()
++    assert _refs(_poll()) == {"hub/default/default/t_new"} and not computes
++
++
++def test_deferral_is_bounded_by_one_poll_while_the_holder_never_publishes(own, monkeypatch):
++    replica, ledger = own
++    _lease()
++    assert kri.refresh(replica, ledger, now=NOW)
++    _poll()
++    clock = [100.0]
++    monkeypatch.setattr(kri, "_clock", lambda: clock[0])
++    _add(replica, _done("t_new"), 50)
++    computes = _count_computes(monkeypatch)
++    assert _poll() == []
++    clock[0] += kri.DEFER_MAX_S - 0.01
++    _add(replica, _done("t_newer"), 51)  # replica churn: a new stamp must not restart the bound
++    assert _poll() == [] and not computes
++    clock[0] += 0.01
++    assert _refs(_poll()) == {"hub/default/default/t_new", "hub/default/default/t_newer"} and len(computes) == 1
++
++
++def test_a_beating_holder_that_never_publishes_does_not_defer_again_after_the_bound(own, monkeypatch):
++    """A holder beats after a failed build too: once a chat's bound expired, its misses compute until a hit."""
++    replica, ledger = own
++    _lease()
++    assert kri.refresh(replica, ledger, now=NOW)
++    _poll()
++    clock = [100.0]
++    monkeypatch.setattr(kri, "_clock", lambda: clock[0])
++    monkeypatch.setattr(kri, "publish", lambda *a, **k: False)  # no copy is ever published
++    _add(replica, _done("t_new"), 50)
++    computes = _count_computes(monkeypatch)
++    assert _poll() == []  # deferred
++    clock[0] += kri.DEFER_MAX_S
++    assert _refs(_poll()) == {"hub/default/default/t_new"} and len(computes) == 1  # bound reached: computed
++    for n in range(3):  # still no holder publish: every later missing state computes at once
++        clock[0] += 5.0
++        _add(replica, _done(f"t_more{n}"), 60 + n)
++        assert f"hub/default/default/t_more{n}" in _refs(_poll()) and len(computes) == 2 + n
++    assert kri.stats["deferred"] == 1
++
++
++def test_a_wall_clock_heartbeat_from_the_future_is_not_a_beat(own, monkeypatch):
++    replica, ledger = own
++    _lease(age=-60.0)  # heartbeat_at a minute ahead: the wall clock stepped back
++    assert kri.refresh(replica, ledger, now=NOW)
++    _poll()
++    _add(replica, _done("t_new"), 50)
++    computes = _count_computes(monkeypatch)
++    assert _refs(_poll()) == {"hub/default/default/t_new"} and len(computes) == 1
++    assert kri.stats["deferred"] == 0
++
++
++def test_a_hit_restarts_the_bound_for_the_next_missing_state(own, monkeypatch):
++    replica, ledger = own
++    _lease()
++    assert kri.refresh(replica, ledger, now=NOW)
++    _poll()
++    clock = [100.0]
++    monkeypatch.setattr(kri, "_clock", lambda: clock[0])
++    _add(replica, _done("t_new"), 50)
++    assert _poll() == []  # deferred at t=100
++    assert kri.refresh(replica, ledger, now=NOW)
++    clock[0] += 1.0
++    assert _refs(_poll()) == {"hub/default/default/t_new"}  # hit: the chat is no longer deferring
++    clock[0] += kri.DEFER_MAX_S + 1.0  # past the old first miss's bound
++    _add(replica, _done("t_later"), 51)
++    computes = _count_computes(monkeypatch)
++    assert _poll() == [] and not computes  # a fresh deferral, not a compute charged to the old miss
++    assert kri.stats["deferred"] == 2
++
++
++def test_a_replica_with_no_change_key_never_defers(own, monkeypatch):
++    replica, ledger = own
++    _lease()
++    assert kri.refresh(replica, ledger, now=NOW)
++    _poll()
++    _add(replica, _done("t_new"), 50)
++    monkeypatch.setattr(kri, "current_key", lambda *a: None)  # e.g. a replica without seq: nothing is published
++    computes = _count_computes(monkeypatch)
++    assert "hub/default/default/t_new" in _refs(_poll()) and len(computes) == 1
++    assert kri.stats["deferred"] == 0
++
++
++@pytest.mark.parametrize("holder", ["absent", "released", "dead_pid", "stale_beat", "corrupt"])
++def test_no_live_beating_holder_computes_the_miss_at_once(own, monkeypatch, holder):
++    replica, ledger = own
++    if holder == "released":
++        _lease(held=False)
++    elif holder == "dead_pid":
++        _lease(pid=2 ** 22 + 12345)
++    elif holder == "stale_beat":
++        _lease(age=3 * 5.0 + 1, interval=5.0)
++    elif holder == "corrupt":
++        _lease(raw="{not json")
++    assert kri.refresh(replica, ledger, now=NOW)
++    _poll()
++    _add(replica, _done("t_new"), 50)
++    computes = _count_computes(monkeypatch)
++    assert _refs(_poll()) == {"hub/default/default/t_new"} and len(computes) == 1
++    assert kri.stats["deferred"] == 0
++
++
++def test_a_profile_home_never_defers_to_the_root_holder(own, tmp_path, monkeypatch):
++    _replica, _root_ledger = own
++    _lease()  # the root's holder publishes only the root ledger's copy
++    profile = tmp_path / "home" / "profiles" / "alpha"
++    (profile / "kanban").mkdir(parents=True)
++    (profile / "config.yaml").write_text("{}\n")
++    monkeypatch.setenv("HERMES_HOME", str(profile))
++    assert krn.ledger_path() == profile / "kanban" / "remote-notices.db"
++    computes = _count_computes(monkeypatch)
++    assert _refs(_poll()) == {"hub/default/default/t_seed"} and len(computes) == 1
++    assert kri.stats["deferred"] == 0
++
++
++def test_explicit_paths_never_defer(own, monkeypatch):
++    replica, ledger = own
++    _lease()
++    assert kri.refresh(replica, ledger, now=NOW)
++    _add(replica, _done("t_new"), 50)
++    computes = _count_computes(monkeypatch)
++    got = krn.collect(CHAT, "default", hub_db=replica, ledger=ledger, now=NOW)
++    assert "hub/default/default/t_new" in _refs(got) and len(computes) == 1
++    assert kri.stats["deferred"] == 0
+diff --git a/tui_gateway/kanban_remote_index.py b/tui_gateway/kanban_remote_index.py
+index db2876a3c8..8c91d6bc1c 100644
+--- a/tui_gateway/kanban_remote_index.py
++++ b/tui_gateway/kanban_remote_index.py
+@@ -28,7 +28,9 @@ the change, like the incremental in-process build it replaces.
+ 
+ The holder (host loop lease ``kanban-remote-index``, :func:`ensure_holder`) watches the replica's change key once
+ a second and republishes as soon as it moves, so the readers' 5 s polls normally hit. With the holder dead every
+-reader still computes on a miss, so a notice is never later than the poll that would have found it before.
++reader still computes on a miss, so a notice is never later than the poll that would have found it before. While
++a live holder is beating, a reader of the root home's own copy leaves a miss to it for at most
++:data:`DEFER_MAX_S` (:func:`defer`): the notice can arrive one poll later, and the poll builds nothing.
+ Only the root home runs a holder; a profile home's ledger gets its copy from its own readers' misses.
+ """
+ from __future__ import annotations
+@@ -60,12 +62,16 @@ _clock = time.monotonic
+ 
+ _memo_lock = threading.Lock()  # guards the dicts below only; never held across I/O
+ _keys: dict[tuple, tuple] = {}  # (hub, ledger) -> (stamp, replica key or None)
+-_answers: dict[tuple, Optional[tuple]] = {}  # (hub, ledger, stamp, profile, sids) -> hit or None (miss)
++_answers: dict[tuple, tuple] = {}  # (hub, ledger, stamp, profile, sids) -> hit (a miss is read again)
++# [daveey] (hub, ledger, profile, sids) -> _clock() of this chat's first miss deferred to the holder (:func:`defer`)
++_deferring: dict[tuple, float] = {}
++DEFER_MAX_S = 4.0  # under one 5 s notice poll: a chat's next poll after a deferred miss computes if still missing
++HOLDER_BEAT_MAX_S = 5.0  # a holder beats each 1 s pass; one slow rebuild (P1 max 2.8 s) must not look dead
+ _published: dict[tuple, tuple] = {}  # (hub, ledger) -> (key, ledger file id) this process published or found
+ _decoded: dict[tuple, tuple] = {}  # (replica base, owner, key) -> (seq, task): payloads this process parsed
+ _DECODED_MAX = 20_000
+ _holders: dict[tuple, tuple] = {}  # (hub, ledger) -> (stop event, role priority) of this process's refresher
+-stats = {"hits": 0, "misses": 0, "publishes": 0, "busy": 0, "rows_written": 0}
++stats = {"hits": 0, "misses": 0, "publishes": 0, "busy": 0, "rows_written": 0, "deferred": 0}
+ 
+ 
+ def index_path(ledger: Path) -> Path:
+@@ -143,7 +149,7 @@ def current_key(hub: Path, ledger: Path, stamp) -> Optional[str]:
+ def lookup(hub: Path, ledger: Path, stamp, profile: str, sids: tuple) -> Optional[tuple]:
+     """``(me, {sid: [card, ...]}, observed)`` from the published copy, or None (compute locally).
+ 
+-    Answers (hit or miss) are memoized per change key, so an unchanged replica opens nothing here."""
++    Hits are memoized per change key, so an unchanged replica opens nothing here; a miss is read again."""
+     from tui_gateway.kanban_remote_observations import Observed
+ 
+     key = current_key(hub, ledger, stamp)
+@@ -168,7 +174,65 @@ def lookup(hub: Path, ledger: Path, stamp, profile: str, sids: tuple) -> Optiona
+         answer = (me, by_sid, observed)
+     with _memo_lock:
+         stats["hits" if answer is not None else "misses"] += 1
+-        _remember(_answers, memo_key, answer)
++        # [daveey] Only hits are kept: the holder publishes this very stamp's copy after the miss (the replica does
++        # not move when it does), and a remembered miss rebuilt the index on every poll until the next commit.
++        if answer is not None:
++            _remember(_answers, memo_key, answer)
++            _deferring.pop((*_slot(hub, ledger), profile, sids), None)
++    return answer
++
++
++def defer(hub: Path, ledger: Path, profile: str, sids: tuple, key: Optional[str]) -> bool:
++    """On a miss of the root home's own copy: True when this poll should read nothing and leave the build to a
++    live holder that is beating (it republishes within ~1 s of a replica commit; rebuilding here too cost a
++    Desktop serve ~1% of a core, J t_01a1d862f6e2fc9e). A chat waits less than :data:`DEFER_MAX_S` (under one
++    5 s poll) from its first deferred miss, across replica stamps; its misses then compute as before until a hit.
++    A replica with no change ``key`` (never published), any doubt about the holder, or a profile home (the holder
++    publishes only the root ledger's copy) computes at once."""
++    from hermes_constants import get_default_hermes_root, get_hermes_home
++
++    slot, now = (*_slot(hub, ledger), profile, sids), _clock()
++    with _memo_lock:
++        first = _deferring.get(slot)
++    try:
++        wait = (key is not None and (first is None or now - first < DEFER_MAX_S) and _holder_beating(now)
++                and os.path.realpath(get_hermes_home()) == os.path.realpath(get_default_hermes_root()))
++    except (OSError, ValueError):
++        wait = False
++    with _memo_lock:
++        if not wait:
++            # An expired slot stays: its later misses compute until a hit (lookup) clears it, so a holder that
++            # beats but never publishes cannot make every other poll wait again. Any other refusal forgets it.
++            if first is None or now - first < DEFER_MAX_S:
++                _deferring.pop(slot, None)
++            return False
++        if first is None:
++            _remember(_deferring, slot, now)
++        stats["deferred"] += 1
++    return True
++
++
++_beating: Optional[tuple] = None  # (_clock() read, answer): one lease read per second for every chat's miss
++
++
++def _holder_beating(now: float) -> bool:
++    """A live process holds :data:`LEASE` and beat within :data:`HOLDER_BEAT_MAX_S` (it beats every pass)."""
++    global _beating
++    memo = _beating
++    if memo is not None and 0 <= now - memo[0] < REFRESH_POLL_S:
++        return memo[1]
++    from hermes_cli.host_loop_lease import holders
++
++    answer = False
++    try:
++        for meta in holders():
++            if meta.get("name") == LEASE and meta.get("live"):
++                age = time.time() - float(meta.get("heartbeat_at") or 0)
++                answer = 0 <= age <= HOLDER_BEAT_MAX_S  # a wall clock stepped back is doubt, not a fresh beat
++                break
++    except (OSError, TypeError, ValueError):
++        answer = False
++    _beating = (now, answer)
+     return answer
+ 
+ 
+@@ -505,9 +569,12 @@ def ensure_holder(role: str) -> None:
+ 
+ def reset() -> None:
+     """Forget this process's memos and stop its refreshers (tests, a backend forgetting its memos)."""
++    global _beating
+     with _memo_lock:
+         _keys.clear()
+         _answers.clear()
++        _deferring.clear()
++        _beating = None
+         _published.clear()
+         _decoded.clear()
+         for name in stats:
+diff --git a/tui_gateway/kanban_remote_notices.py b/tui_gateway/kanban_remote_notices.py
+index 0303d933d3..a3de782512 100644
+--- a/tui_gateway/kanban_remote_notices.py
++++ b/tui_gateway/kanban_remote_notices.py
+@@ -209,9 +209,13 @@ def _index(path: Path) -> tuple[str, dict]:
+     return me, index
+ 
+ 
+-def _chat_index(path: Path, ledger, now: float, profile: str, sids: tuple) -> tuple[str, dict[str, Any], dict]:
++def _chat_index(path: Path, ledger, now: float, profile: str, sids: tuple,
++                own: bool = False) -> tuple[str, dict[str, Any], dict]:
+     """``(me, {sid: [card, ...]}, observed)`` for one chat: the host's published copy when it is of the replica's
+-    current state, else built here (``_index`` + ``observe``, as before) and offered for publishing. [daveey]"""
++    current state, else built here (``_index`` + ``observe``, as before) and offered for publishing. [daveey]
++
++    On the host's ``own`` replica and ledger a miss is left to a live holder for at most one poll
++    (:func:`kanban_remote_index.defer`): no cards this poll, nothing read or claimed."""
+     from tui_gateway import kanban_remote_index as published
+     from tui_gateway.kanban_replica_observer import fingerprint
+ 
+@@ -220,8 +224,10 @@ def _chat_index(path: Path, ledger, now: float, profile: str, sids: tuple) -> tu
+     hit = published.lookup(path, ledger_file, stamp, profile, sids)
+     if hit is not None:
+         return hit
+-    me, index, observed = published.compute(path, ledger, ledger_file, now,
+-                                            published.current_key(path, ledger_file, stamp))
++    key = published.current_key(path, ledger_file, stamp)
++    if own and published.defer(path, ledger_file, profile, sids, key):
++        return "", {}, {}
++    me, index, observed = published.compute(path, ledger, ledger_file, now, key)
+     return me, {sid: index.get((profile, sid), ()) for sid in sids}, observed
+ 
+ 
+@@ -676,7 +682,8 @@ def collect(session_key: str, profile: str, *, hub_db: Optional[Path] = None, le
+         if hub_db is None and ledger is None:  # the host's own replica: keep its published copy current
+             from tui_gateway.kanban_remote_index import ensure_holder
+             ensure_holder("serve")  # once per process; a gateway's own later claim upgrades the role
+-        me, by_sid, fresh_times = _chat_index(path, ledger, now, profile, sids)
++        me, by_sid, fresh_times = _chat_index(path, ledger, now, profile, sids,
++                                              own=hub_db is None and ledger is None)
+         cards = [dict(c, sid=sid) for sid in sids for c in by_sid.get(sid, ())]
+         if not cards:
+             return []
+-- 
+2.43.0
+

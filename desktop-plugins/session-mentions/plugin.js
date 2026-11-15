@@ -931,7 +931,12 @@ async function fetchTask(connectionId, taskId, board) {
 
 export function summarizeTask(data, limit = 10) {
   const t = data?.task || {}
+  // Resolve custody before dropping event payloads/truncating history. An explicit empty
+  // receipt is authoritative; never borrow one from an older completion or the home gateway.
+  const completion = (data?.events || []).findLast(e => e.kind === 'completed')
+  const receipt = data?.artifact_receipt ?? completion?.payload?.artifact_receipt
   return {
+    artifact_receipt: Array.isArray(receipt) ? receipt : [],
     id: t.id,
     title: t.title,
     status: t.status,
@@ -1386,6 +1391,26 @@ export async function performUserTerminal(req, origin, conns) {
           cwd: '',
           origin: { gateway, request_id: String(args.withdraw_request || ''), job_id: String(args.withdraw_job || ''), withdraw: String(args.reason || 'withdrawn by its gateway') }
         },
+        timeoutMs: 40_000
+      })
+      return { ...res, device }
+    }
+    if (args.focus && args.job_id) {
+      // action=focus: raise the job's window. Sent on /start with origin.focus (like withdraw) so a backend whose
+      // routes were mounted earlier serves it; a Mac module from before focus refuses the empty command.
+      const res = await apiPreSendRetry(home.id, `${UT_BASE}/start`, {
+        method: 'POST',
+        body: { command: '', reason: '', cwd: '', origin: { gateway, job_id: String(args.job_id), focus: true } },
+        timeoutMs: 40_000
+      })
+      return { ...res, device }
+    }
+    if (args.enter && args.job_id) {
+      // action=enter (agent-7e5ac22ea5): press Return once in the job's window, after the user confirmed the step in
+      // chat. Same /start route as focus; a Mac module from before enter refuses the empty command (nothing pressed).
+      const res = await apiPreSendRetry(home.id, `${UT_BASE}/start`, {
+        method: 'POST',
+        body: { command: '', reason: '', cwd: '', origin: { gateway, job_id: String(args.job_id), enter: true } },
         timeoutMs: 40_000
       })
       return { ...res, device }

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 from datetime import datetime
 import json
 from pathlib import Path
@@ -13,6 +14,7 @@ import sys
 
 REPO = "daveey/hermes-mods"
 BRANCH = "main"
+landing_repos = runpy.run_path(str(Path(__file__).with_name("guard.py")))["landing_repos"]
 
 
 class Refused(RuntimeError):
@@ -50,20 +52,20 @@ def pages(read, endpoint, key=None):
     raise Refused("GitHub inventory exceeds bounded pagination")
 
 
-def current_pr(read, number, head):
-    pr = read("api", f"repos/{REPO}/pulls/{number}")
+def current_pr(read, number, head, repo=REPO):
+    pr = read("api", f"repos/{repo}/pulls/{number}")
     if (not isinstance(pr, dict) or pr.get("number") != number or pr.get("state") != "open"
             or pr.get("draft") is not False or pr.get("merged") is not False
             or pr.get("head", {}).get("sha") != head
             or pr.get("base", {}).get("ref") != BRANCH
-            or pr.get("base", {}).get("repo", {}).get("full_name", "").lower() != REPO):
+            or pr.get("base", {}).get("repo", {}).get("full_name", "").lower() != repo):
         raise Refused("PR is not an open, non-draft main PR at the requested exact head")
     return pr
 
 
-def requirements(read):
+def requirements(read, repo=REPO):
     # Branch summary includes classic protection; branch rules includes applicable rulesets.
-    branch = read("api", f"repos/{REPO}/branches/{BRANCH}")
+    branch = read("api", f"repos/{repo}/branches/{BRANCH}")
     protection = branch.get("protection") if isinstance(branch, dict) else None
     checks = protection.get("required_status_checks") if isinstance(protection, dict) else None
     if not isinstance(checks, dict) or not isinstance(checks.get("contexts"), list):
@@ -81,7 +83,7 @@ def requirements(read):
             required.append((check.get("context"), app))
 
     identities(checks.get("checks", []), "app_id")
-    for rule in pages(read, f"repos/{REPO}/rules/branches/{BRANCH}"):
+    for rule in pages(read, f"repos/{repo}/rules/branches/{BRANCH}"):
         if not identity(rule.get("type")):
             raise Refused("Malformed branch rule identity")
         if rule["type"] == "required_status_checks":
@@ -94,10 +96,10 @@ def requirements(read):
     return set(required)
 
 
-def ci(read, head):
-    required = requirements(read)
-    runs = pages(read, f"repos/{REPO}/commits/{head}/check-runs?filter=latest", "check_runs")
-    statuses = pages(read, f"repos/{REPO}/commits/{head}/statuses")
+def ci(read, head, repo=REPO):
+    required = requirements(read, repo)
+    runs = pages(read, f"repos/{repo}/commits/{head}/check-runs?filter=latest", "check_runs")
+    statuses = pages(read, f"repos/{repo}/commits/{head}/statuses")
     latest = {}
     for run in runs:
         if run.get("head_sha") != head or not identity(run.get("name")) or not positive_id(run.get("id")):
@@ -134,9 +136,9 @@ def ci(read, head):
     return {"mode": "required" if required else "all", "observed": len(latest)}
 
 
-def reviews(read, number, head, pr):
+def reviews(read, number, head, pr, repo=REPO):
     effective = {}
-    for review in pages(read, f"repos/{REPO}/pulls/{number}/reviews"):
+    for review in pages(read, f"repos/{repo}/pulls/{number}/reviews"):
         if review.get("state") in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
             user = review.get("user")
             login = user.get("login") if isinstance(user, dict) else None
@@ -158,8 +160,54 @@ def reviews(read, number, head, pr):
     return effective
 
 
-def approval(read, number, head, pr, review_task, implementation_task):
-    effective = reviews(read, number, head, pr)
+REVIEW_REPLY_MARKER = "<!-- hermes-review-reply -->"
+
+
+def _epoch(stamp):
+    """Epoch seconds of a Kanban completion stamp (seconds, milliseconds or ISO-8601 UTC), else None."""
+    if isinstance(stamp, bool):
+        return None
+    if isinstance(stamp, str) and re.fullmatch(r"\d+(\.\d+)?", stamp.strip()):
+        stamp = float(stamp)
+    if isinstance(stamp, (int, float)):
+        return float(stamp) / 1000 if stamp > 1e11 else float(stamp) if stamp > 0 else None
+    if isinstance(stamp, str) and stamp.strip():
+        try:
+            parsed = datetime.fromisoformat(stamp.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return parsed.timestamp() if parsed.tzinfo else None
+    return None
+
+
+def points_answered(read, number, receipt, repo=REPO):
+    """Refuse while the approving review card lists non-blocking points that no non-bot PR comment marked
+    REVIEW_REPLY_MARKER answers after the review completed (hermes-core-wt-land review_reply_guard's rule).
+    Reply forms: "fixed in <sha>", "declined: <reason>", "follow-up <card>", "refuted: <evidence>"."""
+    points = receipt.get("non_blocking")
+    if not points:
+        return
+    if not isinstance(points, list):
+        raise Refused("Malformed review points in the review receipt")
+    done = _epoch(receipt.get("completed_at"))
+    if done is None:
+        raise Refused("Review lists non-blocking points but its completion time is unreadable; "
+                      "no PR reply can be shown to answer them")
+    for comment in pages(read, f"repos/{repo}/issues/{number}/comments"):
+        user = comment.get("user") if isinstance(comment.get("user"), dict) else {}
+        login = user.get("login")
+        bot = user.get("type") != "User" or not identity(login) or login.endswith("[bot]")
+        at = _epoch(comment.get("created_at"))
+        if not bot and REVIEW_REPLY_MARKER in str(comment.get("body") or "") and at is not None and at > done:
+            return
+    quoted = "; ".join(f'"{p}"' for p in points)
+    raise Refused(f"Unanswered review points: {quoted}. Answer each in PR #{number} with a comment containing "
+                  f'{REVIEW_REPLY_MARKER} ("fixed in <sha>", "declined: <reason>", "follow-up <card>" or '
+                  '"refuted: <evidence>") posted after the review completed')
+
+
+def approval(read, number, head, pr, review_task, implementation_task, repo=REPO):
+    effective = reviews(read, number, head, pr, repo)
     if review_task:
         # The established validator checks run/session independence and authenticated remote
         # execution custody. No caller-supplied receipt or COMMENT prose is an approval.
@@ -178,14 +226,22 @@ def approval(read, number, head, pr, review_task, implementation_task):
                 except Exception as exc:
                     return None, str(exc)
 
-        receipt = validator["review_gate"](Reader(), REPO, {"number": number}, head,
+        receipt = validator["review_gate"](Reader(), repo, {"number": number}, head,
                                            pr["head"]["ref"], BRANCH, review_task,
                                            impl_task=implementation_task,
                                            approved_sha="", pr_reuse_s=0.0)
         if (receipt.get("verdict") != "approve" or receipt.get("reviewed_sha") != head
-                or receipt.get("reviewed_pr") != f"https://github.com/{REPO}/pull/{number}"
-                or receipt.get("non_blocking")):
-            raise Refused("Invalid review receipt or unanswered review points")
+                or receipt.get("reviewed_pr") != f"https://github.com/{repo}/pull/{number}"):
+            raise Refused("Invalid review receipt")
+        points_answered(read, number, receipt, repo)
+        thread_guard = validator.get("review_reply_guard")
+        if callable(thread_guard):
+            # Parity with hermes-core-wt ship: the installed guard also reads every PR review body for points.
+            # It never posts here (empty reply); its progress lines go to stderr so stdout stays one JSON line.
+            with contextlib.redirect_stdout(sys.stderr):
+                code, why = thread_guard(Reader(), repo, {"number": number}, receipt, "")
+            if code is not None:
+                raise Refused(f"Unanswered review points: {why}")
         return receipt
     author = pr.get("user", {}).get("login")
     user = read("api", "user")
@@ -200,38 +256,76 @@ def approval(read, number, head, pr, review_task, implementation_task):
     raise Refused("No independent review approves the current exact head")
 
 
-def land(number, head, review_task="", implementation_task="", read=gh):
+def unresolved_threads(read, number, repo):
+    """An approval never silently overrides unresolved inline findings."""
+    owner, name = repo.split('/')
+    cursor = ""
+    for _ in range(30):
+        query = ('query($owner:String!,$name:String!,$number:Int!,$cursor:String){'
+                 'repository(owner:$owner,name:$name){pullRequest(number:$number){'
+                 'reviewThreads(first:100,after:$cursor){nodes{isResolved}'
+                 'pageInfo{hasNextPage endCursor}}}}}')
+        args = ['api', 'graphql', '-f', f'query={query}', '-f', f'owner={owner}',
+                '-f', f'name={name}', '-F', f'number={number}']
+        if cursor:
+            args.extend(['-f', f'cursor={cursor}'])
+        data = read(*args)
+        try:
+            if data.get('errors'):
+                raise ValueError('GraphQL errors')
+            threads = data['data']['repository']['pullRequest']['reviewThreads']
+            nodes, page = threads['nodes'], threads['pageInfo']
+            if not isinstance(nodes, list) or type(page['hasNextPage']) is not bool:
+                raise ValueError('bad inventory')
+            if any(not isinstance(n, dict) or n.get('isResolved') is not True for n in nodes):
+                raise Refused('Unresolved or unreadable PR review threads')
+            if not page['hasNextPage']:
+                return
+            next_cursor = page['endCursor']
+            if not identity(next_cursor) or next_cursor == cursor:
+                raise ValueError('bad cursor')
+            cursor = next_cursor
+        except (KeyError, TypeError, ValueError, AttributeError) as exc:
+            raise Refused('Unreadable PR review thread inventory') from exc
+    raise Refused('PR review thread inventory exceeds bounded pagination')
+
+
+def land(number, head, review_task="", implementation_task="", read=gh, repo=REPO):
+    if repo not in landing_repos():
+        raise Refused("Repository is not configured for this landing path")
     if not re.fullmatch(r"[0-9a-f]{40}", head) or number <= 0:
         raise Refused("A positive PR number and full lowercase 40-hex head are required")
     if review_task and (not implementation_task or review_task == implementation_task):
         raise Refused("Kanban review requires a distinct implementation task identity")
-    pr = current_pr(read, number, head)
-    checks = ci(read, head)
-    review = approval(read, number, head, pr, review_task, implementation_task)
+    pr = current_pr(read, number, head, repo)
+    checks = ci(read, head, repo)
+    review = approval(read, number, head, pr, review_task, implementation_task, repo)
+    unresolved_threads(read, number, repo)
     # Refuse base/head movement during preflight. The REST SHA is a server-side head CAS.
-    fresh = current_pr(read, number, head)
+    fresh = current_pr(read, number, head, repo)
     if fresh["base"].get("sha") != pr["base"].get("sha"):
         raise Refused("Base moved during preflight; retry against fresh evidence")
-    result = read("api", f"repos/{REPO}/pulls/{number}/merge", "--method", "PUT",
+    result = read("api", f"repos/{repo}/pulls/{number}/merge", "--method", "PUT",
                   "-f", f"sha={head}", "-f", "merge_method=rebase")
     if not isinstance(result, dict) or result.get("merged") is not True:
         raise Refused("Merge was not confirmed")
-    after = read("api", f"repos/{REPO}/pulls/{number}")
+    after = read("api", f"repos/{repo}/pulls/{number}")
     if after.get("merged") is not True or after.get("head", {}).get("sha") != head:
         raise Refused("Merge response succeeded but exact PR readback is unverified; do not retry blindly")
-    return {"repo": REPO, "pr": number, "head": head, "merged": True,
+    return {"repo": repo, "pr": number, "head": head, "merged": True,
             "merge_commit_sha": after.get("merge_commit_sha"), "checks": checks, "review": review}
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--repo", default=REPO)
     parser.add_argument("--pr", required=True, type=int)
     parser.add_argument("--head", required=True)
     parser.add_argument("--review-task", default="")
     parser.add_argument("--implementation-task", default="")
     args = parser.parse_args()
     try:
-        result = land(args.pr, args.head, args.review_task, args.implementation_task)
+        result = land(args.pr, args.head, args.review_task, args.implementation_task, repo=args.repo)
     except Exception as exc:
         print(f"PR LANDING REFUSED: {exc}", file=sys.stderr)
         return 1

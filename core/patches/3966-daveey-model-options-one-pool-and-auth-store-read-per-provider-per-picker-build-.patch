@@ -1,0 +1,337 @@
+From 66e9d4b9ef0ff5b2ad5e6b00d1afc8dfb70949d1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 22:02:34 +0000
+Subject: [PATCH] [daveey] model.options: one pool and auth-store read per
+ provider per picker build (card J rpc_dispatch)
+
+Design t_01a1d563 card J, rpc_dispatch row (2.2 -> <=1.0% of a core). Hub P1 (serve
+1257536 / 1316938): rpc/model.options 0.40-0.62% (158-210 ms CPU per call, ~11 calls per
+400 s), the top method. In the hub profile (cardJ/sv2.raw) load_pool is 27 of the 39
+samples under model.options: one picker build asks about the same pool from the raw-pool,
+overlay and canonical sections, ~80 full load_pool reads for ~47 providers, and every
+read-only auth check re-parses the 29 KB auth.json.
+
+- list_authenticated_providers runs inside picker_build_scope(): a ContextVar memo that
+  lives for ONE build only. _credential_pool_is_usable shares the build's load_pool result
+  per provider; _auth_store_has_provider / _raw_pool_usable share one auth.json parse
+  while the file's version is unchanged (a load_pool seed that persists mid-build is
+  re-read by the next check). Nothing is cached across calls, so a credential added,
+  removed or exhausted is seen by the next build; nested scopes reuse the outer memo, and
+  the parallel prefetch threads (no context) load afresh as before.
+- A pool load error is not memoized and still falls back to raw_pool_present.
+
+profiles.list (0.22%) is ~70% _check_gateway_running in the hub profile; #2634 memoizes
+that. shell.exec (0.42-0.48%) is the user's own command plus output redaction, which is a
+security path: left as is.
+
+Tests (tests/hermes_cli/test_picker_pool_memo.py): RED on base 5/5 (83 pool loads for 47
+providers per build; replay 150-188 ms per call = 0.41-0.52% of a core at the hub rate vs
+the 0.3% budget; the scope API is new). GREEN: replay 82-89 ms per call (best of 5) =
+0.22-0.24%; 147 picker/inventory tests across 23 files pass.
+---
+ hermes_cli/model_switch_providers.py      |  67 ++++++++-
+ tests/hermes_cli/test_picker_pool_memo.py | 169 ++++++++++++++++++++++
+ 2 files changed, 230 insertions(+), 6 deletions(-)
+ create mode 100644 tests/hermes_cli/test_picker_pool_memo.py
+
+diff --git a/hermes_cli/model_switch_providers.py b/hermes_cli/model_switch_providers.py
+index 60d7a5fa90..e885b7f134 100644
+--- a/hermes_cli/model_switch_providers.py
++++ b/hermes_cli/model_switch_providers.py
+@@ -11,6 +11,8 @@ import http.client
+ import os
+ import time
+ import threading as _threading
++import contextlib
++import contextvars as _contextvars
+ from dataclasses import dataclass, field
+ from typing import Any, List, Optional
+ from agent.command_token_source import build_command_token_provider, materialize_probe_api_key
+@@ -165,6 +167,29 @@ def _fetch_picker_live_models(
+ _picker_prewarm_done = _threading.Event()
+ 
+ 
++# [daveey] One picker build asks about the same pool from several sections (raw-pool, overlay,
++# canonical rows): ~2 full ``load_pool`` reads per provider, about half of a ``model.options``
++# call (design t_01a1d563 card J). The answer is memoized for the duration of ONE build only,
++# never across calls, so a credential added or exhausted is seen by the next build.
++_POOL_STATE_MEMO: _contextvars.ContextVar[Optional[dict]] = _contextvars.ContextVar(
++    "picker_pool_state_memo", default=None)
++_AUTH_STORE_MEMO_KEY = ("auth.json",)  # tuple: never collides with a provider-slug key
++
++
++def _picker_pool(provider: str):
++    """``load_pool(provider)``, shared while a picker build is running (see
++    ``_POOL_STATE_MEMO``); outside a build every call loads afresh."""
++    memo = _POOL_STATE_MEMO.get()
++    key = (provider or "").strip().lower()
++    if memo is not None and key in memo:
++        return memo[key]
++    from agent.credential_pool import load_pool
++    pool = load_pool(provider)  # a load error propagates (not memoized): the caller's except handles it
++    if memo is not None:
++        memo[key] = pool
++    return pool
++
++
+ def _credential_pool_is_usable(provider: str, *, raw_pool_present: bool = False, for_picker: bool = False) -> bool:
+     """Whether *provider* has a credential that can be selected now.
+ 
+@@ -174,8 +199,7 @@ def _credential_pool_is_usable(provider: str, *, raw_pool_present: bool = False,
+     accepts a pool whose entries are all in cooldown: a rate-limited provider is not a signed-out
+     one, and limits are per-model for many providers, so another model may still work."""
+     try:
+-        from agent.credential_pool import load_pool
+-        pool = load_pool(provider)
++        pool = _picker_pool(provider)
+         if pool.has_credentials():
+             return for_picker or pool.has_available()
+     except Exception:
+@@ -183,6 +207,19 @@ def _credential_pool_is_usable(provider: str, *, raw_pool_present: bool = False,
+     return raw_pool_present
+ 
+ 
++@contextlib.contextmanager
++def picker_build_scope():
++    """Share pool reads across one picker build; nested scopes reuse the outer one."""
++    if _POOL_STATE_MEMO.get() is not None:
++        yield
++        return
++    token = _POOL_STATE_MEMO.set({})
++    try:
++        yield
++    finally:
++        _POOL_STATE_MEMO.reset(token)
++
++
+ def prewarm_picker_cache_async() -> Optional[_threading.Thread]:
+     """Warm ``provider_models_cache.json`` in a daemon thread by running the picker path once.
+ 
+@@ -302,11 +339,29 @@ def _iter_builtin_candidates(models_dev_data: dict, excluded: set, seen: set):
+             yield hermes_id, mdev_id, pconfig, env_vars
+ 
+ 
++def _picker_auth_store() -> dict:
++    """``_load_auth_store()`` for the READ-ONLY checks below. Inside a picker build the parse is
++    shared while the file's version is unchanged (a ``load_pool`` seed that persists mid-build
++    changes it, and the next check re-reads); callers must not mutate the result."""
++    from hermes_cli.auth import _auth_file_path, _load_auth_store
++    memo = _POOL_STATE_MEMO.get()
++    if memo is None:
++        return _load_auth_store()
++    from utils import file_cache_version
++    path = _auth_file_path()
++    version = (str(path), file_cache_version(path))
++    cached = memo.get(_AUTH_STORE_MEMO_KEY)
++    if cached is not None and cached[0] == version:
++        return cached[1]
++    store = _load_auth_store()
++    memo[_AUTH_STORE_MEMO_KEY] = (version, store)
++    return store
++
++
+ def _auth_store_has_provider(*keys: str) -> bool:
+     """True when ``auth.json`` has a ``providers`` entry under any of *keys*."""
+     try:
+-        from hermes_cli.auth import _load_auth_store
+-        store = _load_auth_store()
++        store = _picker_auth_store()
+         providers_store = store.get("providers", {})
+         return bool(store and any(k in providers_store for k in keys))
+     except Exception as exc:
+@@ -317,8 +372,7 @@ def _auth_store_has_provider(*keys: str) -> bool:
+ def _raw_pool_usable(hermes_id: str, *, for_picker: bool = False) -> bool:
+     """Section-1 pool check: only consult the pool when auth.json lists a raw entry."""
+     try:
+-        from hermes_cli.auth import _load_auth_store
+-        store = _load_auth_store()
++        store = _picker_auth_store()
+         if store and store.get("credential_pool", {}).get(hermes_id):
+             return _credential_pool_is_usable(hermes_id, raw_pool_present=True, for_picker=for_picker)
+     except Exception:
+@@ -1226,6 +1280,7 @@ def _build_curated_lists(current_provider: str, current_base_url: str, current_m
+     return curated
+ 
+ 
++@picker_build_scope()
+ def list_authenticated_providers(
+     current_provider: str = "", current_base_url: str = "", user_providers: dict | None = None,
+     custom_providers: list | None = None, *, force_fresh_nous_tier: bool = False,
+diff --git a/tests/hermes_cli/test_picker_pool_memo.py b/tests/hermes_cli/test_picker_pool_memo.py
+new file mode 100644
+index 0000000000..5b4464f869
+--- /dev/null
++++ b/tests/hermes_cli/test_picker_pool_memo.py
+@@ -0,0 +1,169 @@
++"""``model.options`` reads each provider's pool and the auth store once per picker build (design
++t_01a1d563 card J, rpc_dispatch row: load_pool was 27 of 39 hub samples under model.options).
++
++The memo lives for ONE build only: a credential added, removed or exhausted between two builds is
++seen by the next one, and an auth.json write in the middle of a build is re-read by the next check.
++"""
++from __future__ import annotations
++
++import json
++import os
++import time
++
++import pytest
++
++from hermes_cli import model_switch_providers as msp
++
++_KEYS = {
++    "OPENROUTER_API_KEY": "sk-or-test", "ANTHROPIC_API_KEY": "sk-ant-test", "OPENAI_API_KEY": "sk-test",
++    "GEMINI_API_KEY": "g-test", "DEEPSEEK_API_KEY": "d-test", "XAI_API_KEY": "x-test",
++    "MISTRAL_API_KEY": "m-test", "TOGETHER_API_KEY": "t-test",
++}
++
++
++@pytest.fixture
++def home(monkeypatch):
++    from hermes_constants import get_hermes_home
++    h = get_hermes_home()
++    for key in list(os.environ):
++        if key.endswith("_API_KEY") or key.endswith("_TOKEN"):
++            monkeypatch.delenv(key, raising=False)
++    (h / ".env").write_text("".join(f"{k}={v}\n" for k, v in _KEYS.items()))
++    for k, v in _KEYS.items():
++        monkeypatch.setenv(k, v)
++    (h / "config.yaml").write_text("model:\n  default: anthropic/claude-sonnet-4\n  provider: openrouter\n")
++    return h
++
++
++def _count(monkeypatch):
++    import agent.credential_pool as cp
++    from hermes_cli import auth
++    calls = {"pool": [], "auth": 0}
++    real_pool, real_auth = cp.load_pool, auth._load_auth_store
++
++    def pool(provider, **kw):
++        calls["pool"].append((provider or "").strip().lower())
++        return real_pool(provider, **kw)
++
++    def store(*a, **kw):
++        calls["auth"] += 1
++        return real_auth(*a, **kw)
++
++    monkeypatch.setattr(cp, "load_pool", pool)
++    monkeypatch.setattr(auth, "_load_auth_store", store)
++    return calls
++
++
++def _build():
++    from hermes_cli.inventory import build_model_options_payload, load_picker_context
++    return build_model_options_payload(load_picker_context())
++
++
++def test_one_build_loads_each_pool_once(home, monkeypatch):
++    _build()
++    calls = _count(monkeypatch)
++    _build()
++    picker = [p for p in calls["pool"]]
++    dupes = {p: picker.count(p) for p in set(picker) if picker.count(p) > 1}
++    # inventory's usage/limit readers load the current provider outside the picker (two more)
++    assert all(n <= 3 for n in dupes.values()), dupes
++    assert len(picker) <= len(set(picker)) + 2, (len(picker), len(set(picker)))
++
++
++def test_memo_is_scoped_to_one_build(home, monkeypatch):
++    calls = _count(monkeypatch)
++    msp._credential_pool_is_usable("openrouter")
++    msp._credential_pool_is_usable("openrouter")
++    assert calls["pool"].count("openrouter") == 2, "outside a build every call loads afresh"
++    with msp.picker_build_scope():
++        msp._credential_pool_is_usable("openrouter")
++        msp._credential_pool_is_usable("openrouter", for_picker=True)
++        with msp.picker_build_scope():  # nested: the outer build's memo
++            msp._credential_pool_is_usable("OpenRouter ")
++    assert calls["pool"].count("openrouter") == 3
++    assert msp._POOL_STATE_MEMO.get() is None
++
++
++def test_next_build_sees_an_exhausted_pool(home, monkeypatch):
++    """A pool that runs dry between two builds drops out of the next picker (no cross-call memo)."""
++    import agent.credential_pool as cp
++
++    class _Pool:
++        def __init__(self, available):
++            self.available = available
++
++        def has_credentials(self):
++            return True
++
++        def has_available(self, **_kw):
++            return self.available
++
++    state = {"available": True}
++    monkeypatch.setattr(cp, "load_pool", lambda provider, **kw: _Pool(state["available"]))
++    with msp.picker_build_scope():
++        assert msp._credential_pool_is_usable("opencode-go")
++    state["available"] = False
++    with msp.picker_build_scope():
++        assert not msp._credential_pool_is_usable("opencode-go")
++        assert msp._credential_pool_is_usable("opencode-go", for_picker=True)
++
++
++def test_auth_write_mid_build_is_reread(home, monkeypatch):
++    """The shared auth parse is keyed on the file version: a load_pool seed that persists in the
++    middle of a build is seen by the next read-only check."""
++    from hermes_cli.auth import _auth_file_path
++    path = _auth_file_path()
++    path.write_text(json.dumps({"version": 1, "providers": {}}))
++    calls = _count(monkeypatch)
++    with msp.picker_build_scope():
++        assert not msp._auth_store_has_provider("nous")
++        assert not msp._auth_store_has_provider("nous")
++        assert calls["auth"] == 1
++        # a different size: the version changes even within one mtime tick
++        path.write_text(json.dumps({"version": 1, "providers": {"nous": {"access_token": "t"}}}))
++        assert msp._auth_store_has_provider("nous")
++        assert calls["auth"] == 2
++
++
++def _unguarded_io(monkeypatch) -> None:
++    """Measure production cost: the suite's HomeIOGuard wraps os.stat/open in Python checks."""
++    import builtins
++    import io
++    for module, name in ((os, "stat"), (os, "lstat"), (builtins, "open"), (io, "open")):
++        fn = getattr(module, name)
++        monkeypatch.setattr(module, name, getattr(fn, "__wrapped__", fn))
++
++
++def test_replay_budget_model_options(home, monkeypatch):
++    """Replay: a hub-sized auth.json (29 KB, pooled credentials for 8 providers) and the measured
++    rate (11 model.options in ~400 s on the hub serve, P1 1316938). Budget: the picker's pool and
++    auth reads at most one per provider per build (the gate above) and model.options at most
++    0.3% of a core at that rate."""
++    from hermes_cli.auth import _auth_file_path
++    _unguarded_io(monkeypatch)
++    pool = {}
++    for env, key in _KEYS.items():
++        slug = env.removesuffix("_API_KEY").lower()
++        pool[slug] = [{"id": f"{slug}-{i}", "label": f"k{i}", "auth_type": "api_key", "priority": i,
++                       "source": "manual", "access_token": f"{key}-{i:04d}" + "x" * 300} for i in range(10)]
++    _auth_file_path().write_text(json.dumps({"version": 1, "providers": {}, "credential_pool": pool}))
++    _build()
++
++    def per_call() -> float:
++        best = float("inf")  # best of N: CPU time still inflates on a loaded box (SMT, cache)
++        for _ in range(5):
++            t0 = time.thread_time()
++            _build()
++            best = min(best, time.thread_time() - t0)
++        return best
++
++    memo = per_call()
++    with monkeypatch.context() as m:
++        m.setattr(msp, "_POOL_STATE_MEMO", type("NoMemo", (), {
++            "get": staticmethod(lambda: None), "set": staticmethod(lambda _v: None),
++            "reset": staticmethod(lambda _t: None)})())
++        unmemo = per_call()
++    share = memo * 11 / 400
++    print(f"model.options {memo * 1000:.1f} ms per call (unshared reads {unmemo * 1000:.1f} ms) "
++          f"-> {share * 100:.3f}% of a core")
++    assert share <= 0.003, f"{memo * 1000:.1f} ms per call = {share * 100:.3f}% (budget 0.3%)"
+-- 
+2.43.0
+

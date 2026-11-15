@@ -1,0 +1,135 @@
+From 4d28c091857f5ddcf245d4f519e72ed2f0658374 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 23:37:09 +0000
+Subject: [PATCH] [daveey] Test sent-only 1011 receipt recovery and owner-fault
+ latch
+
+The post-merge mutation sweep found that treating sent-only 1011 as a card fault survived existing coverage. Exercise real WorkerRPC and RuntimeSessionStore together with controlled send and receive failures, including a committed receipt with no response. Assert retry layer, stable payload/sequence, single commit, terminal envelope and sticky reflush.
+
+Proof: production 58 passed, 0 failed; exact M2 sent-only1011 mutant 2 failed, 3 passed, 0 skips; restored focused 5 passed. scripts/check: 20 checks OK. Test-only; no updater or production changes.
+---
+ .../test_runtime_session_store_sent_close.py  | 112 ++++++++++++++++++
+ 1 file changed, 112 insertions(+)
+ create mode 100644 tests/agent/test_runtime_session_store_sent_close.py
+
+diff --git a/tests/agent/test_runtime_session_store_sent_close.py b/tests/agent/test_runtime_session_store_sent_close.py
+new file mode 100644
+index 0000000000..f48dea8245
+--- /dev/null
++++ b/tests/agent/test_runtime_session_store_sent_close.py
+@@ -0,0 +1,112 @@
++"""Sent-only 1011 must preserve the transport/store retry boundary and terminal owner code."""
++import json
++from types import SimpleNamespace
++
++import pytest
++from websockets.exceptions import ConnectionClosedError
++from websockets.frames import Close
++
++from agent.runtime_session_store import RuntimeSessionStore, WorkerPersistenceError, WorkerRPC
++from gateway.session_kanban import failure_line
++from hermes_cli import kanban_owner_storage_refusal as refusal
++from tests.agent.test_runtime_session_store_receipt_timeout import FakeOwner
++
++
++class ClosingLink:
++    def __init__(self, owner, requests, phase=None):
++        self.owner = owner
++        self.requests = requests
++        self.phase = phase
++        self.closed = False
++        self.ws = SimpleNamespace(close=self.close)
++
++    def close(self):
++        self.closed = True
++
++    @staticmethod
++    def fail():
++        raise ConnectionClosedError(None, Close(1011, 'keepalive ping timeout'), None)
++
++    def send(self, request_id, message):
++        request = json.loads(message)
++        assert request['id'] == request_id
++        self.requests.append(request)
++        if self.phase == 'send':
++            self.fail()  # No complete request was sent: WorkerRPC may retry immediately.
++        if self.phase != 'before_commit':
++            self.result = self.owner(request['method'], **request['params'])
++
++    def receive(self, timeout):
++        assert timeout > 0
++        if self.phase in ('before_commit', 'after_commit'):
++            self.fail()  # Once sent, only the receipt journal may resend this identity.
++        return {'result': self.result}
++
++
++@pytest.mark.parametrize('phase', ['send', 'before_commit', 'after_commit'])
++def test_sent_only_close_recovers_at_the_correct_retry_layer(tmp_path, monkeypatch, phase):
++    owner, requests = FakeOwner(), []
++    rpc = WorkerRPC(tmp_path)
++    links = [ClosingLink(owner, requests, phase), ClosingLink(owner, requests)]
++    remaining = iter(links)
++
++    def connection():
++        rpc.link = next(remaining)
++        return rpc.link
++
++    monkeypatch.setattr(rpc, '_connection', connection)
++    store = RuntimeSessionStore(rpc, {'session_id': 's'}, tmp_path / 'private')
++    try:
++        rows = [{'role': 'user', 'content': 'A'}]
++        assert store.append_messages_batch('s', rows) == 1
++        assert rows[0]['stored'] is True
++        assert owner.rows == ['A'] and owner.commits == [(1, 'transcript.append')]
++        assert len(requests) == 2
++        assert requests[0]['params'] == requests[1]['params']
++        assert (requests[0]['id'] == requests[1]['id']) is (phase == 'send')
++        assert store.journal['pending'] == [] and store.failure is None
++        assert links[0].closed
++    finally:
++        store.close()
++        rpc.close()
++
++
++@pytest.mark.parametrize('phase', ['before_commit', 'after_commit'])
++def test_sent_only_close_exhaustion_latches_owner_fault_without_reflush(tmp_path, monkeypatch, phase):
++    owner, requests = FakeOwner(), []
++    rpc = WorkerRPC(tmp_path)
++    links = [ClosingLink(owner, requests, phase) for _ in range(2)]
++    remaining = iter(links)
++
++    def connection():
++        rpc.link = next(remaining)
++        return rpc.link
++
++    monkeypatch.setattr(rpc, '_connection', connection)
++    store = RuntimeSessionStore(rpc, {'session_id': 's'}, tmp_path / 'private')
++    try:
++        rows = [{'role': 'user', 'content': 'A'}]
++        with pytest.raises(WorkerPersistenceError) as raised:
++            store.append_messages_batch('s', rows)
++        assert str(raised.value) == store.failure == 'owner_link_closed'
++        line = failure_line(raised.value, 'Worker failed')
++        assert line == 'Worker failed: WorkerPersistenceError: owner_link_closed'
++        assert refusal._proof({'exit_code': 1, 'last_output': line}) == {
++            'kind': 'owner_unreachable', 'phase': 'midrun', 'reason': 'owner_link_closed',
++        }
++        assert len(requests) == 2 and requests[0]['id'] != requests[1]['id']
++        assert requests[0]['params'] == requests[1]['params']
++        assert len(store.journal['pending']) == 1
++        assert store.journal['pending'][0]['sequence'] == 1
++        assert 'stored' not in rows[0]
++        with pytest.raises(WorkerPersistenceError) as latched:
++            store.append_messages_batch('s', [*rows, {'role': 'user', 'content': 'B'}])
++        assert failure_line(latched.value, 'Worker failed') == line
++        assert len(requests) == 2 and all(link.closed for link in links)
++        assert owner.rows == (['A'] if phase == 'after_commit' else [])
++        assert len(owner.commits) == (1 if phase == 'after_commit' else 0)
++    finally:
++        store.failure = None
++        store.journal['pending'] = []
++        store.close()
++        rpc.close()
+-- 
+2.43.0
+

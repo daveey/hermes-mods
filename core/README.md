@@ -17,10 +17,10 @@ The last public/private series reconciliation (what was already equivalent, what
 [Hostname normalization](hostname-normalization.md) documents the subsequent privacy
 repair, regex policy rules, fingerprint re-pins and successful 1923-entry replay.
 The [2253 regex escape repair](hostname-escape-repair.md) is a **mandatory post-replay
-overlay** in the Applying recipe below, re-bound to snapshot 3727 by `repair_hostname_escapes_3727.py` (snapshot 3713: `repair_hostname_escapes_3713.py`; snapshot 3689: `repair_hostname_escapes_3689.py`; snapshot 3652: `repair_hostname_escapes_3652.py`; snapshot 3622: `repair_hostname_escapes_3622.py`; snapshot 3577: `repair_hostname_escapes_3577.py`; snapshot 3555: `repair_hostname_escapes_3555.py`; snapshot 3529: `repair_hostname_escapes_3529.py`; snapshot 3501: `repair_hostname_escapes_3501.py`; snapshot 3491: `repair_hostname_escapes_3491.py`; snapshot 3473: `repair_hostname_escapes_3473.py`; snapshot 3423: `repair_hostname_escapes_3423.py`; snapshot 2926: `repair_hostname_escapes_2926.py`; snapshot 2678: `repair_hostname_escapes_2678.py`; snapshot 2563: `repair_hostname_escapes_2563.py`; snapshot 2491: `repair_hostname_escapes_2491.py`; snapshot 2409: `repair_hostname_escapes_2409.py`). The immutable mails alone retain two invalid
+overlay** in the Applying recipe below, re-bound to snapshot 4352 by `repair_hostname_escapes_4352.py` (snapshot 4059: `repair_hostname_escapes_4059.py`) (snapshot 3727: `repair_hostname_escapes_3727.py`) (snapshot 3713: `repair_hostname_escapes_3713.py`; snapshot 3689: `repair_hostname_escapes_3689.py`; snapshot 3652: `repair_hostname_escapes_3652.py`; snapshot 3622: `repair_hostname_escapes_3622.py`; snapshot 3577: `repair_hostname_escapes_3577.py`; snapshot 3555: `repair_hostname_escapes_3555.py`; snapshot 3529: `repair_hostname_escapes_3529.py`; snapshot 3501: `repair_hostname_escapes_3501.py`; snapshot 3491: `repair_hostname_escapes_3491.py`; snapshot 3473: `repair_hostname_escapes_3473.py`; snapshot 3423: `repair_hostname_escapes_3423.py`; snapshot 2926: `repair_hostname_escapes_2926.py`; snapshot 2678: `repair_hostname_escapes_2678.py`; snapshot 2563: `repair_hostname_escapes_2563.py`; snapshot 2491: `repair_hostname_escapes_2491.py`; snapshot 2409: `repair_hostname_escapes_2409.py`). The immutable mails alone retain two invalid
 placement regexes; the original verifier proves historical fidelity, not regex validity.
 
-3727 patches, one entry per non-merge source commit through `78c49a510ba5442d3b72b5bec6d96107f667dc39`.
+4352 patches, one entry per non-merge source commit through `5c9e6833b35266d7989cf607b13cf6eef77b6219`.
 Published ordinals never move. A pass appends exactly the source commits whose SHA header is not yet published,
 in `git rev-list --reverse --no-merges` order among themselves (the 1253 pass placed merged-branch commits at their
 first-parent merge instead, because that order replays cleanly). So a commit that reached the fork through a merged branch can follow
@@ -28,12 +28,573 @@ later-dated mainline commits: ordinals 1203 onward include such entries, and 128
 follows 1281 although it sorts at position 1259 by date. Each patch is identified by its SHA header, never by its
 position in the log. `core/verify_mirror.py` checks exactly this: contiguous ordinals, unique headers, header set equal
 to the source set. Patch 1228 carries a merge's conflict resolution (see [gateway-restart-drain-holds-and-reattach.md](gateway-restart-drain-holds-and-reattach.md)).
-Upstream exclusion tip: `b51a30c461ee663313ce89d01947bb10b55a619c`; current merge-base: `b51a30c461ee663313ce89d01947bb10b55a619c` (previous snapshots: `55b0b2611f683a12450163b9fe423abbd61a9923`, `d01ed2bfac3469fa582b9aaeec746f3e123bd78a`).
-Replay starts at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. All forty-one published bridges remain unchanged; three source-derived integration bridges precede entries 2254, 2255 and 2256, one more (upstream `d01ed2bfac` via fork merge `91c2b94744`) precedes entry 3185, and one more (upstream `55b0b2611f` via fork merge `db5a056366`, [bridges/upstream-55b0b2611f-via-db5a056366.diff](bridges/upstream-55b0b2611f-via-db5a056366.diff)) precedes entry 3651, and one more (upstream `b51a30c461` via fork merge `a38507dd8f`, [bridges/upstream-b51a30c461-via-a38507dd8f.diff](bridges/upstream-b51a30c461-via-a38507dd8f.diff)) precedes entry 3719 (47 total). The bridge before 2087 excludes the six byte-identical path deltas carried by patch 2087. Entries 1626, 1649 and 1656 are applied and tree-verified at their source parents, then represented by ancestry-only merge markers in the main replay. Entries 2410–2491, 2492–2563, 2564–2678 and 2679–2726 and 2727–2926 and 3424–3473 and 3474–3491 and 3492–3501 and 3502–3529 and 3530–3555 and 3556–3577 and 3578–3622 contain no merges and need no new bridge. Entries 3623–3652 contain the upstream sync merge `db5a056366`: its one side-branch commit (3651) is ordered at that merge, after the new bridge. Entries 3653–3689 contain no merges and need no new bridge. Entries 3690–3713 contain no merges and need no new bridge. Entries 3714–3727 contain the upstream sync merge `a38507dd8f`: its one side-branch commit (3719) is ordered at that merge, after the new bridge. Current snapshot: [mirror-replay-3727.json](mirror-replay-3727.json), [mirror-policy-3727.json](mirror-policy-3727.json), and [executed proof](mirror-3727-verification.md). Previous snapshots: [mirror-3713-verification.md](mirror-3713-verification.md), [mirror-3689-verification.md](mirror-3689-verification.md), [mirror-3652-verification.md](mirror-3652-verification.md), [mirror-3622-verification.md](mirror-3622-verification.md), [mirror-3577-verification.md](mirror-3577-verification.md), [mirror-3555-verification.md](mirror-3555-verification.md), [mirror-3529-verification.md](mirror-3529-verification.md), [mirror-3501-verification.md](mirror-3501-verification.md), [mirror-3491-verification.md](mirror-3491-verification.md), [mirror-3473-verification.md](mirror-3473-verification.md), [mirror-3423-verification.md](mirror-3423-verification.md), [mirror-2926-verification.md](mirror-2926-verification.md), [mirror-2678-verification.md](mirror-2678-verification.md), [mirror-2563-verification.md](mirror-2563-verification.md), [mirror-2491-verification.md](mirror-2491-verification.md), [mirror-2409-verification.md](mirror-2409-verification.md), [mirror-2253-verification.md](mirror-2253-verification.md). The following links retain historical verification:
+Upstream exclusion tip: `ae1ff71c39d8527227400c8e71acf9c57a8a59c6`; current merge-base: `ae1ff71c39d8527227400c8e71acf9c57a8a59c6` (previous snapshots: `b51a30c461ee663313ce89d01947bb10b55a619c`, `55b0b2611f683a12450163b9fe423abbd61a9923`, `d01ed2bfac3469fa582b9aaeec746f3e123bd78a`).
+Replay starts at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. All forty-one published bridges remain unchanged; three source-derived integration bridges precede entries 2254, 2255 and 2256, one more (upstream `d01ed2bfac` via fork merge `91c2b94744`) precedes entry 3185, and one more (upstream `55b0b2611f` via fork merge `db5a056366`, [bridges/upstream-55b0b2611f-via-db5a056366.diff](bridges/upstream-55b0b2611f-via-db5a056366.diff)) precedes entry 3651, and one more (upstream `b51a30c461` via fork merge `a38507dd8f`, [bridges/upstream-b51a30c461-via-a38507dd8f.diff](bridges/upstream-b51a30c461-via-a38507dd8f.diff)) precedes entry 3719, and two more (upstream `491f984583` `gateway/AGENTS.md` context via fork merge `e4450f549b`, [bridges/upstream-491f984583-agents-md-via-e4450f549b.diff](bridges/upstream-491f984583-agents-md-via-e4450f549b.diff), and upstream `ae1ff71c39` via fork merges `1ec97dfdb9`/`a3fe7bf2c7`, [bridges/upstream-ae1ff71c39-via-a3fe7bf2c7.diff](bridges/upstream-ae1ff71c39-via-a3fe7bf2c7.diff)) precede entries 4116 and 4118 (49 total). The bridge before 2087 excludes the six byte-identical path deltas carried by patch 2087. Entries 1626, 1649 and 1656 are applied and tree-verified at their source parents, then represented by ancestry-only merge markers in the main replay. Entries 2410–2491, 2492–2563, 2564–2678 and 2679–2726 and 2727–2926 and 3424–3473 and 3474–3491 and 3492–3501 and 3502–3529 and 3530–3555 and 3556–3577 and 3578–3622 contain no merges and need no new bridge. Entries 3623–3652 contain the upstream sync merge `db5a056366`: its one side-branch commit (3651) is ordered at that merge, after the new bridge. Entries 3653–3689 contain no merges and need no new bridge. Entries 3690–3713 contain no merges and need no new bridge. Entries 3714–3727 contain the upstream sync merge `a38507dd8f`: its one side-branch commit (3719) is ordered at that merge, after the new bridge. Entries 3728–4059 contain no merges and need no new bridge. Entries 4060–4352 contain the upstream sync merge `a3fe7bf2c7`: its five side-branch commits (4114–4118) are ordered at that merge, after the 54 mainline entries 4060–4113, with the two new bridges before 4116 and 4118. Current snapshot: [mirror-replay-4352.json](mirror-replay-4352.json), [mirror-policy-4352.json](mirror-policy-4352.json), and [verification](mirror-4352-verification.md). Previous snapshots: [mirror-4059-verification.md](mirror-4059-verification.md), [mirror-3727-verification.md](mirror-3727-verification.md), [mirror-3713-verification.md](mirror-3713-verification.md), [mirror-3689-verification.md](mirror-3689-verification.md), [mirror-3652-verification.md](mirror-3652-verification.md), [mirror-3622-verification.md](mirror-3622-verification.md), [mirror-3577-verification.md](mirror-3577-verification.md), [mirror-3555-verification.md](mirror-3555-verification.md), [mirror-3529-verification.md](mirror-3529-verification.md), [mirror-3501-verification.md](mirror-3501-verification.md), [mirror-3491-verification.md](mirror-3491-verification.md), [mirror-3473-verification.md](mirror-3473-verification.md), [mirror-3423-verification.md](mirror-3423-verification.md), [mirror-2926-verification.md](mirror-2926-verification.md), [mirror-2678-verification.md](mirror-2678-verification.md), [mirror-2563-verification.md](mirror-2563-verification.md), [mirror-2491-verification.md](mirror-2491-verification.md), [mirror-2409-verification.md](mirror-2409-verification.md), [mirror-2253-verification.md](mirror-2253-verification.md). The following links retain historical verification:
 Previous replay: [mirror-replay-2018.json](mirror-replay-2018.json) (twenty-four hash-pinned bridges and three source-checked ancestry-only entries) and [mirror-policy-2018.json](mirror-policy-2018.json). Executed checks: [mirror-2018-verification.md](mirror-2018-verification.md); previous snapshots: [mirror-2909-verification.md](mirror-2909-verification.md), [mirror-2726-verification.md](mirror-2726-verification.md), [mirror-2017-verification.md](mirror-2017-verification.md), [mirror-2016-verification.md](mirror-2016-verification.md), [mirror-2015-verification.md](mirror-2015-verification.md), [mirror-2010-verification.md](mirror-2010-verification.md), [mirror-2005-verification.md](mirror-2005-verification.md), [mirror-2004-verification.md](mirror-2004-verification.md), [mirror-1988-verification.md](mirror-1988-verification.md), [mirror-1979-verification.md](mirror-1979-verification.md), [mirror-1932-verification.md](mirror-1932-verification.md), [mirror-1923-verification.md](mirror-1923-verification.md), [mirror-1918-verification.md](mirror-1918-verification.md), [mirror-1821-verification.md](mirror-1821-verification.md), [mirror-1702-verification.md](mirror-1702-verification.md), [mirror-1625-verification.md](mirror-1625-verification.md).
 The preceding snapshot's executed checks are in [mirror-1427-verification.md](mirror-1427-verification.md), with its policy [mirror-policy-1427.json](mirror-policy-1427.json) (previous snapshots: [mirror-1381-verification.md](mirror-1381-verification.md), [mirror-1326-verification.md](mirror-1326-verification.md), [mirror-1299-verification.md](mirror-1299-verification.md), [mirror-1281-verification.md](mirror-1281-verification.md), [mirror-1253-verification.md](mirror-1253-verification.md), [mirror-1235-verification.md](mirror-1235-verification.md), [mirror-1157-verification.md](mirror-1157-verification.md)); the inherited curated integration overlay is described in [mirror-1134-verification.md](mirror-1134-verification.md).
 The earlier curated-number notes below are historical, not current inventory counts.
 See [mirror-958-verification.md](mirror-958-verification.md) for reconciliation, merge-only adaptations, privacy and executed checks.
+
+## Mirror 4143–4352
+
+Frozen source `5c9e6833b35266d7989cf607b13cf6eef77b6219`; no new source merges.
+
+| Feature | Patches | Scope |
+|---|---|---|
+| [Lifecycle guard: shell arithmetic sinks, comments, heredocs and multi-line feeds](mirror-4352-a-lifecycle-guard-shell-arithmetic.md) | 4143 | test(shell): cover expanding heredoc substitution fallback |
+| [Lifecycle guard: shell arithmetic sinks, comments, heredocs and multi-line feeds](mirror-4352-a-lifecycle-guard-shell-arithmetic.md) | 4144 | Test quoted comments in lifecycle data-sink masking |
+| [Review handoff validation, reader-cache registry, scratch archive and backlog tests](mirror-4352-a-kanban-review-handoff-readers-scratch.md) | 4145 | cover label backlog advice and evidence boundaries |
+| [Desktop remote caches: bystander rows, reader deferral and replay budgets](mirror-4352-a-tui-remote-caches-and-pollers.md) | 4146 | test non-finite original/short retry deadlines on different code |
+| [Review handoff validation, reader-cache registry, scratch archive and backlog tests](mirror-4352-a-kanban-review-handoff-readers-scratch.md) | 4147 | fix(kanban): validate review handoffs and accept legacy automatic class routing |
+| [Review handoff validation, reader-cache registry, scratch archive and backlog tests](mirror-4352-a-kanban-review-handoff-readers-scratch.md) | 4148 | Prove replica consumer reuse and SQLite error retirement |
+| [Kanban placement, pickup order, home-marker audit, machine-target moves and overlap matching](mirror-4352-a-kanban-placement-pickup-and-move-guards.md) | 4149 | Pin placement nesting-bound plain-text fallback |
+| [Shutdown spool ordering and claim/replay audit tests](mirror-4352-a-gateway-recovery-and-claim-audit-tests.md) | 4150 | Test that a gate without buffer attributes streams ordinary turns |
+| [Shutdown spool ordering and claim/replay audit tests](mirror-4352-a-gateway-recovery-and-claim-audit-tests.md) | 4151 | cron: assert lost fire-claim execution is terminal at ready-ack publication |
+| [Shutdown spool ordering and claim/replay audit tests](mirror-4352-a-gateway-recovery-and-claim-audit-tests.md) | 4152 | test(kanban): the sync watcher fences claims from startup, before it holds .sync.lock |
+| [CI and test-fixture fixes: native lane tools, home pinning, flock readiness, forkserver status](mirror-4352-a-test-harness-isolation-and-platform-fixes.md) | 4153 | fix(ci): provision isolated native test tools and messaging |
+| [Shutdown spool ordering and claim/replay audit tests](mirror-4352-a-gateway-recovery-and-claim-audit-tests.md) | 4154 | shutdown recovery: a failed compression-route read holds the chat's later spool rows |
+| [Lifecycle guard: shell arithmetic sinks, comments, heredocs and multi-line feeds](mirror-4352-a-lifecycle-guard-shell-arithmetic.md) | 4155 | fix(shell): inherit arithmetic evaluation through parameter fallbacks |
+| [Lifecycle guard: shell arithmetic sinks, comments, heredocs and multi-line feeds](mirror-4352-a-lifecycle-guard-shell-arithmetic.md) | 4156 | fix(shell): inherit arithmetic after subscripts and replacements |
+| [Lifecycle guard: shell arithmetic sinks, comments, heredocs and multi-line feeds](mirror-4352-a-lifecycle-guard-shell-arithmetic.md) | 4157 | fix(shell): preserve parameter word delimiters in arithmetic |
+| [Desktop remote caches: bystander rows, reader deferral and replay budgets](mirror-4352-a-tui-remote-caches-and-pollers.md) | 4158 | Test released-root compaction in watch_store.release_under |
+| [Shared blocker recovery: event ordering, operator release, input reuse and config reads](mirror-4352-a-shared-blocker-recovery-ordering.md) | 4159 | fix(kanban): contain check failures and normalize alias keys |
+| [Shutdown spool ordering and claim/replay audit tests](mirror-4352-a-gateway-recovery-and-claim-audit-tests.md) | 4160 | test a real sync-loop process publishes its held claim record before its first round |
+| [CI and test-fixture fixes: native lane tools, home pinning, flock readiness, forkserver status](mirror-4352-a-test-harness-isolation-and-platform-fixes.md) | 4161 | Fix Darwin-only fixture failures in failed-result runtime, socket and replay tests |
+| [Codex quota benches, singleton recovery and rotated-pool retries](mirror-4352-a-codex-quota-rotation-and-routing.md) | 4162 | fix(auth): preserve Codex quota benches and rotate past readmitted rows |
+| [Codex quota benches, singleton recovery and rotated-pool retries](mirror-4352-a-codex-quota-rotation-and-routing.md) | 4163 | fix(auth): scope singleton quota recovery to proven row and failure |
+| [Codex quota benches, singleton recovery and rotated-pool retries](mirror-4352-a-codex-quota-rotation-and-routing.md) | 4164 | fix(auth): accept a reopened walled window whose reset moved later |
+| [CI and test-fixture fixes: native lane tools, home pinning, flock readiness, forkserver status](mirror-4352-a-test-harness-isolation-and-platform-fixes.md) | 4165 | Wait for the gateway lookalike to hold its flock, not for the lock file |
+| [Incremental machine throughput refresh and loop error kinds](mirror-4352-a-throughput-refresh-and-loop-accounting.md) | 4166 | bound throughput refresh with transactional dirty-session history |
+| [Incremental machine throughput refresh and loop error kinds](mirror-4352-a-throughput-refresh-and-loop-accounting.md) | 4167 | isolate throughput floor and usage-index cardinality fences |
+| [Lifecycle guard: shell arithmetic sinks, comments, heredocs and multi-line feeds](mirror-4352-a-lifecycle-guard-shell-arithmetic.md) | 4168 | fix(guards): keep literal prose quotes out of arithmetic sinks |
+| [Incremental machine throughput refresh and loop error kinds](mirror-4352-a-throughput-refresh-and-loop-accounting.md) | 4169 | loop accounting: record each pass error's exception class in a bounded error_kinds map |
+| [CI and test-fixture fixes: native lane tools, home pinning, flock readiness, forkserver status](mirror-4352-a-test-harness-isolation-and-platform-fixes.md) | 4170 | pin the passwd account home in the PM runtime bundle tests |
+| [Review handoff validation, reader-cache registry, scratch archive and backlog tests](mirror-4352-a-kanban-review-handoff-readers-scratch.md) | 4171 | fix(kanban): keep bound methods whose owner has no weakref slot registered |
+| [Shared blocker recovery: event ordering, operator release, input reuse and config reads](mirror-4352-a-shared-blocker-recovery-ordering.md) | 4172 | fix(kanban): order operator releases by portable event time |
+| [Artifact custody: bounded I/O, declared-only uploads and completion warnings](mirror-4352-a-artifact-custody-bounds.md) | 4173 | fix(kanban): bound artifact custody I/O, upload only declared artifacts, keep copies on the task's board |
+| [Kanban placement, pickup order, home-marker audit, machine-target moves and overlap matching](mirror-4352-a-kanban-placement-pickup-and-move-guards.md) | 4174 | Worker pickup: machine-pinned cards first; never copy a pre-claim pin-walled card |
+| [Kanban dashboard history: normalized rows, retained reductions and bounded warm refresh](mirror-4352-a-kanban-dashboard-history-reductions.md) | 4175 | Normalize dashboard history and honor P2 event invalidation |
+| [Kanban dashboard history: normalized rows, retained reductions and bounded warm refresh](mirror-4352-a-kanban-dashboard-history-reductions.md) | 4176 | Retain pure dashboard history reductions with exact run overlays |
+| [Kanban dashboard history: normalized rows, retained reductions and bounded warm refresh](mirror-4352-a-kanban-dashboard-history-reductions.md) | 4177 | Bound dashboard warm refresh to changed history |
+| [Kanban dashboard history: normalized rows, retained reductions and bounded warm refresh](mirror-4352-a-kanban-dashboard-history-reductions.md) | 4178 | boundary baseline: board_read imports UNREAD_EVENT_KINDS |
+| [CI and test-fixture fixes: native lane tools, home pinning, flock readiness, forkserver status](mirror-4352-a-test-harness-isolation-and-platform-fixes.md) | 4179 | test: kill forked_exit_status join and _fork_lock mutants |
+| [Change-proportional kanban annotation holder and Windows custody fallback](mirror-4352-a-kanban-annotation-holder-narrow-key.md) | 4180 | perf(kanban): change-proportional annotation holder (card B) |
+| [Lifecycle guard: shell arithmetic sinks, comments, heredocs and multi-line feeds](mirror-4352-a-lifecycle-guard-shell-arithmetic.md) | 4181 | test(shell_comments): unclosed opaque opener after root comment abandons masking |
+| [Lifecycle guard: shell arithmetic sinks, comments, heredocs and multi-line feeds](mirror-4352-a-lifecycle-guard-shell-arithmetic.md) | 4182 | lifecycle guard: keep stdin feeds through compound commands spanning lines |
+| [Shared blocker recovery: event ordering, operator release, input reuse and config reads](mirror-4352-a-shared-blocker-recovery-ordering.md) | 4183 | repark accounting: blocked and parent-gated shared-clear wakes end the premise streak |
+| [Lifecycle guard: shell arithmetic sinks, comments, heredocs and multi-line feeds](mirror-4352-a-lifecycle-guard-shell-arithmetic.md) | 4184 | fix(shell): recognize arithmetic backticks, literal apostrophes and $$ |
+| [Lifecycle guard: shell arithmetic sinks, comments, heredocs and multi-line feeds](mirror-4352-a-lifecycle-guard-shell-arithmetic.md) | 4185 | fix(shell): keep arithmetic apostrophes as frame delimiters |
+| [PTY output drain after child exit and noclobber-safe environment dumps](mirror-4352-a-terminal-and-pty-output-fixes.md) | 4186 | fix(process): drain a PTY child's buffered output after it exits |
+| [Artifact custody: bounded I/O, declared-only uploads and completion warnings](mirror-4352-a-artifact-custody-bounds.md) | 4187 | kanban: one large scratch artifact under two spellings no longer crashes completion |
+| [PR acceptance: reported CI when no checks are required](mirror-4352-a-kanban-pr-no-required-checks-fallback.md) | 4188 | Require reported CI when PRs have no required checks |
+| [PR acceptance: reported CI when no checks are required](mirror-4352-a-kanban-pr-no-required-checks-fallback.md) | 4189 | Preserve distinct workflow suites in all-check merge evidence |
+| [PR acceptance: reported CI when no checks are required](mirror-4352-a-kanban-pr-no-required-checks-fallback.md) | 4190 | Keep same-name sibling checks in merged fallback evidence |
+| [PR acceptance: reported CI when no checks are required](mirror-4352-a-kanban-pr-no-required-checks-fallback.md) | 4191 | Ignore idle app suites and accept skipped/neutral runs in no-required fallback |
+| [PR acceptance: reported CI when no checks are required](mirror-4352-a-kanban-pr-no-required-checks-fallback.md) | 4192 | Let a pre-merge rerun supersede its failed run in the no-required fallback |
+| [Codex quota benches, singleton recovery and rotated-pool retries](mirror-4352-a-codex-quota-rotation-and-routing.md) | 4193 | fix(routing): reselect or type a rotated-off subscription pool before the retry |
+| [CI and test-fixture fixes: native lane tools, home pinning, flock readiness, forkserver status](mirror-4352-a-test-harness-isolation-and-platform-fixes.md) | 4194 | worker policy: resolve the account scratch dir before admitting TMPDIR |
+| [Codex quota benches, singleton recovery and rotated-pool retries](mirror-4352-a-codex-quota-rotation-and-routing.md) | 4195 | kanban quota hold: report when a fallback route opens, not only the walled route's reset |
+| [CI flaky tests: one daily intake card per repository](mirror-4352-a-ci-flaky-daily-intake.md) | 4196 | ci: batch unowned CI flakes into one durable daily intake card |
+| [Lifecycle guard: shell arithmetic sinks, comments, heredocs and multi-line feeds](mirror-4352-a-lifecycle-guard-shell-arithmetic.md) | 4197 | lifecycle guard tests: pin a process substitution closed on the next line (#2393 follow-up) |
+| [Shutdown spool ordering and claim/replay audit tests](mirror-4352-a-gateway-recovery-and-claim-audit-tests.md) | 4198 | tests: pin #2916 resolutions — recovery egress priming stays on the loop; aux 429 recovery keeps base_url |
+| [Shared blocker recovery: event ordering, operator release, input reuse and config reads](mirror-4352-a-shared-blocker-recovery-ordering.md) | 4199 | Reuse validated shared-blocker inputs within a derivation |
+| [Shared blocker recovery: event ordering, operator release, input reuse and config reads](mirror-4352-a-shared-blocker-recovery-ordering.md) | 4200 | Cover cache-hit mutation and unknown blocker input identities |
+| [Shared blocker recovery: event ordering, operator release, input reuse and config reads](mirror-4352-a-shared-blocker-recovery-ordering.md) | 4201 | Snapshot config and memoize run effects per blocker pass |
+| [Shared blocker recovery: event ordering, operator release, input reuse and config reads](mirror-4352-a-shared-blocker-recovery-ordering.md) | 4202 | Tolerate a non-mapping kanban section in blocker input identity |
+| [Change-proportional kanban annotation holder and Windows custody fallback](mirror-4352-a-kanban-annotation-holder-narrow-key.md) | 4203 | fix(kanban): annotation host-copy custody falls back to msvcrt without fcntl |
+| [CI and test-fixture fixes: native lane tools, home pinning, flock readiness, forkserver status](mirror-4352-a-test-harness-isolation-and-platform-fixes.md) | 4204 | Kill M2931d: race Process.start against the post-wait status read |
+| [Origin-work snapshot WAL and root isolation; cheaper subagent roster](mirror-4352-a-origin-work-snapshot-and-roster-reads.md) | 4205 | origin-work snapshot: use WAL so a save never locks out the remote-links cold read |
+| [Origin-work snapshot WAL and root isolation; cheaper subagent roster](mirror-4352-a-origin-work-snapshot-and-roster-reads.md) | 4206 | subagent.roster: read the observation scope once per request, and the gateway name without scanning replicas |
+| [Artifact custody: bounded I/O, declared-only uploads and completion warnings](mirror-4352-a-artifact-custody-bounds.md) | 4207 | fix(kanban): surface custody warnings in kanban_complete; drop executor-local attachment_path |
+| [Shared blocker recovery: event ordering, operator release, input reuse and config reads](mirror-4352-a-shared-blocker-recovery-ordering.md) | 4208 | fix(kanban): don't trust backfilled UUIDv7 uids as event time |
+| [Desktop remote caches: bystander rows, reader deferral and replay budgets](mirror-4352-a-tui-remote-caches-and-pollers.md) | 4209 | tui remote caches: bystander replica rows keep no cards |
+| [Kanban LLM quota pacing governor and per-card spend budget](mirror-4352-a-llm-pacing-and-spend-budget.md) | 4210 | kanban: LLM quota pacing governor holds claims when the pool is ahead of pace |
+| [Lifecycle guard: shell arithmetic sinks, comments, heredocs and multi-line feeds](mirror-4352-a-lifecycle-guard-shell-arithmetic.md) | 4211 | fix(cron): bound repeated raw quote expansion in lifecycle walks |
+| [Kanban LLM quota pacing governor and per-card spend budget](mirror-4352-a-llm-pacing-and-spend-budget.md) | 4212 | fix(kanban): spend budget sends a card that keeps spending without a hand-off to triage |
+| [Lean skills index and compact kanban_show for Kanban workers](mirror-4352-a-kanban-worker-lean-skills-index.md) | 4213 | Kanban workers: lean skills index + compact kanban_show payload |
+| [Lean skills index and compact kanban_show for Kanban workers](mirror-4352-a-kanban-worker-lean-skills-index.md) | 4214 | prompt_builder: move skills-index row labelling + render into prompt_builder_skills_index |
+| [Origin-work snapshot WAL and root isolation; cheaper subagent roster](mirror-4352-a-origin-work-snapshot-and-roster-reads.md) | 4215 | origin-work snapshot: never file one root's scope in another root's file; tests cannot write the live one |
+| [PR acceptance: reported CI when no checks are required](mirror-4352-a-kanban-pr-no-required-checks-fallback.md) | 4216 | Close merged-path fail-opens in the no-required-check CI fallback |
+| [Shared blocker recovery: event ordering, operator release, input reuse and config reads](mirror-4352-a-shared-blocker-recovery-ordering.md) | 4217 | fix(kanban): event order ignores a backfilled uid's clock |
+| [Redelivering automated wakes refused by a held quota wall](mirror-4352-a-gateway-wall-replay-automation-wake.md) | 4218 | fix(gateway): redeliver an automated wake a held quota wall refused, once, after the reset |
+| [Desktop remote caches: bystander rows, reader deferral and replay budgets](mirror-4352-a-tui-remote-caches-and-pollers.md) | 4219 | Defer remote-index reader misses to a live, beating holder |
+| [Desktop remote caches: bystander rows, reader deferral and replay budgets](mirror-4352-a-tui-remote-caches-and-pollers.md) | 4220 | J non-RPC complete-row replays; single-trial gate benches |
+| [Shared blocker recovery: event ordering, operator release, input reuse and config reads](mirror-4352-a-shared-blocker-recovery-ordering.md) | 4221 | fix(kanban): dispatcher releases don't earn the operator exemption |
+| [Shared blocker recovery: event ordering, operator release, input reuse and config reads](mirror-4352-a-shared-blocker-recovery-ordering.md) | 4222 | shared-blocker check lane: kill surviving mutants M06/M15/M19 (+C10) |
+| [Desktop remote caches: bystander rows, reader deferral and replay budgets](mirror-4352-a-tui-remote-caches-and-pollers.md) | 4223 | observation compact lane: a renamed gateway re-classifies every replica row |
+| [Shared blocker recovery: event ordering, operator release, input reuse and config reads](mirror-4352-a-shared-blocker-recovery-ordering.md) | 4224 | Blocker inputs: read live config once per input read, not twice |
+| [Lifecycle guard: shell arithmetic sinks, comments, heredocs and multi-line feeds](mirror-4352-a-lifecycle-guard-shell-arithmetic.md) | 4225 | shell_arith_sink: quoted subscript substitutions in `let` / `[[ -eq ]]` operands are sinks |
+| [Origin-work snapshot WAL and root isolation; cheaper subagent roster](mirror-4352-a-origin-work-snapshot-and-roster-reads.md) | 4226 | origin-work snapshot: a save refused for a moved kanban home no longer fails the remote-links read |
+| [Review handoff validation, reader-cache registry, scratch archive and backlog tests](mirror-4352-a-kanban-review-handoff-readers-scratch.md) | 4227 | scratch archive: a kanban home kept behind a symlink no longer refuses every aged tree |
+| [Lean skills index and compact kanban_show for Kanban workers](mirror-4352-a-kanban-worker-lean-skills-index.md) | 4228 | compact skills index: strip triggers from plugin-registered skill rows too |
+| [Kanban LLM quota pacing governor and per-card spend budget](mirror-4352-a-llm-pacing-and-spend-budget.md) | 4229 | kanban: pacing holds are recorded skips; an idle account's null five_hour counts as a fresh window |
+| [PR acceptance: reported CI when no checks are required](mirror-4352-a-kanban-pr-no-required-checks-fallback.md) | 4230 | Raise ci-red main_health for failed empty post-merge suites |
+| [Kanban placement, pickup order, home-marker audit, machine-target moves and overlap matching](mirror-4352-a-kanban-placement-pickup-and-move-guards.md) | 4231 | home-marker audit: a pool worker's created event says queue only when the card queues |
+| [Shared blocker recovery: event ordering, operator release, input reuse and config reads](mirror-4352-a-shared-blocker-recovery-ordering.md) | 4232 | Shared-blocker hold: one read-only config read per decision |
+| [Kanban placement, pickup order, home-marker audit, machine-target moves and overlap matching](mirror-4352-a-kanban-placement-pickup-and-move-guards.md) | 4233 | fix(kanban): placement config falls back to the board home's block |
+| [Kanban placement, pickup order, home-marker audit, machine-target moves and overlap matching](mirror-4352-a-kanban-placement-pickup-and-move-guards.md) | 4234 | kanban move: refuse a machine: target with no host_reason naming state on it |
+| [CI flaky tests: one daily intake card per repository](mirror-4352-a-ci-flaky-daily-intake.md) | 4235 | ci: fix live daily-intake delivery (expose idempotency_key; reopen --reason) |
+| [Lifecycle guard: shell arithmetic sinks, comments, heredocs and multi-line feeds](mirror-4352-a-lifecycle-guard-shell-arithmetic.md) | 4236 | fix(cron): scan scripts behind escaped subscript substitutions in arithmetic words |
+| [Cheaper session polls: update-paused turns, idle gates and delivery queue](mirror-4352-a-gateway-idle-and-queue-poll-costs.md) | 4237 | Sessions poll: read update-paused gateway turns by index, not an admissions table scan |
+| [Cheaper session polls: update-paused turns, idle gates and delivery queue](mirror-4352-a-gateway-idle-and-queue-poll-costs.md) | 4238 | Idle heartbeat/loop gates: read state_meta by key range, not a LIKE table scan |
+| [Cheaper session polls: update-paused turns, idle gates and delivery queue](mirror-4352-a-gateway-idle-and-queue-poll-costs.md) | 4239 | Delivery-queue poll: resolve each queue path once per tick, not on every one-second look |
+| [Kanban placement, pickup order, home-marker audit, machine-target moves and overlap matching](mirror-4352-a-kanban-placement-pickup-and-move-guards.md) | 4240 | fix(kanban): overlap check stops matching reviews of different PRs by template words |
+| [Shared blocker recovery: event ordering, operator release, input reuse and config reads](mirror-4352-a-shared-blocker-recovery-ordering.md) | 4241 | fix(kanban): a hold-retire clear is not a dispatcher release |
+| [PTY output drain after child exit and noclobber-safe environment dumps](mirror-4352-a-terminal-and-pty-output-fixes.md) | 4242 | terminal: keep exports when the session sets noclobber |
+| [PTY output drain after child exit and noclobber-safe environment dumps](mirror-4352-a-terminal-and-pty-output-fixes.md) | 4243 | test: atomic snapshot write expects the noclobber-safe >/ redirect |
+| [Core-update requeue keeps the retry on the host of live run processes](mirror-4352-a-kanban-requeue-custody.md) | 4244 | kanban: core-update requeue keeps the retry on the host of the run's live processes |
+| [Core-update requeue keeps the retry on the host of live run processes](mirror-4352-a-kanban-requeue-custody.md) | 4245 | kanban: requeue custody bound spares a job the custody host's running retry holds; liveness on macOS |
+| [Redelivering automated wakes refused by a held quota wall](mirror-4352-a-gateway-wall-replay-automation-wake.md) | 4246 | fix(gateway): wall-replay drops stale plans at boot and keeps its retry budget across restarts |
+| [Redelivering automated wakes refused by a held quota wall](mirror-4352-a-gateway-wall-replay-automation-wake.md) | 4247 | test(gateway): wall-replay fixture authority is keyed by its profile home, so a redelivery's own policy fits _admit's scope |
+| [Session roster single-flight and incremental ranking](session-ranking-4352-b01.md) | 4248–4251, 4293, 4307 |
+| [Post-wake session turn-lease custody](post-wake-leases-4352-b02.md) | 4335–4336 |
+| [Per-card spend limits and durable spend-stop decisions](spend-decisions-4352-b03.md) | 4252, 4316–4317 |
+| [Lifecycle guard: arithmetic and nested-shell input provenance](shell-provenance-4352-b04.md) | 4253, 4308–4315, 4338–4343 |
+| [Remote notice identity and mixed transcript constituents](notice-transcripts-4352-b05.md) | 4254–4255, 4333 |
+| [Conservative unloaded-host notice gates](unloaded-notice-gates-4352-b06.md) | 4266–4268 |
+| [Replica notice and replay race regressions](replica-delivery-races-4352-b07.md) | 4270, 4281, 4294–4295, 4299, 4306, 4318, 4337 |
+| [Kept board readers and incremental structural scans](reader-structural-memos-4352-b08.md) | 4257, 4259–4260, 4290, 4292, 4304–4305 |
+| [Shared blocker window reuse and event-order fences](blocker-window-memos-4352-b09.md) | 4258, 4278, 4296, 4326 |
+| [Pacing history, quota consumers and stall explanations](pacing-admission-4352-b10.md) | 4263–4264, 4274–4276, 4287, 4289, 4344 |
+| [Placement, artifact and registered-probe custody](placement-artifact-custody-4352-b11.md) | 4262, 4272–4273, 4279, 4291, 4297, 4346–4347 |
+| [PR completion contracts and history reduction evidence](pr-contract-evidence-4352-b12.md) | 4280, 4282–4283 |
+| [Authenticated updater TERM receipts preserve review handoffs](updater-term-handoffs-4352-b13.md) | 4324–4325 |
+| [Durable flaky-CI intake, bounded manifests and fair retries](ci-flaky-intake-4352-b14.md) | 4265, 4269, 4285–4286, 4300–4302, 4334 |
+| [Portable regression fixtures and host-isolated checks](test-harness-isolation-4352-b15.md) | 4256, 4261, 4288, 4303, 4319, 4327–4328, 4345 |
+| [Tool observation barriers, PTY drain and scratch diagnostics](runtime-accounting-gc-4352-b16.md) | 4271, 4277, 4284, 4323 |
+| [Space-efficient Darwin server allocation](darwin-launch-malloc-4352-b17.md) | 4329–4332 |
+| [Origin-content annotation holder keys](annotation-narrow-keys-4352-b18.md) | 4298, 4320–4322 |
+| [Desktop comments follow the registered owner](desktop-owner-comments-4352-b19.md) | 4348 |
+| [Observation clock parks require explicit card opt-in](observation-clock-parks-4352-b20.md) | 4349–4352 |
+
+## Mirror 4060–4142
+
+Patches through `133dd0ff8e`; verification in [mirror-4142-verification.md](mirror-4142-verification.md).
+
+| Feature | Patches | Scope |
+|---|---|---|
+| [Loss receipt guards and quota start results](mirror-4142-loss-receipt-guards.md) | 4060 | Pin loss receipt writer guards before emission |
+| [Sync claims wait for the first feed round](mirror-4142-sync-claims-first-round.md) | 4061 | kanban sync: claims wait for this process's first round at the feed head; the outbox alarm reads the last completed round |
+| [Sync claims wait for the first feed round](mirror-4142-sync-claims-first-round.md) | 4062 | test(kanban): isolate sync claim state in delivery fixtures |
+| [Sync claims wait for the first feed round](mirror-4142-sync-claims-first-round.md) | 4063 | fix(kanban): distinguish waiting sync watchers from lock owners |
+| [PM seed account resolution under a fake HOME](mirror-4142-pm-seed-account.md) | 4064 | pm: resolve seed account from passwd under a fake HOME |
+| [PM seed account resolution under a fake HOME](mirror-4142-pm-seed-account.md) | 4065 | test(pm): isolate build consumer account cache |
+| [Cron adopted-claim stamping and loss booking](mirror-4142-cron-adoption-claims.md) | 4066 | fix(cron): stamp adopting worker before ready acknowledgement |
+| [Cron adopted-claim stamping and loss booking](mirror-4142-cron-adoption-claims.md) | 4067 | fix(cron): book lost adopted claims before acknowledging handoff |
+| [Watcher release policy and reactivated owners](mirror-4142-watch-store-release.md) | 4068 | Preserve watcher release policy and transient signatures |
+| [Watcher release policy and reactivated owners](mirror-4142-watch-store-release.md) | 4069 | Bypass released-root scans for reactivated watcher owners |
+| [Watcher release policy and reactivated owners](mirror-4142-watch-store-release.md) | 4070 | Make watcher restore invalidation fixtures explicit |
+| [Guarded replica readers, bystander evidence and reader caches](mirror-4142-replica-readers.md) | 4071 | Reuse guarded replica readers in dispatcher operator and wake scans |
+| [Same-label pool backlog explanations and evidence bounds](mirror-4142-pool-backlog-evidence.md) | 4072 | explain same-label pool backlog before capability-dropping moves |
+| [Same-label pool backlog explanations and evidence bounds](mirror-4142-pool-backlog-evidence.md) | 4073 | preserve empty placement shapes and prove backlog guard controls |
+| [Same-label pool backlog explanations and evidence bounds](mirror-4142-pool-backlog-evidence.md) | 4074 | limit pool claim evidence to current ready episode |
+| [Same-label pool backlog explanations and evidence bounds](mirror-4142-pool-backlog-evidence.md) | 4075 | bound pool evidence after shared blocker wakes |
+| [Lifecycle guard shell scanning: printf, comments, feeds and tokenization](mirror-4142-lifecycle-shell-scanning.md) | 4076 | Model printf control-character quoting before precision |
+| [Test harness stability: bootstrap, wrappers, forkserver and runner sweeps](mirror-4142-test-harness-stability.md) | 4077 | test: await desktop bootstrap publication before asserting boot work |
+| [Watched Kanban tables refuse REPLACE writers](mirror-4142-no-replace-guard.md) | 4078 | Guard watched kanban tables against REPLACE writers |
+| [Watched Kanban tables refuse REPLACE writers](mirror-4142-no-replace-guard.md) | 4079 | test(kanban): detect escaped SQL identifier quotes in source guard |
+| [Watched Kanban tables refuse REPLACE writers](mirror-4142-no-replace-guard.md) | 4080 | test(kanban): catch SQLite quoted and commented identifiers |
+| [Lifecycle guard shell scanning: printf, comments, feeds and tokenization](mirror-4142-lifecycle-shell-scanning.md) | 4081 | Keep root shell comments out of lifecycle output sinks |
+| [Lifecycle guard shell scanning: printf, comments, feeds and tokenization](mirror-4142-lifecycle-shell-scanning.md) | 4082 | Use portable Bash shebang in comment sink fixture |
+| [Lifecycle guard shell scanning: printf, comments, feeds and tokenization](mirror-4142-lifecycle-shell-scanning.md) | 4083 | Keep pending heredoc multiline groups unmasked |
+| [Lifecycle guard shell scanning: printf, comments, feeds and tokenization](mirror-4142-lifecycle-shell-scanning.md) | 4084 | lifecycle guard: keep stdin feeds through `2>&1`, `>(…)`, bare `cat`/`tee` and a pipe ending a line |
+| [Lifecycle guard shell scanning: printf, comments, feeds and tokenization](mirror-4142-lifecycle-shell-scanning.md) | 4085 | lifecycle guard: split a `&>` glued to the word before it |
+| [Lifecycle guard shell scanning: printf, comments, feeds and tokenization](mirror-4142-lifecycle-shell-scanning.md) | 4086 | fix(lifecycle): resolve complete process-substitution writers |
+| [Lifecycle guard shell scanning: printf, comments, feeds and tokenization](mirror-4142-lifecycle-shell-scanning.md) | 4087 | test(lifecycle): retain main fd-normalizer token contract |
+| [Lifecycle guard shell scanning: printf, comments, feeds and tokenization](mirror-4142-lifecycle-shell-scanning.md) | 4088 | fix(lifecycle): escape clobber pipes without a new sentinel |
+| [Lifecycle guard shell scanning: printf, comments, feeds and tokenization](mirror-4142-lifecycle-shell-scanning.md) | 4089 | fix(lifecycle): feed output substitutions from closed groups |
+| [Lifecycle guard shell scanning: printf, comments, feeds and tokenization](mirror-4142-lifecycle-shell-scanning.md) | 4090 | fix(lifecycle): preserve literal filename characters during tokenization |
+| [Frozen hub claim lanes before admission](mirror-4142-hub-claim-frozen-lanes.md) | 4091 | Freeze hub claim lanes before admission to exclude asynchronous wakes |
+| [Frozen hub claim lanes before admission](mirror-4142-hub-claim-frozen-lanes.md) | 4092 | Exercise frozen-lane dispatch controls and review admission outcomes |
+| [Frozen hub claim lanes before admission](mirror-4142-hub-claim-frozen-lanes.md) | 4093 | Preserve priority-pool order in frozen admission lanes |
+| [Frozen hub claim lanes before admission](mirror-4142-hub-claim-frozen-lanes.md) | 4094 | isolate capacity ordering from review admission budget |
+| [Loss receipt guards and quota start results](mirror-4142-loss-receipt-guards.md) | 4095 | fix(kanban): preserve quota startup result across owner loss echo |
+| [Shared blocker check lane, recovery fences and independent parks](mirror-4142-shared-blocker-checks.md) | 4096 | WIP shared blocker check lane and stable probe anchor |
+| [Shared blocker check lane, recovery fences and independent parks](mirror-4142-shared-blocker-checks.md) | 4097 | Satisfy checker fixture and subprocess lint gates |
+| [Shared blocker check lane, recovery fences and independent parks](mirror-4142-shared-blocker-checks.md) | 4098 | Fence stale quota assertions and persist portable cheap-check recovery |
+| [Shared blocker check lane, recovery fences and independent parks](mirror-4142-shared-blocker-checks.md) | 4099 | Replay real hub and shadow quota-wall history with modeled reset checks |
+| [Shared blocker check lane, recovery fences and independent parks](mirror-4142-shared-blocker-checks.md) | 4100 | fix(kanban): preserve cheap-check cadence and same-second recovery ordering |
+| [Shared blocker check lane, recovery fences and independent parks](mirror-4142-shared-blocker-checks.md) | 4101 | fix(kanban): honor operator release before cheap-wall worker holds |
+| [Shared blocker check lane, recovery fences and independent parks](mirror-4142-shared-blocker-checks.md) | 4102 | fix(kanban): preserve authoritative check ordering across remote claims |
+| [Shared blocker check lane, recovery fences and independent parks](mirror-4142-shared-blocker-checks.md) | 4103 | docs(kanban): document shared blocker recovery settings |
+| [Guarded replica readers, bystander evidence and reader caches](mirror-4142-replica-readers.md) | 4104 | fix(kanban): weakly retain reader cache eviction callbacks |
+| [Test harness stability: bootstrap, wrappers, forkserver and runner sweeps](mirror-4142-test-harness-stability.md) | 4105 | fix(tests): snapshot wrapper child argv once |
+| [Test harness stability: bootstrap, wrappers, forkserver and runner sweeps](mirror-4142-test-harness-stability.md) | 4106 | retain forkserver exit status after sentinel consumption |
+| [Test harness stability: bootstrap, wrappers, forkserver and runner sweeps](mirror-4142-test-harness-stability.md) | 4107 | Observe the submitter-started owner in the Kanban restart probe |
+| [Parked passive rows across update checkpoints](mirror-4142-parked-passive-rows.md) | 4108 | update pause: passive rows wait while a turn is parked; a drain-fenced automation head settles |
+| [Parked passive rows across update checkpoints](mirror-4142-parked-passive-rows.md) | 4109 | fix(state): defer all passive rows across update checkpoints |
+| [Parked passive rows across update checkpoints](mirror-4142-parked-passive-rows.md) | 4110 | fix(gateway): replay parked rows when unknown work settles |
+| [Parked passive rows across update checkpoints](mirror-4142-parked-passive-rows.md) | 4111 | fix(gateway): retain profile scope for deferred bot replies |
+| [Parked passive rows across update checkpoints](mirror-4142-parked-passive-rows.md) | 4112 | fix(gateway): replay parked passive rows across compression |
+| [Parked passive rows across update checkpoints](mirror-4142-parked-passive-rows.md) | 4113 | fix(gateway): keep deferred replay hydration off loop |
+| [Upstream sync ae1ff71c39 side-branch adaptations](mirror-4142-upstream-sync-adaptations.md) | 4114 | test(e2e): settle the streamed footer before the stream_accepted_unpersisted stall |
+| [Upstream sync ae1ff71c39 side-branch adaptations](mirror-4142-upstream-sync-adaptations.md) | 4115 | update: preload kanban_comment_writer before the checkout moves |
+| [Upstream sync ae1ff71c39 side-branch adaptations](mirror-4142-upstream-sync-adaptations.md) | 4116 | gateway/AGENTS.md: stay under the 30000-char chain cap after upstream 491f984 |
+| [Upstream sync ae1ff71c39 side-branch adaptations](mirror-4142-upstream-sync-adaptations.md) | 4117 | Pin recovered-source resolution off the gateway loop |
+| [Upstream sync ae1ff71c39 side-branch adaptations](mirror-4142-upstream-sync-adaptations.md) | 4118 | Adapt pending-route fixture to upstream provenance recovery |
+| [Lifecycle guard shell scanning: printf, comments, feeds and tokenization](mirror-4142-lifecycle-shell-scanning.md) | 4119 | test literal marker and trailing substitution feeds |
+| [Pickup-stall alarm placement and awaited repair provenance](mirror-4142-pickup-stall-and-repair-tests.md) | 4120 | Prefer capable workers over hub for pickup-stall alarms |
+| [Test harness stability: bootstrap, wrappers, forkserver and runner sweeps](mirror-4142-test-harness-stability.md) | 4121 | Cover shutdown diagnostic watchdog mutation gaps |
+| [Lifecycle guard: no backend reads for missing paths on a local terminal](mirror-4142-lifecycle-local-backend-reads.md) | 4122 | Lifecycle guard: no backend reads for missing paths on a local terminal |
+| [Lifecycle guard: no backend reads for missing paths on a local terminal](mirror-4142-lifecycle-local-backend-reads.md) | 4123 | test(terminal): select ssh for remote lifecycle fixture |
+| [Shared blocker check lane, recovery fences and independent parks](mirror-4142-shared-blocker-checks.md) | 4124 | preserve independent parks across shared blocker clears |
+| [Shared blocker check lane, recovery fences and independent parks](mirror-4142-shared-blocker-checks.md) | 4125 | cover explicit shared awaiting and no-probe wake controls |
+| [Darwin process-title libc by absolute path](mirror-4142-process-title-libc.md) | 4126 | fix(cli): identify Darwin process-title libc by absolute path |
+| [Test harness stability: bootstrap, wrappers, forkserver and runner sweeps](mirror-4142-test-harness-stability.md) | 4127 | Keep runner startup sweeps out of fresh test attempts |
+| [Test harness stability: bootstrap, wrappers, forkserver and runner sweeps](mirror-4142-test-harness-stability.md) | 4128 | Isolate holder subprocess worker policy in sweep regression |
+| [Guarded replica readers, bystander evidence and reader caches](mirror-4142-replica-readers.md) | 4129 | retain scalar evidence for session replica bystanders |
+| [Guarded replica readers, bystander evidence and reader caches](mirror-4142-replica-readers.md) | 4130 | preserve unfiltered structural replica view protocol |
+| [Guarded replica readers, bystander evidence and reader caches](mirror-4142-replica-readers.md) | 4131 | fix(kanban): filter remembered publication lookup eligibility |
+| [Pickup-stall alarm placement and awaited repair provenance](mirror-4142-pickup-stall-and-repair-tests.md) | 4132 | Test awaited repair claim task and run provenance |
+| [Executor custody of completion artifacts](mirror-4142-artifact-custody.md) | 4133 | feat(kanban): track executor custody of completion artifacts |
+| [Executor custody of completion artifacts](mirror-4142-artifact-custody.md) | 4134 | fix(kanban): preserve large scratch custody and warn on missing evidence |
+| [Executor custody of completion artifacts](mirror-4142-artifact-custody.md) | 4135 | fix(kanban): resolve artifact delivery through local byte custody |
+| [Executor custody of completion artifacts](mirror-4142-artifact-custody.md) | 4136 | test(kanban): verify artifact custody on every task read surface |
+| [Executor custody of completion artifacts](mirror-4142-artifact-custody.md) | 4137 | fix(kanban): declare intended custody projection boundary |
+| [Executor custody of completion artifacts](mirror-4142-artifact-custody.md) | 4138 | test(kanban): kill artifact custody boundary mutants |
+| [Executor custody of completion artifacts](mirror-4142-artifact-custody.md) | 4139 | fix(kanban): retain verified local large artifact delivery |
+| [Executor custody of completion artifacts](mirror-4142-artifact-custody.md) | 4140 | fix(kanban): keep artifact guidance within schema budget |
+| [Remote notice custody through completed resume receipts](mirror-4142-remote-notice-resume-custody.md) | 4141 | Preserve remote notice custody through completed resume receipts |
+| [Lifecycle guard shell scanning: printf, comments, feeds and tokenization](mirror-4142-lifecycle-shell-scanning.md) | 4142 | Pin expanding heredoc and comment stripping regressions |
+
+## Mirror 3728–4059
+
+Patches through `3c0d856312`; verification in [mirror-4059-verification.md](mirror-4059-verification.md).
+
+| Feature | Patches | Scope |
+|---|---|---|
+| [Placement refusal isolation and home-path recognition](mirror-4059-a-placement.md) | 3728 | worker placement: a refused pool repin no longer suppresses the origin repin |
+| [Duplicate-language and same-creator overlap guards](mirror-4059-a-overlap.md) | 3729 | kanban overlap guards: a keyword stops at the next one; no-op is no denial; a bumped counter is a re-issue; a moved index is an index |
+| [Duplicate-language and same-creator overlap guards](mirror-4059-a-overlap.md) | 3730 | kanban overlap guards: a hedged negator still denies; a keyword-only aside is no keyword; none other than is no count; pass/take/try are legs |
+| [Live snapshot sweeps and replica-age regression contracts](mirror-4059-a-sync-recovery.md) | 3731 | kanban sync: a 410 on a primary board's live file sweeps this gateway's rows the snapshot lacks |
+| [Scratch-state, refusal-backoff and archive restore safeguards](mirror-4059-a-scratch.md) | 3732 | kanban gc: scratch refusal memo timestamps stay below Windows' gmtime limit; skip_logged never raises |
+| [Duplicate-language and same-creator overlap guards](mirror-4059-a-overlap.md) | 3733 | kanban overlap: one isolated negative per same-creator / re-issue / dup-detector guard |
+| [Content-keyed reuse of the macOS state lane](mirror-4059-a-ci-state.md) | 3734 | ci: mini state lane skips same-PR repeats and unrelated .github edits |
+| [Placement refusal isolation and home-path recognition](mirror-4059-a-placement.md) | 3735 | hub-read root paths: keep every path on a bare $NAME, a backtick or a quoted cd |
+| [Worker policy-root isolation and held-worker diagnostics](mirror-4059-a-worker-policy.md) | 3736 | worker policy root: deny by default, a durable TMPDIR outside account and HOME never admits HERMES_TEST_POLICY_ROOT |
+| [Advisory lint fetch recovery on partial clones](mirror-4059-a-ci-lint.md) | 3737 | CI lint: advisory diff steps fetch through fetch-merge-base, so git 2.55's promisor BUG no longer skips them |
+| [Advisory lint fetch recovery on partial clones](mirror-4059-a-ci-lint.md) | 3738 | tests(ci lint advisory fetch): healthy-path shim survives the runner's own git 2.55 BUG |
+| [Placement refusal isolation and home-path recognition](mirror-4059-a-placement.md) | 3739 | worker-first pickup gate: pin INVALID_REQUIRES through the placement tick |
+| [Scratch-state, refusal-backoff and archive restore safeguards](mirror-4059-a-scratch.md) | 3740 | kanban park pin: a commit-less repo (git init, nothing committed) holds no state |
+| [Attended claim-quiet observation and work custody](mirror-4059-a-quiet-observation.md) | 3741 | feat(quiet): gateway-local quiet proof — activity registry, claim-quiet lease, executed-code attestation [daveey] |
+| [Attended claim-quiet observation and work custody](mirror-4059-a-quiet-observation.md) | 3742 | fix(quiet): CI regressions — boot closure, replaced Thread class, stand-in agents, adapter labels [daveey] |
+| [Attended claim-quiet observation and work custody](mirror-4059-a-quiet-observation.md) | 3743 | fix(quiet): stand-in review agents dispatch via defining class; track gitignored attestation stub fixture [daveey] |
+| [Attended claim-quiet observation and work custody](mirror-4059-a-quiet-observation.md) | 3744 | fix(quiet): seed registry membership from the process reservation; real Registry membership API |
+| [Attended claim-quiet observation and work custody](mirror-4059-a-quiet-observation.md) | 3745 | test(quiet): RED-on-parent coverage for review nits (shut-down pool submit, cancelled queued audio job, same-boot cooldown, expired-episode end) |
+| [Attended claim-quiet observation and work custody](mirror-4059-a-quiet-observation.md) | 3746 | fix(quiet): dispatcher custody attaches via adopt_spawned (health CC); test waits on condition, not clock |
+| [Attended claim-quiet observation and work custody](mirror-4059-a-quiet-observation.md) | 3747 | refactor(quiet): split worker Popen out of _default_spawn so custody keeps its CC at main's 19 [daveey] |
+| [Attended claim-quiet observation and work custody](mirror-4059-a-quiet-observation.md) | 3748 | fix(quiet): executed-code index cap fits the grown gateway graph (MAX_LOADED_CODE 2^18, 2x headroom asserted) |
+| [Attended claim-quiet observation and work custody](mirror-4059-a-quiet-observation.md) | 3749 | fix(quiet): quiet-only stuck classification never masks main's new admission_deferred hold |
+| [Live snapshot sweeps and replica-age regression contracts](mirror-4059-a-sync-recovery.md) | 3750 | kanban live resync sweep test: exercise the since guard and the in-transaction keep re-check |
+| [Lifecycle guard stdin groups and clustered shell commands](mirror-4059-a-lifecycle.md) | 3751 | lifecycle guard: pin five #2393 conditions no test reached |
+| [Worker policy-root isolation and held-worker diagnostics](mirror-4059-a-worker-policy.md) | 3752 | kanban pickup-stall: read the registry hold by truthiness, like pickup's eligible() |
+| [Duplicate-language and same-creator overlap guards](mirror-4059-a-overlap.md) | 3753 | kanban overlap guards: a counter hides only itself; v2.1 and try/take counters are re-issues; not/never before as/because is no denial |
+| [Desktop quota-wall deferral with session routing identity](mirror-4059-a-quota-routing.md) | 3754 | fix(tui-gateway): a Desktop session on a router-picked model moves off a far quota wall [daveey] |
+| [Desktop quota-wall deferral with session routing identity](mirror-4059-a-quota-routing.md) | 3755 | test(tui-gateway): the _make_agent stubs take the session id the resolver now receives [daveey] |
+| [Profile-board ledger fallback boundaries](mirror-4059-a-chat-links.md) | 3756 | kanban chat links: tighten the profile-board ledger fallback (PR #2372 review nits) |
+| [Worker policy-root isolation and held-worker diagnostics](mirror-4059-a-worker-policy.md) | 3757 | tests: pin #2454's relative HERMES_TEST_POLICY_ROOT refusal under a temp cwd and the primary-board-only unknown-streak sweep |
+| [Lifecycle guard stdin groups and clustered shell commands](mirror-4059-a-lifecycle.md) | 3758 | lifecycle guard: a group's own stdin redirection feeds its commands |
+| [Scratch-state, refusal-backoff and archive restore safeguards](mirror-4059-a-scratch.md) | 3759 | kanban gc test: the scratch refusal memo loader drops a bool last_at/retry_at |
+| [Foreign process-management regression contracts](mirror-4059-a-process-contracts.md) | 3760 | tests: pin the foreign process_manage gates and the exit recorder's status (#2376 survivors) |
+| [Scratch-state, refusal-backoff and archive restore safeguards](mirror-4059-a-scratch.md) | 3761 | tests: scratch archive restore drops only gone remote refs; a detached HEAD is checked |
+| [Foreign process-management regression contracts](mirror-4059-a-process-contracts.md) | 3762 | test: foreign poll/log/wait/kill report a recorded kill marker before the supervisor settles |
+| [Update-paused turns remain logically live](mirror-4059-a-sidebar-update.md) | 3763 | fix(sidebar): a turn paused for a core update keeps turn_live, so the row does not paint red for the update [daveey] |
+| [Live snapshot sweeps and replica-age regression contracts](mirror-4059-a-sync-recovery.md) | 3764 | replica-age resume: pin future seen_at, the memo-only detach and seen_at = last observation |
+| [Worker-liveness evidence regression pins](mirror-4059-a-liveness.md) | 3765 | tests: pin three #2420 liveness guards that post-merge mutants survived |
+| [Same-call worker persistence receipt resend](mirror-4059-a-receipt-resend.md) | 3766 | worker store: re-send a receipt whose reply timed out instead of latching |
+| [Same-call worker persistence receipt resend](mirror-4059-a-receipt-resend.md) | 3767 | worker store: re-send an unknown receipt inside the same call, never on a later write |
+| [Duplicate-language and same-creator overlap guards](mirror-4059-a-overlap.md) | 3768 | existing-work record: pin CRLF list stripping (CR-only normalisation survived) |
+| [Placement refusal isolation and home-path recognition](mirror-4059-a-placement.md) | 3769 | placement: linear cd-home .hermes scan; pushd home and commented cd count |
+| [Source-workspace launch cleanup and clone-root diagnostics](mirror-4059-a-source-workspace.md) | 3770 | kanban source launch: never write the fenced branch_name on a source card; a workspace-record failure releases the claim |
+| [Requested cron stops are warnings, not failed-job defects](mirror-4059-a-cron-stop.md) | 3771 | cron: a requested stop (cancel, Stop, remove) logs a WARNING, not 'Job failed' (cron-7c04faf754) |
+| [Duplicate-language and same-creator overlap guards](mirror-4059-a-overlap.md) | 3772 | overlap guards: pin newline clause end, "never", the ’ apostrophe and one-sided replace markers |
+| [Scratch-state, refusal-backoff and archive restore safeguards](mirror-4059-a-scratch.md) | 3773 | tests: deflake test_cli_budget_flag_and_default float compare |
+| [Source-workspace launch cleanup and clone-root diagnostics](mirror-4059-a-source-workspace.md) | 3774 | kanban workspace_source tests: the unregistered-clone refusal names the exact clone root |
+| [Awaited-card wake and unreachable-owner regression contracts](mirror-4059-a-awaited-wake.md) | 3775 | awaited-card wake tests: kill the #2470 post-merge mutants M2 (ref change in one episode) and M5 (expedite re-arm) |
+| [Awaited-card wake and unreachable-owner regression contracts](mirror-4059-a-awaited-wake.md) | 3776 | test(kanban): an ssh timeout/OSError to the owner still wakes on a fresh Board replica [daveey] |
+| [Attended claim-quiet observation and work custody](mirror-4059-a-quiet-observation.md) | 3777 | fix(quiet): all_quiet_deferred uses a positive allowlist of DispatchResult fields |
+| [Hold new queue-reason comments while preserving events](mirror-4059-a-queue-comments.md) | 3778 | kanban queue reason: comment a new wait reason only once it has held 120 s |
+| [Hold new queue-reason comments while preserving events](mirror-4059-a-queue-comments.md) | 3779 | kanban queue reason tests: origin-repin refusal pins which reasons are commented, so run it without the comment hold |
+| [Lifecycle guard stdin groups and clustered shell commands](mirror-4059-a-lifecycle.md) | 3780 | lifecycle guard: walk the payload of a clustered shell -c (`bash -ec`, `-lc`, `-xc`, `-c -e`) |
+| [Per-pass CPU accounting for loops and polled routes](mirror-4059-a-loop-accounting.md) | 3781 | loop_accounting: per-pass CPU accounting for Kanban loops and polled routes (P1) |
+| [Live snapshot sweeps and replica-age regression contracts](mirror-4059-a-sync-recovery.md) | 3782 | test(kanban-sync): pin the live resync sweep's child guards: event window, card outbox hold, child since, children-first [daveey] |
+| [Awaited-card wake and unreachable-owner regression contracts](mirror-4059-a-awaited-wake.md) | 3783 | awaited-card wake: pin five #2432 conditions no test reached |
+| [Remote task and completion identity contracts](mirror-4059-b-remote-identity-test-contracts.md) | 3784 | Direct `_task_rows` calls exclude the supplied own gateway but include all gateways when omitted; the no-seq snapshot keeps only the remote card; indexed cold reads equal planner order and the fixture proves that order differs from rowid order. |
+| [Cron rerun boundaries and expected-stop logging](mirror-4059-b-cron-reruns-and-stop-logging.md) | 3785 | Restart-rerun cases pin awake-versus-asleep classification, a fresh budget for attempts claimed before another rerun, preserved spent budget on deferral, original/replanned/unsaved-slot non-reruns and exact-slot settlement. The gateway case supplies fake owner clocks and requires restart-cut flags with awake 50 and wall 900. |
+| [PR-aware Kanban CI waits](mirror-4059-b-pr-ci-waits.md) | 3786 | Parser, park and sweep cases pin conflict refusal, one wake/comment without shared blocker, fresh-head grace, no-run expiry, runner-offline routing for queued runs, quiet null mergeability, moved/closed heads and fail-open API errors. |
+| [Scratch archive, retry and empty-tree safety guards](mirror-4059-b-scratch-archive-and-tree-guards.md) | 3787 | Changing directory mtime or completion timestamp after two refusals resets count to one, retry delay to BASE_S and the stored fingerprint to the changed tree. |
+| [Scratch archive, retry and empty-tree safety guards](mirror-4059-b-scratch-archive-and-tree-guards.md) | 3788 | A shallow clone retains all objects; a hard-linked tracked file stays whole and restores shared inode/bytes; tampered omitted size or SHA-256 is refused before the target file appears. |
+| [Quiet lease preflight and canonical-home clocks](mirror-4059-b-quiet-lease-preflight.md) | 3789 | Gateway tests compare file-preflight reasons with start at zero margin and require the default margin to reject near-stale windows. CLI tests require exit 78, no cooldown/observer and immediate successful retry after fresh idle state, including missing or exploding preflight cases. |
+| [Worker admission and recovery test contracts](mirror-4059-b-worker-admission-and-recovery-tests.md) | 3790 | With 16 effective cores, pinned load 24 returns worker_load_pressure before leaked-board occupancy and records no unknown streak; pinned load 1 returns worker_resources_unknown and records it. |
+| [Duplicate-completion idempotence and denial parsing](mirror-4059-b-duplicate-completion-idempotence.md) | 3791 | Repeated completion of the body-listed task adds no comments; a task ID only quoted in that body still gets its own completion comment. |
+| [Kanban queue clocks, resume receipts and overlap intent](mirror-4059-b-kanban-intent-test-contracts.md) | 3792 | Two uncommented queue sightings retain the original commented_at timestamp whether the comment table is kept or absent; the eventual refresh adds a second comment instead of merely another sighting. |
+| [CI cache timeout and duration-fixture reliability](mirror-4059-b-ci-cache-and-duration-tests.md) | 3793 | Workflow structure assertions require both cache lookup and save timeout-minutes values to equal two. |
+| [Kanban queue clocks, resume receipts and overlap intent](mirror-4059-b-kanban-intent-test-contracts.md) | 3794 | A None-after receipt survives no runs and update-only requeues, is spent by the first real claim even after requeues, and grants nothing for missing/non-False merge_authorized values. |
+| [Scratch archive, retry and empty-tree safety guards](mirror-4059-b-scratch-archive-and-tree-guards.md) | 3795 | Boundary-parameterized memo records enforce the safe epoch limit and retry logging must include the expected ISO UTC timestamp rather than a raw epoch. |
+| [Board feed clears this host’s dead local claims](mirror-4059-b-feed-clears-dead-local-claims.md) | 3796 | Primary crash-release feed tests require immediate cleared local claim/PID fields for ready/triage/blocked, immediate retry claimability and triage archiving; no queued release, live worker or still-running feed preserves the claim. Leftover sweep parameterization adds triage. |
+| [Board feed clears this host’s dead local claims](mirror-4059-b-feed-clears-dead-local-claims.md) | 3797 | The restart-resume crash fixture requires claim_lock and worker_pid already cleared after feed apply, and the subsequent leftover sweep returns an empty list. |
+| [Late session inventory and MCP reload reporting](mirror-4059-b-late-inventory-and-mcp-reload.md) | 3798 | Gateway tests pin reply-before-late-info ordering, a settled empty inventory on early/late build failure and pending-map cleanup. Classic CLI tests pin one-time deferred notices/warnings and no listener for settled replies. MCP reload uses session.info and adopts its full tool inventory. |
+| [Home-state placement and shell spelling guards](mirror-4059-b-home-path-placement.md) | 3799 | Home-spelling and pool tests distinguish local state paths/direct state-directory changes from repository-relative paths after later cd; own-worker artifacts retain a local marker; long no-match inputs satisfy bounded scan timings. |
+| [Remote task and completion identity contracts](mirror-4059-b-remote-identity-test-contracts.md) | 3800 | With equal legacy numeric run IDs and a later foreign receipt, completion replay still binds this gateway’s own receipt and verifies both completion flags. |
+| [Quiet lease preflight and canonical-home clocks](mirror-4059-b-quiet-lease-preflight.md) | 3801 | Canonical relative homes follow changing cwd while absolute keys cache correctly; future prior-boot wall records permit acquisition, but exact zero age raises a full cooldown. |
+| [Quiet lease preflight and canonical-home clocks](mirror-4059-b-quiet-lease-preflight.md) | 3802 | Symlink-before-dotdot paths resolve identically for absolute, relative and cached spellings and agree with hermes_home_key; adjacent quiet-test wording is clarified without changed runtime assertions. |
+| [Quota-wall fallback for resumed provider-native routes](mirror-4059-b-quota-wall-resumed-overrides.md) | 3803 | A resumed provider-native URL/wire builds the fallback agent, includes the fallback notice and provenance, and does not carry the old endpoint/wire; explicit endpoint/key controls remain refusal cases. |
+| [Explicit handshakes in asynchronous regression fixtures](mirror-4059-b-async-test-handshakes.md) | 3804 | The mixed-batch test now waits for its own queued completion and still requires exactly one non-notice batch result with no early child-failure notice. |
+| [Scratch archive, retry and empty-tree safety guards](mirror-4059-b-scratch-archive-and-tree-guards.md) | 3805 | Garbage and zero-length refs plus a failing HEAD probe all preserve the unpushed-commits fail-safe rather than proving an unborn repository. |
+| [Paused-turn activity follows configured continuation bounds](mirror-4059-b-configured-paused-turn-activity.md) | 3806 | Disabled/expired/exhausted pauses do not annotate turn_live; raised valid windows do; profiles use distinct policy; parser tests pin producer/reader defaults and coercions. |
+| [Worker admission and recovery test contracts](mirror-4059-b-worker-admission-and-recovery-tests.md) | 3807 | Parameterized truthy/falsy hold values require stranded listing to agree with the actual pickup eligibility gate. |
+| [CI cache timeout and duration-fixture reliability](mirror-4059-b-ci-cache-and-duration-tests.md) | 3808 | Parsed slow-case lines may name only the fixture cases, must include the sleeper at least 0.6 seconds, and every reported case must meet the 0.4-second reporting floor. |
+| [Settled chat-link parity across asynchronous stores](mirror-4059-b-chat-links-settle.md) | 3809 | Settling tests require lag to become in_flight, persistent differences to remain unclean, early clean exit, later/reappearing entries, both diff directions, bounded final sleep, configured poll cadence and CLI raw/default behavior. |
+| [Settled chat-link parity across asynchronous stores](mirror-4059-b-chat-links-settle.md) | 3810 | Unreadable samples neither clear nor confirm their board entries; last-read unreadability prevents clean; a difference first visible after unreadability is persistent until a readable absence clears it. |
+| [Kanban queue clocks, resume receipts and overlap intent](mirror-4059-b-kanban-intent-test-contracts.md) | 3811 | A moved marker next to one-sided enumeration returns None from both enumerated and own_distinct. |
+| [Worker admission and recovery test contracts](mirror-4059-b-worker-admission-and-recovery-tests.md) | 3812 | Hold/registry uncertainty keeps repairs open; live Board leases preserve owner work, expired target leases still wait, moved/imported/repinned targets resolve as appropriate; no-card repairs and racing claims stay open, and resolve exceptions do not stop detection. |
+| [Settled chat-link parity across asynchronous stores](mirror-4059-b-chat-links-settle.md) | 3813 | An owner’s only other carried card cannot hide this gateway’s missing ledger obligation, whether that other card belongs to a different gateway or profile; profile-board counts stay empty. |
+| [Desktop WebSocket dial limits follow slow-link mode](mirror-4059-b-desktop-slow-link-dial.md) | 3814 | The slow-link integration file drives the real tracker and shared client with fake sockets/timers: normal/local 15s versus remote slow 60s, 20s successful open, live/dead SSH strikes, answer reset, malformed inputs and IPC/drop-scope behavior. The dial file checks HermesGateway forwarding, typed timeout reporting, non-timeout preservation and absent bridge defaults. |
+| [Quiet lease preflight and canonical-home clocks](mirror-4059-b-quiet-lease-preflight.md) | 3815 | With an otherwise idle window, a drain/admission hold or unreadable hold exits preflight with no active lease, cooldown or spawned observer. |
+| [Lifecycle guard follows consecutive shell group closers](mirror-4059-b-lifecycle-glued-closers.md) | 3816 | Parameterized scan cases cover consecutive braces and mixed if/loop/case closers, nested output pipelines and Python stdin; clean later commands, quoted/data uses and unrelated redirects remain allowed. |
+| [Explicit handshakes in asynchronous regression fixtures](mirror-4059-b-async-test-handshakes.md) | 3817 | The dock fixture uses rc-free bash and still asserts the idle starting label, process block ordering, failure exit display, viewport width and retirement behavior. |
+| [Desktop resubmits after an explicit stale-runtime refusal](mirror-4059-b-desktop-stale-runtime-resubmit.md) | 3818 | Renderer roll fixtures require exactly one admitted identityless or identified turn after resume, retaining a supplied submission ID; ambiguous failures are not automatically resent and explicit stale-runtime retries remain safe. Sidecar tests pin exact pre-admission 4001 and capability rejection before handlers. |
+| [Home-state placement and shell spelling guards](mirror-4059-b-home-path-placement.md) | 3819 | Added hub-read-root controls keep home placement for split-dot traversal, split cd and CR/newline forms rather than incorrectly clearing the root marker. |
+| [Home-state placement and shell spelling guards](mirror-4059-b-home-path-placement.md) | 3820 | An escaped backslash before newline does not join commands and hide a later continued cd; the added control must still pin. |
+| [Explicit handshakes in asynchronous regression fixtures](mirror-4059-b-async-test-handshakes.md) | 3821 | The live-reader test requires a HEAD commit answer before reclaim, then still asserts reclaim refuses and index.lock remains while Git is working. |
+| [Loop accounting survives interrupted passes and thread churn](mirror-4059-b-loop-accounting-lifecycle.md) | 3822 | Tests require two lease runs/one error after a missing beat, nonnegative fork depth with later outer CPU counted, no reused-TID inheritance while exited CPU is retained, config-unavailable defaults/start survival and interval lookup outside the accounting lock. |
+| [PR-aware Kanban CI waits](mirror-4059-b-pr-ci-waits.md) | 3823 | Ambiguous distinct SHA hints still wake on current-head conflict; one old SHA treats a moved head as ok; parser rows distinguish repeated identical SHAs from multiple distinct candidates and explicit/ref precedence. |
+| [Cron rerun boundaries and expected-stop logging](mirror-4059-b-cron-reruns-and-stop-logging.md) | 3824 | Shutdown wins over a cancel marker with one no-traceback shutdown warning, no generic failure or requested-stop warnings, lifecycle-interrupt last_failure and no failure streak. |
+| [Cron rerun boundaries and expected-stop logging](mirror-4059-b-cron-reruns-and-stop-logging.md) | 3825 | Requested/shutdown prefixes still produce failed admission/results without an ERROR traceback; an unrelated error retains ERROR with exception info. |
+| [Worker admission and recovery test contracts](mirror-4059-b-worker-admission-and-recovery-tests.md) | 3826 | A set_workspace_path OSError prevents spawn/capacity use, restores ready/no claim/current run, ends the run as released and records infrastructure metadata without consecutive task failures. |
+| [Duplicate-completion idempotence and denial parsing](mirror-4059-b-duplicate-completion-idempotence.md) | 3827 | New denial phrases containing not as duplicate are excluded by the existing parser parameterization, while positive and other denial cases remain in the same suite. |
+| [Quota-wall fallback for resumed provider-native routes](mirror-4059-b-quota-wall-resumed-overrides.md) | 3828 | Sessionless build cases preserve the quota refusal and selected route without not-deferred warnings, including repeated calls. |
+| [Managed-stub relaunch attestation and read-only quiet check](mirror-4059-b-quiet-code-attestation.md) | 3829 | Real subprocess relaunch cases cover spaced interpreter/current stub, trace-only handoff env and strict refusal of altered flags/argv/root/prefix/body/literals. Launcher-event tests enforce one-shot exact frame/code. Quiet tests pin direct/relaunch agreement, missing ledger pending, cheap latched snapshots, read-only check with unchanged files/epoch, stale-window/refusal parity, unavailable gateway and usage rejection. Existing route/membership fixtures are adapted to provide the captured ledger. |
+| [Managed-stub relaunch attestation and read-only quiet check](mirror-4059-b-quiet-code-attestation.md) | 3830 | No test file changes in this mail; the only changed assertion surface is CI classifier membership for the shared launch template. Upgrade-lane execution is not established by this documentation pass. |
+| [Late session inventory and MCP reload reporting](mirror-4059-b-late-inventory-and-mcp-reload.md) | 3831 | A successful reload followed by session.info timeout prints success with unknown count, preserves unknown inventory and makes no false available-tools claim; reload.mcp timeout still prints failure and performs no count read. |
+| [Home-state placement and shell spelling guards](mirror-4059-b-home-path-placement.md) | 3832 | State-path home-form cases cover fd-redirected cd/pushd and Unicode text before the relative marker, asserting the queue class, normalized path and capability label. |
+| [Process-wide host change feed for subscribed loops](mirror-4059-b-host-change-feed.md) | 3833 | Feed tests cover first baseline, topic-specific/thread/async wakes, deadlines, coalescing, unknown probes, topic appearance/disappearance, stop/close, probe accounting, replica cursor-only keys, state external commits, default counter inventory and pytest singleton non-autostart. |
+| [Idle process-output tail backoff](mirror-4059-b-process-output-idle-backoff.md) | 3834 | Scripted empty reads require the 0.2/0.4/0.8/1.6/2.0 capped wait sequence; late output is ingested on the next poll and resets the wait; a real finish-event test joins the reader promptly. |
+| [Cron list memoizes normalized job records](mirror-4059-b-cron-list-memo.md) | 3835 | Repeated lists do not reparse, rename/add/delete and inode replacement refresh immediately, caller mutations cannot corrupt nested records, execution metadata stays live, profile stores isolate and memo hits increment accounting skips. |
+| [Credential-scoped web delta frame memo](mirror-4059-b-web-delta-frame-memo.md) | 3836 | ASGI polling fixtures decode deltas and require one encode for repeated unchanged requests, new encode on changed body, credential/base isolation, whole-body fallback after base eviction, byte/entry bounds including cached None and accounting skips. |
+| [Done replica cards remain pending until verified release](mirror-4059-b-done-pending-release.md) | 3837 | Replica link/parity tests keep done_pending_release counted and unfinished until release, including never-verifying cards; missing/statusless/archived rows remain unknown. Activity revision and remote-outcome tests keep observing the release transition. |
+| [Done replica cards remain pending until verified release](mirror-4059-b-done-pending-release.md) | 3838 | The closed-card/profile reader expects done_pending_release with released=False for the unreleased done row while retaining profile filtering and released/archived controls. |
+| [Scratch archive, retry and empty-tree safety guards](mirror-4059-b-scratch-archive-and-tree-guards.md) | 3839 | A silent failing for-each-ref subprocess still returns the unpushed-commits fail-safe, even when both output streams are empty. |
+| [Retire host loops before a replaced backend finishes draining](mirror-4059-c-host-loop-retirement.md) | 3840 | superseded/stale backend: release host-loop leases at once, start no new wakes |
+| [Lifecycle guard: shell groups, cat relays and numeric substitutions](mirror-4059-c-lifecycle-shell-dataflow.md) | 3841 | lifecycle guard tests: a closed group's redirection ends at the next operator |
+| [Lifecycle guard: shell groups, cat relays and numeric substitutions](mirror-4059-c-lifecycle-shell-dataflow.md) | 3842 | lifecycle guard: a bare `cat` relays its stdin feed; a subshell's redirection keeps its output |
+| [Lifecycle guard: shell groups, cat relays and numeric substitutions](mirror-4059-c-lifecycle-shell-dataflow.md) | 3843 | lifecycle guard: move _split_logical_lines to cron/lifecycle_guard_lines.py (FILE_LINES offset) |
+| [Requeue proven owner persistence failures without spending the card budget](mirror-4059-c-owner-persistence-requeue.md) | 3844 | Requeue a mid-turn unreachable-owner persistence failure without charging the card |
+| [Session-scoped inventory waits and reply publication ordering](mirror-4059-c-session-inventory.md) | 3845 | classic CLI: a pending-inventory wait never prints a left session's startup notices |
+| [Lifecycle guard: shell groups, cat relays and numeric substitutions](mirror-4059-c-lifecycle-shell-dataflow.md) | 3846 | lifecycle guard: `$(( $(date +%s) ... ))` is no shell sink |
+| [Compaction anchors only intent whose turn is still live](mirror-4059-c-compaction-live-intent.md) | 3847 | fix(compression): never anchor a request whose turn already ended |
+| [Kanban live rebuilds preserve concurrent writes and cold-start at the feed head](mirror-4059-c-sync-live-rebuild.md) | 3848 | kanban sync: the live resync sweep spares rows whose outbox op existed when the rebuild began |
+| [Kanban live rebuilds preserve concurrent writes and cold-start at the feed head](mirror-4059-c-sync-live-rebuild.md) | 3849 | kanban sync: the live resync sweep bounds task_links to links present when the rebuild began |
+| [Kanban live rebuilds preserve concurrent writes and cold-start at the feed head](mirror-4059-c-sync-live-rebuild.md) | 3850 | kanban sync: the live resync sweep spares a link whose child card's links changed during the rebuild |
+| [Kanban live rebuilds preserve concurrent writes and cold-start at the feed head](mirror-4059-c-sync-live-rebuild.md) | 3851 | kanban sync: the 410 sweep test backdates its rows before the rebuild |
+| [Skip unchanged notifier boards without suppressing recovery](mirror-4059-c-notifier-board-gate.md) | 3852 | kanban notifier: skip an unchanged board's collect pass on a full recovery key (H1) |
+| [Skip unchanged notifier boards without suppressing recovery](mirror-4059-c-notifier-board-gate.md) | 3853 | kanban notifier gate: a probe RuntimeError falls back to the writable open |
+| [Portable worktree requirements and home-relative placement boundaries](mirror-4059-c-workspace-and-home-placement.md) | 3854 | kanban workspace_source: a portable worktree card's stored host_repo no longer blocks its move or pickup |
+| [Independent exact-head review for fork-authored upstream syncs](mirror-4059-c-upstream-sync-review.md) | 3855 | upstream sync gate: require an independent exact-head review for a fork-authored sync |
+| [Reuse background read handles with generation-safe retirement](mirror-4059-c-kept-readers.md) | 3856 | kanban/state.db: kept read connections for background readers (card I) |
+| [Scheduled macOS test lane yields to waiting runner work](mirror-4059-c-macos-scheduled-tests.md) | 3857 | ci: scheduled macOS OS-marked test lane on a self-hosted macOS runner (non-required) |
+| [Quiet admission preflight and fail-closed dispatch test pins](mirror-4059-c-quiet-preflight.md) | 3858 | test(quiet): pin literal hold fields + non-dataclass fail-closed in all_quiet_deferred |
+| [Scratch archiving, Board custody discovery and explicit preservation pins](mirror-4059-c-scratch-archive-custody.md) | 3859 | scratch archive: archive the shapes it refused forever (promisor tags, bare repos, linked worktrees, fifos) |
+| [Earlier-run overlap and precise duplicate-language recognition](mirror-4059-c-overlap-and-duplicate-tests.md) | 3860 | kanban overlap: the key-family exemption covers a creator's own cards only from its current run |
+| [Quiet admission preflight and fail-closed dispatch test pins](mirror-4059-c-quiet-preflight.md) | 3861 | quiet preflight parity test: a host-file update hold refuses like start (pin #2591 M2c) |
+| [Portable worktree requirements and home-relative placement boundaries](mirror-4059-c-workspace-and-home-placement.md) | 3862 | test: pin canonical_home tilde expansion and relative bytes spelling |
+| [Profile-specific state topics and race-safe subscription seeding](mirror-4059-c-profile-state-change-feed.md) | 3863 | host_change_feed: resolve the state topic per subscriber profile; detach the probe thread |
+| [Links-diff raw reads and unreadable-board settling](mirror-4059-c-links-diff-tests.md) | 3864 | profile-board links-diff test: settle=0 so the CLI read is one raw read, not a 90 s real-clock window |
+| [PR conflict detection tests exercise either GitHub conflict field](mirror-4059-c-pr-conflict-tests.md) | 3865 | test: pin each half of the PR conflict check in kanban_ci_progress |
+| [Earlier-run overlap and precise duplicate-language recognition](mirror-4059-c-overlap-and-duplicate-tests.md) | 3866 | test: dup-detector body occurrence match needs the leading newline and the trailing space |
+| [Quiet admission preflight and fail-closed dispatch test pins](mirror-4059-c-quiet-preflight.md) | 3867 | quiet-hold: ask quiet-observe-check before taking the claim-quiet lease |
+| [Portable worktree requirements and home-relative placement boundaries](mirror-4059-c-workspace-and-home-placement.md) | 3868 | test(kanban): pin case-insensitive relative .HERMES/ hit naming in _state_path |
+| [Cron delivery test synchronization and racy queue stamps](mirror-4059-c-cron-delivery-watch.md) | 3869 | deflake cron delivery tests: wait for the loop thread to be running before delivering |
+| [Cron delivery test synchronization and racy queue stamps](mirror-4059-c-cron-delivery-watch.md) | 3870 | queue watch: distrust a stamp seen within its mtime granule (deflake settle test) |
+| [Pending notices share a boundary turn without crossing category or human input](mirror-4059-c-pending-notice-turns.md) | 3871 | fix(gateway): pending notices ride the turn that starts at a boundary |
+| [Pending notices share a boundary turn without crossing category or human input](mirror-4059-c-pending-notice-turns.md) | 3872 | test(gateway): released notifier wakes ride one turn after a core drain |
+| [Pending notices share a boundary turn without crossing category or human input](mirror-4059-c-pending-notice-turns.md) | 3873 | fix(gateway): fold only the head's notice category; a fold error never fails the head |
+| [Lifecycle guard: shell groups, cat relays and numeric substitutions](mirror-4059-c-lifecycle-shell-dataflow.md) | 3874 | lifecycle guard tests: pin `--`/lone `-` option end and the rcfile-scan bound at a clustered -c payload |
+| [Walled Desktop route refusal test pins provider ownership and logs](mirror-4059-c-walled-provider-tests.md) | 3875 | test: Desktop wall guard refuses a known other provider's endpoint and logs the refusal reason |
+| [Loop accounting atomic snapshots and CPU attribution tests](mirror-4059-c-loop-accounting-tests.md) | 3876 | test(loop_accounting): pin atomic write, live-pid prune, writer prune, stop flush, record(), procfs CPU fields |
+| [Kanban live rebuilds preserve concurrent writes and cold-start at the feed head](mirror-4059-c-sync-live-rebuild.md) | 3877 | kanban sync: a cold primary live file rebuilds from a snapshot; the failed-result observer reads the board's sync mode |
+| [Kanban live rebuilds preserve concurrent writes and cold-start at the feed head](mirror-4059-c-sync-live-rebuild.md) | 3878 | kanban sync: a cold live rebuild peeks the first page instead of applying it |
+| [Pending notices share a boundary turn without crossing category or human input](mirror-4059-c-pending-notice-turns.md) | 3879 | deflake resume live-text snapshot: a late session.info may follow the snapshot |
+| [Session-scoped inventory waits and reply publication ordering](mirror-4059-c-session-inventory.md) | 3880 | test: pin the inventory print-once lock and shared-build hold release |
+| [Portable worktree requirements and home-relative placement boundaries](mirror-4059-c-workspace-and-home-placement.md) | 3881 | placement: home-relative span ends only at a cd of this shell; cd ~/.hermes && cd hermes-agent is the code tree |
+| [Normalize crash errors before the fingerprint width limit](mirror-4059-c-crash-fingerprint.md) | 3882 | Fingerprint crash errors after PID normalization, not before the 80-char cut |
+| [Earlier-run overlap and precise duplicate-language recognition](mirror-4059-c-overlap-and-duplicate-tests.md) | 3883 | kanban overlap tests: pin dotted re-issue counters, "tries", every join word and judging verb |
+| [Scheduled macOS test lane yields to waiting runner work](mirror-4059-c-macos-scheduled-tests.md) | 3884 | macos_os_tests_gate: read every page of open runs before deciding |
+| [Background process output excludes the login-shell startup banner](mirror-4059-c-background-start-marker.md) | 3885 | background jobs: drop the login shell's rc output before the command (start marker) |
+| [Revision-gated reclaim sub-sweeps keep clocks and process death live](mirror-4059-c-dispatcher-reclaim-gates.md) | 3886 | kanban dispatcher: gate reclaim sub-sweeps on the content revision or a data-derived due time (G2) |
+| [Revision-gated reclaim sub-sweeps keep clocks and process death live](mirror-4059-c-dispatcher-reclaim-gates.md) | 3887 | kanban db: skip task_runs partial indexes until a legacy TEXT-PK table is rebuilt (G2) |
+| [Revision-gated reclaim sub-sweeps keep clocks and process death live](mirror-4059-c-dispatcher-reclaim-gates.md) | 3888 | kanban release_on_feed: pin the four guards that survived removal (#2573 test gap) |
+| [Links-diff raw reads and unreadable-board settling](mirror-4059-c-links-diff-tests.md) | 3889 | test(kanban): pin settle's "at least one read could read the board" rule |
+| [Desktop read sharing isolates native grants and invalidates on WS writes](mirror-4059-c-desktop-native-read-sharing.md) | 3890 | Desktop read sharing: key on the native grant; WS-RPC session writes start a new generation |
+| [Scratch archiving, Board custody discovery and explicit preservation pins](mirror-4059-c-scratch-archive-custody.md) | 3891 | fix(kanban): close scratch custody gaps (archived rows, Board-claim receipts, preserve list) |
+| [Scratch archiving, Board custody discovery and explicit preservation pins](mirror-4059-c-scratch-archive-custody.md) | 3892 | fix(kanban): scratch preserve pin also guards detached-trash sweep; non-mapping kanban section fails closed |
+| [Profile-specific state topics and race-safe subscription seeding](mirror-4059-c-profile-state-change-feed.md) | 3893 | host_change_feed: keep a state seed subscribed during an in-flight probe |
+| [Requeue proven owner persistence failures without spending the card budget](mirror-4059-c-owner-persistence-requeue.md) | 3894 | Requeue an exhausted-resend owner stall (worker_receipt_timeout / owner_link_closed) without charging the card |
+| [Independent exact-head review for fork-authored upstream syncs](mirror-4059-c-upstream-sync-review.md) | 3895 | upstream sync gate: trust only the real upstream, refuse ship-tool faults, drop HERMES_UPSTREAM_SYNC_IMPL_TASK |
+| [Checkpoint restart waits, pause bounds, and replay retirement](mirror-4059-d-restart-replay.md) | 3896 | Adds the short checkpoint settle for managed-only update waits. |
+| [Checkpoint restart waits, pause bounds, and replay retirement](mirror-4059-d-restart-replay.md) | 3897 | Restricts the short wait to unfenced boolean checkpoint/cron-cut intents. |
+| [Checkpoint restart waits, pause bounds, and replay retirement](mirror-4059-d-restart-replay.md) | 3898 | Pins TUI pause freshness and malformed configuration bounds. |
+| [Shell-aware home-path placement regression coverage](mirror-4059-d-placement.md) | 3899 | Rejects false cd-home matches with operands after redirections. |
+| [Checkpoint restart waits, pause bounds, and replay retirement](mirror-4059-d-restart-replay.md) | 3900 | Keeps quota reset timing on code skew without host-loop retirement. |
+| [Change-proportional cron execution list reads](mirror-4059-d-cron-execution-reader.md) | 3901 | Memoizes cron execution list rows on a kept reader data version. |
+| [Off-loop boot recovery and CLI session-switch ordering](mirror-4059-d-gateway-boot-cli.md) | 3902 | Moves boot owner lookup off-loop and batches stale-route end reasons. |
+| [Kept-reader eviction and stale-generation tests](mirror-4059-d-kept-readers.md) | 3903 | Explicitly closes cap-evicted kept readers without closing borrowers early. |
+| [Off-loop boot recovery and CLI session-switch ordering](mirror-4059-d-gateway-boot-cli.md) | 3904 | Publishes CLI current session before switch listeners. |
+| [Lifecycle guard redirections and arithmetic shell sinks](mirror-4059-d-lifecycle-shell.md) | 3905 | Pins closed-group output reset across shell operators. |
+| [Lifecycle guard redirections and arithmetic shell sinks](mirror-4059-d-lifecycle-shell.md) | 3906 | Preserves variable/numeric descriptor redirections in lifecycle scanning. |
+| [Kanban notifier, overlap, sync, and refusal regression contracts](mirror-4059-d-kanban-sync-gates.md) | 3907 | Pins conservative notifier keys and TUI pending-kind filtering. |
+| [Desktop submit refusal guards and slow-link connect wiring](mirror-4059-d-desktop-refusal-link.md) | 3908 | Pins gateway error class/code guards against ambiguous submit resend. |
+| [Shell-aware home-path placement regression coverage](mirror-4059-d-placement.md) | 3909 | Pins placement descriptor digits, path offsets, and independent spans. |
+| [Kanban notifier, overlap, sync, and refusal regression contracts](mirror-4059-d-kanban-sync-gates.md) | 3910 | Pins same-family overlap creator and unknown-time exemptions. |
+| [Per-task Kanban change cursors on boards and shadows](mirror-4059-d-task-change-cursor.md) | 3911 | Adds per-task indexed change cursors with conservative full-read fallback. |
+| [Per-task Kanban change cursors on boards and shadows](mirror-4059-d-task-change-cursor.md) | 3912 | Uses conflict-policy-safe UPSERT for task-change marks. |
+| [Per-task Kanban change cursors on boards and shadows](mirror-4059-d-task-change-cursor.md) | 3913 | Creates task-change tables with rowid for generic snapshots. |
+| [Desktop submit refusal guards and slow-link connect wiring](mirror-4059-d-desktop-refusal-link.md) | 3914 | Requires tunnel liveness registration and tests main/preload connect wiring. |
+| [Exact-head upstream review discovery and CI gate boundary tests](mirror-4059-d-upstream-review-ci.md) | 3915 | Pins bounded gh reads and fail-open scheduled test selection. |
+| [Kanban notifier, overlap, sync, and refusal regression contracts](mirror-4059-d-kanban-sync-gates.md) | 3916 | Pins resync held-card protection and initial link sweep bounds. |
+| [Kanban notifier, overlap, sync, and refusal regression contracts](mirror-4059-d-kanban-sync-gates.md) | 3917 | Pins stop prefixes, ambiguous PR SHA hints, and negated duplicates. |
+| [Delivery queue timestamp race settling](mirror-4059-d-delivery-watch.md) | 3918 | Settles future delivery timestamps after a first-sight recheck. |
+| [Shell-aware home-path placement regression coverage](mirror-4059-d-placement.md) | 3919 | Pins backslash-CR as distinct from shell line continuation. |
+| [Shell-aware home-path placement regression coverage](mirror-4059-d-placement.md) | 3920 | Pins uppercase CD prose and all home-relative pool artifact hits. |
+| [Off-loop boot recovery and CLI session-switch ordering](mirror-4059-d-gateway-boot-cli.md) | 3921 | Waits for completed SIGUSR2 diagnostics before child shutdown. |
+| [Lifecycle guard redirections and arithmetic shell sinks](mirror-4059-d-lifecycle-shell.md) | 3922 | Detects substitution output anywhere inside arithmetic shell contexts. |
+| [Host change-feed contracts and producer-admission/PID read gates](mirror-4059-d-change-feed-admission.md) | 3923 | Pins change-feed topic, waiter, UNKNOWN, and thread contracts. |
+| [Host change-feed contracts and producer-admission/PID read gates](mirror-4059-d-change-feed-admission.md) | 3924 | Pins independent state-probe failure handling and passive threads. |
+| [Quiet admission and relaunch attestation boundary tests](mirror-4059-d-quiet-attestation.md) | 3925 | Pins quiet code-ledger and relaunch-prefix attestation refusals. |
+| [Exact-head upstream review discovery and CI gate boundary tests](mirror-4059-d-upstream-review-ci.md) | 3926 | Models trusted upstream identity in local updater fixtures. |
+| [Scratch archive shape and custody regression tests](mirror-4059-d-scratch-archive.md) | 3927 | Pins archive Git-shape, source-index, and external-history boundaries. |
+| [Shared account tool-store borrowing for fake-home runners](mirror-4059-d-account-tool-store.md) | 3928 | Shares account tool-store borrowing across fake-home shell runners. |
+| [Kanban notifier, overlap, sync, and refusal regression contracts](mirror-4059-d-kanban-sync-gates.md) | 3929 | Reads only complete records from the live sync timing log fixture. |
+| [Host change-feed contracts and producer-admission/PID read gates](mirror-4059-d-change-feed-admission.md) | 3930 | Gates producer-admission reads and memoizes profile PID probes. |
+| [Host change-feed contracts and producer-admission/PID read gates](mirror-4059-d-change-feed-admission.md) | 3931 | Releases observers on lifecycle changes and fences remembered keys. |
+| [Kanban notifier, overlap, sync, and refusal regression contracts](mirror-4059-d-kanban-sync-gates.md) | 3932 | Pins bound legacy/modern midrun owner-refusal receipt proof. |
+| [Exact-head upstream review discovery and CI gate boundary tests](mirror-4059-d-upstream-review-ci.md) | 3933 | Pins the final supported CI queue page before saturation decisions. |
+| [Checkpoint restart waits, pause bounds, and replay retirement](mirror-4059-d-restart-replay.md) | 3934 | Pins host-loop retirement races and repeated skew confirmation. |
+| [Lifecycle guard redirections and arithmetic shell sinks](mirror-4059-d-lifecycle-shell.md) | 3935 | Pins date rebindings that disable the numeric-producer exemption. |
+| [Process output, compression anchors, and memo regression tests](mirror-4059-d-test-harness-memos.md) | 3936 | Pins compression anchor copies without source-request mutation. |
+| [Delivery queue timestamp race settling](mirror-4059-d-delivery-watch.md) | 3937 | Pins newest queue mtime selection and inclusive granule boundaries. |
+| [Process output, compression anchors, and memo regression tests](mirror-4059-d-test-harness-memos.md) | 3938 | Pins split process start markers across hold-buffer overflow. |
+| [Exact-head upstream review discovery and CI gate boundary tests](mirror-4059-d-upstream-review-ci.md) | 3939 | Pins octopus and unparsed remerge output as review-required. |
+| [Process output, compression anchors, and memo regression tests](mirror-4059-d-test-harness-memos.md) | 3940 | Pins idle-finish wakeups and jobs/delta-frame memo boundaries. |
+| [Process output, compression anchors, and memo regression tests](mirror-4059-d-test-harness-memos.md) | 3941 | Synchronizes idle-finish regression with actual wait entry. |
+| [Quiet admission and relaunch attestation boundary tests](mirror-4059-d-quiet-attestation.md) | 3942 | Pins inconsistent quiet admission and unavailable preflight behavior. |
+| [Pending-fold admission custody boundary tests](mirror-4059-d-pending-fold.md) | 3943 | Pins pending-fold custody, replay idempotency, and generation fences. |
+| [Kanban notifier, overlap, sync, and refusal regression contracts](mirror-4059-d-kanban-sync-gates.md) | 3944 | Pins completed sweep-key failure invalidation and unreadable due reads. |
+| [Kanban notifier, overlap, sync, and refusal regression contracts](mirror-4059-d-kanban-sync-gates.md) | 3945 | Pins cold rebuild repair despite an earlier completed repair window. |
+| [Persistent delta bases and fenced Desktop cache writes](mirror-4059-d-delta-persistence.md) | 3946 | Persists scoped delta bases across client/backend restarts. |
+| [Persistent delta bases and fenced Desktop cache writes](mirror-4059-d-delta-persistence.md) | 3947 | Retains hot disk bases without rewriting unchanged polled copies. |
+| [Persistent delta bases and fenced Desktop cache writes](mirror-4059-d-delta-persistence.md) | 3948 | Fences async delta-base publication against delete, replacement, and quit. |
+| [Kept-reader eviction and stale-generation tests](mirror-4059-d-kept-readers.md) | 3949 | Pins kept-reader stale generations, transactions, and shutdown. |
+| [Exact-head upstream review discovery and CI gate boundary tests](mirror-4059-d-upstream-review-ci.md) | 3950 | Discovers exact-head off-key review candidates without granting approval. |
+| [Exact-head upstream review discovery and CI gate boundary tests](mirror-4059-d-upstream-review-ci.md) | 3951 | Preserves terminal rejection across every off-key review candidate. |
+| [Worker receipt retry boundaries](mirror-4059-e-receipt-retry.md) | 3952 | Test sent-only 1011 receipt recovery and owner-fault latch |
+| [Desktop write invalidation across preload and IPC](mirror-4059-e-desktop-write-bridge.md) | 3953 | Exercise Desktop write invalidation across preload and IPC |
+| [Profile-isolated boot recovery contracts](mirror-4059-e-boot-recovery.md) | 3954 | test boot recovery route filtering and batched profile isolation |
+| [Quiet-board claim and provider-blocker clocks](mirror-4059-e-blocker-clock-boundaries.md) | 3955 | test quiet local claims and blocker lookback scope expiry |
+| [Update checkpoint intent reread contracts](mirror-4059-e-checkpoint-intent.md) | 3956 | test(gateway): pin checkpoint intent type and reread semantics |
+| [PID memo bounds and producer-sweeper cleanup](mirror-4059-e-pid-and-sweeper-lifecycle.md) | 3957 | Test PID memo retention and sweeper shutdown cleanup |
+| [Fork-safe nested loop CPU accounting](mirror-4059-e-fork-loop-accounting.md) | 3958 | loop_accounting: pin the exited-tid fold paths; a fork child books pre-fork passes from the fork, not negative CPU |
+| [Fork-safe nested loop CPU accounting](mirror-4059-e-fork-loop-accounting.md) | 3959 | fix(loop-accounting): preserve inherited nesting after fork |
+| [Retirement-reader failures retain replay reset deadlines](mirror-4059-e-retirement-reader.md) | 3960 | Pin replay reset preservation on retirement reader failure |
+| [Kanban change cursor identity and REPLACE contract](mirror-4059-e-task-change-cursor.md) | 3961 | test cursor invalidation on shm identity change |
+| [Cron execution-reader and restart-safe claim liveness](mirror-4059-e-cron-claim-and-readers.md) | 3962 | test(cron): pin populated execution reader contracts |
+| [Cron execution-reader and restart-safe claim liveness](mirror-4059-e-cron-claim-and-readers.md) | 3963 | fix(cron): a restart-safe worker still running a fire keeps its claim live after the claiming gateway exits |
+| [Resync link preservation at the inclusive boundary](mirror-4059-e-resync-link-boundary.md) | 3964 | resync sweep: document link preservation trade and pin inclusive boundary |
+| [Upstream review selection, approval guards and blob recovery](mirror-4059-e-upstream-review.md) | 3965 | Select updater integration consumers for copied upstream gate changes |
+| [Per-build provider-pool and auth-store memo](mirror-4059-e-picker-build-memo.md) | 3966 | model.options: one pool and auth-store read per provider per picker build (card J rpc_dispatch) |
+| [Per-build provider-pool and auth-store memo](mirror-4059-e-picker-build-memo.md) | 3967 | fix(picker): retain auth loader fallback when version stat fails |
+| [Direct activation borrowing controls](mirror-4059-e-activation-borrowing.md) | 3968 | test(activation): cover direct borrowing overrides and stderr |
+| [Review workspace archival does not reopen dependency history](mirror-4059-e-review-workspace-archive.md) | 3969 | Ignore review workspace archival in dependency continuation history |
+| [Enabled-credential walls and pre-reference routing owner](mirror-4059-e-routing-disabled-and-owner.md) | 3970 | Exclude disabled credentials from quota and auth-wall classification |
+| [Home-state placement with shell redirects](mirror-4059-e-home-redirect-placement.md) | 3971 | test(placement): pin single-quoted redirect targets |
+| [Folded notices settle once across checkpoints and preserve notes](mirror-4059-e-folded-notices.md) | 3972 | fold-pending: a turn paused for an update settles its folded notices; resume no longer re-delivers them |
+| [Kanban change cursor identity and REPLACE contract](mirror-4059-e-task-change-cursor.md) | 3973 | test(kanban): reject in-memory change cursors |
+| [Commit-keyed watcher stores and subscription signatures](mirror-4059-e-watch-store-gates.md) | 3974 | tui_gateway: watch signatures and the kanban poll read only on change (card J part 2) |
+| [Commit-keyed watcher stores and subscription signatures](mirror-4059-e-watch-store-gates.md) | 3975 | tui_gateway.watch_store: release on close_all_under and on a new WAL generation (card J part 2) |
+| [Commit-keyed watcher stores and subscription signatures](mirror-4059-e-watch-store-gates.md) | 3976 | fix(watcher): keep released stores transient until an owner returns |
+| [Upstream review selection, approval guards and blob recovery](mirror-4059-e-upstream-review.md) | 3977 | test(ci): cover upstream identity and ship import failures |
+| [Upstream review selection, approval guards and blob recovery](mirror-4059-e-upstream-review.md) | 3978 | fix(ci): guard every approving review receipt |
+| [Claim release compares lock and worker independently](mirror-4059-e-claim-cas.md) | 3979 | Test release claim CAS fields independently |
+| [Race-free Chrome startup in real-profile login tests](mirror-4059-e-chrome-start-fixture.md) | 3980 | deflake real-profile login live tests: read Chrome's CDP port from DevToolsActivePort, 120 s start deadline |
+| [Workspace source custody and sibling materialization](mirror-4059-e-source-materialization.md) | 3981 | Fix workspace source event custody and isolate materialized trees |
+| [Bounded queue pagination and confirmation scans](mirror-4059-e-ci-queue-pagination.md) | 3982 | confirm mini queue scans and continue short nonterminal pages |
+| [Kanban change cursor identity and REPLACE contract](mirror-4059-e-task-change-cursor.md) | 3983 | Document cross-task REPLACE cursor precondition |
+| [Submitter records witnessed owner-restart exit](mirror-4059-e-outer-restart-receipt.md) | 3984 | Kanban submitter books its own exit 76 when no owner can |
+| [Origin-scoped replica projection reuse](mirror-4059-e-replica-profile-states.md) | 3985 | Keep replica projections per origin scope and share slim decoded stages |
+| [Origin-scoped replica projection reuse](mirror-4059-e-replica-profile-states.md) | 3986 | Exercise replica scope cache reset and cross-origin controls |
+| [Home-state placement with shell redirects](mirror-4059-e-home-redirect-placement.md) | 3987 | placement: recognize home redirects and redirected code-tree transitions |
+| [Quiet-board claim and provider-blocker clocks](mirror-4059-e-blocker-clock-boundaries.md) | 3988 | kanban blocker probe lane: recheck routes of an open provider-scoped blocker on a 300 s cadence (G2 follow-up) |
+| [Enabled-credential walls and pre-reference routing owner](mirror-4059-e-routing-disabled-and-owner.md) | 3989 | fix(gateway): bind routing owner before reference expansion |
+| [Upstream review selection, approval guards and blob recovery](mirror-4059-e-upstream-review.md) | 3990 | Recover refused partial-clone blobs for upstream classification |
+| [Upstream review selection, approval guards and blob recovery](mirror-4059-e-upstream-review.md) | 3991 | Adapt unparsed remerge fixture to blob recovery Git seam |
+| [Transactional per-session change cursor](mirror-4059-e-session-change-cursor.md) | 3992 | state.db: per-session change cursor (session_change + triggers) |
+| [Loop-command traceback diagnostics survive capture](mirror-4059-e-loop-hang-diagnostics.md) | 3993 | tests: capture blocked stacks in loop command CI hang |
+| [Loop-command traceback diagnostics survive capture](mirror-4059-e-loop-hang-diagnostics.md) | 3994 | tests: preserve hang diagnostics across pytest capture |
+| [Fork-safe nested loop CPU accounting](mirror-4059-e-fork-loop-accounting.md) | 3995 | Test nonzero fork clock baselines for inherited passes |
+| [Fork-safe nested loop CPU accounting](mirror-4059-e-fork-loop-accounting.md) | 3996 | test(loop-accounting): exercise nonzero baselines through real fork |
+| [Quiet dispatcher capability, supervisor and wake deadlines](mirror-4059-e-dispatcher-due-gates.md) | 3997 | Memoize capability refresh deadlines on quiet dispatcher ticks |
+| [Quiet dispatcher capability, supervisor and wake deadlines](mirror-4059-e-dispatcher-due-gates.md) | 3998 | Gate idle local supervisor drains while retaining external polling |
+| [Quiet dispatcher capability, supervisor and wake deadlines](mirror-4059-e-dispatcher-due-gates.md) | 3999 | Defer wake probe selection and policy reads until indexed due time |
+| [Quiet dispatcher capability, supervisor and wake deadlines](mirror-4059-e-dispatcher-due-gates.md) | 4000 | Preserve refresh invalidation and incoming error isolation; correct drain replay |
+| [Quiet dispatcher capability, supervisor and wake deadlines](mirror-4059-e-dispatcher-due-gates.md) | 4001 | Index wake-check deadlines for idle due probes |
+| [Quiet dispatcher capability, supervisor and wake deadlines](mirror-4059-e-dispatcher-due-gates.md) | 4002 | Keep schema index addition within facade line budget |
+| [Folded notices settle once across checkpoints and preserve notes](mirror-4059-e-folded-notices.md) | 4003 | preserve completion notes when folding pending turns |
+| [Causal loss receipts after worker rebind](mirror-4059-e-rebound-worker-loss.md) | 4004 | Witness rebound worker loss in modern failure recovery |
+| [Isolated seeds for fake Board release matrices](mirror-4059-e-release-matrix-seeds.md) | 4005 | Reuse isolated Board seeds for fake release matrices |
+| [Sweep idle handles for removed Kanban boards](mirror-4059-e-removed-board-handles.md) | 4006 | kanban: close kept board handles once the board file is removed |
+| [Bounded queue pagination and confirmation scans](mirror-4059-e-ci-queue-pagination.md) | 4007 | test(ci): pin short-page total-count equality boundary |
+| [Replica shared-stage lifecycle](mirror-4059-f-replica-stage-lifecycle.md) | 4008 | Pin replica shared-stage cleanup and malformed-row reuse |
+| [Quiet extension reporting and measurement custody](mirror-4059-f-quiet-extension-observation.md) | 4009 | report unattested extension code in quiet observations |
+| [Quiet extension reporting and measurement custody](mirror-4059-f-quiet-extension-observation.md) | 4010 | preserve admitted batch horizon as quiet lease elapses |
+| [Quiet extension reporting and measurement custody](mirror-4059-f-quiet-extension-observation.md) | 4011 | fix(quiet): keep unresolved native loader provenance blocking |
+| [Restart receipts and child-policy test isolation](mirror-4059-f-restart-receipt-tests.md) | 4012 | Test submitter restart receipt fences independently |
+| [Restart receipts and child-policy test isolation](mirror-4059-f-restart-receipt-tests.md) | 4013 | isolate restart-survival child account policy |
+| [Upstream-sync evidence and fetch replay tests](mirror-4059-f-upstream-sync-evidence-tests.md) | 4014 | test(ci): pin off-key receipt full SHA validation |
+| [Nested-shell alias scopes in lifecycle scanning](mirror-4059-f-nested-shell-scan.md) | 4015 | lifecycle guard: walk a nested startup-file shell's input with unknown alias names (PR #2358 review 5894325109 nit 1) |
+| [Nested-shell alias scopes in lifecycle scanning](mirror-4059-f-nested-shell-scan.md) | 4016 | lifecycle guard: key visited scripts by walk scope (PR #2560 review 5897863903 B1) |
+| [SQLite observer restore and install-epoch boundaries](mirror-4059-f-sqlite-observer-tests.md) | 4017 | Deflake same-inode SQLite restore timestamp fixture |
+| [Creator-scoped cross-gateway scratch archive](mirror-4059-f-creator-archive.md) | 4018 | fix(kanban): route creator scratch cleanup to the home gateway |
+| [Creator-scoped cross-gateway scratch archive](mirror-4059-f-creator-archive.md) | 4019 | test(kanban): exercise creator cleanup authorization and races |
+| [Creator-scoped cross-gateway scratch archive](mirror-4059-f-creator-archive.md) | 4020 | test(kanban): isolate creator cleanup predicate boundaries |
+| [Exact incremental Kanban dashboard reads](mirror-4059-f-dashboard-incremental.md) | 4021 | WIP incremental dashboard P2 reads and bookkeeping overlay |
+| [Exact incremental Kanban dashboard reads](mirror-4059-f-dashboard-incremental.md) | 4022 | Refresh only changed dashboard neighbours and preserve exact GET tests |
+| [Exact incremental Kanban dashboard reads](mirror-4059-f-dashboard-incremental.md) | 4023 | Register intended incremental dashboard core boundaries |
+| [Bash printf output-sink reconstruction](mirror-4059-f-printf-sink-scan.md) | 4024 | lifecycle guard: printf `*` width/precision, `%.Ns` truncation, `%b` escapes and `-v NAME` no longer hide the printed command |
+| [Bash printf output-sink reconstruction](mirror-4059-f-printf-sink-scan.md) | 4025 | lifecycle guard printf: C-exact numbers, long-double models, output cap, whole-argument walk kept |
+| [Bash printf output-sink reconstruction](mirror-4059-f-printf-sink-scan.md) | 4026 | lifecycle guard printf: saturate >4300-digit numbers instead of aborting the walk |
+| [Bash printf output-sink reconstruction](mirror-4059-f-printf-sink-scan.md) | 4027 | printf guard: preserve conversions after unknown format escapes |
+| [Credential singleton read and home-path fast paths](mirror-4059-f-picker-path-allocation.md) | 4028 | perf(picker): remove redundant singleton reads and home path allocation |
+| [Credential singleton read and home-path fast paths](mirror-4059-f-picker-path-allocation.md) | 4029 | test(picker): guard new home tests against unittest discovery |
+| [Independent local and relayed credential disable policy](mirror-4059-f-relay-disable-policy.md) | 4030 | Preserve independent local and relay credential disable policy |
+| [Independent local and relayed credential disable policy](mirror-4059-f-relay-disable-policy.md) | 4031 | Report remaining relay policy after local auth enable |
+| [Independent local and relayed credential disable policy](mirror-4059-f-relay-disable-policy.md) | 4032 | Cover relay reporting ownership scope and unreadable roots |
+| [Authoritative account-board worker census](mirror-4059-f-worker-board-inventory.md) | 4033 | fix(worker): bound real inventory to account board roots |
+| [Authoritative account-board worker census](mirror-4059-f-worker-board-inventory.md) | 4034 | fix(worker): use authoritative account boards for slot census |
+| [Authoritative account-board worker census](mirror-4059-f-worker-board-inventory.md) | 4035 | fix(worker): preserve unknown profile discovery errors |
+| [Session checkpoint, thread handoff and reply-delivery tests](mirror-4059-f-session-delivery-regressions.md) | 4036 | Cover folded checkpoint history boundaries and pending publication |
+| [Session checkpoint, thread handoff and reply-delivery tests](mirror-4059-f-session-delivery-regressions.md) | 4037 | Wait for prompt worker startup before joining rewind turns |
+| [Upstream-sync evidence and fetch replay tests](mirror-4059-f-upstream-sync-evidence-tests.md) | 4038 | Test first approving receipt in upstream sync success detail |
+| [Successor-aware durable notice retry deadlines](mirror-4059-f-notice-successor-retry.md) | 4039 | let successor code re-evaluate durable wall retries |
+| [Successor-aware durable notice retry deadlines](mirror-4059-f-notice-successor-retry.md) | 4040 | fix(notices): preserve reset budget across successor rechecks |
+| [Arithmetic sink scanning across quotes and heredocs](mirror-4059-f-arithmetic-heredoc-scan.md) | 4041 | fix(shell): keep arithmetic sink scanning aligned across quoted data |
+| [Arithmetic sink scanning across quotes and heredocs](mirror-4059-f-arithmetic-heredoc-scan.md) | 4042 | fix(guards): retain masked heredoc terminators |
+| [Arithmetic sink scanning across quotes and heredocs](mirror-4059-f-arithmetic-heredoc-scan.md) | 4043 | fix(shell): scan executable literal heredoc bodies for arithmetic sinks |
+| [Arithmetic sink scanning across quotes and heredocs](mirror-4059-f-arithmetic-heredoc-scan.md) | 4044 | refactor(shell): isolate arithmetic scan fast paths |
+| [Shell comment and continuation word boundaries](mirror-4059-f-comment-word-boundaries.md) | 4045 | lifecycle guard: a `#` comments only at a word start; a quote or backslash in a comment opens nothing |
+| [Shell comment and continuation word boundaries](mirror-4059-f-comment-word-boundaries.md) | 4046 | fix(cron): preserve escaped comment word boundaries |
+| [Exact-head repair continuation after awaited reviews](mirror-4059-f-awaited-review-repair.md) | 4047 | fix(kanban): resume timed review waits for exact-head repair |
+| [Deterministic CPU-advisory age boundaries](mirror-4059-f-admission-clock-test.md) | 4048 | Freeze admission clock in advisory age boundary test |
+| [Upstream-sync evidence and fetch replay tests](mirror-4059-f-upstream-sync-evidence-tests.md) | 4049 | Replay fetch integration tests with the CI bash version |
+| [Quiet extension reporting and measurement custody](mirror-4059-f-quiet-extension-observation.md) | 4050 | test: await PTY EOF custody before closing test client |
+| [Quiet extension reporting and measurement custody](mirror-4059-f-quiet-extension-observation.md) | 4051 | Test named-PID CPU reads with controlled work deltas |
+| [Session checkpoint, thread handoff and reply-delivery tests](mirror-4059-f-session-delivery-regressions.md) | 4052 | test(gateway): allow independent busy-reply delivery order |
+| [SQLite observer restore and install-epoch boundaries](mirror-4059-f-sqlite-observer-tests.md) | 4053 | Isolate reinstall epoch invalidation from schema cookies |
+| [Upstream-sync evidence and fetch replay tests](mirror-4059-f-upstream-sync-evidence-tests.md) | 4054 | Test recovered blob store output identity validation |
+| [Home-state placement across nested directory changes](mirror-4059-f-home-span-placement.md) | 4055 | placement: a cd nested in ( ), $( ) or `...` never ends the home span; pushd -n neither |
+| [Targeted late pytest exit diagnostics](mirror-4059-f-pytest-exit-diagnostics.md) | 4056 | capture late pytest exit stacks for derived-session investigation |
+| [Supervised gateway dashboard READY barrier](mirror-4059-f-supervised-dashboard-ready.md) | 4057 | Wait for supervised dashboard mount before gateway READY |
+| [Deterministic shared retry-header parsing test](mirror-4059-f-retry-header-clock-test.md) | 4058 | Freeze retry header clock in metrics sender test |
+| [Session-scoped final buffering after pre-call hooks](mirror-4059-f-session-final-buffer.md) | 4059 | Arm final buffering after hooks with session-scoped eligibility |
 
 ## Mirror 3714–3727
 
@@ -2563,16 +3124,16 @@ not something the public fixture CI can perform without the source repository.
 
 ## Applying
 
-For the current **3727-patch snapshot**, start at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. Apply forty-seven bridges and three ancestry-only markers from `mirror-replay-3727.json`. The verifier first proves each ancestry-only patch against its source-parent tree and proves that its named source merge retains exactly its first-parent tree. Do not discard those patches without that check, start at the new merge-base, or apply one entire glob. Example (Bash, with this repository's absolute path in `MODS`, and run from a fork clone holding both source commits):
+For the current **4352-patch snapshot**, start at `831637fe8d58f050e9aa776b621bb2c7b614dcd1`. Apply forty-nine bridges and three ancestry-only markers from `mirror-replay-4352.json`. The verifier first proves each ancestry-only patch against its source-parent tree and proves that its named source merge retains exactly its first-parent tree. Do not discard those patches without that check, start at the new merge-base, or apply one entire glob. Example (Bash, with this repository's absolute path in `MODS`, and run from a fork clone holding both source commits):
 
 ```bash
 set -e
 SOURCE=$(pwd)
 python3 -B "$MODS/core/verify_mirror.py" --source-repo "$SOURCE" \
-  --source-tip 78c49a510ba5442d3b72b5bec6d96107f667dc39 \
-  --base b51a30c461ee663313ce89d01947bb10b55a619c \
-  --patch-dir "$MODS/core/patches" --policy "$MODS/core/mirror-policy-3727.json" \
-  --replay-plan "$MODS/core/mirror-replay-3727.json"
+  --source-tip 5c9e6833b35266d7989cf607b13cf6eef77b6219 \
+  --base ae1ff71c39d8527227400c8e71acf9c57a8a59c6 \
+  --patch-dir "$MODS/core/patches" --policy "$MODS/core/mirror-policy-4352.json" \
+  --replay-plan "$MODS/core/mirror-replay-4352.json"
 git worktree add --detach ../hermes-mods-test 831637fe8d58f050e9aa776b621bb2c7b614dcd1
 cd ../hermes-mods-test
 patches=("$MODS"/core/patches/*.patch)
@@ -2722,12 +3283,18 @@ git commit -m 'Explicit upstream merge bridge before 3651'
 git am -3 --empty=keep "${patches[@]:3650:68}"
 git apply --index --3way "$MODS/core/bridges/upstream-b51a30c461-via-a38507dd8f.diff"
 git commit -m 'Explicit upstream merge bridge before 3719'
-git am -3 --empty=keep "${patches[@]:3718:9}"
+git am -3 --empty=keep "${patches[@]:3718:397}"
+git apply --index --3way "$MODS/core/bridges/upstream-491f984583-agents-md-via-e4450f549b.diff"
+git commit -m 'Explicit upstream context bridge before 4116'
+git am -3 --empty=keep "${patches[@]:4115:2}"
+git apply --index --3way "$MODS/core/bridges/upstream-ae1ff71c39-via-a3fe7bf2c7.diff"
+git commit -m 'Explicit upstream merge bridge before 4118'
+git am -3 --empty=keep "${patches[@]:4117:235}"
 # Mandatory additive repair: historical mails intentionally remain immutable.
-python3 -B "$MODS/core/repair_hostname_escapes_3727.py" --tree "$PWD"
+python3 -B "$MODS/core/repair_hostname_escapes_4352.py" --tree "$PWD"
 git add hermes_cli/kanban_placement.py
 git commit -m 'Repair historical hostname regex word boundaries'
-python3 -B "$MODS/core/repair_hostname_escapes_3727.py" --source-repo "$SOURCE" --applied "$(git rev-parse HEAD)"
+python3 -B "$MODS/core/repair_hostname_escapes_4352.py" --source-repo "$SOURCE" --applied "$(git rev-parse HEAD)"
 ```
 
 The source object store must contain historical patch-index blobs (see verification prerequisites above). Use Git 2.51 or newer for the replay: Git 2.43's three-way merge conflicts on patch 0032 (`apps/shared/src/gateway-contract.openrpc.json`), which later Git versions merge cleanly. Run the full verifier with its policy and replay plan to check final source equivalence; successful application alone is insufficient. Intermediate trees and standalone feature-patch application are not certified. Remove the throwaway worktree when finished.

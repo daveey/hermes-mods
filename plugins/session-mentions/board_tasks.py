@@ -94,7 +94,12 @@ def handle(args):
                 view = {key: task.get(key) for key in kt._TASK_FIELDS}
                 view.update(source="replica", owner=owner)
                 comments, events, runs = kb.list_comments(conn, tid), kb.list_events(conn, tid), kb.list_runs(conn, tid)
+                # Resolve custody from the latest completion before truncating history.
+                # Preserve records verbatim, including unknown machines and warnings.
+                completion = next((e for e in reversed(events) if e.kind == "completed"), None)
+                receipt = (completion.payload or {}).get("artifact_receipt") if completion else None
                 return {"ok": True, **meta, "task": view,
+                        "artifact_receipt": receipt if isinstance(receipt, list) else [],
                         "history_limit": limit,
                         "history_truncated": {"comments": len(comments) > limit, "events": len(events) > limit, "runs": len(runs) > limit},
                         "parents": kb.parent_ids(conn, tid), "children": kb.child_ids(conn, tid),

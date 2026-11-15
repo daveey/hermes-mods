@@ -1,0 +1,222 @@
+From b7cc2dc8ac7c1517f200905df25ba969d7073ab5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 22:22:46 +0000
+Subject: [PATCH] [daveey] test: kill the 10 surviving #2653 mutants (idle-tail
+ finish, list_jobs memo, delta-frame memo)
+
+Post-merge check t_01a1d6c733b7f9e6 found 10 exact-anchor production mutants of
+#2653 (merge 987876f5d0) surviving every suite. Card t_01a1d6f583821938.
+Test-only: no production change.
+
+New behaviour tests (each named mutant fails exactly one):
+- P4 (idle wait -> time.sleep): test_a_finish_request_ends_a_long_idle_wait_at_once
+  - with a 30 s idle wait in progress, a finish request ends the reader within 5 s.
+- C2 (hit returns the memo list, no deepcopy):
+  test_a_caller_mutating_a_memo_hit_does_not_change_the_next_answer
+  - the old test mutated the miss result; this one mutates a hit.
+- C4 (post-read stamp recheck dropped): test_a_read_that_a_write_raced_is_not_remembered
+  - an in-place same-size write lands during the parse; once the mtime is put back
+    (cp -p / touch -r), the stamp reads as before the read. The next list must parse
+    the file, not serve what the raced read saw.
+- C5 (hit does not record the load stamp):
+  test_a_memo_hit_inside_the_jobs_lock_lets_the_save_skip_the_merge_parse
+  - a hit inside _jobs_lock() must let _unmerged_disk_jobs skip its parse, as
+    load_jobs does.
+- C7 (one memo slot for every jobs file): test_alternating_profile_stores_each_keep_their_memo
+  - after the first walk, walking three profile stores in turn twice parses nothing.
+- D3 (non-shrinking frame memoised as the frame):
+  test_a_frame_no_smaller_than_its_body_is_never_served_from_the_memo
+- D4 (oversize frame accepted): test_an_oversize_frame_is_not_remembered_and_evicts_nothing
+  - the old test passed because the oversize frame evicted itself, but it also
+    evicted every other frame.
+- D7 (no move_to_end on hit): test_a_frame_memo_hit_is_most_recently_used
+- D10 (re-put double counts bytes): test_putting_a_remembered_frame_again_counts_its_bytes_once
+
+Equivalent survivor:
+- C9 (`stamp is not None` dropped from the hit test in cron/jobs.py
+  _listed_records): equivalent. A memo entry is only written under
+  `if stamp is not None and ...`, so every stored hit[0] is a
+  (mtime_ns, size, ino) tuple. When stamp is None, `hit[0] == stamp` is
+  tuple == None, which is always False, so the hit branch is never taken. The
+  clause only skips that comparison. No input reaches a different branch, so no
+  test can tell the two apart.
+
+Mutant tally at this head (sdlc-review scripts/mutants.py against the 3 PR test
+files, 25 tests, baseline ok): killed 9, SURVIVED 1 (C9, equivalent per above).
+scripts/check --base origin/main: 20 checks ok.
+---
+ tests/cron/test_list_jobs_memo.py             | 71 +++++++++++++++++++
+ .../test_web_delta_response_memo.py           | 46 ++++++++++++
+ .../test_process_output_log_idle_backoff.py   | 26 +++++++
+ 3 files changed, 143 insertions(+)
+
+diff --git a/tests/cron/test_list_jobs_memo.py b/tests/cron/test_list_jobs_memo.py
+index e9e99e3df8..45a0c536d7 100644
+--- a/tests/cron/test_list_jobs_memo.py
++++ b/tests/cron/test_list_jobs_memo.py
+@@ -97,3 +97,74 @@ def test_memo_hits_are_p1_skips(store):
+     after = la.counters()["cron.list_jobs"]
+     assert after["runs"] - before["runs"] == 3
+     assert after["skips"] - before["skips"] == 2
++
++
++def test_a_caller_mutating_a_memo_hit_does_not_change_the_next_answer(store):
++    cj.create_job(prompt="first", schedule="every 1h", name="one")
++    cj.list_jobs(include_disabled=True)  # miss: fills the memo
++    hit = cj.list_jobs(include_disabled=True)
++    hit[0]["name"] = "mutated"
++    hit[0]["schedule"]["kind"] = "mutated"
++    hit.append({"name": "extra"})
++    assert _names() == ["one"]
++    assert cj.list_jobs(include_disabled=True)[0]["schedule"]["kind"] != "mutated"
++
++
++def test_a_read_that_a_write_raced_is_not_remembered(store, monkeypatch):
++    """The stamp moved while jobs.json was being read, so what was read is not filed under the pre-read
++    stamp: even when the file's stamp later reads the same again (a same-size in-place edit whose mtime
++    is put back, e.g. ``cp -p``/``touch -r``), the next list parses the file instead of serving the read."""
++    import os
++    cj.create_job(prompt="first", schedule="every 1h", name="aaa")
++    path = cj._current_cron_store().jobs_file
++    before = path.stat()
++    edited = path.read_text().replace('"aaa"', '"bbb"')
++    real = cj._parse_jobs_file
++    raced: list[int] = []
++
++    def racing_parse(p):
++        parsed = real(p)
++        if not raced:
++            raced.append(1)
++            with open(p, "r+") as fh:  # in place: same inode, same size, new mtime
++                fh.write(edited)
++                fh.truncate()
++            os.utime(p, ns=(before.st_atime_ns, before.st_mtime_ns + 10**9))
++        return parsed
++
++    monkeypatch.setattr(cj, "_parse_jobs_file", racing_parse)
++    assert _names() == ["aaa"]  # this read saw the file before the write
++    assert raced
++    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
++    assert cj._jobs_file_stamp(path) == (before.st_mtime_ns, before.st_size, before.st_ino)
++    assert _names() == ["bbb"]
++
++
++def test_a_memo_hit_inside_the_jobs_lock_lets_the_save_skip_the_merge_parse(store):
++    """Like load_jobs, a hit records the jobs file's stamp for the enclosing ``_jobs_lock()`` section, so a
++    save in that section sees disk unchanged without parsing it again."""
++    cj.create_job(prompt="first", schedule="every 1h", name="one")
++    cj.list_jobs(include_disabled=True)  # fills the memo
++    with cj._jobs_lock():
++        assert _names() == ["one"]  # a hit
++        parsed = len(store)
++        assert cj._unmerged_disk_jobs([], None) == []
++        assert len(store) == parsed
++
++
++def test_alternating_profile_stores_each_keep_their_memo(tmp_path, monkeypatch):
++    """A Desktop poll walks every profile's store in turn: each jobs file keeps its own memo slot, so a
++    second walk parses nothing."""
++    parses = []
++    real = cj._parse_jobs_file
++    monkeypatch.setattr(cj, "_parse_jobs_file", lambda path: parses.append(path) or real(path))
++    for name in ("a", "b", "c"):
++        with cj.use_cron_store(tmp_path / name):
++            cj.create_job(prompt=f"job {name}", schedule="every 1h", name=f"job-{name}")
++            assert _names() == [f"job-{name}"]
++    parsed = len(parses)
++    for _ in range(2):
++        for name in ("a", "b", "c"):
++            with cj.use_cron_store(tmp_path / name):
++                assert _names() == [f"job-{name}"]
++    assert len(parses) == parsed
+diff --git a/tests/hermes_cli/test_web_delta_response_memo.py b/tests/hermes_cli/test_web_delta_response_memo.py
+index 6df9d41c82..8a4ea80710 100644
+--- a/tests/hermes_cli/test_web_delta_response_memo.py
++++ b/tests/hermes_cli/test_web_delta_response_memo.py
+@@ -128,3 +128,49 @@ def test_memo_hits_are_p1_skips(served):
+     after = la.counters()["delta.encode"]
+     assert after["runs"] - before["runs"] == 4
+     assert after["skips"] - before["skips"] == 2
++
++
++def test_a_frame_no_smaller_than_its_body_is_never_served_from_the_memo(monkeypatch):
++    """An encode that came out no smaller than the body is remembered as "send the whole body", so the
++    memo hit sends the whole body too, not the oversized frame."""
++    calls = []
++    monkeypatch.setattr(wdr, "encode_delta", lambda body, base: calls.append(1) or b"z" * (len(body) + 1))
++    store = wdr.BodyStore()
++    base = b"b" * 20000
++    store.put(f"ns:{wdr.body_hash(base)}", base)
++    body = b"n" * 20000
++    first = wdr._encode(body, wdr.body_hash(base), "ns", store)
++    again = wdr._encode(body, wdr.body_hash(base), "ns", store)
++    assert first == (wdr.body_hash(body), None)
++    assert again == (wdr.body_hash(body), None)
++    assert len(calls) == 1  # the second answer came from the memo
++
++
++def test_an_oversize_frame_is_not_remembered_and_evicts_nothing():
++    store = wdr.BodyStore(frames_max_bytes=100)
++    for i in range(3):
++        store.put_frame(f"k{i}", b"x" * 30)
++    store.put_frame("big", b"x" * 101)
++    assert store.frame("big") == (False, None)
++    assert [store.frame(f"k{i}")[0] for i in range(3)] == [True, True, True]
++    assert store._frames_bytes == 90
++
++
++def test_a_frame_memo_hit_is_most_recently_used(monkeypatch):
++    monkeypatch.setattr(wdr, "FRAMES_MAX_ENTRIES", 3)
++    store = wdr.BodyStore(frames_max_bytes=1000)
++    for i in range(3):
++        store.put_frame(f"k{i}", b"x" * 10)
++    assert store.frame("k0") == (True, b"x" * 10)  # k0 is now the newest
++    store.put_frame("k3", b"x" * 10)
++    assert [store.frame(f"k{i}")[0] for i in range(4)] == [True, False, True, True]
++
++
++def test_putting_a_remembered_frame_again_counts_its_bytes_once():
++    store = wdr.BodyStore(frames_max_bytes=100)
++    for _ in range(3):
++        store.put_frame("k", b"x" * 40)
++    assert store._frames_bytes == 40
++    assert store.frame("k") == (True, b"x" * 40)
++    store.put_frame("j", b"y" * 40)
++    assert store.frame("k")[0] and store.frame("j")[0]
+diff --git a/tests/tools/test_process_output_log_idle_backoff.py b/tests/tools/test_process_output_log_idle_backoff.py
+index 4cb783c812..14b51b0de5 100644
+--- a/tests/tools/test_process_output_log_idle_backoff.py
++++ b/tests/tools/test_process_output_log_idle_backoff.py
+@@ -113,3 +113,29 @@ def test_a_finish_request_ends_the_tail(tmp_path, monkeypatch):
+     reader.join(5)
+     assert done.is_set()
+     assert not reader.is_alive()
++
++
++def test_a_finish_request_ends_a_long_idle_wait_at_once(tmp_path, monkeypatch):
++    """The backed-off wait is on ``_reader_finish_requested``, not a sleep: with a 30 s wait in progress, a
++    poll()/wait() reconcile's finish request still ends the reader within seconds."""
++    import threading
++
++    monkeypatch.setattr(olog, "_TAIL_SECONDS", 30.0)
++    monkeypatch.setattr(olog, "_IDLE_TAIL_MAX_SECONDS", 30.0)
++    log = tmp_path / "proc_long.log"
++    log.write_bytes(b"tail\n")  # read before the first (30 s) wait
++    registry = ProcessRegistry()
++    session = registry._new_session("c", "t", "t", "k", str(tmp_path), persist_on_release=True)
++    session.output_log = str(log)
++    session.process = None
++    monkeypatch.setattr(registry, "_detached_host_fate", lambda pid, start: "running")
++    done = threading.Event()
++    monkeypatch.setattr(registry, "_finish_exited", lambda s, code, **k: done.set())
++    reader = threading.Thread(target=registry._log_reader_loop, args=(session,), daemon=True)
++    reader.start()
++    from tests.waiting import wait_until
++    wait_until(lambda: session.output_buffer == "tail\n", what="the line written before the start")
++    session._reader_finish_requested.set()
++    reader.join(5)
++    assert not reader.is_alive(), "the finish request did not end the 30 s idle wait"
++    assert done.is_set()
+-- 
+2.43.0
+

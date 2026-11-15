@@ -1,0 +1,661 @@
+From 40f4ec94c3efb56a91f5ad8f2189e407926465fe Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 18:47:43 +0000
+Subject: [PATCH] [daveey] kanban queue reason: comment a new wait reason only
+ once it has held 120 s
+
+#2359 stopped volatile-only flaps from commenting, but replaying the real 11-13
+flood (197 stored worker_queue_reason payloads of t_01a1d5386cb55abf and
+t_01a1d54acc8c8e54, each fed at its recorded time and re-sent every 10 s like
+the Board's reserve replies) through it still wrote 42 and 16 worker-placement
+comments, 14 and 8 in the worst 10 minutes. They all came from meaning changes
+that revert within about a minute: every candidate briefly ineligible
+(reserved <-> mixed/admission_limits), a worker draining for its own core update,
+a 41 s board_error blip, held on/off.
+
+Fix (hermes_cli/kanban_queue_reason.py):
+- Events are unchanged: every meaning change still appends its
+  worker_queue_reason event at once, so pickup-stall sightings
+  (kanban_pickup_stall._seen_unpinned_here_ms) and latest() stay exact.
+- A new meaning is commented only on the first observation at least
+  HOLD_MS = 120_000 after the change whose meaning still equals it (describe()
+  of that observation). One that reverts or changes again first writes no
+  comment; the hold restarts at the newer meaning. A meaning equal to the last
+  commented one is no change.
+- The hold check also runs on repeat observations (same signature as the
+  newest), since the Board's ~10 s repeats are what confirm a hold.
+- Still commented at once: the card's first observation, a return to origin
+  and a new run (lifecycle run_count changes).
+- The volatile refresh rule is kept (one comment per REFRESH_MS for a
+  different volatile picture, counted from the last comment), only while the
+  meaning equals the commented one.
+- The last commented observation, its time and the start of the current
+  meaning live in an origin-local table kanban_queue_commented (like
+  kanban_queue_latest): a hold is confirmed by a repeat, which is no event.
+  Without a row (a card queued before this change) the last event counts as
+  commented, as every meaning change then was.
+
+Proof:
+- New tests/hermes_cli/test_kanban_queue_reason_hold.py with the fixture
+  tests/hermes_cli/fixtures/queue-reason-flood-2026-11-13.json. RED on main
+  (42 and 16 comments, worst 10 min 14 and 8) and GREEN with the fix (6 and 6
+  comments, worst 10 min 2 and 3; acceptance <= 8 and <= 3) on Python 3.11.18
+  and 3.14.9. It also pins: a persisting structural change is commented within
+  HOLD_MS plus one reply, a revert writes events but no comment, a second
+  change restarts the hold, origin and new-run comments are immediate, and a
+  sustained Board outage and its recovery are each commented once held.
+- The flap tests that pinned immediate comments for meaning changes now
+  confirm the hold with one repeat; the 20-minute flap budget test is unchanged
+  and green. Tests in other suites that pin which observations are commented
+  (not when) run with HOLD_MS=0 via the no_comment_hold fixture.
+- The 29 suites importing kanban_queue_reason/repin notice plus all
+  pickup-stall suites: 687 passed.
+
+Card: t_01a1d61f47e3f1a0
+---
+ hermes_cli/kanban_queue_reason.py             | 108 +++++++---
+ .../queue-reason-flood-2026-11-13.json        |   1 +
+ .../test_kanban_queue_error_timing.py         |   3 +
+ .../test_kanban_queue_integration.py          |   4 +
+ tests/hermes_cli/test_kanban_queue_reason.py  |   4 +
+ .../test_kanban_queue_reason_flaps.py         |  32 ++-
+ .../test_kanban_queue_reason_hold.py          | 186 ++++++++++++++++++
+ tests/hermes_cli/test_kanban_queue_safety.py  |   3 +
+ .../test_kanban_queue_transient_debounce.py   |   5 +
+ .../test_kanban_worker_placement_race.py      |   4 +
+ 10 files changed, 320 insertions(+), 30 deletions(-)
+ create mode 100644 tests/hermes_cli/fixtures/queue-reason-flood-2026-11-13.json
+ create mode 100644 tests/hermes_cli/test_kanban_queue_reason_hold.py
+
+diff --git a/hermes_cli/kanban_queue_reason.py b/hermes_cli/kanban_queue_reason.py
+index 76f2103bba..dbfff0e451 100644
+--- a/hermes_cli/kanban_queue_reason.py
++++ b/hermes_cli/kanban_queue_reason.py
+@@ -213,26 +213,81 @@ def _reserved(value):
+     return value.get("machine") if value.get("state") == "assigned" else None
+ 
+ 
+-def _write(previous, value, now_ms):
+-    """``(event, comment)`` for an observation that differs from the last transition ``previous``.
+-
+-    A reservation handed to another worker is an event without a comment: pickup-stall reads the events as "seen
+-    not pinned here" sightings (``kanban_pickup_stall._seen_unpinned_here_ms``), and the thread text would only
+-    repeat the last comment. For the same reason a different volatile-only picture ``SIGHTING_MS`` after the last
+-    event is an event without a comment; the ``REFRESH_MS`` comment clock runs from the last comment
+-    (``COMMENTED_KEY``)."""
++def _write(previous, value, now_ms, commented_ms):
++    """``(event, refresh)`` for an observation that differs from the last transition ``previous``.
++
++    Every meaning change is an event at once. A reservation handed to another worker is an event too: pickup-stall
++    reads the events as "seen not pinned here" sightings (``kanban_pickup_stall._seen_unpinned_here_ms``). For the
++    same reason a different volatile-only picture ``SIGHTING_MS`` after the last event is an event. ``refresh``: a
++    different volatile-only picture ``REFRESH_MS`` after the last comment (``commented_ms``) may be commented.
++    Whether a meaning change is commented is ``_comment_due``'s call."""
+     if previous is None or _meaning(previous) != _meaning(value):
+-        return True, True
++        return True, False
+     if _reserved(previous) != _reserved(value):
+         return True, False
+     if _signature(previous) == _signature(value):
+         return False, False
+-    commented = previous.get(COMMENTED_KEY)
+-    if now_ms - (float(commented) if _number(commented) else _ms_of(previous)) >= REFRESH_MS:
++    if now_ms - commented_ms >= REFRESH_MS:
+         return True, True
+     return now_ms - _ms_of(previous) >= SIGHTING_MS, False
+ 
+ 
++# A new meaning is commented only once it has held this long (t_01a1d61f47e3f1a0): on 11-13 meanings that reverted
++# within about a minute (all candidates briefly ineligible, a worker draining for its own core update, a 41 s Board
++# blip) still wrote 42 comments on one card, 14 in 10 min. The event is still appended at once.
++HOLD_MS = 120_000
++# Origin-local, never synced (like ``LATEST_TABLE``): the last commented observation, when it was commented, and
++# since when the current meaning has held. A hold is confirmed by a repeat reply, which is no event, so this cannot
++# live in the event log.
++COMMENT_TABLE = "kanban_queue_commented"
++
++
++def _comment_state(conn, task_id, previous):
++    """``{"commented", "commented_at_ms", "since_ms"}``; without a stored row (a card queued before the hold
++    existed), the last transition is taken as commented, as every meaning change then was."""
++    try:
++        row = conn.execute(f"SELECT payload FROM {COMMENT_TABLE} WHERE task_id=?", (task_id,)).fetchone()
++    except sqlite3.OperationalError as exc:
++        if "no such table" not in str(exc):
++            raise
++        row = None
++    state = _loads(row[0]) if row else None
++    if isinstance(state, dict) and isinstance(state.get("commented"), dict) and all(
++            _number(state.get(k)) for k in ("commented_at_ms", "since_ms")):
++        return state
++    if previous is None:
++        return None
++    carried = previous.get(COMMENTED_KEY)
++    return {"commented": previous, "commented_at_ms": float(carried) if _number(carried) else _ms_of(previous),
++            "since_ms": _ms_of(previous)}
++
++
++def _save_comment_state(conn, task_id, state):
++    conn.execute(f"CREATE TABLE IF NOT EXISTS {COMMENT_TABLE} (task_id TEXT PRIMARY KEY "
++                 "REFERENCES tasks(id) ON DELETE CASCADE, payload TEXT NOT NULL)")
++    conn.execute(f"INSERT OR REPLACE INTO {COMMENT_TABLE} (task_id, payload) VALUES (?, ?)",
++                 (task_id, json.dumps(state, ensure_ascii=False)))
++
++
++def _run_count(value):
++    lifecycle = value.get("lifecycle")
++    return lifecycle.get("run_count") if isinstance(lifecycle, dict) else None
++
++
++def _comment_due(previous, value, now_ms, state, refresh):
++    """Whether ``value`` gets a thread comment. At once: the card's first observation, a return to origin and a new
++    run. A meaning equal to the last commented one only on a volatile ``refresh``. Any other meaning once it has
++    held ``HOLD_MS`` (``state["since_ms"]``), checked on repeats too; one that reverts or changes first never."""
++    if previous is None or state is None:
++        return True
++    if _meaning(previous) != _meaning(value) and (
++            value.get("state") == "origin" or _run_count(previous) != _run_count(value)):
++        return True
++    if _meaning(state["commented"]) == _meaning(value):
++        return refresh
++    return now_ms - state["since_ms"] >= HOLD_MS
++
++
+ def _stamp(ms):
+     try:
+         return datetime.fromtimestamp(ms / 1000, UTC).isoformat().replace("+00:00", "Z")
+@@ -313,7 +368,8 @@ def _owned_row(conn, task_id, gateway, fence):
+ 
+ 
+ def _record(conn, task_id, gateway, value, *, fence=None, comment=True):
+-    """Append one change-only observation and its thread comment, or store a volatile-only one (``_write``).
++    """Append one change-only observation, or store a volatile-only one (``_write``); comment it when
++    ``_comment_due`` (a new meaning only once it has held ``HOLD_MS``, confirmed by a later reply or repeat).
+ 
+     ``fence`` (from ``snapshot``) checks the row the Board request was made from instead of the current one: a
+     refusal answered against that row stays recorded after a feed pull moved the row on, exactly as it was before
+@@ -327,27 +383,35 @@ def _record(conn, task_id, gateway, value, *, fence=None, comment=True):
+             return False
+         value = {**value, "lifecycle": fence["lifecycle"] if fence is not None else _lifecycle(conn, task_id, row)}
+         newest = _newest(conn, task_id)
+-        if newest and _signature(newest) == _signature(value):
+-            return False
++        # A repeat is no event, but it still confirms a held meaning (``_comment_due``).
++        repeat = bool(newest) and _signature(newest) == _signature(value)
+         previous_ms = (newest or {}).get("recorded_at_ms", 0)
+         recorded_ms = max(int(time.time() * 1000), int(previous_ms) + 1 if _number(previous_ms) else 0)
+         value = {**value, "recorded_at_ms": recorded_ms}
+         previous = _stored(conn, task_id)
+-        event, commented = _write(previous, value, recorded_ms)
+-        if event and not commented and previous is not None:
+-            carried = previous.get(COMMENTED_KEY)
+-            value = {**value, COMMENTED_KEY: carried if _number(carried) else _ms_of(previous)}
+-        if not event:
++        state = _comment_state(conn, task_id, previous)
++        event, refresh = (False, False) if repeat else _write(
++            previous, value, recorded_ms, state["commented_at_ms"] if state else 0)
++        if state is not None and previous is not None and _meaning(previous) != _meaning(value):
++            state = {**state, "since_ms": recorded_ms}  # the hold restarts at every meaning change
++        commented = _comment_due(previous, value, recorded_ms, state, refresh)
++        if event and not commented and state is not None:
++            value = {**value, COMMENTED_KEY: state["commented_at_ms"]}
++        if commented:
++            state = {"commented": value, "commented_at_ms": recorded_ms, "since_ms": recorded_ms}
++        if state is not None and (event or commented):
++            _save_comment_state(conn, task_id, state)
++        if event:
++            kb._append_event(conn, task_id, EVENT, value)
++        elif not repeat:
+             conn.execute(f"CREATE TABLE IF NOT EXISTS {LATEST_TABLE} (task_id TEXT PRIMARY KEY "
+                          "REFERENCES tasks(id) ON DELETE CASCADE, payload TEXT NOT NULL)")
+             conn.execute(f"INSERT OR REPLACE INTO {LATEST_TABLE} (task_id, payload) VALUES (?, ?)",
+                          (task_id, json.dumps(value, ensure_ascii=False)))
+-            return False
+-        kb._append_event(conn, task_id, EVENT, value)
+         if comment and commented:  # a card no pool worker can run gets the owner's repin notice as its comment
+             kb.add_comment(conn, task_id, "worker-placement", comment if isinstance(comment, str) else describe(value),
+                            origin_gateway=gateway)
+-        return True
++        return event
+ 
+ 
+ def mark_refused(value, refused):
+diff --git a/tests/hermes_cli/fixtures/queue-reason-flood-2026-11-13.json b/tests/hermes_cli/fixtures/queue-reason-flood-2026-11-13.json
+new file mode 100644
+index 0000000000..d7b0b88088
+--- /dev/null
++++ b/tests/hermes_cli/fixtures/queue-reason-flood-2026-11-13.json
+@@ -0,0 +1 @@
++{"source":"MacBook board default, kind=worker_queue_reason, ordered by recorded_at_ms","streams":{"t_01a1d5386cb55abf":[{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":["held","max_card_runs_reached"]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":[]}],"observed_at_ms":1794578608754,"state":"assigned","machine":"worker-3","lifecycle":{"runs_on":null,"run_count":0},"recorded_at_ms":1794578608808},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":["held"]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":[]}],"observed_at_ms":1794578609853,"state":"assigned","machine":"worker-3","lifecycle":{"runs_on":"[\"machine:worker-3\"]","run_count":0},"recorded_at_ms":1794578609896},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":["draining","held"],"drain_until_ms":1794578797294.949},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":[]}],"observed_at_ms":1794578619647,"state":"assigned","machine":"worker-3","lifecycle":{"runs_on":"[\"machine:worker-3\"]","run_count":0},"recorded_at_ms":1794578619710},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":["draining","held"],"drain_until_ms":1794578797294.949},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794578674084,"state":"assigned","machine":"worker-3","lifecycle":{"runs_on":"[\"machine:worker-3\"]","run_count":0},"recorded_at_ms":1794578674107},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":["held"]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794578685483,"state":"assigned","machine":"worker-3","lifecycle":{"runs_on":"[\"machine:worker-3\"]","run_count":0},"recorded_at_ms":1794578685536},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794578708348,"state":"assigned","machine":"worker-3","lifecycle":{"runs_on":"[\"machine:worker-3\"]","run_count":0},"recorded_at_ms":1794578708390},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794578713634,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-3\"]","run_count":0},"recorded_at_ms":1794578713661},{"version":1,"code":"board_error","candidates":[],"error_class":"HubError","stage":"recover","elapsed_ms":244,"http_status":409,"lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794578714871},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794578755979,"state":"assigned","machine":"worker-3","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794578755987},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":["last_seen_invalid"]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794578761216,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-3\"]","run_count":0},"recorded_at_ms":1794578761358},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794578761872,"state":"assigned","machine":"worker-3","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794578761979},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":["last_seen_invalid"]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794578762722,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-3\"]","run_count":0},"recorded_at_ms":1794578762808},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794578763032,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794578763146},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["last_seen_invalid","load_threshold"]}],"observed_at_ms":1794578763855,"state":"assigned","machine":"worker-3","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794578763968},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794578764469,"state":"assigned","machine":"worker-3","lifecycle":{"runs_on":"[\"machine:worker-3\"]","run_count":0},"recorded_at_ms":1794578764550},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["last_seen_invalid","load_threshold"]}],"observed_at_ms":1794578800203,"state":"assigned","machine":"worker-3","lifecycle":{"runs_on":"[\"machine:worker-3\"]","run_count":0},"recorded_at_ms":1794578800305},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794578800984,"state":"assigned","machine":"worker-3","lifecycle":{"runs_on":"[\"machine:worker-3\"]","run_count":0},"recorded_at_ms":1794578801073},{"version":1,"code":"mixed","candidates":[{"machine":"worker-2","reasons":["last_seen_invalid"]},{"machine":"worker-3","reasons":["last_seen_invalid"]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794578811389,"state":"queued","lifecycle":{"runs_on":"[\"machine:worker-3\"]","run_count":0},"recorded_at_ms":1794578811511},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794578872023,"state":"assigned","machine":"worker-3","lifecycle":{"runs_on":null,"run_count":0},"recorded_at_ms":1794578872065},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":["last_seen_invalid"]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794578890814,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-3\"]","run_count":0},"recorded_at_ms":1794578890930},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["last_seen_invalid","load_threshold"]}],"observed_at_ms":1794578890908,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-3\"]","run_count":0},"recorded_at_ms":1794578891008},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794578892216,"state":"assigned","machine":"worker-3","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794578892301},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["last_seen_invalid","load_threshold"]}],"observed_at_ms":1794578915284,"state":"assigned","machine":"worker-3","lifecycle":{"runs_on":"[\"machine:worker-3\"]","run_count":0},"recorded_at_ms":1794578915386},{"version":1,"code":"mixed","candidates":[{"machine":"worker-2","reasons":["last_seen_invalid"]},{"machine":"worker-3","reasons":["last_seen_invalid"]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794578915875,"state":"queued","lifecycle":{"runs_on":"[\"machine:worker-3\"]","run_count":0},"recorded_at_ms":1794578916036},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794578977440,"state":"assigned","machine":"worker-3","lifecycle":{"runs_on":null,"run_count":0},"recorded_at_ms":1794578977472},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["draining","load_threshold"],"drain_until_ms":1794579094585.1536}],"observed_at_ms":1794578985132,"state":"assigned","machine":"worker-3","lifecycle":{"runs_on":"[\"machine:worker-3\"]","run_count":0},"recorded_at_ms":1794578985179},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["draining","load_threshold"],"drain_until_ms":1794579094585.1536}],"observed_at_ms":1794578993821,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-3\"]","run_count":0},"recorded_at_ms":1794578993876},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["draining","load_threshold"],"drain_until_ms":1794579094585.1536}],"observed_at_ms":1794579004180,"state":"assigned","machine":"worker-3","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794579004288},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":["last_seen_invalid"]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["draining","load_threshold"],"drain_until_ms":1794579094585.1536}],"observed_at_ms":1794579005492,"state":"assigned","machine":"worker-3","lifecycle":{"runs_on":"[\"machine:worker-3\"]","run_count":0},"recorded_at_ms":1794579005602},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["draining","last_seen_invalid","load_threshold"],"drain_until_ms":1794579094585.1536}],"observed_at_ms":1794579006444,"state":"assigned","machine":"worker-3","lifecycle":{"runs_on":"[\"machine:worker-3\"]","run_count":0},"recorded_at_ms":1794579006552},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["draining","load_threshold"],"drain_until_ms":1794579094585.1536}],"observed_at_ms":1794579007115,"state":"assigned","machine":"worker-3","lifecycle":{"runs_on":"[\"machine:worker-3\"]","run_count":0},"recorded_at_ms":1794579007228},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["draining","load_threshold"],"drain_until_ms":1794579094585.1536}],"observed_at_ms":1794579014801,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-3\"]","run_count":0},"recorded_at_ms":1794579014901},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":["last_seen_invalid"]},{"machine":"worker-4","reasons":["draining","load_threshold"],"drain_until_ms":1794579094585.1536}],"observed_at_ms":1794579023784,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794579023888},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["draining","load_threshold"],"drain_until_ms":1794579094585.1536}],"observed_at_ms":1794579024013,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794579024121},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":["last_seen_invalid"]},{"machine":"worker-4","reasons":["draining","load_threshold"],"drain_until_ms":1794579094585.1536}],"observed_at_ms":1794579031746,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794579031849},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["draining","load_threshold"],"drain_until_ms":1794579094585.1536}],"observed_at_ms":1794579032051,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794579032218},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["draining","load_threshold"],"drain_until_ms":1794579094585.1536}],"observed_at_ms":1794579033016,"state":"assigned","machine":"worker-3","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794579033126},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":["last_seen_invalid","max_card_runs_reached"]},{"machine":"worker-4","reasons":["draining","load_threshold"],"drain_until_ms":1794579094585.1536}],"observed_at_ms":1794579034607,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-3\"]","run_count":0},"recorded_at_ms":1794579034713},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":["max_card_runs_reached"]},{"machine":"worker-4","reasons":["draining","load_threshold"],"drain_until_ms":1794579094585.1536}],"observed_at_ms":1794579035089,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794579035183},{"version":1,"code":"mixed","candidates":[{"machine":"worker-2","reasons":["last_seen_invalid"]},{"machine":"worker-3","reasons":["last_seen_invalid","max_card_runs_reached"]},{"machine":"worker-4","reasons":["draining","load_threshold"],"drain_until_ms":1794579094585.1536}],"observed_at_ms":1794579072591,"state":"queued","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794579072757},{"version":1,"code":"admission_limits","candidates":[{"machine":"worker-2","reasons":["load_threshold"]},{"machine":"worker-3","reasons":["max_card_runs_reached"]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794579133641,"state":"queued","lifecycle":{"runs_on":null,"run_count":0},"recorded_at_ms":1794579133700},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794579194401,"state":"assigned","machine":"worker-3","lifecycle":{"runs_on":null,"run_count":0},"recorded_at_ms":1794579194414},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":[]}],"observed_at_ms":1794579203628,"state":"assigned","machine":"worker-3","lifecycle":{"runs_on":"[\"machine:worker-3\"]","run_count":0},"recorded_at_ms":1794579203660},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":[]}],"observed_at_ms":1794579210870,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-3\"]","run_count":0},"recorded_at_ms":1794579210890},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":["last_seen_invalid"]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":[]}],"observed_at_ms":1794579251278,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794579251386},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":[]}],"observed_at_ms":1794579252398,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794579252485},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":["last_seen_invalid"]},{"machine":"worker-4","reasons":["last_seen_invalid"]}],"observed_at_ms":1794579302577,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794579302697},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["last_seen_invalid"]}],"observed_at_ms":1794579302680,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794579302811},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":[]}],"observed_at_ms":1794579303734,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794579303861},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["last_seen_invalid"]}],"observed_at_ms":1794579317138,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794579317250},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":[]}],"observed_at_ms":1794579317152,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794579317262},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":["last_seen_invalid"]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":[]}],"observed_at_ms":1794579318207,"state":"assigned","machine":"worker-4","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794579318352},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":[]}],"observed_at_ms":1794579318243,"state":"assigned","machine":"worker-4","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794579318371},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":[]}],"observed_at_ms":1794579319484,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-4\"]","run_count":0},"recorded_at_ms":1794579319585},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":[]}],"observed_at_ms":1794579328429,"state":"assigned","machine":"worker-4","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794579328474},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":["load_threshold"]},{"machine":"worker-4","reasons":[]}],"observed_at_ms":1794579341897,"state":"assigned","machine":"worker-4","lifecycle":{"runs_on":"[\"machine:worker-4\"]","run_count":0},"recorded_at_ms":1794579341949},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":["load_threshold"]},{"machine":"worker-4","reasons":[]}],"observed_at_ms":1794579379384,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-4\"]","run_count":0},"recorded_at_ms":1794579379421},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":["load_threshold"]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794579389508,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794579389578},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":["load_threshold"]},{"machine":"worker-4","reasons":["last_seen_invalid","load_threshold"]}],"observed_at_ms":1794579392574,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794579392679},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":["load_threshold"]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794579393687,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794579393804},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794579404954,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794579405043},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794579426189,"state":"assigned","machine":"worker-3","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794579426245},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794579439770,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-3\"]","run_count":0},"recorded_at_ms":1794579439803},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794579445217,"state":"assigned","machine":"worker-3","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794579445292},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794579450270,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794579450320},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794579460574,"state":"assigned","machine":"worker-3","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794579460620},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":["load_threshold"]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794579470514,"state":"assigned","machine":"worker-3","lifecycle":{"runs_on":"[\"machine:worker-3\"]","run_count":0},"recorded_at_ms":1794579470565},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794579481079,"state":"assigned","machine":"worker-3","lifecycle":{"runs_on":"[\"machine:worker-3\"]","run_count":0},"recorded_at_ms":1794579481132},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":["load_threshold"]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794579491273,"state":"assigned","machine":"worker-3","lifecycle":{"runs_on":"[\"machine:worker-3\"]","run_count":0},"recorded_at_ms":1794579491303},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":["load_threshold","max_card_runs_reached"]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794579501420,"state":"assigned","machine":"worker-3","lifecycle":{"runs_on":"[\"machine:worker-3\"]","run_count":0},"recorded_at_ms":1794579501483},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":["max_card_runs_reached"]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794579522015,"state":"assigned","machine":"worker-3","lifecycle":{"runs_on":"[\"machine:worker-3\"]","run_count":0},"recorded_at_ms":1794579522047},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794579587158,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-3\"]","run_count":0},"recorded_at_ms":1794579587210},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794579628320,"state":"assigned","machine":"worker-3","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794579628409},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":["last_seen_invalid"]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794579634614,"state":"assigned","machine":"worker-3","lifecycle":{"runs_on":"[\"machine:worker-3\"]","run_count":0},"recorded_at_ms":1794579634727},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794579635516,"state":"assigned","machine":"worker-3","lifecycle":{"runs_on":"[\"machine:worker-3\"]","run_count":0},"recorded_at_ms":1794579635602},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":["last_seen_invalid"]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794579673734,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-3\"]","run_count":0},"recorded_at_ms":1794579673857},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794579674276,"state":"assigned","machine":"worker-3","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794579674376},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794579700074,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-3\"]","run_count":0},"recorded_at_ms":1794579700137},{"version":1,"code":"mixed","candidates":[{"machine":"worker-2","reasons":["last_seen_invalid"]},{"machine":"worker-3","reasons":["last_seen_invalid"]},{"machine":"worker-4","reasons":["last_seen_invalid","load_threshold"]}],"observed_at_ms":1794579706789,"state":"queued","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794579706984},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794579769793,"state":"assigned","machine":"worker-3","lifecycle":{"runs_on":null,"run_count":0},"recorded_at_ms":1794579769805},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794579774199,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-3\"]","run_count":0},"recorded_at_ms":1794579774258},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":["last_seen_invalid"]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794579802492,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794579802619},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":["last_seen_invalid"]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794579803475,"state":"assigned","machine":"worker-3","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794579803634},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794579804271,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-3\"]","run_count":0},"recorded_at_ms":1794579804386},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":["reserved_capacity_held"]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794579826537,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794579826658},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":["last_seen_invalid","reserved_capacity_held"]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794579832159,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794579832259},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":["reserved_capacity_held"]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794579833156,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794579833232},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794579855085,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794579855138},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["last_seen_invalid","load_threshold"]}],"observed_at_ms":1794579903779,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794579903907},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794579904010,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794579904122},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":["max_card_runs_reached"]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794579908841,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794579908917},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":["reserved_capacity_held"]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794579922652,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794579922797},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":["reserved_capacity_held"]},{"machine":"worker-4","reasons":["last_seen_invalid","load_threshold"]}],"observed_at_ms":1794579924440,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794579924545},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":["reserved_capacity_held"]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794579925814,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794579925957},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":["reserved_capacity_held"]},{"machine":"worker-4","reasons":["last_seen_invalid","load_threshold"]}],"observed_at_ms":1794579926690,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794579926904},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":["reserved_capacity_held"]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794579927797,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794579927918},{"version":1,"code":"mixed","candidates":[{"machine":"worker-2","reasons":["last_seen_invalid"]},{"machine":"worker-3","reasons":["reserved_capacity_held"]},{"machine":"worker-4","reasons":["last_seen_invalid","load_threshold"]}],"observed_at_ms":1794579955960,"state":"queued","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794579956095},{"version":1,"code":"mixed","candidates":[{"machine":"worker-2","reasons":["unclassified"]},{"machine":"worker-3","reasons":["reserved_capacity_held"]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794579956043,"state":"queued","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794579956176},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794580018580,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":null,"run_count":0},"recorded_at_ms":1794580018625},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":["last_seen_invalid"]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794580065113,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794580065229},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794580066247,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794580066358},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":["reserved_capacity_held"]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794580068959,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794580069060},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":["max_card_runs_reached"]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794580072277,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794580072337},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":["last_seen_invalid","max_card_runs_reached"]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794580111161,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794580111290},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":["max_card_runs_reached"]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794580111662,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794580111769},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":["last_seen_invalid"]},{"machine":"worker-3","reasons":["max_card_runs_reached"]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794580150186,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794580150337},{"version":1,"code":"admission_limits","candidates":[{"machine":"worker-2","reasons":["max_card_runs_reached"]},{"machine":"worker-3","reasons":["max_card_runs_reached"]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794580152170,"state":"queued","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794580152267},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":["reserved_capacity_held"]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold","max_card_runs_reached"]}],"observed_at_ms":1794580214168,"state":"assigned","machine":"worker-3","lifecycle":{"runs_on":null,"run_count":0},"recorded_at_ms":1794580214235},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":["last_seen_invalid","max_card_runs_reached"]},{"machine":"worker-3","reasons":["last_seen_invalid"]},{"machine":"worker-4","reasons":["load_threshold","max_card_runs_reached"]}],"observed_at_ms":1794580253049,"state":"assigned","machine":"worker-3","lifecycle":{"runs_on":"[\"machine:worker-3\"]","run_count":0},"recorded_at_ms":1794580253337},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":["max_card_runs_reached"]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold","max_card_runs_reached"]}],"observed_at_ms":1794580253969,"state":"assigned","machine":"worker-3","lifecycle":{"runs_on":"[\"machine:worker-3\"]","run_count":0},"recorded_at_ms":1794580254048},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794580263948,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-3\"]","run_count":0},"recorded_at_ms":1794580264027},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold","max_card_runs_reached"]}],"observed_at_ms":1794580276475,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794580276570},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":["max_card_runs_reached"]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold","max_card_runs_reached"]}],"observed_at_ms":1794580304177,"state":"assigned","machine":"worker-3","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794580304307},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":["max_card_runs_reached"]},{"machine":"worker-3","reasons":["last_seen_invalid"]},{"machine":"worker-4","reasons":["load_threshold","max_card_runs_reached"]}],"observed_at_ms":1794580304355,"state":"assigned","machine":"worker-3","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794580304483},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":["max_card_runs_reached"]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold","max_card_runs_reached"]}],"observed_at_ms":1794580305665,"state":"assigned","machine":"worker-3","lifecycle":{"runs_on":"[\"machine:worker-3\"]","run_count":0},"recorded_at_ms":1794580305762},{"version":1,"code":"admission_limits","candidates":[{"machine":"worker-2","reasons":["max_card_runs_reached"]},{"machine":"worker-3","reasons":["load_threshold"]},{"machine":"worker-4","reasons":["load_threshold","max_card_runs_reached"]}],"observed_at_ms":1794580310467,"state":"queued","lifecycle":{"runs_on":"[\"machine:worker-3\"]","run_count":0},"recorded_at_ms":1794580310500},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":["load_threshold"]},{"machine":"worker-4","reasons":["load_threshold","max_card_runs_reached"]}],"observed_at_ms":1794580371482,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":null,"run_count":0},"recorded_at_ms":1794580371515},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold","max_card_runs_reached"]}],"observed_at_ms":1794580381870,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794580381958},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":["max_card_runs_reached"]},{"machine":"worker-4","reasons":["load_threshold","max_card_runs_reached"]}],"observed_at_ms":1794580391563,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794580391658},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold","max_card_runs_reached"]}],"observed_at_ms":1794580404390,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794580405416},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":["reserved_capacity_held"]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794580418804,"state":"assigned","machine":"worker-3","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794580418900},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":["reserved_capacity_held"]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold","max_card_runs_reached"]}],"observed_at_ms":1794580421021,"state":"assigned","machine":"worker-3","lifecycle":{"runs_on":"[\"machine:worker-3\"]","run_count":0},"recorded_at_ms":1794580421125},{"version":1,"code":"admission_limits","candidates":[{"machine":"worker-2","reasons":["reserved_capacity_held"]},{"machine":"worker-3","reasons":["max_card_runs_reached"]},{"machine":"worker-4","reasons":["load_threshold","max_card_runs_reached"]}],"observed_at_ms":1794580422867,"state":"queued","lifecycle":{"runs_on":"[\"machine:worker-3\"]","run_count":0},"recorded_at_ms":1794580422988},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":["reserved_capacity_held"]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794580484677,"state":"assigned","machine":"worker-3","lifecycle":{"runs_on":null,"run_count":0},"recorded_at_ms":1794580484693},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":["max_card_runs_reached"]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794580492284,"state":"assigned","machine":"worker-3","lifecycle":{"runs_on":"[\"machine:worker-3\"]","run_count":0},"recorded_at_ms":1794580492353},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794580502788,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-3\"]","run_count":0},"recorded_at_ms":1794580502844},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":[]}],"observed_at_ms":1794580627250,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794580627299},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":["last_seen_invalid"]},{"machine":"worker-4","reasons":["last_seen_invalid"]}],"observed_at_ms":1794580806851,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794580806976},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":[]}],"observed_at_ms":1794580807187,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794580807383},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":[]}],"observed_at_ms":1794580844297,"state":"assigned","machine":"worker-4","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794580844367},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":["draining"],"drain_until_ms":1794581067891.456},{"machine":"worker-4","reasons":[]}],"observed_at_ms":1794580950132,"state":"assigned","machine":"worker-4","lifecycle":{"runs_on":"[\"machine:worker-4\"]","run_count":0},"recorded_at_ms":1794580950187},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":["draining"],"drain_until_ms":1794581077528.4807},{"machine":"worker-3","reasons":["draining"],"drain_until_ms":1794581067891.456},{"machine":"worker-4","reasons":[]}],"observed_at_ms":1794580967449,"state":"assigned","machine":"worker-4","lifecycle":{"runs_on":"[\"machine:worker-4\"]","run_count":0},"recorded_at_ms":1794580967566},{"version":1,"code":"draining","candidates":[{"machine":"worker-2","reasons":["draining"],"drain_until_ms":1794581077528.4807},{"machine":"worker-3","reasons":["draining"],"drain_until_ms":1794581067891.456},{"machine":"worker-4","reasons":["last_seen_invalid"]}],"observed_at_ms":1794581002502,"state":"assigned","machine":"worker-3","lifecycle":{"runs_on":"[\"machine:worker-4\"]","run_count":0},"recorded_at_ms":1794581002638},{"version":1,"code":"draining","candidates":[{"machine":"worker-2","reasons":["draining"],"drain_until_ms":1794581077528.4807},{"machine":"worker-3","reasons":["draining"],"drain_until_ms":1794581067891.456},{"machine":"worker-4","reasons":[]}],"observed_at_ms":1794581002876,"state":"assigned","machine":"worker-3","lifecycle":{"runs_on":"[\"machine:worker-4\"]","run_count":0},"recorded_at_ms":1794581002957},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":["draining"],"drain_until_ms":1794581077528.4807},{"machine":"worker-3","reasons":["draining"],"drain_until_ms":1794581067891.456},{"machine":"worker-4","reasons":[]}],"observed_at_ms":1794581006483,"state":"assigned","machine":"worker-4","lifecycle":{"runs_on":"[\"machine:worker-3\"]","run_count":0},"recorded_at_ms":1794581006549},{"version":1,"code":"draining","candidates":[{"machine":"worker-2","reasons":["draining"],"drain_until_ms":1794581077528.4807},{"machine":"worker-3","reasons":["draining"],"drain_until_ms":1794581067891.456},{"machine":"worker-4","reasons":[]}],"observed_at_ms":1794581040629,"state":"assigned","machine":"worker-3","lifecycle":{"runs_on":"[\"machine:worker-4\"]","run_count":0},"recorded_at_ms":1794581040758},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":["draining"],"drain_until_ms":1794581077528.4807},{"machine":"worker-3","reasons":["draining"],"drain_until_ms":1794581067891.456},{"machine":"worker-4","reasons":[]}],"observed_at_ms":1794581050163,"state":"assigned","machine":"worker-4","lifecycle":{"runs_on":"[\"machine:worker-3\"]","run_count":0},"recorded_at_ms":1794581050211},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":["draining"],"drain_until_ms":1794581067891.456},{"machine":"worker-4","reasons":[]}],"observed_at_ms":1794581059023,"state":"assigned","machine":"worker-4","lifecycle":{"runs_on":"[\"machine:worker-4\"]","run_count":0},"recorded_at_ms":1794581059108},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":[]}],"observed_at_ms":1794581081037,"state":"assigned","machine":"worker-4","lifecycle":{"runs_on":"[\"machine:worker-4\"]","run_count":0},"recorded_at_ms":1794581081079},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":[]}],"observed_at_ms":1794581081685,"state":"assigned","machine":"worker-3","lifecycle":{"runs_on":"[\"machine:worker-4\"]","run_count":0},"recorded_at_ms":1794581081753},{"version":1,"code":"mixed","candidates":[{"machine":"worker-2","reasons":["last_seen_invalid","max_card_runs_reached"]},{"machine":"worker-3","reasons":["last_seen_invalid","load_threshold"]},{"machine":"worker-4","reasons":["draining","held"],"drain_until_ms":1794586233405.1763}],"observed_at_ms":1794586096882,"state":"queued","lifecycle":{"runs_on":null,"run_count":1},"recorded_at_ms":1794586097011},{"version":1,"code":"admission_limits","candidates":[{"machine":"worker-2","reasons":["max_card_runs_reached"]},{"machine":"worker-3","reasons":["max_card_runs_reached"]},{"machine":"worker-4","reasons":["draining","held"],"drain_until_ms":1794586233405.1763}],"observed_at_ms":1794586159825,"state":"queued","lifecycle":{"runs_on":null,"run_count":1},"recorded_at_ms":1794586159844},{"version":1,"code":"admission_limits","candidates":[{"machine":"worker-2","reasons":["max_card_runs_reached"]},{"machine":"worker-3","reasons":["max_card_runs_reached"]},{"machine":"worker-4","reasons":["held"]}],"observed_at_ms":1794586220587,"state":"queued","lifecycle":{"runs_on":null,"run_count":1},"recorded_at_ms":1794586220851},{"version":1,"code":"admission_limits","candidates":[{"machine":"worker-2","reasons":["max_card_runs_reached"]},{"machine":"worker-3","reasons":["load_threshold","max_card_runs_reached"]},{"machine":"worker-4","reasons":["held"]}],"observed_at_ms":1794586343295,"state":"queued","lifecycle":{"runs_on":null,"run_count":1},"recorded_at_ms":1794586343299}],"t_01a1d54acc8c8e54":[{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":["reserved_capacity_held"]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794579813459,"state":"assigned","machine":"worker-3","lifecycle":{"runs_on":null,"run_count":0},"recorded_at_ms":1794579813517},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794579854800,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-3\"]","run_count":0},"recorded_at_ms":1794579854848},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["last_seen_invalid","load_threshold"]}],"observed_at_ms":1794579903483,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794579903612},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":["last_seen_invalid"]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794579903737,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794579903847},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794579905569,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794579905660},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":["max_card_runs_reached"]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794579908582,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794579908637},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794579922332,"state":"assigned","machine":"worker-3","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794579922425},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":["last_seen_invalid"]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794579955778,"state":"assigned","machine":"worker-3","lifecycle":{"runs_on":"[\"machine:worker-3\"]","run_count":0},"recorded_at_ms":1794579955889},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794579958323,"state":"assigned","machine":"worker-3","lifecycle":{"runs_on":"[\"machine:worker-3\"]","run_count":0},"recorded_at_ms":1794579958396},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794579991048,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-3\"]","run_count":0},"recorded_at_ms":1794579991334},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794580068668,"state":"assigned","machine":"worker-3","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794580068766},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":["max_card_runs_reached"]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794580072009,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-3\"]","run_count":0},"recorded_at_ms":1794580072065},{"version":1,"code":"admission_limits","candidates":[{"machine":"worker-2","reasons":["max_card_runs_reached"]},{"machine":"worker-3","reasons":["max_card_runs_reached"]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794580151721,"state":"queued","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794580151817},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold","max_card_runs_reached"]}],"observed_at_ms":1794580213821,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":null,"run_count":0},"recorded_at_ms":1794580213941},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":["last_seen_invalid"]},{"machine":"worker-4","reasons":["last_seen_invalid","load_threshold","max_card_runs_reached"]}],"observed_at_ms":1794580219341,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794580219516},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold","max_card_runs_reached"]}],"observed_at_ms":1794580220258,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794580220363},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":["reserved_capacity_held"]},{"machine":"worker-4","reasons":["load_threshold","max_card_runs_reached"]}],"observed_at_ms":1794580226512,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794580226577},{"version":1,"code":"admission_limits","candidates":[{"machine":"worker-2","reasons":["max_card_runs_reached"]},{"machine":"worker-3","reasons":["reserved_capacity_held"]},{"machine":"worker-4","reasons":["load_threshold","max_card_runs_reached"]}],"observed_at_ms":1794580252758,"state":"queued","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794580252898},{"version":1,"code":"admission_limits","candidates":[{"machine":"worker-2","reasons":["max_card_runs_reached"]},{"machine":"worker-3","reasons":["load_threshold"]},{"machine":"worker-4","reasons":["load_threshold","max_card_runs_reached"]}],"observed_at_ms":1794580313136,"state":"queued","lifecycle":{"runs_on":null,"run_count":0},"recorded_at_ms":1794580313208},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":["load_threshold"]},{"machine":"worker-4","reasons":["load_threshold","max_card_runs_reached"]}],"observed_at_ms":1794580374292,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":null,"run_count":0},"recorded_at_ms":1794580374429},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold","max_card_runs_reached"]}],"observed_at_ms":1794580381539,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794580381655},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":["max_card_runs_reached"]},{"machine":"worker-4","reasons":["load_threshold","max_card_runs_reached"]}],"observed_at_ms":1794580392918,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794580393042},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold","max_card_runs_reached"]}],"observed_at_ms":1794580402309,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794580402613},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":["reserved_capacity_held"]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794580419087,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794580419196},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":["reserved_capacity_held"]},{"machine":"worker-4","reasons":["load_threshold","max_card_runs_reached"]}],"observed_at_ms":1794580421321,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794580421430},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":["max_card_runs_reached"]},{"machine":"worker-4","reasons":["load_threshold","max_card_runs_reached"]}],"observed_at_ms":1794580423160,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794580423293},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":["max_card_runs_reached"]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794580440090,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794580440143},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":["max_card_runs_reached"]},{"machine":"worker-4","reasons":["load_threshold","max_card_runs_reached"]}],"observed_at_ms":1794580454020,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794580454047},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":["max_card_runs_reached"]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794580470676,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794580470708},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794580475386,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794580475409},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":["reserved_capacity_held"]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794580484959,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794580484989},{"version":1,"code":"admission_limits","candidates":[{"machine":"worker-2","reasons":["max_card_runs_reached"]},{"machine":"worker-3","reasons":["reserved_capacity_held"]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794580492176,"state":"queued","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794580492508},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794580553457,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":null,"run_count":0},"recorded_at_ms":1794580553519},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":["last_seen_invalid"]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794580569030,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794580569136},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":["load_threshold"]}],"observed_at_ms":1794580569805,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794580570162},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":[]}],"observed_at_ms":1794580628146,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794580628227},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":["reserved_capacity_held"]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":[]}],"observed_at_ms":1794580764536,"state":"assigned","machine":"worker-3","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":0},"recorded_at_ms":1794580764559},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":["reserved_capacity_held"]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":[]}],"observed_at_ms":1794580777466,"state":"assigned","machine":"worker-4","lifecycle":{"runs_on":"[\"machine:worker-3\"]","run_count":0},"recorded_at_ms":1794580777569},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":["last_seen_invalid","reserved_capacity_held"]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":[]}],"observed_at_ms":1794580800124,"state":"assigned","machine":"worker-4","lifecycle":{"runs_on":"[\"machine:worker-4\"]","run_count":0},"recorded_at_ms":1794580800222},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":["reserved_capacity_held"]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":[]}],"observed_at_ms":1794580800872,"state":"assigned","machine":"worker-4","lifecycle":{"runs_on":"[\"machine:worker-4\"]","run_count":0},"recorded_at_ms":1794580800941},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":[]}],"observed_at_ms":1794580844530,"state":"assigned","machine":"worker-4","lifecycle":{"runs_on":"[\"machine:worker-4\"]","run_count":0},"recorded_at_ms":1794580844589},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":["last_seen_invalid"]},{"machine":"worker-3","reasons":["last_seen_invalid"]},{"machine":"worker-4","reasons":[]}],"observed_at_ms":1794580910121,"state":"assigned","machine":"worker-4","lifecycle":{"runs_on":"[\"machine:worker-4\"]","run_count":0},"recorded_at_ms":1794580910237},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":[]}],"observed_at_ms":1794580910772,"state":"assigned","machine":"worker-4","lifecycle":{"runs_on":"[\"machine:worker-4\"]","run_count":0},"recorded_at_ms":1794580910861},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":["draining"],"drain_until_ms":1794581067891.456},{"machine":"worker-4","reasons":[]}],"observed_at_ms":1794580949039,"state":"assigned","machine":"worker-4","lifecycle":{"runs_on":"[\"machine:worker-4\"]","run_count":0},"recorded_at_ms":1794580949057},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":["draining"],"drain_until_ms":1794581077528.4807},{"machine":"worker-3","reasons":["draining"],"drain_until_ms":1794581067891.456},{"machine":"worker-4","reasons":[]}],"observed_at_ms":1794580966137,"state":"assigned","machine":"worker-4","lifecycle":{"runs_on":"[\"machine:worker-4\"]","run_count":0},"recorded_at_ms":1794580966289},{"version":1,"code":"draining","candidates":[{"machine":"worker-2","reasons":["draining"],"drain_until_ms":1794581077528.4807},{"machine":"worker-3","reasons":["draining"],"drain_until_ms":1794581067891.456},{"machine":"worker-4","reasons":[]}],"observed_at_ms":1794581040981,"state":"assigned","machine":"worker-3","lifecycle":{"runs_on":"[\"machine:worker-4\"]","run_count":0},"recorded_at_ms":1794581041042},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":["draining"],"drain_until_ms":1794581077528.4807},{"machine":"worker-3","reasons":["draining"],"drain_until_ms":1794581067891.456},{"machine":"worker-4","reasons":[]}],"observed_at_ms":1794581050464,"state":"assigned","machine":"worker-4","lifecycle":{"runs_on":"[\"machine:worker-3\"]","run_count":0},"recorded_at_ms":1794581050513},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":["draining"],"drain_until_ms":1794581067891.456},{"machine":"worker-4","reasons":[]}],"observed_at_ms":1794581059348,"state":"assigned","machine":"worker-4","lifecycle":{"runs_on":"[\"machine:worker-4\"]","run_count":0},"recorded_at_ms":1794581059388},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":[]},{"machine":"worker-4","reasons":[]}],"observed_at_ms":1794581080286,"state":"assigned","machine":"worker-3","lifecycle":{"runs_on":"[\"machine:worker-4\"]","run_count":0},"recorded_at_ms":1794581080377},{"version":1,"code":"reserved","candidates":[{"machine":"worker-2","reasons":[]},{"machine":"worker-3","reasons":["max_card_runs_reached"]},{"machine":"worker-4","reasons":["max_card_runs_reached"]}],"observed_at_ms":1794584586838,"state":"assigned","machine":"worker-2","lifecycle":{"runs_on":null,"run_count":1},"recorded_at_ms":1794584586924},{"version":1,"code":"admission_limits","candidates":[{"machine":"worker-2","reasons":["max_card_runs_reached"]},{"machine":"worker-3","reasons":["max_card_runs_reached"]},{"machine":"worker-4","reasons":["max_card_runs_reached"]}],"observed_at_ms":1794584589694,"state":"queued","lifecycle":{"runs_on":"[\"machine:worker-2\"]","run_count":1},"recorded_at_ms":1794584589768},{"version":1,"code":"admission_limits","candidates":[{"machine":"worker-2","reasons":["max_card_runs_reached"]},{"machine":"worker-3","reasons":["held","max_card_runs_reached"]},{"machine":"worker-4","reasons":["load_threshold","max_card_runs_reached"]}],"observed_at_ms":1794584710553,"state":"queued","lifecycle":{"runs_on":null,"run_count":1},"recorded_at_ms":1794584710660},{"version":1,"code":"admission_limits","candidates":[{"machine":"worker-2","reasons":["max_card_runs_reached"]},{"machine":"worker-3","reasons":["held","load_threshold","max_card_runs_reached"]},{"machine":"worker-4","reasons":["load_threshold","max_card_runs_reached"]}],"observed_at_ms":1794584832832,"state":"queued","lifecycle":{"runs_on":null,"run_count":1},"recorded_at_ms":1794584832864}]}}
+\ No newline at end of file
+diff --git a/tests/hermes_cli/test_kanban_queue_error_timing.py b/tests/hermes_cli/test_kanban_queue_error_timing.py
+index 9d37f5934d..950e729ea7 100644
+--- a/tests/hermes_cli/test_kanban_queue_error_timing.py
++++ b/tests/hermes_cli/test_kanban_queue_error_timing.py
+@@ -19,6 +19,7 @@ from hermes_cli import kanban_queue_reason as qr
+ from hermes_cli import kanban_sync_client as client
+ from hermes_cli import kanban_worker_placement as wp
+ from tests.hermes_cli import test_kanban_worker_reserve_client as fixtures
++from tests.hermes_cli import test_kanban_queue_reason_hold as hold
+ 
+ 
+ @pytest.fixture(autouse=True)
+@@ -30,6 +31,7 @@ def _confirm_on_first_pass(monkeypatch):
+     monkeypatch.setattr(kanban_queue_reason, "CONFIRM_PASSES", 1)
+ 
+ 
++no_comment_hold = hold.no_comment_hold
+ conn = fixtures.conn
+ CFG = {"worker_pools": {"hub": ["worker-1"]}}
+ SECRET = "https://user:hunter2-SECRET@hub.invalid/api?token=SECRET"
+@@ -246,6 +248,7 @@ def test_timing_is_measured_from_the_failing_call_not_the_tick(conn, monkeypatch
+     assert value.get("budget_ms") == 1000 and value.get("elapsed_ms") == 250
+ 
+ 
++@pytest.mark.usefixtures("no_comment_hold")
+ def test_real_http_reserve_after_slow_local_pull_records_starved_budget_timeout(conn, monkeypatch):
+     """End to end through ``dispatch_tick``: a slow local pull spends most of the shared 2 s tick deadline, so the
+     real reserve POST reaches a Board that never answers with only the remainder and times out. The record must show
+diff --git a/tests/hermes_cli/test_kanban_queue_integration.py b/tests/hermes_cli/test_kanban_queue_integration.py
+index 82ca664fc9..6a22ee6828 100644
+--- a/tests/hermes_cli/test_kanban_queue_integration.py
++++ b/tests/hermes_cli/test_kanban_queue_integration.py
+@@ -12,10 +12,13 @@ from hermes_cli import kanban_sync_client as client
+ from hermes_cli import kanban_worker_placement as wp
+ from tests.hermes_cli import test_kanban_worker_reserve_client as fixtures
+ from tests.hermes_cli.test_kanban_queue_reason import reply
++from tests.hermes_cli import test_kanban_queue_reason_hold as hold
+ 
++no_comment_hold = hold.no_comment_hold
+ conn = fixtures.conn
+ 
+ 
++@pytest.mark.usefixtures("no_comment_hold")
+ @pytest.mark.parametrize("error", [OSError("private transport text"), client.HubError(500, "private response")])
+ def test_initial_pull_failure_is_durable_and_recovers(conn, monkeypatch, error):
+     tid = fixtures.acknowledged(conn)
+@@ -43,6 +46,7 @@ def test_initial_pull_failure_is_durable_and_recovers(conn, monkeypatch, error):
+     assert wp.execution_refusal(conn, dict(conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone())) == wp.WAITING
+ 
+ 
++@pytest.mark.usefixtures("no_comment_hold")
+ @pytest.mark.parametrize("error", [OSError("private transport text"), client.HubError(503, "private response")])
+ def test_reserve_failure_dedupes_and_recovers(conn, monkeypatch, error):
+     tid = fixtures.acknowledged(conn)
+diff --git a/tests/hermes_cli/test_kanban_queue_reason.py b/tests/hermes_cli/test_kanban_queue_reason.py
+index 7860c825a2..57866fdb41 100644
+--- a/tests/hermes_cli/test_kanban_queue_reason.py
++++ b/tests/hermes_cli/test_kanban_queue_reason.py
+@@ -6,7 +6,9 @@ import pytest
+ from hermes_cli import kanban_db as kb
+ from hermes_cli import kanban_queue_reason as qr
+ from tests.hermes_cli import test_kanban_worker_reserve_client as fixtures
++from tests.hermes_cli import test_kanban_queue_reason_hold as hold
+ 
++no_comment_hold = hold.no_comment_hold
+ conn = fixtures.conn
+ 
+ 
+@@ -16,6 +18,7 @@ def reply(code="admission_limits", at=1000, reasons=None):
+                             "candidates": [{"machine": "worker-1", "reasons": reasons or ["load_threshold"]}]}}
+ 
+ 
++@pytest.mark.usefixtures("no_comment_hold")
+ def test_reason_persists_once_and_recovers(conn):
+     tid = fixtures.acknowledged(conn)
+     assert qr.record_reply(conn, tid, "hub", reply())
+@@ -29,6 +32,7 @@ def test_reason_persists_once_and_recovers(conn):
+     assert conn.execute("SELECT runs_on FROM tasks WHERE id=?", (tid,)).fetchone()[0] is None
+ 
+ 
++@pytest.mark.usefixtures("no_comment_hold")
+ def test_legacy_and_board_errors_are_honest(conn):
+     tid = fixtures.acknowledged(conn)
+     qr.record_reply(conn, tid, "hub", {"state": "queued", "reason": "waiting_for_worker_capacity"})
+diff --git a/tests/hermes_cli/test_kanban_queue_reason_flaps.py b/tests/hermes_cli/test_kanban_queue_reason_flaps.py
+index e4e6c40521..6d83f08e11 100644
+--- a/tests/hermes_cli/test_kanban_queue_reason_flaps.py
++++ b/tests/hermes_cli/test_kanban_queue_reason_flaps.py
+@@ -4,8 +4,8 @@ On 11-13 a ready worker-first card waiting for pickup (t_01a1d5386cb55abf) got 7
+ 79 ``worker_queue_reason`` events in 18 min: the Board's reserve reply came back every ~10 s with the same code and
+ reservation, and only a candidate's ``load_threshold`` / ``max_card_runs_reached`` flipped. A flap still updates the
+ stored latest observation (``latest()``, the ``queue:`` line of ``kanban show``); it writes at most one event and
+-comment per ``REFRESH_MS``. A change of meaning (state code, eligibility, a structural reason, origin) still writes
+-at once.
++comment per ``REFRESH_MS``. A change of meaning (state code, eligibility, a structural reason, origin) is still an
++event at once; its comment waits until it has held ``HOLD_MS`` (t_01a1d61f47e3f1a0), except a return to origin.
+ """
+ import pytest
+ 
+@@ -87,49 +87,65 @@ def test_refresh_needs_a_different_volatile_picture(conn, clock):
+     assert counts(conn, tid) == (2, 2)
+ 
+ 
+-def test_state_code_changes_still_comment_at_once(conn, clock):
++def held(clock, send):
++    """Repeat ``send`` once the new meaning has held ``HOLD_MS``: its comment is written then
++    (t_01a1d61f47e3f1a0)."""
++    clock[0] += qr.HOLD_MS / 1000
++    return send()
++
++
++def test_state_code_changes_comment_once_held(conn, clock):
+     tid = fixtures.acknowledged(conn)
+     qr.record_reply(conn, tid, "hub", assigned(1, flap(0)))
+     clock[0] += 5
+     qr.record_reply(conn, tid, "hub", assigned(2, flap(1)))  # volatile only: stored, no comment
+     clock[0] += 5
+     assert qr.record_error(conn, tid, "hub", status=400)
++    assert counts(conn, tid) == (1, 2)  # the event at once, its comment once held
++    held(clock, lambda: qr.record_error(conn, tid, "hub", status=400))
+     clock[0] += 5
+-    assert qr.record_reply(conn, tid, "hub", queued(4, [{"machine": "worker-2", "reasons": ["last_seen_stale"]}],
+-                                                    "no_live_candidate"))
++    no_live = queued(4, [{"machine": "worker-2", "reasons": ["last_seen_stale"]}], "no_live_candidate")
++    assert qr.record_reply(conn, tid, "hub", no_live)
++    held(clock, lambda: qr.record_reply(conn, tid, "hub", no_live))
+     bodies = [c.body for c in kb.list_comments(conn, tid)]
+     assert len(bodies) == 3
+     assert bodies[1].startswith("Board observation failed") and bodies[2].startswith("No live candidate")
+     assert qr.latest(conn, tid)["code"] == "no_live_candidate"
+ 
+ 
+-def test_all_candidates_becoming_ineligible_comments_at_once(conn, clock):
++def test_all_candidates_becoming_ineligible_comments_once_held(conn, clock):
+     tid = fixtures.acknowledged(conn)
+     qr.record_reply(conn, tid, "hub", assigned(1, flap(0)))
+     clock[0] += 10
+     none_eligible = [{"machine": m, "reasons": ["load_threshold"]} for m in ("worker-2", "worker-3", "worker-4")]
+     assert qr.record_reply(conn, tid, "hub", assigned(2, none_eligible))
++    assert counts(conn, tid) == (1, 2)
++    held(clock, lambda: qr.record_reply(conn, tid, "hub", assigned(3, none_eligible)))
+     assert counts(conn, tid) == (2, 2)
+     clock[0] += 10
+-    assert qr.record_reply(conn, tid, "hub", assigned(3, flap(0)))  # and back
++    assert qr.record_reply(conn, tid, "hub", assigned(4, flap(0)))  # and back
++    held(clock, lambda: qr.record_reply(conn, tid, "hub", assigned(5, flap(0))))
+     assert counts(conn, tid) == (3, 3)
+ 
+ 
+-def test_gaining_or_losing_a_structural_reason_comments_at_once(conn, clock):
++def test_gaining_or_losing_a_structural_reason_comments_once_held(conn, clock):
+     tid = fixtures.acknowledged(conn)
+     qr.record_reply(conn, tid, "hub", assigned(1, flap(0)))
+     clock[0] += 10
+     gained = flap(0)
+     gained[1] = {"machine": "worker-3", "reasons": ["missing_labels"], "missing_labels": ["skill:five-whys"]}
+     assert qr.record_reply(conn, tid, "hub", assigned(2, gained))
++    held(clock, lambda: qr.record_reply(conn, tid, "hub", assigned(2, gained)))
+     assert "missing skill:five-whys" in kb.list_comments(conn, tid)[-1].body
+     clock[0] += 10
+     draining = flap(0)
+     draining[2] = {"machine": "worker-4", "reasons": ["draining", "load_threshold"]}
+     gained[2] = draining[2]
+     assert qr.record_reply(conn, tid, "hub", assigned(3, gained))
++    held(clock, lambda: qr.record_reply(conn, tid, "hub", assigned(3, gained)))
+     clock[0] += 10
+     assert qr.record_reply(conn, tid, "hub", assigned(4, flap(0)))  # both lost
++    held(clock, lambda: qr.record_reply(conn, tid, "hub", assigned(4, flap(0))))
+     assert counts(conn, tid) == (4, 4)
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_queue_reason_hold.py b/tests/hermes_cli/test_kanban_queue_reason_hold.py
+new file mode 100644
+index 0000000000..ac980862b3
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_queue_reason_hold.py
+@@ -0,0 +1,186 @@
++"""A new wait reason gets its thread comment only once it has held for ``HOLD_MS`` (t_01a1d61f47e3f1a0).
++
++#2359 stopped volatile-only flaps from commenting, but the real 11-13 flood replayed through it still wrote 42
++``worker-placement`` comments on t_01a1d5386cb55abf (14 in one 10-minute window) and 16 on t_01a1d54acc8c8e54: meaning
++changes that revert within about a minute (all candidates briefly ineligible, a worker draining for its own core
++update, a 41 s board_error blip). Every meaning change is still an event at once (pickup-stall sightings and
++``latest()`` stay exact); only the comment waits until the new meaning has held.
++
++The fixture holds the 197 stored ``worker_queue_reason`` payloads of both cards from the MacBook board, in recorded
++order. Each is fed at its recorded time and re-sent every 10 s until the next one, as the Board's reserve replies did.
++"""
++import json
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_queue_reason as qr
++from tests.hermes_cli import test_kanban_queue_reason_flaps as flaps
++from tests.hermes_cli import test_kanban_worker_reserve_client as fixtures
++
++conn = fixtures.conn
++clock = flaps.clock
++
++FIXTURE = Path(__file__).parent / "fixtures" / "queue-reason-flood-2026-11-13.json"
++STREAMS = json.loads(FIXTURE.read_text())["streams"]
++REPEAT_S = 10
++WINDOW_S = 600
++
++
++def _comments(conn, tid):
++    return [c for c in kb.list_comments(conn, tid) if c.author == "worker-placement"]
++
++
++@pytest.fixture
++def no_comment_hold(monkeypatch):
++    """For tests that pin WHICH observations are commented, not when: every meaning change is commented at once,
++    as before the hold. This module pins the hold itself."""
++    monkeypatch.setattr(qr, "HOLD_MS", 0)
++
++
++def _send(conn, tid, payload):
++    value = {k: v for k, v in payload.items() if k not in ("recorded_at_ms", "lifecycle")}
++    fence = {"row": qr.snapshot(conn, tid)["row"], "lifecycle": payload["lifecycle"]}
++    return qr._record(conn, tid, "hub", value, fence=fence)
++
++
++def replay(conn, clock, stream, tail_s=300):
++    """Feed ``stream`` with 10 s repeats; returns ``(task id, comment times in s)``."""
++    tid = fixtures.acknowledged(conn)
++    times = []
++    ends = [p["recorded_at_ms"] for p in stream[1:]] + [stream[-1]["recorded_at_ms"] + tail_s * 1000]
++    for payload, end_ms in zip(stream, ends):
++        at_ms = payload["recorded_at_ms"]
++        while at_ms < end_ms:
++            clock[0] = at_ms / 1000
++            before = len(_comments(conn, tid))
++            _send(conn, tid, payload)
++            times.extend([clock[0]] * (len(_comments(conn, tid)) - before))
++            at_ms += REPEAT_S * 1000
++    return tid, times
++
++
++def _worst_window(times):
++    return max((sum(1 for u in times if t <= u < t + WINDOW_S) for t in times), default=0)
++
++
++@pytest.mark.parametrize("task", sorted(STREAMS))
++def test_the_11_13_flood_replay_comments_only_held_reasons(conn, clock, task):
++    stream = STREAMS[task]
++    tid, times = replay(conn, clock, stream)
++    worst = _worst_window(times)
++    print(f"{task}: {len(stream)} observations -> {len(times)} comments, worst 10 min {worst}")
++    assert len(times) <= 8
++    assert worst <= 3
++    # Events are unchanged: every meaning change is still appended, and latest() is the newest observation.
++    events = conn.execute("SELECT count(*) FROM task_events WHERE task_id=? AND kind=?", (tid, qr.EVENT)).fetchone()[0]
++    assert events >= len(times)
++    newest = qr.latest(conn, tid)
++    last = stream[-1]
++    assert newest.get("code") == last["code"] and newest.get("candidates") == last["candidates"]
++
++
++def test_the_first_observation_comments_at_once(conn, clock):
++    tid = fixtures.acknowledged(conn)
++    assert qr.record_reply(conn, tid, "hub", flaps.assigned(1, flaps.flap(0)))
++    assert len(_comments(conn, tid)) == 1
++
++
++def _structural(at):
++    gained = flaps.flap(0)
++    gained[1] = {"machine": "worker-3", "reasons": ["missing_labels"], "missing_labels": ["skill:five-whys"]}
++    return flaps.assigned(at, gained)
++
++
++def test_a_persisting_structural_change_comments_within_the_hold_plus_one_reply(conn, clock):
++    tid = fixtures.acknowledged(conn)
++    qr.record_reply(conn, tid, "hub", flaps.assigned(1, flaps.flap(0)))
++    clock[0] += 10
++    changed_at = clock[0]
++    assert qr.record_reply(conn, tid, "hub", _structural(2))  # the event is appended at once
++    assert len(_comments(conn, tid)) == 1  # its comment waits
++    commented_at = confirming = None
++    for i in range(1, 30):
++        clock[0] = changed_at + REPEAT_S * i
++        qr.record_reply(conn, tid, "hub", _structural(2 + i))  # the Board's repeats confirm the hold
++        if len(_comments(conn, tid)) == 2:
++            commented_at, confirming = clock[0], 2 + i
++            break
++    assert commented_at is not None and commented_at - changed_at <= qr.HOLD_MS / 1000 + REPEAT_S
++    assert commented_at - changed_at >= qr.HOLD_MS / 1000
++    body = _comments(conn, tid)[-1].body
++    assert "missing skill:five-whys" in body
++    assert body.endswith(qr._stamp(confirming))  # describe() of the confirming observation
++
++
++def test_a_change_that_reverts_before_the_hold_writes_events_but_no_comment(conn, clock):
++    tid = fixtures.acknowledged(conn)
++    qr.record_reply(conn, tid, "hub", flaps.assigned(1, flaps.flap(0)))
++    for i in range(1, 6):
++        clock[0] += 10
++        qr.record_reply(conn, tid, "hub", _structural(1 + i))
++    clock[0] += 10
++    assert qr.record_reply(conn, tid, "hub", flaps.assigned(10, flaps.flap(0)))  # back: an event
++    for i in range(30):
++        clock[0] += 10
++        qr.record_reply(conn, tid, "hub", flaps.assigned(11 + i, flaps.flap(0)))
++    assert len(_comments(conn, tid)) == 1
++    events = conn.execute("SELECT count(*) FROM task_events WHERE task_id=? AND kind=?", (tid, qr.EVENT)).fetchone()[0]
++    assert events == 3
++
++
++def test_a_second_change_restarts_the_hold(conn, clock):
++    tid = fixtures.acknowledged(conn)
++    qr.record_reply(conn, tid, "hub", flaps.assigned(1, flaps.flap(0)))
++    clock[0] += 10
++    qr.record_reply(conn, tid, "hub", _structural(2))
++    clock[0] += 100
++    none_eligible = [{"machine": m, "reasons": ["load_threshold"]} for m in ("worker-2", "worker-3", "worker-4")]
++    second_at = clock[0]
++    assert qr.record_reply(conn, tid, "hub", flaps.assigned(3, none_eligible))
++    clock[0] = second_at + qr.HOLD_MS / 1000 - 10
++    qr.record_reply(conn, tid, "hub", flaps.assigned(4, none_eligible))
++    assert len(_comments(conn, tid)) == 1  # the first change never held; the second has not yet
++    clock[0] = second_at + qr.HOLD_MS / 1000
++    qr.record_reply(conn, tid, "hub", flaps.assigned(5, none_eligible))
++    assert len(_comments(conn, tid)) == 2
++
++
++def test_a_new_run_comments_at_once(conn, clock):
++    tid = fixtures.acknowledged(conn)
++    first = {"version": 1, "code": "reserved", "state": "assigned", "machine": "worker-2",
++             "candidates": [{"machine": "worker-2", "reasons": []}]}
++    qr._record(conn, tid, "hub", first, fence={"row": qr.snapshot(conn, tid)["row"],
++                                               "lifecycle": {"runs_on": None, "run_count": 0}})
++    clock[0] += 10
++    assert qr._record(conn, tid, "hub", first, fence={"row": qr.snapshot(conn, tid)["row"],
++                                                      "lifecycle": {"runs_on": None, "run_count": 1}})
++    assert len(_comments(conn, tid)) == 2
++
++
++def test_return_to_origin_comments_at_once(conn, clock):
++    tid = fixtures.acknowledged(conn)
++    qr.record_reply(conn, tid, "hub", flaps.assigned(1, flaps.flap(0)))
++    clock[0] += 10
++    origin = {"state": "origin", "machine": "hub", "reason": "no pool worker can run it: missing git",
++              "observation": {"version": 1, "code": "no_eligible_worker", "observed_at_ms": 2,
++                              "candidates": flaps.flap(1)}}
++    assert qr.record_reply(conn, tid, "hub", origin)
++    assert len(_comments(conn, tid)) == 2
++
++
++def test_a_sustained_board_outage_is_commented_once_held_and_its_recovery_too(conn, clock):
++    """Each failing pass re-records the confirmed board_error: those repeats confirm the hold."""
++    tid = fixtures.acknowledged(conn)
++    qr.record_reply(conn, tid, "hub", flaps.assigned(1, flaps.flap(0)))
++    for _ in range(qr.HOLD_MS // 10_000 + 2):
++        clock[0] += 10
++        qr.record_error(conn, tid, "hub", error=TimeoutError(), stage="reserve")
++    assert qr.latest(conn, tid)["code"] == "board_error"
++    assert [c.body.split(" — ")[0] for c in _comments(conn, tid)][-1] == "Board observation failed"
++    for i in range(qr.HOLD_MS // 10_000 + 1):
++        clock[0] += 10
++        qr.record_reply(conn, tid, "hub", flaps.assigned(10 + i, flaps.flap(0)))
++    assert len(_comments(conn, tid)) == 3
++    assert _comments(conn, tid)[-1].body.startswith("Worker reserved")
+diff --git a/tests/hermes_cli/test_kanban_queue_safety.py b/tests/hermes_cli/test_kanban_queue_safety.py
+index 7e5877a8f9..a24a15063e 100644
+--- a/tests/hermes_cli/test_kanban_queue_safety.py
++++ b/tests/hermes_cli/test_kanban_queue_safety.py
+@@ -10,10 +10,13 @@ from hermes_cli import kanban_sync_client as client
+ from hermes_cli import kanban_worker_placement as wp
+ from tests.hermes_cli import test_kanban_worker_reserve_client as fixtures
+ from tests.hermes_cli.test_kanban_queue_reason import reply
++from tests.hermes_cli import test_kanban_queue_reason_hold as hold
+ 
++no_comment_hold = hold.no_comment_hold
+ conn = fixtures.conn
+ 
+ 
++@pytest.mark.usefixtures("no_comment_hold")
+ def test_assigned_to_queued_feed_is_not_a_second_transition(conn):
+     tid = fixtures.acknowledged(conn)
+     assigned = {**reply("reserved"), "state": "assigned", "machine": "worker-1"}
+diff --git a/tests/hermes_cli/test_kanban_queue_transient_debounce.py b/tests/hermes_cli/test_kanban_queue_transient_debounce.py
+index cbe9877f21..938a5d7b1a 100644
+--- a/tests/hermes_cli/test_kanban_queue_transient_debounce.py
++++ b/tests/hermes_cli/test_kanban_queue_transient_debounce.py
+@@ -23,7 +23,12 @@ from hermes_cli import kanban_queue_reason as qr
+ from hermes_cli import kanban_sync_client as client
+ from hermes_cli import kanban_worker_placement as wp
+ from tests.hermes_cli import test_kanban_worker_reserve_client as fixtures
++from tests.hermes_cli import test_kanban_queue_reason_hold as hold
+ 
++# These pin which failures are commented, not when (the hold: test_kanban_queue_reason_hold).
++pytestmark = pytest.mark.usefixtures("no_comment_hold")
++
++no_comment_hold = hold.no_comment_hold
+ conn = fixtures.conn
+ CFG = {"worker_pools": {"hub": ["worker-1"]}}
+ TIMEOUT_S = 0.8  # scaled-down dispatch budget (a good pass = reserve + feed pull must fit)
+diff --git a/tests/hermes_cli/test_kanban_worker_placement_race.py b/tests/hermes_cli/test_kanban_worker_placement_race.py
+index f7263e8ead..363fcb656c 100644
+--- a/tests/hermes_cli/test_kanban_worker_placement_race.py
++++ b/tests/hermes_cli/test_kanban_worker_placement_race.py
+@@ -21,7 +21,9 @@ from tests.hermes_cli import test_kanban_worker_policy_db as db_fixtures
+ from tests.hermes_cli.test_kanban_worker_move_request import PlacementHub, RecordingHub, _acknowledged
+ from tests.hermes_cli.test_kanban_worker_node import BOARD, HUB, WORKER
+ from tests.hermes_cli.test_kanban_worker_repin import _policy_card
++from tests.hermes_cli import test_kanban_queue_reason_hold as hold
+ 
++no_comment_hold = hold.no_comment_hold
+ conn = db_fixtures.conn
+ gws = node_fixtures.gws
+ svc = node_fixtures.svc
+@@ -87,6 +89,7 @@ def test_not_claimable_after_the_reserved_worker_claimed_is_recorded_as_picked_u
+     assert (row["status"], row["lease_holder"]) == ("running", WORKER)  # recorded as picked up by worker-1
+ 
+ 
++@pytest.mark.usefixtures("no_comment_hold")
+ def test_not_claimable_without_a_claim_by_the_reserved_machine_is_still_refused(conn, monkeypatch):
+     monkeypatch.setattr(ksc, "pull", lambda *a, **kw: None)  # the feed shows no lease: the row is still unclaimed
+     tid = _acknowledged(conn)
+@@ -112,6 +115,7 @@ def _pull_applying(conn_, tid, *, claims, lease_holder=None, holder="worker-2"):
+     return pull
+ 
+ 
++@pytest.mark.usefixtures("no_comment_hold")
+ def test_not_claimable_while_another_machine_holds_the_lease_is_still_refused(conn, monkeypatch):
+     tid = _acknowledged(conn)
+     claims = []
+-- 
+2.43.0
+

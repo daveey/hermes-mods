@@ -1,0 +1,96 @@
+From 75f29989904fe5ccb58d2a4048cf800bd482935e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 23:39:00 +0000
+Subject: [PATCH] [daveey] Defer wake probe selection and policy reads until
+ indexed due time
+
+Proof: RED idle probe-policy reads 2 vs 0; GREEN 72 wake, home and relay tests. Due probe submits at its exact next_at with no intervening write; all recovery and pool housekeeping remain outside the gate.
+---
+ hermes_cli/kanban_wake_check.py               | 16 +++++---
+ tests/hermes_cli/test_kanban_wake_due_gate.py | 40 +++++++++++++++++++
+ 2 files changed, 51 insertions(+), 5 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_wake_due_gate.py
+
+diff --git a/hermes_cli/kanban_wake_check.py b/hermes_cli/kanban_wake_check.py
+index 184985aa48..f6ffbc948e 100644
+--- a/hermes_cli/kanban_wake_check.py
++++ b/hermes_cli/kanban_wake_check.py
+@@ -992,7 +992,6 @@ def run_due_wake_checks(conn: sqlite3.Connection, *, now: Optional[int] = None,
+         if not db_path:
+             return {"submitted": [], "in_flight": 0}
+         ts = int(time.time()) if now is None else int(now)
+-        stale_interval = episode.stale_seconds()  # resolve before crossing into unscoped pool threads
+         try:
+             stale = conn.execute(
+                 "SELECT w.task_id FROM task_wake_checks w LEFT JOIN tasks t ON t.id = w.task_id "
+@@ -1010,10 +1009,17 @@ def run_due_wake_checks(conn: sqlite3.Connection, *, now: Optional[int] = None,
+         kar.reconcile(conn, now=ts)  # [daveey] an ask's probe row follows its stored ask; a lost one is restored
+         from hermes_cli.kanban_awaited_card_wake import report_lag
+         report_lag(conn, now=ts)  # [daveey] a park still asleep 2 min after its awaited card finished: one WARNING
+-        due = conn.execute(
+-            "SELECT w.task_id, w.cmd, w.every, w.generation, w.purpose FROM task_wake_checks w "
+-            f"JOIN tasks t ON t.id = w.task_id WHERE {_LIVE_ROW} AND w.next_at <= ? ORDER BY w.next_at",
+-            (ts,)).fetchall()
++        # next_at is indexed and changes outside the task content revision. Read it live;
++        # never skip the recovery passes above or pool/CI housekeeping below on this clock.
++        next_at = conn.execute("SELECT MIN(next_at) FROM task_wake_checks").fetchone()[0]
++        due = []
++        if next_at is not None and next_at <= ts:
++            due = conn.execute(
++                "SELECT w.task_id, w.cmd, w.every, w.generation, w.purpose FROM task_wake_checks w "
++                f"JOIN tasks t ON t.id = w.task_id WHERE {_LIVE_ROW} AND w.next_at <= ? ORDER BY w.next_at",
++                (ts,)).fetchall()
++        # Resolve policy only for a real probe batch, still on the scoped dispatcher thread.
++        stale_interval = episode.stale_seconds() if due else None
+         for task_id, cmd, every, generation, purpose in due:
+             key = (db_path, task_id)
+             sweeping = kanban_ci_progress.running_sweeps()  # [daveey] a CI sweep holds a pool worker too
+diff --git a/tests/hermes_cli/test_kanban_wake_due_gate.py b/tests/hermes_cli/test_kanban_wake_due_gate.py
+new file mode 100644
+index 0000000000..fed2aabea7
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_wake_due_gate.py
+@@ -0,0 +1,40 @@
++"""The due index gates probe selection, never recovery or pool housekeeping. [daveey]"""
++from concurrent.futures import Future
++from unittest.mock import Mock
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_wake_check as kwc
++from tests.hermes_cli import test_kanban_wake_check as helpers
++
++kanban_home = helpers.kanban_home
++
++
++def test_not_due_avoids_probe_join_and_config_but_due_runs(kanban_home, monkeypatch):
++    from hermes_cli import kanban_ci_progress as ci
++    monkeypatch.setattr(ci, "submit_sweep", Mock(return_value=None))
++    stale = Mock(return_value=10000)
++    monkeypatch.setattr(kwc.episode, "stale_seconds", stale)
++    pool = Mock()
++    completed = Future()
++    completed.set_result(None)
++    pool.submit.return_value = completed
++    monkeypatch.setattr(kwc, "_pool", lambda: pool)
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="due probe", assignee="default")
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='scheduled' WHERE id=?", (tid,))
++            kwc.set_check(conn, tid, "true", 300, now=1000)
++            conn.execute("UPDATE task_wake_checks SET next_at=1100 WHERE task_id=?", (tid,))
++        sql = []
++        conn.set_trace_callback(sql.append)
++        for now in (1000, 1099):
++            assert kwc.run_due_wake_checks(conn, now=now)["submitted"] == []
++        assert stale.call_count == 0
++        assert not any("SELECT w.task_id, w.cmd, w.every" in q for q in sql)
++        # No task/probe writes intervene: advancing to the indexed deadline is enough.
++        assert kwc.run_due_wake_checks(conn, now=1100)["submitted"] == [tid]
++        stale.assert_called_once()
++        pool.submit.assert_called_once()
++        assert kwc.get_state(conn, tid)["next_at"] == 1400
++        conn.set_trace_callback(None)
+-- 
+2.43.0
+

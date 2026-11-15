@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from . import approval_adapter_loading, approval_reconciliation, lifecycle, user_step_lifecycle, runtime_contract, core, handoff, pr_approval_request, chat_delivery, superseding, physical_asks, replan, agent_condition, owner_recommendation, access_scope, judge as judge_mod
+    from . import approval_adapter_loading, approval_reconciliation, lifecycle, user_step_lifecycle, runtime_contract, core, handoff, pr_approval_request, chat_delivery, superseding, physical_asks, replan, agent_condition, owner_recommendation, merge_ask, access_scope, approval_reuse, judge as judge_mod
 except ImportError:  # pytest/spec loading imports the hyphenated plugin dir without a parent package
     import importlib.util as _ilu
     import sys as _sys
@@ -44,7 +44,9 @@ except ImportError:  # pytest/spec loading imports the hyphenated plugin dir wit
     replan = _sib("replan")
     agent_condition = _sib("agent_condition")
     owner_recommendation = _sib("owner_recommendation")
+    merge_ask = _sib("merge_ask")
     access_scope = _sib("access_scope")
+    approval_reuse = _sib("approval_reuse")
 
 SKIP_PLATFORMS = {"cron", "kanban", "webhook", "subagent"}
 # Surfaces where the typed turn is the single local user's own words. Only an answer typed there may be bound to a
@@ -54,7 +56,7 @@ TASK_BINDING_PLATFORMS = frozenset({"", "cli", "tui", "local", "desktop"})
 DEFAULT_BOT_PROFILES = ("bb-tuner", "coach")  # cron profiles whose reports go to David and are judged like a chat reply
 _SUBAGENTS: set[str] = set()                  # sessions seen with a parent_session_id (delegate_task children)
 MAX_NUDGES = 2
-LOG = core.TurnLog()
+LOG = core.TurnLog(core.shared_turn_state(str(core.home())))  # survives a mid-turn plugin reload
 _LEDGER: dict[str, Any] = {}
 
 
@@ -937,6 +939,43 @@ def _agent_condition_hold(session_id: str, tool_name: str, request: dict) -> dic
         return None
 
 
+# Process-local hold counts per (session, tool, card or request title), like _OWNER_RECOMMENDATION_HELD.
+_MERGE_ASK_HELD: dict[tuple[str, str, str], int] = {}
+
+
+def _merge_ask_gate(session_id: str, tool_name: str, args: dict) -> dict | None:
+    """Hold an ask that hands David the merge of a PR while naming no limit only he can change (self-heal
+    agent-b62d798d7d). Covers human_request on kanban_block / kanban_create and action_request approvals/choices.
+    Runs before the chat-delivery and judge checks so the refusal names the real fix. Deterministic, bounded to
+    merge_ask.MAX_HOLDS per (session, tool, card or title); fails open."""
+    try:
+        if tool_name == "action_request":
+            req = args.get("request")
+            if "withdraw" in args or not isinstance(req, dict):
+                return None
+            found = merge_ask.action_request_hit(req)
+            ident = " ".join(str(req.get("title") or "").split())
+        elif tool_name in ("kanban_block", "kanban_create") and isinstance(args.get("human_request"), dict):
+            found = merge_ask.hit(args["human_request"])
+            ident = next(iter(_block_card(tool_name, args)), "") or str(args.get("title") or "")
+        else:
+            return None
+        if found is None:
+            return None
+        key = (session_id, tool_name, ident)
+        n = _MERGE_ASK_HELD.get(key, 0)
+        if n >= merge_ask.MAX_HOLDS:
+            core.log_event("merge_ask_released", tool=tool_name, session=session_id, holds=n, quote=found["quote"])
+            return None
+        _MERGE_ASK_HELD[key] = n + 1
+        core.log_event("merge_ask_hold", tool=tool_name, session=session_id, attempt=n,
+                       task=os.environ.get("HERMES_KANBAN_TASK") or "", quote=found["quote"])
+        return {"action": "block", "message": merge_ask.HOLD_MESSAGE}
+    except Exception as e:
+        core.log_event("merge_ask_error", tool=tool_name, session=session_id, error=repr(e)[:300])
+        return None
+
+
 # Process-local hold counts per (session, tool, blocked card), not per ask text: an agent rewords a held ask, and a
 # text key would restart the bound on every rewording, holding a real ask whose limit the regex misses forever.
 _OWNER_RECOMMENDATION_HELD: dict[tuple[str, str, str], int] = {}
@@ -1137,6 +1176,9 @@ def pre_tool_call(tool_name: str = "", args: Any = None, session_id: str = "", *
             replanned = _replan_hold(session_id, tool_name, "\n".join(replan.chat_hits(candidates)), chat=True)
             if replanned is not None:
                 return replanned
+        merged = _merge_ask_gate(session_id, tool_name, args)
+        if merged is not None:
+            return merged
         delivery = _chat_delivery_gate(session_id, tool_name, args)
         if delivery is not None:
             return delivery
@@ -1280,6 +1322,19 @@ def _source_ref_cards(req: dict) -> list[str]:
     return sorted({str(x.get("id")) for x in refs if isinstance(x, dict) and core.is_card_id(str(x.get("id") or ""))})
 
 
+def _session_rows(session_id: str) -> list[tuple[str, str, Any]]:
+    """This chat's user and tool rows (role, content, timestamp), oldest first, for approval_reuse."""
+    c = core._ro_connect(core.home() / 'state.db', timeout=2)
+    try:
+        cols = {r[1] for r in c.execute("pragma table_info(messages)")}
+        ts = "timestamp" if "timestamp" in cols else "null"
+        return c.execute(f"select role, content, {ts} from messages where session_id=? and role in ('user','tool') "
+                         "and (content like 'Canonical user decision.%' or content like '%\"receipt\"%') order by id",
+                         (session_id,)).fetchall()
+    finally:
+        c.close()
+
+
 def _action_request_gate(session_id: str, args: dict) -> dict | None:
     """Judge an action_request approval/choice against David's words from the whole chat (agent-ebedadaefd).
     Withdrawals, other kinds and an unreachable judge pass; only already_answered/agent_can_do block."""
@@ -1299,6 +1354,16 @@ def _action_request_gate(session_id: str, args: dict) -> dict | None:
     if _AR_HELD.get(key, 0) >= _AR_MAX_HOLDS:
         core.log_event("action_request_released", session=session_id, title=title[:160], holds=_AR_HELD[key])
         return None
+    try:
+        reuse = approval_reuse.check(req, lambda: _session_rows(session_id))
+    except Exception as e:  # a detector error never blocks the publish
+        core.log_event("approval_reuse_error", session=session_id, error=repr(e))
+        reuse = None
+    if reuse is not None:
+        _AR_HELD[key] = _AR_HELD.get(key, 0) + 1
+        core.log_event("action_request_held", session=session_id, title=title[:160], hold=_AR_HELD[key],
+                       rule=reuse[0])
+        return {"action": "block", "message": reuse[1]}
     users = _session_user_msgs(session_id, ask)
     tools = _tools_now(session_id)
     verdicts, errors = None, []

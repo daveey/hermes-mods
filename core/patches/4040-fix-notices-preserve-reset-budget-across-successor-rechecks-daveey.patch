@@ -1,0 +1,114 @@
+From 5de279d002abb9d481fa244699d69d2eb04b5edc Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 02:09:46 +0000
+Subject: [PATCH] fix(notices): preserve reset budget across successor rechecks
+ [daveey]
+
+---
+ .../test_notice_retry_successor.py            | 25 ++++++++++++++++++-
+ tui_gateway/notice_guarantee.py               | 13 +++++++---
+ tui_gateway/notice_retry.py                   | 12 +++++++++
+ 3 files changed, 46 insertions(+), 4 deletions(-)
+
+diff --git a/tests/tui_gateway/test_notice_retry_successor.py b/tests/tui_gateway/test_notice_retry_successor.py
+index bee71750e5..5a678b2a7f 100644
+--- a/tests/tui_gateway/test_notice_retry_successor.py
++++ b/tests/tui_gateway/test_notice_retry_successor.py
+@@ -108,5 +108,28 @@ def test_claim_cas_still_fences_successor_and_new_failure_rebooks(db, monkeypatc
+     stale = ng.candidates(db, now)[0]
+     assert helpers._run(db, verdict="error", now=now)[1] == [(helpers.CHAT, row)]
+     assert not ng._claim(db, stale, now)
+-    assert helpers._closeout_meta(db, row)[2] == 2
++    assert helpers._closeout_meta(db, row)[2] == 1
+     assert helpers._run(db, now=now + 1000) == ([], [])
++
++
++@pytest.mark.parametrize("attempts", [1, ng.MAX_ATTEMPTS - 1])
++def test_repeated_deploy_wall_failures_preserve_reset_attempt(db, monkeypatch, attempts):
++    now = 2_000_000_000.0
++    reset = now + 4 * 86400
++    monkeypatch.setattr(ng.time, "time", lambda: now)
++    monkeypatch.setattr(ng, "_retry_at", lambda sid, t: reset)
++    row = helpers._notice(db, "done", closeout={
++        "state": "deferred", "retry_at": reset, "attempts": attempts,
++        "retry_code_sha": "a" * 40, "retry_short_at": now})
++    for code in ("b", "c", "d", "e"):
++        now += 3600
++        monkeypatch.setattr(host_loop_lease, "_core_sha", lambda: code * 40)
++        assert helpers._run(db, verdict="error", now=now)[1] == [(helpers.CHAT, row)]
++        assert tuple(helpers._closeout_meta(db, row)) == ("deferred", reset, attempts)
++        assert helpers._run(db, now=now + 1000) == ([], [])
++    # At the real deadline the normal failed-wake budget applies, not a refund.
++    now = reset
++    assert helpers._run(db, verdict="error", now=now)[1] == [(helpers.CHAT, row)]
++    state, _, count = helpers._closeout_meta(db, row)
++    assert count == attempts + 1
++    assert state == ("error" if count == ng.MAX_ATTEMPTS else "deferred")
+diff --git a/tui_gateway/notice_guarantee.py b/tui_gateway/notice_guarantee.py
+index 48373d420f..3891b7f1ee 100644
+--- a/tui_gateway/notice_guarantee.py
++++ b/tui_gateway/notice_guarantee.py
+@@ -23,7 +23,8 @@ unloaded sweeper's loop therefore looks, in every profile store, for chats whose
+   restart (or a still-broken store) outlived was never offered again (two hub chats, 2026-11-10). A deferred row
+   is durable: any backend's pass picks it up. Long wall bookings include the process's frozen code identity:
+   a different-code successor uses the booking's short-delay deadline instead. Same/unknown code and legacy
+-  rows keep the wall deadline; discovery still claims with CAS and preserves the attempt budget. [daveey]
++  rows keep the wall deadline. Failed early rechecks refund their attempt so deploys cannot exhaust the
++  normal failed-wake budget before the wall reset; discovery still claims with CAS. [daveey]
+ - a wake that found the chat ``"busy"`` (no live turn, yet admission refused it: a core update's admission hold or
+   drain, a paused turn owed to its restarting backend, an exiting backend's fence) is deferred the same way,
+   ``BUSY_RETRY_S`` doubling up to ``BUSY_RETRY_MAX_S``, at most ``MAX_BUSY_ATTEMPTS`` busy wakes per row (counted in
+@@ -304,7 +305,8 @@ def _retry_at(sid: str, now: float) -> float:
+ 
+ 
+ def _closeout_job(session_db, wake, sid: str, msg_id: int, attempts: int = 1,
+-                  retry_at: Optional[Callable[[str, float], float]] = None, busy_attempts: int = 0) -> str:
++                  retry_at: Optional[Callable[[str, float], float]] = None, busy_attempts: int = 0,
++                  early_recheck: bool = False) -> str:
+     """Worker: the wake, then the verdict on the claimed row; a wake that did not start refreshes the outcome.
+     A failed (``"error"``) or busy wake with attempts left is stamped ``deferred`` for a later pass (module doc)."""
+     try:
+@@ -314,6 +316,8 @@ def _closeout_job(session_db, wake, sid: str, msg_id: int, attempts: int = 1,
+             logger.warning("notice close-out wake of %s failed", sid, exc_info=True)
+             verdict = "error"
+         extra: dict = {}
++        if verdict == "error" and early_recheck:
++            attempts -= 1  # Speculative successor failure must leave the reset-time budget intact.
+         if verdict == "busy":
+             busy_attempts += 1
+             extra = {"busy_attempts": busy_attempts}
+@@ -400,7 +404,10 @@ def _handle(db, cand: dict, now: float, *, holders, session_db, wake, spawn, see
+     try:
+         attempts = _attempts(cand["meta"]) + 1
+         busy = _busy_attempts(cand["meta"])
+-        spawn(lambda: _closeout_job(session_db, wake, sid, cand["msg_id"], attempts=attempts, busy_attempts=busy))
++        from tui_gateway.notice_retry import early_recheck
++        early = early_recheck(cand["meta"], now)
++        spawn(lambda: _closeout_job(session_db, wake, sid, cand["msg_id"], attempts=attempts,
++                                   busy_attempts=busy, early_recheck=early))
+     except Exception:
+         _wake_slots.release()
+         _stamp(db, cand["msg_id"], "error")
+diff --git a/tui_gateway/notice_retry.py b/tui_gateway/notice_retry.py
+index 2d22efa434..413db5a5c2 100644
+--- a/tui_gateway/notice_retry.py
++++ b/tui_gateway/notice_retry.py
+@@ -37,3 +37,15 @@ def effective_due(closeout: dict) -> Any:
+     if current and current != sha:
+         return min(due, short)
+     return due
++
++
++def early_recheck(meta: dict, now: float) -> bool:
++    """Only a due, different-code wake before the stored wall is speculative."""
++    closeout = meta.get("closeout")
++    if not isinstance(closeout, dict) or closeout.get("state") != "deferred":
++        return False
++    due = effective_due(closeout)
++    original = closeout.get("retry_at")
++    return (isinstance(due, (int, float)) and not isinstance(due, bool)
++            and isinstance(original, (int, float)) and not isinstance(original, bool)
++            and due <= now < original)
+-- 
+2.43.0
+

@@ -4,27 +4,31 @@ A public, stdlib-only command guard that routes landing through a repository's
 trusted ship workflow for core main, with a narrow state-branch preflight below.
 It does not merge or push. State preflight makes two bounded read-only GitHub
 requests (the PR view and one base compare), plus at most three bounded
-per-file commit lookups when it refuses for base drift.
+per-file commit lookups when it refuses for base drift. Turn eligibility adds the
+bounded snapshot and server-push activity reads described below.
 
 ## Preflight budgets
 
-The registered `pre_tool_call` callback declares a **150-second** host timeout
-(`hermes_hook_timeout`); other callbacks retain their own/default budgets and
-host timeout failures remain fail-closed. Carry verification can exceed the
-host's default 30 seconds even when every individual probe succeeds.
+The registered `pre_tool_call` callback retains a **30-second** host backstop.
+The adapter and standalone `--gh-args` entry point share an **18-second aggregate
+monotonic deadline** across probes, including nested parallel workers. A deadline
+refusal names the stage (approval/carry, tree/blob reads, Git fetch/merge-tree,
+land-turn reads, or drift); late results never allow a command. Every worker gets
+its own copied context with the same deadline, and is joined before return.
 
-The adapter and standalone `--gh-args` entry point share a **120-second aggregate
-monotonic deadline** across all probes in one invocation, including nested tool
-calls. Each subprocess keeps its existing per-call cap (2–30 seconds), clipped
-to the remaining aggregate allowance. Exhaustion stops new probes and refuses
-the operation; a result arriving after the deadline cannot allow it. The extra
-30 seconds leave cleanup/return headroom; the host remains the hard callback
-backstop for Python or filesystem stalls. Direct library callers can use
-`bounded_preflight(check_argv, argv)` for the same aggregate bound.
+Independent carry patch reads, blob reads, and the two clean-merge checks run in
+parallel. Both the API tree/content prefilter and authoritative Git merge-tree
+must still pass. Approval and a **read-only** land-turn scan overlap; that scan
+never deletes refs speculatively. Non-speculative turn readers retain cleanup.
+The mutable base-drift read stays **last**, after approval/hold checks, so the
+optimization does not widen the final base-read race. Optional turn acquisition
+starts only when its budget fits; lack of time never changes a refusal to allow.
 
-`tests_budget.py` covers registration, clipping, late-result rejection, context
-reset/nesting, real subprocess expiry, standalone refusal, and (when core is
-available) real bounded host dispatch and fail-closed timeout/suppression.
+Preflights taking at least one second log elapsed time and allowed/refused status,
+without logging submitted commands. `tests_budget.py` and `tests_parallel.py`
+cover registration, clipping, nested context propagation, named real subprocess
+expiry, late-result rejection, exception propagation and host fail-closed dispatch.
+Private incident recordings stay out of this public repository.
 
 ## Configuration
 
@@ -143,10 +147,22 @@ other odd read refuses. This path-wise check is only a rejection prefilter:
 rename/delete conflicts can look clean path by path. Every survivor must also
 pass real `git merge-tree --write-tree <first> <second>` with exit 0 and a
 single tree id equal to the fetched merge's tree. A scratch bare repository
-under `$HERMES_HOME/cache` fetches those three SHAs with `--depth=128`, no tags
-or submodules, and 30-second command timeouts. Full blobs avoid lazy fetches
+under `$HERMES_HOME/cache` fetches the PR head once, with
+`--depth=131` (128 plus `_CARRY_MERGES`, so every merge, first and second
+parent of the chain keeps at least 128 commits of history below it), no tags
+or submodules, and 30-second command timeouts. The fetch needs no chain, so it
+starts with the ancestry compare instead of after it (t_01a1dadbf711c31c: a
+3-merge carry spent 4.3 s on that compare and then 9 s on the fetch, and the
+drift check ran out of the 18 s budget). Full blobs avoid lazy fetches
 inside merge-tree; authentication uses `gh auth git-credential` and inherited
-Git configuration is disabled. Multiple merge bases, shallow cuts before the
+Git configuration is disabled. The prefilter reads its trees (`git ls-tree -r
+-l`), blobs (`git cat-file`) and merge bases (`git merge-base --all`, used only
+when it is single and no shallow cut sits above it) from that fetch instead of
+`git/trees`, `git/blobs` and `compare` gh calls: objects are content-addressed,
+so the entries are the same, and a tree, blob or base the fetch lacks (or a
+refused fetch) is read through gh as before, so every refusal and its priority is unchanged
+(t_01a1da82db1127a5: the gh reads left the drift check ~2 s of the 18 s budget on a
+twice-updated state PR under the worker gh shim). Multiple merge bases, shallow cuts before the
 base, failed fetches, unsupported Git versions and odd output all refuse;
 the scratch repository is removed on exit. No carry is inferred from the
 path-wise approximation alone.
@@ -208,7 +224,10 @@ above pass, the guard reads `gh api repos/OWNER/REPO/compare/<baseRefOid>...stat
 that base overlaps a PR file:
 
 - the same directory cut to its top three segments (`hosts/<host>/bb-tuner/`,
-  `home/bin/`);
+  `home/scripts/`), except distinct direct children of `home/bin/` or
+  `hosts/<host>/bin/`; these flat executable directories still overlap for the
+  same file or test/code coupling below. Nested directories retain area checks;
+  the exemption is name-based and does not infer script/helper dependencies;
 - the same file for a repo-root file or one directly in a top-level dir
   (`tests/test_x.py`, `docs/x.md`, whose dozens of unrelated modules would
   otherwise hold every PR);
@@ -254,35 +273,125 @@ fails GitHub's rebase merge. hermes-sync pushes live skill edits straight to
 Skill prose next to code (`home/skills/x/scripts/*.py`) and markdown outside
 the skill trees still overlap.
 
-**Land turn (bounded landing).** On 2026-11-13 the hot areas (`hermes-sync`,
-`tests/`, workflows) took a commit about once per CI cycle. #2563 was green and
-approved 4 times and refused 4 times; each refusal cost an update-branch and
-another CI cycle. So the first drift refusal of a green, approved PR also records
-a turn: the ref `refs/land-turn/pr-<N>` points at a commit whose message is
-`land-turn pr=<N>` plus one JSON line `{"pr", "head", "expires", "files"}`.
-The expiry is 90 minutes out (`_TURN_TTL`). A later refusal does not extend a
-live turn. After a turn expires, its PR cannot take a new one for another
-`_TURN_TTL` (the cooldown), so a PR whose area keeps drifting through sync
-exports holds that area at most half the time. Readers delete turns that are
-past their cooldown or unparseable. They read at most `_TURN_MAX` turns, newest
-PR number first, within `_TURN_BUDGET` seconds.
-While the turn is live and its PR is open, the guard refuses any other state PR
-merge with a file that would drift the holder (`_overlap(holder_file, file)`,
-the same rules as above), and names the holder and the expiry. When the holder
-has merged or closed, the turn no longer counts: the guard deletes its ref the
-next time it reads it. State's `scripts/state-push-guard` pre-push applies the
-same check to direct pushes to `state`, except hermes-sync and skills-sync exports.
-The turn only adds refusals. If the turn listing can't be read, or the turn code raises, the guard fails
-open, because the drift compare above still guards correctness. Replayed against
-the real state history of 2026-11-13 (61 merged PRs plus #2563, start times every
-5 minutes), the share of PRs that land within 2 CI cycles rose:
+**Ordered land turns (protocol 2).** A drift refusal of a green, approved PR
+may record `refs/land-turn/pr-<N>`, pointing at a commit with subject
+`land-turn pr=<N>` and one JSON line containing `pr`, `head`, `acquired`,
+`expires`, and `files`. The lifetime is 90 minutes; repeat refusals and changed
+heads do not extend it. Legacy records infer acquisition as `expires - 5400`.
+Acquisition time, then PR number, orders tickets; only the oldest eligible
+non-overlapping holders are effective. Younger overlapping tickets wait and
+never refuse the older holder. Acquisition checks that same ordering before
+and after publication. A waiting ticket cannot reserve an extra area against
+otherwise independent PRs. This is a preflight, not an atomic merge lock.
 
-- with a 20-minute cycle, from 79.7% to 97.2%;
-- with a 60-minute cycle, from 52.5% to 96.2%.
+Optional `owner_task` and `owner_board` fields preserve the runtime Kanban identity
+(`HERMES_KANBAN_TASK`, else `HERMES_KANBAN_WORKER_TASK`; `HERMES_KANBAN_BOARD`).
+They come from the same environment source, never from a title or branch.
+Unknown fields are omitted and legacy records remain readable.
 
-#2563 lands within 2 cycles at every start time. The PRs still left out edit
-a path that the hosts' live sync exports, for example `hosts/daveey-mini/sync.json`
-(#2483). The simulator is attached to card t_01a1d6b3538e8e43.
+`effective_turns(snapshot, eligible, check)` is the read-only selection seam used
+by merge preflight: it sorts a complete supplied snapshot, skips overlap waiters,
+and calls the caller's eligibility/deadline checks before yielding each holder.
+It performs no source reads or deletions itself. Owner/board filtering must follow
+selection, not precede it. An observer must still supply complete bounded verdict,
+carry and drift evidence; this helper alone is not observer integration.
+
+The reader follows all ref-list pages and fetches immutable commit objects in
+batches of 100, rather than dropping old holders after six sequential reads.
+Incomplete, timed-out or malformed snapshots **fail closed**: base drift checks
+alone cannot establish fair turn ordering. Bounded record and eligibility reads
+refuse rather than silently admitting when their deadline is reached. The
+refusal reports both a hold and independently observed base drift so the owner
+refreshes immediately rather than merely parking behind the holder.
+
+**Shared time budget.** The state-merge preflight (and each state pre-push turn
+check) runs under the canonical aggregate deadline described under "Preflight
+budgets" (`PREFLIGHT_TIMEOUT`, 18 s inside the 20 s callback budget; there is
+no second, shorter budget): every `gh`/`git` timeout is clipped to what is left,
+an exhausted budget refuses with a named message (never allows), and no turn
+write starts with less than 10 s left, so nothing is published after the
+deadline. Within one invocation the snapshot is read once and reused (commit
+objects by sha, holder PRs fetched concurrently on copied contexts, one compare
+per base, no per-file attribution while deciding a yield); only the post-write
+ordering check re-lists refs. If that re-read fails, the refusal says the turn
+record was already written and may be in force.
+
+**Out-of-hook turn (`--land-turn`).** The PRs that keep drifting are the
+update-branched ones, whose approval carries through the patch-identical check;
+on a loaded worker that carry plus the drift compare leave 2-4 s of the 18 s, too
+little to start the acquisition, so the hook alone never recorded their turn and
+they livelocked through update-branch, CI and drift. When the hook cannot record
+(or finish recording) the turn, its drift refusal names, before the update-branch
+step:
+
+```sh
+python3 <plugin>/guard.py --land-turn N --repo OWNER/REPO --match-head-commit FULL_SHA
+```
+
+It re-runs the same state preflight, every refusal predicate unchanged, under its
+own 60 s budget (`LAND_TURN_TIMEOUT`, outside the hook), and only records the
+turn: exit 0 when the PR holds its turn afterwards, 1 with the reason otherwise
+(including "no drift, no turn needed"), 2 for malformed arguments or an
+unprotected repository. It never merges or admits a merge. A later hook attempt
+reports the PR's own live turn from its hold snapshot instead of asking again
+(`tests_turn_after_carry.py`, under the worker shim latency model).
+
+An old ticket is not expired by age alone: the 15-minute grace below yields only
+a holder that is still drifted against its current base, so a refreshed head
+keeps its place (pinned in `tests_turn.py`).
+
+Closed PRs and exact-head requests for changes yield. A changed head keeps its
+ticket exactly when the merge gate's own `_approval_refusal` would still admit
+it (exact-head approval, or the existing patch-identical update-branch carry;
+that policy is not changed here); an unreviewed content change yields.
+After a 15-minute refresh grace from the later of acquisition and sustained drift arrival, a still-drifted holder
+yields as well; a refreshed head the gate admits can regain the original ticket only
+within its original lifetime. CI may still be pending while an eligible holder
+reserves its area. The usual approval, review and CI gates still apply to landing.
+
+**Drift-age attribution (server push clock).** The 900-second grace for a drifted
+holder runs from `max(acquired, T)`, where `T` starts the currently sustained overlap.
+The validated `base...state` compare pins a unique tip. GitHub's state activity API
+supplies the authoritative `before`/`after` chain back to the CI base and the server
+push timestamps; commit parent order and commit dates never determine arrival.
+Events newer than the frozen tip are ignored; a push straddling the base is clipped
+to that base. Cycles, duplicate destinations, missing links, malformed events and
+decreasing timestamps refuse.
+
+For each push endpoint `after_j`, test the cumulative net diff `base...after_j`
+with the normal overlap rule, including both rename paths. Reuse the already
+validated overall compare for the tip. Walk endpoints newest backward until the
+latest nonoverlap, then take the next push's timestamp; if every prefix overlaps,
+take the first push's timestamp. Equivalently, choose the oldest `k` for which
+every cumulative prefix `j >= k` overlaps. Thus a touch, revert, and new touch of
+the same file (or a different overlapping file) starts a fresh full grace, not a
+grace from the cancelled touch. At most eight immutable compare reads run at once;
+results decide strictly newest-first. Truncated (>= 300 files) or unreadable
+prefixes needed for that decision refuse. Workers are stopped and joined before
+return. Eligibility's existing 30 s ceiling is also clipped by the canonical
+18 s aggregate deadline (including standalone pre-push): the earlier deadline
+bounds every subprocess and rejects late results.
+Future selected timestamps refuse; no new clock heuristic or persistent clock is used.
+
+**Retention limit:** activity is read serially by the API's `Link` next cursor,
+not page number, for at most five pages of 100 events. GitHub does not document
+activity retention. A base outside the available chain/page bound fails closed;
+its holder cannot yield on drift age and may retain priority until ticket expiry.
+
+After expiry there is a further 90-minute cooldown before reacquisition. Cleanup
+is limited to two past-cooldown records per snapshot. A malformed open peer
+record names its ref and refuses; the owner can repair its own record through
+normal acquisition (after checking other holders), or close/merge its PR.
+Malformed closed records do not block. No peer's live malformed ref is edited
+or deleted as recovery. State pre-push requires protocol 2 and invokes this same
+reader and selector for direct non-export pushes, instead of reconstructing
+eligibility from a recorded tree. Deploy the plugin before the state wrapper.
+
+The earlier single-contender history replay reported 97.2% / 96.2% landing
+within two cycles at 20 / 60 minutes respectively. Those numbers did not test
+concurrent holders and are **not evidence of a concurrent landing bound**.
+The original simulator belongs to card t_01a1d6b3538e8e43; a concurrent replay
+and deployment proof are separate validation requirements.
 
 **Gate boundary:** this guard checks that an exact-head approval record exists;
 it does not authenticate that its author was independent (every agent posts as
@@ -313,6 +422,19 @@ non-green check names and conclusions) instead of the generic deny. The `gh`
 probes take the repo from the explicit `--repo`, so a derived cwd that does not
 exist (e.g. an unset `cd $VAR;` target) is dropped and the probe runs in the
 guard's own cwd; `cd $VAR`/`${VAR}` targets expand from the command's env when set.
+
+**Briefs that cancel the carry are refused (`brief.py`).** A `kanban_create` body or
+`kanban_comment` about a state PR or a base refresh (update-branch, base drift)
+that orders a fresh exact-head review for every new head, with no patch condition
+("Any new head needs a fresh exact-head verdict", "required fresh exact-head
+review"), is refused before it is written. Workers read such a rule as stricter
+than the patch-identical carry above and file one review per base refresh; each
+round gives the base time to drift again (state PR #2555 had seven review rounds
+with one unchanged verbatim patch-id). The text passes when it conditions the
+review on the patch (`patch-id`, `range-diff`, "patch differs", a conflict), or
+with a `no-carry: <reason>` line for a deliberate exception. Tests:
+`tests_brief.py`. A replay over 7 days of real hub briefs (2389) and comments
+(12609) refused only the two texts that caused those rounds.
 
 ## Upstream-sync landing (main, merge commit)
 

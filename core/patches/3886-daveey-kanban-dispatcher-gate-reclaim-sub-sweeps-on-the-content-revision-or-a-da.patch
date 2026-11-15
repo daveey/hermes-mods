@@ -1,0 +1,1166 @@
+From b3038ebd65e79898281b475824e61cd7a22ce095 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 21:00:33 +0000
+Subject: [PATCH] [daveey] kanban dispatcher: gate reclaim sub-sweeps on the
+ content revision or a data-derived due time (G2)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Card t_01a1d59e58887bd2, design t_01a1d563324d7e8e §3 (G2 row), §9 C12, review R13.
+
+Why: the dispatcher's reclaim phase was 5.5% of the hub gateway's samples. A replay of the hub `default`
+board (290 MB, 20k runs, 375k events) cost 168-225 ms CPU per 15 s tick, ~1.1-1.5% of a core, on a board
+whose content changed on 58-72% of ticks. Claim/lease expiry is bookkeeping (it never bumps the revision,
+`kanban_activity_revision.BOOKKEEPING_COLUMNS`), so a revision gate alone would sleep through expiry and
+process death. Each gated sweep therefore also carries a due time derived from its own rows, and the
+liveness sweeps stay every-tick but start from partial indexes so their empty case is O(candidates).
+
+What:
+- `kanban_sweep_gate` (new): `gated(name, conn, fn, extra=, due=, run_due=)` runs `fn` when the key
+  (file identity + `kanban_activity_revision` counter + `extra`) is unknown or moved, or when a due time
+  arrived: `due(conn)` is re-read every tick (bookkeeping clocks), `run_due(result)` is the next moment the
+  run's own rows go due (stored with the key: those rows cannot change while the key holds). A failed run,
+  an unreadable counter or a key read inside a transaction never vouches. `memo()` for pure structural reads.
+  A skip counts in loop accounting (`skips`).
+- `foreign_ids` memoized on the revision (it scanned every task ~7x per tick).
+- Shared-blocker lanes (release, probe) gated; due = probe-interval end of each deferred blocker, and the
+  14-day lookback exit of the oldest assertion. `idx_runs_blocker_assert` and a JSON-free `run_effect` fast
+  path cut a forced `blocker_states` pass from 41 to ~16 ms.
+- Continuation parks gated; due = the earliest pending park wake.
+- `candidate_task_ids` (archive relay / unresolved archives / guard notice) driven from the event-kind index
+  instead of one probe per done/archived task (~5 ms a call, 5 calls a tick).
+- `detect_crashed_workers` (`crash_sweep_due`) now also runs while any card holds a local `worker_pid`
+  (process death: `_pid_alive`), never gated.
+- Partial indexes for the every-tick liveness sweeps: `idx_tasks_claim_lock`, `idx_runs_worker_pid`,
+  `idx_runs_rate_limited` (also in the drifted-table rebuild spec).
+- `wake_episode.stale_seconds` reads config read-only (no per-tick deepcopy).
+- `scripts/kanban_reclaim_replay_bench.py`: replay benchmark over a board copy (`--replay S` replays the
+  board's own write cadence; all side effects stubbed).
+
+Every `dispatch_once` sub-sweep (order of `_run_reclaim_phase`, then maintenance):
+
+| sweep | gate key | due time | notes |
+|---|---|---|---|
+| reap_worker_zombies | every tick | - | process liveness (waitpid), 0.005 ms |
+| reap_terminal_workers | every tick | - | process liveness; `idx_runs_worker_pid` |
+| stopped_scope_units | every tick | - | systemd scope liveness |
+| apply_remote_archives | candidates memo (tasks+events rev) | - | per-card retry clocks run every tick on candidates only |
+| release_stale_claims (orphan/expired claims) | every tick while a card is `running` | `claim_expires` | bookkeeping clock: never revision-gated |
+| reconcile_orphaned_running / close_dangling_runs | every tick | - | liveness; 0.8 ms |
+| release_leftover_local_claims | every tick | - | `idx_tasks_claim_lock`, 0.03 ms |
+| detect_stale_running / enforce_max_runtime | every tick while running | heartbeat / runtime deadlines | bookkeeping clocks |
+| detect_crashed_workers | every tick while running, pending release, or a local `worker_pid` | - | process death (C12) |
+| dispatcher_drain (supervisor) | every tick | - | `supervisor_requests` is not a revision table; 0.4 ms |
+| wake checks (`run_due_wake_checks`) | every tick | `task_wake_checks.next_at` | already due-driven; probes off-thread |
+| continuation parks | revision + own gateway | earliest park wake | gated |
+| recompute_ready | every tick | - | external input (GitHub review release, replica freshness, 600 s parent-missing clock); 2.7 ms |
+| shared blockers: release | revision + gateway + config | lookback exit | gated |
+| shared blockers: probe | revision + gateway + config | probe-interval ends, lookback exit | gated |
+| wake-check `foreign_ids` | revision memo (`created_on` is content) | - | memo |
+| provider walls `tick_upkeep` | every tick | - | 0.09 ms (walls expire on clocks) |
+| quota-block recovery | every tick (keeps its input and cadence) | - | 0.06 ms with the memoized `foreign_ids` |
+| maintenance: blocked-card policy, guard holds, quota drain, parent-unclaimed, pickup stall | every tick | - | pickup stall reads Board/remote pickup (external); 2 ms total |
+| worker_pickup / placement | spawn phase, not reclaim | - | unchanged |
+
+Benchmark (`scripts/kanban_reclaim_replay_bench.py`, hub `default` snapshot, 15 s interval, CPU per tick):
+
+| shape | base 0ef3eae4ad7 | this change |
+|---|---|---|
+| replay of the last 30 min (68 of 120 ticks write) | 167.8 ms (1.12% core) | 40.5 ms (0.27%) |
+| write-free | 179-199 ms | 23.5 ms (0.16%) |
+| a content write every tick (worst case) | 224.7 ms | 54.1 ms (0.36%) |
+| hub `hermes` board replay (write-free) | 3.5 ms | 3.0 ms |
+
+Budget (<=0.4% of a core) holds even in the worst case.
+
+Tests: tests/hermes_cli/test_kanban_sweep_gate.py (new). RED proofs by mutation:
+- expired claim on a write-free board reclaimed within one tick: RED when the liveness branch is gated on
+  the revision (`has_running and gated(...)`);
+- SIGKILLed worker on a quiet board detected within one tick: RED when `detect_crashed_workers` is gated;
+- continuation park and stranded-blocker probe run at their due time with no other change: RED with
+  `run_due=None`;
+- quota recovery still fires: regression guard (its trigger, another card's completion, is a content write).
+`test_kanban_watcher_idle_work::test_empty_blocker_sweeps_skip_and_new_candidates_run` now expects a lane
+with candidates to run once, then again only after a content write.
+`test_kanban_restart_survival` fails identically on base on the worker host (subprocess readiness timeout).
+---
+ hermes_cli/kanban_continuation.py             |  22 +-
+ hermes_cli/kanban_db_connect.py               |  24 ++
+ hermes_cli/kanban_db_dispatch.py              |   5 +-
+ hermes_cli/kanban_db_dispatch_claims.py       |  17 +
+ hermes_cli/kanban_idle_candidates.py          |  32 +-
+ hermes_cli/kanban_placement_forward.py        |   8 +-
+ hermes_cli/kanban_shared_blockers.py          |  34 +-
+ hermes_cli/kanban_sweep_gate.py               | 174 ++++++++++
+ hermes_cli/kanban_wake_check.py               |  11 +-
+ hermes_cli/kanban_wake_episode.py             |   4 +-
+ scripts/kanban_reclaim_replay_bench.py        | 150 +++++++++
+ tests/hermes_cli/test_kanban_sweep_gate.py    | 307 ++++++++++++++++++
+ tests/hermes_cli/test_kanban_wake_episode.py  |   6 +-
+ .../test_kanban_watcher_idle_work.py          |   7 +-
+ 14 files changed, 769 insertions(+), 32 deletions(-)
+ create mode 100644 hermes_cli/kanban_sweep_gate.py
+ create mode 100644 scripts/kanban_reclaim_replay_bench.py
+ create mode 100644 tests/hermes_cli/test_kanban_sweep_gate.py
+
+diff --git a/hermes_cli/kanban_continuation.py b/hermes_cli/kanban_continuation.py
+index 1dd32723ff..840af08e4e 100644
+--- a/hermes_cli/kanban_continuation.py
++++ b/hermes_cli/kanban_continuation.py
+@@ -286,14 +286,25 @@ def wake_due_continuations(conn: sqlite3.Connection, *, now: Optional[int] = Non
+     time) are left for a human/cron unblock. Counters are untouched (``unblock_task`` would
+     reset ``consecutive_failures``).
+     """
+-    from hermes_cli import kanban_db as kb
+-    from hermes_cli.kanban_wake_check import run_due_wake_checks
++    from hermes_cli.kanban_wake_check import own_gateway, run_due_wake_checks
+ 
+     run_due_wake_checks(conn)  # condition wakes: start due probes off-thread, never waits [daveey]
+     from hermes_cli.kanban_capability_registry import maybe_refresh_async
+     maybe_refresh_async()  # live-check this gateway's capabilities off-thread, throttled [daveey]
++    from hermes_cli.kanban_sweep_gate import gated
++    # [daveey] G2: the park scan reads only content rows (the parking events, statuses), so it reruns when they
++    # move or when the earliest wake it found arrives; condition probes above keep their own next_at clock.
++    return gated("dispatch.continuation_parks", conn, _wake_parks, conn, now, skipped=([], None), now=now,
++                 extra=own_gateway, run_due=lambda out: out[1])[0]
++
++
++def _wake_parks(conn: sqlite3.Connection, now: Optional[int]) -> tuple[list[str], Optional[int]]:
++    """Wake the due parks; returns ``(woken, earliest wake still pending)`` (None when no park can come due)."""
++    from hermes_cli import kanban_db as kb
++
+     now = int(time.time()) if now is None else int(now)
+     woken: list[str] = []
++    pending: list[int] = []
+     from hermes_cli.kanban_wake_check import foreign_ids
+     copies = foreign_ids(conn)  # [daveey] a worker node's copy: its home board owns the clock wake
+     for row in conn.execute("SELECT id, block_kind FROM tasks WHERE status = 'scheduled'").fetchall():
+@@ -303,9 +314,12 @@ def wake_due_continuations(conn: sqlite3.Connection, *, now: Optional[int] = Non
+         payload = pending_wake(conn, tid)
+         if payload is None:
+             # Invariant: every scheduled card has a wake or becomes blocked. [daveey]
+-            _enforce_wake_invariant(conn, tid, row[1], now, woken)
++            if not _enforce_wake_invariant(conn, tid, row[1], now, woken):
++                info = missing_wake(conn, tid)
++                pending.append(int(info["wake_at"]) if info and info.get("wake_at") is not None else now)
+             continue
+         wake_at = payload["wake_at"]
++        pending.append(int(wake_at))  # a skipped or stale wake stays due: the next tick retries it
+         if wake_at > now:
+             continue
+         resume = payload.get("resume_status") if payload.get("resume_status") in ("ready", "review") else "ready"
+@@ -323,7 +337,7 @@ def wake_due_continuations(conn: sqlite3.Connection, *, now: Optional[int] = Non
+                 kb._append_event(conn, tid, CONTINUATION_WOKEN_EVENT,
+                                  {"status": new_status, "wake_at": wake_at})
+                 woken.append(tid)
+-    return woken
++    return woken, min(pending, default=None)
+ 
+ 
+ HUMAN_BLOCK_KINDS = ("needs_input", "capability")
+diff --git a/hermes_cli/kanban_db_connect.py b/hermes_cli/kanban_db_connect.py
+index 31c92e8a6f..3aabe80a50 100644
+--- a/hermes_cli/kanban_db_connect.py
++++ b/hermes_cli/kanban_db_connect.py
+@@ -1206,6 +1206,12 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
+     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_tenant ON tasks(tenant)")
+     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_idempotency ON tasks(idempotency_key)")
+     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)")
++    # [daveey] G2: partial indexes over the rows the every-tick, process-liveness reclaim sweeps start from
++    # (``release_leftover_local_claims``, ``reap_terminal_workers``, ``rate_limit_storm``). Liveness can't be
++    # gated on a revision, so the empty case must be cheap: an index holding only the candidates (almost always
++    # none), instead of a scan of every task or run per tick. Each sweep's WHERE repeats the index's WHERE.
++    # The task_runs ones (``_RUN_PARTIAL_INDEXES``) are made with that table's columns below.
++    conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_claim_lock ON tasks(status) WHERE claim_lock IS NOT NULL")
+ 
+     # [daveey] task_comments.origin_gateway: which gateway a comment came from (relay sender), so wake
+     # probes match the gateway, not a free-text author. Back-filled from ``hub:gw:<x>`` / ``<x>/t_...``.
+@@ -1244,6 +1250,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
+         for name, ddl in _TASK_RUN_COLUMNS:
+             if name not in run_cols:
+                 _add_column_if_missing(conn, "task_runs", name, ddl)
++        _ensure_run_partial_indexes(conn)
+         _backfill_legacy_inflight_runs(conn)
+ 
+     # One-shot event-kind rename: old names still worked but were awkward on
+@@ -1340,6 +1347,22 @@ def _backfill_legacy_inflight_runs(conn: sqlite3.Connection) -> None:
+ # down with it (including ``idx_events_run``, added by the additive pass above). To guard against this list
+ # drifting from SCHEMA_SQL, ``test_rebuilt_schema_matches_fresh`` asserts a rebuilt legacy DB is
+ # byte-identical to a fresh one.
++# [daveey] G2: partial indexes over task_runs for the every-tick reclaim sweeps (see ``idx_tasks_claim_lock``):
++# ``reap_terminal_workers`` (worker_pid) and the rate-limit storm. ``idx_runs_blocker_assert`` serves the
++# shared-blocker lanes' assertion scan (``blocker_states``), which reread every run's metadata on each pass the
++# board revision forces (~21 ms on the hub board); only ~100 runs carry a blocker id.
++_RUN_PARTIAL_INDEXES = (
++    "CREATE INDEX idx_runs_worker_pid ON task_runs(ended_at) WHERE worker_pid IS NOT NULL",
++    "CREATE INDEX idx_runs_rate_limited ON task_runs(ended_at) WHERE outcome = 'rate_limited'",
++    "CREATE INDEX idx_runs_blocker_assert ON task_runs(ended_at) WHERE metadata LIKE '%\"blocker_id\"%'",
++)
++
++
++def _ensure_run_partial_indexes(conn: sqlite3.Connection) -> None:
++    for ddl in _RUN_PARTIAL_INDEXES:
++        conn.execute(ddl.replace("CREATE INDEX ", "CREATE INDEX IF NOT EXISTS ", 1))
++
++
+ _REBUILD_SPECS = {
+     "task_events": (
+         "CREATE TABLE task_events ("
+@@ -1371,6 +1394,7 @@ _REBUILD_SPECS = {
+         (
+             "CREATE INDEX idx_runs_task ON task_runs(task_id, started_at)",
+             "CREATE INDEX idx_runs_status ON task_runs(status)",
++            *_RUN_PARTIAL_INDEXES,
+         ),
+     ),
+     "kanban_notify_subs": (
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 9fe0f6d861..958ee5c7f4 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -2005,9 +2005,8 @@ def _run_reclaim_phase(
+         result.released_leftover_claims = _la.timed("dispatch.release_leftover_local_claims", release_leftover_local_claims, conn)  # not gated: not running [daveey]
+     if has_running:
+         result.stale = _la.timed("dispatch.detect_stale_running", detect_stale_running, conn, stale_timeout_seconds=stale_timeout_seconds)
+-    # An ended primary run can still owe post-feed effects even with no running tasks.
+-    from hermes_cli.kanban_neutral_release import pending
+-    if has_running or pending(conn):
++    from hermes_cli.kanban_db_dispatch_claims import crash_sweep_due  # G2: runs while a local pid may have died
++    if crash_sweep_due(conn, has_running):
+         result.crashed = _la.timed("dispatch.detect_crashed_workers", detect_crashed_workers, conn, board=board)
+         result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
+         result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
+diff --git a/hermes_cli/kanban_db_dispatch_claims.py b/hermes_cli/kanban_db_dispatch_claims.py
+index b002c89d5b..189233dc97 100644
+--- a/hermes_cli/kanban_db_dispatch_claims.py
++++ b/hermes_cli/kanban_db_dispatch_claims.py
+@@ -84,3 +84,20 @@ def release_leftover_local_claims(conn: sqlite3.Connection) -> list[str]:
+     if released:
+         _kb()._log.info("kanban: released leftover local claims on non-running cards: %s", released)
+     return released
++
++
++def crash_sweep_due(conn: sqlite3.Connection, has_running: bool) -> bool:
++    """Whether ``detect_crashed_workers`` runs this tick. [daveey]
++
++    A running card, or an ended primary run that still owes post-feed effects (``kanban_neutral_release.pending``).
++    G2/C12: also a local worker pid on any card. Process death (``_pid_alive``) moves no revision and has no due
++    time, so this sweep is never gated and runs every tick while such a pid exists (``idx_tasks_claim_lock``).
++    """
++    from hermes_cli.kanban_neutral_release import pending
++
++    if has_running or pending(conn):
++        return True
++    prefix = _kb()._host_prefix()
++    return conn.execute(
++        "SELECT 1 FROM tasks WHERE claim_lock IS NOT NULL AND worker_pid IS NOT NULL "
++        "AND substr(claim_lock, 1, ?) = ? LIMIT 1", (len(prefix), prefix)).fetchone() is not None
+diff --git a/hermes_cli/kanban_idle_candidates.py b/hermes_cli/kanban_idle_candidates.py
+index baf5ab8d2f..403d7541ad 100644
+--- a/hermes_cli/kanban_idle_candidates.py
++++ b/hermes_cli/kanban_idle_candidates.py
+@@ -43,9 +43,11 @@ def _on_connection(conn, statuses, kinds, exclude_statuses=False):
+     if stamp is not None and cache.get(key, (None,))[0] == stamp:
+         return cache[key][1]
+     operator = 'NOT IN' if exclude_statuses else 'IN'
++    # [daveey] G2: drive from the event-kind index (a handful of rows) rather than probing it once per task in the
++    # status set (~6k done/archived cards on the hub board, ~5 ms a call, 5 calls a tick). Same rows.
+     found = tuple(row[0] for row in conn.execute(
+-        f"SELECT t.id FROM tasks t WHERE t.status {operator} ({','.join('?' * len(statuses))}) AND EXISTS "
+-        f"(SELECT 1 FROM task_events e WHERE e.task_id = t.id AND e.kind IN ({','.join('?' * len(kinds))}))",
++        f"SELECT t.id FROM tasks t WHERE t.status {operator} ({','.join('?' * len(statuses))}) AND t.id IN "
++        f"(SELECT e.task_id FROM task_events e WHERE e.kind IN ({','.join('?' * len(kinds))}))",
+         (*statuses, *kinds),
+     ).fetchall())
+     if stamp is not None:
+@@ -57,17 +59,35 @@ def _on_connection(conn, statuses, kinds, exclude_statuses=False):
+ 
+ 
+ def sweep_shared_blockers(conn, result) -> None:
+-    """Skip proven-empty lanes; positive candidates still obey time-based policy."""
++    """Skip proven-empty lanes; positive candidates still obey time-based policy.
++
++    [daveey] G2: each lane also skips while the board's content revision, this gateway's id and the config hold
++    and none of its clocks ran out (``kanban_sweep_gate``). Both lanes read only content rows (``task_runs``
++    outcomes and metadata, statuses, events). Their clocks: the probe interval of a blocker the probe lane deferred,
++    and the 14-day lookback, whose oldest assertion leaving the window reruns both lanes."""
+     from hermes_cli import kanban_db as kb
+     from hermes_cli.kanban_shared_blockers import probe_stranded_blockers, release_cleared_blockers
++    from hermes_cli.kanban_sweep_gate import config_key, gated
++    from hermes_cli.kanban_wake_check import own_gateway
++
++    def probe(c):
++        due: list = []  # lookback expiry of the oldest assertion + each deferred blocker's next probe moment
++        out = probe_stranded_blockers(c, due_out=due)
++        return out, min(due, default=None)
++
++    def release(c):
++        due: list = []
++        return release_cleared_blockers(c, oldest_out=due), min(due, default=None)
+ 
+     for statuses, handler, field in (
+-        (('blocked', 'scheduled', 'ready', 'review'), release_cleared_blockers, 'shared_blocker_released'),
+-        (('blocked',), probe_stranded_blockers, 'shared_blocker_probed'),
++        (('blocked', 'scheduled', 'ready', 'review'), release, 'shared_blocker_released'),
++        (('blocked',), probe, 'shared_blocker_probed'),
+     ):
+         try:
+             if conn.execute(f"SELECT 1 FROM tasks WHERE status IN ({','.join('?' * len(statuses))}) LIMIT 1",
+                             statuses).fetchone():
+-                setattr(result, field, handler(conn))
++                out, _due = gated(f"dispatch.{field}", conn, handler, conn, skipped=([], None),
++                                  extra=lambda c: (own_gateway(c), config_key()), run_due=lambda r: r[1])
++                setattr(result, field, out)
+         except Exception:  # health: allow BLE001 -- each independent maintenance source must leave the tick alive
+             kb._log.warning('kanban: %s failed', field, exc_info=True)
+diff --git a/hermes_cli/kanban_placement_forward.py b/hermes_cli/kanban_placement_forward.py
+index d36a52342c..ace2be2d53 100644
+--- a/hermes_cli/kanban_placement_forward.py
++++ b/hermes_cli/kanban_placement_forward.py
+@@ -319,10 +319,10 @@ def sweep_unresolved_archives(conn: sqlite3.Connection, *, now: Optional[float]
+     (:func:`_archive_request_id`), so a replay racing the original forward is applied once. Returns the ids whose
+     archive request was sent."""
+     now = time.time() if now is None else now
+-    rows = conn.execute(
+-        "SELECT t.id FROM tasks t WHERE t.status IN ('archived', 'done') AND EXISTS "
+-        "(SELECT 1 FROM task_events e WHERE e.task_id = t.id AND e.kind IN (?, ?))",
+-        (ARCHIVE_FORWARDED, CANCEL_INTENT)).fetchall()
++    # [daveey] G2: the candidate set is structural (status + event kinds), memoized on the task/event revision; the
++    # per-card retry, grace and give-up clocks below still run every tick.
++    from hermes_cli.kanban_idle_candidates import candidate_task_ids
++    rows = [(tid,) for tid in candidate_task_ids(conn, ("archived", "done"), (ARCHIVE_FORWARDED, CANCEL_INTENT))]
+     sent: list[str] = []
+     for (task_id,) in rows:
+         intent = _last_event(conn, task_id, CANCEL_INTENT)
+diff --git a/hermes_cli/kanban_shared_blockers.py b/hermes_cli/kanban_shared_blockers.py
+index 02718a758f..08fb8e029d 100644
+--- a/hermes_cli/kanban_shared_blockers.py
++++ b/hermes_cli/kanban_shared_blockers.py
+@@ -91,9 +91,13 @@ def run_effect(outcome: Optional[str], metadata) -> tuple[str, Optional[str]]:
+     (a neutral outcome or a re-park without the id: says nothing). [daveey]"""
+     from hermes_cli import kanban_db as kb
+ 
+-    meta = kb._json_dict(metadata)
+     if (outcome or "") in CLEAR_OUTCOMES:
+         return "clear", None
++    # [daveey] G2: most runs carry neither key; skip their JSON decode (the blocker lanes walk ~750 run histories
++    # a pass on the hub board). Writers use json.dumps, which never escapes an ASCII key name.
++    if isinstance(metadata, str) and '"blocker_id"' not in metadata and f'"{CLEAR_FLAG}"' not in metadata:
++        return "pass", None
++    meta = kb._json_dict(metadata)
+     bid = normalize_blocker_id(meta.get("blocker_id"))
+     if bid is not None:
+         return "assert", bid
+@@ -272,8 +276,20 @@ def _explicit_clear(kb, metadata) -> bool:
+     return kb._json_dict(metadata).get(CLEAR_FLAG) is True
+ 
+ 
+-def blocker_states(conn: sqlite3.Connection, *, now: Optional[int] = None) -> dict[str, BlockerState]:
+-    """Derive every recently asserted blocker's state from ``task_runs`` (read-only)."""
++def _note_window_exit(out: Optional[list], asserting) -> None:
++    """G2: when the oldest in-window assertion leaves the lookback, ``blocker_states`` can change unwritten."""
++    from hermes_cli import kanban_db as kb
++
++    if out is not None and asserting:
++        out.append(min(kb._to_epoch(r["ended_at"]) or 0 for r in asserting) + _LOOKBACK_SECONDS + 1)
++
++
++def blocker_states(conn: sqlite3.Connection, *, now: Optional[int] = None,
++                   oldest_out: Optional[list] = None) -> dict[str, BlockerState]:
++    """Derive every recently asserted blocker's state from ``task_runs`` (read-only).
++
++    ``oldest_out`` (G2) receives the moment the oldest assertion inside the lookback window leaves it: then
++    this derivation can change with no row changing."""
+     from hermes_cli import kanban_db as kb
+ 
+     now = int(time.time()) if now is None else int(now)
+@@ -283,6 +299,7 @@ def blocker_states(conn: sqlite3.Connection, *, now: Optional[int] = None) -> di
+         "ORDER BY id",
+         (now - _LOOKBACK_SECONDS,),
+     ).fetchall()
++    _note_window_exit(oldest_out, asserting)
+     states: dict[str, BlockerState] = {}
+     scopes: dict[str, set[Optional[str]]] = {}
+     task_ids: set[str] = set()
+@@ -508,7 +525,8 @@ def _released_as_probe(conn: sqlite3.Connection, st: BlockerState, task_id: str)
+     return False
+ 
+ 
+-def release_cleared_blockers(conn: sqlite3.Connection, *, now: Optional[int] = None) -> list[str]:
++def release_cleared_blockers(conn: sqlite3.Connection, *, now: Optional[int] = None,
++                             oldest_out: Optional[list] = None) -> list[str]:
+     """Wake parked cards and retire ready/review hold evidence after a clear.
+     Returns only task ids whose lane changed (ready/review cards remain queued)."""
+     from hermes_cli import kanban_db as kb
+@@ -517,7 +535,7 @@ def release_cleared_blockers(conn: sqlite3.Connection, *, now: Optional[int] = N
+     # Retained executor copies own host-local wake probes, not shared-wall policy writes.
+     foreign = kwc.foreign_ids(conn)
+     released: list[str] = []
+-    for st in blocker_states(conn, now=now).values():
++    for st in blocker_states(conn, now=now, oldest_out=oldest_out).values():
+         if st.is_open or st.cleared_by is None:
+             continue
+         by_task, by_run = st.cleared_by
+@@ -559,7 +577,7 @@ def release_cleared_blockers(conn: sqlite3.Connection, *, now: Optional[int] = N
+ 
+ 
+ def probe_stranded_blockers(conn: sqlite3.Connection, *, now: Optional[int] = None,
+-                            interval: Optional[int] = None) -> list[str]:
++                            interval: Optional[int] = None, due_out: Optional[list] = None) -> list[str]:
+     """Unblock ONE ``blocked`` card per open blocker that nothing else would probe. Returns task ids.
+ 
+     :func:`shared_blocker_guard` only spaces out ``ready`` cards, so a blocker whose cards are all
+@@ -576,7 +594,7 @@ def probe_stranded_blockers(conn: sqlite3.Connection, *, now: Optional[int] = No
+     if interval is None:
+         interval = probe_interval_seconds()
+     probed: list[str] = []
+-    for st in blocker_states(conn, now=now).values():
++    for st in blocker_states(conn, now=now, oldest_out=due_out).values():
+         if not st.is_open or not st.behind:
+             continue
+         ids = sorted(t for t in st.behind if task_applies(conn, st, t))
+@@ -589,6 +607,8 @@ def probe_stranded_blockers(conn: sqlite3.Connection, *, now: Optional[int] = No
+             continue   # the ready-card guard already spaces those probes
+         last = max([st.asserted_at, *st.probe_starts.values()])
+         if now - last < interval:
++            if due_out is not None:
++                due_out.append(last + interval)  # G2: the time policy's next due moment for this blocker
+             continue
+         candidates = sorted((st.behind[r["id"]], r["id"]) for r in rows
+                             if r["status"] == "blocked" and not r["human_request"])
+diff --git a/hermes_cli/kanban_sweep_gate.py b/hermes_cli/kanban_sweep_gate.py
+new file mode 100644
+index 0000000000..bcf02d318f
+--- /dev/null
++++ b/hermes_cli/kanban_sweep_gate.py
+@@ -0,0 +1,174 @@
++"""Run a dispatcher sub-sweep only when its input moved or a due time derived from its data has arrived. [daveey]
++
++G2 of the change-proportional design (t_01a1d563324d7e8e §3, review R13, condition C12). Every ``dispatch_once``
++tick used to run each reclaim/maintenance sub-sweep in full, although on a quiet board none of their inputs moved.
++
++A gated sweep runs when any of these holds:
++
++* its **key** is unknown (no activity counter in the file, the caller holds a transaction, a read failed);
++* its key differs from the key read *before* its last completed run. The key is the file identity, the
++  ``kanban_activity_revision`` counter of the task tables (claim, lease and heartbeat writes do not move it) and
++  the sweep's own ``extra`` read of any other table it reads;
++* its **due time** has arrived. ``due(conn)`` is re-read on every tick from the rows (``MIN(claim_expires)``, a
++  blocker's next probe, a park's wake), never memoized: time and process liveness are decisions, not structure.
++  It returns the earliest epoch second at which the sweep's own time policy could act on unchanged rows, or None
++  when nothing in the rows can come due.
++
++The key is read before the sweep runs, so a write that lands during the run moves the next tick's key. A sweep's
++own writes move the key too, which costs one extra run and then settles.
++"""
++from __future__ import annotations
++
++import os
++import sqlite3
++import threading
++import time
++from pathlib import Path
++from typing import Any, Callable, Hashable, Optional
++
++from hermes_cli import kanban_activity_revision as _rev
++from hermes_cli import loop_accounting as _la
++
++_GATES: dict[tuple, tuple] = {}  # (file identity, sweep name) -> (key read before its last run, run due time)
++_MEMOS: dict[tuple, tuple] = {}  # (file identity, memo name) -> (key, value)
++_LOCK = threading.Lock()
++_MAX = 1024
++
++
++def file_identity(conn: sqlite3.Connection) -> Optional[tuple]:
++    """``(path, device, inode)`` of ``conn``'s main file, or None (in-memory, unreadable)."""
++    try:
++        path = next((f for _s, n, f in conn.execute("PRAGMA database_list") if n == "main"), None)
++    except sqlite3.Error:
++        return None
++    if not path:
++        return None
++    try:
++        st = os.stat(path)
++    except OSError:
++        return None
++    return (path, st.st_dev, st.st_ino)
++
++
++def content_revision(conn: sqlite3.Connection, ident: Optional[tuple] = None) -> Optional[tuple]:
++    """``(revision, schema_version)`` of the board's task tables, or None when the counter cannot vouch for them."""
++    ident = ident or file_identity(conn)
++    if ident is None:
++        return None
++    if conn.in_transaction:
++        # Inside the caller's transaction the counter is read in the same snapshot as the rows, and the caller's
++        # own uncommitted writes have bumped it through the triggers, so it still vouches for what the caller
++        # sees. Only the coverage proof (a sqlite_master scan that needs its own BEGIN) must already be known.
++        with _rev._COVERED_LOCK:
++            version = _rev._COVERED.get((ident[0], ident[1], ident[2], _rev.LOCAL_TABLES))
++        if version is None:
++            return None
++        try:
++            row = conn.execute(_rev._READ_SQL).fetchone()
++        except sqlite3.Error:
++            return None
++        return (int(row[0]), int(row[1])) if row is not None and int(row[1]) == version else None
++    try:
++        return _rev._covered_read(conn, Path(ident[0]), (ident[1], ident[2]), _rev.LOCAL_TABLES)
++    except sqlite3.Error:
++        return None
++
++
++def _put(table: dict, slot: tuple, value) -> None:
++    with _LOCK:
++        if len(table) >= _MAX:
++            table.clear()
++        table[slot] = value
++
++
++def key(conn: sqlite3.Connection, extra: Optional[Callable[[sqlite3.Connection], Hashable]] = None,
++        ident: Optional[tuple] = None) -> Optional[tuple]:
++    """The gate key for one sweep (see the module docstring), or None when unknown."""
++    ident = ident or file_identity(conn)
++    revision = content_revision(conn, ident)
++    if revision is None:
++        return None
++    try:
++        return (ident, revision, extra(conn) if extra is not None else None)
++    except sqlite3.Error:
++        return None
++
++
++def is_due(conn: sqlite3.Connection, due: Optional[Callable[[sqlite3.Connection], Optional[float]]],
++           now: float) -> bool:
++    if due is None:
++        return False
++    try:
++        at = due(conn)
++    except sqlite3.Error:
++        return True  # an unreadable due time is unknown: run
++    return at is not None and float(at) <= now
++
++
++def gated(name: str, conn: sqlite3.Connection, fn: Callable, /, *args: Any,
++          extra: Optional[Callable[[sqlite3.Connection], Hashable]] = None,
++          due: Optional[Callable[[sqlite3.Connection], Optional[float]]] = None,
++          run_due: Optional[Callable[[Any], Optional[float]]] = None,
++          skipped: Any = None, now: Optional[float] = None, **kwargs: Any) -> Any:
++    """Call ``fn(*args, **kwargs)`` as the accounted pass ``name`` unless its key is unchanged and no due time has
++    arrived; then return ``skipped`` and count a skip.
++
++    ``due(conn)`` is read on every tick (for due times kept in bookkeeping columns or tables outside the key).
++    ``run_due(result)`` is the earliest due time the run itself derived from the rows it read (a park's wake, a
++    probe interval's end); it is kept with the key, which is sound because those rows cannot change while the key
++    holds."""
++    ident = file_identity(conn)
++    k = key(conn, extra, ident)
++    storable = k is not None and not conn.in_transaction  # see ``memo``: a rolled-back bump can recur
++    slot = (ident, name)
++    t = time.time() if now is None else now
++    held = _GATES.get(slot)
++    if (k is not None and held is not None and held[0] == k and (held[1] is None or t < held[1])
++            and not is_due(conn, due, t)):
++        with _la.pass_(name, skipped=True):
++            return skipped
++    with _LOCK:
++        _GATES.pop(slot, None)  # a failed run must not leave the old key vouching for it
++    result = _la.timed(name, fn, *args, **kwargs)
++    if storable:
++        try:
++            at = run_due(result) if run_due is not None else None
++        except Exception:  # health: allow BLE001 -- an unknown due time only means the next tick runs
++            return result
++        _put(_GATES, slot, (k, None if at is None else float(at)))
++    return result
++
++
++def memo(name: str, conn: sqlite3.Connection, compute: Callable[[sqlite3.Connection], Any],
++         extra: Optional[Callable[[sqlite3.Connection], Hashable]] = None) -> Any:
++    """``compute(conn)``, reused while the gate key holds. Only for structural values (no clock, no liveness);
++    the caller must not mutate the returned value."""
++    ident = file_identity(conn)
++    k = key(conn, extra, ident)
++    if k is None:
++        return compute(conn)
++    slot = (ident, name)
++    hit = _MEMOS.get(slot)
++    if hit is not None and hit[0] == k:
++        return hit[1]
++    value = compute(conn)
++    if not conn.in_transaction:  # a key read in a transaction that later rolls back could recur on other rows
++        _put(_MEMOS, slot, (k, value))
++    return value
++
++
++def config_key(_conn: Optional[sqlite3.Connection] = None) -> Hashable:
++    """The config file's cache signature: sweeps whose policy reads ``kanban.*`` config rerun when it changes."""
++    try:
++        from hermes_cli.config import get_config_path
++        from hermes_cli.config_backend import config_cache_version_or_none
++        return config_cache_version_or_none(get_config_path())
++    except Exception:  # health: allow BLE001 -- an unreadable signature is a fresh key, so the sweep runs
++        return object()
++
++
++def reset() -> None:
++    """Forget every gate and memo (tests, and a board file replaced in place)."""
++    with _LOCK:
++        _GATES.clear()
++        _MEMOS.clear()
+diff --git a/hermes_cli/kanban_wake_check.py b/hermes_cli/kanban_wake_check.py
+index bc401d8426..184985aa48 100644
+--- a/hermes_cli/kanban_wake_check.py
++++ b/hermes_cli/kanban_wake_check.py
+@@ -320,9 +320,16 @@ def foreign_ids(conn: sqlite3.Connection, own: Optional[str] = None) -> set[str]
+     own = own or own_gateway(conn)
+     if not own:
+         return set()
++
++    def scan(c: sqlite3.Connection) -> frozenset[str]:
++        rows = c.execute("SELECT id FROM tasks WHERE created_on IS NOT NULL AND created_on != ?", (own,))
++        return frozenset(r[0] for r in rows.fetchall())
++
++    # [daveey] Structural (``created_on`` is a content column, so any change moves the task-table revision):
++    # reuse the scan while the revision holds. It ran ~7 times a tick, a full ``tasks`` scan each (G2).
++    from hermes_cli.kanban_sweep_gate import memo
+     try:
+-        rows = conn.execute("SELECT id FROM tasks WHERE created_on IS NOT NULL AND created_on != ?", (own,))
+-        return {r[0] for r in rows.fetchall()}
++        return memo(f"foreign_ids:{own}", conn, scan)
+     except sqlite3.OperationalError:
+         return set()
+ 
+diff --git a/hermes_cli/kanban_wake_episode.py b/hermes_cli/kanban_wake_episode.py
+index b5d6e6f9e5..2fef162718 100644
+--- a/hermes_cli/kanban_wake_episode.py
++++ b/hermes_cli/kanban_wake_episode.py
+@@ -242,10 +242,10 @@ def repark(conn: sqlite3.Connection, task_id: str, cmd: str | None) -> None:
+ 
+ def stale_seconds() -> float:
+     from hermes_cli.config_backend import ConfigBackendUnavailable
+-    from hermes_cli.config import load_config
++    from hermes_cli.config import load_config_readonly
+ 
+     try:
+-        section = load_config().get("kanban")
++        section = load_config_readonly().get("kanban")  # read-only: no per-tick deepcopy (G2)
+     except (ConfigBackendUnavailable, OSError, ValueError):
+         section = None
+     value = section.get("wake_check_stale_hours") if isinstance(section, dict) else None
+diff --git a/scripts/kanban_reclaim_replay_bench.py b/scripts/kanban_reclaim_replay_bench.py
+new file mode 100644
+index 0000000000..29928357df
+--- /dev/null
++++ b/scripts/kanban_reclaim_replay_bench.py
+@@ -0,0 +1,150 @@
++"""Replay benchmark for the dispatcher reclaim phase (G2, design t_01a1d563324d7e8e): real ``dispatch_once``
++ticks over a COPY of a board in a scratch home, CPU per tick per sweep from ``loop_accounting``.
++
++usage: scripts/hermes-python scripts/kanban_reclaim_replay_bench.py <worktree> <board copy> <ticks>
++           [--churn N | --replay SECONDS] [--json out] [--profile]
++
++--churn N       before every Nth tick, one content write (a comment), so the board revision moves; 0 = write-free.
++--replay S      replay the copy's own write cadence: tick i writes iff the i-th 15 s bucket of the last S seconds
++                of the board's history had a content event (heartbeats excluded: they never move the revision).
++
++Side effects are stubbed: wake-check probes, the CI sweep, the capability refresh, worker placement (Board),
++spawns (max_spawn=0), signals and subprocesses; any DB path outside the scratch home opens an empty read-only file.
++"""
++import json
++import os
++import shutil
++import sqlite3
++import sys
++import tempfile
++import time
++from pathlib import Path
++
++INTERVAL = 15
++wt, src, ticks = sys.argv[1], sys.argv[2], int(sys.argv[3])
++churn = int(sys.argv[sys.argv.index("--churn") + 1]) if "--churn" in sys.argv else 0
++replay = int(sys.argv[sys.argv.index("--replay") + 1]) if "--replay" in sys.argv else 0
++out = sys.argv[sys.argv.index("--json") + 1] if "--json" in sys.argv else None
++schedule = None
++if replay:
++    ro = sqlite3.connect(f"file:{os.path.abspath(src)}?mode=ro", uri=True)
++    end = ro.execute("SELECT MAX(created_at) FROM task_events").fetchone()[0] or 0
++    start = end - replay
++    hit = {int(r[0]) for r in ro.execute(
++        "SELECT DISTINCT (created_at - ?) / ? FROM task_events WHERE kind != 'heartbeat' AND created_at > ? "
++        "UNION SELECT DISTINCT (created_at - ?) / ? FROM task_comments WHERE created_at > ?",
++        (start, INTERVAL, start, start, INTERVAL, start))}
++    ro.close()
++    ticks = min(ticks, replay // INTERVAL)
++    schedule = [i in hit for i in range(ticks)]
++home = tempfile.mkdtemp(prefix="reclaim-bench-home-")
++os.environ["HERMES_HOME"] = home
++for k in list(os.environ):
++    if k.startswith("HERMES_KANBAN") or k.startswith("HERMES_SESSION"):
++        del os.environ[k]
++shutil.copy(src, os.path.join(home, "kanban.db"))
++Path(home, "config.yaml").write_text(f"kanban:\n  dispatch_interval_seconds: {INTERVAL}\n", encoding="utf-8")
++sys.path.insert(0, wt)
++_orig_connect = sqlite3.connect
++
++
++def _guarded(db, *a, **k):
++    p = str(db)
++    if p.startswith("file:"):
++        p = "/" + p[5:].split("?")[0].lstrip("/")
++    if p not in (":memory:", "", "/:memory:") and not os.path.realpath(p).startswith(os.path.realpath(home)):
++        k.pop("uri", None)  # a board row names a live-host DB: never open the real file
++        return _orig_connect(f"file:{home}/absent-{os.path.basename(p)}?mode=ro", *a[1:], uri=True, **k)
++    return _orig_connect(db, *a, **k)
++
++
++sqlite3.connect = _guarded
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as d
++from hermes_cli import loop_accounting as la
++import hermes_cli.kanban_capability_registry as cr
++import hermes_cli.kanban_ci_progress as ci
++import hermes_cli.kanban_wake_check as kwc
++import hermes_cli.kanban_worker_placement as wp
++import subprocess
++
++
++class _NoPool:
++    def submit(self, *a, **k):
++        raise RuntimeError("bench: probe spawn refused")
++
++
++class _NoProc:
++    def __init__(self, *a, **k):
++        raise PermissionError("bench: subprocess refused")
++
++
++_orig_kill = os.kill
++
++
++def _no_killpg(*a):
++    raise PermissionError("bench: killpg refused")
++
++
++def _no_kill(pid, sig):
++    if sig != 0:
++        raise PermissionError(f"bench: signal {sig} to {pid} refused")
++    return _orig_kill(pid, 0)
++
++
++kwc._pool = lambda: _NoPool()
++os.kill = _no_kill
++os.__dict__["killpg"] = _no_killpg  # POSIX-only bench: refuse process-group signals
++kb._host_prefix = lambda: "bench-nohost:"
++kb._claimer_id = lambda: "bench-nohost:1"
++subprocess.Popen = _NoProc
++ci.submit_sweep = lambda *a, **k: None
++cr.maybe_refresh_async = lambda **k: False
++wp.dispatch_tick = lambda conn: None
++
++conn = kbc.connect()
++row = conn.execute("SELECT id FROM tasks WHERE status NOT IN ('done','archived') ORDER BY created_at DESC LIMIT 1")
++t_open = (row.fetchone() or [None])[0]
++
++
++def tick():
++    d.dispatch_once(conn, spawn_fn=lambda *a, **k: None, max_spawn=0, board=None)
++
++
++tick()  # warm: first tick installs triggers and imports
++base = {k: dict(v) for k, v in la.counters().items()}
++prof = None
++if "--profile" in sys.argv:
++    import cProfile
++    prof = cProfile.Profile()
++    prof.enable()
++writes = 0
++c0, w0 = time.thread_time(), time.perf_counter()
++for i in range(ticks):
++    write = schedule[i] if schedule is not None else bool(churn and i % churn == 0)
++    if write and t_open:
++        writes += 1
++        with kb.write_txn(conn):
++            kb._insert_comment(conn, t_open, "bench", f"churn {i}", int(time.time()))
++    tick()
++cpu, wall = time.thread_time() - c0, time.perf_counter() - w0
++if prof is not None:
++    import pstats
++    prof.disable()
++    pstats.Stats(prof).sort_stats("cumulative").print_stats("hermes_cli", 60)
++res = {}
++for k, v in la.counters().items():
++    if k.startswith("dispatch"):
++        b = base.get(k, {})
++        res[k] = {"runs": v["runs"] - b.get("runs", 0), "skips": v["skips"] - b.get("skips", 0),
++                  "cpu_ms_per_tick": round(1000 * (v["cpu_s"] - b.get("cpu_s", 0.0)) / ticks, 3)}
++summary = {"board": os.path.basename(src), "ticks": ticks, "churn": churn, "replay_s": replay,
++           "write_ticks": writes, "cpu_ms_per_tick_total": round(1000 * cpu / ticks, 3),
++           "core_pct_at_interval": round(100 * cpu / ticks / INTERVAL, 3), "wall_s": round(wall, 2), "sweeps": res}
++print(json.dumps(summary, indent=1))
++if out:
++    with open(out, "w", encoding="utf-8") as f:
++        json.dump(summary, f, indent=1)
++shutil.rmtree(home, ignore_errors=True)
+diff --git a/tests/hermes_cli/test_kanban_sweep_gate.py b/tests/hermes_cli/test_kanban_sweep_gate.py
+new file mode 100644
+index 0000000000..d4d10973a9
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_sweep_gate.py
+@@ -0,0 +1,307 @@
++"""G2: dispatcher reclaim sub-sweeps run when their input revision moved or a due time from their data arrived.
++
++Design t_01a1d563324d7e8e §3 (G2), review R13, condition C12. A quiet board (no content writes) must still:
++reclaim an expired claim within one tick (claim expiry is a bookkeeping column: it never moves the revision),
++detect a SIGKILLed local worker within one tick, release a recovered quota block, and run every gated sweep once
++its own due time passes with nothing else changing.
++"""
++from __future__ import annotations
++
++import os
++import signal
++import subprocess
++import sys
++import time
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_activity_revision as rev
++from hermes_cli import kanban_continuation as kc
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_db_dispatch_quota as kbq
++from hermes_cli import kanban_sweep_gate as gate
++from hermes_cli import kanban_wake_check as kwc
++from hermes_cli import loop_accounting as la
++
++
++@pytest.fixture
++def home(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("HERMES_PROFILE", "default")
++    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
++    for var in ("HERMES_KANBAN_DB", "HERMES_KANBAN_WORKSPACES_ROOT", "HERMES_KANBAN_BOARD", "HERMES_SESSION_ID",
++                "HERMES_DELEGATED_CHILD_CONTEXT", "HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID"):
++        monkeypatch.delenv(var, raising=False)
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    kb._INITIALIZED_PATHS.clear()
++    kb.init_db()
++    gate.reset()
++    yield home
++    gate.reset()
++
++
++def _revision(conn) -> int:
++    return conn.execute("SELECT revision FROM kanban_activity_revision").fetchone()[0]
++
++
++def _tick(conn):
++    return kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: None, max_spawn=0)
++
++
++def _runs(name: str) -> tuple[int, int]:
++    st = la.counters().get(name, {})
++    return st.get("runs", 0), st.get("skips", 0)
++
++
++# -- the gate itself --------------------------------------------------------------------------------------------
++
++def test_gate_skips_unchanged_input_and_reruns_when_content_moves(home):
++    calls = []
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="t", assignee="nobody")
++        for _ in range(3):
++            gate.gated("test.sweep", conn, lambda: calls.append(1))
++        assert len(calls) == 1
++        kb.add_comment(conn, tid, "someone", "a content write")
++        gate.gated("test.sweep", conn, lambda: calls.append(1))
++        assert len(calls) == 2
++
++
++def test_gate_bookkeeping_write_moves_nothing_so_a_due_time_must_carry_it(home):
++    """Why every gated sweep needs a data-derived due time: claim/lease columns never bump (R13)."""
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="t", assignee="nobody")
++        before = _revision(conn)
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET claim_expires = 1, last_heartbeat_at = 2 WHERE id = ?", (tid,))
++        assert _revision(conn) == before
++
++
++def test_gate_runs_when_the_live_due_time_arrives(home):
++    calls = []
++    with kbc.connect_closing() as conn:
++        kb.create_task(conn, title="t", assignee="nobody")
++        due = lambda c: 1_000  # e.g. MIN(next_at) of a bookkeeping table, read every tick
++        gate.gated("test.due", conn, lambda: calls.append(1), due=due, now=900)
++        gate.gated("test.due", conn, lambda: calls.append(1), due=due, now=999)
++        assert len(calls) == 1
++        gate.gated("test.due", conn, lambda: calls.append(1), due=due, now=1_000)
++        assert len(calls) == 2
++
++
++def test_gate_keeps_the_runs_own_due_time_with_its_key(home):
++    calls = []
++    with kbc.connect_closing() as conn:
++        kb.create_task(conn, title="t", assignee="nobody")
++
++        def sweep():
++            calls.append(1)
++            return 2_000
++
++        for now in (1_000, 1_500, 1_999):
++            gate.gated("test.run_due", conn, sweep, run_due=lambda at: at, now=now)
++        assert len(calls) == 1
++        gate.gated("test.run_due", conn, sweep, run_due=lambda at: at, now=2_000)
++        assert len(calls) == 2
++
++
++def test_gate_without_the_revision_counter_always_runs(home):
++    calls = []
++    with kbc.connect_closing() as conn:
++        kb.create_task(conn, title="t", assignee="nobody")
++        with kb.write_txn(conn):
++            rev.drop_triggers(conn)
++        rev._COVERED.clear()
++        for _ in range(3):
++            gate.gated("test.unknown", conn, lambda: calls.append(1))
++        assert len(calls) == 3
++
++
++def test_gate_failed_run_does_not_vouch(home):
++    calls = []
++
++    def boom():
++        calls.append(1)
++        raise RuntimeError("x")
++
++    with kbc.connect_closing() as conn:
++        kb.create_task(conn, title="t", assignee="nobody")
++        for _ in range(2):
++            with pytest.raises(RuntimeError):
++                gate.gated("test.fail", conn, boom)
++        assert len(calls) == 2
++
++
++def test_foreign_ids_memo_follows_new_copies(home):
++    with kbc.connect_closing() as conn:
++        if "created_on" not in {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}:
++            with kb.write_txn(conn):  # a board that never synced has no provenance column yet
++                conn.execute("ALTER TABLE tasks ADD COLUMN created_on TEXT")
++            rev.ensure_revision(conn, rev.LOCAL_TABLES)
++        mine = kb.create_task(conn, title="mine", assignee="nobody")
++        other = kb.create_task(conn, title="copy", assignee="nobody")
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET created_on = 'gw-a' WHERE id = ?", (mine,))
++        assert kwc.foreign_ids(conn, "gw-a") == set()
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET created_on = 'gw-b' WHERE id = ?", (other,))
++        assert kwc.foreign_ids(conn, "gw-a") == {other}
++        assert kwc.foreign_ids(conn, "gw-a") == {other}
++        conn.execute("BEGIN IMMEDIATE")  # inside a transaction: the caller's own uncommitted write counts
++        conn.execute("UPDATE tasks SET created_on = 'gw-c' WHERE id = ?", (mine,))
++        assert kwc.foreign_ids(conn, "gw-a") == {other, mine}
++        conn.rollback()
++        assert kwc.foreign_ids(conn, "gw-a") == {other}
++
++
++@pytest.mark.parametrize("sql, index", [
++    ("SELECT id FROM task_runs WHERE ended_at IS NOT NULL AND ended_at <= 5 "
++     "AND worker_pid IS NOT NULL AND worker_started_at IS NOT NULL", "idx_runs_worker_pid"),
++    ("SELECT id FROM tasks WHERE status IN ('ready','todo','review','blocked','scheduled','done') "
++     "AND claim_lock IS NOT NULL AND substr(claim_lock, 1, 3) = 'h:'", "idx_tasks_claim_lock"),
++    ("SELECT COUNT(*) FROM task_runs WHERE outcome = 'rate_limited' AND ended_at > 5", "idx_runs_rate_limited"),
++    ("SELECT id FROM task_runs WHERE ended_at IS NOT NULL AND ended_at >= 5 AND metadata LIKE '%\"blocker_id\"%' "
++     "ORDER BY id", "idx_runs_blocker_assert"),
++])
++def test_liveness_sweeps_start_from_a_partial_index(home, sql, index):
++    """Process-liveness sweeps run every tick, so their empty case must not scan every task or run."""
++    with kbc.connect_closing() as conn:
++        plan = " ".join(r[-1] for r in conn.execute("EXPLAIN QUERY PLAN " + sql))
++        assert index in plan, plan
++
++
++# -- the tick: quiet-board guarantees (R13, C12) ---------------------------------------------------------------
++
++@pytest.mark.parametrize("outcome, metadata, want", [
++    ("blocked", '{"blocker_id": "Wall X"}', ("assert", "wall-x")),
++    ("blocked", '{"clear_blocker": true}', ("clear", None)),
++    ("blocked", '{"clear_blocker": false}', ("pass", None)),
++    ("blocked", '{"note": "blocker_id mentioned in prose"}', ("pass", None)),
++    ("blocked", '{"x": 1}', ("pass", None)),
++    ("completed", '{"blocker_id": "w"}', ("clear", None)),
++    ("blocked", {"blocker_id": "w"}, ("pass", None)),  # unchanged: _json_dict only decodes text
++    ("blocked", None, ("pass", None)),
++])
++def test_run_effect_fast_path_matches_the_parsed_answer(outcome, metadata, want):
++    from hermes_cli.kanban_shared_blockers import run_effect
++    assert run_effect(outcome, metadata) == want
++
++
++def test_expired_claim_on_a_write_free_board_is_reclaimed_within_one_tick(home):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="claimed", assignee="nobody")
++        assert kb.claim_task(conn, tid)
++        _tick(conn)
++        _tick(conn)  # every gate now holds its key
++        assert kb.get_task(conn, tid).status == "running"
++        before = _revision(conn)
++        with kb.write_txn(conn):  # the lease runs out: a bookkeeping write, the revision does not move
++            conn.execute("UPDATE tasks SET claim_expires = ? WHERE id = ?", (int(time.time()) - 1, tid))
++            conn.execute("UPDATE task_runs SET claim_expires = ? WHERE task_id = ?", (int(time.time()) - 1, tid))
++        assert _revision(conn) == before
++        res = _tick(conn)
++        assert res.reclaimed >= 1
++        assert kb.get_task(conn, tid).status == "ready"
++
++
++def test_sigkilled_worker_on_a_quiet_board_is_detected_within_one_tick(home):
++    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
++    try:
++        with kbc.connect_closing() as conn:
++            tid = kb.create_task(conn, title="worker", assignee="nobody")
++            assert kb.claim_task(conn, tid)
++            kbd._set_worker_pid(conn, tid, proc.pid)
++            _tick(conn)
++            _tick(conn)
++            assert kb.get_task(conn, tid).status == "running"
++            before = _revision(conn)
++            os.kill(proc.pid, signal.SIGKILL)
++            proc.wait(timeout=10)
++            assert _revision(conn) == before  # process death writes nothing
++            res = _tick(conn)
++            assert tid in res.crashed
++            assert kb.get_task(conn, tid).status != "running"
++    finally:
++        if proc.poll() is None:
++            proc.kill()
++            proc.wait()
++
++
++def test_quota_recovery_still_fires_after_quiet_ticks(home, monkeypatch):
++    err = "pid 82594 exited rate-limited (quota wall) — requeued without counting a failure"
++    reason = ("Held in ready by the respawn guard (blocker_auth) for 30 min without running. "
++              f"Last error: {err} Fix the cause (credentials, quota, PR binding), then unblock.")
++    now = int(time.time()) - 600
++    with kbc.connect_closing() as conn:
++        monkeypatch.setattr(kb.time, "time", lambda: now)
++        tid = kb.create_task(conn, title="held", assignee="nobody-runs-this")
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET last_failure_error=? WHERE id=?", (err, tid))
++        assert kb.block_task(conn, tid, reason=reason, kind="capability")
++        monkeypatch.undo()
++        for _ in range(2):
++            assert tid not in (_tick(conn).quota_block_released or [])
++        monkeypatch.setattr(kb.time, "time", lambda: now + 60)
++        other = kb.create_task(conn, title="other", assignee="b")
++        kb.claim_task(conn, other)
++        assert kb.complete_task(conn, other, result="ok")
++        monkeypatch.undo()
++        assert tid in _tick(conn).quota_block_released
++        assert kbq  # keeps its own input (blocked rows + completed runs) and cadence: never gated
++
++
++# -- each gated sweep runs when its own due time passes with no other change ----------------------------------
++
++def test_continuation_park_wakes_at_its_wake_time_with_no_other_change(home):
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="parked", assignee="nobody")
++        wake_at = int(time.time()) + 900
++        assert kb.schedule_task(conn, tid, reason=f"SCHEDULED_UNTIL={wake_at} soak", clock_only=True)
++        wake_at = kc.pending_wake(conn, tid)["wake_at"]
++        _, skips0 = _runs("dispatch.continuation_parks")
++        for now in (wake_at - 100, wake_at - 50, wake_at - 1):
++            assert kc.wake_due_continuations(conn, now=now) == []
++        _, skips1 = _runs("dispatch.continuation_parks")
++        assert skips1 - skips0 >= 2, "an unchanged board must not rescan its parks"
++        assert kc.wake_due_continuations(conn, now=wake_at) == [tid]
++        assert kb.get_task(conn, tid).status in ("ready", "todo")
++
++
++def test_stranded_blocker_probe_runs_when_its_interval_ends_with_no_other_change(home, monkeypatch):
++    from hermes_cli import kanban_shared_blockers as ksb
++    from hermes_cli.kanban_idle_candidates import sweep_shared_blockers
++
++    monkeypatch.setattr(ksb, "probe_interval_seconds", lambda cfg=None: 1800)
++    t0 = int(time.time())
++    with kbc.connect_closing() as conn:
++        from unittest import mock
++
++        from hermes_cli import kanban_timed_park as ktp
++        tid = kb.create_task(conn, title="behind", assignee="default")
++        assert kb.claim_task(conn, tid)
++        with mock.patch.object(ktp, "park_mode", lambda *a, **k: None):  # a plain ``blocked`` card, no wake
++            assert kb.block_task(conn, tid, reason="wall", kind="capability", blocker_id="wall-x")
++        assert kb.get_task(conn, tid).status == "blocked"
++        assert ksb.blocker_states(conn)["wall-x"].is_open
++
++        class R:
++            shared_blocker_released = shared_blocker_probed = None
++
++        clock = {"t": t0 + 10}
++        monkeypatch.setattr(kb.time, "time", lambda: clock["t"])
++        r = R()
++        sweep_shared_blockers(conn, r)
++        assert r.shared_blocker_probed == []
++        _, skips0 = _runs("dispatch.shared_blocker_probed")
++        clock["t"] = t0 + 1000
++        sweep_shared_blockers(conn, r)
++        assert _runs("dispatch.shared_blocker_probed")[1] == skips0 + 1  # gated: nothing moved, not yet due
++        clock["t"] = t0 + 1801
++        sweep_shared_blockers(conn, r)
++        assert r.shared_blocker_probed == [tid]
++        assert kb.get_task(conn, tid).status != "blocked"
+diff --git a/tests/hermes_cli/test_kanban_wake_episode.py b/tests/hermes_cli/test_kanban_wake_episode.py
+index 3aa2c02194..d8082a4867 100644
+--- a/tests/hermes_cli/test_kanban_wake_episode.py
++++ b/tests/hermes_cli/test_kanban_wake_episode.py
+@@ -210,7 +210,7 @@ def test_eviction_deletes_episode(parked):
+ @pytest.mark.parametrize("value", [0, -1, "invalid", float("nan"), float("inf"), None])
+ def test_invalid_config_uses_default(monkeypatch, value):
+     from hermes_cli import config
+-    monkeypatch.setattr(config, "load_config", lambda: {"kanban": {"wake_check_stale_hours": value}})
++    monkeypatch.setattr(config, "load_config_readonly", lambda: {"kanban": {"wake_check_stale_hours": value}})
+     assert wc.episode.stale_seconds() == 48 * HOUR
+ 
+ 
+@@ -221,9 +221,9 @@ def test_config_backend_outage_keeps_default(monkeypatch):
+     def unavailable():
+         raise ConfigBackendUnavailable("unavailable")
+ 
+-    monkeypatch.setattr(config, "load_config", unavailable)
++    monkeypatch.setattr(config, "load_config_readonly", unavailable)
+     assert wc.episode.stale_seconds() == 48 * HOUR
+-    monkeypatch.setattr(config, "load_config", lambda: {"kanban": None})
++    monkeypatch.setattr(config, "load_config_readonly", lambda: {"kanban": None})
+     assert wc.episode.stale_seconds() == 48 * HOUR
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_watcher_idle_work.py b/tests/hermes_cli/test_kanban_watcher_idle_work.py
+index 906d3c9809..acddc2f2f2 100644
+--- a/tests/hermes_cli/test_kanban_watcher_idle_work.py
++++ b/tests/hermes_cli/test_kanban_watcher_idle_work.py
+@@ -187,7 +187,12 @@ def test_empty_blocker_sweeps_skip_and_new_candidates_run(board, monkeypatch):
+         board.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (task,))
+     for _ in range(3):
+         tick()
+-    assert release.call_count == probe.call_count == 3
++    # [daveey] G2: a candidate runs its lane, then the lane skips until the content revision moves or a due
++    # time it returned arrives (``kanban_sweep_gate``); the mocks return no due time.
++    assert release.call_count == probe.call_count == 1
++    kb.add_comment(board, task, 'someone', 'a content write')
++    tick()
++    assert release.call_count == probe.call_count == 2
+ 
+ 
+ def test_owner_archive_candidate_scan_is_not_repeated(board, monkeypatch):
+-- 
+2.43.0
+

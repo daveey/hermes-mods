@@ -1,0 +1,130 @@
+From 435e55ceeb3b7d7338f5b4e9eada8ccd7e7fa980 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 03:04:21 +0000
+Subject: [PATCH] [daveey] Pin loss receipt writer guards before emission
+
+Preserve unverified loss diagnostics and reject modern attestation before emission when binding, birth, PID or claim evidence is invalid. Pair with faulty-producer consumer controls for both recovery entry points. No production changes.
+
+Proof: canonical runner 1396 passed across five files before fixture table cleanup; focused 18 passed after cleanup. Each single writer guard removal yields two behavioral assertion failures; downstream masking is not an exploit or global equivalence claim.
+---
+ .../test_kanban_loss_emission_guards.py       | 84 +++++++++++++++++++
+ .../test_kanban_rebound_worker_loss.py        |  5 +-
+ 2 files changed, 87 insertions(+), 2 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_loss_emission_guards.py
+
+diff --git a/tests/hermes_cli/test_kanban_loss_emission_guards.py b/tests/hermes_cli/test_kanban_loss_emission_guards.py
+new file mode 100644
+index 0000000000..9b55d3de9b
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_loss_emission_guards.py
+@@ -0,0 +1,84 @@
++"""Loss writer contracts before emission, independent of consumer masking (#2857)."""
++import json
++from types import SimpleNamespace
++
++import pytest
++
++from gateway.session_kanban import record_worker_loss
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_dispatch as dispatch
++from hermes_cli import kanban_failed_result as proof
++from hermes_cli import kanban_lost_result as loss
++from hermes_cli.kanban_failed_result_identity import result_identity_fields
++from tests.hermes_cli import test_kanban_rebound_worker_loss as rebound
++
++board = rebound.board
++
++
++def damage_before_loss(conn, context, damage):
++    bound = rebound.lost_after_restart(conn, context, emit_loss=False)
++    pid = bound['pid']
++    if damage == 'wrong_pid':
++        return pid + 100000000
++    statements = {
++        'missing_binding': ("DELETE FROM task_events WHERE task_id=? AND run_id=? AND kind='worker_bound'",
++                            (context['task_id'], context['run_id'])),
++        'missing_birth': ('UPDATE tasks SET worker_started_at=NULL WHERE id=?', (context['task_id'],)),
++    }
++    with kb.write_txn(conn):
++        if damage in statements:
++            conn.execute(*statements[damage])
++        else:
++            assert damage == 'wrong_claim'
++            row = conn.execute("SELECT id, payload FROM task_events WHERE task_id=? AND run_id=? "
++                               "AND kind='worker_bound' ORDER BY id DESC LIMIT 1",
++                               (context['task_id'], context['run_id'])).fetchone()
++            payload = json.loads(row['payload'])
++            payload['claim_lock'] = 'foreign:1'
++            conn.execute('UPDATE task_events SET payload=? WHERE id=?', (json.dumps(payload), row['id']))
++    return pid
++
++
++def emit_loss(conn, context, pid):
++    assert conn.execute("SELECT count(*) FROM task_events WHERE kind='worker_lost'").fetchone()[0] == 0
++    record_worker_loss(SimpleNamespace(kanban_json=json.dumps(context)), 'EOFError', pid=pid, bound=True)
++    events = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='worker_lost'",
++                          (context['task_id'], context['run_id'])).fetchall()
++    assert len(events) == 1, 'unverified loss must still retain its diagnostic event'
++    return json.loads(events[0]['payload'])
++
++
++@pytest.mark.parametrize('damage', ['missing_binding', 'missing_birth', 'wrong_pid', 'wrong_claim'])
++def test_unverified_loss_preserves_diagnostic_without_attesting_receipt(board, damage):
++    conn, context = board
++    pid = damage_before_loss(conn, context, damage)
++    payload = emit_loss(conn, context, pid)
++    assert payload['reason'] == 'EOFError'
++    assert payload['pid'] == pid
++    assert 'loss_receipt' not in payload
++    assert 'death_proof_version' not in payload
++
++
++@pytest.mark.parametrize('damage', ['missing_birth', 'wrong_pid', 'wrong_claim'])
++@pytest.mark.parametrize('observer', [False, True])
++def test_consumer_holds_even_if_writer_attests_invalid_loss(board, monkeypatch, damage, observer):
++    conn, context = board
++    pid = damage_before_loss(conn, context, damage)
++
++    def unchecked_identity(conn, context, pid, bound):
++        # Inject a faulty producer at its seam, not a consumer bypass. These
++        # controls explain masking; they do not make the writer guards redundant.
++        return {'death_proof_version': 1, 'loss_receipt': True, 'exit_code': None,
++                **result_identity_fields(conn, context)}
++
++    monkeypatch.setattr(loss, 'loss_identity_fields', unchecked_identity)
++    assert emit_loss(conn, context, pid)['loss_receipt'] is True
++    assert proof.failed_result_proof(conn, context['task_id'], context['run_id'], context['claim_lock']) is None
++    dispatch.detect_crashed_workers(conn, failed_results_only=observer)
++    task = kb.get_task(conn, context['task_id'])
++    run = conn.execute('SELECT status, ended_at FROM task_runs WHERE id=?', (context['run_id'],)).fetchone()
++    assert task.status == 'running'
++    assert task.claim_lock == context['claim_lock']
++    assert task.current_run_id == context['run_id']
++    assert task.consecutive_failures == 0
++    assert run['status'] == 'running' and run['ended_at'] is None
+diff --git a/tests/hermes_cli/test_kanban_rebound_worker_loss.py b/tests/hermes_cli/test_kanban_rebound_worker_loss.py
+index fabdf76aae..a42386fa1f 100644
+--- a/tests/hermes_cli/test_kanban_rebound_worker_loss.py
++++ b/tests/hermes_cli/test_kanban_rebound_worker_loss.py
+@@ -13,7 +13,7 @@ from tests.hermes_cli import test_kanban_owner_restart_failed_receipt as restart
+ board = restart.board
+ 
+ 
+-def lost_after_restart(conn, context):
++def lost_after_restart(conn, context, *, emit_loss=True):
+     restart._failed_child(conn, context)
+     restart.book(context, True)
+     import subprocess
+@@ -26,7 +26,8 @@ def lost_after_restart(conn, context):
+                           env=build_subprocess_env(), cwd=str(Path(__file__).resolve().parents[2]))
+     assert done.returncode == 0, done.stderr
+     bound = json.loads(conn.execute("SELECT payload FROM task_events WHERE kind='worker_bound' ORDER BY id DESC LIMIT 1").fetchone()[0])
+-    record_worker_loss(SimpleNamespace(kanban_json=json.dumps(context)), 'EOFError', pid=bound['pid'], bound=True)
++    if emit_loss:
++        record_worker_loss(SimpleNamespace(kanban_json=json.dumps(context)), 'EOFError', pid=bound['pid'], bound=True)
+     return bound
+ 
+ 
+-- 
+2.43.0
+

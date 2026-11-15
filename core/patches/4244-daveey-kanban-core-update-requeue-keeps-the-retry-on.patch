@@ -1,0 +1,725 @@
+From fd30ce59cdc83dd80c6ca8d7763e8b296c65dbef Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 16:58:16 +0000
+Subject: [PATCH] [daveey] kanban: core-update requeue keeps the retry on the
+ host of the run's live processes
+
+Card t_01a1dae3ec3f5b57. Incident t_01a1d85b7b4a9e6d (2026-11-14, PR #2946): hermes-sync's
+restart-safe requeue reclaimed run 48261 on worker-2 at 09:34:41Z and worker-8 claimed the retry
+2 s later. worker-2's `hermes-core-wt ship`, started by the reclaimed run, kept running for at least
+104 s: it pushed eba5aef1, placed a land-lane hold and logged review_refused while worker-8's own
+ship ran. The two ships pushed three heads in 2m48s.
+
+Five whys
+1. Two runs' ships of one card ran at once, on two hosts.
+2. The core-update requeue made the card claimable by any pool worker at once, while a process the
+   reclaimed run started was still alive on worker-2.
+3. The requeue terminated only the worker process. Nothing ended the run's other processes, and for
+   persist_on_release jobs (which exist to survive this pause) nothing tied the next claim to their
+   host or waited for them to exit.
+Root (happened): the requeue released the card without accounting for the run's live processes.
+Root (not caught): no test combined a restart-safe requeue, a live run process and a claim from
+another host. Same class as t_01a1b77e56b5f51c (orphaned ship plus a second ship).
+
+Fix (new hermes_cli/kanban_requeue_custody.py; only for CORE_UPDATE_REQUEUE_REASON):
+- reclaim_task, after the worker is terminated and before the lease is released, lists what the run
+  started that is still alive on this host. Ownership reuses existing evidence: processes.json
+  entries whose parent_session_id is one of the card's owner_admitted sessions (verified by kernel
+  start time), and the run's systemd scope (hermes-worker-kanban-<task>-run-<n>.scope).
+- Plain processes (scope pids, non-persisted checkpoint entries) are terminated as a group, TERM
+  then KILL, before the release. Persisted jobs and their descendants are spared.
+- Live persisted jobs put `custody: {host, run_id, run_uid, processes:[{pid,start,cmd,unit}],
+  until}` into the reclaimed payload (same transaction as the status flip, so it syncs with it).
+  until = now + max_runtime_seconds (3600 when unset).
+- kanban_db_sync.claim_gate (the local seam before every Board acquire) defers another host's claim
+  while a custody is open: "requeue_custody: run N's persisted process(es) still live on <host>:
+  pid P (<cmd>) ...". The custody host claims as usual.
+- The custody host's dispatch tick (sweep) records requeue_custody_released {outcome: exited} once
+  every custody pid has exited, or at `until` terminates them (TERM, then KILL) and records
+  {outcome: terminated}. A custody whose host never reports stops holding 600 s after `until`.
+- No live process at the requeue: no custody key, behaviour unchanged. Other reclaim reasons are
+  untouched.
+- kanban_worker_scope: _persisted_pids now reads through a shared checkpoint_entries() helper.
+
+Tests (tests/hermes_cli/test_kanban_requeue_custody.py, real child processes; only the run scope is
+injected). RED with the three hook sites at origin/main and the module present: tests 1, 2, 3, 5,
+the spare test and the silent-host test fail (KeyError 'custody' / claim not deferred / processes
+alive); test 4 and the other-reason test pass on both sides by design (they pin unchanged
+behaviour). GREEN: 8/8.
+1. live persisted job: another host's claim deferred naming host, pid, command; same host claims.
+2. the job exits: sweep releases (outcome exited); pool claim allowed.
+3. bound elapses: TERM-ignoring job killed, released (outcome terminated); pool claim allowed.
+4. no live persisted job: no custody; any host claims.
+5. plain/foreground command whose child ignores TERM: dead before the release; no custody.
+
+Residual: a replica that applies the status flip and the reclaimed event in different sync pages
+could claim in between (both are written in one local transaction); a foreground command on a host
+with no systemd user bus has no run scope to find.
+---
+ hermes_cli/kanban_db.py                       |   8 +-
+ hermes_cli/kanban_db_dispatch.py              |   6 +-
+ hermes_cli/kanban_db_sync.py                  |   4 +-
+ hermes_cli/kanban_requeue_custody.py          | 286 ++++++++++++++++++
+ hermes_cli/kanban_worker_scope.py             |  31 +-
+ .../hermes_cli/test_kanban_requeue_custody.py | 227 ++++++++++++++
+ 6 files changed, 542 insertions(+), 20 deletions(-)
+ create mode 100644 hermes_cli/kanban_requeue_custody.py
+ create mode 100644 tests/hermes_cli/test_kanban_requeue_custody.py
+
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 356ddc0234..113b128f25 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -32,7 +32,7 @@ from dataclasses import dataclass
+ from pathlib import Path
+ from typing import Any, Callable, Iterable, Optional
+ 
+-from hermes_cli import kanban_db_sync as _sync, kanban_park_pin as _park_pin, kanban_priority, kanban_source_receipt as _sr
++from hermes_cli import kanban_db_sync as _sync, kanban_park_pin as _park_pin, kanban_priority, kanban_source_receipt as _sr, kanban_requeue_custody as _requeue_custody
+ from hermes_cli.kanban_db_values import _first_line, _opt_int, _json_or_null
+ from hermes_cli.kanban_db_event import Event  # public kb.Event; helpers import lazily: no cycle
+ from hermes_cli.kanban_worker_placement import resolved_db_placement, validate_creation
+@@ -2317,11 +2317,11 @@ def reclaim_task(
+     prev_lock = row["claim_lock"]
+     termination = _terminate_reclaimed_worker(
+         row["worker_pid"], prev_lock, signal_fn=signal_fn, started_at=row["worker_started_at"])
++    custody = _requeue_custody.for_requeue(conn, task_id, reason)  # core update: end plain processes, pin persisted
+     with write_txn(conn):
+         retry_status = _retry_status_for_run(conn, task_id)
+         cur = conn.execute(
+-            "UPDATE tasks SET status = ?, claim_lock = NULL, "
+-            "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
++            "UPDATE tasks SET status = ?, claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
+             "WHERE id = ? AND status IN ('running', 'ready', 'blocked') "
+             "AND claim_lock IS ?", (retry_status, task_id, prev_lock),
+         )
+@@ -2330,7 +2330,7 @@ def reclaim_task(
+         run_id = _record_reclaim(
+             conn, task_id, termination,
+             error=f"manual_reclaim: {reason}" if reason else f"manual_reclaim lock={prev_lock}",
+-            payload={"manual": True, "reason": reason, "prev_lock": prev_lock, "retry_status": retry_status},
++            payload={"manual": True, "reason": reason, "prev_lock": prev_lock, "retry_status": retry_status, **custody},
+         )
+     _sync.release_lease(conn, task_id, _sync.run_uid(conn, run_id))
+     # Operator intervention = fresh retry budget (own txn, runs after commit).
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 9bce46767f..b23b36e430 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -38,7 +38,7 @@ from hermes_cli.kanban_db_dispatch_allowlist import _dispatch_profile_allowlist,
+ from hermes_cli import kanban_worker_scope as _worker_scope, kanban_aggregate_scope as _aggregate_scope
+ from hermes_cli import kanban_host_reboot as _host_reboot, kanban_owner_unavailable as _ou  # [daveey]
+ from hermes_cli import kanban_owner_death as _owner_death, kanban_parent_unclaimed as _parent_unclaimed  # [daveey]
+-from hermes_cli import kanban_guard_refusal as _guard_refusal, loop_accounting as _la  # [daveey]
++from hermes_cli import kanban_guard_refusal as _guard_refusal, loop_accounting as _la, kanban_requeue_custody as _requeue_custody  # [daveey]
+ from hermes_cli.kanban_db_dispatch_crash_accounting import _account_crashes  # [daveey]
+ from hermes_cli.kanban_failure_accounting import _record_task_failure
+ from hermes_cli.kanban_db_dispatch_dead_worker import _DeadWorker
+@@ -1954,8 +1954,8 @@ def _run_reclaim_phase(
+     _la.timed("dispatch.reap_worker_zombies", reap_worker_zombies)
+     result.reaped_terminal_workers = _la.timed("dispatch.reap_terminal_workers", reap_terminal_workers, conn)
+     result.stopped_run_scopes = _la.timed("dispatch.stopped_scope_units", _worker_scope.stopped_scope_units, conn, board=board)  # orphans of ended runs [daveey]
+-    # Stop requests and forwarded owner card archives other gateways sent (kanban_owner_archive_relay). Before the
+-    # reclaim sweeps, so they see the archived cards. [daveey]
++    _la.timed("dispatch.requeue_custody", _requeue_custody.sweep, conn)  # requeued runs' persisted jobs: release or bound
++    # Stop requests and owner card archives other gateways sent (kanban_owner_archive_relay), before the reclaim sweeps. [daveey]
+     from hermes_cli.kanban_owner_archive_relay import apply_remote_archives
+     result.remote_archived = _la.timed("dispatch.apply_remote_archives", apply_remote_archives, conn)
+     # [daveey] Before any stale check: a long gap since the last pass is a host suspend, which the
+diff --git a/hermes_cli/kanban_db_sync.py b/hermes_cli/kanban_db_sync.py
+index d1fa7fa0d9..3fe56a59db 100644
+--- a/hermes_cli/kanban_db_sync.py
++++ b/hermes_cli/kanban_db_sync.py
+@@ -902,7 +902,9 @@ def claim_gate(conn: sqlite3.Connection, task_id: str, expires: int, lane: str =
+     from hermes_cli.kanban_worker_placement import execution_refusal
+     from hermes_cli.kanban_sync_diagnostics import record_claim
+     row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+-    if row is not None and (reason := execution_refusal(conn, row) or _source_skip(conn, row)):
++    from hermes_cli.kanban_requeue_custody import claim_refusal as custody_refusal
++    if row is not None and (reason := execution_refusal(conn, row) or _source_skip(conn, row)
++                            or custody_refusal(conn, row)):  # a requeued run's processes still live elsewhere
+         defer_claim(task_id, reason, ORIGIN_LOCAL)
+         return ClaimGate(expires, deferred=True)
+     if board_mode(conn) != "primary":
+diff --git a/hermes_cli/kanban_requeue_custody.py b/hermes_cli/kanban_requeue_custody.py
+new file mode 100644
+index 0000000000..1d33ee8bec
+--- /dev/null
++++ b/hermes_cli/kanban_requeue_custody.py
+@@ -0,0 +1,286 @@
++"""A core-update requeue releases a card only once the run's own processes are gone or pinned. [daveey]
++
++Incident t_01a1d85b7b4a9e6d (2026-11-14, PR #2946): hermes-sync's restart-safe requeue
++(:data:`kanban_core_update_requeue.CORE_UPDATE_REQUEUE_REASON`) reclaimed run 48261 on worker-2. That
++terminated only the worker process, then released the Board lease, and worker-8 claimed the retry 2 s later.
++worker-2's ``hermes-core-wt ship``, started by the reclaimed run, kept running for at least 104 s more: it
++pushed a head, placed a land-lane hold and logged ``review_refused`` while worker-8's own ship ran. Same class as
++t_01a1b77e56b5f51c (orphaned ship plus a second ship).
++
++At such a requeue, :func:`settle` (called by ``reclaim_task`` after the worker is terminated and before the
++lease is released) lists what the run started that is still alive on this host:
++
++* **plain** processes: every pid in the run's systemd scope (``hermes-worker-kanban-<task>-run-<n>.scope``,
++  where foreground commands and plain background jobs run) and every non-persisted process-checkpoint entry of
++  the card's worker sessions (``parent_session_id`` = a run's ``owner_admitted`` session). They are terminated
++  as a group, TERM then KILL, before the card is released;
++* **persisted** jobs (``persist_on_release``, which exist to survive exactly this pause): checkpoint entries of
++  the card's worker sessions, verified by their kernel start time. They are left running, and the ``reclaimed``
++  payload carries ``custody`` = ``{host, processes, until, run_uid}``.
++
++While a custody is open, :func:`claim_refusal` (called from ``kanban_db_sync.claim_gate``, the local seam before
++every Board lease) defers another host's claim with a reason naming the host, the pids and the commands; the
++custody host claims as usual. The custody host's dispatch tick (:func:`sweep`) records
++``requeue_custody_released`` once every custody pid has exited, or at ``until`` (the run's
++``max_runtime_seconds``, 60 min when unset) terminates the jobs as groups (TERM, then KILL) and records it. A
++custody whose host never reports (the host died with its processes) stops holding ``RELEASE_GRACE_SECONDS``
++after ``until``. A requeue that finds no live persisted job records no custody: today's behaviour.
++
++Residual: a foreground command on a host with no run scope (no systemd user bus) is not found once its worker
++died; the checkpoint covers background jobs only.
++"""
++from __future__ import annotations
++
++import logging
++import os
++import signal
++import sqlite3
++import time
++from typing import Any, Callable, Optional
++
++log = logging.getLogger(__name__)
++
++RELEASED_EVENT = "requeue_custody_released"
++DEFAULT_BOUND_SECONDS = 3600
++RELEASE_GRACE_SECONDS = 600
++TERM_GRACE_SECONDS = 5.0
++SWEEP_WINDOW_SECONDS = 14 * 86400
++CMD_CHARS = 160
++
++
++# --- host identity ------------------------------------------------------------------------------
++
++def own_host(conn: sqlite3.Connection) -> str:
++    """This machine as the Board names it (``gateway_id`` of a primary board), else its local claim prefix."""
++    from hermes_cli import kanban_db_sync as sync
++
++    state = sync.sync_state(conn) or {}
++    if state.get("mode") == "primary" and state.get("gateway_id"):
++        return str(state["gateway_id"])
++    from hermes_cli import kanban_db as kb
++    return kb._host_prefix().rstrip(":")
++
++
++# --- process inventory --------------------------------------------------------------------------
++
++def _start_ticks(pid: int) -> Optional[int]:
++    """Kernel start time of a running pid; None when gone or a zombie (exited, not yet reaped)."""
++    from pathlib import Path
++    try:
++        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8-sig")
++        fields = stat[stat.rindex(")") + 2:].split()
++        return None if fields[0] in ("Z", "X") else int(fields[19])
++    except (OSError, ValueError, IndexError):
++        return None
++
++
++def _alive(pid: Any, start: Any) -> bool:
++    """Same process as recorded: pid > 1 and an exact kernel start-time match (never a bare pid)."""
++    return type(pid) is int and pid > 1 and type(start) is int and _start_ticks(pid) == start
++
++
++def _sessions(conn: sqlite3.Connection, task_id: str) -> set[str]:
++    rows = conn.execute("SELECT payload FROM task_events WHERE kind = 'owner_admitted' AND task_id = ?", (task_id,))
++    from hermes_cli import kanban_db as kb
++    return {s for (p,) in rows if isinstance(s := kb._json_dict(p).get("session_id"), str) and s}
++
++
++def _entry_record(entry: dict) -> dict:
++    return {"pid": entry["pid"], "start": entry["host_start_time"],
++            "cmd": str(entry.get("command") or "")[:CMD_CHARS], "unit": str(entry.get("systemd_unit") or "")}
++
++
++def _run_scope_pids(task_id: str, run_id: Optional[int]) -> list[int]:
++    """Pids in the run's systemd scope (empty without one or without a user bus). Test seam."""
++    if run_id is None:
++        return []
++    from hermes_cli.kanban_worker_scope import _scope_pids
++    return _scope_pids(f"hermes-worker-kanban-{task_id}-run-{run_id}.scope") or []
++
++
++def inventory(conn: sqlite3.Connection, task_id: str, run_id: Optional[int]) -> dict[str, list[dict]]:
++    """``{"persisted": [...], "plain": [...]}`` live processes the card's worker runs started on this host."""
++    from hermes_cli.kanban_worker_scope import _cmdline, _is_spared, checkpoint_entries
++
++    sessions = _sessions(conn, task_id)
++    persisted: list[dict] = []
++    plain: dict[int, dict] = {}
++    for entry in checkpoint_entries():
++        if entry.get("parent_session_id") not in sessions or entry.get("pid_scope", "host") != "host":
++            continue
++        if not _alive(entry.get("pid"), entry.get("host_start_time")):
++            continue
++        (persisted.append(_entry_record(entry)) if entry.get("persist_on_release")
++         else plain.setdefault(entry["pid"], _entry_record(entry)))
++    spared = {p["pid"] for p in persisted}
++    for pid in _run_scope_pids(task_id, run_id):
++        if pid == os.getpid() or pid in plain or _is_spared(pid, spared):
++            continue
++        start = _start_ticks(pid)
++        if start is not None:
++            plain[pid] = {"pid": pid, "start": start, "cmd": _cmdline(pid)[:CMD_CHARS], "unit": ""}
++    return {"persisted": persisted, "plain": list(plain.values())}
++
++
++def _signal(record: dict, sig: int, *, group: bool) -> None:
++    pid = record["pid"]
++    if not _alive(pid, record["start"]):
++        return
++    try:
++        if group and os.getpgid(pid) == pid:
++            os.killpg(pid, sig)  # windows-footgun: ok -- POSIX only (reads /proc); a job leads its own group
++        else:
++            os.kill(pid, sig)
++    except OSError:
++        pass
++
++
++def terminate(records: list[dict], *, grace: float = TERM_GRACE_SECONDS) -> list[dict]:
++    """TERM each process (its group when it leads one), wait ``grace``, then KILL survivors and stop their scope
++    units. Returns the records still alive afterwards (normally none)."""
++    if not records:
++        return []
++    for record in records:
++        _signal(record, signal.SIGTERM, group=True)
++    deadline = time.monotonic() + grace
++    while time.monotonic() < deadline and any(_alive(r["pid"], r["start"]) for r in records):
++        time.sleep(0.1)
++    kill = getattr(signal, "SIGKILL", signal.SIGTERM)
++    for record in records:
++        if record.get("unit"):
++            from hermes_cli.kanban_worker_scope import _systemctl
++            _systemctl("kill", "--signal=KILL", record["unit"])
++        _signal(record, kill, group=True)
++    deadline = time.monotonic() + 2.0
++    while time.monotonic() < deadline and any(_alive(r["pid"], r["start"]) for r in records):
++        time.sleep(0.05)
++    return [r for r in records if _alive(r["pid"], r["start"])]
++
++
++# --- requeue ------------------------------------------------------------------------------------
++
++def for_requeue(conn: sqlite3.Connection, task_id: str, reason: Optional[str]) -> dict:
++    """``reclaim_task``'s hook: ``{"custody": ...}`` to merge into the ``reclaimed`` payload, or ``{}``. Only the
++    restart-safe core-update requeue settles the run's processes; every other reclaim is unchanged."""
++    from hermes_cli.kanban_core_update_requeue import CORE_UPDATE_REQUEUE_REASON
++    if reason != CORE_UPDATE_REQUEUE_REASON:
++        return {}
++    row = conn.execute("SELECT current_run_id FROM tasks WHERE id = ?", (task_id,)).fetchone()
++    custody = settle(conn, task_id, int(row[0]) if row is not None and row[0] else None)
++    return {"custody": custody} if custody else {}
++
++
++def settle(conn: sqlite3.Connection, task_id: str, run_id: Optional[int], *,
++           now: Optional[float] = None) -> Optional[dict]:
++    """At a restart-safe requeue (worker already terminated, before the claim is released): end the run's plain
++    processes, and return the ``custody`` payload for its live persisted jobs (None when there are none).
++    Never raises: an inventory fault keeps today's release."""
++    try:
++        found = inventory(conn, task_id, run_id)
++        survivors = terminate(found["plain"])
++        held = found["persisted"] + survivors  # a plain process that outlived KILL still holds the card here
++        if found["plain"]:
++            log.info("kanban requeue %s: terminated run %s's plain processes %s (survivors %s)", task_id, run_id,
++                     [p["pid"] for p in found["plain"]], [p["pid"] for p in survivors])
++        if not held:
++            return None
++        row = conn.execute("SELECT max_runtime_seconds FROM tasks WHERE id = ?", (task_id,)).fetchone()
++        bound = int(row[0]) if row is not None and row[0] else DEFAULT_BOUND_SECONDS
++        from hermes_cli import kanban_db_sync as sync
++        return {"host": own_host(conn), "run_id": run_id, "run_uid": sync.run_uid(conn, run_id),
++                "processes": held, "until": int((time.time() if now is None else now) + bound),
++                "terminated_plain": [p["pid"] for p in found["plain"] if p not in survivors]}
++    except Exception:  # health: allow BLE001 -- a custody fault must never stop the requeue itself
++        log.warning("kanban requeue %s: process custody inventory failed", task_id, exc_info=True)
++        return None
++
++
++# --- custody state ------------------------------------------------------------------------------
++
++def _key(custody: dict) -> str:
++    return str(custody.get("run_uid") or custody.get("run_id"))
++
++
++def _custodies(conn: sqlite3.Connection, task_id: Optional[str], since: float) -> list[tuple[str, int, dict]]:
++    """``(task_id, local run_id, custody)`` of open custodies (no release recorded), oldest first."""
++    from hermes_cli import kanban_db as kb
++    where, args = ("AND task_id = ?", (task_id,)) if task_id else ("", ())
++    released = {(t, str(kb._json_dict(p).get("key"))) for t, p in conn.execute(
++        f"SELECT task_id, payload FROM task_events WHERE kind = ? {where} AND created_at >= ?",
++        (RELEASED_EVENT, *args, int(since)))}
++    out = []
++    for tid, run_id, payload in conn.execute(
++            f"SELECT task_id, run_id, payload FROM task_events WHERE kind = 'reclaimed' {where} "
++            "AND created_at >= ? AND payload LIKE '%\"custody\"%' ORDER BY id", (*args, int(since))):
++        custody = kb._json_dict(payload).get("custody")
++        if isinstance(custody, dict) and isinstance(custody.get("processes"), list) \
++                and (tid, _key(custody)) not in released:
++            out.append((tid, run_id, custody))
++    return out
++
++
++def _describe(custody: dict) -> str:
++    procs = ", ".join(f"pid {p.get('pid')} ({p.get('cmd') or '?'})" for p in custody["processes"][:3]
++                      if isinstance(p, dict))
++    more = len(custody["processes"]) - 3
++    return procs + (f" and {more} more" if more > 0 else "")
++
++
++def claim_refusal(conn: sqlite3.Connection, row, *, now: Optional[float] = None) -> Optional[str]:
++    """Why this host may not claim ``row`` yet, or None. Only another host is refused, and only while the
++    custody is open and younger than ``until`` + :data:`RELEASE_GRACE_SECONDS`."""
++    try:
++        moment = time.time() if now is None else now
++        open_ = _custodies(conn, row["id"], moment - SWEEP_WINDOW_SECONDS)
++        if not open_:
++            return None
++        me = own_host(conn)
++        for _tid, _run, custody in reversed(open_):
++            if custody.get("host") == me or moment >= float(custody.get("until") or 0) + RELEASE_GRACE_SECONDS:
++                continue
++            return (f"requeue_custody: run {custody.get('run_id')}'s persisted process(es) still live on "
++                    f"{custody.get('host')}: {_describe(custody)}; only {custody.get('host')} may claim until "
++                    "they exit or the bound ends them")
++        return None
++    except Exception:  # health: allow BLE001 -- an unreadable custody keeps today's claim path
++        log.warning("kanban: requeue custody check failed for %s", row["id"], exc_info=True)
++        return None
++
++
++def _release(conn: sqlite3.Connection, task_id: str, custody: dict, outcome: str, extra: dict) -> None:
++    from hermes_cli import kanban_db as kb
++    with kb.write_txn(conn):
++        kb._append_event(conn, task_id, RELEASED_EVENT, {
++            "key": _key(custody), "host": custody.get("host"), "run_id": custody.get("run_id"),
++            "outcome": outcome, **extra})
++
++
++def sweep(conn: sqlite3.Connection, *, now: Optional[float] = None,
++          terminate_fn: Optional[Callable[[list[dict]], list[dict]]] = None) -> list[str]:
++    """Dispatch tick on the custody host: release custodies whose processes all exited; at ``until``, terminate
++    them first. Returns the task ids released. Never raises."""
++    released: list[str] = []
++    try:
++        moment = time.time() if now is None else now
++        me = own_host(conn)
++        for task_id, _run, custody in _custodies(conn, None, moment - SWEEP_WINDOW_SECONDS):
++            if custody.get("host") != me:
++                continue
++            procs = [p for p in custody["processes"] if isinstance(p, dict)]
++            live = [p for p in procs if _alive(p.get("pid"), p.get("start"))]
++            if live and moment < float(custody.get("until") or 0):
++                continue
++            extra: dict = {}
++            outcome = "exited"
++            if live:
++                left = (terminate_fn or terminate)(live)
++                if left:
++                    log.warning("kanban requeue custody %s: %s survived termination", task_id,
++                                [p["pid"] for p in left])
++                    continue
++                outcome, extra = "terminated", {"terminated": [p["pid"] for p in live]}
++            _release(conn, task_id, custody, outcome, extra)
++            released.append(task_id)
++    except Exception:  # health: allow BLE001 -- the sweep must never stop a dispatch tick
++        log.warning("kanban: requeue custody sweep failed", exc_info=True)
++    return released
+diff --git a/hermes_cli/kanban_worker_scope.py b/hermes_cli/kanban_worker_scope.py
+index 408d4c48e2..f73f6c5f89 100644
+--- a/hermes_cli/kanban_worker_scope.py
++++ b/hermes_cli/kanban_worker_scope.py
+@@ -289,8 +289,8 @@ def _cmdline(pid: int) -> str:
+         return ""
+ 
+ 
+-def _persisted_pids() -> set[int]:
+-    """Live pids of ``persist_on_release`` jobs from every profile's process checkpoint."""
++def checkpoint_entries() -> list[dict]:
++    """Every profile's process-checkpoint (``processes.json``) entries, unvalidated beyond being dicts."""
+     from hermes_constants import get_default_hermes_root, get_hermes_home
+ 
+     homes = {get_hermes_home()}
+@@ -300,21 +300,28 @@ def _persisted_pids() -> set[int]:
+         homes.update(p for p in (root / "profiles").iterdir() if p.is_dir())
+     except OSError:
+         pass
+-    pids: set[int] = set()
++    out: list[dict] = []
+     for home in homes:
+         try:
+             entries = json.loads((home / "processes.json").read_text(encoding="utf-8-sig"))
+         except (OSError, ValueError):
+             continue
+-        for entry in entries if isinstance(entries, list) else []:
+-            if not isinstance(entry, dict) or not entry.get("persist_on_release"):
+-                continue
+-            pid, start = entry.get("pid"), entry.get("host_start_time")
+-            if type(pid) is not int or pid <= 1:
+-                continue
+-            stat = _proc_stat(pid)
+-            if stat is not None and (type(start) is not int or stat[1] == start):
+-                pids.add(pid)
++        out.extend(entry for entry in (entries if isinstance(entries, list) else []) if isinstance(entry, dict))
++    return out
++
++
++def _persisted_pids() -> set[int]:
++    """Live pids of ``persist_on_release`` jobs from every profile's process checkpoint."""
++    pids: set[int] = set()
++    for entry in checkpoint_entries():
++        if not entry.get("persist_on_release"):
++            continue
++        pid, start = entry.get("pid"), entry.get("host_start_time")
++        if type(pid) is not int or pid <= 1:
++            continue
++        stat = _proc_stat(pid)
++        if stat is not None and (type(start) is not int or stat[1] == start):
++            pids.add(pid)
+     return pids
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_requeue_custody.py b/tests/hermes_cli/test_kanban_requeue_custody.py
+new file mode 100644
+index 0000000000..546f0f2f76
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_requeue_custody.py
+@@ -0,0 +1,227 @@
++"""A core-update requeue keeps the retry off other hosts while the run's processes live (t_01a1dae3ec3f5b57).
++
++Incident t_01a1d85b7b4a9e6d (2026-11-14): hermes-sync's restart-safe requeue reclaimed run 48261 on worker-2,
++and worker-8 claimed the retry 2 s later while worker-2's ship of PR #2946, started by that run, kept pushing.
++Real child processes stand in for the run's jobs; the run's systemd scope is the one injected seam.
++"""
++from __future__ import annotations
++
++import json
++import signal
++import subprocess
++import sys
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_requeue_custody as custody
++from hermes_cli.kanban_core_update_requeue import CORE_UPDATE_REQUEUE_REASON
++
++SESSION = "local-run-48261-session"
++HOST, OTHER = "worker-2", "worker-8"
++
++
++@pytest.fixture
++def board(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    monkeypatch.setattr(custody, "_run_scope_pids", lambda task_id, run_id: [])
++    monkeypatch.setattr(custody, "TERM_GRACE_SECONDS", 1.0)
++    kb.init_db()
++    with kbc.connect() as conn:
++        yield conn
++
++
++@pytest.fixture
++def procs():
++    started: list[subprocess.Popen] = []
++
++    def spawn(code: str) -> subprocess.Popen:
++        proc = subprocess.Popen([sys.executable, "-c", code], start_new_session=True,
++                                stdout=subprocess.PIPE, text=True)
++        started.append(proc)
++        return proc
++
++    yield spawn
++    for proc in started:
++        if proc.poll() is None:
++            proc.kill()
++        proc.wait(timeout=5)
++
++
++SLEEPER = "import time; print('up', flush=True); time.sleep(600)"
++STUBBORN = ("import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); print('up', flush=True); "
++            "time.sleep(600)")
++
++
++def _ready(proc: subprocess.Popen) -> int:
++    assert proc.stdout.readline().strip() == "up"  # handlers installed before we signal it
++    return proc.pid
++
++
++def _checkpoint(board, *entries: dict) -> None:
++    from pathlib import Path
++    import os
++    (Path(os.environ["HERMES_HOME"]) / "processes.json").write_text(json.dumps(list(entries)))
++
++
++def _entry(pid: int, *, persist: bool, command: str) -> dict:
++    return {"session_id": f"proc_{pid}", "command": command, "pid": pid, "pid_scope": "host",
++            "host_start_time": custody._start_ticks(pid), "parent_session_id": SESSION,
++            "persist_on_release": persist, "systemd_unit": ""}
++
++
++def _running_card(board, *, max_runtime=None) -> str:
++    tid = kb.create_task(board, title="ship PR #2946", assignee="dev", max_runtime_seconds=max_runtime)
++    assert kb.claim_task(board, tid) is not None
++    run_id = kb.get_task(board, tid).current_run_id
++    with kb.write_txn(board):
++        kb._append_event(board, tid, "owner_admitted", {"session_id": SESSION}, run_id=run_id)
++    return tid
++
++
++def _requeue(board, tid) -> dict:
++    assert kb.reclaim_task(board, tid, reason=CORE_UPDATE_REQUEUE_REASON, signal_fn=lambda *_: None)
++    assert kb.get_task(board, tid).status == "ready"
++    (event,) = [e for e in kb.list_events(board, tid) if e.kind == "reclaimed"]
++    return event.payload
++
++
++def _claim_from(board, monkeypatch, tid, host) -> sync.ClaimGate:
++    monkeypatch.setattr(custody, "own_host", lambda conn: host)
++    sync.pop_claim_deferral(tid)
++    return sync.claim_gate(board, tid, int(time.time()) + 900)
++
++
++def _wait_dead(pid: int, start: int, seconds: float = 5.0) -> bool:
++    deadline = time.monotonic() + seconds
++    while time.monotonic() < deadline:
++        if not custody._alive(pid, start):
++            return True
++        time.sleep(0.05)
++    return False
++
++
++def test_live_persisted_job_pins_the_retry_to_its_host(board, procs, monkeypatch):
++    """Test 1: another host's claim is deferred naming host, pid and command; the same host claims."""
++    tid = _running_card(board)
++    ship = _ready(procs(SLEEPER))
++    _checkpoint(board, _entry(ship, persist=True, command="hermes-core-wt ship 2946"))
++    monkeypatch.setattr(custody, "own_host", lambda conn: HOST)
++    payload = _requeue(board, tid)
++    assert payload["custody"]["host"] == HOST
++    assert [p["pid"] for p in payload["custody"]["processes"]] == [ship]
++
++    gate = _claim_from(board, monkeypatch, tid, OTHER)
++    assert gate.deferred
++    reason = str(sync.pop_claim_deferral(tid))
++    assert HOST in reason and f"pid {ship}" in reason and "hermes-core-wt ship 2946" in reason
++
++    assert not _claim_from(board, monkeypatch, tid, HOST).deferred
++    assert custody._alive(ship, custody._start_ticks(ship))  # the persisted job was left running
++
++
++def test_exit_of_the_persisted_job_returns_the_card_to_the_pool(board, procs, monkeypatch):
++    """Test 2: once the job exited, the custody host's sweep releases it and a pool claim is allowed."""
++    tid = _running_card(board)
++    proc = procs(SLEEPER)
++    ship = _ready(proc)
++    _checkpoint(board, _entry(ship, persist=True, command="ship"))
++    monkeypatch.setattr(custody, "own_host", lambda conn: HOST)
++    _requeue(board, tid)
++    assert custody.sweep(board) == []  # still alive: custody holds
++    assert _claim_from(board, monkeypatch, tid, OTHER).deferred
++
++    proc.kill()
++    proc.wait(timeout=5)
++    monkeypatch.setattr(custody, "own_host", lambda conn: HOST)
++    assert custody.sweep(board) == [tid]
++    (released,) = [e for e in kb.list_events(board, tid) if e.kind == custody.RELEASED_EVENT]
++    assert released.payload["outcome"] == "exited"
++    assert not _claim_from(board, monkeypatch, tid, OTHER).deferred
++
++
++def test_bound_terminates_the_persisted_jobs_then_releases(board, procs, monkeypatch):
++    """Test 3: at max_runtime_seconds the jobs are terminated as a group (TERM, then KILL), then a pool claim
++    is allowed. The job ignores TERM, so the KILL step is exercised."""
++    tid = _running_card(board, max_runtime=120)
++    ship = _ready(procs(STUBBORN))
++    start = custody._start_ticks(ship)
++    _checkpoint(board, _entry(ship, persist=True, command="ship"))
++    monkeypatch.setattr(custody, "own_host", lambda conn: HOST)
++    payload = _requeue(board, tid)
++    until = payload["custody"]["until"]
++    assert until - time.time() == pytest.approx(120, abs=5)
++
++    assert custody.sweep(board, now=until - 1) == []
++    assert custody._alive(ship, start)
++    assert custody.sweep(board, now=until + 1) == [tid]
++    assert _wait_dead(ship, start)
++    (released,) = [e for e in kb.list_events(board, tid) if e.kind == custody.RELEASED_EVENT]
++    assert released.payload == {"key": payload["custody"]["run_uid"] or str(payload["custody"]["run_id"]),
++                                "host": HOST, "run_id": payload["custody"]["run_id"], "outcome": "terminated",
++                                "terminated": [ship]}
++    assert not _claim_from(board, monkeypatch, tid, OTHER).deferred
++
++
++def test_requeue_without_persisted_jobs_is_unchanged(board, monkeypatch):
++    """Test 4: no live persisted job: no custody, and any host may claim at once."""
++    tid = _running_card(board)
++    _checkpoint(board, {"pid": 999999, "host_start_time": 1, "parent_session_id": SESSION,
++                        "persist_on_release": True, "command": "gone"})  # exited long ago
++    monkeypatch.setattr(custody, "own_host", lambda conn: HOST)
++    payload = _requeue(board, tid)
++    assert "custody" not in payload
++    assert not _claim_from(board, monkeypatch, tid, OTHER).deferred
++
++
++def test_plain_command_ignoring_term_is_dead_before_another_host_claims(board, procs, monkeypatch):
++    """Test 5: a plain-background or foreground command whose child ignores the first TERM. The requeue ends
++    it (TERM, then KILL) before the card is released, so another host's claim is not held by it."""
++    tid = _running_card(board)
++    stubborn = _ready(procs(STUBBORN))  # a foreground command's child in the run's scope
++    background = _ready(procs(STUBBORN))  # a plain background job from the checkpoint
++    starts = {p: custody._start_ticks(p) for p in (stubborn, background)}
++    _checkpoint(board, _entry(background, persist=False, command="plain ship"))
++    monkeypatch.setattr(custody, "_run_scope_pids", lambda task_id, run_id: [stubborn])
++    monkeypatch.setattr(custody, "own_host", lambda conn: HOST)
++    payload = _requeue(board, tid)
++    assert all(not custody._alive(p, s) for p, s in starts.items())  # dead before the release
++    assert "custody" not in payload
++    assert not _claim_from(board, monkeypatch, tid, OTHER).deferred
++
++
++def test_plain_kill_spares_the_persisted_job_and_its_children(board, procs, monkeypatch):
++    """A scope pid that descends from a persisted job (the job's own children) is not terminated."""
++    tid = _running_card(board)
++    ship = _ready(procs(SLEEPER))
++    _checkpoint(board, _entry(ship, persist=True, command="ship"))
++    monkeypatch.setattr(custody, "_run_scope_pids", lambda task_id, run_id: [ship])
++    monkeypatch.setattr(custody, "own_host", lambda conn: HOST)
++    payload = _requeue(board, tid)
++    assert custody._alive(ship, custody._start_ticks(ship))
++    assert payload["custody"]["terminated_plain"] == []
++
++
++def test_other_reclaim_reasons_do_not_touch_processes(board, procs, monkeypatch):
++    tid = _running_card(board)
++    ship = _ready(procs(SLEEPER))
++    _checkpoint(board, _entry(ship, persist=False, command="ship"))
++    assert kb.reclaim_task(board, tid, reason="operator", signal_fn=lambda *_: None)
++    assert custody._alive(ship, custody._start_ticks(ship))
++    (event,) = [e for e in kb.list_events(board, tid) if e.kind == "reclaimed"]
++    assert "custody" not in event.payload
++
++
++def test_custody_of_a_silent_host_stops_holding_after_the_grace(board, procs, monkeypatch):
++    tid = _running_card(board, max_runtime=60)
++    ship = _ready(procs(SLEEPER))
++    _checkpoint(board, _entry(ship, persist=True, command="ship"))
++    monkeypatch.setattr(custody, "own_host", lambda conn: HOST)
++    until = _requeue(board, tid)["custody"]["until"]
++    monkeypatch.setattr(custody, "own_host", lambda conn: OTHER)
++    row = board.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone()
++    assert custody.claim_refusal(board, row, now=until + custody.RELEASE_GRACE_SECONDS - 1)
++    assert custody.claim_refusal(board, row, now=until + custody.RELEASE_GRACE_SECONDS) is None
+-- 
+2.43.0
+

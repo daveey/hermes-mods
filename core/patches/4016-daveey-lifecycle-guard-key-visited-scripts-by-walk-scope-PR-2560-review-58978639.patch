@@ -1,0 +1,145 @@
+From 8d2f341c788da0b7e9a1f76077baf6adfb4a4f62 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 21:23:13 +0000
+Subject: [PATCH] [daveey] lifecycle guard: key visited scripts by walk scope
+ (PR #2560 review 5897863903 B1)
+
+A script referenced both by a nested startup-file shell (a login bash given the script, or a
+login bash payload that sources it) and by the session shell (`. s.sh`) was walked once: the
+nested flag was decided per path and `visited` keyed by path only, so the masked nested walk
+suppressed the session walk that keeps heredoc bodies visible under `alias python3=...`.
+Base 9715502dea refused these; 4c852121d6 allowed them.
+
+`unvisited_scopes` keys shell visits by (alias names, heredoc masking) and returns every scope a
+path still needs: the session scope always (exactly as base walked it), plus the nested scope when
+any reference hands it to such a shell. A shell visit in any scope still subsumes the Python scan.
+---
+ cron/lifecycle_guard.py                       | 25 +++++++------------
+ cron/lifecycle_guard_nested_shells.py         | 22 ++++++++++++++++
+ .../test_lifecycle_guard_session_aliases.py   | 17 +++++++++++++
+ 3 files changed, 48 insertions(+), 16 deletions(-)
+
+diff --git a/cron/lifecycle_guard.py b/cron/lifecycle_guard.py
+index b30a4ad261..c9bdfbae85 100644
+--- a/cron/lifecycle_guard.py
++++ b/cron/lifecycle_guard.py
+@@ -1751,16 +1751,6 @@ def _walk_candidates(
+         yield path, False, True
+ 
+ 
+-def _visit_key(resolved: Path, *, python_source: bool) -> object:
+-    """A shell walk of a file subsumes its Python regex scan, never the reverse, so the two are
+-    keyed apart in ``visited``."""
+-    return (resolved, "python") if python_source else resolved
+-
+-
+-def _already_visited(visited: set[object], resolved: Path, *, python_source: bool) -> bool:
+-    return resolved in visited or _visit_key(resolved, python_source=python_source) in visited
+-
+-
+ def _contains_unsafe_gateway_action(
+     command: str, *, cwd: Optional[str], depth: int, visited: set[object], budget: _LifecycleScanBudget,
+     read_remote_script: Optional[_ReadRemoteScriptFn] = None, executed: bool = True,
+@@ -1800,7 +1790,8 @@ def _contains_unsafe_gateway_action(
+                     else command)
+ 
+     # A nested startup-file shell's input is walked first, with unknown alias names (nit 1).
+-    from cron.lifecycle_guard_nested_shells import collect_nested_shell_inputs, shell_scope
++    from cron.lifecycle_guard_nested_shells import (
++        collect_nested_shell_inputs, shell_scope, unvisited_scopes)
+ 
+     nested_texts, nested_scripts = collect_nested_shell_inputs(
+         command, walk_command, cwd=cwd, budget=budget)
+@@ -1825,13 +1816,15 @@ def _contains_unsafe_gateway_action(
+                 )
+             continue
+         resolved = _resolve_lenient(script_path)
+-        if _already_visited(visited, resolved, python_source=python_source):
++        scopes = unvisited_scopes(visited, budget, resolved, python_source=python_source,
++                                  nested=resolved in nested_scripts)
++        if not scopes:
+             continue
+         if not budget.charge_path():
+             if candidate_executed:
+                 return _budget_exhausted(budget, "paths", depth)
+             continue  # an alias may make a later call-argument entry executed
+-        visited.add(_visit_key(resolved, python_source=python_source))
++        visited.update(itertools.chain.from_iterable((key, key[:2]) for _nested, key in scopes))
+         # Never read more than the walk can still afford to tokenize; a file larger than the
+         # remainder fails closed exactly like an oversized one.
+         script_text, unsafe = _read_referenced_script(script_path, max_bytes=budget.bytes_remaining)
+@@ -1860,10 +1853,10 @@ def _contains_unsafe_gateway_action(
+         if not script_text:
+             continue
+         # Relative references inside a script resolve against that script's directory, not the cwd.
+-        if recurse(
++        if any(recurse(
+             script_text, _resolve_script_directory(str(resolved)) or cwd, candidate_executed,
+-            f"`{script_path}`", python_source, nested=resolved in nested_scripts,
+-        ):
++            f"`{script_path}`", python_source, nested=nested,
++        ) for nested, _key in scopes):
+             return True
+     return False
+ 
+diff --git a/cron/lifecycle_guard_nested_shells.py b/cron/lifecycle_guard_nested_shells.py
+index 3415a114ab..e1864f70b0 100644
+--- a/cron/lifecycle_guard_nested_shells.py
++++ b/cron/lifecycle_guard_nested_shells.py
+@@ -53,6 +53,28 @@ def shell_scope(budget: _LifecycleScanBudget, nested: bool) -> contextlib.Abstra
+     return nested_shell_scope(budget) if nested else contextlib.nullcontext()
+ 
+ 
++def unvisited_scopes(
++    visited: set[object], budget: _LifecycleScanBudget, resolved: Path, *, python_source: bool,
++    nested: bool,
++) -> list[tuple[bool, tuple]]:
++    """``(nested, visit key)`` for each scope *resolved* still needs a walk in. A shell walk
++    depends on its scope (alias names, heredoc masking), so ``visited`` keys carry it: a path one
++    reference hands to a nested shell and another to the session shell is walked in both scopes
++    (review 5897863903 B1), the session one exactly as before. A shell walk in any scope subsumes
++    the file's Python regex scan, never the reverse; the caller also records ``key[:2]``, the
++    scope-free ``(resolved, "shell")`` mark, for that."""
++    if python_source:
++        seen = (resolved, "python") in visited or (resolved, "shell") in visited
++        return [] if seen else [(False, (resolved, "python"))]
++    wanted = [(False, (budget.alias_names, budget.mask_heredocs))]
++    if nested:
++        wanted.append((True, (None, True)))  # nested_shell_scope's state
++    keys: dict[tuple, bool] = {}
++    for flag, scope in wanted:
++        keys.setdefault((resolved, "shell", scope), flag)
++    return [(flag, key) for key, flag in keys.items() if key not in visited]
++
++
+ def collect_nested_shell_inputs(
+     command: str, walk_command: str, *, cwd: Optional[str], budget: _LifecycleScanBudget,
+ ) -> tuple[list[str], set[Path]]:
+diff --git a/tests/cron/test_lifecycle_guard_session_aliases.py b/tests/cron/test_lifecycle_guard_session_aliases.py
+index 08fcf694dc..69f2b3a328 100644
+--- a/tests/cron/test_lifecycle_guard_session_aliases.py
++++ b/tests/cron/test_lifecycle_guard_session_aliases.py
+@@ -305,3 +305,20 @@ def test_nested_shell_input_shapes():
+     assert found == []  # *walk_command* holds the segments; *command* only its heredocs
+     text = "bash -l -c 'x ( y )'; bash -c 'z'"
+     assert list(_iter_nested_shell_inputs(text, text, cwd="/")) == [("x ( y )", None)]
++
++
++# PR #2560 review 5897863903 B1: one script referenced both by a nested login shell and by the
++# session shell must be walked in both scopes. A path-keyed `visited` let the masked nested walk
++# suppress the session walk, whose `alias python3=...` keeps the heredoc body visible.
++@pytest.mark.parametrize("shape", [
++    ". s.sh",
++    "bash -l s.sh; . s.sh",
++    ". s.sh; bash -l s.sh",
++    "bash -l -c 'bash s.sh'; . s.sh",
++    "bash -l -c '. s.sh'; source s.sh",
++])
++def test_script_shared_by_nested_and_session_scope_is_walked_in_both(tmp_path, shape):
++    (tmp_path / "s.sh").write_text(_FN_BODY)
++    unsafe, _refusal = scan_gateway_lifecycle(
++        shape, cwd=str(tmp_path), session_aliases=frozenset({"python3"}))
++    assert unsafe is True, shape
+-- 
+2.43.0
+

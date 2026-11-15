@@ -1,0 +1,276 @@
+From 942da9ab553c39e9c3ceacf39445ac37364fb0ee Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 18:04:11 +0000
+Subject: [PATCH] [daveey] kanban: a skip replacing an expired timed hold is
+ recorded again; an account with both windows null is fresh headroom
+
+Follow-ups from the PR #3058 exact-head review (t_01a1db22547c9a59, GitHub review 5906149853), card
+t_01a1db2e63e89126.
+
+1. paced -> held(until T) -> paced read stranded_in_ready.
+   kanban_dispatch_skip.record() dedupes against every skip of the episode, and the llm_paced key carries no
+   until, so the second `paced` appended nothing. Past T the newest dispatch_skipped row was the expired `held`
+   one: kanban_diagnostics._llm_paced_hold returned None and the card read stranded_in_ready (error, "Ready for
+   1.0h with no worker") while the dispatcher still paced it (skips.latest() was right).
+   Why: diagnostics reads only the event log; the current-skip table is machine-local. Fix: record() appends a
+   seen key again when the episode's newest row is a different key carrying `until`
+   (_supersedes_timed), except when the key is already this host's current skip (a replica catching up, the
+   case the seen-table keys exist for). A paced/held flap adds one row; MAX_PER_EPISODE still caps any flap.
+
+2. An account read with BOTH windows null added no headroom.
+   /api/oauth/usage reports an idle or brand-new account's five_hour and seven_day as null; _usage_windows drops
+   both, the snapshot is not `available`, and read_pool skipped the account, so _sustainable never saw it and
+   the pool over-paced, contradicting the docs ("counts as a fresh full window"). read_pool now reads an
+   account whose read succeeded (not None, no unavailable_reason) with no account-scope window as two fresh
+   windows (0%, no reset), which _sustainable counts as full windows of headroom. A failed or unavailable read
+   still adds nothing. Docs say so.
+
+Tests (tests/hermes_cli/test_kanban_llm_pacing_review_3058.py); the repro, flap and read_pool tests fail on
+origin/main (3 failed) and pass here; the replica and idle-pool tests are guards:
+- reviewer repro through dispatch_once (read_interval_seconds 0): rows paced, held(T), paced; diagnostics at
+  T+3600 = held_in_ready/llm_paced (was stranded_in_ready);
+- a 7-step paced/held flap leaves 3 rows;
+- replica catch-up (newest row lost, current skip already the key) appends nothing;
+- read_pool: idle and model-window-only accounts read as two fresh windows; failed (None) and unavailable
+  reads add none; the pool factor includes both fresh 5h windows;
+- a fully idle pool is OPEN.
+All 30 test files importing the changed modules: 712 passed, 1 skipped. scripts/check --base origin/main: ok.
+---
+ hermes_cli/kanban_dispatch_skip.py            |  17 ++-
+ hermes_cli/kanban_llm_pacing_dispatch.py      |  15 +-
+ .../test_kanban_llm_pacing_review_3058.py     | 135 ++++++++++++++++++
+ website/docs/user-guide/features/kanban.md    |   2 +-
+ 4 files changed, 160 insertions(+), 9 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_llm_pacing_review_3058.py
+
+diff --git a/hermes_cli/kanban_dispatch_skip.py b/hermes_cli/kanban_dispatch_skip.py
+index a9226db390..dd8b84777e 100644
+--- a/hermes_cli/kanban_dispatch_skip.py
++++ b/hermes_cli/kanban_dispatch_skip.py
+@@ -11,7 +11,8 @@ guessed a quota wall and parked the card. The tick logs had rotated, so the real
+   row the tick passed over: ``skipped_ineligible``, ``capsule_refused``, ``no_progress_held``,
+   ``per_profile_capped``, ``claim_deferred`` (Board lease refusals and this host's admission-gate refusals, told
+   apart by the deferral's ``origin``), ``owner_down``, ``pinned_quota_wall`` and ``llm_paced``.
+-  A (reason, detail) the episode already holds adds nothing; a new one appends. At most :data:`MAX_PER_EPISODE` per
++  A (reason, detail) the episode already holds adds nothing, unless the newest row is a timed hold (``until``)
++  it replaces (:func:`_supersedes_timed`); a new one appends. At most :data:`MAX_PER_EPISODE` per
+   episode, so two dispatchers that disagree cannot grow a card's history without bound.
+ * :func:`pinned_quota_hold` holds a fresh card (no run yet) on the ready lane whose explicit pin's provider pool
+   is quota-walled right now (``kanban_provider_walls.live_quota_wall``): its first worker would exit 75 into
+@@ -155,6 +156,16 @@ def _write_seen(conn: sqlite3.Connection, task_id: str, anchor: str, payload: di
+          int(time.time())))
+ 
+ 
++def _supersedes_timed(skips: list[dict[str, Any]], key: tuple[Any, Any, Any], current: bool) -> bool:
++    """A seen ``key`` replaces a newest row that carries ``until``: append it again. Readers of the event log
++    (``kanban_diagnostics``) drop a timed hold once its ``until`` passes, so without a newer row a card the dispatcher
++    still holds (paced -> held until T -> paced) read as stranded past T (PR #3058 review). Bounded: once the
++    untimed key is newest again, a repeat of the timed key (already held) appends nothing, so a paced/held flap adds
++    one row; :data:`MAX_PER_EPISODE` caps any other flap. Not when ``key`` is already this host's current skip: that
++    is a replica that has not pulled this host's row back yet, not a change. [daveey]"""
++    return bool(skips) and skips[0].get("until") is not None and _skip_key(skips[0]) != key and not current
++
++
+ def record(conn: sqlite3.Connection, task_id: str, reason: str, *, detail: Any = None,
+            until: Optional[float] = None, extra: Optional[dict[str, Any]] = None) -> bool:
+     """Append the skip unless the episode already holds the same (reason, detail); True when it appended. Either
+@@ -177,11 +188,11 @@ def record(conn: sqlite3.Connection, task_id: str, reason: str, *, detail: Any =
+         # Keys this host recorded count too: a pickup copy re-imported from a replica that has not pulled this
+         # host's just-pushed skip back yet reads as missing it for a tick or two (hub 2026-11-12).
+         keys = {_skip_key(s) for s in skips} | (seen["keys"] if seen else set())
+-        append = key not in keys and len(skips) < MAX_PER_EPISODE
++        current = seen is not None and _skip_key(seen["payload"]) == key
++        append = (key not in keys or _supersedes_timed(skips, key, current)) and len(skips) < MAX_PER_EPISODE
+         if append:
+             kb._append_event(conn, task_id, EVENT, payload)
+             keys.add(key)
+-        current = seen is not None and _skip_key(seen["payload"]) == key
+         if seen is None or not current or append or time.time() - seen["seen_at"] >= SEEN_REFRESH_SECONDS:
+             since = seen["since"] if seen is not None and current else int(time.time())
+             _write_seen(conn, task_id, anchor, payload, keys, since)
+diff --git a/hermes_cli/kanban_llm_pacing_dispatch.py b/hermes_cli/kanban_llm_pacing_dispatch.py
+index 3833743e97..4eaacf188a 100644
+--- a/hermes_cli/kanban_llm_pacing_dispatch.py
++++ b/hermes_cli/kanban_llm_pacing_dispatch.py
+@@ -95,14 +95,19 @@ def _snapshots(provider: str) -> list[tuple[str, Any]]:
+ 
+ 
+ def read_pool(provider: str, now: float) -> list[lp.Reading]:
+-    """This moment's account-wide usage windows for every readable account of ``provider``."""
++    """This moment's account-wide usage windows for every readable account of ``provider``. An account whose read
++    succeeded with no account window at all (``/api/oauth/usage`` reports an idle or brand-new account's
++    ``five_hour`` and ``seven_day`` as ``null``, so the snapshot is not even ``available``) reads as two fresh
++    windows, 0% with no reset: :func:`kanban_llm_pacing._sustainable` counts each as a full window of headroom
++    (PR #3058 review). A failed read (None) or an unavailable one stays unknown."""
+     readings = []
+     for label, snapshot in _snapshots(provider):
+-        if snapshot is None or not snapshot.available:
++        if snapshot is None or snapshot.unavailable_reason:
+             continue
+-        for window in snapshot.windows:
+-            if window.scope != "account" or window.used_percent is None:
+-                continue
++        account = [w for w in snapshot.windows if w.scope == "account" and w.used_percent is not None]
++        if not account:
++            readings += [lp.Reading(now, label, kind, 0.0, None) for kind in (lp.FIVE_HOUR, lp.SEVEN_DAY)]
++        for window in account:
+             reset = window.reset_at.timestamp() if window.reset_at is not None else None
+             readings.append(lp.Reading(now, label, lp.window_kind(window.label), float(window.used_percent), reset))
+     return readings
+diff --git a/tests/hermes_cli/test_kanban_llm_pacing_review_3058.py b/tests/hermes_cli/test_kanban_llm_pacing_review_3058.py
+new file mode 100644
+index 0000000000..87233ee20b
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_llm_pacing_review_3058.py
+@@ -0,0 +1,135 @@
++"""LLM pacing follow-ups from the PR #3058 review (t_01a1db2e63e89126). [daveey]
++
++1. paced -> held(until T) -> paced: ``kanban_dispatch_skip.record`` dedupes against every skip of the episode, so the
++   second ``paced`` appended nothing. Past T the newest row was the expired ``held`` one, ``_llm_paced_hold`` returned
++   None and ``kanban diagnostics`` called the still-paced card ``stranded_in_ready`` (error). A skip that replaces a
++   time-bounded newest row (one carrying ``until``) is now appended again.
++2. An account whose usage read succeeded with BOTH account windows ``null`` (fully idle / brand-new) produced no
++   reading at all, so it added no fresh-window headroom. ``read_pool`` now reads it as two fresh windows (0%, no
++   reset).
++"""
++from __future__ import annotations
++
++import time
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_dispatch_skip as skips
++from hermes_cli import kanban_llm_pacing as lp
++from hermes_cli import kanban_llm_pacing_dispatch as pd
++from hermes_cli.kanban_diagnostics import compute_task_diagnostics
++from tests.hermes_cli.test_kanban_llm_pacing_followups import (CFG, DAY, HOUR, _config, _opus, _skips, _tick,
++                                                               paced_board)
++from tests.hermes_cli.test_kanban_model_tier import board as _board_fixture
++
++board = _board_fixture
++__all__ = ["paced_board"]
++
++
++# --- 1. paced -> held -> paced keeps the hold visible to diagnostics -----------------------------------------
++
++def test_paced_after_an_expired_held_row_is_recorded_again(paced_board, monkeypatch):
++    """Reviewer repro: pool reads paced -> held (reset now+60) -> paced; diagnostics an hour past the reset."""
++    _config(paced_board, kanban={"llm_pacing": {"read_interval_seconds": 0}})
++    phase, reset = ["paced"], [0.0]
++
++    def read(provider, now):
++        if phase[0] == "held":
++            reset[0] = now + 60
++            return [lp.Reading(now, f"{provider}-1", lp.SEVEN_DAY, 90, reset[0])]
++        return [lp.Reading(now, f"{provider}-1", lp.SEVEN_DAY, 20, now + 6 * DAY)]  # factor 0.625: paced
++    monkeypatch.setattr(pd, "read_pool", read)
++    with kbc.connect() as conn:
++        tid = _opus(conn, "flip")
++        for step in ("paced", "held", "paced"):
++            phase[0] = step
++            pd._CACHE.clear()
++            seen, _ = _tick(conn)
++            assert seen == []
++        rows = [(s["reason"], s["detail"], s.get("until")) for s in _skips(conn, tid)]
++        assert rows == [(skips.LLM_PACED, "anthropic paced", None), (skips.LLM_PACED, "anthropic held", int(reset[0])),
++                        (skips.LLM_PACED, "anthropic paced", None)]
++        assert skips.latest(conn, tid)["detail"] == "anthropic paced"
++        _tick(conn)  # paced again: already the newest row, nothing more
++        assert len(_skips(conn, tid)) == 3
++        diags = compute_task_diagnostics(kb.get_task(conn, tid), kb.list_events(conn, tid), kb.list_runs(conn, tid),
++                                         now=reset[0] + 3600)
++    assert [d.kind for d in diags] == ["held_in_ready"]
++    assert diags[0].data["hold_reason"] == "llm_paced"
++
++
++def test_a_flapping_hold_appends_at_most_one_row_per_expiry(paced_board, monkeypatch):
++    """held <-> paced flaps do not refill the episode: once ``paced`` is newest, a later ``held`` (a key the episode
++    holds) appends nothing, so the newest row stays the untimed ``paced`` one."""
++    _config(paced_board, kanban={"llm_pacing": {"read_interval_seconds": 0}})
++    phase = ["paced"]
++
++    def read(provider, now):
++        if phase[0] == "held":
++            return [lp.Reading(now, f"{provider}-1", lp.SEVEN_DAY, 90, now + 60)]
++        return [lp.Reading(now, f"{provider}-1", lp.SEVEN_DAY, 20, now + 6 * DAY)]
++    monkeypatch.setattr(pd, "read_pool", read)
++    with kbc.connect() as conn:
++        tid = _opus(conn, "flap")
++        for step in ("paced", "held", "paced", "held", "paced", "held", "paced"):
++            phase[0] = step
++            pd._CACHE.clear()
++            _tick(conn)
++        assert [s["detail"] for s in _skips(conn, tid)] == ["anthropic paced", "anthropic held", "anthropic paced"]
++
++
++def test_a_replica_catching_up_does_not_duplicate_the_current_skip(paced_board):
++    """The superseding append keys on this host's current skip: when that is already the new key (a pickup copy
++    re-imported before the replica pulled this host's row back), nothing is appended again."""
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="t", assignee="default")
++        assert skips.record(conn, tid, skips.LLM_PACED, detail="anthropic held", until=time.time() + 60)
++        assert skips.record(conn, tid, skips.LLM_PACED, detail="anthropic paced")
++        # The replica copy lost the just-pushed ``paced`` row: the newest event is the timed ``held`` again.
++        conn.execute("DELETE FROM task_events WHERE id = (SELECT max(id) FROM task_events WHERE task_id = ? "
++                     "AND kind = ?)", (tid, skips.EVENT))
++        conn.commit()
++        assert not skips.record(conn, tid, skips.LLM_PACED, detail="anthropic paced")
++
++
++# --- 2. an account with both windows null is fresh headroom --------------------------------------------------
++
++def _window(label, used, reset_in=None, *, now, scope="account"):
++    from datetime import UTC, datetime
++    reset = None if reset_in is None else datetime.fromtimestamp(now + reset_in, tz=UTC)
++    return SimpleNamespace(label=label, used_percent=used, reset_at=reset, scope=scope)
++
++
++def _snap(*windows, unavailable_reason=None):
++    return SimpleNamespace(windows=tuple(windows), details=(), unavailable_reason=unavailable_reason,
++                           available=bool(windows) and not unavailable_reason)
++
++
++def test_an_account_read_with_both_windows_null_counts_as_two_fresh_windows(monkeypatch):
++    now = 1_800_000_000.0
++    monkeypatch.setattr(pd, "_snapshots", lambda provider: [
++        ("busy", _snap(_window("Current session", 60, HOUR, now=now), _window("Current week", 10, 6 * DAY, now=now))),
++        ("idle", _snap()),  # /api/oauth/usage: five_hour null, seven_day null
++        ("opus-only", _snap(_window("Opus week", 5, 6 * DAY, now=now, scope="model"))),
++        ("failed", None),  # the read itself failed: unknown, never headroom
++        ("oauth-less", _snap(unavailable_reason="not an OAuth account")),
++    ])
++    current = pd.read_pool("anthropic", now)
++    fresh = sorted((r.account, r.kind, r.used, r.reset_at) for r in current if r.account != "busy")
++    assert fresh == [("idle", lp.FIVE_HOUR, 0.0, None), ("idle", lp.SEVEN_DAY, 0.0, None),
++                     ("opus-only", lp.FIVE_HOUR, 0.0, None), ("opus-only", lp.SEVEN_DAY, 0.0, None)]
++
++    history = [lp.Reading(now - HOUR, "busy", lp.FIVE_HOUR, 30, now + HOUR)]
++    pace = lp.pool_pace("anthropic", current, history, CFG)
++    five_hour = ((95 - 60) / HOUR + 2 * 95 / lp.WINDOW_SECONDS[lp.FIVE_HOUR]) / (30 / HOUR)
++    assert pace.factor == pytest.approx(five_hour, rel=1e-3)
++
++
++def test_a_fully_idle_pool_is_open():
++    now = 1_800_000_000.0
++    current = [lp.Reading(now, "idle", kind, 0.0, None) for kind in (lp.FIVE_HOUR, lp.SEVEN_DAY)]
++    pace = lp.pool_pace("anthropic", current, [], CFG)
++    assert pace.state == lp.OPEN and lp.admit_limit(pace, 3, deferrable=False, cfg=CFG) is None
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index 76bb44b78c..317d7e31a9 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -1549,7 +1549,7 @@ To see why a ready card is not spawning, run `hermes kanban dispatch --dry-run`
+ 
+ ### LLM quota pacing (`kanban.llm_pacing`)
+ 
+-Before claiming a ready or review card, the dispatcher checks the OAuth pool of the provider the card's next run would use (for a `class:*` selector, every provider the class may route to; the card waits only when all of them hold it). It reads each account's account-wide usage windows (`five_hour` and `seven_day` from `/api/oauth/usage`; Codex `Session`/`Weekly`) at most every `read_interval_seconds`, measures each window's burn rate from its recent samples, and compares the pool's burn with the rate that would bring every account with headroom to `target_percent` exactly at its window's reset. An account whose window has not started yet (the endpoint reports `null` for an idle `five_hour`) counts as a fresh full window.
++Before claiming a ready or review card, the dispatcher checks the OAuth pool of the provider the card's next run would use (for a `class:*` selector, every provider the class may route to; the card waits only when all of them hold it). It reads each account's account-wide usage windows (`five_hour` and `seven_day` from `/api/oauth/usage`; Codex `Session`/`Weekly`) at most every `read_interval_seconds`, measures each window's burn rate from its recent samples, and compares the pool's burn with the rate that would bring every account with headroom to `target_percent` exactly at its window's reset. An account whose window has not started yet (the endpoint reports `null` for an idle `five_hour`) counts as a fresh full window; an account read successfully with both windows `null` (idle or brand-new) counts as two. A failed usage read adds no headroom.
+ 
+ - **open**: the pool is on or behind pace, so claims proceed (just behind pace, this host may grow only to its recent concurrency × the pace factor, at least one run).
+ - **paced**: the pool is ahead of pace, so this host keeps its recent average concurrency on that provider × the pace factor. Review-lane, negative-priority and continuation-woken cards get only `deferrable_share` of that limit.
+-- 
+2.43.0
+

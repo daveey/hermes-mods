@@ -1,0 +1,406 @@
+From 57bb81adc08ee36e0ab8e84129ed9d9d2887ec45 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 04:45:30 +0000
+Subject: [PATCH] fix(auth): preserve Codex quota benches and rotate past
+ readmitted rows [daveey]
+
+Reproduce with the real three-row fill-first pool and HTTP-only usage stubs: an open short window erased a six-day quota wall, hid healthy B and produced the non-retryable no-selected-entry error. Require evidence for the persisted reset window and do not reuse positive evidence from an older failure generation. Preserve quota when adopting a singleton token pair. Reapply a just-marked account failure and exclude its row before resync/probes, preserving stale terminal-token generation safety. Log early bench lifts at INFO.
+
+Proof: three regression tests RED on 89a90ff35bed; five new tests GREEN; 412 tests in 47 pool/auth/model-routing files passed; all 20 scripts/check gates passed against the implementation base. Further consumer/mutation checks and compatibility-pin audit remain before publication.
+---
+ agent/credential_pool.py                      |  37 +++----
+ agent/credential_pool_bench.py                |  23 ++++
+ hermes_cli/auth_codex.py                      |  22 ++--
+ hermes_cli/auth_codex_quota_window.py         |  31 ++++++
+ tests/agent/test_codex_rotation_window.py     | 103 ++++++++++++++++++
+ .../hermes_cli/test_auth_codex_quota_probe.py |   5 +-
+ .../test_codex_credential_host_binding.py     |   3 +-
+ 7 files changed, 188 insertions(+), 36 deletions(-)
+ create mode 100644 agent/credential_pool_bench.py
+ create mode 100644 hermes_cli/auth_codex_quota_window.py
+ create mode 100644 tests/agent/test_codex_rotation_window.py
+
+diff --git a/agent/credential_pool.py b/agent/credential_pool.py
+index 95d4a197aa..8c90607edf 100644
+--- a/agent/credential_pool.py
++++ b/agent/credential_pool.py
+@@ -1366,6 +1366,7 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
+                 )
+                 should_adopt = False
+             if should_adopt:
++                from agent.credential_pool_pushed import has_live_quota_mark
+                 logger.debug(
+                     "Pool entry %s: syncing %s tokens from auth.json (refreshed by another process)",
+                     entry.id, display,
+@@ -1373,7 +1374,7 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
+                 field_updates: dict[str, Any] = {
+                     "access_token": store_access or entry.access_token,
+                     "refresh_token": store_refresh or entry.refresh_token,
+-                    **_CLEAR_STATUS,
++                    **({} if is_codex and has_live_quota_mark(entry) else _CLEAR_STATUS),
+                 }
+                 if state.get("last_refresh"):
+                     field_updates["last_refresh"] = state["last_refresh"]
+@@ -1939,7 +1940,8 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
+             # The row keeps the canonical URL; a gateway key belongs to its route host (#121486).
+             from hermes_cli.auth_codex import _codex_pool_route_base_url
+             return bool(auth_mod._probe_codex_quota_restored(
+-                token, base_url=_codex_pool_route_base_url(entry.base_url)))
++                token, base_url=_codex_pool_route_base_url(entry.base_url),
++                reset_at=entry.last_error_reset_at, failure_at=entry.last_status_at))
+         except Exception:
+             logger.debug("Codex quota-restored probe failed", exc_info=True)
+             return False
+@@ -2039,6 +2041,7 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
+ 
+     def _available_entries(
+         self, *, clear_expired: bool = False, refresh: bool = False, model: Optional[str] = None,
++        exclude_id: Optional[str] = None,
+     ) -> tuple[list[PooledCredential], list[PooledCredential]]:
+         """Return (available, pending_refresh) for entries not in cooldown.
+ 
+@@ -2047,13 +2050,14 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
+         so cross-process flock acquisition and OAuth I/O cannot stall every pool consumer.
+         """
+         from agent.codex_entitlements import codex_entry_entitled_for_model
++        from agent.credential_pool_bench import log_early_lift, resync_with_logging, rotation_candidates
+         now = time.time()
+         cleared_any = False
+         entries_to_prune: list[str] = []
+         available: list[PooledCredential] = []
+         pending_refresh: list[PooledCredential] = []
+         sole_credential = self._is_sole_credential()
+-        for entry in self._enabled_entries():  # rows switched off by ``hermes auth disable`` never serve
++        for entry in rotation_candidates(self, exclude_id):  # exclude before resync/probes
+             if self._allowed_auth_types is not None and entry.auth_type not in self._allowed_auth_types:
+                 continue
+             # Borrowed credentials persist as metadata-only references and are
+@@ -2061,7 +2065,7 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
+             # unhydrated duplicate as an empty key.
+             if entry.auth_type == AUTH_TYPE_API_KEY and not entry.runtime_api_key:
+                 continue
+-            synced = self._resync_stale_entry(entry)
++            synced = resync_with_logging(self, entry)
+             if synced is not entry:
+                 entry = synced
+                 cleared_any = True
+@@ -2099,6 +2103,7 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
+                 ):
+                     continue
+                 if clear_expired:
++                    log_early_lift(entry, "quota_probe")
+                     # The probe may have rotated this row's single-use token pair: clear the
+                     # cooldown on the live row, not on this pre-probe copy.
+                     entry = self._find(lambda e, i=entry.id: e.id == i) or entry
+@@ -2145,13 +2150,11 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
+ 
+     def _select_unlocked(
+         self, *, refresh: bool = True, count: bool = True, model: Optional[str] = None,
++        exclude_id: Optional[str] = None,
+     ) -> tuple[Optional[PooledCredential], list[PooledCredential]]:
+-        """Select the best available entry; returns ``(entry, pending_refresh)``.
+-
+-        ``count=False`` skips the ``request_count`` bump for selections that are
+-        not going to serve a request (a forced-refresh target lookup).
+-        """
+-        available, pending_refresh = self._available_entries(clear_expired=True, refresh=refresh, model=model)
++        """Return (entry, pending_refresh); count=False skips the request counter."""
++        available, pending_refresh = self._available_entries(
++            clear_expired=True, refresh=refresh, model=model, exclude_id=exclude_id)
+         if not available:
+             self._current_id = None
+             self._log_no_available_entries()
+@@ -2335,18 +2338,14 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
+             self._current_id = None
+             next_entry, _pending = self._select_unlocked(refresh=False, model=model)
+             if next_entry is not None and next_entry.id == entry.id:
+-                # No-recovery guard (#97315): selection handed back the very entry that was
+-                # just marked (the auth-store sync adopted fresher tokens, or a quota probe
+-                # false-positive lifted the bench mid-selection). Returning it reports a
+-                # successful rotation without changing the credential, so the caller retries
+-                # the same 429 forever (~2 req/s for hours). Mirror the single-entry guard on
+-                # the unmatched-identity branch: surface the failure instead.
++                # Preserve #97315's no-self-retry invariant without hiding healthy peers.
+                 logger.warning(
+                     "credential pool: rotation returned the just-marked entry %s — "
+-                    "treating as no-recovery so the failure surfaces", _label,
++                    "reapplying failure and selecting another entry", _label,
+                 )
+-                self._current_id = None
+-                return None
++                if status_code in (402, 429) or next_entry.runtime_api_key == entry.runtime_api_key:
++                    self._mark_exhausted(next_entry, status_code, error_context, failure_reason=failure_reason)
++                next_entry, _pending = self._select_unlocked(refresh=False, model=model, exclude_id=entry.id)
+             if next_entry:
+                 logger.info("credential pool: rotated to %s", next_entry.label or next_entry.id[:8])
+             return next_entry
+diff --git a/agent/credential_pool_bench.py b/agent/credential_pool_bench.py
+new file mode 100644
+index 0000000000..aaa46e0d82
+--- /dev/null
++++ b/agent/credential_pool_bench.py
+@@ -0,0 +1,23 @@
++"""Pool bench-lift diagnostics and rotation-local exclusions."""
++import logging
++import time
++
++logger = logging.getLogger(__name__)
++
++
++def log_early_lift(entry, mechanism):
++    reset = entry.last_error_reset_at
++    if entry.last_status == "exhausted" and reset is not None and reset > time.time():
++        logger.info("credential pool: bench lifted early %s mechanism=%s old_reset=%s",
++                    entry.label or entry.id[:8], mechanism, reset)
++
++
++def resync_with_logging(pool, entry):
++    synced = pool._resync_stale_entry(entry)
++    if synced.last_status != entry.last_status:
++        log_early_lift(entry, "resync")
++    return synced
++
++
++def rotation_candidates(pool, exclude_id):
++    return (entry for entry in pool._enabled_entries() if entry.id != exclude_id)
+diff --git a/hermes_cli/auth_codex.py b/hermes_cli/auth_codex.py
+index b34345fc4f..45154c5cda 100644
+--- a/hermes_cli/auth_codex.py
++++ b/hermes_cli/auth_codex.py
+@@ -735,6 +735,7 @@ def _entry_is_rate_limit_exhausted(entry: dict[str, Any]) -> bool:
+ # pool is exhausted, so without a floor a busy gateway would hammer the usage endpoint per call.
+ CODEX_QUOTA_PROBE_MIN_INTERVAL_SECONDS = 300  # 5 minutes
+ _codex_quota_probe_cache: dict[str, tuple[float, Optional[bool]]] = {}
++_codex_quota_probe_evidence: dict[str, tuple[Optional[float], Optional[float]]] = {}
+ _codex_quota_probe_lock = threading.Lock()
+ 
+ 
+@@ -757,6 +758,7 @@ def _codex_usage_probe_url(base_url: Optional[str]) -> str:
+ 
+ def _probe_codex_quota_restored(
+     access_token: Any, *, base_url: Optional[str] = None,
++    reset_at: Optional[float] = None, failure_at: Optional[float] = None,
+     min_interval_seconds: float = CODEX_QUOTA_PROBE_MIN_INTERVAL_SECONDS) -> Optional[bool]:
+     """Ask the Codex usage endpoint whether this account's quota is usable again.
+ 
+@@ -770,13 +772,15 @@ def _probe_codex_quota_restored(
+     if not token or not _decode_jwt_claims(token):
+         return None
+     cache_key = _codex_quota_probe_cache_key(token)
++    scope = (reset_at, failure_at)
+     now = time.monotonic()
+     with _codex_quota_probe_lock:
+         cached = _codex_quota_probe_cache.get(cache_key)
+         if cached is not None and (now - cached[0]) < min_interval_seconds:
+-            return cached[1]
++            return cached[1] if _codex_quota_probe_evidence.get(cache_key, (None, None)) == scope else None
+         # Reserve the slot immediately so concurrent selectors don't stampede the endpoint.
+         _codex_quota_probe_cache[cache_key] = (now, None)
++        _codex_quota_probe_evidence[cache_key] = scope
+     result: Optional[bool] = None
+     try:
+         # Account/residency headers from the JWT (required for some account shapes).
+@@ -788,20 +792,8 @@ def _probe_codex_quota_restored(
+             response = client.get(_codex_usage_probe_url(base_url), headers=headers)
+         if response.status_code == 200:
+             payload = response.json() or {}
+-            # A model-scoped allowance (``additional_rate_limits``) at 100% still 429s that
+-            # model, so it counts against "restored" like the account-wide windows (#97315).
+-            windows = [payload.get("rate_limit") or {}] + [
+-                extra.get("rate_limit") or {}
+-                for extra in (payload.get("additional_rate_limits") or [])
+-                if isinstance(extra, dict)]
+-            worst_used: Optional[float] = None
+-            for rate_limit in windows:
+-                for key in ("primary_window", "secondary_window"):
+-                    used = (rate_limit.get(key) or {}).get("used_percent")
+-                    if isinstance(used, (int, float)):
+-                        worst_used = max(worst_used or 0.0, float(used))
+-            if worst_used is not None:
+-                result = worst_used < 100.0
++            from hermes_cli.auth_codex_quota_window import quota_restored
++            result = quota_restored(payload, reset_at)
+         elif response.status_code == 429:
+             result = False
+     except Exception:
+diff --git a/hermes_cli/auth_codex_quota_window.py b/hermes_cli/auth_codex_quota_window.py
+new file mode 100644
+index 0000000000..291d1809c6
+--- /dev/null
++++ b/hermes_cli/auth_codex_quota_window.py
+@@ -0,0 +1,31 @@
++"""Conservative evidence for lifting a persisted Codex quota window."""
++import math
++
++
++def _number(value):
++    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
++
++
++def quota_restored(payload, reset_at=None):
++    """A partial short-window response cannot disprove a named long-window wall.
++
++    Match absolute reset epochs with a minute of provider rounding tolerance.
++    Unknown/missing evidence keeps the bench; account/model denial always wins.
++    """
++    limits = [payload.get("rate_limit") or {}] + [
++        extra.get("rate_limit") or {} for extra in (payload.get("additional_rate_limits") or [])
++        if isinstance(extra, dict)]
++    usages = []
++    matched = reset_at is None
++    for limit in limits:
++        if limit.get("allowed") is False or limit.get("limit_reached") is True:
++            return False
++        for key in ("primary_window", "secondary_window"):
++            window = limit.get(key) or {}
++            used = window.get("used_percent")
++            if _number(used):
++                usages.append(used)
++                reset = window.get("reset_at")
++                if _number(reset_at) and _number(reset) and abs(reset - reset_at) <= 60:
++                    matched = True
++    return bool(usages) and matched and all(0 <= used < 100 for used in usages)
+diff --git a/tests/agent/test_codex_rotation_window.py b/tests/agent/test_codex_rotation_window.py
+new file mode 100644
+index 0000000000..6b9c7b0b81
+--- /dev/null
++++ b/tests/agent/test_codex_rotation_window.py
+@@ -0,0 +1,103 @@
++"""Real pool/probe regression: a short-window response cannot undo a weekly 429."""
++import base64
++import json
++import logging
++import time
++
++import httpx
++import pytest
++
++from agent.credential_pool import load_pool
++from agent.model_routing_runtime import verify_class_runtime
++from agent.model_routing_unavailable import SubscriptionQuotaUnavailable
++from hermes_cli import auth, auth_codex
++
++
++def _token(label):
++    payload = base64.urlsafe_b64encode(json.dumps({"exp": time.time() + 3600, "sub": label}).encode()).decode().rstrip("=")
++    return f"eyJhbGciOiJub25lIn0.{payload}.sig"
++
++
++def _pool(tmp_path, monkeypatch, *, other_walled=False, payload=None):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    auth._codex_quota_probe_cache.clear()
++    reset = time.time() + 6 * 86400
++    rows = []
++    for index, label in enumerate("ABC"):
++        row = dict(id=label, label=label, priority=index, source="manual", auth_type="oauth",
++                   access_token=_token(label), refresh_token=f"refresh-{label}")
++        if label == "C" or (label == "B" and other_walled):
++            row.update(last_status="exhausted", last_status_at=time.time(), last_error_code=429,
++                       last_error_reason="usage_limit_reached", last_error_reset_at=reset)
++        rows.append(row)
++    (tmp_path / "auth.json").write_text(json.dumps({"version": 1, "credential_pool": {"openai-codex": rows}}))
++    response = payload or {"rate_limit": {"primary_window": {"used_percent": 0, "reset_at": time.time() + 18000}}}
++    transport = httpx.MockTransport(lambda request: httpx.Response(200, json=response))
++    monkeypatch.setattr(auth_codex, "_codex_http_client", lambda **kwargs: httpx.Client(transport=transport))
++    pool = load_pool("openai-codex")
++    return pool, rows, reset
++
++
++def _verify(pool, token):
++    verify_class_runtime(dict(provider="openai-codex", api_key=token, credential_pool=pool,
++                              base_url="https://chatgpt.com/backend-api/codex", api_mode="codex_responses"),
++                         dict(selected_provider="openai-codex", selected_model="gpt-6-astra", billing_group="subscription"))
++
++
++def _rotate(pool, reset):
++    return pool.mark_exhausted_and_rotate(status_code=429, credential_id="A",
++                                         error_context={"reason": "usage_limit_reached", "reset_at": reset})
++
++
++def test_positive_probe_before_429_is_not_reused(tmp_path, monkeypatch):
++    pool, rows, reset = _pool(tmp_path, monkeypatch)
++    assert auth_codex._probe_codex_quota_restored(rows[0]["access_token"]) is True
++    nxt = _rotate(pool, reset)
++    assert nxt is not None and nxt.id == "B"
++    assert next(e for e in pool.entries() if e.id == "A").last_status == "exhausted"
++
++
++def test_singleton_token_adoption_preserves_weekly_quota(tmp_path, monkeypatch):
++    pool, _, reset = _pool(tmp_path, monkeypatch)
++    # Use the real singleton sync, with a newer token pair for the same device-code row.
++    entry = pool._adopt(pool.entries()[0], source="device_code")
++    pool._mark_exhausted(entry, 429, {"reason": "usage_limit_reached", "reset_at": reset})
++    state = json.loads((tmp_path / "auth.json").read_text())
++    fresh = _token("replacement")
++    state["providers"] = {"openai-codex": {"tokens": {"access_token": fresh, "refresh_token": "new-refresh"}}}
++    (tmp_path / "auth.json").write_text(json.dumps(state))
++    entry = next(e for e in pool.entries() if e.id == "A")
++    adopted = pool._sync_entry_from_auth_store(entry)
++    assert adopted.access_token == fresh
++    assert adopted.last_status == "exhausted"
++    assert adopted.last_error_reset_at == reset
++
++
++def test_short_window_cannot_hide_healthy_fallback(tmp_path, monkeypatch):
++    pool, _, reset = _pool(tmp_path, monkeypatch)
++    nxt = _rotate(pool, reset)
++    assert nxt is not None and nxt.id == "B"
++    _verify(pool, nxt.runtime_api_key)
++    assert next(e for e in pool.entries() if e.id == "A").last_status == "exhausted"
++
++
++def test_short_window_all_walled_is_retryable(tmp_path, monkeypatch):
++    pool, rows, reset = _pool(tmp_path, monkeypatch, other_walled=True)
++    assert _rotate(pool, reset) is None
++    with pytest.raises(SubscriptionQuotaUnavailable):
++        _verify(pool, rows[0]["access_token"])
++
++
++def test_proven_weekly_reopen_logs_and_rotation_still_excludes_failure(tmp_path, monkeypatch, caplog):
++    reset = time.time() + 6 * 86400
++    payload = {"rate_limit": {"primary_window": {"used_percent": 0},
++                              "secondary_window": {"used_percent": 0, "reset_at": reset}}}
++    pool, _, _ = _pool(tmp_path, monkeypatch, payload=payload)
++    with caplog.at_level(logging.INFO):
++        nxt = _rotate(pool, reset)
++    assert nxt is not None and nxt.id == "B"
++    _verify(pool, nxt.runtime_api_key)
++    assert "bench lifted early" in caplog.text
++    assert "quota_probe" in caplog.text
++    assert "old_reset=" in caplog.text
++    assert next(e for e in pool.entries() if e.id == "A").last_status == "exhausted"
+diff --git a/tests/hermes_cli/test_auth_codex_quota_probe.py b/tests/hermes_cli/test_auth_codex_quota_probe.py
+index 3f82561dbd..3f82bb3c40 100644
+--- a/tests/hermes_cli/test_auth_codex_quota_probe.py
++++ b/tests/hermes_cli/test_auth_codex_quota_probe.py
+@@ -428,7 +428,10 @@ def test_pool_selection_keeps_probe_rotated_tokens_when_quota_restored(tmp_path,
+     fresh = _jwt({"exp": now + 3600})
+     refresh_calls: list = []
+     _fake_refresh(monkeypatch, fresh, refresh_calls)
+-    http_calls = _patch_expiry_aware_httpx(monkeypatch, _StubResponse(200, _usage_payload(0.0, 0.0)))
++    payload = _usage_payload(0.0, 0.0)
++    # Restoration must prove the same weekly window, not just anonymous percentages.
++    payload["rate_limit"]["secondary_window"]["reset_at"] = store["credential_pool"]["openai-codex"][0]["last_error_reset_at"]
++    http_calls = _patch_expiry_aware_httpx(monkeypatch, _StubResponse(200, payload))
+     from agent.credential_pool import load_pool
+ 
+     pool = load_pool("openai-codex")
+diff --git a/tests/hermes_cli/test_codex_credential_host_binding.py b/tests/hermes_cli/test_codex_credential_host_binding.py
+index 5cc67df4ba..8f7cf84919 100644
+--- a/tests/hermes_cli/test_codex_credential_host_binding.py
++++ b/tests/hermes_cli/test_codex_credential_host_binding.py
+@@ -383,9 +383,10 @@ class _UsageRecorder:
+         return False
+ 
+     def get(self, url, headers=None, **_kw):
++        import time
+         self.seen.append((str(url), (headers or {}).get("Authorization", "")))
+         return SimpleNamespace(status_code=200, json=lambda: {
+-            "rate_limit": {"primary_window": {"used_percent": 10}}}, headers={})
++            "rate_limit": {"primary_window": {"used_percent": 10, "reset_at": time.time() + 3 * 86400}}}, headers={})
+ 
+ 
+ def _exhausted_jwt_pool(home: Path) -> None:
+-- 
+2.43.0
+

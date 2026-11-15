@@ -1,0 +1,130 @@
+From d61aa27f727a44b2c8c06bca826caa6d874f6a36 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 21:35:25 +0000
+Subject: [PATCH] [daveey] automation replay: distrust a wall reset only in a
+ retired process, not on code skew alone
+
+PR #2625 made `trusted_resets_at` drop a build failure's `failure_resets_at` when this process ran stale
+code, judged by `host_loops_retired()` OR `detect_code_skew()`. A gateway whose checkout moved but that is
+not retiring still runs the replay itself, on the same stale code: a genuine SubscriptionQuotaUnavailable
+replayed after the short delay, hit the same wall, failed and gave up, where before #2625 it waited for the
+wall's reset and delivered. `notice_guarantee._retry_at` spent close-out attempts the same way.
+
+Five whys: the replay gave up early -> it was due after REPLAY_MIN_DELAY_S, not at the reset -> skew alone
+made `trusted_resets_at` return None -> #2625 treated "older code than the checkout" as "a successor runs
+the replay" -> only a retired process (host loops released, being replaced) actually hands the replay to a
+successor on newer code.
+
+Fix: `stale_code_reason` (only used by `trusted_resets_at`) now returns `host_loops_retired()` and nothing
+else. A skewed always-on backend that stays behind is still covered: the skew watchdog retires its host
+loops once the skew persists (test_an_always_on_backend_behind_the_checkout_gives_the_lease_up...).
+
+Proof: tests/hermes_cli/test_superseded_host_loops.py
+- test_a_skewed_but_not_retired_process_still_waits_for_the_reset: RED on main (trusted_resets_at -> None),
+  GREEN here (replay due and close-out retry_at at the reset).
+- test_a_wall_failure_in_a_retired_process_replays_after_the_short_delay[skewed=False|True]: retired keeps
+  the short delay.
+All 13 test files importing automation_replay/notice_guarantee: 225 passed. scripts/check --base origin/main ok.
+
+Card t_01a1d6b19bf73072 (review nit on PR #2625, review 5897920822). Reverse: revert this commit.
+---
+ .../hermes_cli/test_superseded_host_loops.py  | 28 ++++++++++++++-----
+ tui_gateway/automation_replay.py              | 25 ++++++++---------
+ 2 files changed, 32 insertions(+), 21 deletions(-)
+
+diff --git a/tests/hermes_cli/test_superseded_host_loops.py b/tests/hermes_cli/test_superseded_host_loops.py
+index fbf9289d6d..acdf13f223 100644
+--- a/tests/hermes_cli/test_superseded_host_loops.py
++++ b/tests/hermes_cli/test_superseded_host_loops.py
+@@ -213,17 +213,31 @@ def test_a_wall_failure_on_current_code_still_waits_for_the_reset(monkeypatch):
+     assert ng._retry_at("20261031_064851_d0f106", now) == reset + ng.DEFER_SLACK_S
+ 
+ 
+-@pytest.mark.parametrize("stale", ["retired", "skew"])
+-def test_a_wall_failure_on_stale_code_replays_after_the_short_delay(monkeypatch, stale):
++def test_a_skewed_but_not_retired_process_still_waits_for_the_reset(monkeypatch):
++    # [daveey] t_01a1d6b19bf73072: this process runs the replay itself, on the same stale code, so a short-delay
++    # replay would hit the same wall, fail and give up; only a retired process hands the replay to a successor.
+     from gateway import code_skew
+     from tui_gateway import automation_replay as ar
+     from tui_gateway import notice_guarantee as ng
+ 
+-    if stale == "retired":
+-        monkeypatch.setattr(code_skew, "detect_code_skew", lambda: None)
+-        hll.retire_host_loops("test", "always-on backend :9148 superseded")
+-    else:
+-        monkeypatch.setattr(code_skew, "detect_code_skew", lambda: ("17f28630e4", "0068f2ca86"))
++    monkeypatch.setattr(code_skew, "detect_code_skew", lambda: ("17f28630e4", "0068f2ca86"))
++    assert hll.host_loops_retired() is None
++    now = time.time()
++    reset = now + 4 * 86400
++    assert _replay_due(monkeypatch, reset) == reset
++    assert ar.trusted_resets_at(reset) == reset
++    assert ng._retry_at("20261031_064851_d0f106", now) == reset + ng.DEFER_SLACK_S
++
++
++@pytest.mark.parametrize("skewed", [False, True])
++def test_a_wall_failure_in_a_retired_process_replays_after_the_short_delay(monkeypatch, skewed):
++    from gateway import code_skew
++    from tui_gateway import automation_replay as ar
++    from tui_gateway import notice_guarantee as ng
++
++    skew = ("17f28630e4", "0068f2ca86") if skewed else None
++    monkeypatch.setattr(code_skew, "detect_code_skew", lambda: skew)
++    hll.retire_host_loops("test", "always-on backend :9148 superseded")
+     now = time.time()
+     due = _replay_due(monkeypatch, now + 4 * 86400)
+     assert now + ar.REPLAY_MIN_DELAY_S <= due <= time.time() + ar.REPLAY_MIN_DELAY_S
+diff --git a/tui_gateway/automation_replay.py b/tui_gateway/automation_replay.py
+index 24ec44f5e4..cee776ddd0 100644
+--- a/tui_gateway/automation_replay.py
++++ b/tui_gateway/automation_replay.py
+@@ -118,26 +118,23 @@ def replay_due(now: float, resets_at: Any = None) -> float:
+ 
+ 
+ def stale_code_reason() -> str | None:
+-    """Why this process's code may be behind the checkout (host loops retired, or the boot commit is no longer
+-    the checkout's), else None. Never raises."""
++    """Why this process is being replaced by one on newer code (its host loops are retired), else None. Code skew
++    alone does not count: a skewed process that is not retiring runs the replay itself, on the same stale code, so
++    only a retired one hands it to a successor. Never raises."""
+     try:
+         from hermes_cli.host_loop_lease import host_loops_retired
+-        retired = host_loops_retired()
+-        if retired:
+-            return retired
+-        from gateway.code_skew import detect_code_skew
+-        skew = detect_code_skew()
+-    except Exception:  # health: allow BLE001 -- an unreadable revision is no proof of stale code
++        return host_loops_retired()
++    except Exception:  # health: allow BLE001 -- an unreadable state is no proof of a successor
+         return None
+-    return "this process loaded {} but the checkout is at {}".format(*skew) if skew else None
+ 
+ 
+ def trusted_resets_at(failure: Any) -> Any:
+     """[daveey] A build failure's ``failure_resets_at`` (``failure`` is the ``agent_failure`` dict or the value
+-    itself), or None when the failing process ran stale code: a quota or route wall it hit may be one the
+-    checkout's code already routes around, so the replay and the deferred close-out take the short delay instead
+-    of waiting days for that wall's reset (hub :9148 booked Nov 17 for a wake that failed on pre-fix code,
+-    t_01a1d65520e78e7d)."""
++    itself), or None when this process is retired (``host_loops_retired``): a successor on the checkout's code
++    runs the replay, and that code may already route around the quota or route wall, so the replay and the
++    deferred close-out take the short delay instead of waiting days for that wall's reset (hub :9148 booked Nov 17
++    for a wake that failed on pre-fix code, t_01a1d65520e78e7d). A skewed process that is not retiring keeps the
++    reset: a short-delay replay would run on the same stale code, fail again and give up (t_01a1d6b19bf73072)."""
+     resets_at = failure.get("failure_resets_at") if isinstance(failure, dict) else failure
+     if resets_at is None:
+         return None
+@@ -166,7 +163,7 @@ def replay_failed_wake(key: str, text: str, session: dict, display_kind: str | N
+                        display_metadata: dict | None, label: str) -> None:
+     """[daveey] A wake that carried an automation delivery (sweep-wake, owner-wake, a notice) failed before its turn
+     could start (agent build): ONE delayed replay, at the build failure's recorded quota/route reset when it has one
+-    (``agent_failure.failure_resets_at``, unless this process ran stale code: ``trusted_resets_at``), else
++    (``agent_failure.failure_resets_at``, unless this process is retired: ``trusted_resets_at``), else
+     ``REPLAY_MIN_DELAY_S``. The delivery is not in the transcript, so a later successful turn does not cancel it.
+     A replay's own failure gives up. A chat close-out wake is included: ``notice_guarantee`` stamps its row
+     ``closeout.state = "deferred"`` with a ``retry_at`` after this replay's due time (the durable fallback when this
+-- 
+2.43.0
+

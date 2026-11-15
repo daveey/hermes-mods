@@ -1,0 +1,171 @@
+From ea47cf3fa9197322dedae33f8e39b5f499895fc3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 01:54:18 +0000
+Subject: [PATCH] fix(shell): inherit arithmetic after subscripts and
+ replacements [daveey]
+
+Classify parameter words after closing a subscript; keep replacement patterns lexical until the unescaped replacement delimiter. Preserve ordinary expansion boundaries. Review 5900427657 findings addressed. Proof: 13 new real-bash marker cases failed on prior head; 52 focused tests pass, 8 exact-line mutants killed, 1205 lifecycle family tests pass. Parameter dispatch extracted to retain complexity headroom.
+---
+ .../test_lifecycle_guard_arith_parameter.py   | 49 ++++++++++++++++++-
+ tools/shell_arith_sink.py                     | 39 ++++++++++-----
+ 2 files changed, 75 insertions(+), 13 deletions(-)
+
+diff --git a/tests/cron/test_lifecycle_guard_arith_parameter.py b/tests/cron/test_lifecycle_guard_arith_parameter.py
+index 67eb41a7ba..90d4177e57 100644
+--- a/tests/cron/test_lifecycle_guard_arith_parameter.py
++++ b/tests/cron/test_lifecycle_guard_arith_parameter.py
+@@ -18,7 +18,7 @@ def test_parameter_output_executes_in_arithmetic(tmp_path, op, prelude, nested):
+     marker = tmp_path / "marker"
+     big = tmp_path / "big.sh"
+     big.write_text("# padding\n" * 130000 + f"printf RAN > {marker}\n", encoding="utf-8")
+-    value = "$(echo 'a[$(bash " + str(big) + ")]')"
++    value = "$(echo 'b[$(bash " + str(big) + ")]')"
+     if nested:
+         value = "${w:-" + value + "}"
+     command = prelude + "x=$(( 1 + ${v" + op + value + "} ))"
+@@ -54,6 +54,53 @@ def test_parameter_data_and_closed_arithmetic_are_not_sinks(command, tmp_path):
+     assert not output_reaches_shell(command)
+ 
+ 
++@pytest.mark.parametrize("parameter,prelude", [
++    ("a[0]:-", "unset a;"), ("a[0]:=", "unset a;"),
++    ("a[0]:+", "a=(1);"), ("a[0]-", "unset a;"),
++    ("a[0]=", "unset a;"), ("a[0]+", "a=(1);"),
++    ("v/1/", "v=1;"), ("v//1/", "v=1;"),
++    ("v/#1/", "v=1;"), ("v/%1/", "v=1;"),
++    ("a[0]/1/", "a=(1);"),
++    ("v/${w:-1}/", "v=1; unset w;"),
++    ('v/"1"/', "v=1;"),
++])
++def test_subscript_and_replacement_output_executes(tmp_path, parameter, prelude):
++    marker = tmp_path / "marker"
++    big = tmp_path / "big.sh"
++    big.write_text("# padding\n" * 130000 + f"printf RAN > {marker}\n", encoding="utf-8")
++    value = "$(echo 'b[$(bash " + str(big) + ")]')"
++    command = prelude + "x=$(( ${" + parameter + value + "} ))"
++    result = subprocess.run(
++        ["/bin/bash"], input=command, text=True, encoding="utf-8", capture_output=True,
++        timeout=20, check=False, env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)},
++    )
++    assert result.returncode == 0, result.stderr
++    assert marker.read_text(encoding="utf-8") == "RAN"
++    assert substitution_in_arithmetic(command, date_exempt=True)
++    assert output_reaches_shell(command)
++    unsafe, refusal = scan_gateway_lifecycle(command, cwd=str(tmp_path))
++    assert unsafe and refusal and "larger than the scan cap" in refusal
++
++
++@pytest.mark.parametrize("command", [
++    "a=(1); x=${a[0]:-$(echo data)}",
++    "v=1; x=${v/1/$(echo data)}",
++    "v=1; x=$(( ${v//$(printf unused)/0} ))",
++    "v=1; x=$(( ${v/${w:-$(printf unused)}/0} ))",
++    r"v=1; x=$(( ${v/unused\/$(printf unused)/0} ))",
++    'v=1; x=$(( ${v/"unused/$(printf unused)"/0} ))',
++    "v=1; x=$(( ${v/unused/1} )); y=$(echo data)",
++    "a=(1); x=$(( ${a[0]:-1} )); y=$(echo data)",
++])
++def test_replacement_pattern_and_subscript_controls(command, tmp_path):
++    result = subprocess.run(
++        ["/bin/bash"], input=command, text=True, encoding="utf-8", capture_output=True,
++        timeout=20, check=False, env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)},
++    )
++    assert result.returncode == 0, result.stderr
++    assert not output_reaches_shell(command)
++
++
+ def test_parameter_date_exemption_remains_caller_controlled():
+     command = "x=$(( ${v:-${w:-$(date +%s)}} ))"
+     assert not substitution_in_arithmetic(command, date_exempt=True)
+diff --git a/tools/shell_arith_sink.py b/tools/shell_arith_sink.py
+index d11f2a63fe..c7fe7ecf71 100644
+--- a/tools/shell_arith_sink.py
++++ b/tools/shell_arith_sink.py
+@@ -27,6 +27,7 @@ _TOKENS = (r"\\.|'|\"|`|\$\(\(|\$\(|\$\[|\$\{|\(\(|\(|\)|\[\[|\]\]|\[|\]|\}|#"
+            r"|\$'|<<<|<<|\n|(?<![\w.$/-])let[ \t]+")
+ _TOKEN_RE = re.compile(_TOKENS, re.DOTALL)
+ _NO_HEREDOC_TOKEN_RE = re.compile(_TOKENS.replace(r"|\n", ""), re.DOTALL)
++_PATTERN_TOKEN_RE = re.compile(_TOKENS + r"|/", re.DOTALL)
+ # Inside `let` the list operators end the arithmetic too; elsewhere skipping them keeps the scan
+ # of a long script fast.
+ _LET_TOKEN_RE = re.compile(_TOKENS + r"|[;&|\n]", re.DOTALL)
+@@ -40,6 +41,7 @@ _COMMENT_PRECEDERS = frozenset(" \t\n;&|(")
+ # Frame kinds. A frame is [kind, closer, depth, in_double_quotes].
+ _CMD, _ARITH, _PARAM = "cmd", "arith", "param"
+ _PARAM_ARITH = "param_arith"  # parameter word feeding an arithmetic evaluator
++_PARAM_PATTERN = "param_pattern"  # only its replacement feeds the evaluator
+ 
+ 
+ def substitution_in_arithmetic(command: str, *, date_exempt: bool, _depth: int = 0) -> bool:
+@@ -62,6 +64,7 @@ def substitution_in_arithmetic(command: str, *, date_exempt: bool, _depth: int =
+     command_tokens = _TOKEN_RE if "<<" in command else _NO_HEREDOC_TOKEN_RE
+     while pos < end:
+         tokens = _LET_TOKEN_RE if stack[-1][1] == "let" else command_tokens
++        tokens = {_PARAM_PATTERN: _PATTERN_TOKEN_RE}.get(stack[-1][0], tokens)
+         match = tokens.search(command, pos)
+         if match is None:
+             break
+@@ -105,13 +108,8 @@ def substitution_in_arithmetic(command: str, *, date_exempt: bool, _depth: int =
+             pos = _cmd_token(command, token, start, pos, stack, closes, operators)
+         elif kind == _ARITH:
+             pos = _arith_token(command, token, pos, stack)
+-        elif token == "}":  # _PARAM
+-            stack.pop()
+-        elif token == "#" or token.startswith("let"):
+-            continue
+-        elif token in (")", "]", "]]") and len(stack) > 1:
+-            stack.pop()  # a parameter frame never closes on these: recover outward
+-            pos = start
++        else:
++            pos = _parameter_token(token, start, pos, stack)
+     # Callers also pass opener-only command units; queued bodies are not quote errors.
+     return backtick_open or any(frame[3] for frame in stack)
+ 
+@@ -181,15 +179,23 @@ def _quote_close(command: str, pos: int, *, ansi: bool) -> int | None:
+     return None
+ 
+ 
++
++def _parameter_token(token, start, pos, stack) -> int:
++    if stack[-1][0] == _PARAM_PATTERN and token == "/":
++        stack[-1][0] = _PARAM_ARITH
++    elif token == "}":
++        stack.pop()
++    elif token in (")", "]", "]]") and len(stack) > 1:
++        stack.pop()  # a parameter frame never closes on these: recover outward
++        return start
++    return pos
++
++
+ def _open_parameter(command: str, pos: int, stack: list[list]) -> int:
+     """Push the frame for a ``${`` opened before *pos*; return where scanning resumes."""
+     name = _PARAM_NAME_RE.match(command, pos)
+     after = name.end() if name else pos
+-    # Default/alternate/assignment words feed the surrounding evaluator; pattern
+-    # operands do not. Preserve parameter lexical rules (not arithmetic brackets).
+-    operator = command[after:after + 2].lstrip(":")[:1]
+-    inherited = stack[-1][0] in (_ARITH, _PARAM_ARITH) and operator in ("-", "=", "+")
+-    stack.append([_PARAM_ARITH if inherited else _PARAM, "}", 0, False])
++    stack.append([_PARAM, "}", 0, False])
+     return _after_parameter_name(command, after, stack)
+ 
+ 
+@@ -203,6 +209,15 @@ def _after_parameter_name(command: str, pos: int, stack: list[list]) -> int:
+     if following[:1] == ":" and following[1:2] not in ("-", "=", "+", "?"):
+         stack[-1] = [_ARITH, "}", 0, False]
+         return pos + 1
++    # Classify after the subscript too. Keep parameter lexical rules: literal
++    # brackets in words and patterns must not open arithmetic frames.
++    if stack[-2][0] in (_ARITH, _PARAM_ARITH):
++        operator = following.lstrip(":")[:1]
++        if operator in ("-", "=", "+"):
++            stack[-1][0] = _PARAM_ARITH
++        elif following.startswith("/"):
++            stack[-1][0] = _PARAM_PATTERN
++            return pos + (2 if following == "//" else 1)
+     return pos
+ 
+ 
+-- 
+2.43.0
+

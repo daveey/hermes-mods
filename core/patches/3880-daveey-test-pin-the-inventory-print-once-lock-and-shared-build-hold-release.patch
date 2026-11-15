@@ -1,0 +1,159 @@
+From 147a9e9d5141b8bf2980b5de630f731eccd4d3fe Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 21:30:18 +0000
+Subject: [PATCH] [daveey] test: pin the inventory print-once lock and
+ shared-build hold release
+
+Post-merge mutants on #2549 (t_01a1d697acbb03f7) left two clauses untested:
+
+- M7 hermes_cli/cli_init_mixin.py `or not claimed.acquire(blocking=False)`:
+  a second settled session.info reaching the wait (a delivery whose
+  apply_event snapshotted the listener list before the first removed it)
+  must print nothing and not raise. New test
+  test_two_settled_frames_reaching_the_wait_print_the_notices_once.
+- M14 gateway/session_local_inventory.py `if not entry.holds and
+  entry.task.done()`: two pending resume replies hold one shared build that
+  finishes while both are still being assembled; releasing the first hold
+  publishes nothing, the second publishes exactly one settled session.info,
+  after both replies. New test
+  test_a_shared_build_publishes_only_after_every_pending_reply_holding_it.
+
+Also derive the 60 s-inventory create test's bound from
+REPLY_INVENTORY_BUDGET_S plus 10 s instead of a fixed 3 s: it measured
+3.13 s on a loaded worker (load 26) on both the merge and its parent.
+
+Mutants (sdlc-review scripts/mutants.py, 3 test files, baseline 20 passed):
+M7 killed by the new CLI test only; M14 killed by the new gateway test only.
+Test-only change.
+---
+ .../test_session_create_inventory_budget.py   | 61 ++++++++++++++++++-
+ .../test_cli_gateway_inventory_pending.py     | 21 +++++++
+ 2 files changed, 81 insertions(+), 1 deletion(-)
+
+diff --git a/tests/gateway/test_session_create_inventory_budget.py b/tests/gateway/test_session_create_inventory_budget.py
+index 4d61a28d5a..9b98b5080a 100644
+--- a/tests/gateway/test_session_create_inventory_budget.py
++++ b/tests/gateway/test_session_create_inventory_budget.py
+@@ -67,13 +67,15 @@ def _info_frames(authority, sid):
+ @pytest.mark.asyncio
+ async def test_create_reply_does_not_wait_on_a_60s_inventory_and_info_follows(tmp_path, monkeypatch):
+     gateway = await _gateway(tmp_path, monkeypatch)
++    from gateway.session_local_inventory import REPLY_INVENTORY_BUDGET_S
+     from tui_gateway.contracts.registry import CANONICAL_METHODS
+     release, calls = _slow_inventory(monkeypatch, hold_s=60)
+     try:
+         started = time.monotonic()
+         created = await gateway.call('session.create', request_id='slow', source='tui', cwd=gateway.cwd)
+         elapsed = time.monotonic() - started
+-        assert elapsed < 3, f'session.create reply took {elapsed:.1f}s behind the inventory'
++        # The budget plus room for a loaded worker (3.1 s seen at load 26), far below the 60 s build.
++        assert elapsed < REPLY_INVENTORY_BUDGET_S + 10, f'session.create reply took {elapsed:.1f}s behind the inventory'
+         CANONICAL_METHODS['session.create'].result.model_validate(created)
+         info = created['info']
+         assert info['inventory_pending'] is True and info['tools'] == {} and info['skills'] == {}, info
+@@ -142,6 +144,63 @@ async def test_concurrent_opens_of_one_session_share_one_build(tmp_path, monkeyp
+     assert session_local_inventory._pending == {}
+ 
+ 
++@pytest.mark.asyncio
++async def test_a_shared_build_publishes_only_after_every_pending_reply_holding_it(tmp_path, monkeypatch):
++    """Two opens of one session wait on the same build and both reply pending. The build finishes
++    while both replies are still being assembled: releasing the first reply's hold publishes nothing
++    (the second reply's pending shape would overwrite the inventory), the second publishes it once."""
++    gateway = await _gateway(tmp_path, monkeypatch)
++    from gateway import session_controls, session_local_inventory
++    release, calls = _slow_inventory(monkeypatch, hold_s=60)
++    monkeypatch.setattr(session_local_inventory, 'REPLY_INVENTORY_BUDGET_S', 0.05)
++    try:
++        created = await gateway.call('session.create', request_id='holds', source='tui', cwd=gateway.cwd)
++        sid = created['session_id']
++        assert created['info']['inventory_pending'] is True
++        order = []
++        gateway.authority.sessions[sid].event_stream.observers.add(
++            lambda frame: order.append(frame['params']['payload']) if frame['params']['type'] == 'session.info' else None)
++        gates, real_transcript = [], session_controls._resume_transcript
++
++        async def gated_transcript(*args):
++            gate = asyncio.Event()
++            gates.append(gate)
++            await gate.wait()  # this reply is still being assembled
++            return await real_transcript(*args)
++
++        monkeypatch.setattr(session_controls, '_resume_transcript', gated_transcript)
++
++        async def resume(label):
++            reply = await gateway.call('session.resume', session_id=sid)
++            order.append(label)
++            return reply
++
++        first, second = (asyncio.ensure_future(resume(label)) for label in ('first reply', 'second reply'))
++        await async_wait_until(lambda: len(gates) == 2, what='both replies past reply_info')
++        (entry,) = session_local_inventory._pending.values()
++        assert entry.holds == 2 and calls == ['tui']
++    finally:
++        release.set()
++    await async_wait_until(lambda: entry.task.done(), what='shared inventory built')
++    for _ in range(5):
++        await asyncio.sleep(0)  # the build's done callback (_settle) has run
++    assert order == [], order  # both replies still hold it
++    gates[0].set()
++    await asyncio.wait({first, second}, return_when=asyncio.FIRST_COMPLETED)
++    for _ in range(5):
++        await asyncio.sleep(0)  # the first reply's hold is released (call_soon)
++    assert entry.holds == 1 and len(order) == 1 and isinstance(order[0], str), order
++    gates[1].set()
++    replies = await asyncio.gather(first, second)
++    assert all(reply['info']['inventory_pending'] is True for reply in replies)
++    await async_wait_until(lambda: len(order) == 3, what='late session.info published')
++    for _ in range(5):
++        await asyncio.sleep(0)
++    assert sorted(order[:2]) == ['first reply', 'second reply'] and len(order) == 3, order
++    assert order[2]['inventory_pending'] is False and order[2]['tools'] == {'terminal': ['terminal']}
++    assert session_local_inventory._pending == {}
++
++
+ def _failing_inventory(monkeypatch):
+     """``session_inventory`` that raises once released (a builder bug, a closed profile)."""
+     from gateway import session_local_inventory
+diff --git a/tests/hermes_cli/test_cli_gateway_inventory_pending.py b/tests/hermes_cli/test_cli_gateway_inventory_pending.py
+index 84068f7128..c9996db11f 100644
+--- a/tests/hermes_cli/test_cli_gateway_inventory_pending.py
++++ b/tests/hermes_cli/test_cli_gateway_inventory_pending.py
+@@ -2,6 +2,7 @@
+ (``inventory_pending``, gateway/session_local_inventory.reply_info). The classic CLI printed the
+ gateway-judged startup lines (``unknown_toolsets``, ``tool_availability_warnings``) only from that
+ reply, so under load they never showed: they now print when the late ``session.info`` settles it."""
++import asyncio
+ from contextlib import asynccontextmanager
+ 
+ import pytest
+@@ -67,6 +68,26 @@ def test_late_inventory_prints_the_startup_notices_once(pending_store, monkeypat
+     assert len(printed) == 3, printed
+ 
+ 
++def test_two_settled_frames_reaching_the_wait_print_the_notices_once(pending_store, monkeypatch):
++    """Two settled ``session.info`` deliveries can both reach the wait: each ``apply_event`` snapshots
++    the listener list before it calls it, so a republish whose delivery snapshotted the list before the
++    first one removed the listener still calls it. The second call must print nothing and not raise."""
++    db, _client = pending_store
++    _host, printed = _launch(monkeypatch, db)
++    state = db.connection.state("local-new")
++    assert len(state.info_listeners) == 1
++    waiting = state.info_listeners[0]  # what a second delivery's snapshot of the list holds
++
++    async def deliver_twice():
++        state.apply_event("session.info", dict(LATE))  # the first settled frame: prints, ends the wait
++        waiting(dict(LATE))  # the second delivery, from a snapshot taken before the removal
++
++    asyncio.run_coroutine_threadsafe(deliver_twice(), db.connection.loop).result(10)
++    assert len(printed) == 3, printed
++    assert "gone_plugin" in printed[0] and printed[1:] == ["", "⚠ web: set FIRECRAWL_API_KEY"], printed
++    assert state.info_listeners == [] and db.switch_listeners == []
++
++
+ def _settle_after_switch(db, client):
+     """The first session's late settled frame, then a marker frame: the pump applies frames in order, so
+     once the marker is in, every listener the settled frame reached has returned."""
+-- 
+2.43.0
+

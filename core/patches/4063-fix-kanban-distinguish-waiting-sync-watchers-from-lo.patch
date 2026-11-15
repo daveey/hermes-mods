@@ -1,0 +1,190 @@
+From 9435baf78d09a2c99aa55774730ea14fa456b182 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 00:21:51 +0000
+Subject: [PATCH] fix(kanban): distinguish waiting sync watchers from lock
+ owners [daveey]
+
+---
+ hermes_cli/kanban_sync_claims.py              | 42 ++++++++++++++-----
+ hermes_cli/kanban_sync_stop.py                |  3 +-
+ .../hermes_cli/test_kanban_sync_claim_gate.py | 41 ++++++++++++++++++
+ 3 files changed, 75 insertions(+), 11 deletions(-)
+
+diff --git a/hermes_cli/kanban_sync_claims.py b/hermes_cli/kanban_sync_claims.py
+index 11050fbd6d..1942dc4e60 100644
+--- a/hermes_cli/kanban_sync_claims.py
++++ b/hermes_cli/kanban_sync_claims.py
+@@ -7,10 +7,11 @@ and that run row sat in the outbox for 15 min: the push before a round's pulls h
+ ``task_runs`` row on (``kanban_sync_backlog.sendable_before_head``), so it went out only with the push at the end of
+ that first round. The Board kept the lease meanwhile, the canary read ``running`` and the enrollment failed.
+ 
+-So a process that runs (or is about to run) this host's sync loop claims nothing on a ``primary`` board until one
++So a process that holds this host's sync lock claims nothing on a ``primary`` board until one
+ of its rounds on that board COMPLETED with the replica and live pulls at the feed head (``note_round``). The gate
+ fails closed: before the loop's first round, during it, and after a round that ended behind. Once open it stays open
+-for the process (a later catch-up, e.g. after a Mac sleeps, keeps claiming as before).
++for that lock tenure (a later catch-up, e.g. after a Mac sleeps, keeps claiming as before).
++Watchers waiting for the lock use its current owner's record; without a live record they fail closed.
+ 
+ - A process with no sync loop (``hermes kanban claim``/``dispatch`` from a shell) is not gated here, unless another
+   live process's loop recorded the board held in :func:`state_path` (a profile gateway can hold the dispatcher lock
+@@ -37,7 +38,8 @@ DEFERRAL = "sync_first_round"
+ class _State:
+     def __init__(self) -> None:
+         self.lock = threading.Lock()
+-        self.loop = False  # this process runs or is about to run the host's sync loop
++        self.expected = False  # watcher may be waiting for another process's lock
++        self.loop = False  # this process actually holds the host sync lock
+         self.open: dict[str, str] = {}  # realpath -> slug: a completed round of this process reached the head
+         self.logged: set[str] = set()  # boards whose hold was logged (one INFO line per board per hold)
+ 
+@@ -59,15 +61,31 @@ def loop_expected() -> None:
+     """This process will run the sync loop (the gateway's sync watcher, before it holds the host sync lock): its
+     dispatcher holds claims from now on, so a tick before the loop's first round cannot slip a claim through."""
+     with _STATE.lock:
+-        _STATE.loop = True
++        _STATE.expected = True
+ 
+ 
+ def loop_started() -> None:
+     """The sync loop starts in this process: record that its boards hold claims until a round reaches the head."""
+     loop_expected()
++    with _STATE.lock:
++        _STATE.loop = True
++        _STATE.open.clear()
+     _write()
+ 
+ 
++def loop_stopped() -> None:
++    """Release local readiness when a sync tenure ends, including normal return and crashes."""
++    with _STATE.lock:
++        _STATE.loop = False
++        _STATE.open.clear()
++    record = _read()
++    if record and record.get("pid") == os.getpid():
++        try:
++            state_path().unlink(missing_ok=True)
++        except OSError:
++            _log.warning("kanban sync: cannot remove stopped claim gate", exc_info=True)
++
++
+ def note_round(slug: str, path: Any, *, at_head: bool) -> None:
+     """A round on this board completed; ``at_head``: its replica and live pulls reached the feed head."""
+     if not at_head:
+@@ -93,8 +111,9 @@ def held(conn: sqlite3.Connection) -> bool:
+     with _STATE.lock:
+         if key in _STATE.open:
+             return False
+-        local = _STATE.loop
+-    if not local and not _held_elsewhere(key):
++        local, expected = _STATE.loop, _STATE.expected
++    elsewhere = None if local else _held_elsewhere(key)
++    if not (local or (expected if elsewhere is None else elsewhere)):
+         return False
+     with _STATE.lock:
+         first = key not in _STATE.logged
+@@ -105,11 +124,11 @@ def held(conn: sqlite3.Connection) -> bool:
+     return True
+ 
+ 
+-def _held_elsewhere(key: str) -> bool:
++def _held_elsewhere(key: str) -> Optional[bool]:
+     """Another live process's sync loop recorded this board held (no round of it at the head yet)."""
+     record = _read()
+     if not record or record.get("pid") == os.getpid() or not _alive(record.get("pid")):
+-        return False
++        return None
+     return key not in (record.get("open") or {})
+ 
+ 
+@@ -121,9 +140,12 @@ def describe(path: Any, mode: str) -> str:
+     with _STATE.lock:
+         if key in _STATE.open:
+             return "open"
++        local, expected = _STATE.loop, _STATE.expected
++    if local:
++        return HELD
+     record = _read()
+-    if not record or not _alive(record.get("pid")):
+-        return "no live sync loop recorded"
++    if not record or record.get("pid") == os.getpid() or not _alive(record.get("pid")):
++        return HELD if expected else "no live sync loop recorded"
+     return "open" if key in (record.get("open") or {}) else HELD
+ 
+ 
+diff --git a/hermes_cli/kanban_sync_stop.py b/hermes_cli/kanban_sync_stop.py
+index bf88e9431c..7d3ba48baa 100644
+--- a/hermes_cli/kanban_sync_stop.py
++++ b/hermes_cli/kanban_sync_stop.py
+@@ -22,7 +22,7 @@ def stop_scope(keep_running: Callable[[], bool]):
+ def run_loop(loop, keep_running: Callable[[], bool], interval) -> None:
+     """Keep shutdown normal, crashes visible, and diagnostics cleanup unconditional."""
+     from hermes_cli import kanban_sync_runstate as runstate, kanban_sync_timing as timing
+-    from hermes_cli.kanban_sync_claims import loop_started
++    from hermes_cli.kanban_sync_claims import loop_started, loop_stopped
+     loop_started()  # this process's claims wait for its first round at the feed head (t_01a1d6c4e700958e)
+     try:
+         with stop_scope(keep_running):
+@@ -33,6 +33,7 @@ def run_loop(loop, keep_running: Callable[[], bool], interval) -> None:
+         runstate.record_down(f"kanban sync loop crashed: {type(exc).__name__}: {exc}")
+         raise
+     finally:
++        loop_stopped()
+         timing.stop()
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_sync_claim_gate.py b/tests/hermes_cli/test_kanban_sync_claim_gate.py
+index cebfb1657a..d0051539f0 100644
+--- a/tests/hermes_cli/test_kanban_sync_claim_gate.py
++++ b/tests/hermes_cli/test_kanban_sync_claim_gate.py
+@@ -198,6 +198,47 @@ def test_another_live_process_loop_record_holds_and_opens_claims(live, kanban_ho
+     assert not claims.held(live)
+ 
+ 
++@pytest.mark.parametrize("previous_tenure", [False, True])
++def test_waiting_sync_gateway_uses_current_lock_owners_record(live, kanban_home, previous_tenure):
++    """A watcher waiting for .sync.lock must not override the root loop's readiness."""
++    tid = kb.create_task(live, title="split watcher", assignee="default")
++    claims.loop_expected()
++    assert claims.held(live)  # no owner has finished the initial round
++    if previous_tenure:
++        from hermes_cli.kanban_sync_stop import run_loop
++        run_loop(lambda *_: None, lambda: True, 1)
++    path = claims.state_path()
++    path.parent.mkdir(parents=True, exist_ok=True)
++    key = os.path.realpath(kanban_home / "kanban.db")
++    path.write_text(json.dumps({"pid": os.getppid(), "open": {key: BOARD}}))
++    assert not claims.held(live)
++    assert claims.describe(kanban_home / "kanban.db", "primary") == "open"
++    assert kb.claim_task(live, tid, ttl_seconds=900)
++
++
++@pytest.mark.parametrize("crash", [False, True])
++def test_ended_sync_tenure_discards_its_readiness(live, kanban_home, crash):
++    from hermes_cli.kanban_sync_stop import run_loop
++    path = kanban_home / "kanban.db"
++
++    def loop(*_):
++        claims.note_round(BOARD, path, at_head=True)
++        assert not claims.held(live)
++        if crash:
++            raise RuntimeError("loop failed")
++
++    if crash:
++        with pytest.raises(RuntimeError, match="loop failed"):
++            run_loop(loop, lambda: True, 1)
++    else:
++        run_loop(loop, lambda: True, 1)
++    assert not claims.state_path().exists()
++    assert claims.held(live)
++    assert claims.describe(path, "primary") == claims.HELD
++    claims.loop_started()
++    assert claims.held(live)  # a new tenure must finish its own round
++
++
+ def test_sync_status_shows_the_gate(live, svc, kanban_home, capsys):
+     from hermes_cli import kanban_sync_cli
+     _board_history(svc, 3)
+-- 
+2.43.0
+

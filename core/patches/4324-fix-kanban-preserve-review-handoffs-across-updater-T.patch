@@ -1,0 +1,290 @@
+From e2764f4009d49f82c71c6c36eae559955bdfc1a9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 22:57:49 +0000
+Subject: [PATCH] fix(kanban): preserve review handoffs across updater TERM
+ receipts [daveey]
+
+Recognize only exact same-run successful host-local TERM receipt pairs; preserve unmatched crashes, timeouts, SIGKILL and worker-lost evidence. Use shared requeue recognition in foreign-review and ordering fault scans. Proof: two predicate regressions RED then GREEN, ordering consumer RED then GREEN, 48 receipt controls pass. Read-only candidate replay clears original active_pr without editing live data. Broad consumer validation and independent review pending.
+---
+ hermes_cli/kanban_core_update_requeue.py      |  47 +++++--
+ hermes_cli/kanban_db_dispatch_pr_state.py     |   2 +-
+ hermes_cli/kanban_move_parent_evidence.py     |   7 +-
+ .../test_kanban_updater_term_handoff.py       |  32 +++++
+ .../test_kanban_updater_term_receipt.py       | 121 ++++++++++++++++++
+ 5 files changed, 197 insertions(+), 12 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_updater_term_handoff.py
+ create mode 100644 tests/hermes_cli/test_kanban_updater_term_receipt.py
+
+diff --git a/hermes_cli/kanban_core_update_requeue.py b/hermes_cli/kanban_core_update_requeue.py
+index 03814e60dc..4af2ce59cc 100644
+--- a/hermes_cli/kanban_core_update_requeue.py
++++ b/hermes_cli/kanban_core_update_requeue.py
+@@ -8,7 +8,8 @@ counted as one, so the guard then held the owner ``active_pr`` with no worker (2
+ t_01a1ce8aff1f09c1 on worker-5). A requeued run is skipped as if it never ran.
+ 
+ Only an exact manual reclaim with that reason, whose run ended ``reclaimed`` and carries no
+-crash or timeout evidence, qualifies. Any other reclaim, crash or timeout still consumes the
++independent crash or timeout evidence, qualifies. A same-run SIGTERM diagnostic matching
++its successful host-local updater termination receipt is not an independent crash. Any other reclaim, crash or timeout still consumes the
+ handoff (fail closed). A PR the requeued run reported is a newer PR comment that post-dates every
+ handoff; when that run itself wrote every such comment, ran as the card's assignee and no real
+ run was claimed since, the pause grants its lineage one continuation
+@@ -35,19 +36,47 @@ def is_core_update_requeue(conn: sqlite3.Connection, run) -> bool:
+ 
+     if run["outcome"] != "reclaimed" or run["ended_at"] is None:
+         return False
+-    requeued = False
+-    for event in conn.execute(
+-        "SELECT kind, payload FROM task_events WHERE task_id = ? AND run_id = ? "
++    events = list(conn.execute(
++        "SELECT kind, payload, created_at FROM task_events WHERE task_id = ? AND run_id = ? "
+         f"AND kind IN ('reclaimed', {', '.join('?' * len(_FAILURE_KINDS))})",
+         (run["task_id"], run["id"], *_FAILURE_KINDS),
+-    ):
+-        if event["kind"] != "reclaimed":
+-            return False
++    ))
++    reclaims = [e for e in events if e["kind"] == "reclaimed"]
++    if not reclaims:
++        return False
++    for event in reclaims:
+         payload = kb._json_dict(event["payload"])
+         if payload.get("manual") is not True or payload.get("reason") != CORE_UPDATE_REQUEUE_REASON:
+             return False
+-        requeued = True
+-    return requeued
++    return all(e["kind"] == "reclaimed" or _updater_term(e, reclaims, run["ended_at"])
++               for e in events)
++
++
++def _updater_term(event, reclaims, ended_at) -> bool:
++    """Recognize only the updater's successful TERM, not an independent crash.
++
++    Reclaim and process observation can race and both append a terminal event.
++    Require the same run (caller's query), PID, claim and exact end second; missing
++    or conflicting evidence stays a failure. No event or run history is rewritten.
++    """
++    from hermes_cli import kanban_db as kb
++
++    crash = kb._json_dict(event["payload"])
++    if (event["kind"] != "crashed" or event["created_at"] != ended_at
++            or crash.get("exit_kind") != "signaled" or type(crash.get("exit_code")) is not int
++            or crash["exit_code"] != 15 or "worker_lost" in crash or "attempt_note" in crash):
++        return False
++    for receipt in reclaims:
++        p = kb._json_dict(receipt["payload"])
++        if (receipt["created_at"] == ended_at
++                and p.get("host_local") is True and p.get("termination_attempted") is True
++                and p.get("terminated") is True and p.get("sigkill") is False
++                and type(p.get("prev_pid")) is int and p["prev_pid"] > 0
++                and type(crash.get("pid")) is int and crash["pid"] == p["prev_pid"]
++                and isinstance(p.get("prev_lock"), str) and p["prev_lock"].strip()
++                and crash.get("claimer") == p["prev_lock"]):
++            return True
++    return False
+ 
+ 
+ def requeued_run_ids(conn: sqlite3.Connection, task_id: str) -> set[int]:
+diff --git a/hermes_cli/kanban_db_dispatch_pr_state.py b/hermes_cli/kanban_db_dispatch_pr_state.py
+index 4ffcb836e8..7b4438ecb7 100644
+--- a/hermes_cli/kanban_db_dispatch_pr_state.py
++++ b/hermes_cli/kanban_db_dispatch_pr_state.py
+@@ -409,7 +409,7 @@ def _dependency_handoff_after(conn: sqlite3.Connection, task_id: str, since: int
+         return False
+     requeued = requeued_run_ids(conn, task_id)
+     if any(e["kind"] in {"crashed", "reclaimed", "timed_out"} and at >= parked_at
+-           and not (e["kind"] == "reclaimed" and e["run_id"] in requeued)
++           and e["run_id"] not in requeued
+            for at, e in timed):
+         return False
+     if not any(e["kind"] == "promoted" and at >= ended
+diff --git a/hermes_cli/kanban_move_parent_evidence.py b/hermes_cli/kanban_move_parent_evidence.py
+index 4e5ed85a14..2a774f3f8b 100644
+--- a/hermes_cli/kanban_move_parent_evidence.py
++++ b/hermes_cli/kanban_move_parent_evidence.py
+@@ -125,12 +125,15 @@ def owner_faulted_since(conn, task_id, since) -> bool:
+     supplies the parent's result.
+     """
+     from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_core_update_requeue import requeued_run_ids
+ 
++    paused = requeued_run_ids(conn, task_id)
+     faults = conn.execute(
+-        "SELECT created_at FROM task_events WHERE task_id = ? "
++        "SELECT created_at, run_id FROM task_events WHERE task_id = ? "
+         "AND kind IN ('crashed', 'reclaimed', 'timed_out')", (task_id,),
+     )
+-    return any((kb._to_epoch(e[0]) or 0) >= since for e in faults)
++    return any((kb._to_epoch(e["created_at"]) or 0) >= since and e["run_id"] not in paused
++               for e in faults)
+ 
+ 
+ def result(conn, task_id, parent_id):
+diff --git a/tests/hermes_cli/test_kanban_updater_term_handoff.py b/tests/hermes_cli/test_kanban_updater_term_handoff.py
+new file mode 100644
+index 0000000000..fca0dea63e
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_updater_term_handoff.py
+@@ -0,0 +1,32 @@
++"""Exercise updater receipt recognition through actual PR continuation consumers."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_dispatch as dispatch
++from hermes_cli.kanban_core_update_requeue import CORE_UPDATE_REQUEUE_REASON
++from tests.hermes_cli import test_kanban_core_update_requeue_handoff as helpers
++
++board = helpers.board
++
++
++@pytest.mark.parametrize("setup", [helpers._approved, helpers._ordering])
++def test_matching_term_keeps_handoff_and_real_successor_fault_consumes_it(board, setup):
++    task = setup(board)
++    helpers._reclaim(board, task, CORE_UPDATE_REQUEUE_REASON)
++    run = helpers._latest_run(board, task)
++    row = board.execute("SELECT id, payload FROM task_events WHERE task_id = ? AND run_id = ? "
++                        "AND kind = 'reclaimed'", (task, run["id"])).fetchone()
++    payload = json.loads(row["payload"])
++    payload.update(prev_pid=42, prev_lock="worker:99", host_local=True,
++                   termination_attempted=True, terminated=True, sigkill=False)
++    board.execute("UPDATE task_events SET payload = ?, created_at = ? WHERE id = ?",
++                  (json.dumps(payload), run["ended_at"], row["id"]))
++    kb._append_event(board, task, "crashed", dict(pid=42, claimer="worker:99",
++                     exit_kind="signaled", exit_code=15), run_id=run["id"])
++    board.execute("UPDATE task_events SET created_at = ? WHERE task_id = ? AND run_id = ? "
++                  "AND kind = 'crashed'", (run["ended_at"], task, run["id"]))
++    assert dispatch.check_respawn_guard(board, task) is None
++    helpers._reclaim(board, task, helpers.CRASH)
++    assert dispatch.check_respawn_guard(board, task) == "active_pr"
+diff --git a/tests/hermes_cli/test_kanban_updater_term_receipt.py b/tests/hermes_cli/test_kanban_updater_term_receipt.py
+new file mode 100644
+index 0000000000..a6f7a751f2
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_updater_term_receipt.py
+@@ -0,0 +1,121 @@
++"""Updater TERM diagnostics must not consume orderly review continuations."""
++import json
++import sqlite3
++
++import pytest
++
++from hermes_cli.kanban_core_update_requeue import CORE_UPDATE_REQUEUE_REASON, is_core_update_requeue
++from hermes_cli.kanban_move_parent_evidence import owner_faulted_since
++
++
++@pytest.fixture
++def receipt():
++    conn = sqlite3.connect(":memory:")
++    conn.row_factory = sqlite3.Row
++    conn.executescript("""
++        CREATE TABLE task_runs (id INTEGER, task_id TEXT, outcome TEXT, ended_at INTEGER);
++        CREATE TABLE task_events (task_id TEXT, run_id INTEGER, kind TEXT, payload TEXT, created_at INTEGER);
++        INSERT INTO task_runs VALUES (7, 'owner', 'reclaimed', 100);
++    """)
++    reclaim = dict(manual=True, reason=CORE_UPDATE_REQUEUE_REASON, prev_pid=42,
++                   prev_lock="worker:99", host_local=True, termination_attempted=True,
++                   terminated=True, sigkill=False)
++    crash = dict(pid=42, claimer="worker:99", exit_kind="signaled", exit_code=15)
++    yield conn, reclaim, crash
++    conn.close()
++
++
++def populate(receipt, *, crash_time=100, crash_kind="crashed", crash_run=7):
++    conn, reclaim, crash = receipt
++    conn.executemany("INSERT INTO task_events VALUES ('owner', ?, ?, ?, ?)", [
++        (7, "reclaimed", json.dumps(reclaim), 100),
++        (crash_run, crash_kind, json.dumps(crash), crash_time),
++    ])
++    return conn.execute("SELECT * FROM task_runs").fetchone()
++
++
++def test_matching_updater_term_is_not_a_foreign_review_fault(receipt):
++    run = populate(receipt)
++    conn = receipt[0]
++    assert is_core_update_requeue(conn, run)
++    assert not owner_faulted_since(conn, "owner", 90)
++    # A genuine successor fault still consumes the continuation.
++    conn.execute("INSERT INTO task_events VALUES ('owner', 8, 'crashed', '{}', 101)")
++    assert owner_faulted_since(conn, "owner", 90)
++
++
++@pytest.mark.parametrize("side,key,value", [
++    ("reclaim", "manual", False), ("reclaim", "reason", "other"),
++    ("reclaim", "prev_pid", 0), ("reclaim", "prev_pid", True),
++    ("reclaim", "prev_pid", "42"), ("reclaim", "prev_lock", ""),
++    ("reclaim", "prev_lock", 99), ("reclaim", "host_local", False),
++    ("reclaim", "termination_attempted", False), ("reclaim", "terminated", False),
++    ("reclaim", "sigkill", True), ("reclaim", "sigkill", None),
++    ("crash", "pid", 43), ("crash", "pid", "42"),
++    ("crash", "claimer", "other:99"), ("crash", "exit_kind", "exited"),
++    ("crash", "exit_code", 9), ("crash", "exit_code", "15"),
++    ("crash", "exit_code", 15.0), ("crash", "worker_lost", {}),
++    ("crash", "attempt_note", "managed worker lost: EOFError"),
++    ("reclaim", "prev_lock", "   "), ("crash", "pid", 42.0),
++])
++def test_mismatched_or_incomplete_receipt_remains_a_fault(receipt, side, key, value):
++    receipt[1 if side == "reclaim" else 2][key] = value
++    run = populate(receipt)
++    assert not is_core_update_requeue(receipt[0], run)
++    assert owner_faulted_since(receipt[0], "owner", 90)
++
++
++@pytest.mark.parametrize("kind", ["timed_out", "spawn_failed", "gave_up"])
++def test_other_failure_kinds_are_never_exempt(receipt, kind):
++    run = populate(receipt, crash_kind=kind)
++    assert not is_core_update_requeue(receipt[0], run)
++
++
++@pytest.mark.parametrize("stamp", [99, 101, None])
++def test_unmatched_time_is_not_termination_proof(receipt, stamp):
++    run = populate(receipt, crash_time=stamp)
++    assert not is_core_update_requeue(receipt[0], run)
++
++
++def test_no_crash_requeue_is_not_a_foreign_review_fault(receipt):
++    run = populate(receipt)
++    receipt[0].execute("DELETE FROM task_events WHERE kind = 'crashed'")
++    assert is_core_update_requeue(receipt[0], run)
++    assert not owner_faulted_since(receipt[0], "owner", 90)
++
++
++def test_failure_on_another_run_is_not_erased(receipt):
++    run = populate(receipt, crash_run=8)
++    assert is_core_update_requeue(receipt[0], run)
++    assert owner_faulted_since(receipt[0], "owner", 90)
++
++
++@pytest.mark.parametrize("side,key", [
++    (1, "prev_pid"), (1, "prev_lock"), (1, "host_local"), (1, "termination_attempted"),
++    (1, "terminated"), (1, "sigkill"), (2, "pid"), (2, "claimer"),
++    (2, "exit_kind"), (2, "exit_code"),
++])
++def test_missing_termination_fields_fail_closed(receipt, side, key):
++    del receipt[side][key]
++    run = populate(receipt)
++    assert not is_core_update_requeue(receipt[0], run)
++
++
++@pytest.mark.parametrize("case", ["reclaim_time", "run_end", "outcome", "no_reclaim", "extra_failure"])
++def test_conflicting_evidence_fails_closed(receipt, case):
++    populate(receipt)
++    conn = receipt[0]
++    statements = {
++        "reclaim_time": "UPDATE task_events SET created_at = 99 WHERE kind = 'reclaimed'",
++        "run_end": "UPDATE task_runs SET ended_at = 99",
++        "outcome": "UPDATE task_runs SET outcome = 'crashed'",
++        "no_reclaim": "DELETE FROM task_events WHERE kind = 'reclaimed'",
++        "extra_failure": "INSERT INTO task_events VALUES ('owner', 7, 'crashed', '{}', 100)",
++    }
++    conn.execute(statements[case])
++    assert not is_core_update_requeue(conn, conn.execute("SELECT * FROM task_runs").fetchone())
++
++
++def test_fault_before_checkpoint_does_not_invalidate_it(receipt):
++    populate(receipt, crash_time=99)
++    assert not owner_faulted_since(receipt[0], "owner", 101)
+-- 
+2.43.0
+

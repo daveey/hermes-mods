@@ -1,0 +1,224 @@
+From eb7c3bfb240cc839ba68267e48f2042d6fe87d51 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 22:50:25 +0000
+Subject: [PATCH] [daveey] Make arithmetic and terminal probe execution
+ fixtures portable
+
+macOS Bash 3.2 evaluates a quoted subscript in explicit arithmetic but rejects its bare assignment; Bash 5.2 reverses those contexts. Keep the original scanner assertions unconditional and select the actual execution context by Bash major version, without skips.
+
+The PTY peer used 300ms from query flush as proof the probe had returned, but deadline creation and drain entry can be descheduled. Coordinate replies at real select and prompt-ownership boundaries; require the real timeout/readiness sequence and send user keys only after prompt cbreak is ready. Production deadlines and scanner policy remain unchanged.
+
+Proof: original macOS run 43645454916/job/132602112917; native Bash 3.2.57 direct versus explicit arithmetic probes; controlled after-flush/after-select schedules reproduce the terminal mismatch. Canonical Linux tests: 34 passed, no retries. scripts/check: 20 checks OK.
+---
+ .../agent/test_terminal_image_vscode_probe.py | 119 ++++++++++++------
+ .../test_lifecycle_guard_arith_lexical.py     |  12 +-
+ 2 files changed, 89 insertions(+), 42 deletions(-)
+
+diff --git a/tests/agent/test_terminal_image_vscode_probe.py b/tests/agent/test_terminal_image_vscode_probe.py
+index 2357dde99f..327c69888f 100644
+--- a/tests/agent/test_terminal_image_vscode_probe.py
++++ b/tests/agent/test_terminal_image_vscode_probe.py
+@@ -1,20 +1,18 @@
+-"""VS Code image-support probe (agent/terminal_image.py::probe_vscode_images) over a real PTY.
++"""Real PTY replies during the probe, its drain, and after prompt ownership.
+ 
+-The far end of the PTY plays the terminal: it answers the probe the way VS Code's xterm.js was
+-measured to answer with ``terminal.integrated.enableImages`` on (sixel reply + DA1) and off
+-(DA1 only), optionally late, then types ``hi``. After the probe the child reads its tty and feeds
+-it to prompt_toolkit's parser with the CLI's input tables, as the prompt would: ``typed`` is what
+-would land in the user's prompt.
++The terminal peer waits for protocol boundaries, not wall-clock guesses: a child
++can be descheduled after flushing the query or before starting the drain. The
++real select/clock still expire both production waits in the late-reply cases.
+ """
+ 
+ from __future__ import annotations
+ 
+ import os
+ import select
++import socket
+ import subprocess
+ import sys
+ import textwrap
+-import time
+ from pathlib import Path
+ 
+ import pytest
+@@ -23,25 +21,47 @@ pytestmark = pytest.mark.platforms("posix")
+ 
+ _REPO = str(Path(__file__).resolve().parents[2])
+ _CHILD = textwrap.dedent("""
+-    import os, select, sys, termios, tty
++    import os, select, socket, sys, termios, tty
+     from agent import terminal_image
+     from hermes_cli.pt_input_extras import install_ignored_terminal_sequences
+     from prompt_toolkit.input.vt100_parser import Vt100Parser
+     from prompt_toolkit.keys import Keys
+-    result = terminal_image.probe_vscode_images()
++    peer = socket.socket(fileno=int(sys.argv[1]))
++    peer.settimeout(15)
++    def boundary(phase):
++        peer.sendall(phase)
++        assert peer.recv(1) == b"G"
++    real_select = select.select
++    waits = []
++    def probe_select(readers, writers, errors, timeout):
++        # No synthetic readiness or clock: only coordinate which real wait
++        # receives the terminal's reply. The first wait must expire for D/P.
++        boundary(b"Q" if not waits else b"D")
++        ready = real_select(readers, writers, errors, timeout)
++        waits.append(bool(ready[0]))
++        return ready
++    select.select = probe_select
++    try:
++        result = terminal_image.probe_vscode_images()
++    finally:
++        select.select = real_select
+     fd = sys.stdin.fileno()
+     old = termios.tcgetattr(fd)
+     tty.setcbreak(fd)
++    boundary(b"P")  # reply/keys are queued before the prompt reader starts
+     leaked = b""
+-    while select.select([fd], [], [], 0.3)[0]:
+-        leaked += os.read(fd, 256)
+-    termios.tcsetattr(fd, termios.TCSADRAIN, old)
++    try:
++        while select.select([fd], [], [], 0.3)[0]:
++            leaked += os.read(fd, 256)
++    finally:
++        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+     install_ignored_terminal_sequences()
+     presses = []
+     parser = Vt100Parser(presses.append)
+     parser.feed(leaked.decode())
+     parser.flush()
+     typed = "".join(p.data for p in presses if p.key is not Keys.Ignore)
++    print("WAITS", waits, flush=True)
+     print("RESULT", result, terminal_image.supports_iterm_images(),
+           terminal_image.resolve_inline_mode("auto", overlays=True), "typed=%r" % typed, flush=True)
+ """)
+@@ -50,51 +70,68 @@ _ON = b"\x1b[?1;0;4096S\x1b[?62;4;9;22c"
+ _OFF = b"\x1b[?1;2c"
+ 
+ 
+-def _run(reply: bytes, delay: float) -> str:
++def _run(reply: bytes, phase: bytes) -> str:
+     import pty
+ 
+     master, slave = pty.openpty()
++    parent, child = socket.socketpair()
+     env = {k: v for k, v in os.environ.items()
+            if not k.startswith(("SSH_", "KITTY_", "ITERM_", "WEZTERM_", "KONSOLE_", "TMUX"))}
+     env.update(TERM_PROGRAM="vscode", TERM="xterm-256color", PYTHONPATH=_REPO)
+-    proc = subprocess.Popen([sys.executable, "-c", _CHILD], stdin=slave, stdout=slave,
+-                            stderr=subprocess.PIPE, env=env, cwd=_REPO)
++    proc = subprocess.Popen([sys.executable, "-c", _CHILD, str(child.fileno())],
++                            stdin=slave, stdout=slave, stderr=subprocess.PIPE,
++                            pass_fds=(child.fileno(),), env=env, cwd=_REPO)
+     os.close(slave)
++    child.close()
+     out = b""
+-    answered = False
++    phases = []
+     try:
+-        while select.select([master], [], [], 15)[0]:
+-            try:
+-                data = os.read(master, 4096)
+-            except OSError:  # EIO: the child closed its end
+-                break
+-            if not data:
+-                break
+-            out += data
+-            if not answered and b"\x1b[c" in out:
+-                time.sleep(delay)  # health: allow HX013 -- the late reply IS the scenario under test
+-                os.write(master, reply)
+-                time.sleep(0.02)  # health: allow HX013 -- the user's keys arrive after the reply
+-                os.write(master, b"hi")
+-                answered = True
++        while True:
++            ready = select.select([master, parent], [], [], 15)[0]
++            assert ready, ("child stalled", phases, out)
++            if parent in ready:
++                event = parent.recv(1)
++                if event:
++                    phases.append(event)
++                    if event == phase:
++                        os.write(master, reply)
++                    if event == b"P":
++                        os.write(master, b"hi")
++                    parent.sendall(b"G")
++            if master in ready:
++                try:
++                    data = os.read(master, 4096)
++                except OSError:  # EIO: the child closed its end
++                    break
++                if not data:
++                    break
++                out += data
++        proc.wait(timeout=15)
++        assert proc.returncode == 0 and proc.stderr is not None, proc.stderr and proc.stderr.read()
+     finally:
++        if proc.poll() is None:
++            proc.kill()
++            proc.wait(timeout=15)
+         os.close(master)
+-        proc.wait(timeout=15)
+-    assert proc.returncode == 0 and proc.stderr is not None, proc.stderr and proc.stderr.read()
++        parent.close()
++        if proc.stderr is not None:
++            proc.stderr.close()
+     text = out.decode(errors="replace")
++    expected_waits = {b"Q": [True], b"D": [False, True], b"P": [False, False]}
++    assert f"WAITS {expected_waits[phase]}" in text, text
++    assert phases == ([b"Q", b"P"] if phase == b"Q" else [b"Q", b"D", b"P"])
+     return text[text.index("RESULT"):].splitlines()[0].strip() if "RESULT" in text else text
+ 
+ 
+ @pytest.mark.parametrize(
+-    ("reply", "delay", "expected"),
++    ("reply", "phase", "expected"),
+     [
+-        (_ON, 0, "RESULT True True iterm typed='hi'"),  # enableImages on
+-        (_OFF, 0, "RESULT False False unicode typed='hi'"),  # enableImages off: DA1 only
+-        (_ON, 0.08, "RESULT True True iterm typed='hi'"),  # past the 50 ms deadline, inside the drain
+-        # Past every wait: the probe misses it, and the prompt's parser drops it.
+-        (_ON, 0.3, "RESULT False False unicode typed='hi'"),
+-        (_OFF, 0.3, "RESULT False False unicode typed='hi'"),
++        (_ON, b"Q", "RESULT True True iterm typed='hi'"),
++        (_OFF, b"Q", "RESULT False False unicode typed='hi'"),
++        (_ON, b"D", "RESULT True True iterm typed='hi'"),
++        (_ON, b"P", "RESULT False False unicode typed='hi'"),
++        (_OFF, b"P", "RESULT False False unicode typed='hi'"),
+     ],
+ )
+-def test_vscode_probe_reads_its_reply_and_leaves_nothing_for_the_prompt(reply, delay, expected):
+-    assert _run(reply, delay) == expected
++def test_vscode_probe_reads_its_reply_and_leaves_nothing_for_the_prompt(reply, phase, expected):
++    assert _run(reply, phase) == expected
+diff --git a/tests/cron/test_lifecycle_guard_arith_lexical.py b/tests/cron/test_lifecycle_guard_arith_lexical.py
+index 7120a524fc..2dc639e4da 100644
+--- a/tests/cron/test_lifecycle_guard_arith_lexical.py
++++ b/tests/cron/test_lifecycle_guard_arith_lexical.py
+@@ -39,8 +39,18 @@ def test_executed_arithmetic_substitutions_are_sinks(tmp_path, shape):
+     script = tmp_path / "payload.sh"
+     script.write_text(f"touch '{marker}'\nprintf 0\n", encoding="utf-8")
+     command = shape.replace("SCRIPT", str(script))
++    execution_command = command
++    if shape == "a['$(bash SCRIPT)']=1":
++        # Bash 3.2 expands this quoted subscript in explicit arithmetic, but
++        # rejects it in bare assignment. Bash 5.2 does the reverse. Exercise
++        # the executing context on each, while guarding the bare form below
++        # unconditionally (guard policy cannot depend on the host's Bash).
++        execution_command = (
++            'if (( BASH_VERSINFO[0] == 3 )); then '
++            f'(( {command} )); else {command}; fi'
++        )
+     result = subprocess.run(
+-        [bash, "--noprofile", "--norc", "-c", command], cwd=tmp_path,
++        [bash, "--noprofile", "--norc", "-c", execution_command], cwd=tmp_path,
+         env={"PATH": "/usr/bin:/bin"}, capture_output=True, text=True,
+         encoding="utf-8", timeout=10, check=False,
+     )
+-- 
+2.43.0
+

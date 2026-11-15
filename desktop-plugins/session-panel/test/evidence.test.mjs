@@ -22,6 +22,7 @@ globalThis.__obsJsx = J
 globalThis.__obsHost = { state: { focusedSessionId: atom('R1'), focusedStoredSessionId: atom('S1'), busy: atom(false), connectionId: atom('C1'), profile: atom('default'), focusedSessionOwner: atom({ connectionId: 'C1', profile: 'default' }) }, composer: { setDraft() {}, focus() {} } }
 register('data:text/javascript,' + encodeURIComponent(`export async function resolve(s,c,n){const map={'react':'const R=globalThis.__obsReact;export const useState=R.useState,useEffect=R.useEffect,useRef=R.useRef','react/jsx-runtime':'const J=globalThis.__obsJsx;export const jsx=J.jsx,jsxs=J.jsxs','@hermes/plugin-sdk':${JSON.stringify(sdkStubSource())}};return map[s]?{url:'data:text/javascript,'+encodeURIComponent(map[s]),shortCircuit:true}:n(s,c)}`))
 const m = await import('../plugin.js')
+const tasks = await import('../../session-tasks/plugin.js')
 const { createRoot } = require('react-dom/client')
 const root = createRoot(document.getElementById('root'))
 const el = () => document.getElementById('root')
@@ -29,6 +30,49 @@ const flush = () => new Promise(r => setTimeout(r, 0))
 const show = async node => React.act(async () => { root.render(node); await flush() })
 afterEach(async () => { await show(null) })
 after(async () => { await React.act(async () => { root.unmount() }); dom.window.close() })
+
+test('fresh board status survives a parked card with no execution generation', { skip: !projector }, async () => {
+  at(10)
+  const raw = record('t_x', { set: { 'identity.gateway': 'hub', 'identity.profile': 'default', 'identity.board': 'default', state: 'waiting', source: 'kanban.card', observed_at: null, valid_until: null, source_revision: null, evidence_refs: [] }, delete: ['identity.run_id'] })
+  const chips = tasks.sessionTaskChips([{ id: 't_x', title: 'Wait for release', status: 'scheduled', board: 'default', execution_observations: [raw] }], { connectionId: 'C1', profile: 'default' })
+  const b = bridges({ chips })
+  await show(React.createElement(m.Panel, { key: 'board-status' }))
+  assert.match(el().querySelector('[data-panel-row]').textContent, /scheduled · board status/)
+  assert.match(el().querySelector('[data-evidence]').textContent, /hub\/default\/default\/card:t_x/)
+  assert.equal(m.chipObservation(chips[0], BASE_AT + 10).state, 'unknown', 'no fake execution generation')
+  at(71)
+  await React.act(async () => { b.tick(); await flush() })
+  assert.match(el().querySelector('[data-panel-row]').textContent, /status unknown/)
+})
+
+test('a fresh replica labels its board status as reported, and failed reads cannot reuse it', { skip: !projector }, () => {
+  at(10)
+  const chips = tasks.sessionTaskChips([{ id: 't_x', title: 'Remote wait', gateway: 'worker', profile: 'default', board: 'default', remote: true, status: 'scheduled', execution_observations: [record('t_x', { set: { 'identity.gateway': 'worker', 'identity.profile': 'default', 'identity.board': 'default', state: 'waiting', source: 'kanban.card', observed_at: null, valid_until: null, source_revision: null, evidence_refs: [] }, delete: ['identity.run_id'] })] }])
+  const opts = { nowMs: Date.now(), evidence: c => m.chipObservation(c, Date.now() / 1000) }
+  assert.match(m.classify(chips, opts).waiting[0].detail, /scheduled · reported board status/)
+  assert.match(m.classify(chips.map(c => ({ ...c, stale: true })), opts).waiting[0].detail, /status unknown/)
+})
+
+test('board freshness expires even without execution observations or an SDK verdict', () => {
+  at(10)
+  for (const observations of [undefined, []]) {
+    const chips = tasks.sessionTaskChips([{ id: 't_x', title: 'Parked', status: 'scheduled', execution_observations: observations }])
+    for (const evidence of [c => m.chipObservation(c, Date.now() / 1000), () => null]) {
+      assert.match(m.classify(chips, { nowMs: Date.now(), evidence }).waiting[0].detail, /scheduled · board status/)
+      assert.match(m.classify(chips, { nowMs: Date.now() + 60_001, evidence }).waiting[0].detail, /status unknown/)
+      for (const boardStatus of [{ ...chips[0].boardStatus, readAt: NaN }, { ...chips[0].boardStatus, state: 'ready' }, { ...chips[0].boardStatus, readAt: Date.now() + 1 }]) {
+        assert.match(m.classify([{ ...chips[0], boardStatus }], { nowMs: Date.now(), evidence }).waiting[0].detail, /status unknown/)
+      }
+    }
+  }
+})
+
+test('needs-you shows the plain card title next to the action', async () => {
+  bridges({ chips: [card('t_x', 'blocked', { label: 'Choose the release window', look: 'needs-you', humanRequest: { action: 'Choose A or B' } })] })
+  await show(React.createElement(m.Panel, { key: 'ask-context' }))
+  assert.equal(el().querySelector('[data-ask-title]')?.textContent, 'Choose the release window')
+  assert.match(el().querySelector('[data-ask-step]').textContent, /Choose A or B/)
+})
 
 const { fixture } = loadFixture()
 const skip = projector ? false : 'no core checkout: set HERMES_CORE_SOURCE'

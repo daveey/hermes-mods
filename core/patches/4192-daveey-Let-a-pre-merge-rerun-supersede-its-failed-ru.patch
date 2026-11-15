@@ -1,0 +1,220 @@
+From 7363e1a28a440d52523dbb5d40492698f6e0e4fb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 14:37:47 +0000
+Subject: [PATCH] [daveey] Let a pre-merge rerun supersede its failed run in
+ the no-required fallback
+
+Review t_01a1d96be17c3315 (B1): merged-state fallback keyed runs by run id, so a
+failed job re-run to success in the same suite before the merge stayed failure
+and nothing could waive it (live: hermes-mods #183, #178).
+
+A same (name, app, suite) run is now superseded only when it completed and another
+run in that group started strictly after its completion. Overlapping, tied and
+never-completed runs all stay as evidence (fail closed). Merge cutoff, tie-at-merge
+handling and the required-check path are unchanged.
+
+Nit: a queued empty github-actions (app 15368) suite is never idle, since it can
+be a concurrency-held workflow.
+
+Proof: 5 new cases fail on 332fb0b0 and pass here (64 passed); 17 consumer
+files: 462 passed, 0 failed, 1 skipped.
+---
+ hermes_cli/kanban_pr_fallback.py            |  4 +-
+ hermes_cli/kanban_pr_merge_time.py          | 41 +++++++++++--
+ tests/hermes_cli/test_kanban_pr_fallback.py | 68 ++++++++++++++++++++-
+ 3 files changed, 103 insertions(+), 10 deletions(-)
+
+diff --git a/hermes_cli/kanban_pr_fallback.py b/hermes_cli/kanban_pr_fallback.py
+index 67d6320b99..b6ebf73747 100644
+--- a/hermes_cli/kanban_pr_fallback.py
++++ b/hermes_cli/kanban_pr_fallback.py
+@@ -6,6 +6,8 @@ from hermes_cli.kanban_pr_merge_time import check_receipt, timestamp
+ 
+ # A just-created empty suite may be CI that has not started its jobs yet.
+ IDLE_SUITE_GRACE = timedelta(minutes=15)
++# A queued empty Actions suite can be a concurrency-held workflow: never idle.
++GITHUB_ACTIONS_APP_ID = 15368
+ # GitHub branch protection accepts these completed conclusions as passing.
+ _PASSING_CONCLUSIONS = ("neutral", "skipped")
+ 
+@@ -36,7 +38,7 @@ def idle_suites(suite_rows, runs, now):
+         app = _app_id(suite)
+         if suite.get("latest_check_runs_count") != 0 or suite.get("status") != "queued":
+             continue
+-        if app is None or app in active:
++        if app is None or app in active or app == GITHUB_ACTIONS_APP_ID:
+             continue
+         try:
+             age = now - timestamp(suite["created_at"].replace("Z", "+00:00"))
+diff --git a/hermes_cli/kanban_pr_merge_time.py b/hermes_cli/kanban_pr_merge_time.py
+index e6b466c883..1ba4192bec 100644
+--- a/hermes_cli/kanban_pr_merge_time.py
++++ b/hermes_cli/kanban_pr_merge_time.py
+@@ -42,10 +42,9 @@ def partition_at_merge(checks, merged_at, *, runs, distinct_suites=False):
+     def key_of(check):
+         if runs:
+             if distinct_suites:
+-                # Names are not job identities, even within one suite/attempt.
+-                # Retain every run: without proven supersession, a later sibling
+-                # success cannot replace a failure (or a pending merge-time run).
+-                return (check["name"], check["app"]["id"], check["check_suite"]["id"], check["id"])
++                # Workflow suites stay distinct; supersession inside one is
++                # proven by chronology below, never assumed from the name.
++                return (check["name"], check["app"]["id"], check["check_suite"]["id"])
+             return (check["name"], check["app"]["id"])
+         return (check["context"], (check.get("creator") or {}).get("id"))
+ 
+@@ -57,13 +56,18 @@ def partition_at_merge(checks, merged_at, *, runs, distinct_suites=False):
+     # unordered against it. If it had not concluded by then while an earlier same-key
+     # run had, that earlier conclusion is what gated the merge: the tie run is later
+     # (post-merge) evidence. With no earlier conclusion it stays pending (fail closed).
+-    gated = {key_of(c) for c in checks if start(c) < cutoff and concluded_at_merge(c)} if runs else set()
++    # Same-name runs in one suite may be concurrent siblings, so in the fallback
++    # a tie run is never assumed to follow another run's conclusion.
++    def gate_key(check):
++        return (*key_of(check), check["id"]) if runs and distinct_suites else key_of(check)
++
++    gated = {gate_key(c) for c in checks if start(c) < cutoff and concluded_at_merge(c)} if runs else set()
+     latest = {}
+     post = []
+     for check in checks:
+         started = start(check)
+         tie_after_gate = (runs and started == cutoff and not concluded_at_merge(check)
+-                          and key_of(check) in gated)
++                          and gate_key(check) in gated)
+         if started > cutoff or tie_after_gate:
+             post.append(check)
+             continue
+@@ -71,12 +75,37 @@ def partition_at_merge(checks, merged_at, *, runs, distinct_suites=False):
+         if runs and check.get("completed_at") and timestamp(check["completed_at"]) > cutoff:
+             check = {**check, "status": "in_progress", "conclusion": None}
+         key = key_of(check)
++        if runs and distinct_suites:
++            latest.setdefault(key, []).append(check)
++            continue
+         order = (started, check["id"])
+         if key not in latest or order > latest[key][0]:
+             latest[key] = (order, check)
++    if runs and distinct_suites:
++        return [c for group in latest.values() for c in _unsuperseded(group, start)], post
+     return [entry[1] for entry in latest.values()], post
+ 
+ 
++def _unsuperseded(group, start):
++    """Drop a same-name, same-suite run only when another started after it ended.
++
++    That is a rerun (GitHub re-runs a failed job in the same suite). Overlapping or
++    tied runs can be concurrent sibling jobs, and a run that never completed has no
++    end to start after, so both stay as evidence (fail closed).
++    """
++    def ended(check):
++        done = check.get("completed_at")
++        return timestamp(done) if check.get("status") == "completed" and done else None
++
++    starts = [start(c) for c in group]
++    kept = []
++    for check in group:
++        end = ended(check)
++        if end is None or not any(s > end for s in starts):
++            kept.append(check)
++    return kept
++
++
+ def merge_evidence(receipt, pr, repo, runs, statuses, *, distinct_suites=False):
+     if pr["state"] != "MERGED":
+         return runs, statuses
+diff --git a/tests/hermes_cli/test_kanban_pr_fallback.py b/tests/hermes_cli/test_kanban_pr_fallback.py
+index d81ec0c55d..92113b1b8d 100644
+--- a/tests/hermes_cli/test_kanban_pr_fallback.py
++++ b/tests/hermes_cli/test_kanban_pr_fallback.py
+@@ -115,15 +115,76 @@ def test_merged_fallback_keeps_same_name_workflows_distinct(evidence):
+ 
+ @pytest.mark.parametrize("outcome,expected", [("failure", "failure"), ("pending", "pending"),
+                                              ("cancelled", "infra"), ("success", "success")])
+-@pytest.mark.parametrize("started", ["2026-11-02T12:00:00Z", "2026-11-02T12:30:00Z"])
+-def test_merged_fallback_preserves_same_suite_siblings(evidence, outcome, expected, started):
+-    evidence.update(merged=True, runs=[run(outcome), run("success", id=2, started=started)])
++def test_merged_fallback_preserves_concurrent_same_suite_siblings(evidence, outcome, expected):
++    # Same start (a tie with the first run's end) can be a sibling job, not a rerun.
++    evidence.update(merged=True, runs=[run(outcome), run("success", id=2)])
+     receipt = gate.collect_acceptance(URL, None)
+     assert receipt["classification"] == expected
+     assert receipt["ok"] is (expected == "success")
+     assert [c["id"] for c in receipt["checks"]] == [1, 2]
+ 
+ 
++def rerun_pair(first, *, second="success", second_start="2026-11-02T12:30:00Z", suite=7,
++               first_end="2026-11-02T12:10:00Z"):
++    earlier = {**run(first), "completed_at": first_end}
++    later = {**run(second, id=2, started=second_start), "check_suite": {"id": suite}}
++    return [earlier, later]
++
++
++@pytest.mark.parametrize("first", ["failure", "cancelled", "timed_out"])
++def test_merged_fallback_rerun_before_merge_supersedes_failure(evidence, first):
++    # hermes-mods #183/#178: a failed job re-run to success before the merge.
++    evidence.update(merged=True, runs=rerun_pair(first))
++    receipt = gate.collect_acceptance(URL, None)
++    assert receipt["classification"] == "success"
++    assert receipt["ok"] is True
++    assert [c["id"] for c in receipt["checks"]] == [2]
++
++
++@pytest.mark.parametrize("second,expected", [("failure", "failure"), ("pending", "pending"),
++                                             ("cancelled", "infra")])
++def test_merged_fallback_red_rerun_stays_red(evidence, second, expected):
++    evidence.update(merged=True, runs=rerun_pair("success", second=second))
++    receipt = gate.collect_acceptance(URL, None)
++    assert receipt["classification"] == expected
++    assert receipt["ok"] is False
++
++
++@pytest.mark.parametrize("kw", [
++    {"second_start": "2026-11-02T12:05:00Z"},  # overlaps the failed run
++    {"second_start": "2026-11-02T12:10:00Z"},  # starts the second the failure ended
++    {"suite": 8},                              # another workflow suite, not a rerun
++])
++def test_merged_fallback_unproven_supersession_keeps_failure(evidence, kw):
++    evidence.update(merged=True, runs=rerun_pair("failure", **kw))
++    receipt = gate.collect_acceptance(URL, None)
++    assert receipt["classification"] == "failure"
++    assert receipt["ok"] is False
++    assert [c["id"] for c in receipt["checks"]] == [1, 2]
++
++
++def test_merged_fallback_pending_run_is_never_superseded(evidence):
++    evidence.update(merged=True, runs=rerun_pair("pending"))
++    receipt = gate.collect_acceptance(URL, None)
++    assert receipt["classification"] == "pending"
++    assert [c["id"] for c in receipt["checks"]] == [1, 2]
++
++
++def test_merged_fallback_rerun_after_merge_keeps_failure(evidence):
++    # Green-after-merge is post-merge evidence; the merge was gated on red.
++    evidence.update(merged=True, runs=rerun_pair("failure", second_start="2026-11-02T13:30:00Z"))
++    receipt = gate.collect_acceptance(URL, None)
++    assert receipt["classification"] == "failure"
++    assert [c["classification"] for c in receipt["post_merge_checks"]] == ["success"]
++
++
++def test_merged_fallback_rerun_finishing_after_merge_is_pending(evidence):
++    runs = rerun_pair("failure", second_start="2026-11-02T12:50:00Z")
++    runs[1]["completed_at"] = "2026-11-02T13:10:00Z"
++    evidence.update(merged=True, runs=runs)
++    assert gate.collect_acceptance(URL, None)["classification"] == "pending"
++
++
+ def test_fallback_merge_cutoff(evidence):
+     evidence.update(merged=True, runs=[run("failure"), run("success", id=2, started="2026-11-02T14:00:00Z")])
+     receipt = gate.collect_acceptance(URL, None)
+@@ -208,6 +269,7 @@ def test_only_idle_suites_is_waivable_absence(evidence, merged):
+     suite(100, 900, created="2999-01-01T00:00:00Z"),  # inside the grace period
+     {**suite(100, 900), "created_at": None},          # unreadable age
+     {**suite(100, 900), "app": None},                 # unreadable app
++    suite(100, 15368),                                # github-actions: may be concurrency-held
+ ])
+ def test_possibly_live_empty_suite_stays_missing(evidence, live):
+     evidence.update(runs=[run("success")], extra_suites=[live])
+-- 
+2.43.0
+

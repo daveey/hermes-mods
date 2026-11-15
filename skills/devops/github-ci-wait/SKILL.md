@@ -35,7 +35,10 @@ superseded push run is attempt 1. push-guard refuses a bare `gh run cancel` / `g
 every host and names the script (a "status is queued" check stopped an owner's fresh attempt 3, costing it its queue
 place). Superseded gate latches: `scripts/ci_latch_sweep.py` (below). PRs merged in a window, by merge time and fully
 paged: `scripts/merged_since.py --repo O/R --since <UTC ISO>` (`gh pr list --state merged --limit N` lists the
-newest-*created* PRs and drops a long-lived PR that merged in the window).
+newest-*created* PRs and drops a long-lived PR that merged in the window). A search you write yourself (GraphQL
+`search(...)` to also read each head's statuses, `gh search`, REST `search/*`) stops at 1000 results and `--paginate`
+ends there with exit 0: select `issueCount`/`total_count`, and split the window until each part is under 1000 before
+any "none"/"all" claim. A row count of exactly 1000 is the cap, not the total (the coach `search_cap` hint flags it).
 
 Telling the user when a PR merges: green CI is one step of several; list them all from a check made that turn
 (pr-blocker-check, "Telling the user when it merges").

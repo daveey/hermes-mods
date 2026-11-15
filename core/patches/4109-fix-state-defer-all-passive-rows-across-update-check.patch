@@ -1,0 +1,974 @@
+From 52bcc27e9e3b6b208b53c01d9b92c7eb6abfc891 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 00:01:30 +0000
+Subject: [PATCH] fix(state): defer all passive rows across update checkpoints
+ [daveey]
+
+---
+ gateway/mirror.py                             |  10 +
+ gateway/session_authority.py                  |   6 +-
+ gateway/session_settlement_recovery.py        |  18 ++
+ gateway/session_transcript.py                 |  25 +-
+ gateway/shutdown_flush.py                     |  44 +++-
+ hermes_state_detached_results.py              |  23 ++
+ hermes_state_messages.py                      |  24 +-
+ .../test_parked_automation_fence_settles.py   |  19 +-
+ .../test_parked_passive_row_delivery.py       | 230 ++++++++++++++++++
+ tests/gateway/test_update_pause_cache.py      |   5 +-
+ .../gateway/test_update_pause_native_boot.py  |   3 +-
+ .../test_update_pause_remaining_guards.py     |   5 +-
+ tests/hermes_state/raw_rows.py                |  13 +
+ .../test_parked_turn_passive_writes.py        |  81 ++++++
+ tests/hermes_state/test_update_checkpoint.py  |   3 +-
+ tests/tui_gateway/test_tui_gateway_server.py  |   4 +-
+ tools/bot_mode_dm.py                          |  16 +-
+ tui_gateway/methods_prompt.py                 |  13 +-
+ tui_gateway/methods_session_interrupt.py      |  19 +-
+ tui_gateway/server.py                         |  17 +-
+ 20 files changed, 528 insertions(+), 50 deletions(-)
+ create mode 100644 tests/gateway/test_parked_passive_row_delivery.py
+ create mode 100644 tests/hermes_state/raw_rows.py
+
+diff --git a/gateway/mirror.py b/gateway/mirror.py
+index 118332be54..054196fe6a 100644
+--- a/gateway/mirror.py
++++ b/gateway/mirror.py
+@@ -147,10 +147,20 @@ def _append_to_sqlite(session_id: str, message: dict) -> None:
+     Raises on failure: ``mirror_to_session`` reports ``False`` (and warns) only when the
+     exception reaches it — swallowing it here made every failed write look mirrored (#10130).
+     """
++    from hermes_state_errors import SessionTurnLeaseLostError
+     from hermes_state_registry import acquire, release_or_close
+ 
+     db = acquire()
+     try:
+         db.append_message(session_id=session_id, role=message.get("role", "assistant"), content=message.get("content"))
++    except SessionTurnLeaseLostError:
++        # The chat's turn is parked for an update: a row now would void its checkpoint. Queue it on the durable
++        # transcript spool (landed after the resume); with no spool the refusal surfaces and reports False.
++        from gateway.shutdown_flush import defer_row_for_parked_turn
++        if defer_row_for_parked_turn(session_id, {"role": message.get("role", "assistant"),
++                                                  "content": message.get("content")}) is None:
++            raise
++        logger.info("Mirror: session %s has a turn parked for an update; queued the row for after the resume",
++                    session_id)
+     finally:
+         release_or_close(db)
+diff --git a/gateway/session_authority.py b/gateway/session_authority.py
+index bfe90af958..65734c42d8 100644
+--- a/gateway/session_authority.py
++++ b/gateway/session_authority.py
+@@ -523,12 +523,10 @@ class SessionAuthority:
+         the messaging delivery waiters are released for it; an API/webhook/Bot observer keeps
+         waiting for the answer instead of reporting accepted work as a conflict.
+ 
+-        [daveey] t_01a1d6f94ac774a2: every pause is logged, WARNING unless transient: a silent
++        [daveey] t_01a1d6f94ac774a2: every pause is logged at WARNING, transient reasons included: a silent
+         pause stalled a chat for 1 h 45 min with only INFO refusals to show for it."""
+         import logging
+-        transient = reason in ('session_busy', 'runtime_draining')
+-        logging.getLogger(__name__).log(logging.INFO if transient else logging.WARNING,
+-                                        'Session %s paused: %s', ref.session_id, reason)
++        logging.getLogger(__name__).warning('Session %s paused: %s', ref.session_id, reason)
+         for row in list_session_admissions(self.db, session_id=ref.session_id):
+             admission_id = row['admission_id']
+             if reason == 'session_busy' and admission_id not in self.native_waiters:
+diff --git a/gateway/session_settlement_recovery.py b/gateway/session_settlement_recovery.py
+index fb0bcee65f..36171c6d53 100644
+--- a/gateway/session_settlement_recovery.py
++++ b/gateway/session_settlement_recovery.py
+@@ -238,6 +238,22 @@ def publish_terminal(authority, ref, row, settled, response, captured):
+     authority._publish_pending(ref)
+ 
+ 
++async def drain_deferred_rows(authority, ref):
++    """[daveey t_01a1d6f94ac774a2] A settled turn is no longer parked: land the passive rows (mirror, bot-DM
++    reply, gateway transcript retries) the update checkpoint deferred. Off-loop, best effort; the files wait
++    for the next append or boot recovery otherwise."""
++    store = getattr(getattr(authority, 'runner', None), 'session_store', None)
++    drain = getattr(store, 'drain_deferred_transcript', None)
++    if not callable(drain):
++        from gateway.shutdown_flush import replay_deferred_rows
++        drain = lambda sid: replay_deferred_rows(authority.db, sid)
++    try:
++        for sid in dict.fromkeys((ref.session_id, authority.physical_target(ref))):
++            await asyncio.to_thread(drain, sid)
++    except Exception:
++        logger.debug('Deferred transcript drain for %s failed', ref.session_id, exc_info=True)
++
++
+ async def settle_and_deliver(authority, live, ref, row, response, outcome):
+     """Own settlement through delivery even if the drain's waiter is cancelled.
+ 
+@@ -325,6 +341,8 @@ async def settle_and_deliver(authority, live, ref, row, response, outcome):
+             # Taken on every exit, so a turn that never settled leaves no reset for a later one.
+             reset = authority.deferred_resets.pop(live.route, None)
+         await authority._run_deferred_reset(live.route, reset)
++        if settled is not None:
++            await drain_deferred_rows(authority, ref)
+         from gateway.session_ingress import deliver_settled, fire_post_delivery
+         await deliver_settled(authority, admission_id)
+         await fire_post_delivery(authority, admission_id)
+diff --git a/gateway/session_transcript.py b/gateway/session_transcript.py
+index dd74eb367b..d3176f4593 100644
+--- a/gateway/session_transcript.py
++++ b/gateway/session_transcript.py
+@@ -343,6 +343,16 @@ class SessionTranscriptMixin:
+                             "Session DB transcript append rejected for compression-ended %s with "
+                             "no unique live child; not retrying", session_id)
+                         return
++                from hermes_state_errors import SessionTurnLeaseLostError
++                if isinstance(exc, SessionTurnLeaseLostError):
++                    # The chat's turn is parked for an update: a busy refusal that clears on resume, not a DB
++                    # outage. Never count it toward the stalled-session escalation; park the backlog on the
++                    # durable spool (a restart is exactly what happens next) and let the post-resume drain or
++                    # the next append land it. If the spool is unavailable it stays queued in memory.
++                    spooled = self._spool_stalled_backlog(session_id, queue_session_id)
++                    logger.info("Session DB transcript append deferred for %s: turn parked for an update "
++                                "(spooled=%d, pending=%d)", session_id, spooled, len(pending))
++                    return
+                 if self._is_fts_corruption_error(exc) and self._rebuild_fts_once():
+                     if spool_exc is not None:
+                         continue  # repaired: drain the older spool again before ``msg``
+@@ -432,6 +442,18 @@ class SessionTranscriptMixin:
+             logger.warning("Failed to drain transcript spool for %s: %s", session_id, exc)
+             return None
+ 
++    def drain_deferred_transcript(self, session_id: str) -> None:
++        """Land the rows parked behind a turn's update checkpoint (this store's own deferred appends and the
++        mirror / bot-DM rows other writers spooled) once that turn has resumed and settled. Still-parked
++        sessions keep every file. Never raises."""
++        try:
++            with self._get_transcript_drain_lock():
++                with self._transcript_retry_lock:
++                    self._lazy("_spooled_drop_sessions", set).add(session_id)
++                self._drain_spooled_drops(session_id)
++        except Exception as exc:  # health: allow BLE001 -- the files stay for the next append or boot recovery
++            logger.debug("Deferred transcript drain for %s failed: %s", session_id, exc)
++
+     def mark_spooled_drop_sessions(self, session_ids) -> None:
+         """Have each session's next transcript write drain the on-disk spool first. Boot recovery marks
+         the sessions it held back, so their next live row cannot land ahead of those files."""
+@@ -448,7 +470,8 @@ class SessionTranscriptMixin:
+             # into the ambient store.
+             raise RuntimeError(
+                 f"no owning session store for {session_id}; deferring transcript write")
+-        _db.append_message(**transcript_append_kwargs(session_id, message))
++        from gateway.shutdown_flush import replay_spooled_row
++        replay_spooled_row(_db, session_id, message)
+ 
+     @staticmethod
+     def _is_fts_corruption_error(exc: Exception) -> bool:
+diff --git a/gateway/shutdown_flush.py b/gateway/shutdown_flush.py
+index 9700bd71d2..4c0eaa3875 100644
+--- a/gateway/shutdown_flush.py
++++ b/gateway/shutdown_flush.py
+@@ -23,6 +23,7 @@ import uuid
+ from pathlib import Path
+ from typing import Any, Dict, Optional
+ from hermes_dir_acl import make_user_dir
++from hermes_state_errors import SessionTurnLeaseLostError
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -198,6 +199,36 @@ def drain_transcript_spool(session_id: str, replay, *, db_known_failing: bool =
+     return replayed, remaining
+ 
+ 
++def defer_row_for_parked_turn(session_id: str, message: dict[str, Any]) -> Optional[Path]:
++    """Durably queue a passive row the state layer refused (``SessionTurnLeaseLostError``: the chat's turn is
++    parked for an update and any later row would void its checkpoint). The row waits on the transcript spool
++    that already survives a restart, and :func:`replay_deferred_rows` lands it once the turn has resumed.
++    ``None`` when the spool is unavailable: the caller must then surface the refusal, never report delivery
++    [daveey t_01a1d6f94ac774a2]."""
++    return spool_dropped_transcript_message(session_id, message)
++
++
++def replay_spooled_row(session_db, session_id: str, message: dict[str, Any], *, fallback_ts=None):
++    """Replay a passive row, retaining model-pivot replacement semantics on every drain path."""
++    from gateway.session_transcript import transcript_append_kwargs
++    if message.get('display_kind') == 'model_switch':
++        return session_db.replace_display_kind_row(session_id, 'model_switch', message['content'],
++                                                  message_uid=message.get('message_uid'))
++    return session_db.append_message(**transcript_append_kwargs(session_id, message, fallback_ts=fallback_ts))
++
++
++def replay_deferred_rows(session_db, session_id: str) -> tuple[int, int]:
++    """Land the rows :func:`defer_row_for_parked_turn` queued for *session_id*; ``(replayed, remaining)``.
++    Still parked: the first replay is refused again and everything stays on disk. Never raises."""
++    try:
++        return drain_transcript_spool(
++            session_id, lambda message: replay_spooled_row(session_db, session_id, message),
++            db_known_failing=True)
++    except Exception as exc:  # health: allow BLE001 -- best-effort post-resume drain; the files stay for the next one
++        logger.debug("Deferred-row replay for %s failed: %s", session_id, exc)
++        return 0, 1
++
++
+ def _json_safe(value: Any) -> bool:
+     try:
+         json.dumps(value)
+@@ -386,7 +417,6 @@ def _recover_one_payload(session_db, path: Path, payload: dict[str, Any], *,
+     # Cap-dropped transcript payloads carry the full message dict keyed by session_id: replay it
+     # directly (#78182). This handles spool files that were never drained before a restart.
+     if payload.get("reason") == TRANSCRIPT_CAP_DROP_REASON:
+-        from gateway.session_transcript import transcript_append_kwargs
+         data = payload.get("data", {}) or {}
+         spooled_sid, message = data.get("session_id", ""), data.get("message")
+         if not spooled_sid or not isinstance(message, dict):
+@@ -400,7 +430,7 @@ def _recover_one_payload(session_db, path: Path, payload: dict[str, Any], *,
+             blocked_sessions[spooled_sid] += 1
+             return False
+         try:
+-            session_db.append_message(**transcript_append_kwargs(spooled_sid, message, fallback_ts=payload.get("ts")))
++            replay_spooled_row(session_db, spooled_sid, message, fallback_ts=payload.get("ts"))
+         except Exception as exc:
+             if is_row_rejection(exc):  # no retry can write it, so it must not hold the session back
+                 _quarantine_spool_file(path, spooled_sid, exc)
+@@ -435,8 +465,14 @@ def _recover_one_payload(session_db, path: Path, payload: dict[str, Any], *,
+                        "session_key-to-id resolution failed. "
+                        "The message text is preserved in %s", session_key, path)
+         return False
+-    target_db.append_message(session_id=session_id, role="user", content=text,
+-                             timestamp=payload.get("ts", int(time.time())))
++    ts = payload.get("ts", int(time.time()))
++    try:
++        target_db.append_message(session_id=session_id, role="user", content=text, timestamp=ts)
++    except SessionTurnLeaseLostError:
++        # The session's turn is parked for an update (boot recovery runs before its resume). Move the row onto
++        # the transcript spool, which the post-resume drain lands in order; keep this file if that fails.
++        if defer_row_for_parked_turn(session_id, {"role": "user", "content": text, "timestamp": ts}) is None:
++            raise
+     return True
+ 
+ 
+diff --git a/hermes_state_detached_results.py b/hermes_state_detached_results.py
+index 3852d9f53e..ecd60d0de8 100644
+--- a/hermes_state_detached_results.py
++++ b/hermes_state_detached_results.py
+@@ -37,6 +37,29 @@ class SessionDetachedResultsMixin:
+             session_id, content, display_kind, {**metadata, "completion_admission": admission_id},
+             "json_extract(m.display_metadata, '$.completion_admission') = ?", (admission_id,))
+ 
++    def replace_display_kind_row(self, session_id: str, display_kind: str, content: str, *,
++                                 message_uid: str | None = None) -> int:
++        """ONE transaction: deactivate every live row of ``display_kind`` and append the user row replacing them;
++        returns the new row id. The TUI model-switch pivot used a separate deactivate then append, so an append
++        refused for a turn parked for an update left the old pivot gone and no new one. Same lease-less guards
++        as a plain append [daveey t_01a1d6f94ac774a2]."""
++        msg = {"content": content, "display_kind": display_kind}
++        if message_uid:
++            msg["message_uid"] = message_uid
++        stamp_message_uid(msg)
++        row = self._message_row_params(session_id, "user", msg, None, time.time(), keep_reasoning=True)
++
++        def _do(conn):
++            from hermes_state_messages import _INSERT_MESSAGE_SQL
++            self._check_transcript_write_guards(conn, session_id, None, reject_parked_turn=True)
++            conn.execute("UPDATE messages SET active = 0 WHERE session_id = ? AND display_kind = ? AND active = 1",
++                         (session_id, display_kind))
++            msg_id = conn.execute(_INSERT_MESSAGE_SQL, row).lastrowid
++            self._bump_session_counters(conn, session_id, 1, 0, unit=True)
++            return msg_id
++
++        return self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
++
+     def _append_detached_result(self, session_id: str, content: str, display_kind: str, metadata: dict[str, Any],
+                                 match_sql: str, params: tuple) -> int:
+         """Record a result that arrived between turns as a user row once, including replay after rotation: a row
+diff --git a/hermes_state_messages.py b/hermes_state_messages.py
+index a404204969..92a595cc4e 100644
+--- a/hermes_state_messages.py
++++ b/hermes_state_messages.py
+@@ -215,16 +215,16 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin,
+     def _check_transcript_write_guards(self, conn, session_id: str, compression_lock_holder: Optional[str],
+         turn_lease_holder: Optional[str] = None, turn_lease_ttl_seconds: float = 300.0,
+         reject_active_turn_lease: bool = False, reject_active_compression_lock: bool = False,
+-        allow_closed_compression_parent: bool = False) -> None:
++        allow_closed_compression_parent: bool = False, reject_parked_turn: bool = False) -> None:
+         """Transcript-write admission checks, run INSIDE the write txn by every writer. Ordinary appends do
+         NOT check compression_locks: the lock only stops two COMPRESSIONS colliding and archive_and_compact()
+         commits against a watermark, so concurrent appends are safe (blocking them killed turns during slow
+         summaries). Destructive user mutations opt in via ``reject_active_*`` so a compressor that captured
+         its watermark cannot resurrect the removed turn.
+ 
+-        Shared by every writer so they never diverge on these invariants (#74478 patience note below). A
+-        lease-less caller opting in via ``reject_active_turn_lease`` is refused while a turn holds the lease
+-        or one is parked for an update (its checkpoint forbids any later row) [daveey t_01a1d6f94ac774a2]."""
++        Shared by every writer (#74478 patience note below). ``reject_active_turn_lease`` also refuses a turn
++        parked for an update (its checkpoint forbids a later row); ``reject_parked_turn`` is that half alone,
++        for the public lease-less appenders: a passive row must not void the proof [daveey t_01a1d6f94ac774a2]."""
+         from hermes_state import SessionCompressionInProgressError
+         from hermes_state_errors import CompressionSessionClosedError, SessionTurnLeaseLostError
+         # NOTE (#75316 redesign): appends do NOT check compression_locks. The lock's job is to stop two
+@@ -263,9 +263,9 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin,
+                 # Same reclaim rule as acquisition; deleting also fences a stale late flush after the mutation.
+                 conn.execute("DELETE FROM session_turn_leases WHERE conversation_id = ? AND holder = ?",
+                     (conversation_id, lease["holder"]))
+-            if not turn_lease_holder:
+-                from hermes_state_update_pause import refuse_parked_write
+-                refuse_parked_write(conn, session_id, conversation_id)
++        if not turn_lease_holder and (reject_active_turn_lease or reject_parked_turn):
++            from hermes_state_update_pause import refuse_parked_write
++            refuse_parked_write(conn, session_id, self._session_turn_lease_key_on_conn(conn, session_id))
+         if _ended_by_compression(conn.execute(_ENDED_ROW_SQL, (session_id,)).fetchone()) and not allow_closed_compression_parent:
+             raise CompressionSessionClosedError(session_id)
+ 
+@@ -421,7 +421,7 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin,
+             session_id, role, msg, tool_calls, message_timestamp, keep_reasoning=True)
+         def _do(conn):
+             self._check_transcript_write_guards(conn, session_id, compression_lock_holder,
+-                turn_lease_holder=turn_lease_holder, turn_lease_ttl_seconds=turn_lease_ttl_seconds)
++                turn_lease_holder=turn_lease_holder, turn_lease_ttl_seconds=turn_lease_ttl_seconds, reject_parked_turn=True)
+             msg_id = conn.execute(_INSERT_MESSAGE_SQL, params).lastrowid
+             self._bump_session_counters(conn, session_id, 1, _tool_calls_count(tool_calls), unit=True)
+             return msg_id
+@@ -514,13 +514,13 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin,
+                 for start in range(0, len(messages), chunk_rows))
+         return self._execute_transcript_write(lambda conn: self._append_messages_in_transaction(
+             conn, session_id, messages, compression_lock_holder=compression_lock_holder,
+-            turn_lease_holder=turn_lease_holder, turn_lease_ttl_seconds=turn_lease_ttl_seconds),
++            turn_lease_holder=turn_lease_holder, turn_lease_ttl_seconds=turn_lease_ttl_seconds, reject_parked_turn=True),
+             messages, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
+ 
+     def _append_messages_in_transaction(self, conn, session_id, messages, *,
+-            compression_lock_holder=None, turn_lease_holder=None, turn_lease_ttl_seconds=300.0):
+-        self._check_transcript_write_guards(conn, session_id, compression_lock_holder,
+-            turn_lease_holder=turn_lease_holder, turn_lease_ttl_seconds=turn_lease_ttl_seconds)
++            compression_lock_holder=None, turn_lease_holder=None, turn_lease_ttl_seconds=300.0, reject_parked_turn=False):
++        self._check_transcript_write_guards(conn, session_id, compression_lock_holder, turn_lease_holder=turn_lease_holder,
++            turn_lease_ttl_seconds=turn_lease_ttl_seconds, reject_parked_turn=reject_parked_turn)
+         from agent.transcript_repair import resolve_and_repair_transcript_batch
+         inserted_rows = resolve_and_repair_transcript_batch(
+             conn,
+diff --git a/tests/gateway/test_parked_automation_fence_settles.py b/tests/gateway/test_parked_automation_fence_settles.py
+index 88a35f78ab..756c4662c2 100644
+--- a/tests/gateway/test_parked_automation_fence_settles.py
++++ b/tests/gateway/test_parked_automation_fence_settles.py
+@@ -53,6 +53,13 @@ async def _drain(owner):
+     await asyncio.wait_for(owner.sessions['s'].task, 10)
+ 
+ 
++def _void_proof(db):
++    """An unguarded writer's row, raw SQL: the public appenders now refuse while the turn is parked."""
++    db._execute_write(lambda c: c.execute(
++        "INSERT INTO messages(session_id, role, content, timestamp) "
++        "VALUES('s', 'user', 'a row an unguarded writer appended', 1)"))
++
++
+ def _status(db, admission):
+     row = get_session_admission(db, admission_id=admission['admission_id'])
+     return row['status'], row['outcome']
+@@ -80,7 +87,7 @@ async def test_drain_fenced_automation_head_settles_and_follower_runs_in_same_dr
+     it and the same drain runs the queued follower, with no pause."""
+     db, owner, head, follower, calls = await _after_boot(tmp_path, monkeypatch, AUTOMATION)
+     with db:
+-        db.append_message('s', 'user', 'a row an unguarded writer appended')  # voids the proof
++        _void_proof(db)  # voids the proof
+         assert get_session_checkpoint(db, session_id='s') is None
+         with caplog.at_level(logging.INFO, logger='gateway.session_authority'):
+             await _drain(owner)
+@@ -94,7 +101,7 @@ async def test_drain_fenced_automation_head_settles_and_follower_runs_in_same_dr
+ async def test_drain_fenced_persons_head_still_pauses_and_says_so(tmp_path, monkeypatch, caplog):
+     db, owner, head, follower, calls = await _after_boot(tmp_path, monkeypatch, PERSON)
+     with db:
+-        db.append_message('s', 'user', 'a row an unguarded writer appended')
++        _void_proof(db)
+         with caplog.at_level(logging.INFO, logger='gateway.session_authority'):
+             await _drain(owner)
+         assert calls == []
+@@ -104,12 +111,10 @@ async def test_drain_fenced_persons_head_still_pauses_and_says_so(tmp_path, monk
+         assert paused and paused[0].levelno == logging.WARNING
+ 
+ 
+-@pytest.mark.parametrize('reason,level', [('session_busy', logging.INFO), ('runtime_draining', logging.INFO),
+-                                          ('unknown_execution', logging.WARNING),
+-                                          ('admission_conflict', logging.WARNING)])
+-def test_every_pause_is_logged(tmp_path, monkeypatch, caplog, reason, level):
++@pytest.mark.parametrize('reason', ['session_busy', 'runtime_draining', 'unknown_execution', 'admission_conflict'])
++def test_every_pause_is_logged_at_warning(tmp_path, monkeypatch, caplog, reason):
+     from tests.gateway.test_session_authority_cancel_settlement import _authority
+     db, owner = _authority(tmp_path, monkeypatch)
+     with db, caplog.at_level(logging.INFO, logger='gateway.session_authority'):
+         owner._pause(REF, reason)
+-    assert [(r.getMessage(), r.levelno) for r in caplog.records] == [(f'Session s paused: {reason}', level)]
++    assert [(r.getMessage(), r.levelno) for r in caplog.records] == [(f'Session s paused: {reason}', logging.WARNING)]
+diff --git a/tests/gateway/test_parked_passive_row_delivery.py b/tests/gateway/test_parked_passive_row_delivery.py
+new file mode 100644
+index 0000000000..cac966c6c5
+--- /dev/null
++++ b/tests/gateway/test_parked_passive_row_delivery.py
+@@ -0,0 +1,230 @@
++"""t_01a1d6f94ac774a2: every real passive appender keeps its row across a turn parked for an update.
++
++The state layer now refuses a plain ``append_message`` / ``append_messages_batch`` while a started turn is
++parked (``SessionTurnLeaseLostError``). Each caller below parks a real update checkpoint, is invoked for
++real, and must (a) land no row while parked (the proof stays valid), (b) lose nothing, and (c) deliver the
++row exactly once after the resume, through the transcript spool that already survives a restart.
++"""
++import json
++import threading
++import time
++import types
++
++import pytest
++
++import hermes_state_runtime as rt
++from gateway import shutdown_flush
++from hermes_state_update_pause import get_session_checkpoint, resume_session_checkpoint
++from tests.hermes_state import test_parked_turn_passive_writes as _passive
++
++parked = _passive.parked  # the real parked checkpoint fixture, shared rather than copied
++
++
++@pytest.fixture
++def spool_home(tmp_path, monkeypatch):
++    monkeypatch.setenv('HERMES_HOME', str(tmp_path / 'home'))
++    import hermes_constants
++    monkeypatch.setattr(hermes_constants, 'get_hermes_home', lambda: tmp_path / 'home', raising=False)
++    (tmp_path / 'home').mkdir()
++    return tmp_path / 'home'
++
++
++def _spool_files():
++    return list(shutdown_flush._get_flush_dir().glob('pending-*.json'))
++
++
++def _resume(db, row):
++    epoch = rt.begin_runtime_epoch(db, instance_id='after-update')
++    assert rt.recover_session_inputs(db, epoch=epoch) == 0
++    resume_session_checkpoint(db, epoch=epoch, admission_id=row['admission_id'])
++    assert get_session_checkpoint(db, session_id='s') is None
++
++
++def _contents(db, **where):
++    return [m['content'] for m in db.get_messages('s') if all(m.get(k) == v for k, v in where.items())]
++
++
++def _assert_proof_intact(db):
++    assert get_session_checkpoint(db, session_id='s') is not None
++
++
++def test_mirror_defers_to_spool_then_lands_once(parked, spool_home, monkeypatch):
++    import hermes_state_registry
++    from gateway.mirror import mirror_to_session
++    db, _, row = parked
++    monkeypatch.setattr(hermes_state_registry, 'acquire', lambda: db)
++    monkeypatch.setattr(hermes_state_registry, 'release_or_close', lambda d: None)
++    before = db.get_messages('s')
++    assert mirror_to_session('telegram', '1', 'cron says hi', session_id='s', role='user') is True
++    assert db.get_messages('s') == before and len(_spool_files()) == 1
++    _assert_proof_intact(db)
++    assert shutdown_flush.replay_deferred_rows(db, 's') == (0, 1)  # still parked: nothing lost, nothing landed
++    assert len(_spool_files()) == 1
++    _resume(db, row)
++    assert shutdown_flush.replay_deferred_rows(db, 's') == (1, 0)
++    assert _contents(db).count('cron says hi') == 1 and not _spool_files()
++    assert shutdown_flush.replay_deferred_rows(db, 's') == (0, 0)
++
++
++def test_mirror_without_a_spool_reports_the_refusal_not_success(parked, spool_home, monkeypatch):
++    import hermes_state_registry
++    from gateway.mirror import mirror_to_session
++    db, _, _ = parked
++    monkeypatch.setattr(hermes_state_registry, 'acquire', lambda: db)
++    monkeypatch.setattr(hermes_state_registry, 'release_or_close', lambda d: None)
++    monkeypatch.setattr(shutdown_flush, 'spool_dropped_transcript_message', lambda *a: None)
++    assert mirror_to_session('telegram', '1', 'x', session_id='s') is False
++    assert 'x' not in _contents(db)
++
++
++def test_gateway_store_defers_without_counting_a_failure_then_drains(parked, spool_home, monkeypatch):
++    from gateway.session import SessionStore
++    db, _, row = parked
++    store = object.__new__(SessionStore)
++    store._db = db
++    store._transcript_retry_lock = threading.Lock()
++    store._dirty_transcripts = {}
++    store._transcript_append_failures = {}
++    monkeypatch.setattr(store, '_db_for_session_id', lambda sid: db, raising=False)
++    store.append_to_transcript('s', {'role': 'user', 'content': 'retry me'})
++    assert 'retry me' not in _contents(db)
++    assert store._transcript_append_failures.get('s', 0) == 0, 'lease busy must not feed the stall escalation'
++    assert store._dirty_transcripts.get('s', []) == [] and len(_spool_files()) == 1
++    _assert_proof_intact(db)
++    store.drain_deferred_transcript('s')  # still parked: refused again, files kept
++    assert len(_spool_files()) == 1 and 'retry me' not in _contents(db)
++    _resume(db, row)
++    store.drain_deferred_transcript('s')
++    assert _contents(db).count('retry me') == 1 and not _spool_files()
++
++
++def test_gateway_store_keeps_order_across_deferred_rows(parked, spool_home, monkeypatch):
++    from gateway.session import SessionStore
++    db, _, row = parked
++    store = object.__new__(SessionStore)
++    store._db = db
++    store._transcript_retry_lock = threading.Lock()
++    store._dirty_transcripts = {}
++    store._transcript_append_failures = {}
++    monkeypatch.setattr(store, '_db_for_session_id', lambda sid: db, raising=False)
++    for text in ('first', 'second'):
++        store.append_to_transcript('s', {'role': 'user', 'content': text})
++    _resume(db, row)
++    store.append_to_transcript('s', {'role': 'user', 'content': 'third'})  # the next live append drains first
++    assert _contents(db)[-3:] == ['first', 'second', 'third'] and not _spool_files()
++
++
++def test_bot_dm_reply_is_consumed_then_deferred_and_lands_after_resume(parked, spool_home, monkeypatch):
++    from tools import bot_mode_dm
++    from tools import process_registry_notifications as notes
++    from tools.process_registry import process_registry
++    db, _, row = parked
++    done = threading.Event()
++    proc = types.SimpleNamespace(_completion_event=done)
++    monkeypatch.setattr(process_registry, 'get', lambda pid: proc)
++    monkeypatch.setattr(process_registry, 'is_completion_consumed', lambda pid: False)
++    monkeypatch.setattr(process_registry, '_exit_snapshot', lambda p, s: {'status': s})
++    monkeypatch.setattr(notes, 'format_process_notification', lambda evt: 'REPLY FROM RECIPIENT')
++    monkeypatch.setattr(notes, 'process_completion_display_text', lambda evts: 'reply')
++    agent = types.SimpleNamespace(_session_db=db, session_id='s')
++    assert bot_mode_dm._persist_reply_when_done('proc-1', agent) is True
++    done.set()
++    deadline = time.time() + 10
++    while not _spool_files() and time.time() < deadline:
++        time.sleep(0.05)
++    assert len(_spool_files()) == 1 and 'REPLY FROM RECIPIENT' not in _contents(db)
++    _assert_proof_intact(db)
++    _resume(db, row)
++    assert shutdown_flush.replay_deferred_rows(db, 's') == (1, 0)
++    assert _contents(db, display_kind='process_complete') == ['REPLY FROM RECIPIENT']
++
++
++def test_shutdown_spool_replay_holds_back_while_parked_then_recovers(parked, spool_home):
++    db, _, row = parked
++    assert shutdown_flush.spool_dropped_transcript_message('s', {'role': 'user', 'content': 'spooled at shutdown'})
++    recovered, held_back = shutdown_flush.recover_pending_spool(db)
++    assert (recovered, held_back) == (0, {'s'}) and len(_spool_files()) == 1
++    assert 'spooled at shutdown' not in _contents(db)
++    _assert_proof_intact(db)
++    _resume(db, row)
++    assert shutdown_flush.recover_pending_spool(db) == (1, set()) and not _spool_files()
++    assert _contents(db).count('spooled at shutdown') == 1
++
++
++def test_shutdown_pending_message_moves_to_the_transcript_spool_while_parked(parked, spool_home):
++    """A pending-message file is not drained after boot, so it must not sit as one: it becomes a spool row."""
++    db, _, row = parked
++    payload = {'session_key': 'agent:main:x', 'ts': 1700000000, 'data': {'text': 'typed at shutdown', 'session_id': 's'}}
++    shutdown_flush._write_payload(shutdown_flush._get_flush_dir(), payload)
++    recovered, _held_back = shutdown_flush.recover_pending_spool(db)
++    assert recovered == 1 and 'typed at shutdown' not in _contents(db)
++    files = _spool_files()
++    assert len(files) == 1
++    saved = json.loads(files[0].read_text())
++    assert saved['reason'] == shutdown_flush.TRANSCRIPT_CAP_DROP_REASON and saved['data']['session_id'] == 's'
++    _resume(db, row)
++    assert shutdown_flush.replay_deferred_rows(db, 's') == (1, 0)
++    assert _contents(db).count('typed at shutdown') == 1
++
++
++def _tui_session(db, key='s'):
++    return {'agent': types.SimpleNamespace(_session_db=db, session_id=key), 'history': [], 'session_key': key,
++            'history_lock': threading.RLock(), 'running': False}
++
++
++def test_tui_stop_notice_survives_the_parked_turn_and_is_not_written_twice(parked, spool_home):
++    from tui_gateway import server
++    db, _, row = parked
++    session = _tui_session(db)
++    session['_stop_issuer'] = 'Desktop'
++    entry = server._record_stop_notice(session, 'interrupted')
++    assert entry in session['history'] and entry.get('_db_persisted') is not False
++    assert _contents(db, display_kind='turn_stopped') == [] and len(_spool_files()) == 1
++    _assert_proof_intact(db)
++    _resume(db, row)
++    assert shutdown_flush.replay_deferred_rows(db, 's') == (1, 0)
++    notices = _contents(db, display_kind='turn_stopped')
++    assert notices == ['[Turn stopped by Desktop before it finished.]']
++    from agent.context_compressor import _DB_PERSISTED_MARKER
++    assert entry[_DB_PERSISTED_MARKER] is True, 'the spool owns the row: no flush may write a second copy'
++
++
++def test_tui_model_switch_marker_is_atomic_when_the_turn_is_parked(parked, spool_home):
++    from agent.context_compressor import _DB_PERSISTED_MARKER
++    from tui_gateway import server
++    db, _, row = parked
++    # Seed an older pivot BEFORE the checkpoint-bound assistant/tool suffix.
++    db._execute_write(lambda c: c.execute("UPDATE messages SET display_kind='model_switch', content='m1' "
++                                          "WHERE session_id='s' AND role='user'"))
++    _assert_proof_intact(db)
++    session = _tui_session(db)
++    active = lambda: [m['content'] for m in db.get_messages('s') if m.get('display_kind') == 'model_switch']
++    first = active()
++    assert len(first) == 1 and 'm1' in first[0]
++    server._append_model_switch_marker(session, model='m2', provider='p')  # parked: refused, nothing half-applied
++    assert active() == first, 'the previous pivot must stay active when the new one cannot land'
++    live = [h for h in session['history'] if h.get('display_kind') == 'model_switch']
++    assert len(live) == 1 and 'm2' in live[0]['content'] and live[0][_DB_PERSISTED_MARKER]
++    _assert_proof_intact(db)
++    _resume(db, row)
++    # The rebuilt owner has no SessionStore and no old in-memory history (the TUI path).
++    import asyncio
++    from gateway.session_settlement_recovery import drain_deferred_rows
++    authority = types.SimpleNamespace(db=db, runner=None, physical_target=lambda ref: 's')
++    asyncio.run(drain_deferred_rows(authority, types.SimpleNamespace(session_id='s')))
++    assert len(active()) == 1 and 'm2' in active()[0] and not _spool_files()
++    asyncio.run(drain_deferred_rows(authority, types.SimpleNamespace(session_id='s')))
++    assert len(active()) == 1
++
++
++def test_settlement_drains_deferred_rows_for_both_session_ids():
++    import asyncio
++    from gateway.session_settlement_recovery import drain_deferred_rows
++    drained = []
++    store = types.SimpleNamespace(drain_deferred_transcript=drained.append)
++    authority = types.SimpleNamespace(runner=types.SimpleNamespace(session_store=store),
++                                      physical_target=lambda ref: 'tip')
++    asyncio.run(drain_deferred_rows(authority, types.SimpleNamespace(session_id='s')))
++    assert drained == ['s', 'tip']
++    # A runner without a store (tests, headless owners) is a no-op, never an error.
++    asyncio.run(drain_deferred_rows(types.SimpleNamespace(runner=None), types.SimpleNamespace(session_id='s')))
+diff --git a/tests/gateway/test_update_pause_cache.py b/tests/gateway/test_update_pause_cache.py
+index 0c5c3c4255..8a6bf7005f 100644
+--- a/tests/gateway/test_update_pause_cache.py
++++ b/tests/gateway/test_update_pause_cache.py
+@@ -1,4 +1,5 @@
+ """Checkpoint cache is only a parked hint, never a replacement for transactional proof."""
++from tests.hermes_state.raw_rows import raw_append_message
+ import pytest
+ from gateway.session_update_pause import checkpoint_head, resume_checkpoint
+ from tests.gateway.test_authority_update_pause import parked_fixture
+@@ -32,7 +33,7 @@ async def test_held_poll_does_not_rehash_but_resume_revalidates(tmp_path, monkey
+         for _ in range(3):
+             assert await owner._claim_next(REF, owner.sessions['s']) == ('update_paused', None)
+         # A writer changes the suffix while parked: cache must not authorize resume.
+-        db.append_message('s', 'assistant', 'changed tail')
++        raw_append_message(db, 's', 'assistant', 'changed tail')
+         monkeypatch.setattr(session_update_pause, 'update_held', lambda authority: False)
+         with pytest.raises(RuntimeStoreError, match='invalid_checkpoint'):
+             await resume_checkpoint(owner, REF, owner.sessions['s'], head)
+@@ -44,7 +45,7 @@ async def test_invalid_receipt_is_unknown_not_stranded_started(tmp_path, monkeyp
+     from hermes_state_runtime import get_session_admission
+     db, owner, head = parked_fixture(tmp_path, monkeypatch)
+     with db:
+-        db.append_message('s', 'assistant', 'changed tail')
++        raw_append_message(db, 's', 'assistant', 'changed tail')
+         await owner._claim_with_retry(REF, owner.sessions['s'])
+         assert get_session_admission(db, admission_id=head['admission_id'])['status'] == 'unknown'
+ 
+diff --git a/tests/gateway/test_update_pause_native_boot.py b/tests/gateway/test_update_pause_native_boot.py
+index f7efd967bc..5255d09a7d 100644
+--- a/tests/gateway/test_update_pause_native_boot.py
++++ b/tests/gateway/test_update_pause_native_boot.py
+@@ -1,4 +1,5 @@
+ """Boot finds durable started checkpoints without replaying ordinary started turns."""
++from tests.hermes_state.raw_rows import raw_append_message
+ import pytest
+ 
+ 
+@@ -80,7 +81,7 @@ async def test_boot_does_not_schedule_ordinary_current_started_turn(tmp_path, mo
+     runner, owner, ref, row = await _started(tmp_path, monkeypatch, checkpoint=invalid_receipt, detached=detached)
+     try:
+         if invalid_receipt:
+-            owner.db.append_message(ref.session_id, 'assistant', 'boundary changed')
++            raw_append_message(owner.db, ref.session_id, 'assistant', 'boundary changed')
+         from hermes_state_update_pause import get_session_checkpoint
+         assert get_session_checkpoint(owner.db, session_id=ref.session_id) is None
+         scheduled = []
+diff --git a/tests/gateway/test_update_pause_remaining_guards.py b/tests/gateway/test_update_pause_remaining_guards.py
+index 8892c98d00..49b1b047f9 100644
+--- a/tests/gateway/test_update_pause_remaining_guards.py
++++ b/tests/gateway/test_update_pause_remaining_guards.py
+@@ -1,4 +1,5 @@
+ """Behavior guards for update-pause bookkeeping that earlier suites left unobserved."""
++from tests.hermes_state.raw_rows import raw_append_message
+ import types
+ 
+ import pytest
+@@ -38,7 +39,7 @@ def test_recovery_preserves_valid_receipt_and_unknowns_invalid_one(tmp_path, mon
+         # Same-epoch rows are never touched.
+         assert db._execute_write(lambda c: recover_checkpointed_inputs(c, owner.epoch)) == 0
+         # Corrupt the proof: recovery fences the head and removes the dead receipt.
+-        db.append_message('s', 'assistant', 'tail changed')
++        raw_append_message(db, 's', 'assistant', 'tail changed')
+         # The current owner's own started row is live work even when its proof is stale.
+         assert db._execute_write(lambda c: recover_checkpointed_inputs(c, owner.epoch)) == 0
+         assert get_session_admission(db, admission_id=head['admission_id'])['status'] == 'started'
+@@ -76,7 +77,7 @@ async def test_uncached_invalid_proof_raises_not_none(tmp_path, monkeypatch):
+     from hermes_state_runtime import RuntimeStoreError
+     db, owner, _head = parked_fixture(tmp_path, monkeypatch)
+     with db:
+-        db.append_message('s', 'assistant', 'tail changed')
++        raw_append_message(db, 's', 'assistant', 'tail changed')
+         with pytest.raises(RuntimeStoreError, match='invalid_checkpoint'):
+             sup.checkpoint_head(owner, REF)
+ 
+diff --git a/tests/hermes_state/raw_rows.py b/tests/hermes_state/raw_rows.py
+new file mode 100644
+index 0000000000..e860216dec
+--- /dev/null
++++ b/tests/hermes_state/raw_rows.py
+@@ -0,0 +1,13 @@
++"""Raw-SQL row writer for tests that deliberately corrupt an update checkpoint's proof.
++
++The public appenders refuse while a started turn is parked (t_01a1d6f94ac774a2), so a test that needs the
++"somebody wrote after the tool suffix" corruption must bypass them. This is the corruption, not a writer.
++"""
++import time
++
++
++def raw_append_message(db, session_id, role, content, **_ignored):
++    """Insert one active row after the current tail, skipping every guard the public appenders run."""
++    return db._execute_write(lambda c: c.execute(
++        'INSERT INTO messages(session_id, role, content, timestamp) VALUES(?,?,?,?)',
++        (session_id, role, content, time.time())).lastrowid)
+diff --git a/tests/hermes_state/test_parked_turn_passive_writes.py b/tests/hermes_state/test_parked_turn_passive_writes.py
+index f104ef9940..b2b7341d00 100644
+--- a/tests/hermes_state/test_parked_turn_passive_writes.py
++++ b/tests/hermes_state/test_parked_turn_passive_writes.py
+@@ -152,3 +152,84 @@ def test_neighbouring_state_meta_keys_are_not_receipts(parked):
+                                           (CHECKPOINT_PREFIX[:-1] + '/' + row['admission_id'], '{}')))
+     with db._read_ctx() as conn:
+         assert parked_update_turn(conn, ['s']) is None
++
++
++# ── plain public appenders (mirror, bot DM, Stop, transcript retry, spool replay all go through these) ──
++
++def _plain_append(db, sid):
++    return db.append_message(sid, 'user', 'plain passive row')
++
++
++def _plain_batch(db, sid):
++    return db.append_messages_batch(sid, [{'role': 'user', 'content': 'batch passive row'}])
++
++
++def _chunked_batch(db, sid):
++    return db.append_messages_batch(sid, [{'role': 'user', 'content': f'chunk {i}'} for i in range(3)], chunk_rows=2)
++
++
++PLAIN = {'append_message': _plain_append, 'append_messages_batch': _plain_batch,
++         'append_messages_batch_chunked': _chunked_batch}
++
++
++@pytest.mark.parametrize('write', PLAIN.values(), ids=PLAIN.keys())
++def test_plain_append_defers_then_lands_after_resume(parked, write):
++    from hermes_state_update_pause import get_session_checkpoint, resume_session_checkpoint
++    db, epoch, row = parked
++    before = db.get_messages('s')
++    with pytest.raises(SessionTurnLeaseLostError, match='parked for an update'):
++        write(db, 's')
++    assert db.get_messages('s') == before, 'a refused batch must land no row at all'
++    assert get_session_checkpoint(db, session_id='s') is not None
++    epoch = rt.begin_runtime_epoch(db, instance_id='second')
++    assert rt.recover_session_inputs(db, epoch=epoch) == 0
++    resume_session_checkpoint(db, epoch=epoch, admission_id=row['admission_id'])
++    write(db, 's')
++    assert len(db.get_messages('s')) > len(before)
++
++
++def test_plain_append_to_other_chat_is_unaffected(parked):
++    db, _, _ = parked
++    assert _plain_append(db, 'other') > 0
++    assert _plain_batch(db, 'other') == 1
++
++
++def test_plain_append_does_not_change_live_lease_behaviour(parked):
++    """Another backend's live lease never blocked a plain append, and the parked fence does not add that."""
++    db, _, row = parked
++    from hermes_state_update_pause import CHECKPOINT_PREFIX
++    db._execute_write(lambda c: c.execute('DELETE FROM state_meta WHERE key=?', (CHECKPOINT_PREFIX + row['admission_id'],)))
++    db._execute_write(lambda c: c.execute(
++        "INSERT INTO session_turn_leases(conversation_id, holder, acquired_at, expires_at) VALUES('s','live',0,?)", (2e10,)))
++    assert _plain_append(db, 's') > 0
++    assert _plain_batch(db, 's') == 1
++
++
++def test_owner_settlement_write_is_not_blocked_by_the_fence(parked):
++    """gateway/session_results.py settles a parked-era turn through the in-transaction writer: its default stays open."""
++    db, _, _ = parked
++    n = db._execute_write(lambda c: db._append_messages_in_transaction(
++        c, 's', [{'role': 'assistant', 'content': 'owner boundary'}]))
++    assert n == 1
++    with pytest.raises(SessionTurnLeaseLostError):
++        db._execute_write(lambda c: db._append_messages_in_transaction(
++            c, 's', [{'role': 'user', 'content': 'x'}], reject_parked_turn=True))
++
++
++def test_replace_display_kind_row_is_atomic_when_refused(parked):
++    """The model-switch pivot: a refused replace leaves the previous pivot active (no half change)."""
++    from hermes_state_update_pause import CHECKPOINT_PREFIX
++    db, _, row = parked
++    key = CHECKPOINT_PREFIX + row['admission_id']
++    saved = db._execute_write(lambda c: c.execute('SELECT value FROM state_meta WHERE key=?', (key,)).fetchone()[0])
++    db._execute_write(lambda c: c.execute('DELETE FROM state_meta WHERE key=?', (key,)))
++    old = db.replace_display_kind_row('s', 'model_switch', 'first pivot')
++    db._execute_write(lambda c: c.execute('INSERT INTO state_meta(key,value) VALUES(?,?)', (key, saved)))
++    active = lambda: [m['content'] for m in db.get_messages('s') if m.get('display_kind') == 'model_switch']
++    assert active() == ['first pivot'] and old > 0
++    with pytest.raises(SessionTurnLeaseLostError):
++        db.replace_display_kind_row('s', 'model_switch', 'second pivot')
++    assert active() == ['first pivot']
++    db._execute_write(lambda c: c.execute('DELETE FROM state_meta WHERE key=?', (key,)))
++    db.replace_display_kind_row('s', 'model_switch', 'second pivot')
++    assert active() == ['second pivot']
+diff --git a/tests/hermes_state/test_update_checkpoint.py b/tests/hermes_state/test_update_checkpoint.py
+index d08d190ee5..63fb49fe36 100644
+--- a/tests/hermes_state/test_update_checkpoint.py
++++ b/tests/hermes_state/test_update_checkpoint.py
+@@ -1,4 +1,5 @@
+ """Store-only update parking: no execution or gateway transport in these contracts."""
++from tests.hermes_state.raw_rows import raw_append_message
+ import json
+ import sqlite3
+ 
+@@ -112,7 +113,7 @@ def test_changed_checkpoint_is_invalid_before_resume_and_recovery(running, mutat
+             request_id='steer', payload={'text': 'possibly delivered'}, intent='steer')
+         rt.steer_session_input(db, epoch=epoch, admission_id=steer['admission_id'], generation=row['generation'])
+     actions = {
+-        'append': lambda: db.append_message('s', role='assistant', content='later'),
++        'append': lambda: raw_append_message(db, 's', 'assistant', 'later'),
+         'edit': lambda: db._execute_write(lambda c: c.execute("UPDATE messages SET content='different' WHERE role='tool'")),
+         'generation': lambda: db._execute_write(lambda c: c.execute(
+             "UPDATE sessions SET runtime_generation=runtime_generation+1 WHERE id='s'")),
+diff --git a/tests/tui_gateway/test_tui_gateway_server.py b/tests/tui_gateway/test_tui_gateway_server.py
+index f2f342b2dc..b593da7652 100644
+--- a/tests/tui_gateway/test_tui_gateway_server.py
++++ b/tests/tui_gateway/test_tui_gateway_server.py
+@@ -10665,8 +10665,8 @@ def test_config_set_model_switches_agent_without_touching_env(monkeypatch):
+                 {"session_id": session_id, "role": role, "content": content}
+             )
+ 
+-        def deactivate_messages_by_display_kind(self, _session_id, _display_kind):
+-            return 0
++        def replace_display_kind_row(self, session_id, _display_kind, content, **_kwargs):
++            self.append_message(session_id, "user", content)
+ 
+     agent = Agent()
+     db = SessionDB()
+diff --git a/tools/bot_mode_dm.py b/tools/bot_mode_dm.py
+index fe67995e36..941a140c88 100644
+--- a/tools/bot_mode_dm.py
++++ b/tools/bot_mode_dm.py
+@@ -910,6 +910,7 @@ def _persist_reply_when_done(proc_id: str, agent: Any) -> bool:
+     the outcome via process(action='wait'/'log') is not told twice. Returns False (nothing
+     armed) when the sender has no session transcript or the process is not tracked here."""
+     from tools.process_registry import process_registry
++    from hermes_state_errors import SessionTurnLeaseLostError
+ 
+     db, session_id = getattr(agent, "_session_db", None), getattr(agent, "session_id", None)
+     proc = process_registry.get(proc_id)
+@@ -925,10 +926,19 @@ def _persist_reply_when_done(proc_id: str, agent: Any) -> bool:
+         if process_registry.is_completion_consumed(proc_id):
+             return
+         evt = {"type": "completion", "session_id": proc_id, **process_registry._exit_snapshot(proc, "exited")}
++        row = {"role": "user", "content": format_process_notification(evt), "display_kind": "process_complete",
++               "display_metadata": {"display_text": process_completion_display_text([evt])}}
+         try:
+-            db.append_message(session_id, "user", content=format_process_notification(evt),
+-                              display_kind="process_complete",
+-                              display_metadata={"display_text": process_completion_display_text([evt])})
++            try:
++                db.append_message(session_id, **row)
++            except SessionTurnLeaseLostError:
++                # The sender's turn is parked for an update. The completion is already consumed, so the reply
++                # waits on the durable transcript spool and lands after the resume; no spool: report it below.
++                from gateway.shutdown_flush import defer_row_for_parked_turn
++                if defer_row_for_parked_turn(session_id, row) is None:
++                    raise
++                logger.info("message_agent: session %s has a turn parked for an update; queued the reply of %s",
++                            session_id, proc_id)
+         except Exception as exc:
+             logger.warning("message_agent: could not persist the reply of %s into session %s: %s",
+                            proc_id, session_id, exc)
+diff --git a/tui_gateway/methods_prompt.py b/tui_gateway/methods_prompt.py
+index ff5fd905d8..79c2878b2a 100644
+--- a/tui_gateway/methods_prompt.py
++++ b/tui_gateway/methods_prompt.py
+@@ -686,14 +686,21 @@ def _close_agent_init_failed_turn(session: dict, message: str, error_surface: di
+     try:
+         from agent.redact import redact_sensitive_text
+         from agent.turn_failure_copy import FAILED_TURN_DISPLAY_KIND, FAILED_TURN_NOTICE, OPEN_TURN_TAIL_ROLES
++        from hermes_state_errors import SessionTurnLeaseLostError
+ 
+         with _session_db(session) as db:
+             if db is None or db.latest_conversation_role(sid) not in OPEN_TURN_TAIL_ROLES:
+                 return
+             error = redact_sensitive_text(str(message or "").strip()[:2000], force=True)
+-            db.append_message(
+-                sid, role="assistant", content=FAILED_TURN_NOTICE, display_kind=FAILED_TURN_DISPLAY_KIND,
+-                display_metadata={k: v for k, v in (("error", error), ("error_surface", error_surface)) if v})
++            row = {"role": "assistant", "content": FAILED_TURN_NOTICE, "display_kind": FAILED_TURN_DISPLAY_KIND,
++                   "display_metadata": {k: v for k, v in (("error", error), ("error_surface", error_surface)) if v}}
++            try:
++                db.append_message(sid, **row)
++            except SessionTurnLeaseLostError:
++                # Turn parked for an update: the boundary waits on the durable spool and lands after the resume.
++                from gateway.shutdown_flush import defer_row_for_parked_turn
++                if defer_row_for_parked_turn(sid, row) is None:
++                    raise
+     except Exception:  # health: allow BLE001 -- the terminal frame must still reach the client
+         logger.warning("prompt.submit: failed-turn boundary not written for %s", sid, exc_info=True)
+ 
+diff --git a/tui_gateway/methods_session_interrupt.py b/tui_gateway/methods_session_interrupt.py
+index f18390316c..17f4355e60 100644
+--- a/tui_gateway/methods_session_interrupt.py
++++ b/tui_gateway/methods_session_interrupt.py
+@@ -120,10 +120,21 @@ def _record_stop_notice(session: dict, status: str) -> dict | None:
+             if db is not None:
+                 from agent.context_compressor import _DB_PERSISTED_MARKER
+                 from agent.message_metadata import stamp_message_uid
+-                entry["_row_id"] = db.append_message(
+-                    session_id=_submit_row_target_key(session), role="user", content=content,
+-                    display_kind=_STOP_NOTICE_KIND, display_metadata=dict(metadata),
+-                    message_uid=stamp_message_uid(entry))
++                from hermes_state_errors import SessionTurnLeaseLostError
++                target = _submit_row_target_key(session)
++                try:
++                    entry["_row_id"] = db.append_message(
++                        session_id=target, role="user", content=content,
++                        display_kind=_STOP_NOTICE_KIND, display_metadata=dict(metadata),
++                        message_uid=stamp_message_uid(entry))
++                except SessionTurnLeaseLostError:
++                    # The turn is parked for an update: a row now would void its checkpoint, and the in-memory
++                    # history alone is rebuilt from the DB on resume. Park the notice on the durable spool (it
++                    # lands after the resume) and mark the live entry persisted so no flush writes it twice.
++                    from gateway.shutdown_flush import defer_row_for_parked_turn
++                    if defer_row_for_parked_turn(target, {k: v for k, v in entry.items() if not k.startswith("_")}) is None:
++                        raise
++                    logger.info("session.interrupt: stop notice for %s queued: turn parked for an update", target)
+                 entry[_DB_PERSISTED_MARKER] = True
+     except Exception:
+         logger.warning("failed to persist stop notice", exc_info=True)
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index 9a14653231..c01073a4cc 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -1208,11 +1208,20 @@ def _append_model_switch_marker(session: dict | None, *, model: str, provider: s
+                 target = _submit_row_target_key(session)
+                 # The in-memory strip above keeps one marker; the durable rows need the same invariant or N
+                 # switches leave N active rows that all replay on resume (#65891 kept it in memory only).
+-                db.deactivate_messages_by_display_kind(target, "model_switch")
++                # One transaction with the append: a turn parked for an update refuses it, and a refusal after
++                # a separate deactivate would leave the chat with no pivot at all [daveey t_01a1d6f94ac774a2].
+                 from agent.message_metadata import stamp_message_uid
+-                entry["_row_id"] = db.append_message(
+-                    session_id=target, role="user", content=marker, display_kind="model_switch",
+-                    message_uid=stamp_message_uid(entry))
++                from hermes_state_errors import SessionTurnLeaseLostError
++                try:
++                    entry["_row_id"] = db.replace_display_kind_row(
++                        target, "model_switch", marker, message_uid=stamp_message_uid(entry))
++                except SessionTurnLeaseLostError:
++                    from gateway.shutdown_flush import defer_row_for_parked_turn
++                    if defer_row_for_parked_turn(target, entry) is None:
++                        raise
++                    entry[_DB_PERSISTED_MARKER] = True  # durable spool owns delivery across history rebuilds
++                    logger.info("model switch marker deferred: session %s has a turn parked for an update", target)
++                    return
+                 entry[_DB_PERSISTED_MARKER] = True
+     except Exception:
+         # warning, not debug: filing the pivot in the LIVE session (#123545) means this write can now hit
+-- 
+2.43.0
+

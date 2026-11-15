@@ -1,0 +1,224 @@
+From 68043abc6e56f524bb30d72ab527e8d8ba2f79e9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 23:17:39 +0000
+Subject: [PATCH] [daveey] Discover exact-head off-key upstream sync review
+ receipts
+
+Proof: 166 upstream-sync tests pass. Reverting off-key lookup fails test_offkey_exact_head_approval_lands_without_duplicate[None]. Read-only replay across 20 hub board/replica DB paths for PR 2479 discovers exactly t_01a1d67bdac4b6bc; old keyed lookup and other-sha control find none. All candidates retain authoritative ship review/session and GitHub gates.
+---
+ scripts/ci/upstream_sync_review.py            | 52 +++++++++--
+ .../ci/test_upstream_sync_offkey_review.py    | 93 +++++++++++++++++++
+ tests/scripts/ci/test_upstream_sync_review.py |  4 +
+ 3 files changed, 142 insertions(+), 7 deletions(-)
+ create mode 100644 tests/scripts/ci/test_upstream_sync_offkey_review.py
+
+diff --git a/scripts/ci/upstream_sync_review.py b/scripts/ci/upstream_sync_review.py
+index 5fddf88925..33ba957786 100644
+--- a/scripts/ci/upstream_sync_review.py
++++ b/scripts/ci/upstream_sync_review.py
+@@ -12,8 +12,9 @@ remerge-diff files and a test fixup with no review; t_01a1d6945ea46bd0).
+ The review gate is ``hermes-core-wt ship``'s own, loaded from ``hermes-core-wt-land`` (state repo; installed at
+ ``~/.hermes/bin`` on the hub and ``~/.hermes/lib/core-tools`` on pool workers, or ``$HERMES_CORE_WT_LAND``): the
+ exact-head review card under its idempotency key ``core-wt-review:<repo>#<pr>:<sha>`` (filed with
+-``request_review``), then ``review_gate`` on the PR's exact head, then ``review_reply_guard`` for non-blocking
+-points. A host without that tool cannot judge a review, so a fork-authored sync is refused there, never landed.
++``request_review``), or a completed off-key receipt bound to that exact PR URL and full head SHA when no keyed
++card exists. Both routes use ``review_gate`` on the PR's exact head, then ``review_reply_guard`` for non-blocking
++points. Replica discovery only supplies candidate IDs, never approval. A host without the tool refuses.
+ """
+ from __future__ import annotations
+ 
+@@ -24,8 +25,10 @@ import json
+ import os
+ import re
+ import shutil
++import sqlite3
+ import subprocess
+ import sys
++from contextlib import closing
+ from dataclasses import dataclass, field
+ from pathlib import Path
+ 
+@@ -192,6 +195,7 @@ class ReviewUnavailable(Exception):
+ # The ship-gate entry points this gate calls, with the parameters it passes: an installed tool that drifted
+ # from them refuses here instead of failing mid-judgement (or, worse, judging with a changed meaning).
+ SHIP_GATE_CONTRACT = {
++    "board_db_paths": (),
+     "keyed_review_card": ("slug", "number", "sha"),
+     "request_review": ("wt", "slug", "number", "sha", "old", "base", "prior_review", "impl_task", "gh"),
+     "review_gate": ("gh", "slug", "pr", "sha", "branch", "base", "review_task", "impl_task"),
+@@ -215,6 +219,38 @@ class _NeverRaised(Exception):
+     """Stands in for a ship-tool exception class an older tool lacks."""
+ 
+ 
++def off_key_review_cards(mod, slug: str, number: int, sha: str) -> list[str]:
++    """Discover exact-head completion receipts, never grant approval from replica metadata.
++
++    Ship's review_gate must still re-read each candidate's authoritative execution record,
++    latest verdict and independent session, plus the unchanged GitHub review restrictions.
++    A keyed card takes precedence, so a pending/rejected keyed review cannot be bypassed.
++    """
++    if not re.fullmatch(r"[0-9a-f]{40}", sha):
++        return []
++    cards = []
++    for path in mod.board_db_paths():
++        try:
++            with closing(sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True, timeout=2)) as db:
++                rows = db.execute(
++                    "SELECT t.id, r.metadata FROM tasks t JOIN task_runs r ON r.task_id = t.id "
++                    "WHERE t.status = 'done' AND r.status = 'done' AND r.outcome = 'completed' "
++                    "ORDER BY r.ended_at DESC"
++                ).fetchall()
++        except (OSError, sqlite3.Error):
++            continue
++        for card, raw in rows:
++            try:
++                md = json.loads(raw or "null")
++            except (TypeError, ValueError):
++                continue
++            if (isinstance(md, dict) and md.get("verdict") == "approve" and md.get("reviewed_sha") == sha
++                    and md.get("reviewed_pr") == f"https://github.com/{slug}/pull/{number}"
++                    and isinstance(card, str) and re.fullmatch(r"t_[0-9a-f]+", card) and card not in cards):
++                cards.append(card)
++    return cards
++
++
+ class ShipReview:
+     """``hermes-core-wt ship``'s independent exact-head review gate, applied to a sync PR.
+ 
+@@ -258,11 +294,13 @@ class ShipReview:
+         gh = mod.Gh(self.repo)
+         pr = {"number": number}
+         card = mod.keyed_review_card(gh_repo, number, head)
+-        try:
+-            receipt = mod.review_gate(gh, gh_repo, pr, head, branch, "main", card, impl_task=self.impl_task)
+-        except mod.ReviewRefused as exc:
+-            refusal = str(exc)
+-        else:
++        candidates = [card] if card else [*off_key_review_cards(mod, gh_repo, number, head), ""]
++        for candidate in candidates:
++            try:
++                receipt = mod.review_gate(gh, gh_repo, pr, head, branch, "main", candidate, impl_task=self.impl_task)
++            except mod.ReviewRefused as exc:
++                refusal = str(exc)
++                continue
+             code, why = mod.review_reply_guard(gh, gh_repo, pr, receipt, self.reply)
+             if code is not None:
+                 return False, (f"{why} (answer with `upstream_sync.py --head {head[:12]} --review-reply "
+diff --git a/tests/scripts/ci/test_upstream_sync_offkey_review.py b/tests/scripts/ci/test_upstream_sync_offkey_review.py
+new file mode 100644
+index 0000000000..f17430774f
+--- /dev/null
++++ b/tests/scripts/ci/test_upstream_sync_offkey_review.py
+@@ -0,0 +1,93 @@
++"""Off-key receipts discover candidates; only ship's independent gate may approve them."""
++import json
++import sqlite3
++from types import SimpleNamespace
++
++import pytest
++
++from scripts.ci import upstream_sync as sync
++from scripts.ci import upstream_sync_review as review
++from tests.scripts.ci import test_upstream_sync_review as helpers
++from tests.scripts.ci.test_upstream_sync import gate
++
++world = helpers.world
++land_stub = helpers.land_stub
++CARD = "t_1234567890abcdef"
++SHA = "a" * 40
++URL = "https://github.com/example/fork/pull/7"
++
++
++def board(path, *, metadata=None, task_status="done", run_status="done", outcome="completed", card=CARD):
++    with sqlite3.connect(path) as db:
++        db.executescript("CREATE TABLE tasks (id TEXT, status TEXT, idempotency_key TEXT); "
++                         "CREATE TABLE task_runs (task_id TEXT, status TEXT, outcome TEXT, metadata TEXT, ended_at INT);")
++        db.execute("INSERT INTO tasks VALUES (?, ?, ?)", (card, task_status, "unrelated:review"))
++        md = metadata if metadata is not None else {"verdict": "approve", "reviewed_sha": SHA, "reviewed_pr": URL}
++        db.execute("INSERT INTO task_runs VALUES (?, ?, ?, ?, 1)", (card, run_status, outcome, json.dumps(md)))
++    return SimpleNamespace(board_db_paths=lambda: [path])
++
++
++@pytest.mark.parametrize("mismatch", [None, "other_sha", "request_changes"])
++def test_offkey_exact_head_approval_lands_without_duplicate(world, land_stub, tmp_path, mismatch):
++    root, checkout = world
++    head = helpers.fixup_sync(root, checkout)
++    actions = helpers.staged_green(root, checkout, head)
++    pr = {"number": 1}  # gate creates its first landing PR after staging CI is green
++    slug = "example/fork"
++    board(tmp_path / "land-state.db", metadata={
++        "verdict": "request_changes" if mismatch == "request_changes" else "approve",
++        "reviewed_sha": "0" * 40 if mismatch == "other_sha" else head,
++        "reviewed_pr": f"https://github.com/{slug}/pull/{pr['number']}"})
++    land_stub.update(approve={CARD: head})
++    assert gate(checkout, head, actions) == (sync.NOT_YET if mismatch else sync.LANDED)
++    state = land_stub.read()
++    assert len(state["filed"]) == (1 if mismatch else 0)
++    assert state["gates"][-1][0] == ("" if mismatch else CARD)
++
++
++@pytest.mark.parametrize("change", [
++    {"reviewed_sha": "b" * 40}, {"verdict": "request_changes"},
++    {"reviewed_pr": URL + "0"}, {"reviewed_sha": SHA[:10]},
++    {"verdict": "APPROVE"}, {"reviewed_pr": {URL: True}},
++])
++def test_offkey_wrong_receipt_not_discovered(tmp_path, change):
++    md = {"verdict": "approve", "reviewed_sha": SHA, "reviewed_pr": URL, **change}
++    mod = board(tmp_path / "board.db", metadata=md)
++    assert review.off_key_review_cards(mod, "example/fork", 7, SHA) == []
++
++
++@pytest.mark.parametrize("fields", [
++    {"task_status": "running"}, {"run_status": "running"}, {"outcome": "blocked"},
++    {"metadata": []}, {"card": "not-a-task"},
++])
++def test_offkey_requires_done_completed_record(tmp_path, fields):
++    mod = board(tmp_path / "board.db", **fields)
++    assert review.off_key_review_cards(mod, "example/fork", 7, SHA) == []
++
++
++def test_offkey_full_sha_and_replica_dedup(tmp_path):
++    path = tmp_path / "board.db"
++    mod = board(path)
++    mod.board_db_paths = lambda: [tmp_path / "missing.db", path, path]
++    assert review.off_key_review_cards(mod, "example/fork", 7, SHA) == [CARD]
++    assert review.off_key_review_cards(mod, "example/fork", 7, SHA[:10]) == []
++    with sqlite3.connect(path) as db:
++        db.execute("UPDATE task_runs SET metadata = '{broken'")
++    assert review.off_key_review_cards(mod, "example/fork", 7, SHA) == []
++
++
++def test_offkey_discovery_is_not_approval_and_preserves_impl_identity(land_stub, tmp_path):
++    board(tmp_path / "land-state.db")
++    checker = review.ShipReview(tmp_path, impl_task="t_implementer")
++    accepted, _ = checker.check("example/fork", 7, SHA, "sync/head")
++    assert not accepted  # authoritative ship gate refuses the otherwise matching receipt
++    assert land_stub.read()["gates"][0] == [CARD, 7, SHA, "sync/head", "main", "t_implementer"]
++    assert len(land_stub.read()["filed"]) == 1
++
++
++def test_keyed_refusal_cannot_be_bypassed_by_offkey(land_stub, tmp_path):
++    board(tmp_path / "land-state.db")
++    land_stub.update(cards={f"example/fork#7:{SHA}": "t_keyed"}, approve={CARD: SHA})
++    accepted, _ = review.ShipReview(tmp_path).check("example/fork", 7, SHA, "sync/head")
++    assert not accepted
++    assert [row[0] for row in land_stub.read()["gates"]] == ["t_keyed"]
+diff --git a/tests/scripts/ci/test_upstream_sync_review.py b/tests/scripts/ci/test_upstream_sync_review.py
+index 08ae9632a9..a9f747f010 100644
+--- a/tests/scripts/ci/test_upstream_sync_review.py
++++ b/tests/scripts/ci/test_upstream_sync_review.py
+@@ -39,6 +39,10 @@ def _save(state):
+     with open(os.environ["STUB_LAND_STATE"], "w") as fh:
+         json.dump(state, fh)
+ 
++def board_db_paths():
++    from pathlib import Path
++    return [Path(os.environ["STUB_LAND_STATE"]).with_suffix(".db")]
++
+ def keyed_review_card(slug, number, sha):
+     return _load()["cards"].get(f"{slug}#{number}:{sha}", "")
+ 
+-- 
+2.43.0
+

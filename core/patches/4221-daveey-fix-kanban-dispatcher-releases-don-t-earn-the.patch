@@ -1,0 +1,224 @@
+From 200e3101bf80dbf4fe2d64d096a06538dcbbde71 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 16:17:53 +0000
+Subject: [PATCH] [daveey] fix(kanban): dispatcher releases don't earn the
+ operator exemption
+
+PR #2923 exempted a card behind a wall with a registered check (default
+github-rest-quota) from the running-sibling hold and the probe interval when
+the card's own `unblocked` event is newer than its own last assertion, so a
+peer cannot revoke an operator's explicit release.
+
+The dispatcher writes the same `unblocked` event when it releases cards
+itself: release_cleared_blockers (after a check exits 0) and
+probe_stranded_blockers. After a verified recovery, a run that started after
+it and finds the quota exhausted again re-asserts the wall, yet every
+released card kept passing the exemption, so each spawned once only to
+rediscover the wall (26 cards behind this wall on worker-1 on 2026-11-13).
+
+Only an operator release earns the exemption now. `_operator_released`
+treats the card's newest `unblocked` event as the dispatcher's when the
+card's very next event (portable #2946 order) is shared_blocker_cleared or
+shared_blocker_probe_released; such a card falls back to the normal rule,
+where a newer assertion by any card holds it. #2923's fence is unchanged: a
+stale assertion from a run that began before the recovery still never
+re-holds a released card.
+
+Also corrects the fence docstring: run_due_checks runs only while a wall is
+open, so after a verified clear only a run that started after the recovery
+re-opens it, never the next cheap check.
+
+Cost note: the per-id config reload this card was asked to measure is
+already gone on main (0190f3467d snapshots config per blocker pass), so this
+commit adds no config cache of its own.
+
+Tests: tests/hermes_cli/test_kanban_shared_blocker_release_kinds.py. The
+check-release and probe-release cases fail on main (guard returns None) and
+pass here; the fence and operator-after-dispatcher cases pass on both. No
+existing case pinned the old behaviour; every test file importing the module
+passes unmodified.
+---
+ hermes_cli/kanban_shared_blocker_fence.py     |   5 +-
+ hermes_cli/kanban_shared_blockers.py          |  29 ++++-
+ ...est_kanban_shared_blocker_release_kinds.py | 104 ++++++++++++++++++
+ 3 files changed, 134 insertions(+), 4 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_shared_blocker_release_kinds.py
+
+diff --git a/hermes_cli/kanban_shared_blocker_fence.py b/hermes_cli/kanban_shared_blocker_fence.py
+index e10946e65d..d1641b8fdd 100644
+--- a/hermes_cli/kanban_shared_blocker_fence.py
++++ b/hermes_cli/kanban_shared_blocker_fence.py
+@@ -56,8 +56,9 @@ def fence_stale_quota_assertions(conn, states, asserting, *, now):
+     """Keep stale cards releasable, but don't treat their old runs as new evidence.
+ 
+     Only the GitHub quota family opts into this policy. A run that began before
+-    recovery cannot reopen it; the dispatcher can discover a genuinely new wall
+-    on its next cheap check or a newly started worker can report it.
++    recovery cannot reopen it. After a verified clear only a run that started
++    after the recovery can report a genuinely new wall: ``run_due_checks`` runs
++    the cheap check only while a wall is open, so it never re-opens one.
+     """
+     from hermes_cli import kanban_db as kb
+     from hermes_cli.kanban_shared_blockers import _mark_cleared, run_effect
+diff --git a/hermes_cli/kanban_shared_blockers.py b/hermes_cli/kanban_shared_blockers.py
+index 1a0ce110b1..e76f210412 100644
+--- a/hermes_cli/kanban_shared_blockers.py
++++ b/hermes_cli/kanban_shared_blockers.py
+@@ -520,6 +520,31 @@ def _unblocked_since_assertion(conn: sqlite3.Connection, task_id: str, blocker_i
+     return True
+ 
+ 
++_DISPATCHER_RELEASES = (CLEARED_EVENT, PROBE_RELEASED_EVENT)
++
++
++def _operator_released(conn: sqlite3.Connection, task_id: str, blocker_id: str) -> bool:
++    """The card's newest ``unblocked`` is newer than its own last assertion and was not the dispatcher's.
++
++    :func:`release_cleared_blockers` and :func:`probe_stranded_blockers` release through
++    ``kb.unblock_task`` too, then record :data:`CLEARED_EVENT` / :data:`PROBE_RELEASED_EVENT` as the
++    card's very next event. Such a release answers the wall's state at that moment; a run started after
++    it that hits the wall again is newer evidence, so the card falls back to the normal rule instead of
++    spawning only to rediscover the wall (one wasted run per released card per episode). [daveey]
++    """
++    if not _unblocked_since_assertion(conn, task_id, blocker_id, own_only=True):
++        return False
++    rows = conn.execute("SELECT * FROM task_events WHERE task_id=? AND kind='unblocked'", (task_id,)).fetchall()
++    newest = max(rows, key=_event_order)
++    order = _event_order(newest)
++    following = [row for row in conn.execute(
++        "SELECT * FROM task_events WHERE task_id=? AND created_at>=? AND id<>?",
++        (task_id, newest["created_at"], newest["id"]),
++    ) if _event_order(row) > order]
++    after = min(following, key=_event_order, default=None)
++    return after is None or after["kind"] not in _DISPATCHER_RELEASES
++
++
+ def shared_blocker_guard(
+     conn: sqlite3.Connection, task_id: str, *, now: Optional[int] = None,
+     interval: Optional[int] = None,
+@@ -553,10 +578,10 @@ def _shared_blocker_hold(conn, task_id, *, now=None, interval=None) -> Optional[
+     if st is None or not st.is_open or not task_applies(conn, st, task_id):
+         return None
+     from hermes_cli.kanban_shared_blocker_checks import registered_checks
+-    if st.blocker_id in registered_checks() and _unblocked_since_assertion(
+-            conn, task_id, st.blocker_id, own_only=True):
++    if st.blocker_id in registered_checks() and _operator_released(conn, task_id, st.blocker_id):
+         # This wall has an independent dispatcher probe. A peer's long run or
+         # reassertion cannot revoke the operator's explicit release of this card.
++        # The dispatcher's own releases earn no such exemption (_operator_released).
+         return None
+     others = [t for t in st.behind if t != task_id and task_applies(conn, st, t)]
+     if others:
+diff --git a/tests/hermes_cli/test_kanban_shared_blocker_release_kinds.py b/tests/hermes_cli/test_kanban_shared_blocker_release_kinds.py
+new file mode 100644
+index 0000000000..3eba18783e
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_shared_blocker_release_kinds.py
+@@ -0,0 +1,104 @@
++"""Only an operator's release survives a newer assertion of a cheap-check wall.
++
++The dispatcher writes the same ``unblocked`` event when it releases cards itself
++(``release_cleared_blockers`` after a clear, ``probe_stranded_blockers`` for a
++stranded wall). Those releases must not earn the operator exemption: once a run
++that started after the release hits the wall again, the released cards are held
++like any other card behind it, so each one does not spawn just to rediscover it.
++"""
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_shared_blocker_checks as checks
++from hermes_cli import kanban_shared_blockers as blockers
++from tests.hermes_cli import test_kanban_shared_blockers as helpers
++
++kanban_home = helpers.kanban_home
++
++WALL = 'github-rest-quota'
++CFG = {'kanban': {'shared_blocker_checks': {WALL: 'exit 0'}}}
++
++
++@pytest.fixture
++def clock(monkeypatch):
++    now = [1800000000]
++    monkeypatch.setattr(blockers.time, 'time', lambda: now[0])
++    monkeypatch.setattr(checks, 'registered_checks', lambda cfg=None: {WALL: 'exit 0'})
++    return now
++
++
++def _check_release(conn, clock):
++    """Three cards behind the wall; the registered check exits 0 and the dispatcher releases them."""
++    cards = []
++    for i in range(3):
++        cards.append(helpers._legacy_blocked_behind(conn, f'waiter {i}', blocker_id=WALL))
++        clock[0] += 1
++    clock[0] += 60
++    assert checks.run_due_checks(conn, cfg=CFG) == [WALL]
++    clock[0] += 30
++    assert sorted(blockers.release_cleared_blockers(conn)) == sorted(cards)
++    for tid in cards:
++        assert kb.get_task(conn, tid).status == 'ready'
++        assert blockers.shared_blocker_guard(conn, tid) is None
++    return cards
++
++
++def test_check_released_cards_held_by_post_recovery_assertion(kanban_home, clock):
++    with kbc.connect_closing() as conn:
++        cards = _check_release(conn, clock)
++        clock[0] += 60
++        # A run that started after the recovery finds the quota exhausted again.
++        helpers._blocked_behind(conn, 'fresh run hits the wall again', blocker_id=WALL)
++        assert blockers.blocker_states(conn)[WALL].is_open
++        for tid in cards:
++            assert blockers.shared_blocker_guard(conn, tid) == blockers.GUARD_REASON
++
++
++def test_check_released_cards_ignore_stale_pre_recovery_assertion(kanban_home, clock):
++    """#2923's fence: a run that began before the recovery never re-holds a released card."""
++    with kbc.connect_closing() as conn:
++        stale = kb.create_task(conn, title='already running with old context', assignee='default')
++        assert kb.claim_task(conn, stale)
++        clock[0] += 1
++        cards = _check_release(conn, clock)
++        clock[0] += 60
++        assert kb.block_task(conn, stale, reason='stale quota context', kind='capability', blocker_id=WALL)
++        assert not blockers.blocker_states(conn)[WALL].is_open
++        for tid in cards:
++            assert blockers.shared_blocker_guard(conn, tid) is None
++
++
++def test_probe_released_card_held_by_newer_assertion(kanban_home, clock):
++    with kbc.connect_closing() as conn:
++        cards = []
++        for i in range(3):
++            cards.append(helpers._legacy_blocked_behind(conn, f'stranded {i}', blocker_id=WALL))
++            clock[0] += 1
++        clock[0] += 1800
++        probe, peer = cards[0], cards[1]
++        assert blockers.probe_stranded_blockers(conn, interval=1800) == [probe]
++        assert kb.get_task(conn, probe).status == 'ready'
++        assert blockers.shared_blocker_guard(conn, probe, interval=1800) is None
++        clock[0] += 30
++        # A peer's run that started after the release (its own wake) hits the wall again.
++        assert kb.unblock_task(conn, peer) and kb.claim_task(conn, peer)
++        clock[0] += 30
++        assert kb.block_task(conn, peer, reason='quota still out', kind='capability', blocker_id=WALL)
++        assert blockers.shared_blocker_guard(conn, probe, interval=1800) == blockers.GUARD_REASON
++
++
++def test_operator_release_after_dispatcher_release_stays_exempt(kanban_home, clock):
++    """An operator's unblock newer than a dispatcher release is still the operator's."""
++    with kbc.connect_closing() as conn:
++        cards = _check_release(conn, clock)
++        target = cards[0]
++        clock[0] += 10
++        assert kb.claim_task(conn, target)
++        assert kb.block_task(conn, target, reason='still walled', kind='capability', blocker_id=WALL)
++        clock[0] += 10
++        assert kb.unblock_task(conn, target)   # the operator says: try again now
++        clock[0] += 10
++        helpers._blocked_behind(conn, 'peer reasserts', blocker_id=WALL)
++        assert blockers.blocker_states(conn)[WALL].is_open
++        assert blockers.shared_blocker_guard(conn, target) is None
+-- 
+2.43.0
+

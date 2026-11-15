@@ -216,7 +216,18 @@ a `pop`/`apply` word piped into a shell, an unknown `declare -n` target, or a da
 of an unmodeled program that holds a restore command, such as `ssh host "git stash pop"`).
 This remains bounded shell analysis, not a shell sandbox. Known limits: shell aliases
 defined before the command (an `alias` in the command makes every unmodeled name a
-possible git),
+possible git, except for narrowly recognized literal data positions). The exemption
+accepts a single expansion-free `echo`, or the canonical
+`token-broker exec --scope user/github --reason … -- env GIT_…=… /absolute/hermes-core-wt ship …`
+shape: only quoted `--reason` and `--review-reply` values are inert there. Git identity/config
+assignments and the documented ship options are recognized; unknown consumers, extra commands,
+redirections, pipelines, comments, newlines, substitutions and escapes keep whole-text taint.
+Trailing empty semicolon statements emitted by the activation adapter are ignored. Shell words
+are assembled before classification, not assessed as individual quoted fragments. This is
+intentionally narrower than a general prose detector: quoted eval arguments, stored payloads,
+conditional prefixes and option-bearing prefixes retain taint regardless of their wording.
+The four brokered-prose acceptance controls and all real-repository restore regressions are
+retained. Other known limits include
 Git aliases already stored in repository/user config, `shopt -s lastpipe`, `set -e`,
 exported functions, inherited state of a persistent terminal (logical `PWD`, exported
 `IFS`/`CDPATH`/`GIT_DIR`, `set -a`), scripts whose text is not in the command (a file

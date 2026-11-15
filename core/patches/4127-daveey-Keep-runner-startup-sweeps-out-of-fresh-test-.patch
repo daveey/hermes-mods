@@ -1,0 +1,179 @@
+From 0b5ea7fa4456353df5f267235a7f0755edc5b3d8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 01:58:46 +0000
+Subject: [PATCH] [daveey] Keep runner startup sweeps out of fresh test
+ attempts
+
+Why: the host-slot deleted-tree test observed SIGTERM (-15), not its expected SIGKILL. A concurrent nested runner scans the shared test scratch root; generic pruning reaps deleted cwd processes even when no entry is old. The deliberately deleted fixture cwd was mistaken for an abandoned process.
+
+Scope runner cleanup to selected idle entries while retaining generic deleted-cwd reclamation by default. Recheck the selected entries after owned-process rescue. Preserve the original slot test and retry policy unchanged.
+
+Proof: owned-child replay fails on base with -15; 124 tests pass with retries disabled across seven consumer files, including real holder SIGSTOP/SIGCONT duty cycles. Both dispatch and post-rescue-filter mutants are killed. scripts/check --base origin/main passes.
+---
+ hermes_constants_scratch.py                   | 21 ++++--
+ scripts/run_tests_parallel.py                 |  4 +-
+ .../scripts/test_runner_sweep_live_holder.py  | 70 +++++++++++++++++++
+ 3 files changed, 89 insertions(+), 6 deletions(-)
+ create mode 100644 tests/scripts/test_runner_sweep_live_holder.py
+
+diff --git a/hermes_constants_scratch.py b/hermes_constants_scratch.py
+index 32d1879f04..673ee314ab 100644
+--- a/hermes_constants_scratch.py
++++ b/hermes_constants_scratch.py
+@@ -295,7 +295,9 @@ def _owned_by_hermes(proc, registered: set[int]) -> bool:
+         return False
+ 
+ 
+-def reap_processes_rooted_in(scratch_root: Path, doomed: list[Path], audit: logging.Logger = logger) -> int:
++def reap_processes_rooted_in(
++    scratch_root: Path, doomed: list[Path], audit: logging.Logger = logger, *, reap_deleted_cwds: bool = True,
++) -> int:
+     """TERM (then KILL) same-user processes whose cwd is inside an entry about to be
+     pruned, or is a path under *scratch_root* that no longer exists. Returns the count.
+ 
+@@ -347,7 +349,8 @@ def reap_processes_rooted_in(scratch_root: Path, doomed: list[Path], audit: logg
+     # Re-filter against the shrunk *doomed*: an orphan in a kept entry is spared with it (the
+     # reap only exists to clear the way for rmtree); one whose cwd is already gone still goes.
+     victims = [(proc, cwd_path) for proc, cwd_path in victims if (proc, cwd_path) not in owned
+-               and (not os.path.exists(cwd_path) or any(_under(cwd_path, os.path.realpath(str(e))) for e in doomed))]
++               and ((reap_deleted_cwds and not os.path.exists(cwd_path))
++                    or any(_under(cwd_path, os.path.realpath(str(e))) for e in doomed))]
+     if not victims:
+         return 0
+     for proc, cwd_path in victims:
+@@ -415,15 +418,19 @@ def release_git_worktrees(repos: set[str]) -> None:
+ 
+ def prune_idle_entries(
+     root: Path, max_idle_hours: float, skip_names: frozenset[str], log_file: Path | None = None,
++    *, reap_deleted_cwds: bool = True,
+ ) -> int:
+     """Delete top-level entries of *root* with no write anywhere in their subtree for
+     *max_idle_hours*, reaping processes and worktree registrations rooted in them first.
+     Each removal, each signalled process and each entry rescued mid-prune (touched
+     again after selection) is recorded in *log_file*. Returns the count actually
+-    removed."""
++    removed. Set ``reap_deleted_cwds=False`` for shared test roots: deleted working
++    directories inside fresh attempts are test fixtures, not abandoned processes.
++    Processes inside selected idle entries are still reaped before removal.
++    """
+     audit = _open_prune_log(log_file)
+     try:
+-        return _prune_idle_entries(root, max_idle_hours, skip_names, audit)
++        return _prune_idle_entries(root, max_idle_hours, skip_names, audit, reap_deleted_cwds=reap_deleted_cwds)
+     finally:
+         if audit is not logger:
+             for handler in audit.handlers:
+@@ -432,6 +439,7 @@ def prune_idle_entries(
+ 
+ def _prune_idle_entries(
+     root: Path, max_idle_hours: float, skip_names: frozenset[str], audit: logging.Logger,
++    *, reap_deleted_cwds: bool = True,
+ ) -> int:
+     cutoff = time.time() - max_idle_hours * 3600
+     # Entries already known to hold files this user cannot read or delete are skipped before
+@@ -453,7 +461,10 @@ def _prune_idle_entries(
+     # Runs even with nothing to delete: orphans whose cwd was removed by an earlier pass
+     # (or by hand) are found by the deleted-cwd rule, not by membership in ``doomed``.
+     try:
+-        reap_processes_rooted_in(root, doomed, audit)
++        if reap_deleted_cwds:
++            reap_processes_rooted_in(root, doomed, audit)
++        else:
++            reap_processes_rooted_in(root, doomed, audit, reap_deleted_cwds=False)
+     # health: allow BLE001 -- fail-closed boundary: any failure leaves who works inside unknown; audited below
+     except Exception as exc:  # psutil missing or restricted host
+         audit.info("scratch prune: process check failed (%s: %r), nothing deleted this pass",
+diff --git a/scripts/run_tests_parallel.py b/scripts/run_tests_parallel.py
+index a2694c8c65..a303674b0a 100644
+--- a/scripts/run_tests_parallel.py
++++ b/scripts/run_tests_parallel.py
+@@ -78,7 +78,9 @@ def _sweep_killed_run_roots(root: str) -> None:
+         from hermes_constants_scratch import prune_idle_entries
+     except ImportError:  # runner invoked from outside the repo root
+         return
+-    prune_idle_entries(Path(root), 24, frozenset())
++    # Concurrent tests deliberately delete a child's cwd (e.g. host-slot reclamation).
++    # Only aged attempt roots belong to this sweep, not every deleted cwd on the host.
++    prune_idle_entries(Path(root), 24, frozenset(), reap_deleted_cwds=False)
+ 
+ 
+ def _rmtree_force(path: str) -> None:
+diff --git a/tests/scripts/test_runner_sweep_live_holder.py b/tests/scripts/test_runner_sweep_live_holder.py
+new file mode 100644
+index 0000000000..e9130fdb0b
+--- /dev/null
++++ b/tests/scripts/test_runner_sweep_live_holder.py
+@@ -0,0 +1,70 @@
++"""A concurrent runner must not reap a live test's deliberately deleted cwd."""
++import os
++import shutil
++import signal
++from unittest.mock import Mock
++
++import psutil
++import pytest
++
++from scripts import run_tests_parallel as runner
++from scripts import run_tests_host_slots as slots
++from tests.scripts import test_run_tests_host_slots as holders
++import hermes_constants_scratch as scratch
++
++slot_env = holders.slot_env
++pytestmark = pytest.mark.platforms("linux")
++
++
++@pytest.mark.parametrize("mode", ["fresh-runner", "aged-runner", "default-pruner"])
++def test_runner_sweep_deleted_cwd_scope(slot_env, monkeypatch, tmp_path, mode):
++    monkeypatch.setenv("HERMES_TEST_HOST_SLOTS", "1")
++    tree = tmp_path / "attempt" / "worktree"
++    tree.mkdir(parents=True)
++    child, _ = holders._spawn_holder(tree)
++    proc = psutil.Process(child.pid)
++    # Never inventory or signal another test's or the host's processes.
++    monkeypatch.setattr(psutil, "process_iter", lambda *args, **kwargs: iter([proc]))
++    monkeypatch.setattr(scratch, "_registered_live_pids", lambda home: set())
++    try:
++        shutil.rmtree(tree)
++        if mode == "aged-runner":
++            os.utime(tree.parent, (1, 1))
++        if mode == "default-pruner":
++            scratch.prune_idle_entries(tmp_path, 24, frozenset())
++        else:
++            runner._sweep_killed_run_roots(str(tmp_path))
++        if mode != "fresh-runner":
++            # psutil.wait_procs reaps this child, so Popen no longer owns its status.
++            assert proc.returncode == -signal.SIGTERM
++            assert tree.parent.exists() is (mode == "default-pruner")
++            return
++        assert child.poll() is None, (
++            f"startup sweep killed a live attempt's holder: {getattr(proc, 'returncode', None)}"
++        )
++        notes = slots.reclaim_stale_slots(str(slot_env), 1)
++        assert notes, "the slot reclaimer still owns deleted-tree recovery"
++        assert child.wait(30) == -signal.SIGKILL
++    finally:
++        if child.poll() is None:
++            child.kill()
++        child.wait(30)
++
++
++def test_runner_scope_keeps_deleted_child_when_idle_entry_is_rescued(monkeypatch, tmp_path):
++    entry = tmp_path / "attempt"
++    entry.mkdir()
++    keeper, child = Mock(pid=10001), Mock(pid=10002)
++    for proc in (keeper, child):
++        proc.uids.return_value.real = os.getuid()
++    keeper.cwd.return_value = str(entry)
++    child.cwd.return_value = str(entry / "deleted") + " (deleted)"
++    monkeypatch.setattr(psutil, "process_iter", lambda *args: iter([keeper, child]))
++    monkeypatch.setattr(scratch, "_own_lineage", lambda: set())
++    monkeypatch.setattr(scratch, "_registered_live_pids", lambda home: set())
++    monkeypatch.setattr(scratch, "_owned_by_hermes", lambda proc, registered: proc is keeper)
++    doomed = [entry]
++    assert scratch.reap_processes_rooted_in(tmp_path, doomed, reap_deleted_cwds=False) == 0
++    assert doomed == []
++    keeper.terminate.assert_not_called()
++    child.terminate.assert_not_called()
+-- 
+2.43.0
+

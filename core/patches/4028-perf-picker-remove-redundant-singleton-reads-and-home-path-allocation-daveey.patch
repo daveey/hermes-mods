@@ -1,0 +1,204 @@
+From 12948c50a7d143794b1afd963710ba88f53a5052 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 00:57:09 +0000
+Subject: [PATCH] perf(picker): remove redundant singleton reads and home path
+ allocation [daveey]
+
+Profile representative model.options fixture: singleton dispatch parsed auth.json even for seeders that never consumed it (126 total reads -> 74). Load only in the consuming branches. Reuse bounded immutable expanded Path syntax, with live env expansion each call, and avoid Path reconstruction on warm home-key hits. No new credential/config/provider cache and no changes to plugin due checks.
+
+RED/GREEN: singleton dispatch 4 expected failures/2 passes ->6 passes; immutable Path identity 1 expected failure/3 passes ->4 passes; warm home-key allocation refusal fails ->passes. Regression:118 files,987 pass,4 preexisting skips, retries disabled. Ten unchanged replay tests pass; all50 measured shared samples57.40-100.54ms (worst0.27647% core at11/400 calls/s), original best-of-five0.158-0.177%, unchanged0.3% budget. An earlier intermediate sample110.65ms (0.3043%) is retained as a failure, not acceptance. scripts/check --base origin/main passes. J owns full RPC/P1/C18 acceptance.
+---
+ agent/credential_pool.py                     |  5 +--
+ hermes_constants.py                          | 16 ++++---
+ tests/agent/test_pool_singleton_lazy_read.py | 33 ++++++++++++++
+ tests/test_home_key_fast_hit.py              | 12 +++++
+ tests/test_home_path_construction.py         | 47 ++++++++++++++++++++
+ 5 files changed, 105 insertions(+), 8 deletions(-)
+ create mode 100644 tests/agent/test_pool_singleton_lazy_read.py
+ create mode 100644 tests/test_home_key_fast_hit.py
+ create mode 100644 tests/test_home_path_construction.py
+
+diff --git a/agent/credential_pool.py b/agent/credential_pool.py
+index eefd5ce2b5..95d4a197aa 100644
+--- a/agent/credential_pool.py
++++ b/agent/credential_pool.py
+@@ -2761,11 +2761,10 @@ def _seed_tokens_singleton(seed: _Seeder, auth_store: dict[str, Any]) -> None:
+ 
+ def _seed_from_singletons(provider: str, entries: list[PooledCredential]) -> tuple[bool, set[str]]:
+     seed = _Seeder(provider, entries)
+-    auth_store = _load_auth_store()
+     if provider == "anthropic":
+         _seed_anthropic_singletons(seed)
+     elif provider == "nous":
+-        _seed_nous_singleton(seed, auth_store)
++        _seed_nous_singleton(seed, _load_auth_store())
+     elif provider == "qwen-oauth":
+         _seed_qwen_singleton(seed)
+     elif provider == "minimax-oauth":
+@@ -2775,7 +2774,7 @@ def _seed_from_singletons(provider: str, entries: list[PooledCredential]) -> tup
+         # this gate the removal is undone on the next load_pool().
+         if provider == "openai-codex" and seed.is_suppressed(provider, "device_code"):
+             return seed.result
+-        _seed_tokens_singleton(seed, auth_store)
++        _seed_tokens_singleton(seed, _load_auth_store())
+     else:
+         _seed_profile_singleton(seed)
+     return seed.result
+diff --git a/hermes_constants.py b/hermes_constants.py
+index 13fa3144af..40c0506e82 100644
+--- a/hermes_constants.py
++++ b/hermes_constants.py
+@@ -10,6 +10,7 @@ import shutil
+ import stat
+ import sys
+ from collections.abc import Callable, Mapping, MutableMapping
++from functools import lru_cache
+ from pathlib import Path
+ 
+ _profile_fallback_warned: bool = False
+@@ -61,9 +62,15 @@ def get_hermes_home_override() -> str | None:
+     return (current_state().home or None) if current_state is not None else None
+ 
+ 
++@lru_cache(maxsize=128)
++def _expanded_home_path(expanded: str) -> Path:
++    """Reuse only immutable path syntax, never environment selection or filesystem state."""
++    return Path(expanded)
++
++
+ def _expand_hermes_home(path: str) -> Path:
+-    """Expand environment and user-home syntax in a Hermes home path."""
+-    return Path(os.path.expanduser(os.path.expandvars(path)))
++    """Expand live inputs each call; avoid rebuilding the same Path thousands of times per picker."""
++    return _expanded_home_path(os.path.expanduser(os.path.expandvars(path)))
+ 
+ 
+ def _platform_default_hermes_home(environ: Mapping[str, str], user_home: Callable[[], Path]) -> Path:
+@@ -234,12 +241,11 @@ def hermes_home_key(path: str | Path | None = None) -> str:
+     not exist yet is resolved without touching the cache, because the answer
+     can change once it is created (e.g. part of the path turns out to be a symlink).
+     """
+-    candidate = Path(path) if path is not None else get_hermes_home()
+-    raw = str(candidate)
++    raw = os.fspath(path) if path is not None else str(get_hermes_home())
+     cached = _HOME_KEY_CACHE.get(raw)
+     if cached is not None:
+         return cached
+-    expanded = candidate.expanduser()
++    expanded = Path(raw).expanduser()
+     try:
+         resolved = expanded.resolve(strict=True)
+     except OSError:
+diff --git a/tests/agent/test_pool_singleton_lazy_read.py b/tests/agent/test_pool_singleton_lazy_read.py
+new file mode 100644
+index 0000000000..4061320ba4
+--- /dev/null
++++ b/tests/agent/test_pool_singleton_lazy_read.py
+@@ -0,0 +1,33 @@
++"""Singleton dispatch must not load auth.json when the selected seeder does not use it."""
++import pytest
++
++from agent import credential_pool as cp
++
++
++@pytest.mark.parametrize('provider,seeder', [
++    ('openrouter', '_seed_profile_singleton'),
++    ('anthropic', '_seed_anthropic_singletons'),
++    ('qwen-oauth', '_seed_qwen_singleton'),
++    ('minimax-oauth', '_seed_minimax_singleton'),
++])
++def test_dispatch_does_not_read_unused_auth(monkeypatch, provider, seeder):
++    calls = []
++    monkeypatch.setattr(cp, seeder, lambda seed: calls.append(seed.provider))
++    def unexpected():
++        pytest.fail('dispatch read an auth store its seeder does not consume')
++    monkeypatch.setattr(cp, '_load_auth_store', unexpected)
++    assert cp._seed_from_singletons(provider, []) == (False, set())
++    assert calls == [provider]
++
++
++@pytest.mark.parametrize('provider,seeder', [('nous', '_seed_nous_singleton'), ('openai-codex', '_seed_tokens_singleton')])
++def test_dispatch_reads_current_auth_for_consumers(monkeypatch, provider, seeder):
++    state = {'generation': 1}
++    seen = []
++    monkeypatch.setattr(cp, '_is_source_suppressed_fn', lambda: lambda *args: False)
++    monkeypatch.setattr(cp, '_load_auth_store', lambda: dict(state))
++    monkeypatch.setattr(cp, seeder, lambda seed, store: seen.append(store))
++    cp._seed_from_singletons(provider, [])
++    state['generation'] = 2
++    cp._seed_from_singletons(provider, [])
++    assert seen == [{'generation': 1}, {'generation': 2}]
+diff --git a/tests/test_home_key_fast_hit.py b/tests/test_home_key_fast_hit.py
+new file mode 100644
+index 0000000000..5b399f0509
+--- /dev/null
++++ b/tests/test_home_key_fast_hit.py
+@@ -0,0 +1,12 @@
++"""A warm home key need not allocate/reparse another Path."""
++import hermes_constants as hc
++
++
++def test_warm_key_uses_input_string_without_reconstructing_path(monkeypatch, tmp_path):
++    hc.reset_hermes_home_key_cache()
++    key = hc.hermes_home_key(tmp_path)
++    def unexpected(*args):
++        raise AssertionError('a warm key reconstructed a Path')
++    monkeypatch.setattr(hc, 'Path', unexpected)
++    assert hc.hermes_home_key(tmp_path) == key
++    assert hc.hermes_home_key(str(tmp_path)) == key
+diff --git a/tests/test_home_path_construction.py b/tests/test_home_path_construction.py
+new file mode 100644
+index 0000000000..3b52dcf1c3
+--- /dev/null
++++ b/tests/test_home_path_construction.py
+@@ -0,0 +1,47 @@
++"""Only immutable Path construction is memoized; home selection/expansion remains live."""
++from pathlib import Path
++
++import hermes_constants as hc
++
++
++def test_reuses_expanded_path_without_freezing_environment(monkeypatch, tmp_path):
++    monkeypatch.setenv('PICKER_HOME_ROOT', str(tmp_path / 'one'))
++    first = hc._expand_hermes_home('$PICKER_HOME_ROOT/profile')
++    assert hc._expand_hermes_home('$PICKER_HOME_ROOT/profile') is first
++    monkeypatch.setenv('PICKER_HOME_ROOT', str(tmp_path / 'two'))
++    assert hc._expand_hermes_home('$PICKER_HOME_ROOT/profile') == tmp_path / 'two/profile'
++    assert hc._expand_hermes_home('$PICKER_HOME_ROOT/profile') is not first
++
++
++def test_tilde_expansion_is_live(monkeypatch, tmp_path):
++    monkeypatch.setenv('HOME', str(tmp_path / 'first'))
++    monkeypatch.setenv('USERPROFILE', str(tmp_path / 'first'))
++    assert hc._expand_hermes_home('~/profile') == tmp_path / 'first/profile'
++    monkeypatch.setenv('HOME', str(tmp_path / 'second'))
++    monkeypatch.setenv('USERPROFILE', str(tmp_path / 'second'))
++    assert hc._expand_hermes_home('~/profile') == tmp_path / 'second/profile'
++
++
++def test_process_and_nested_context_home_changes_are_immediate(monkeypatch, tmp_path):
++    monkeypatch.setenv('HERMES_HOME', str(tmp_path / 'process'))
++    assert hc.get_hermes_home() == tmp_path / 'process'
++    token = hc.set_hermes_home_override(tmp_path / 'outer')
++    try:
++        assert hc.get_hermes_home() == tmp_path / 'outer'
++        nested = hc.set_hermes_home_override(tmp_path / 'inner')
++        try:
++            assert hc.get_hermes_home() == tmp_path / 'inner'
++        finally:
++            hc.reset_hermes_home_override(nested)
++        assert hc.get_hermes_home() == tmp_path / 'outer'
++    finally:
++        hc.reset_hermes_home_override(token)
++    monkeypatch.setenv('HERMES_HOME', str(tmp_path / 'next'))
++    assert hc.get_hermes_home() == tmp_path / 'next'
++
++
++def test_relative_path_does_not_freeze_working_directory(monkeypatch, tmp_path):
++    relative = hc._expand_hermes_home('relative-home')
++    monkeypatch.chdir(tmp_path)
++    assert relative.resolve() == tmp_path / 'relative-home'
++    assert relative == Path('relative-home')
+-- 
+2.43.0
+

@@ -1,0 +1,801 @@
+From d21b8bb4062bad39ecc4c27ab8b94513e87be2a9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 03:26:58 +0000
+Subject: [PATCH] fix(quiet): seed registry membership from the process
+ reservation; real Registry membership API
+
+Exact-head review 5885418937 (PR #1806) required changes:
+1. QuietControl called registry.membership_generation(), which the production
+   hermes_cli.local_work.Registry lacked, so every start was refused
+   membership_unsupported. Registry now exposes membership_generation(),
+   membership_snapshot() and coverage_pending() (membership_unseeded /
+   membership_transition_pending). Snapshots with an open membership
+   transition are never clean.
+2. Nothing seeded membership, so the first reservation latched sticky
+   unknown-home. The process reservation (gateway.runtime_ownership
+   .process_ownership) is the authority on served homes: it now opens an
+   add transition before each gateway.lock acquisition (ready on success,
+   removed on failure) and a retire transition around each release. This
+   covers the launch home, every multiplex profile and hot-serve add/remove.
+   Maintenance owners are separate instances and never touch membership.
+   The Registry canonicalizes every home (expanduser/realpath/normcase, as
+   hermes_home_key), so symlinked or non-canonical caller spellings match.
+
+Nits: audio _run_reserved releases a still-queued job whose waiter was
+cancelled (the job then never runs); _submit_owned releases instead of
+latching when a stdlib pool refused a shut-down/broken submit; dispatcher
+custody attaches even if the birth fingerprint read raises; a lease-refused
+snapshot records the episode as ended; same-boot cooldown uses the elapsed
+clock only (a corrected future wall time no longer wedges starts);
+run_conversation keeps its own __name__; attestation detects the route
+before hashing the interpreter / scanning dependency roots.
+
+Tests drive the production Registry: tests/gateway/test_quiet_membership_seeding.py
+(behavioral RED on 95089d00fb: unknown-home after the launch lock) and
+test_quiet_control.py now seeds via the tracked ProfileOwnership.
+---
+ agent/claim_quiet.py                          |  13 +-
+ agent/turn_facade.py                          |   4 +-
+ gateway/quiet_control.py                      |  10 +-
+ gateway/runtime_ownership.py                  |  87 +++++++---
+ hermes_cli/code_attestation.py                |   8 +-
+ hermes_cli/kanban_db_dispatch.py              |   8 +-
+ hermes_cli/local_work.py                      |  59 ++++++-
+ hermes_cli/local_work_threads.py              |  17 +-
+ hermes_cli/web_routers/audio.py               |  16 ++
+ tests/agent/test_claim_quiet.py               |  18 ++-
+ tests/gateway/test_quiet_control.py           |  54 +++++--
+ .../gateway/test_quiet_membership_seeding.py  | 152 ++++++++++++++++++
+ 12 files changed, 391 insertions(+), 55 deletions(-)
+ create mode 100644 tests/gateway/test_quiet_membership_seeding.py
+
+diff --git a/agent/claim_quiet.py b/agent/claim_quiet.py
+index b7377210e8..41cb0aaaac 100644
+--- a/agent/claim_quiet.py
++++ b/agent/claim_quiet.py
+@@ -530,13 +530,16 @@ def _check_cooldown(dir_fd: int, wall: float, ns: int, boot: str) -> None:
+         raise QuietUnavailableError(f"cooldown record unusable, refusing: {exc}") from exc
+     if last is None:
+         return
+-    ages = [wall - last.started_at]
++    # Same boot: the monotonic age alone is authoritative, so a wall clock that was ahead when the
++    # record was written (and later corrected) cannot refuse every start until real time catches up.
++    # Other boot: only the wall age exists.
+     if last.boot_id == boot:
+-        ages.append((ns - last.started_ns) / _NS)
+-    if min(ages) < 0:
++        age = (ns - last.started_ns) / _NS
++    else:
++        age = wall - last.started_at
++    if age < 0:
+         raise QuietUnavailableError("cooldown clocks are incoherent, refusing")
+-    # The smaller age is the longer remaining cooldown: a clock step can never shorten it.
+-    remaining = COOLDOWN_S - min(ages)
++    remaining = COOLDOWN_S - age
+     if remaining > 0:
+         raise QuietCooldownError(remaining)
+ 
+diff --git a/agent/turn_facade.py b/agent/turn_facade.py
+index 6b9a7dd919..654dba43ab 100644
+--- a/agent/turn_facade.py
++++ b/agent/turn_facade.py
+@@ -5,7 +5,6 @@ refresher thread and liveness watchdog (``agent.turn_facade_lease``), relay/acco
+ balanced start/finish marks. Extracted from ``run_agent.py``; every method resolves through ``AIAgent``'s
+ MRO unchanged.
+ """
+-import functools
+ import logging
+ import uuid
+ from contextlib import suppress
+@@ -227,7 +226,8 @@ class TurnFacadeMixin:
+             # Through the class, not self: callers drive this on stand-in agents (tests, relays).
+             return TurnFacadeMixin._run_conversation_scoped(self, *args, **kwargs)
+ 
+-    run_conversation = functools.wraps(_run_conversation_scoped)(run_conversation)
++    # Signature (inspect/autospec) follows the scoped body; __name__/__qualname__ stay run_conversation.
++    run_conversation.__dict__["__wrapped__"] = _run_conversation_scoped
+ 
+     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
+         """Final response string of one turn; ``stream_callback`` receives each text delta."""
+diff --git a/gateway/quiet_control.py b/gateway/quiet_control.py
+index f38dde9420..618b6921c0 100644
+--- a/gateway/quiet_control.py
++++ b/gateway/quiet_control.py
+@@ -236,7 +236,8 @@ class QuietControl:
+         unknowns = sorted(set(snap.unknowns) | set(getattr(self._runner, "_quiet_local_unknowns", ())))
+         view = {"activity_epoch": snap.epoch, "active_count": snap.active,
+                 "per_kind": dict(snap.per_kind), "unknowns": unknowns,
+-                "membership_generation": gen}
++                "membership_generation": gen,
++                "pending_transitions": getattr(snap, "pending_transitions", 0)}
+         membership = getattr(registry, "membership_snapshot", None)
+         if callable(membership):
+             view["membership"] = membership()
+@@ -335,6 +336,8 @@ class QuietControl:
+             reasons += [f"update:{r}" for r in update_reasons]
+         if view["unknowns"]:
+             reasons += [f"unknown:{u}" for u in view["unknowns"]]
++        if view["pending_transitions"]:
++            reasons.append("membership_transition_pending")  # a served home is joining or leaving
+         if full:
+             for name in ("active_agents", "workers", "held_turn_leases"):
+                 if predicates.get(name):
+@@ -463,6 +466,11 @@ class QuietControl:
+             with self._lock:  # token authority expires with the lease
+                 if any(r.startswith("lease_") for r in reasons) and self._episode is episode:
+                     self._episode = None
++                    # Remember it as ended so the observer's best-effort end gets "ended", not a
++                    # foreign-episode error.
++                    self._ended[episode_id] = (episode["token"], episode["peer"])
++                    while len(self._ended) > _ENDED_KEPT:
++                        self._ended.pop(next(iter(self._ended)))
+             return self._refuse(episode_id, "refused", reasons)
+         return self._measure(episode_id, "snapshot")
+ 
+diff --git a/gateway/runtime_ownership.py b/gateway/runtime_ownership.py
+index fbd412e13d..e257862b03 100644
+--- a/gateway/runtime_ownership.py
++++ b/gateway/runtime_ownership.py
+@@ -147,8 +147,23 @@ def _still_names(path: Path, fd: int) -> bool:
+         return False
+ 
+ 
++def _membership_registry():
++    """The bootstrap-installed local-work registry, or None (CLI, tests, older trees)."""
++    try:
++        from hermes_cli import local_work
++    except Exception:  # health: allow BLE001 -- membership bookkeeping must never fail an ownership change
++        return None
++    return local_work._registry
++
++
+ class ProfileOwnership:
+-    def __init__(self):
++    """``track_membership``: the process reservation (``process_ownership``) is the authority on
++    which homes this process serves, so it seeds the local-work registry membership: a home joins
++    (``add`` -> ``ready``) around its lock acquisition and leaves (``retire`` -> ``removed``) around
++    its release. Maintenance reservations are separate instances and never touch membership."""
++
++    def __init__(self, *, track_membership: bool = False):
++        self._track_membership = track_membership
+         self._handles: dict[Path, object] = {}
+         self._writers: list[threading.Thread] = []
+         self._mutex = threading.RLock()
+@@ -168,26 +183,32 @@ class ProfileOwnership:
+                 for home in sorted({canonical_home(p) for p in homes}):
+                     if home in self._handles:
+                         continue
+-                    make_user_dir(home, mode=0o700, parents=True, exist_ok=True)
+-                    path = home / 'gateway.lock'
+-                    fd = _open_lock(path)
+-                    handle = os.fdopen(fd, 'r+', encoding='utf-8')  # windows-footgun: ok — write-only
++                    transition = self._membership_begin(home, 'add')
+                     try:
+-                        if not _try_acquire_file_lock(handle) or not _still_names(path, handle.fileno()):
+-                            raise OwnershipConflict(f'Gateway runtime already owns profile {home}')
+-                        record = {**_build_pid_record(), 'hermes_home': str(home)}
+-                        if purpose:
+-                            record['purpose'] = purpose
+-                        handle.seek(0)
+-                        handle.truncate()
+-                        json.dump(record, handle)
+-                        handle.flush()
+-                        os.fsync(handle.fileno())
++                        make_user_dir(home, mode=0o700, parents=True, exist_ok=True)
++                        path = home / 'gateway.lock'
++                        fd = _open_lock(path)
++                        handle = os.fdopen(fd, 'r+', encoding='utf-8')  # windows-footgun: ok — write-only
++                        try:
++                            if not _try_acquire_file_lock(handle) or not _still_names(path, handle.fileno()):
++                                raise OwnershipConflict(f'Gateway runtime already owns profile {home}')
++                            record = {**_build_pid_record(), 'hermes_home': str(home)}
++                            if purpose:
++                                record['purpose'] = purpose
++                            handle.seek(0)
++                            handle.truncate()
++                            json.dump(record, handle)
++                            handle.flush()
++                            os.fsync(handle.fileno())
++                        except BaseException:
++                            handle.close()
++                            raise
+                     except BaseException:
+-                        handle.close()
++                        self._membership_commit(transition, 'removed')
+                         raise
+                     self._handles[home] = handle
+                     added.append(home)
++                    self._membership_commit(transition, 'ready')
+             except BaseException:
+                 for home in reversed(added):
+                     # Unpublish before letting go: a rolled-back attempt's record would otherwise
+@@ -216,10 +237,36 @@ class ProfileOwnership:
+     def release(self, home: Path) -> None:
+         from gateway.status import _release_file_lock
+         with self._mutex:
+-            handle = self._handles.pop(canonical_home(home), None)
++            home = canonical_home(home)
++            handle: Any = self._handles.pop(home, None)
+             if handle is not None:
+-                _release_file_lock(handle)
+-                handle.close()
++                transition = self._membership_begin(home, 'retire')
++                try:
++                    _release_file_lock(handle)
++                    handle.close()
++                finally:
++                    self._membership_commit(transition, 'removed')
++
++    def _membership_begin(self, home: Path, transition: str):
++        """Open a registry membership transition BEFORE the ownership change; None when untracked."""
++        registry = _membership_registry() if self._track_membership else None
++        if registry is None:
++            return None
++        try:
++            return registry, registry.membership_begin(str(home), role='owned', transition=transition)
++        except Exception:  # health: allow BLE001 -- a bookkeeping failure latches unknown coverage, never blocks ownership
++            registry.mark_unknown('membership-seed-failed')
++            return None
++
++    @staticmethod
++    def _membership_commit(transition, state: str) -> None:
++        if transition is None:
++            return
++        registry, token = transition
++        try:
++            registry.membership_commit(token, state=state)
++        except Exception:  # health: allow BLE001 -- a bookkeeping failure latches unknown coverage, never blocks ownership
++            registry.mark_unknown('membership-seed-failed')
+ 
+     def start_writer(self, thread: threading.Thread) -> None:
+         """Register before starting so partial startup cannot forget a live writer."""
+@@ -238,7 +285,7 @@ class ProfileOwnership:
+                 self.release(home)
+ 
+ 
+-process_ownership = ProfileOwnership()
++process_ownership = ProfileOwnership(track_membership=True)
+ _maintenance = threading.local()
+ 
+ 
+diff --git a/hermes_cli/code_attestation.py b/hermes_cli/code_attestation.py
+index e49dd34b27..4ad838c316 100644
+--- a/hermes_cli/code_attestation.py
++++ b/hermes_cli/code_attestation.py
+@@ -472,7 +472,9 @@ class Attestation:
+         self._modules = {}  # bounded strong identity inventory, including replacements
+         self._stdlib = Path(sysconfig.get_path("stdlib")).resolve()
+         self._blobs = {}
+-        self._deps = _DependencyIndex(sys.prefix, sys.path)
++        # Route detection runs first: a refused route latches unsupported-route without paying for
++        # the interpreter hash or the dependency root scan (an empty index keeps reports total).
++        self._deps = _DependencyIndex(sys.prefix, ())
+         self._dep_units = {}  # executed/loaded receipts only, never audited units
+         self._native_loads = []
+         self._unknown_detail = {}
+@@ -480,7 +482,7 @@ class Attestation:
+             "executable": str(Path(sys.executable).resolve()),
+             "version": sys.version, "cache_tag": sys.implementation.cache_tag,
+             "prefix": sys.prefix, "base_prefix": sys.base_prefix,
+-            "binary_sha256": _binary_sha(Path(sys.executable)),
++            "binary_sha256": None,
+         }
+         route = None
+         required = SEED  # direct construction: the full allowed inventory, still pending
+@@ -497,6 +499,8 @@ class Attestation:
+             self.route = route["route"]
+             self.stub_head_digest = route["stub_head_digest"]
+             required = SEED_COMMON
++        self._deps = _DependencyIndex(sys.prefix, sys.path)
++        self.interpreter_identity["binary_sha256"] = _binary_sha(Path(sys.executable))
+         try:
+             self._blobs = _boot_blobs(self.core_root, boot_sha)
+         except (OSError, ValueError, subprocess.SubprocessError) as exc:
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 492bc43260..3f8d5d78f3 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -2767,7 +2767,13 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None, o
+     # Intentionally NOT closing log_f: the child keeps writing after return;
+     # the OS-level FD stays open in the child until it exits.
+     _live_worker_procs[proc.pid] = proc
+-    _custody.adopt(proc, held, _process_fingerprint(proc.pid))
++    try:
++        birth = _process_fingerprint(proc.pid)
++    except Exception:  # health: allow BLE001 -- the child exists: custody must still attach; an unknown birth latches unknown
++        birth = None
++        if held is not None:
++            held.mark_unknown("kanban-worker-birth-unreadable")
++    _custody.adopt(proc, held, birth)
+     return proc.pid
+ 
+ 
+diff --git a/hermes_cli/local_work.py b/hermes_cli/local_work.py
+index 2e8cdbadbc..106e601e35 100644
+--- a/hermes_cli/local_work.py
++++ b/hermes_cli/local_work.py
+@@ -1,7 +1,11 @@
+ """Process-local physical work ledger. Stdlib only; no runtime coverage claim.
+ 
+-Homes are explicit, already-canonical ownership keys supplied by the caller.
+-This foundation does not discover profiles, attest code or establish readiness.
++Homes are ownership keys supplied by the caller; the registry canonicalizes every one
++(``canonical_home``: the same expanduser/realpath/normcase form as
++``hermes_constants.hermes_home_key``), so a symlinked or relative spelling of a member home
++is the member, never a sticky ``unknown-home``. This foundation does not discover profiles,
++attest code or establish readiness: membership is seeded by the process profile reservation
++(``gateway.runtime_ownership.process_ownership``).
+ A directly constructed Registry is useful for isolated consumers/tests; installing
+ one at bootstrap is a separate integration responsibility.
+ """
+@@ -13,6 +17,31 @@ from types import MappingProxyType
+ import weakref
+ 
+ 
++_HOME_KEYS = {}
++_HOME_KEYS_MAX = 256
++
++
++def canonical_home(home):
++    """Canonical membership key for ``home`` (None stays None: an unbound home).
++
++    Mirrors ``hermes_constants.hermes_home_key`` without importing it (stdlib-only seed module):
++    expanduser + realpath + normcase. Only an existing directory's answer is cached, because a
++    path that does not exist yet can resolve differently once created.
++    """
++    if home is None:
++        return None
++    raw = os.fspath(home)
++    cached = _HOME_KEYS.get(raw)
++    if cached is not None:
++        return cached
++    key = os.path.normcase(os.path.realpath(os.path.expanduser(raw)))
++    if os.path.isdir(key):
++        if len(_HOME_KEYS) >= _HOME_KEYS_MAX:
++            _HOME_KEYS.clear()
++        _HOME_KEYS[raw] = key
++    return key
++
++
+ ACTIVE_SCOPE: ContextVar["WorkScope | None"] = ContextVar(
+     "local_work_active_scope", default=None,
+ )
+@@ -89,7 +118,7 @@ class Registry:
+ 
+     def __init__(self, *, homes=()):
+         # home -> (state, roles). Seeds are ready launch homes.
+-        self._members = {os.fspath(h): ("ready", frozenset({"launch"})) for h in homes}
++        self._members = {canonical_home(h): ("ready", frozenset({"launch"})) for h in homes}
+         self._retired = set()
+         self._transitions = {}
+         self._membership_generation = 0
+@@ -132,7 +161,7 @@ class Registry:
+             raise ValueError("kind must be a nonempty string")
+         if not isinstance(source, str) or not source:
+             raise ValueError("source must be a nonempty string")
+-        home = os.fspath(home) if home is not None else None
++        home = canonical_home(home)
+         token = object()
+         with self._lock:
+             if home not in self._members:
+@@ -168,7 +197,7 @@ class Registry:
+             raise ValueError("unknown membership transition")
+         if not isinstance(role, str) or not role:
+             raise ValueError("role must be a nonempty string")
+-        home = os.fspath(home)
++        home = canonical_home(home)
+         token = MembershipToken(home, role, transition)
+         with self._lock:
+             roles = self._members.get(home, (None, frozenset()))[1]
+@@ -211,6 +240,26 @@ class Registry:
+             self._epoch += 1
+             return True
+ 
++    def membership_generation(self):
++        """Current membership generation (also on every ``Snapshot``); observers bracket reads with it."""
++        with self._lock:
++            return self._membership_generation
++
++    def membership_snapshot(self):
++        """Detached ``{home: (state, roles)}`` view of the served-home membership."""
++        with self._lock:
++            return {h: (m[0], tuple(sorted(m[1]))) for h, m in self._members.items()}
++
++    def coverage_pending(self):
++        """Reasons membership coverage is not established (observers refuse to start on any)."""
++        with self._lock:
++            reasons = []
++            if not any(state == "ready" for state, _roles in self._members.values()):
++                reasons.append("membership_unseeded")
++            if self._transitions:
++                reasons.append("membership_transition_pending")
++            return reasons
++
+     def attest_component(self, component, *, implementation_id, runtime_instance,
+                          capabilities=()):
+         """Record a concrete component identity; a change bumps coverage generation."""
+diff --git a/hermes_cli/local_work_threads.py b/hermes_cli/local_work_threads.py
+index fdc79fe1de..765e469506 100644
+--- a/hermes_cli/local_work_threads.py
++++ b/hermes_cli/local_work_threads.py
+@@ -154,6 +154,15 @@ def submit_tracked(executor, function, /, *args, registry=None, home=None,
+     return _submit_owned(executor, function, args, kwargs, owner, kind)
+ 
+ 
++def _refused_before_enqueue(executor):
++    """True when a stdlib ThreadPoolExecutor is shut down or broken (its submit refuses pre-enqueue)."""
++    if not isinstance(executor, ThreadPoolExecutor):
++        return False
++    from concurrent.futures import thread as _thread
++    return bool(getattr(executor, "_shutdown", False) or getattr(executor, "_broken", False)
++                or getattr(_thread, "_shutdown", False))
++
++
+ def _submit_owned(executor, function, args, kwargs, owner, kind):
+     reservation = _Reservation(owner, kind, copy_context())
+     try:
+@@ -165,7 +174,13 @@ def _submit_owned(executor, function, args, kwargs, owner, kind):
+         else:
+             future = executor.submit(reservation.run, function, args, kwargs)
+     except BaseException:
+-        owner.registry.mark_unknown("submit-outcome-uncertain")
++        if _refused_before_enqueue(executor):
++            # A stdlib pool refuses a shut-down/broken submit under its lock BEFORE enqueuing.
++            # Even if it had raced an enqueue, never_started makes the wrapper a no-op, so
++            # releasing here can never undercount physical work.
++            reservation.never_started()
++        else:
++            owner.registry.mark_unknown("submit-outcome-uncertain")
+         raise
+     # done + pending proves this wrapper never began (cancelled or broken pool).
+     # A running wrapper owns its release even if an async waiter was canceled.
+diff --git a/hermes_cli/web_routers/audio.py b/hermes_cli/web_routers/audio.py
+index 0407cee39a..d48412fc53 100644
+--- a/hermes_cli/web_routers/audio.py
++++ b/hermes_cli/web_routers/audio.py
+@@ -76,13 +76,28 @@ async def _run_reserved(source: str, fn, *, copy_context: bool = True):
+     from tools import code_kernel_scope
+ 
+     handle = code_kernel_scope.reserve("audio", source)
++    custody = threading.Lock()
++    state = ["pending"]  # pending -> running (worker owns release) | abandoned (never ran)
+ 
+     def _held():
++        with custody:
++            if state[0] != "pending":
++                return None  # the awaiting request was cancelled while queued: already released
++            state[0] = "running"
+         try:
+             return fn()
+         finally:
+             code_kernel_scope.finish(handle)
+ 
++    def _abandoned(fut):
++        # A cancelled waiter cancels a still-queued job: it will never run _held, so release here.
++        # A job that already started keeps custody until its own finally.
++        if fut.cancelled():
++            with custody:
++                if state[0] == "pending":
++                    state[0] = "abandoned"
++                    code_kernel_scope.finish(handle)
++
+     target = _held
+     if copy_context:  # what asyncio.to_thread does: the request context reaches the worker
+         target = functools.partial(contextvars.copy_context().run, _held)
+@@ -91,6 +106,7 @@ async def _run_reserved(source: str, fn, *, copy_context: bool = True):
+     except BaseException:
+         code_kernel_scope.finish(handle)
+         raise
++    future.add_done_callback(_abandoned)
+     return await future
+ 
+ 
+diff --git a/tests/agent/test_claim_quiet.py b/tests/agent/test_claim_quiet.py
+index a38e5454a1..c78e9f34e2 100644
+--- a/tests/agent/test_claim_quiet.py
++++ b/tests/agent/test_claim_quiet.py
+@@ -285,13 +285,27 @@ def test_backwards_clocks_refuse_rather_than_shorten_cooldown(home, backwards):
+     clock = FakeClock()
+     cq.acquire(max_s=30, reason="first", clock=clock).close()
+     if backwards == "wall":
++        # Same boot: the elapsed clock is authoritative, so a wall step back cannot shorten it either.
+         clock.now_wall -= 100
+-    else:
+-        clock.now_ns -= 100 * NS
++        with pytest.raises(cq.QuietCooldownError):
++            cq.acquire(max_s=30, reason="second", clock=clock)
++        return
++    clock.now_ns -= 100 * NS
+     with pytest.raises(cq.QuietUnavailableError, match="incoherent"):
+         cq.acquire(max_s=30, reason="second", clock=clock)
+ 
+ 
++def test_corrected_future_wall_time_does_not_wedge_cooldown_on_same_boot(home):
++    """A record written while the wall clock was ahead (later corrected) must not refuse every start
++    until real time catches up: on the same boot the elapsed clock alone decides."""
++    clock = FakeClock()
++    clock.now_wall += 10 * 24 * 3600  # wall clock 10 days ahead at the first start
++    cq.acquire(max_s=30, reason="first", clock=clock).close()
++    clock.now_wall -= 10 * 24 * 3600  # NTP corrects it
++    clock.now_ns += (records.COOLDOWN_S + 1) * NS
++    cq.acquire(max_s=30, reason="second", clock=clock).close()
++
++
+ @pytest.mark.parametrize("payload", [b"{", b"[]", b'{"schema": 1}', b"\xff\xfe", b""])
+ def test_malformed_cooldown_refuses_it_is_never_erased_to_bypass_two_hours(home, payload):
+     clock = FakeClock()
+diff --git a/tests/gateway/test_quiet_control.py b/tests/gateway/test_quiet_control.py
+index 6c2e654b14..d28bd78539 100644
+--- a/tests/gateway/test_quiet_control.py
++++ b/tests/gateway/test_quiet_control.py
+@@ -20,6 +20,7 @@ from gateway import quiet_control
+ from gateway.control_dispatch import ControlRequestDispatcher, verb_is_work_bearing
+ from gateway.control_socket import GatewayControlServer
+ from gateway.run import GatewayRunner
++from gateway.runtime_ownership import ProfileOwnership
+ from gateway.turn_lease import SessionTurnLeaseRegistry
+ from hermes_cli import kanban_deploy_window as window
+ from hermes_cli import local_work
+@@ -28,17 +29,6 @@ from tests.waiting import wait_until
+ PEER = "uid:1000"
+ 
+ 
+-class MembershipRegistry(local_work.Registry):
+-    """The real ledger plus the membership generation the INGRESS API supplies."""
+-
+-    def __init__(self, **kwargs):
+-        super().__init__(**kwargs)
+-        self.generation = 1
+-
+-    def membership_generation(self):
+-        return self.generation
+-
+-
+ class Runner(GatewayRunner):
+     session_runtime_descriptor = {"instance_id": "inst-1", "state": "ready"}
+ 
+@@ -48,8 +38,12 @@ def env(tmp_path, monkeypatch):
+     root = tmp_path / "hermes"
+     root.mkdir(mode=0o700)
+     monkeypatch.setenv("HERMES_HOME", str(root))
+-    registry = MembershipRegistry(homes=[str(root)])
++    # The production registry, unseeded exactly as hermes_bootstrap installs it; membership comes from
++    # the production seeding path (the tracked process reservation of the launch home).
++    registry = local_work.Registry()
+     monkeypatch.setattr(local_work, "_registry", registry)
++    ownership = ProfileOwnership(track_membership=True)
++    ownership.reserve([root])
+     monkeypatch.setitem(quiet_control._boot, "registry", None)
+     monkeypatch.setitem(quiet_control._boot, "captured", False)
+     quiet_control.capture_bootstrap_registry()  # the registry predates every runner: bootstrap provenance
+@@ -66,6 +60,7 @@ def env(tmp_path, monkeypatch):
+     yield type("Env", (), dict(root=root, registry=registry, runner=runner, server=server,
+                                control=control, lease=lease, monkeypatch=monkeypatch))
+     owner.close()
++    ownership.close()
+ 
+ 
+ def write_window(root, state, *, age=0):
+@@ -169,7 +164,7 @@ def test_start_refused_with_unknown_registry_state(env):
+ 
+ def test_start_refused_when_membership_api_missing(env):
+     attest(env)
+-    env.monkeypatch.setattr(MembershipRegistry, "membership_generation", None)
++    env.monkeypatch.setattr(local_work.Registry, "membership_generation", None)
+     result = ok(env, "quiet-observe-start", start_params(env))
+     assert "membership_unsupported" in result["reasons"]
+ 
+@@ -271,7 +266,9 @@ def test_clean_cycle_reports_registry_predicates_and_update_status(env):
+         assert snap["valid"] is True and snap["reasons"] == []
+         assert snap["active_count"] == 0 and snap["unknowns"] == []
+         assert snap["activity_epoch"] == env.registry.snapshot().epoch
+-        assert snap["membership_generation"] == 1
++        assert snap["membership_generation"] == env.registry.membership_generation() > 0
++        assert snap["pending_transitions"] == 0
++        assert snap["membership"] == {local_work.canonical_home(env.root): ["ready", ["owned"]]}
+         assert snap["predicates"] == {"active_agents": 0, "workers": 0, "held_turn_leases": 0}
+         assert snap["update"]["collision"] is False and snap["update"]["window_state"] == "idle"
+         assert snap["gateway"]["pid"] == os.getpid() and snap["registry_provenance"] == "bootstrap"
+@@ -314,14 +311,39 @@ def test_membership_generation_change_during_read_is_not_clean(env):
+     token = ok(env, "quiet-observe-start", start_params(env))["observer_token"]
+     real = env.runner._active_work_count
+ 
+-    def churn():
+-        env.registry.generation += 1
++    def churn():  # a served profile joins mid-read through the real membership API
++        env.registry.membership_commit(env.registry.membership_begin(
++            str(env.root / "profiles" / "late"), role="owned", transition="add"), state="ready")
+         return real()
+ 
+     env.monkeypatch.setattr(env.runner, "_active_work_count", churn)
+     assert "epoch_moved_during_read" in ok(env, "quiet-observe-snapshot", follow_params(env, token))["reasons"]
+ 
+ 
++def test_open_membership_transition_is_not_clean(env):
++    attest(env)
++    token = ok(env, "quiet-observe-start", start_params(env))["observer_token"]
++    joining = env.registry.membership_begin(str(env.root / "profiles" / "joining"), role="owned",
++                                            transition="add")
++    snap = ok(env, "quiet-observe-snapshot", follow_params(env, token))
++    assert snap["valid"] is False and snap["pending_transitions"] == 1
++    assert "membership_transition_pending" in snap["reasons"]
++    env.registry.membership_commit(joining, state="ready")
++    assert ok(env, "quiet-observe-snapshot", follow_params(env, token))["valid"] is True
++
++
++def test_production_registry_start_is_not_refused_for_membership(env):
++    """RED on 95089d00fb: the production Registry had no membership_generation (every start refused
++    ``membership_unsupported``) and nothing seeded membership (first reservation latched unknown-home)."""
++    attest(env)
++    assert type(env.registry) is local_work.Registry
++    held = env.registry.reserve("agent", home=str(env.root), source="test")
++    env.registry.finish(held)
++    started = ok(env, "quiet-observe-start", start_params(env))
++    assert "membership_unsupported" not in started["reasons"]
++    assert started["valid"] is True and started["unknowns"] == []
++
++
+ def test_original_predicates_are_read_from_their_real_sources(env):
+     attest(env)
+     token = ok(env, "quiet-observe-start", start_params(env))["observer_token"]
+diff --git a/tests/gateway/test_quiet_membership_seeding.py b/tests/gateway/test_quiet_membership_seeding.py
+new file mode 100644
+index 0000000000..1d8a545d71
+--- /dev/null
++++ b/tests/gateway/test_quiet_membership_seeding.py
+@@ -0,0 +1,152 @@
++"""Served-home membership seeding for the production ``hermes_cli.local_work.Registry``.
++
++The process profile reservation (``gateway.runtime_ownership.process_ownership``) is the authority on
++which homes a gateway serves; it seeds registry membership around every lock acquisition and release.
++Every test drives the real Registry (no stand-in) and real ``gateway.lock`` files under tmp homes.
++RED on 95089d00fb: nothing seeded membership, so the first reservation latched sticky ``unknown-home``,
++and the real Registry had no ``membership_generation``/``coverage_pending``.
++"""
++from __future__ import annotations
++
++import os
++import types
++
++import pytest
++
++from agent import local_work_agent
++from gateway import quiet_control, runtime_ownership
++from gateway.runtime_ownership import OwnershipConflict, ProfileOwnership, exclusive_maintenance
++from hermes_cli import local_work
++from hermes_constants import hermes_home_key
++
++
++@pytest.fixture
++def registry(monkeypatch):
++    reg = local_work.Registry()  # exactly what hermes_bootstrap installs: homes=()
++    monkeypatch.setattr(local_work, "_registry", reg)
++    return reg
++
++
++@pytest.fixture
++def homes(tmp_path):
++    real = tmp_path / "real-home"
++    real.mkdir(mode=0o700)
++    link = tmp_path / "linked-home"
++    link.symlink_to(real, target_is_directory=True)
++    return real, link
++
++
++def test_process_ownership_singleton_tracks_membership():
++    assert runtime_ownership.process_ownership._track_membership is True
++    assert ProfileOwnership()._track_membership is False  # maintenance/ad-hoc owners never seed
++
++
++def test_reservation_seeds_canonical_membership_for_every_home_spelling(registry, homes, monkeypatch):
++    real, link = homes
++    owner = ProfileOwnership(track_membership=True)
++    assert "membership_unseeded" in registry.coverage_pending()
++    owner.reserve([link])  # a non-canonical (symlinked) spelling of the served home
++    try:
++        snap = registry.snapshot()
++        key = local_work.canonical_home(real)
++        assert snap.membership == {key: ("ready", ("owned",))}
++        assert snap.pending_transitions == 0 and registry.coverage_pending() == []
++        assert key == hermes_home_key(link) == hermes_home_key(real)
++        # Every caller spelling of the home is the member: raw symlink, resolved path, hermes_home_key,
++        # str(get_hermes_home()) (agent seam default) under a symlinked HERMES_HOME.
++        monkeypatch.setenv("HERMES_HOME", str(link))
++        for spelling in (str(link), str(real), hermes_home_key(link), os.path.join(str(link), ".")):
++            registry.finish(registry.reserve("probe", home=spelling, source="test"))
++        local_work_agent.release(local_work_agent.reserve("agent_turn", "test.default_home"))
++        snap = registry.snapshot()
++        assert snap.unknowns == () and snap.active == 0
++    finally:
++        owner.close()
++
++
++def test_release_retires_home_and_late_reentry_invalidates(registry, homes):
++    real, _link = homes
++    owner = ProfileOwnership(track_membership=True)
++    owner.reserve([real])
++    generation = registry.membership_generation()
++    owner.release(real)
++    snap = registry.snapshot()
++    assert local_work.canonical_home(real) not in snap.membership
++    assert snap.membership_generation > generation and snap.pending_transitions == 0
++    assert snap.unknowns == ()
++    late = registry.reserve("late-callback", home=str(real), source="test")
++    assert "retired-home-reentry" in registry.snapshot().unknowns
++    registry.finish(late)
++
++
++def test_failed_reservation_leaves_no_member_and_no_open_transition(registry, homes):
++    real, _link = homes
++    holder = ProfileOwnership()  # another owner (separate open file description) holds the flock
++    holder.reserve([real])
++    try:
++        owner = ProfileOwnership(track_membership=True)
++        with pytest.raises(OwnershipConflict):
++            owner.reserve([real])
++        snap = registry.snapshot()
++        assert snap.pending_transitions == 0
++        assert local_work.canonical_home(real) not in snap.membership
++        assert "membership_unseeded" in registry.coverage_pending()
++    finally:
++        holder.close()
++
++
++def test_maintenance_reservation_never_touches_membership(registry, homes):
++    real, _link = homes
++    before = registry.membership_generation()
++    with exclusive_maintenance([real], purpose="test"):
++        assert registry.snapshot().membership == {}
++    assert registry.membership_generation() == before
++
++
++def test_first_reservation_after_launch_lock_is_not_unknown_home(registry, homes, monkeypatch):
++    """Behavioral RED on 95089d00fb (existing APIs only): boot reserves the launch home, then the first
++    agent reservation latched sticky ``unknown-home`` because nothing seeded membership."""
++    from gateway.status import acquire_gateway_runtime_lock, release_gateway_runtime_lock
++
++    _real, link = homes
++    monkeypatch.setenv("HERMES_HOME", str(link))
++    assert acquire_gateway_runtime_lock()
++    try:
++        local_work_agent.release(local_work_agent.reserve("agent_turn", "test.first"))
++        assert registry.snapshot().unknowns == ()
++    finally:
++        release_gateway_runtime_lock()
++
++
++def test_launch_lock_acquisition_seeds_the_installed_registry(registry, homes, monkeypatch):
++    """Production boot path: ``acquire_gateway_runtime_lock`` reserves the launch home through the
++    tracked singleton, which seeds the bootstrap-installed registry."""
++    from gateway.status import acquire_gateway_runtime_lock, release_gateway_runtime_lock
++
++    real, link = homes
++    monkeypatch.setenv("HERMES_HOME", str(link))
++    assert acquire_gateway_runtime_lock()
++    try:
++        assert registry.membership_snapshot() == {local_work.canonical_home(real): ("ready", ("owned",))}
++        local_work_agent.release(local_work_agent.reserve("agent_turn", "test.launch"))
++        assert registry.snapshot().unknowns == ()
++    finally:
++        release_gateway_runtime_lock()
++    assert registry.membership_snapshot() == {}
++
++
++def test_quiet_control_pending_reads_the_real_registry(registry, homes):
++    real, _link = homes
++    runner = types.SimpleNamespace(_quiet_registry=registry, _quiet_bootstrap_provenance=True,
++                                   _quiet_attested=True)
++    control = quiet_control.QuietControl(runner)
++    pending = control._pending(registry)
++    assert "membership_unsupported" not in pending and "membership_unseeded" in pending
++    owner = ProfileOwnership(track_membership=True)
++    owner.reserve([real])
++    try:
++        assert control._pending(registry) == []
++        view, _ = control._registry_view(registry)
++        assert view["membership_generation"] == registry.membership_generation()
++    finally:
++        owner.close()
+-- 
+2.43.0
+

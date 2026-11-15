@@ -1,0 +1,424 @@
+From 623e45e1b01540444eaaeb961d234d2179d5e7fd Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 00:53:01 +0000
+Subject: [PATCH] [daveey] Wait for supervised dashboard mount before gateway
+ READY
+
+Why-chain:
+- Desktop releases local API polls when the gateway publishes READY.
+- On laptop-1, all 29 retained conn=local timeouts on Nov 13 clustered
+  within the minute of READY across six restarts. At 13:58:49.990 PST
+  READY preceded plugin mounts at 13:58:55.188..57 and the first API
+  requests at 13:58:59.297, exceeding the polls' 4-8s deadlines.
+- The after-READY warm-up came from 276da15e93c's lazy cold chat -q
+  optimization, but supervised Desktop/service gateways need the routes.
+- Start supervised warm-up just after the runtime listener, overlapping
+  adapter/cron startup. The gateway-bound http_lifespan owns HTTP/PTY
+  resources only and does not require running adapters.
+- Await warm-up before READY and on the early-verdict path. Shield the
+  task and bound the wait at 30s; warn and publish READY on timeout while
+  mounting continues. Failed mounts retain first-request retry.
+
+Idle-exit gateways still do not warm/import the dashboard before READY.
+The in-process ensure already has a 300s adaptive CPU-starvation ceiling.
+CLI ensure/attach instead defaulted to a hard 60s and Desktop killed its
+client at 75s; align these explicit callers to 330s (300+30), retaining
+Desktop's 15s output/interpreter grace and explicit --timeout overrides.
+This also means a hung default explicit CLI start can now wait 330s;
+callers wanting a shorter hard deadline still supply --timeout.
+
+Proof:
+- Real bootstrap with a slow mount: READY waits, bounded mount completes
+  after READY, failure warns then first ASGI request retries successfully,
+  early verdict awaits, and adapter start overlaps the mount.
+- Baseline: four original new regressions fail; idle-exit is an unchanged
+  control, killed by removing the new non-idle guard. Removing shield also
+  kills the pending-mount assertion. Cold idle path leaves web_server absent.
+- Focused Python suites: 54 passed, 4 platform skips; lazy listener and
+  deferred integrity suites pass. All 50 direct bootstrap/listener consumer
+  files pass (510 tests, 4 platform skips). The no-task and shield mutants
+  each fail their behavioral assertion; restored suite passes all 10 tests.
+- Desktop deadline test fails with old 60s budget; 36 Desktop tests pass
+  with the fix; electron TypeScript check passes. Full scripts/check passes.
+
+Live MacBook restart proof is separately owned by t_01a1d6fbb11b47da:
+backend_cold_start.count == 0 within 45s of READY after deployment.
+No live Mac restart or detector change is part of this PR.
+---
+ .../electron/local-gateway-deadline.test.ts   |   6 +-
+ apps/desktop/electron/local-gateway.ts        |   7 +-
+ gateway/run_api.py                            |  21 +-
+ gateway/run_bootstrap.py                      |  18 +-
+ hermes_cli/subcommands/gateway.py             |   8 +-
+ .../gateway/test_bootstrap_dashboard_ready.py | 193 ++++++++++++++++++
+ 6 files changed, 234 insertions(+), 19 deletions(-)
+ create mode 100644 tests/gateway/test_bootstrap_dashboard_ready.py
+
+diff --git a/apps/desktop/electron/local-gateway-deadline.test.ts b/apps/desktop/electron/local-gateway-deadline.test.ts
+index 1b25d771e1..6ab3d7fc2e 100644
+--- a/apps/desktop/electron/local-gateway-deadline.test.ts
++++ b/apps/desktop/electron/local-gateway-deadline.test.ts
+@@ -64,8 +64,8 @@ test('a stale-owner restart client that times out but obeys SIGTERM is logged an
+   expect(logs).toEqual(['gateway restart exited 7: hermes gateway restart timed out'])
+ })
+ 
+-// `hermes gateway ensure` owns a 60 s startup deadline (hermes_cli/gateway_runtime.py
+-// DEFAULT_ENSURE_TIMEOUT) and always answers with a protocol verdict by then. Killing the client
++// `hermes gateway ensure` owns a 330 s startup deadline (hermes_cli/subcommands/gateway.py)
++// including the starved-start ceiling and dashboard barrier. Killing the client
+ // earlier turned a slow-but-valid cold start into "produced no result … Update Hermes".
+ test('the default ensure client outlives the protocol deadline and reads a late verdict', async () => {
+   vi.useFakeTimers()
+@@ -77,7 +77,7 @@ test('the default ensure client outlives the protocol deadline and reads a late
+   vi.doMock('node:child_process', () => ({ spawn: () => child }))
+   const { runGatewayEnsure } = await import('./local-gateway')
+   const result = runGatewayEnsure({ command: 'owned-client', args: [], env: {}, shell: false }, '.', 'profile', {})
+-  await vi.advanceTimersByTimeAsync(60_000)
++  await vi.advanceTimersByTimeAsync(330_000)
+   child.stdout.emit('data', Buffer.from('{"state":"starting","reason_code":"deadline"}'))
+   child.emit('close', 5)
+   await expect(result).resolves.toEqual({ code: 5, stdout: '{"state":"starting","reason_code":"deadline"}', stderr: '' })
+diff --git a/apps/desktop/electron/local-gateway.ts b/apps/desktop/electron/local-gateway.ts
+index b87e86a802..0da17abdd4 100644
+--- a/apps/desktop/electron/local-gateway.ts
++++ b/apps/desktop/electron/local-gateway.ts
+@@ -5,10 +5,11 @@ import { profileCollectionRoute, profileRouteSuffix } from './profile-routes'
+ import { hiddenWindowsChildOptions, windowsShellCommand } from './windows-child-options'
+ 
+ // `hermes gateway ensure` answers with a protocol verdict (ready, or `starting: deadline`) within
+-// its own startup deadline: `--timeout` defaults to 60 s (hermes_cli/gateway_runtime.py
+-// DEFAULT_ENSURE_TIMEOUT). The client is killed only after that deadline plus interpreter start
++// its own startup deadline: `--timeout` defaults to 330 s (hermes_cli/subcommands/gateway.py):
++// the adaptive cold-start ceiling (300 s) plus the supervised dashboard barrier (30 s).
++// The client is killed only after that deadline plus interpreter start
+ // and verdict output, so a slow-but-valid cold start is never reported as "produced no result".
+-const GATEWAY_ENSURE_PROTOCOL_DEADLINE_MS = 60_000
++const GATEWAY_ENSURE_PROTOCOL_DEADLINE_MS = 330_000
+ const GATEWAY_ENSURE_CLIENT_GRACE_MS = 15_000
+ 
+ /** Run one bounded `hermes ... gateway <verb>` client (`ensure` by default; `restart` for a stale owner). */
+diff --git a/gateway/run_api.py b/gateway/run_api.py
+index 6695ea4409..c2102c138e 100644
+--- a/gateway/run_api.py
++++ b/gateway/run_api.py
+@@ -7,7 +7,7 @@ not bootstrap an agent, scheduler, hosted room, or a second gateway.
+ The native session WebSocket (ticketed ``/api/ws`` — every local CLI/TUI/Desktop session) is served
+ without the dashboard app: importing ``hermes_cli.web_server`` (about 690 routes, ~0.6 s) before the
+ listener bound stalled every cold start and the control socket's identify. The dashboard is mounted
+-on its first request (imported off the event loop) or warmed after READY for a supervised gateway
++on its first request (imported off the event loop) or warmed before READY for a supervised gateway
+ (``warm_gateway_dashboard``); a gated listener (non-loopback bind, ``webapp.public_url`` on the Webapp's,
+ ``dashboard.public_url`` on the private one) and a
+ process that already imported it mount it before the listener starts, exactly as before.
+@@ -299,7 +299,7 @@ async def start_gateway_api(runner, *, host: str = "127.0.0.1", port: int = 0, w
+ 
+ 
+ def warm_gateway_dashboard(runner) -> None:
+-    """Mount the dashboard in the background once the gateway is READY (supervised gateways, whose
++    """Mount the dashboard in the background before READY (supervised gateways, whose
+     clients — Desktop, the dashboard SPA — call its routes right away). Never raises."""
+     handle = getattr(runner, "session_api", None)
+     mount = getattr(handle, "app", None)
+@@ -317,6 +317,23 @@ def warm_gateway_dashboard(runner) -> None:
+         _warm(), name="gateway-dashboard-warmup")
+ 
+ 
++async def await_gateway_dashboard_warm(runner, *, timeout: float = 30.0) -> None:
++    """Bound the supervised READY barrier without cancelling a still-running mount.
++
++    Warm-up logs failures itself; a failed mount is retried by the first request.
++    Like the session preload, ordinary failures never prevent READY.
++    """
++    task = getattr(runner, "_gateway_dashboard_warmup", None)
++    if task is None:
++        return
++    try:
++        await asyncio.wait_for(asyncio.shield(task), timeout)
++    except TimeoutError:
++        logger.warning("Gateway dashboard API mount still running after %.0fs; publishing READY", timeout)
++    except Exception:
++        logger.warning("Gateway dashboard API warm-up failed; it loads on first request", exc_info=True)
++
++
+ _SESSION_SOCKET_MODULE = "tui_gateway.ws"
+ 
+ 
+diff --git a/gateway/run_bootstrap.py b/gateway/run_bootstrap.py
+index d849e16044..4d765360be 100644
+--- a/gateway/run_bootstrap.py
++++ b/gateway/run_bootstrap.py
+@@ -1033,8 +1033,15 @@ async def _start_gateway_runtime(config: Optional[GatewayConfig] = None, replace
+         _log_standalone_profiles_at_boot(runner)
+         from gateway.run_runtime import start_gateway_runtime_api
+         await start_gateway_runtime_api(runner)
+-        from gateway.run_api import await_session_socket_preload, preload_session_socket
++        from gateway.run_api import (
++            await_gateway_dashboard_warm, await_session_socket_preload,
++            preload_session_socket, warm_gateway_dashboard,
++        )
+         ws_preload = preload_session_socket() if idle_exit else None  # overlaps the adapter/cron start
++        # The gateway HTTP lifespan only owns HTTP resources, not adapters/cron. Start now so its
++        # imports overlap startup; Desktop releases its polls at READY, not at the first request.
++        if not idle_exit:
++            warm_gateway_dashboard(runner)
+ 
+         def _lifecycle_record_startup() -> Optional[dict]:
+             # Report if the previous life died uncleanly (SIGKILL / OOM / VM death), then claim the
+@@ -1054,6 +1061,7 @@ async def _start_gateway_runtime(config: Optional[GatewayConfig] = None, replace
+         _early_verdict = await _start_gateway_run_runner(runner, _signal_initiated_shutdown)
+         if _early_verdict is not None:
+             await await_session_socket_preload(ws_preload)  # never left unawaited on the way out
++            await await_gateway_dashboard_warm(runner)
+             return _early_verdict
+         if _unclean_exit is not None:
+             _start_deferred_state_db_integrity_check(_unclean_exit)
+@@ -1065,6 +1073,7 @@ async def _start_gateway_runtime(config: Optional[GatewayConfig] = None, replace
+         from gateway.run_runtime import publish_gateway_runtime_ready, wait_gateway_runtime
+         try:
+             await await_session_socket_preload(ws_preload)
++            await await_gateway_dashboard_warm(runner)
+             # READY only once adapters, cron and housekeeping run; missing systemd state just disables watchdog.
+             publish_gateway_runtime_ready(runner)
+             from gateway.quiet_control import finalize_attestation
+@@ -1073,12 +1082,7 @@ async def _start_gateway_runtime(config: Optional[GatewayConfig] = None, replace
+             if idle_exit:
+                 from gateway.run_idle_exit import arm_unmanaged_idle_exit
+                 arm_unmanaged_idle_exit(runner)
+-            else:
+-                # A supervised/explicit gateway serves Desktop and the dashboard SPA, which call the
+-                # dashboard routes right away: mount them now, after READY. A client's own idle-exit
+-                # gateway (chat -q, TUI) only uses the native WebSocket; it mounts on first request.
+-                from gateway.run_api import warm_gateway_dashboard
+-                warm_gateway_dashboard(runner)
++
+             await wait_gateway_runtime(runner)
+         finally:
+             try:
+diff --git a/hermes_cli/subcommands/gateway.py b/hermes_cli/subcommands/gateway.py
+index 21d4a2fd59..f49f6ca2d5 100644
+--- a/hermes_cli/subcommands/gateway.py
++++ b/hermes_cli/subcommands/gateway.py
+@@ -132,8 +132,8 @@ def build_gateway_parser(
+                "4 authorization/profile mismatch; 5 deadline; 6 draining/update-paused; "
+                "7 inaccessible/conflicting supervisor. Pending startup is not readiness.")
+     _flag(gateway_ensure, "--json", help="Emit one credential-free JSON result (default)")
+-    gateway_ensure.add_argument("--timeout", default="60",
+-                                help="Total startup deadline in seconds (default: 60)")
++    gateway_ensure.add_argument("--timeout", default="330",
++                                help="Total startup deadline in seconds (default: 330)")
+     gateway_ensure.set_defaults(func=cmd_gateway_ensure)
+ 
+     gateway_attach = gateway_subparsers.add_parser(
+@@ -150,8 +150,8 @@ def build_gateway_parser(
+     _flag(attach_mode, "--start", help="Start the gateway when none serves this profile")
+     _flag(attach_mode, "--recover",
+         help="Discover first; start (or replace an older Hermes's) gateway only when it is not ready")
+-    gateway_attach.add_argument("--timeout", default="60",
+-                                help="Start deadline in seconds for --start/--recover (default: 60)")
++    gateway_attach.add_argument("--timeout", default="330",
++                                help="Start deadline in seconds for --start/--recover (default: 330)")
+     gateway_attach.set_defaults(func=cmd_gateway_attach)
+ 
+     gateway_start = gateway_subparsers.add_parser(
+diff --git a/tests/gateway/test_bootstrap_dashboard_ready.py b/tests/gateway/test_bootstrap_dashboard_ready.py
+new file mode 100644
+index 0000000000..964c9324d5
+--- /dev/null
++++ b/tests/gateway/test_bootstrap_dashboard_ready.py
+@@ -0,0 +1,193 @@
++"""Supervised READY includes the dashboard; idle-exit startup stays lazy."""
++import asyncio
++import argparse
++from contextlib import asynccontextmanager
++import sys
++from types import SimpleNamespace
++
++import pytest
++
++from gateway import run_api, run_bootstrap, run_runtime
++from gateway.config import GatewayConfig
++from tests.gateway import test_bootstrap_deferred_integrity_scan as helpers
++
++_startup = helpers._startup
++_REAL_WARM = run_api.warm_gateway_dashboard
++
++
++@pytest.fixture
++def dashboard(_startup, monkeypatch):
++    events, _, _ = _startup
++    entered, release = asyncio.Event(), asyncio.Event()
++    state = SimpleNamespace(attempts=0, fail=False, runner=None)
++
++    @asynccontextmanager
++    async def lifespan(app):
++        state.attempts += 1
++        events.append("mount_started")
++        entered.set()
++        await release.wait()
++        if state.fail and state.attempts == 1:
++            raise RuntimeError("mount failed")
++        events.append("mount_loaded")
++        yield
++
++    async def app(scope, receive, send):
++        await send({"type": "http.response.start", "status": 200})
++        await send({"type": "http.response.body", "body": b"ok"})
++
++    app.state = SimpleNamespace()
++    app.router = SimpleNamespace(lifespan_context=lifespan)
++    monkeypatch.setitem(sys.modules, "hermes_cli.web_server", SimpleNamespace(app=app))
++
++    async def start_api(runner):
++        state.runner = runner
++        mount = run_api.GatewayDashboardMount(runner, SimpleNamespace())
++        monkeypatch.setattr(mount, "_bind_state", lambda web: None)
++        monkeypatch.setattr(mount, "_unbind_state", lambda: None)
++        runner.session_api = SimpleNamespace(app=mount)
++
++    monkeypatch.setattr(run_runtime, "start_gateway_runtime_api", start_api)
++    monkeypatch.setattr(run_runtime, "drain_gateway_runtime", helpers.AsyncMock())
++    monkeypatch.setattr(run_api, "warm_gateway_dashboard", _REAL_WARM)
++    yield events, entered, release, state
++
++
++def boot(**kwargs):
++    return run_bootstrap.start_gateway(config=GatewayConfig(), replace=False, verbosity=None, **kwargs)
++
++
++@pytest.mark.asyncio
++async def test_supervised_ready_waits_for_mount(dashboard):
++    events, entered, release, state = dashboard
++    task = asyncio.create_task(boot())
++    try:
++        await asyncio.wait_for(entered.wait(), 10)
++        assert "ready" not in events
++        release.set()
++        assert await task is True
++        assert state.runner.session_api.app.loaded
++        assert events.index("mount_loaded") < events.index("ready")
++    finally:
++        release.set()
++        await task
++        await state.runner.session_api.app.close()
++
++
++@pytest.mark.asyncio
++async def test_timeout_publishes_ready_without_cancelling_mount(dashboard, monkeypatch, caplog):
++    events, entered, release, state = dashboard
++    real_wait = getattr(run_api, "await_gateway_dashboard_warm", None)
++    assert real_wait is not None
++    waits = []
++
++    async def bounded(runner):
++        waits.append(asyncio.get_running_loop().time())
++        await real_wait(runner, timeout=0.02)
++        waits.append(asyncio.get_running_loop().time())
++
++    monkeypatch.setattr(run_api, "await_gateway_dashboard_warm", bounded)
++    try:
++        assert await asyncio.wait_for(boot(), 10) is True
++        assert entered.is_set() and "ready" in events and "mount_loaded" not in events
++        assert waits[1] - waits[0] >= 0.02
++        assert "publishing READY" in caplog.text and "still running" in caplog.text
++        warm = state.runner._gateway_dashboard_warmup
++        assert not warm.done()
++        release.set()
++        await asyncio.wait_for(warm, 5)
++        assert state.runner.session_api.app.loaded
++        assert events.index("ready") < events.index("mount_loaded")
++    finally:
++        release.set()
++        await asyncio.gather(state.runner._gateway_dashboard_warmup, return_exceptions=True)
++        await state.runner.session_api.app.close()
++
++
++@pytest.mark.asyncio
++async def test_failed_mount_warns_before_ready_and_first_request_retries(dashboard, caplog):
++    events, _, release, state = dashboard
++    state.fail = True
++    release.set()
++    assert await boot() is True
++    mount = state.runner.session_api.app
++    try:
++        assert state.attempts == 1 and not mount.loaded
++        assert events.index("mount_started") < events.index("ready")
++        assert "loads on first request" in caplog.text
++        sent = []
++
++        async def send(message):
++            sent.append(message)
++
++        await mount({"type": "http"}, helpers.AsyncMock(), send)
++        assert state.attempts == 2 and mount.loaded
++        assert sent[0]["status"] == 200
++    finally:
++        await mount.close()
++
++
++@pytest.mark.asyncio
++async def test_idle_exit_does_not_warm_dashboard(dashboard, monkeypatch):
++    events, _, _, state = dashboard
++    monkeypatch.delitem(sys.modules, "hermes_cli.web_server", raising=False)
++    monkeypatch.setattr(run_api, "preload_session_socket", lambda: None)
++    monkeypatch.setattr("gateway.run_idle_exit.arm_unmanaged_idle_exit", lambda runner: None)
++    assert await boot(idle_exit=True) is True
++    assert "ready" in events and state.attempts == 0
++    assert not hasattr(state.runner, "_gateway_dashboard_warmup")
++    assert "hermes_cli.web_server" not in sys.modules
++
++
++@pytest.mark.asyncio
++async def test_early_verdict_awaits_started_warmup(dashboard, monkeypatch):
++    events, _, release, state = dashboard
++    monkeypatch.setattr(run_bootstrap, "_start_gateway_run_runner", helpers.AsyncMock(return_value=False))
++    release.set()
++    assert await boot() is False
++    try:
++        assert state.runner._gateway_dashboard_warmup.done()
++        assert state.runner.session_api.app.loaded and "ready" not in events
++    finally:
++        await state.runner.session_api.app.close()
++
++
++@pytest.mark.asyncio
++async def test_warmup_overlaps_adapter_start(dashboard, monkeypatch):
++    _, entered, release, state = dashboard
++
++    async def start_runner(runner, signal_shutdown):
++        await asyncio.wait_for(entered.wait(), 5)
++        release.set()
++
++    monkeypatch.setattr(run_bootstrap, "_start_gateway_run_runner", start_runner)
++    assert await boot() is True
++    await state.runner.session_api.app.close()
++
++
++@pytest.mark.asyncio
++async def test_missing_warmup_is_noop(caplog):
++    await run_api.await_gateway_dashboard_warm(SimpleNamespace())
++    assert not caplog.text
++
++
++@pytest.mark.asyncio
++async def test_unexpected_warmup_failure_is_nonfatal(caplog):
++    async def fail():
++        raise RuntimeError("unexpected warmup failure")
++
++    runner = SimpleNamespace(_gateway_dashboard_warmup=asyncio.create_task(fail()))
++    await run_api.await_gateway_dashboard_warm(runner)
++    assert "loads on first request" in caplog.text
++
++
++@pytest.mark.parametrize("verb", ["ensure", "attach"])
++def test_cli_deadline_covers_starved_start_and_dashboard_barrier(verb):
++    from hermes_cli.gateway_runtime_progress import MAX_ADAPTIVE_TIMEOUT
++    from hermes_cli.subcommands.gateway import build_gateway_parser
++
++    parser = argparse.ArgumentParser()
++    build_gateway_parser(parser.add_subparsers(), cmd_gateway=lambda: None,
++                         cmd_proxy=lambda: None, cmd_gateway_enroll=lambda: None)
++    assert float(parser.parse_args(["gateway", verb]).timeout) >= MAX_ADAPTIVE_TIMEOUT + 30
++    assert parser.parse_args(["gateway", verb, "--timeout", "2"]).timeout == "2"
+-- 
+2.43.0
+

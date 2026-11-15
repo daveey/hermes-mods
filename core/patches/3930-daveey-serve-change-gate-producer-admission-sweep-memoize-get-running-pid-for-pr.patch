@@ -1,0 +1,768 @@
+From 38350ed5b36263d9e77473f98fcb9e741ac951d9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 20:17:01 +0000
+Subject: [PATCH] [daveey] serve: change-gate producer_admission sweep +
+ memoize get_running_pid for profile lists (card J, part 1)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Design t_01a1d563324d7e8e §3, card J rows 1-2.
+
+producer_admission.sweep_once opened every profile's SessionDB on every
+15 s pass (13 of 17 profile samples; P1 on the hub serve: 1.9% of a core).
+Each store now keeps one read-only autocommit observer connection; a pass
+reads its (dev, ino, PRAGMA data_version) and skips the store only when
+that key is unchanged since a pass that found nothing pending. A pending
+row is due again on every pass (a refused resume or busy owner retries
+next tick), so pending stores are never skipped; an unchanged-key store
+with pending rows still takes today's full path. When the observer can
+not answer (unreadable, replaced mid-read) the pass falls back to the
+full path. Observers of profiles no longer listed are closed.
+
+hermes_cli.profiles._check_gateway_running ran get_running_pid's flock
+probe and command-line identity scan per profile on every polled profile
+list. gateway/status_pid_memo.running_pid reuses the answer while the PID
+and lock files keep their (dev, ino, mtime_ns, size), a cached live PID is
+still the same live process (Linux: one /proc/<pid>/stat read, not a
+zombie, same start ticks; elsewhere kill(pid,0) + start time + runtime
+lock held), and at most RECHECK_S=30 s has passed. A racy read (files
+moved during the probe) is answered but never memoized; answers are keyed
+by the probe in effect.
+
+Tests: RED on base 0ef3eae4ad7 (7 of 10 gate tests fail: reopen every
+pass; replay bench 148-165 ms per pass = ~1% of a core vs budget 0.2%;
+profiles memo test probes 5x). GREEN: change picked up next pass, pending
+row retried each pass with no other change, RECHECK_S deadline reprobes
+with no other change, dead/reused/zombie PID noticed with no file change;
+replay benches assert 0.2% and 0.05% of a core.
+---
+ gateway/status_pid_memo.py                    | 127 ++++++++++++
+ hermes_cli/profiles.py                        |  10 +-
+ tests/gateway/test_status_pid_memo.py         | 190 +++++++++++++++++
+ .../test_producer_admission_gate.py           | 195 ++++++++++++++++++
+ tui_gateway/producer_admission.py             | 138 +++++++++++--
+ 5 files changed, 638 insertions(+), 22 deletions(-)
+ create mode 100644 gateway/status_pid_memo.py
+ create mode 100644 tests/gateway/test_status_pid_memo.py
+ create mode 100644 tests/tui_gateway/test_producer_admission_gate.py
+
+diff --git a/gateway/status_pid_memo.py b/gateway/status_pid_memo.py
+new file mode 100644
+index 0000000000..f7f932bc4a
+--- /dev/null
++++ b/gateway/status_pid_memo.py
+@@ -0,0 +1,127 @@
++"""Memoized gateway liveness for polled per-profile status reads (design t_01a1d563324d7e8e §3, card J). [daveey]
++
++``hermes_cli.profiles._check_gateway_running`` runs for every profile on every polled ``profiles.list`` /
++``GET /api/profiles``; each call re-ran ``get_running_pid``'s flock probe and process command-line identity scan
++(0.4% of a core on the hub serve for answers that almost never change). The answer is a function of the PID and
++lock files plus the named process staying alive, so it is reused while:
++
++- the PID file and its sibling lock file keep their identity (dev, ino, mtime_ns, size): a gateway that starts,
++  stops cleanly or is replaced rewrites one of them;
++- a cached live PID is still the same live process: on Linux one ``/proc/<pid>/stat`` read (not a zombie, same
++  start ticks); elsewhere ``kill(pid, 0)`` plus the start-time PID-reuse guard plus its runtime lock still held
++  (a zombie has released its lock). A gateway that died without touching its files is noticed on the next call;
++- at most ``RECHECK_S`` has passed (backstop for anything the key cannot see, e.g. an identity matcher that
++  would now adopt a record it rejected).
++
++Only ``cleanup_stale=False`` probes are memoized: a cleaning probe unlinks files and must run every time.
++"""
++
++from __future__ import annotations
++
++import os
++import threading
++import time
++from pathlib import Path
++from typing import Callable, Optional
++
++RECHECK_S = 30.0
++_lock = threading.Lock()
++# (str(pid_path), probe) -> (signature, pid, start_time, checked_at)
++_memo: dict[tuple[str, object], tuple[tuple, Optional[int], Optional[int], float]] = {}
++_MAX_ENTRIES = 256
++
++
++def _file_key(path: Path) -> tuple:
++    try:
++        st = path.stat()
++    except OSError:
++        return (None,)
++    return (st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size)
++
++
++def _signature(pid_path: Path) -> tuple:
++    from gateway.status import _get_gateway_lock_path
++    return (_file_key(pid_path), _file_key(_get_gateway_lock_path(pid_path)))
++
++
++def _pid_alive(pid: int) -> bool:
++    """``kill(pid, 0)`` on POSIX (the full ``_pid_exists`` costs a psutil status read, ~35 µs); a zombie passes
++    here but has released its runtime lock, which the caller checks next."""
++    from gateway.status import _pid_exists
++    if os.name == "nt":
++        return _pid_exists(pid)
++    try:
++        os.kill(pid, 0)  # windows-footgun: ok — the nt branch above returns first
++    except ProcessLookupError:
++        return False
++    except PermissionError:
++        return True
++    except OSError:
++        return _pid_exists(pid)
++    return True
++
++
++def _proc_stat(pid: int) -> Optional[tuple[bytes, int]]:
++    """``(state, start ticks)`` from one ``/proc/<pid>/stat`` read (Linux); None where there is no /proc."""
++    try:
++        fields = Path(f"/proc/{pid}/stat").read_bytes().rsplit(b")", 1)[1].split()
++        return fields[0], int(fields[19])
++    except FileNotFoundError:
++        if Path("/proc/self/stat").exists():
++            return b"", -1  # procfs is there and the pid is gone
++        return None
++    except (IndexError, ValueError, OSError):
++        return None
++
++
++def _still_alive(pid_path: Path, pid: int, start_time: Optional[int]) -> bool:
++    """The cached gateway is still the same live process. Linux: one ``/proc/<pid>/stat`` read (not a zombie,
++    same start ticks), ~10 µs. Elsewhere: ``kill(pid, 0)`` + start time + the runtime lock still held (a zombie
++    has released its lock)."""
++    from gateway.status import _get_gateway_lock_path, _get_process_start_time, is_gateway_runtime_lock_active
++    stat = _proc_stat(pid)
++    if stat is not None:
++        state, ticks = stat
++        return state not in (b"", b"Z", b"X", b"x") and (start_time is None or ticks == start_time)
++    if not _pid_alive(pid):
++        return False
++    if start_time is not None and _get_process_start_time(pid) != start_time:
++        return False
++    return is_gateway_runtime_lock_active(_get_gateway_lock_path(pid_path))
++
++
++def _default_probe(path: Path) -> Optional[int]:
++    from gateway.status import get_running_pid
++    return get_running_pid(path, cleanup_stale=False)
++
++
++def running_pid(pid_path: Path, *, probe: Optional[Callable[[Path], Optional[int]]] = None,
++                now: Optional[float] = None) -> Optional[int]:
++    """``get_running_pid(pid_path, cleanup_stale=False)``, memoized as described in the module docstring. The
++    probe in effect is part of the key: an answer is never shared across probes (or a replaced ``get_running_pid``)."""
++    from gateway import status
++    key = (str(pid_path), probe or status.get_running_pid)
++    probe = probe or _default_probe
++    now = time.monotonic() if now is None else now
++    signature = _signature(pid_path)
++    with _lock:
++        hit = _memo.get(key)
++    if hit is not None and hit[0] == signature and now - hit[3] < RECHECK_S:
++        pid, start_time = hit[1], hit[2]
++        if pid is None or _still_alive(pid_path, pid, start_time):
++            return pid
++    pid = probe(pid_path)
++    start_time = status._get_process_start_time(pid) if pid is not None else None
++    with _lock:
++        if _signature(pid_path) == signature:
++            if len(_memo) >= _MAX_ENTRIES and key not in _memo:
++                _memo.clear()
++            _memo[key] = (signature, pid, start_time, now)
++        else:  # the files moved during the probe: answer, but never memoize a racy read
++            _memo.pop(key, None)
++    return pid
++
++
++def clear() -> None:
++    with _lock:
++        _memo.clear()
+diff --git a/hermes_cli/profiles.py b/hermes_cli/profiles.py
+index 1ed923cffc..c45eef9019 100644
+--- a/hermes_cli/profiles.py
++++ b/hermes_cli/profiles.py
+@@ -756,12 +756,12 @@ def _check_gateway_running(profile_dir: Path) -> bool:
+     Primary signal is ``gateway.pid`` verified against the runtime lock (fails closed when
+     the lock isn't held by *this* reader: dashboard as a separate s6 service, launch-service
+     gateways with no live PID file); fallback validates the PID in ``gateway_state.json``
+-    against the process table, matching ``/api/status``."""
+-    from gateway.status import get_running_pid, resolve_gateway_liveness
++    against the process table, matching ``/api/status``. The PID-file rung is memoized (``gateway.status_pid_memo``):
++    this runs per profile on every polled profile list."""
++    from gateway.status import resolve_gateway_liveness
++    from gateway.status_pid_memo import running_pid
+     # cleanup_stale=False: a status probe for ANOTHER profile must never unlink its PID file.
+-    return resolve_gateway_liveness(
+-        profile_dir=profile_dir, use_cache=False,
+-        pid_probe=lambda path: get_running_pid(path, cleanup_stale=False)).running
++    return resolve_gateway_liveness(profile_dir=profile_dir, use_cache=False, pid_probe=running_pid).running
+ 
+ 
+ def _served_by_running_multiplexer(profile_name: str) -> bool:
+diff --git a/tests/gateway/test_status_pid_memo.py b/tests/gateway/test_status_pid_memo.py
+new file mode 100644
+index 0000000000..4a74603717
+--- /dev/null
++++ b/tests/gateway/test_status_pid_memo.py
+@@ -0,0 +1,190 @@
++"""Memoized ``get_running_pid`` for polled per-profile status (design t_01a1d563324d7e8e §3, card J). [daveey]
++
++Gate: the PID/lock files' identity, the cached process staying alive under its start time with its lock held,
++and a ``RECHECK_S`` backstop. RED before the memo: ``_check_gateway_running`` re-ran the full probe every call.
++"""
++
++from __future__ import annotations
++
++import os
++import time
++
++import pytest
++
++from gateway import status
++from gateway import status_pid_memo as memo
++
++
++@pytest.fixture(autouse=True)
++def _fresh():
++    memo.clear()
++    yield
++    memo.clear()
++
++
++@pytest.fixture
++def files(tmp_path):
++    pid_path = tmp_path / "gateway.pid"
++    pid_path.write_text("{}")
++    status._get_gateway_lock_path(pid_path).write_text("")
++    return pid_path
++
++
++class _Probe:
++    def __init__(self, answer):
++        self.answer, self.calls = answer, 0
++
++    def __call__(self, path):
++        self.calls += 1
++        return self.answer
++
++
++@pytest.fixture(params=["procfs", "portable"])
++def alive(request, monkeypatch):
++    """Drive both liveness paths: Linux's one /proc read, and kill(0)+start time+lock elsewhere."""
++    state = {"alive": True, "start": 111, "locked": True, "zombie": False}
++
++    def _proc(pid):
++        if request.param != "procfs":
++            return None
++        if not state["alive"]:
++            return b"", -1
++        return (b"Z" if state["zombie"] else b"S"), state["start"]
++
++    monkeypatch.setattr(memo, "_proc_stat", _proc)
++    monkeypatch.setattr(memo, "_pid_alive", lambda pid: state["alive"])
++    monkeypatch.setattr(status, "_get_process_start_time", lambda pid: state["start"])
++    monkeypatch.setattr(status, "is_gateway_runtime_lock_active",
++                        lambda path=None: state["locked"] and not state["zombie"])
++    return state
++
++
++def test_unchanged_files_and_live_process_reuse_the_answer(files, alive):
++    probe = _Probe(4242)
++    assert [memo.running_pid(files, probe=probe, now=t) for t in (0, 1, 2, 3)] == [4242] * 4
++    assert probe.calls == 1
++
++
++def test_stopped_gateway_answer_is_reused_until_a_file_moves(files, alive):
++    probe = _Probe(None)
++    assert memo.running_pid(files, probe=probe, now=0) is None
++    assert memo.running_pid(files, probe=probe, now=1) is None
++    assert probe.calls == 1
++    probe.answer = 777  # a gateway starts: it rewrites the PID file
++    files.write_text('{"pid": 777, "started": true}')
++    assert memo.running_pid(files, probe=probe, now=2) == 777
++    assert probe.calls == 2
++
++
++def test_lock_file_change_is_picked_up_next_call(files, alive):
++    probe = _Probe(None)
++    memo.running_pid(files, probe=probe, now=0)
++    lock = status._get_gateway_lock_path(files)
++    os.replace(_write(lock.with_name("new.lock"), "x"), lock)
++    probe.answer = 9
++    assert memo.running_pid(files, probe=probe, now=1) == 9
++
++
++def _write(path, text):
++    path.write_text(text)
++    return path
++
++
++@pytest.mark.parametrize("change", ["dead", "pid_reused", "zombie"])
++def test_cached_live_pid_rechecked_without_any_file_change(files, alive, change):
++    probe = _Probe(4242)
++    assert memo.running_pid(files, probe=probe, now=0) == 4242
++    if change == "dead":
++        alive["alive"] = False
++    elif change == "pid_reused":
++        alive["start"] = 222
++    else:
++        alive["zombie"] = True
++    probe.answer = None
++    assert memo.running_pid(files, probe=probe, now=1) is None
++    assert probe.calls == 2
++
++
++def test_recheck_deadline_passing_reprobes_with_no_other_change(files, alive):
++    probe = _Probe(None)
++    memo.running_pid(files, probe=probe, now=0)
++    memo.running_pid(files, probe=probe, now=memo.RECHECK_S - 0.01)
++    assert probe.calls == 1
++    probe.answer = 31
++    assert memo.running_pid(files, probe=probe, now=memo.RECHECK_S) == 31
++    assert probe.calls == 2
++
++
++def test_file_moving_during_probe_is_not_memoized(files, alive):
++    calls = []
++
++    def racy(path):
++        calls.append(1)
++        if len(calls) == 1:
++            files.write_text('{"pid": 5, "mid-probe": true}')
++        return 5
++
++    assert memo.running_pid(files, probe=racy, now=0) == 5
++    assert memo.running_pid(files, probe=racy, now=1) == 5
++    assert len(calls) == 2
++
++
++def test_answers_are_not_shared_across_probes(files, alive):
++    a, b = _Probe(1), _Probe(None)
++    assert memo.running_pid(files, probe=a, now=0) == 1
++    assert memo.running_pid(files, probe=b, now=0) is None
++    assert (a.calls, b.calls) == (1, 1)
++
++
++def test_profiles_check_gateway_running_uses_the_memo(tmp_path, monkeypatch, alive):
++    from hermes_cli import profiles
++    calls = []
++
++    def fake_get_running_pid(pid_path=None, *, cleanup_stale=True):
++        calls.append(cleanup_stale)
++
++    monkeypatch.setattr(status, "get_running_pid", fake_get_running_pid)
++    monkeypatch.setattr(status, "multiplexer_liveness_for_profile", lambda profile_dir: None)
++    home = tmp_path / "profiles" / "work"
++    home.mkdir(parents=True)
++    for _ in range(5):
++        assert profiles._check_gateway_running(home) is False
++    assert calls == [False], "the PID-file rung must probe once while nothing changes, never cleaning"
++
++
++# -- replay benchmark: budget 0.05% of one core (design §3: get_running_pid 0.4 -> 0.05) --------------------------
++
++def test_replay_budget_polled_profile_list(files):
++    """The measured stream: 11 profiles listed every 2 s by an open Desktop, no gateway changing state. A memo
++    hit costs two stats plus one /proc read per profile; budget is per wall second of polling."""
++    import fcntl
++    paths, held = [], []
++    for n in range(11):
++        d = files.parent / f"p{n}"
++        d.mkdir()
++        p = d / "gateway.pid"
++        p.write_text("{}")
++        lock = status._get_gateway_lock_path(p)
++        lock.write_text("")
++        h = open(lock, "a+")  # a real held lock: the portable path checks it
++        fcntl.flock(h.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
++        held.append(h)
++        paths.append(p)
++    pid = os.getpid()  # a real live process: exercise the real liveness path
++    probe = _Probe(pid)
++    try:
++        for p in paths:
++            memo.running_pid(p, probe=probe)
++        best = float("inf")
++        for _ in range(5):
++            t0 = time.thread_time()
++            for _ in range(50):
++                for p in paths:
++                    assert memo.running_pid(p, probe=probe) == pid
++            best = min(best, (time.thread_time() - t0) / 50)
++    finally:
++        for h in held:
++            h.close()
++    assert probe.calls == len(paths)
++    per_second = best / 2.0  # one profile list every 2 s
++    assert per_second <= 0.0005, f"{best * 1000:.3f} ms per list = {per_second:.4%} of a core"
+diff --git a/tests/tui_gateway/test_producer_admission_gate.py b/tests/tui_gateway/test_producer_admission_gate.py
+new file mode 100644
+index 0000000000..707322559e
+--- /dev/null
++++ b/tests/tui_gateway/test_producer_admission_gate.py
+@@ -0,0 +1,195 @@
++"""Change gate of the producer-admission cold-chat sweep (design t_01a1d563324d7e8e §3, card J). [daveey]
++
++``sweep_once`` opened every profile's SessionDB on every 15 s pass (13 of 17 profile samples; ~0.7 s CPU a pass
++on the hub). It now keeps one read-only observer per store and skips a store whose (file identity,
++``data_version``) is unchanged since a pass that found nothing pending. A pending row is due on every pass, so a
++refused resume retries with no commit in between.
++"""
++
++from __future__ import annotations
++
++import contextlib
++import os
++import shutil
++import time
++
++import pytest
++
++import hermes_state_producer_admission as pa
++from tests.tui_gateway.test_producer_admission import (
++    PRODUCER,
++    SID,
++    _admit,
++    _db,
++    _install_resume,
++    _notices,
++    _root,
++    sdb as sdb,  # noqa: PLC0414 -- the self-alias is load-bearing: it suppresses F811 for the pytest fixture parameter shadowing this import
++    turns as turns,  # noqa: PLC0414 -- the self-alias is load-bearing: it suppresses F811 for the pytest fixture parameter shadowing this import
++)
++from tui_gateway import producer_admission as delivery
++from tui_gateway import server
++
++
++@pytest.fixture(autouse=True)
++def _fresh_observers():
++    reset = getattr(delivery, "reset_observers", lambda: None)  # tolerant: the RED run predates the gate
++    reset()
++    yield
++    reset()
++
++
++@pytest.fixture
++def opens(monkeypatch):
++    """Count full-path store opens (the cost the gate removes)."""
++    calls = []
++    real = pa.open_profile_db
++
++    def _counting(home):
++        calls.append(str(home))
++        return real(home)
++
++    monkeypatch.setattr(pa, "open_profile_db", _counting)
++    return calls
++
++
++def test_unchanged_store_with_nothing_pending_is_not_reopened(sdb, opens):
++    assert delivery.sweep_once() == []
++    first = len(opens)
++    for _ in range(3):
++        assert delivery.sweep_once() == []
++    assert len(opens) == first, "a quiet store must be skipped, not reopened every pass"
++
++
++def test_unrelated_commit_reads_the_observer_but_opens_nothing(sdb, opens):
++    delivery.sweep_once()
++    before = len(opens)
++    sdb.append_message(SID, "user", "an unrelated turn moves data_version")
++    assert delivery.sweep_once() == []
++    assert len(opens) == before, "no pending owner: the observer answers without a SessionDB open"
++
++
++def test_admission_after_a_skipped_pass_is_picked_up_next_pass(sdb, turns, monkeypatch, opens):
++    calls, _ = _install_resume(monkeypatch)
++    assert delivery.sweep_once() == [] and delivery.sweep_once() == []
++    _admit()  # the input change: one commit to the store
++    [rec] = delivery.sweep_once()
++    assert rec["verdict"] == "started" and rec["owner"] == SID
++    assert len(_notices(sdb)) == 1 and len(calls) == 1
++
++
++def test_pending_row_is_retried_every_pass_with_no_other_change(sdb, turns, monkeypatch):
++    calls, _ = _install_resume(monkeypatch, refuse=True)
++    _admit()
++    for n in range(1, 4):  # a refused resume writes nothing: the row is due again on the next pass anyway
++        [rec] = delivery.sweep_once()
++        assert rec["verdict"] == "resume_refused"
++        assert len(calls) == n
++    assert pa.read_producer_admission(producer=PRODUCER, profile_home=_root())["status"] == "queued"
++
++
++def test_delivered_row_settles_then_the_store_goes_quiet(sdb, turns, monkeypatch, opens):
++    _install_resume(monkeypatch)
++    _admit()
++    [rec] = delivery.sweep_once()
++    assert rec["verdict"] == "started"
++    assert delivery.sweep_once() == []  # the pass after a pending one re-reads, finds nothing
++    settled = len(opens)
++    assert delivery.sweep_once() == [] and len(opens) == settled
++
++
++def test_replaced_store_file_is_reobserved(tmp_path):
++    import sqlite3
++    path = tmp_path / "state.db"
++
++    def _make(target):
++        with contextlib.closing(sqlite3.connect(target)) as conn:
++            conn.execute("CREATE TABLE t (x)")
++            conn.commit()
++
++    _make(path)
++    with delivery._observers_lock:
++        key1, conn1 = delivery._observe(path)
++        assert delivery._observe(path) == (key1, conn1)  # unchanged: same key, same kept connection
++    _make(tmp_path / "restored.db")
++    os.replace(tmp_path / "restored.db", path)  # a restore swaps the inode
++    with delivery._observers_lock:
++        key2, conn2 = delivery._observe(path)
++    assert key2[:2] != key1[:2] and conn2 is not conn1
++
++
++def test_profile_store_added_later_is_swept(turns, monkeypatch):
++    calls, _ = _install_resume(monkeypatch)
++    assert delivery.sweep_once() == []
++    work = _db("work")
++    work.create_session(SID, "desktop")
++    work.append_message(SID, "user", "hi")
++
++    @contextlib.contextmanager
++    def _opener(session):
++        yield work
++
++    monkeypatch.setattr(server, "_session_db", _opener)
++    _admit(home=_root() / "profiles" / "work")
++    recs = delivery.sweep_once()
++    assert [(r["profile"], r["verdict"]) for r in recs] == [("work", "started")]
++    assert len(calls) == 1
++    work.close()
++
++
++def test_removed_profile_store_drops_its_observer(monkeypatch):
++    work = _db("work")
++    work.create_session(SID, "desktop")
++    work.close()
++    delivery.sweep_once()
++    assert any("work" in p for p in delivery._observers)
++    shutil.rmtree(_root() / "profiles" / "work")
++    delivery.sweep_once()
++    assert not any("work" in p for p in delivery._observers)
++
++
++def test_unreadable_store_takes_the_full_path(sdb, opens, monkeypatch):
++    def _broken(path):
++        raise OSError("observer unavailable")
++
++    monkeypatch.setattr(delivery, "_observe", _broken)
++    delivery.sweep_once()
++    delivery.sweep_once()
++    assert len(opens) == 2, "no observer: every pass keeps today's full path"
++
++
++# -- replay benchmark: budget 0.2% of one core (design §3: producer_admission 1.3 -> 0.2) -------------------------
++
++PROFILES = 11  # the hub's profile count at measurement time
++INTERVAL_S = delivery.INTERVAL_S
++BUDGET_CORE = 0.002
++
++
++def test_replay_budget_every_store_committing_every_pass():
++    """Worst case of the measured change stream (state.db data_version moved in 140/300 2 s windows, so every
++    15 s pass sees a commit): every store commits before every pass. CPU per pass / interval must stay in budget."""
++    stores = [_db(None)] + [_db(f"p{n}") for n in range(PROFILES - 1)]
++    try:
++        for n, db in enumerate(stores):
++            db.create_session(f"s{n}", "desktop")
++        delivery.sweep_once()  # cold: opens observers
++        best = float("inf")
++        for _ in range(3):
++            spent = 0.0
++            for i in range(10):
++                for db in stores:
++                    _commit(db, i)
++                t0 = time.thread_time()
++                assert delivery.sweep_once() == []
++                spent += time.thread_time() - t0
++            best = min(best, spent / 10)
++        assert best / INTERVAL_S <= BUDGET_CORE, f"{best * 1000:.2f} ms per pass = {best / INTERVAL_S:.4%} of a core"
++    finally:
++        for db in stores:
++            db.close()
++
++
++def _commit(db, i: int) -> None:
++    with db._read_ctx() as conn:
++        sid = conn.execute("SELECT id FROM sessions LIMIT 1").fetchone()[0]
++    db.append_message(sid, "user", f"tick {i}")
+diff --git a/tui_gateway/producer_admission.py b/tui_gateway/producer_admission.py
+index c15bf0eecd..74ae43242b 100644
+--- a/tui_gateway/producer_admission.py
++++ b/tui_gateway/producer_admission.py
+@@ -148,7 +148,7 @@ def deliver_pending(sid: str, session: dict) -> str:
+             server._notif_release_turn(session)
+ 
+ 
+-def _profile_home(profile: Optional[str]) -> Optional[Path]:
++def _profile_home(profile: Optional[str]) -> Path:
+     from hermes_constants import get_default_hermes_root
+     root = Path(get_default_hermes_root())
+     return root if not profile else root / "profiles" / profile
+@@ -163,30 +163,134 @@ def _live(server, key: str, profile: Optional[str]):
+     return None
+ 
+ 
++# Change gate (design t_01a1d563324d7e8e §3 card J). Opening every profile's SessionDB each pass was 13 of 17
++# samples of this loop (~0.7 s CPU per 15 s pass on the hub). Each profile store keeps ONE read-only observer
++# connection; a pass reads its ``PRAGMA data_version`` (moves on every commit by any other connection, this
++# process's writers included) and file identity. A store is skipped only when that key is unchanged AND its last
++# pass found no pending owner: a pending row is due again every pass (a refused resume or a busy owner retries on
++# the next tick), so it never waits on a commit. path -> ((dev, ino), conn); path -> (key, had_pending).
++_observers: dict[str, tuple[tuple[int, int], sqlite3.Connection]] = {}
++_last_pass: dict[str, tuple[tuple, bool]] = {}
++_observers_lock = threading.Lock()
++_PENDING_OWNERS_SQL = "SELECT DISTINCT owner FROM producer_admissions WHERE status IN (?, ?)"
++
++
++def _drop_observer(path: str) -> None:
++    entry = _observers.pop(path, None)
++    _last_pass.pop(path, None)
++    if entry is not None:
++        with contextlib.suppress(sqlite3.Error):
++            entry[1].close()
++
++
++def reset_observers() -> None:
++    """Close every kept observer connection (tests, shutdown)."""
++    with _observers_lock:
++        for path in list(_observers):
++            _drop_observer(path)
++        _last_pass.clear()
++
++
++def _observe(path: Path) -> tuple[tuple, sqlite3.Connection]:
++    """``(key, conn)`` for ``path``'s store: key = (dev, ino, data_version) on the kept observer connection,
++    reopened when the file was replaced. Raises OSError/sqlite3.Error when the store cannot be read."""
++    from hermes_state_holders import read_only_db_uri
++    st = path.stat()
++    identity = (st.st_dev, st.st_ino)
++    entry = _observers.get(str(path))
++    if entry is not None and entry[0] != identity:
++        _drop_observer(str(path))
++        entry = None
++    if entry is None:
++        # Tracked: a long-held fd must be visible to has_live_connection()/offline_file_access() (restores, header
++        # byte probes), like every other state.db opener.
++        from hermes_cli.sqlite_safe_read import connect_tracked
++        conn = connect_tracked(read_only_db_uri(path), tracking_path=path, uri=True, check_same_thread=False,
++                               isolation_level=None, timeout=0.5)
++        entry = _observers[str(path)] = (identity, conn)
++    version = entry[1].execute("PRAGMA data_version").fetchone()[0]
++    return (*identity, version), entry[1]
++
++
++def _pending_owners_on(conn: sqlite3.Connection) -> list[str]:
++    """``pa.pending_owners`` on the observer connection (autocommit: reads the latest committed state)."""
++    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='producer_admissions'").fetchone() is None:
++        return []
++    return [r[0] for r in conn.execute(_PENDING_OWNERS_SQL, pa.PENDING).fetchall()]
++
++
++def _gate(path: Path) -> Optional[tuple]:
++    """None to skip ``path`` this pass; else ``(key, owners)`` where ``owners`` is None when the observer could not
++    answer (the caller then takes today's full path). Called under ``_observers_lock``."""
++    try:
++        key, conn = _observe(path)
++    except (OSError, sqlite3.Error):
++        _drop_observer(str(path))
++        return (None, None)
++    last = _last_pass.get(str(path))
++    if last is not None and last[0] == key and not last[1]:
++        return None
++    try:
++        return key, _pending_owners_on(conn)
++    except sqlite3.Error:
++        _drop_observer(str(path))
++        return (None, None)
++
++
+ @_la.accounted("producer_admission.sweep", rows=True)
+ def sweep_once() -> list[dict]:
+     """One pass over every profile store: wake each cold chat that holds an undelivered completion, then deliver.
+-    Returns one record per owner it acted on. Never raises."""
++    Returns one record per owner it acted on. Never raises. A store whose commit key is unchanged since a pass
++    that found nothing pending is skipped without opening it (see ``_observers``)."""
+     server = _server()
+     out: list[dict] = []
+-    for profile in server._readopt_wake_profiles():
+-        try:
+-            db = pa.open_profile_db(_profile_home(profile))
+-        except (sqlite3.Error, OSError):
+-            logger.warning("producer admission: store of profile %s unavailable", profile, exc_info=True)
+-            continue
+-        if db is None:
+-            continue
+-        try:
+-            for owner in pa.pending_owners(db):
+-                out.append(_sweep_owner(server, db, profile, owner))
+-        except Exception:
+-            logger.warning("producer admission sweep failed for profile %s", profile, exc_info=True)
+-        finally:
+-            db.close()
++    profiles = [(profile, _profile_home(profile)) for profile in server._readopt_wake_profiles()]
++    with _observers_lock:
++        live = {str(home / "state.db") for _profile, home in profiles}
++        for path in [p for p in _observers if p not in live]:
++            _drop_observer(path)
++    for profile, home in profiles:
++        path = home / "state.db"
++        with _la.pass_("producer_admission.profile") as acct, _observers_lock:
++            gate = _gate(path)
++            if gate is None:
++                acct.skip()
++                continue
++            key, owners = gate
++            acct.change(key is not None)
++            if owners is not None and not owners:
++                _last_pass[str(path)] = (key, False)
++                continue
++            acct.fallback(owners is None)
++        had_pending = _sweep_profile(server, profile, home, out)
++        if key is not None:
++            with _observers_lock:
++                _last_pass[str(path)] = (key, had_pending)
+     return out
+ 
+ 
++def _sweep_profile(server, profile: Optional[str], home: Path, out: list) -> bool:
++    """Today's full pass over one store. True unless it proved nothing is pending (an error counts as pending,
++    so the next pass retries)."""
++    try:
++        db = pa.open_profile_db(home)
++    except (sqlite3.Error, OSError):
++        logger.warning("producer admission: store of profile %s unavailable", profile, exc_info=True)
++        return True
++    if db is None:
++        return False
++    try:
++        owners = pa.pending_owners(db)
++        for owner in owners:
++            out.append(_sweep_owner(server, db, profile, owner))
++        return bool(owners)
++    except Exception:
++        logger.warning("producer admission sweep failed for profile %s", profile, exc_info=True)
++        return True
++    finally:
++        db.close()
++
++
+ def _sweep_owner(server, db, profile: Optional[str], owner: str) -> dict:
+     record = {"profile": profile, "owner": owner}
+     if db.get_session(owner) is None:
+-- 
+2.43.0
+

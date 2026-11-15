@@ -1,0 +1,310 @@
+From 99a6fd0c02830b0ab50ea1112fd60224b0ea9bac Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 23:26:51 +0000
+Subject: [PATCH] [daveey] Share durable FIFO across flake owner and page
+ retries
+
+Pending-owner work previously ran before all existing pages. A slow failed owner lookup consumed every deadline and starved immutable retry pages despite per-queue rotation. Merge eligible work by shared durable tickets; retain pre-attempt rotation, exact readback and a deadline fence after batch flushes. Preserve bounded admission packing and retry-group boundaries; the half-window threshold flushes batches rather than imposing queue priority.
+
+Proof: 608 tests passed across 23 consumer files. Ten exact-anchor mutants killed: both phase priorities, missing occurrence rotation/page delivery, stale and non-drain ticket filters, retry groups, post-flush deadline, pre-page flush and timed batch flush. Three original starvation assertions failed before implementation; composition also caught and fixed the 0/40 backlog regression. Full scripts/check: 20 checks OK. All fixtures disposable; no production queue or mini writes.
+---
+ docs/ci-flaky-intake.md                   |  12 +-
+ scripts/ci/flaky_kanban.py                |  33 ++--
+ tests/ci/test_flaky_intake_cross_queue.py | 191 ++++++++++++++++++++++
+ 3 files changed, 221 insertions(+), 15 deletions(-)
+ create mode 100644 tests/ci/test_flaky_intake_cross_queue.py
+
+diff --git a/docs/ci-flaky-intake.md b/docs/ci-flaky-intake.md
+index c1ff3a0e88..be6dc08814 100644
+--- a/docs/ci-flaky-intake.md
++++ b/docs/ci-flaky-intake.md
+@@ -89,10 +89,14 @@ Board/courier operations already started may still consume their existing transp
+ Before GitHub discovery, a drain gets half the invocation budget and checkpoints the JSON
+ cursor; a slow discovery cannot prevent already queued delivery on every invocation.
+ Within a drain, consecutive admissions are packed by `plan_pages` into multi-row pages
+-(maximum 6000 bytes), flushed after at most 16 rows, an ownership boundary, or the
+-resolution deadline. Occurrences are durable before ownership resolution; each batch's
+-pages are committed before immediate delivery in the same drain. Half the drain window is
+-reserved for prior attempted pages. If a slow owner exhausts it, the unsent pages remain
++(maximum 6000 bytes), flushed after at most 16 rows, an ownership boundary, or halfway
++through the drain window (then after each subsequent admission). Occurrences are durable before ownership resolution; each batch's
++pages are committed before immediate delivery in the same drain. Pending owner resolutions
++and prior attempted pages share one FIFO ordered by durable tickets, rather than
++fixed-priority phases. Batches are also flushed before selecting a prior page.
++A slow operation may consume the remaining window, but its rotated ticket lets the other
++queue progress on the next drain, including after restart. No new external work starts at
++or after the drain deadline. If a slow owner exhausts it, the unsent pages remain
+ durable and retain their batch boundaries during next-drain ownership rechecks, so that
+ unrelated slow owner cannot repeatedly delay the already-admitted prefix.
+ Durable FIFO tickets are assigned transactionally when occurrences, pages and run attempts
+diff --git a/scripts/ci/flaky_kanban.py b/scripts/ci/flaky_kanban.py
+index d4e38ad21c..13abe5de12 100644
+--- a/scripts/ci/flaky_kanban.py
++++ b/scripts/ci/flaky_kanban.py
+@@ -580,12 +580,19 @@ def drain_intake(journal: Journal, repo: str, board: Board, state: dict, relay:
+         "SELECT o.id,o.page FROM occurrences o JOIN pages p ON p.id=o.page "
+         "WHERE o.repo=? AND p.attempted=0 AND p.delivered=0", (repo,)))
+     journal.recheck_unattempted(repo)
+-    # Reserve half the drain for retry pages. Bound admission batches independently
+-    # of the backlog; every flush commits its pages before attempting delivery.
++    # Flush admissions early enough to leave time for their first delivery. This
++    # is a batch boundary, not a priority phase that can starve either queue.
+     now = time.monotonic()
+-    resolve_deadline = None if deadline is None else now + max(0, deadline - now) / 2
+-    old_pages = {r[0] for r in journal.db.execute(
++    batch_deadline = None if deadline is None else now + max(0, deadline - now) / 2
++    # Both queues already share durable tickets. Merge them before external work:
++    # a slow first operation can overrun any reserved phase budget. Rotation before
++    # each attempt gives the other queue its turn even across process restarts.
++    pending = {str(row["id"]): row for row in journal.pending(repo)}
++    old_pages = {str(r[0]) for r in journal.db.execute(
+         "SELECT id FROM pages WHERE repo=? AND delivered=0", (repo,))}
++    work = [(kind, item) for kind, item in journal.db.execute(
++        "SELECT kind,item FROM scheduling WHERE repo=? ORDER BY ticket,kind,item", (repo,))
++        if (kind == "occurrence" and item in pending) or (kind == "page" and item in old_pages)]
+     def create(title, body, key, page):
+         return _create_intake(journal, repo, board, state, relay, title, body, key, page, deadline)
+     batch, owner_checks = [], {}
+@@ -605,15 +612,19 @@ def drain_intake(journal: Journal, repo: str, board: Board, state: dict, relay:
+         owner_checks.clear()
+         return journal.deliver(repo, board, deadline=deadline, create=create, page_ids=page_ids)
+     previous_group = None
+-    for row in journal.pending(repo):
+-        group = retry_groups.get(row["id"])
+-        if group != previous_group:
++    for kind, item in work:
++        group = retry_groups.get(pending[item]["id"]) if kind == "occurrence" else None
++        if kind == "page" or group != previous_group:
+             log += flush()
+         previous_group = group
+-        if resolve_deadline is not None and time.monotonic() >= resolve_deadline:
++        if deadline is not None and time.monotonic() >= deadline:
+             log.append("FAILED intake_budget; durable retry pending")
+             break
+-        journal.rotate(repo, "occurrence", str(row["id"]))
++        if kind == "page":
++            log += journal.deliver(repo, board, deadline=deadline, create=create, page_ids={int(item)})
++            continue
++        row = pending[item]
++        journal.rotate(repo, "occurrence", item)
+         meta = json.loads(row["metadata"])
+         url = f"https://github.com/{repo}/actions/runs/{meta['run_id']}/job/{meta['job_id']}"
+         notes: dict[str, list[dict[str, str]]] = {}
+@@ -627,7 +638,7 @@ def drain_intake(journal: Journal, repo: str, board: Board, state: dict, relay:
+         if lines == ["queued"]:
+             batch.append(row)
+             owner_checks[row["id"]] = notes.get(meta["test_id"], [])
+-            if len(batch) >= 16:
++            if len(batch) >= 16 or (batch_deadline is not None and time.monotonic() >= batch_deadline):
+                 log += flush()
+         else:
+             log += flush()
+@@ -635,7 +646,7 @@ def drain_intake(journal: Journal, repo: str, board: Board, state: dict, relay:
+                 journal.acknowledge(row["id"], json.dumps(state["cards"][meta["test_id"]], sort_keys=True))
+         log += lines
+     log += flush()
+-    return log + journal.deliver(repo, board, deadline=deadline, create=create, page_ids=old_pages)
++    return log
+ 
+ 
+ def _create_intake(journal, repo, board, state, relay, title, body, key, page, deadline):
+diff --git a/tests/ci/test_flaky_intake_cross_queue.py b/tests/ci/test_flaky_intake_cross_queue.py
+new file mode 100644
+index 0000000000..d41e6d8b58
+--- /dev/null
++++ b/tests/ci/test_flaky_intake_cross_queue.py
+@@ -0,0 +1,191 @@
++"""One durable FIFO across owner resolution and immutable page retries."""
++import pytest
++
++from scripts.ci import flaky_intake as intake
++from scripts.ci import flaky_kanban as fk
++from tests.ci.test_flaky_intake import Board
++
++
++@pytest.mark.parametrize("first", ["page", "occurrence"])
++def test_slow_queues_take_turns_across_restart(tmp_path, monkeypatch, first):
++    path = tmp_path / "queue.sqlite3"
++    clock, calls = [0.0], []
++    monkeypatch.setattr(fk.time, "monotonic", lambda: clock[0])
++    journal = intake.Journal(path)
++    journal.record("o/r", [(9, [{"test_id": "tests/a.py::test_page"}])],
++                   {"id": 1, "head_sha": "a" * 40})
++    journal.plan_pages("o/r", journal.pending("o/r"))
++    with journal.db:
++        journal.db.execute("UPDATE pages SET attempted=1")
++    original = tuple(journal.db.execute("SELECT id,payload,attempted FROM pages").fetchone())
++    journal.record("o/r", [(9, [{"test_id": "tests/a.py::test_pending"}])],
++                   {"id": 2, "head_sha": "a" * 40})
++    with journal.db:
++        journal.enqueue("o/r", "run", "2")  # a run ticket is not pending-owner work
++    if first == "occurrence":
++        journal.rotate("o/r", "page", "1")
++    journal.close()
++
++    class Slow(Board):
++        def list_cards(self):
++            calls.append("page")
++            clock[0] += 20
++            raise RuntimeError("page inventory unavailable")
++
++    def resolve(*args, **kwargs):
++        calls.append("occurrence")
++        clock[0] += 20
++        raise RuntimeError("owner unavailable")
++
++    monkeypatch.setattr(fk, "file_cards", resolve)
++    board = Slow()
++    other = "occurrence" if first == "page" else "page"
++    for index in range(4):
++        journal = intake.Journal(path)
++        log = fk.drain_intake(journal, "o/r", board, {"cards": {}}, None, deadline=clock[0] + 10)
++        # No second operation may start after the first consumes the budget.
++        assert len(calls) == index + 1
++        assert any("intake_budget" in line for line in log)
++        assert tuple(journal.db.execute("SELECT id,payload,attempted FROM pages").fetchone()) == original
++        assert journal.db.execute("SELECT sum(delivered) FROM occurrences").fetchone()[0] == 0
++        journal.close()
++    assert calls == [first, other, first, other]
++    assert not board.cards
++
++
++def test_retry_page_delivers_despite_slow_pending_owner(tmp_path, monkeypatch):
++    path = tmp_path / "queue.sqlite3"
++    clock = [0.0]
++    monkeypatch.setattr(fk.time, "monotonic", lambda: clock[0])
++    journal = intake.Journal(path)
++    journal.record("o/r", [(9, [{"test_id": "tests/a.py::test_page"}])],
++                   {"id": 1, "head_sha": "a" * 40})
++    journal.plan_pages("o/r", journal.pending("o/r"))
++    with journal.db:
++        journal.db.execute("UPDATE pages SET attempted=1")
++    payload = journal.db.execute("SELECT payload FROM pages").fetchone()[0]
++    journal.record("o/r", [(9, [{"test_id": "tests/a.py::test_pending"}])],
++                   {"id": 2, "head_sha": "a" * 40})
++    journal.close()
++
++    def resolve(*args, **kwargs):
++        clock[0] += 20
++        raise RuntimeError("owner unavailable")
++
++    monkeypatch.setattr(fk, "file_cards", resolve)
++    board = Board()
++    for _ in range(3):
++        journal = intake.Journal(path)
++        fk.drain_intake(journal, "o/r", board, {"cards": {}}, None, deadline=clock[0] + 10)
++        journal.close()
++    journal = intake.Journal(path)
++    assert [r[0] for r in journal.db.execute("SELECT delivered FROM occurrences ORDER BY id")] == [1, 0]
++    assert len(board.cards) == 1
++    assert board.notes["card0"] == [payload]
++    journal.close()
++
++
++def test_pending_progresses_despite_slow_retry_and_stale_tickets(tmp_path, monkeypatch):
++    path = tmp_path / "queue.sqlite3"
++    clock = [0.0]
++    monkeypatch.setattr(fk.time, "monotonic", lambda: clock[0])
++    journal = intake.Journal(path)
++    run = {"id": 1, "head_sha": "a" * 40}
++    journal.remember_runs("o/r", [run])
++    journal.record("o/r", [(9, [{"test_id": "tests/a.py::test_page"}])], run)
++    journal.plan_pages("o/r", journal.pending("o/r"))
++    with journal.db:
++        journal.db.execute("UPDATE pages SET attempted=1")
++        journal.enqueue("o/r", "page", "999")  # retained historical ticket, no page
++    journal.record("o/r", [(9, [{"test_id": "tests/a.py::test_pending"}])],
++                   {"id": 2, "head_sha": "a" * 40})
++    journal.record("other/repo", [(9, [{"test_id": "tests/a.py::test_foreign"}])], run)
++    journal.close()
++
++    class Slow(Board):
++        def comment(self, cid, body):
++            if '"test_id": "tests/a.py::test_page"' in body:
++                clock[0] += 20
++                raise RuntimeError("page unavailable")
++            super().comment(cid, body)
++
++    board = Slow()
++    for _ in range(3):
++        journal = intake.Journal(path)
++        fk.drain_intake(journal, "o/r", board, {"cards": {}}, None, deadline=clock[0] + 10)
++        journal.close()
++    journal = intake.Journal(path)
++    assert [r[0] for r in journal.db.execute("SELECT delivered FROM occurrences ORDER BY id")] == [0, 1, 0]
++    assert len(board.cards) == 1
++    assert len(board.notes["card0"]) == 1
++    # An unbounded ordinary drain retains the same filtering and exact readback.
++    fk.drain_intake(journal, "o/r", board, {"cards": {}}, None)
++    assert len(board.notes["card0"]) == 1
++    with journal.db:
++        journal.enqueue("o/r", "run", "2")  # shares a pending occurrence's numeric ID
++    selected = []
++    def select_pages(*args, **kwargs):
++        if kwargs["page_ids"]:
++            selected.append(("page", kwargs["page_ids"]))
++        return []
++    monkeypatch.setattr(journal, "deliver", select_pages)
++
++    def unavailable(entries, **kwargs):
++        selected.append(("occurrence", entries[0]["test_id"]))
++        raise RuntimeError("fixture unavailable")
++
++    monkeypatch.setattr(fk, "file_cards", unavailable)
++    fk.drain_intake(journal, "o/r", board, {"cards": {}}, None)
++    assert selected == [("page", {1})], "exclude delivered, foreign, stale and non-drain tickets"
++    journal.close()
++
++
++@pytest.mark.parametrize("boundary", ["page", "occurrence"])
++def test_batch_flush_deadline_prevents_next_attempt(tmp_path, monkeypatch, boundary):
++    journal = intake.Journal(tmp_path / "queue.sqlite3")
++    journal.record("o/r", [(9, [{"test_id": "tests/a.py::test_first"}])],
++                   {"id": 1, "head_sha": "a" * 40})
++    journal.plan_pages("o/r", journal.pending("o/r"))
++    if boundary == "page":
++        with journal.db:
++            journal.db.execute("UPDATE pages SET attempted=1")
++    journal.record("o/r", [(9, [{"test_id": "tests/a.py::test_second"}])],
++                   {"id": 2, "head_sha": "a" * 40})
++    if boundary == "page":
++        journal.rotate("o/r", "page", "1")
++    clock, owners = [0.0], []
++    monkeypatch.setattr(fk.time, "monotonic", lambda: clock[0])
++
++    def resolve(entries, **kwargs):
++        owners.append(entries[0]["test_id"])
++        return ["queued"]
++
++    class Slow(Board):
++        def list_cards(self):
++            clock[0] += 20
++            raise RuntimeError("delivery inventory unavailable")
++
++    monkeypatch.setattr(fk, "file_cards", resolve)
++    expected = "first" if boundary == "occurrence" else "second"
++    deferred_kind, deferred_id = ("occurrence", "2") if boundary == "occurrence" else ("page", "1")
++    ticket = journal.db.execute("SELECT ticket FROM scheduling WHERE kind=? AND item=?",
++                                (deferred_kind, deferred_id)).fetchone()[0]
++    log = fk.drain_intake(journal, "o/r", Slow(), {"cards": {}}, None, deadline=10)
++    assert owners == [f"tests/a.py::test_{expected}"]
++    assert any("intake_budget" in line for line in log)
++    assert journal.db.execute("SELECT ticket FROM scheduling WHERE kind=? AND item=?",
++                              (deferred_kind, deferred_id)).fetchone()[0] == ticket
++    journal.close()
++
++
++def test_expired_drain_does_not_rotate_or_call_board(tmp_path, monkeypatch):
++    journal = intake.Journal(tmp_path / "queue.sqlite3")
++    journal.record("o/r", [(9, [{"test_id": "tests/a.py::test_pending"}])],
++                   {"id": 1, "head_sha": "a" * 40})
++    before = [tuple(r) for r in journal.db.execute("SELECT * FROM scheduling")]
++    monkeypatch.setattr(fk.time, "monotonic", lambda: 10)
++    monkeypatch.setattr(fk, "file_cards", lambda *a, **kw: pytest.fail("expired owner lookup"))
++    assert fk.drain_intake(journal, "o/r", Board(), {"cards": {}}, None, deadline=10) == [
++        "FAILED intake_budget; durable retry pending"]
++    assert [tuple(r) for r in journal.db.execute("SELECT * FROM scheduling")] == before
++    journal.close()
+-- 
+2.43.0
+

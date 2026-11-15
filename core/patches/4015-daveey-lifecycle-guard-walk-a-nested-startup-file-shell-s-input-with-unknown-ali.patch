@@ -1,0 +1,492 @@
+From 76e3ffa400e80611347e68b10d0b4b9cf8c159a7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 17:27:28 +0000
+Subject: [PATCH] [daveey] lifecycle guard: walk a nested startup-file shell's
+ input with unknown alias names (PR #2358 review 5894325109 nit 1)
+
+A nested login/interactive shell, zsh, an ssh remote shell or a root login
+shell sources its own startup files, so the session's alias names say nothing
+about its aliases. Heredoc bodies fed to it (any depth), its -c payload and
+its script are walked again with alias_names=None, so any NAME ( there may
+open a keyword-led subshell. Quoted interpreter bodies inside it
+(python3 - <<'PY') stay masked, keeping the ssh 'bash -ls' repro allowed.
+
+The detector lives in cron/lifecycle_guard_nested_shells.py (FILE_LINES cap).
+After #2494 (915aebe6ac, clustered -c flags) `_shell_options_end` returns the
+payload operand's index for a -c, so `_shell_inputs` reads arguments[index];
+clustered shapes (bash -lc, -ilc, -euo pipefail -lc, -c -l, zsh -lc/-ec) are
+covered by the nested-shell tests.
+
+RED->GREEN: on the #2358 source 18 new session-alias tests fail (including
+the exact nit shape `bash -l <<'EOF'\nt ( bash ~/.hermes/kanban.db )\nEOF`
+with session aliases {"zz"}); with this change all pass. Guard/heredoc test
+files (29 files referencing lifecycle_guard/shell_heredoc/terminal_tool_guards):
+1953 passed.
+
+Replay over 27728 unique real terminal commands from state.db x 5 alias sets
+(none/ll/stock/zz/unknown), old (main 1cd1ecc706) vs new: 0 verdict changes;
+refused 28/28/29/28/55 both sides (identical JSON output).
+---
+ cron/lifecycle_guard.py                       |  31 ++-
+ cron/lifecycle_guard_nested_shells.py         | 212 ++++++++++++++++++
+ .../test_lifecycle_guard_session_aliases.py   |  88 ++++++++
+ tools/shell_heredoc.py                        |  40 ++++
+ 4 files changed, 362 insertions(+), 9 deletions(-)
+ create mode 100644 cron/lifecycle_guard_nested_shells.py
+
+diff --git a/cron/lifecycle_guard.py b/cron/lifecycle_guard.py
+index 77e8214abc..b30a4ad261 100644
+--- a/cron/lifecycle_guard.py
++++ b/cron/lifecycle_guard.py
+@@ -502,6 +502,7 @@ class _LifecycleScanBudget:
+ 
+     __slots__ = (
+         "alias_names",
++        "aliases_defined",
+         "bytes_remaining",
+         "lines_remaining",
+         "mask_heredocs",
+@@ -536,13 +537,16 @@ class _LifecycleScanBudget:
+         self.alias_names: Optional[frozenset[str]] = (
+             session_aliases if isinstance(session_aliases, frozenset)
+             and all(isinstance(name, str) for name in session_aliases) else None)
++        # Sticky: some walked text may define or enable an alias (see `note_aliases`).
++        self.aliases_defined = False
+         # False when a session alias may shadow a heredoc consumer, wrapper or shell name
+         # (`alias python3=bash`): then no heredoc body is provably inert, so none is masked.
+         self.mask_heredocs = not _session_aliases_shadow_consumers(session_aliases)
+ 
+     def note_aliases(self, text: str) -> None:
+         """Record (sticky) that walked *text* may define or enable an alias."""
+-        if self.alias_names is not None and _may_define_alias(text):
++        if not self.aliases_defined and _may_define_alias(text):
++            self.aliases_defined = True
+             self.alias_names = None
+ 
+     def charge_text(self, text: str) -> bool:
+@@ -1777,13 +1781,15 @@ def _contains_unsafe_gateway_action(
+ 
+     def recurse(
+         text: str, cwd: Optional[str], executed: bool, source: Optional[str], python_source: bool = False,
++        nested: bool = False,
+     ) -> bool:
+         if python_source:
+             return _python_source_is_unsafe(text, budget)
+-        return _contains_unsafe_gateway_action(
+-            text, cwd=cwd, depth=depth + 1, visited=visited, budget=budget,
+-            read_remote_script=read_remote_script, executed=executed, source=source,
+-        )
++        with shell_scope(budget, nested):
++            return _contains_unsafe_gateway_action(
++                text, cwd=cwd, depth=depth + 1, visited=visited, budget=budget,
++                read_remote_script=read_remote_script, executed=executed, source=source,
++            )
+ 
+     # The walks below must see the same masked view `_direct_lifecycle_scan` sees (#110422): a
+     # path or `sh -c` payload inside a provably-inert heredoc body is never shell-executed, and an
+@@ -1793,11 +1799,18 @@ def _contains_unsafe_gateway_action(
+     walk_command = (strip_inert_heredoc_bodies(command, nested=True) if budget.mask_heredocs
+                     else command)
+ 
+-    for payload in itertools.chain(_iter_shell_command_payloads(walk_command),
+-                                   _iter_printed_shell_payloads(walk_command)):
++    # A nested startup-file shell's input is walked first, with unknown alias names (nit 1).
++    from cron.lifecycle_guard_nested_shells import collect_nested_shell_inputs, shell_scope
++
++    nested_texts, nested_scripts = collect_nested_shell_inputs(
++        command, walk_command, cwd=cwd, budget=budget)
++    for payload, nested in itertools.chain(
++            zip(nested_texts, itertools.repeat(True)),
++            zip(itertools.chain(_iter_shell_command_payloads(walk_command),
++                                _iter_printed_shell_payloads(walk_command)), itertools.repeat(False))):
+         # An `sh -c` payload is text of the same file (or command) it appears in; so is a string
+         # an interpreter prints when its output is fed to a shell.
+-        if recurse(payload, cwd, executed, source):
++        if recurse(payload, cwd, executed, source, nested=nested):
+             return True
+ 
+     for script_path, candidate_executed, python_source in _walk_candidates(
+@@ -1849,7 +1862,7 @@ def _contains_unsafe_gateway_action(
+         # Relative references inside a script resolve against that script's directory, not the cwd.
+         if recurse(
+             script_text, _resolve_script_directory(str(resolved)) or cwd, candidate_executed,
+-            f"`{script_path}`", python_source,
++            f"`{script_path}`", python_source, nested=resolved in nested_scripts,
+         ):
+             return True
+     return False
+diff --git a/cron/lifecycle_guard_nested_shells.py b/cron/lifecycle_guard_nested_shells.py
+new file mode 100644
+index 0000000000..3415a114ab
+--- /dev/null
++++ b/cron/lifecycle_guard_nested_shells.py
+@@ -0,0 +1,212 @@
++"""Nested shells holding aliases of their own, for the lifecycle guard (review 5894325109 nit 1).
++
++A shell the command starts may hold aliases the session's names say nothing about: its own
++startup files define them. What such a shell parses is walked with unknown alias names.
++"""
++
++from __future__ import annotations
++
++import contextlib
++import itertools
++import re
++from collections.abc import Iterator
++from pathlib import Path
++from typing import TYPE_CHECKING, Optional
++
++from cron.lifecycle_guard import (
++    _SHELL_EXECUTABLES,
++    _command_token_index,
++    _executable_name,
++    _executed_command_index,
++    _iter_command_segment_views,
++    _peel_transparent_prefixes,
++    _resolve_lenient,
++    _resolved_or_nothing,
++    _shell_options_end,
++    _split_redirections,
++)
++
++if TYPE_CHECKING:
++    from cron.lifecycle_guard import _LifecycleScanBudget
++
++
++@contextlib.contextmanager
++def nested_shell_scope(budget: _LifecycleScanBudget) -> Iterator[None]:
++    """Walk text such a nested shell parses: its alias names are unknown, so ``alias_names`` is
++    ``None`` inside and every ``NAME (`` may open a keyword-led subshell. The session's aliases do
++    not reach that shell, so they no longer keep heredoc bodies visible there (``mask_heredocs``).
++    Its own startup files are trusted not to rename an interpreter (``alias python3=bash``), as
++    everywhere a remote or nested shell's body is masked. On exit the session's state returns,
++    except that an alias defined by walked text stays sticky (``aliases_defined``)."""
++    saved = budget.alias_names, budget.mask_heredocs
++    budget.alias_names, budget.mask_heredocs = None, True
++    try:
++        yield
++    finally:
++        budget.mask_heredocs = saved[1]
++        if not budget.aliases_defined:
++            budget.alias_names = saved[0]
++
++
++def shell_scope(budget: _LifecycleScanBudget, nested: bool) -> contextlib.AbstractContextManager:
++    """``nested_shell_scope(budget)`` when *nested*, else a no-op scope."""
++    return nested_shell_scope(budget) if nested else contextlib.nullcontext()
++
++
++def collect_nested_shell_inputs(
++    command: str, walk_command: str, *, cwd: Optional[str], budget: _LifecycleScanBudget,
++) -> tuple[list[str], set[Path]]:
++    """``(texts, resolved scripts)`` a nested shell holding its own aliases parses in *command*
++    (see ``_iter_nested_shell_inputs``). Already unknown alias names need no second walk."""
++    texts: list[str] = []
++    scripts: set[Path] = set()
++    if budget.alias_names is None:
++        return texts, scripts
++    for text, script in _iter_nested_shell_inputs(command, walk_command, cwd=cwd):
++        if script is not None:
++            scripts.add(_resolve_lenient(script))
++        elif text:
++            texts.append(text)
++    return texts, scripts
++
++
++# Login/interactive POSIX shells (`-l`, `-i`, `-ils`, `--login`), every zsh (`~/.zshenv` runs
++# even non-interactively), a remote shell over ssh (sshd's bash sources `~/.bashrc`; no remote
++# command means a login shell), and `sudo -i`/`-s`, `su`, `exec -l`.
++_LOGIN_SHELL_OPTION_RE = re.compile(r"-[A-Za-z]*[il][A-Za-z]*|--login|--interactive")
++_SUDO_SHELL_OPTION_RE = re.compile(r"-[A-Za-z]*[is][A-Za-z]*|--login|--shell")
++_SUDO_VALUE_OPTIONS = frozenset("ugUCprtTh")
++# Cheap pre-filter: every such shell's name ends in "sh" or is su/sudo/exec.
++_NESTED_SHELL_HINT_RE = re.compile(r"sh\b|\bsu(?:do)?\b|\bexec\b")
++
++
++def _option_words(arguments: list[str], value_letters: frozenset[str]) -> tuple[list[str], int]:
++    """``(option words, index of the first operand)`` of a getopt-style argv tail; a short option
++    in *value_letters* consumes the next word unless the value is glued (``-uroot``)."""
++    options: list[str] = []
++    index = 0
++    while index < len(arguments) and arguments[index].startswith("-") and arguments[index] != "-":
++        word = arguments[index]
++        index += 1
++        if word == "--":
++            break
++        options.append(word)
++        if not word.startswith("--"):
++            for position, letter in enumerate(word[1:], 1):
++                if letter in value_letters:
++                    index += position == len(word) - 1  # `-u root` takes the next word
++                    break
++    return options, index
++
++
++def _shell_inputs(arguments: list[str], shell: str) -> tuple[str, Optional[str]]:
++    """What a POSIX *shell* given *arguments* parses as code: ``("payload", text)`` for ``-c``,
++    ``("script", path)`` for a script operand, else ``("stdin", None)``."""
++    index, command_string, reads_stdin = _shell_options_end(arguments, shell)
++    if command_string:
++        return ("payload", arguments[index]) if index < len(arguments) else ("stdin", None)
++    if index < len(arguments) and not reads_stdin:
++        return "script", arguments[index]
++    return "stdin", None
++
++
++def _remote_reads_stdin(remote: list[str]) -> bool:
++    """Whether an ssh remote command (its words, as ssh joins them) hands stdin to a shell:
++    none (a login shell), unparsable, or any segment running a shell that reads stdin."""
++    if not remote:
++        return True
++    text = " ".join(remote)
++    try:
++        views = list(_iter_command_segment_views(text))
++    except ValueError:
++        return True
++    for view in views:
++        index = _executed_command_index(view)
++        if index is None:
++            continue
++        name = _executable_name(view[index])
++        if name in _SHELL_EXECUTABLES and _shell_inputs(
++                _split_redirections(view[index + 1:])[0], name)[0] == "stdin":
++            return True
++        if name in ("sudo", "su", "ssh"):
++            return True  # another hop: fail closed rather than model it
++    return False
++
++
++def _nested_shell_input(view: list[str]) -> Optional[tuple[str, Optional[str]]]:
++    """``_shell_inputs`` of the nested shell *view* starts when that shell holds aliases of its
++    own (see above), else ``None``. For ssh only stdin counts: a remote ``-c`` or script names
++    remote text and paths."""
++    index = _command_token_index(view)
++    if index is None:
++        return None
++    name = _executable_name(view[index])
++    if name == "su":
++        options = view[index + 1:]
++        for position, word in enumerate(options[:-1]):
++            if word in ("-c", "--command"):
++                return "payload", options[position + 1]
++        return "stdin", None
++    if name == "sudo":
++        options, operand = _option_words(view[index + 1:], _SUDO_VALUE_OPTIONS)
++        if any(_SUDO_SHELL_OPTION_RE.fullmatch(word) for word in options):
++            rest = _split_redirections(view[index + 1 + operand:])[0]
++            return ("payload", " ".join(rest)) if rest else ("stdin", None)
++    login_exec = name == "exec" and "-l" in itertools.takewhile(
++        lambda word: word.startswith("-"), view[index + 1:])
++    peeled = _peel_transparent_prefixes(view, index)
++    if peeled >= len(view):
++        return None
++    name = _executable_name(view[peeled])
++    arguments = _split_redirections(view[peeled + 1:])[0]
++    if name == "ssh":
++        from tools.shell_heredoc import _SSH_VALUE_OPTIONS
++
++        _options, host = _option_words(arguments, frozenset(_SSH_VALUE_OPTIONS))
++        return ("stdin", None) if _remote_reads_stdin(arguments[host + 1:]) else None
++    if name not in _SHELL_EXECUTABLES:
++        return None
++    options_end = _shell_options_end(arguments, name)[0]
++    if name == "zsh" or login_exec or any(
++            _LOGIN_SHELL_OPTION_RE.fullmatch(word) for word in arguments[:options_end]):
++        return _shell_inputs(arguments, name)
++    return None
++
++
++def _feeds_nested_shell(owner: Optional[str]) -> bool:
++    """Whether a heredoc's *owner* text hands the body to such a nested shell as its script
++    (``None``: unknown owner, fail closed)."""
++    if owner is None:
++        return True
++    if not _NESTED_SHELL_HINT_RE.search(owner):
++        return False
++    try:
++        views = list(_iter_command_segment_views(owner))
++    except ValueError:
++        return True
++    return any(_nested_shell_input(view) == ("stdin", None) for view in views)
++
++
++def _iter_nested_shell_inputs(
++    command: str, walk_command: str, *, cwd: Optional[str],
++) -> Iterator[tuple[Optional[str], Optional[Path]]]:
++    """``(text, None)`` or ``(None, script)``: what a nested shell holding its own aliases parses
++    from *command*: heredoc bodies fed to it (at any depth, read from the unmasked *command*),
++    its ``-c`` payload and its script (from *walk_command*, as the ordinary walk reads them)."""
++    if not _NESTED_SHELL_HINT_RE.search(command):
++        return
++    from tools.shell_heredoc import iter_heredoc_bodies
++
++    for owner, body in iter_heredoc_bodies(command):
++        if _feeds_nested_shell(owner):
++            yield body, None
++    for view in _iter_command_segment_views(walk_command):
++        found = _nested_shell_input(view)
++        if found is None:
++            continue
++        kind, value = found
++        if kind == "payload" and value:
++            yield value, None
++        elif kind == "script" and value:
++            for path in _resolved_or_nothing(value, cwd):
++                yield None, path
+diff --git a/tests/cron/test_lifecycle_guard_session_aliases.py b/tests/cron/test_lifecycle_guard_session_aliases.py
+index c329c3a5f1..08fcf694dc 100644
+--- a/tests/cron/test_lifecycle_guard_session_aliases.py
++++ b/tests/cron/test_lifecycle_guard_session_aliases.py
+@@ -217,3 +217,91 @@ def test_heredoc_body_reading_an_over_cap_data_file_is_not_refused(tmp_path, in_
+     # Control: unknown session aliases still fail closed on the same text.
+     unsafe, refusal = scan_gateway_lifecycle(command, cwd=str(tmp_path), session_aliases=None)
+     assert unsafe is True and refusal is not None and "scan cap" in refusal
++
++
++# --- PR #2358 review 5894325109 nit 1: a nested login/interactive shell holds its own aliases -----
++# Its startup files (~/.bash_profile, ~/.zshenv, a remote host's) define them, so the outer
++# session's names say nothing about them: inside, every `NAME (` may be a keyword-led subshell.
++_NESTED_FOREIGN_SHELLS = [
++    "bash -l <<'EOF'\nt ( bash {db} )\nEOF",  # the nit's exact shape
++    "bash -i <<'EOF'\nt ( bash {db} )\nEOF",
++    "bash -ls <<'EOF'\nt ( bash {db} )\nEOF",
++    "bash --login <<'EOF'\nt ( bash {db} )\nEOF",
++    "sh -l <<'EOF'\nt ( bash {db} )\nEOF",
++    "zsh <<'EOF'\nt ( bash {db} )\nEOF",  # zsh sources ~/.zshenv even when non-interactive
++    "ssh -o BatchMode=yes ubuntu@h 'bash -ls' <<'EOF'\nt ( bash {db} )\nEOF",
++    "ssh ubuntu@h <<'EOF'\nt ( bash {db} )\nEOF",  # no remote command: a remote login shell
++    "ssh ubuntu@h 'bash -s' <<'EOF'\nt ( bash {db} )\nEOF",  # the remote host's startup files
++    "sudo -i <<'EOF'\nt ( bash {db} )\nEOF",
++    "bash -l -c 't ( bash {db} )'",
++    "bash -lc 't ( bash {db} )'",  # a clustered `-c` (#2494)
++    "bash -ilc 't ( bash {db} )'",
++    "bash -euo pipefail -lc 't ( bash {db} )'",
++    "zsh -lc 't ( bash {db} )'",
++    "bash -c -l 't ( bash {db} )'",
++    "zsh -c 't ( bash {db} )'",
++    "zsh -ec 't ( bash {db} )'",
++    "bash -l <<'EOF'\npython3 - <<'PY'\nprint(1)\nPY\nt ( bash {db} )\nEOF",
++    "bash -l {script}",
++]
++
++
++@pytest.mark.parametrize("shape", _NESTED_FOREIGN_SHELLS)
++def test_nested_login_shell_body_treats_names_as_unknown(tmp_path, live_kanban_db, shape):
++    """Base refused these under any session alias; #2358 allowed them when the outer names
++    (`zz`) missed `t`. The inner shell's own startup files decide whether `t` is an alias."""
++    assert "alias" not in str(tmp_path).lower()
++    script = tmp_path / "inner.sh"
++    script.write_text(f"t ( bash {live_kanban_db} )\n")
++    text = shape.format(db=live_kanban_db, script=script)
++    for names in (frozenset({"zz"}), frozenset()):
++        unsafe, refusal = scan_gateway_lifecycle(text, cwd=str(tmp_path), session_aliases=names)
++        assert unsafe is True and refusal is not None and "SQLite" in refusal, (shape, names)
++
++
++@pytest.mark.parametrize("shape", [
++    "bash <<'EOF'\nt ( bash {db} )\nEOF",  # a non-login, non-interactive child inherits no aliases
++    "bash -s <<'EOF'\nt ( bash {db} )\nEOF",
++    "t2 ( bash {db} )",
++])
++def test_plain_child_shell_keeps_session_names(tmp_path, live_kanban_db, shape):
++    """Controls: no login/interactive shell, so the session's names still decide (#2358)."""
++    assert "alias" not in str(tmp_path).lower()
++    text = shape.format(db=live_kanban_db)
++    assert scan_gateway_lifecycle(text, cwd=str(tmp_path), session_aliases=frozenset({"zz"})) == (
++        False, None)
++
++
++@pytest.mark.parametrize("names", [frozenset(), frozenset({"zz"}), _STOCK_ALIASES])
++def test_card_repro_python_body_in_login_shell_stays_allowed(tmp_path, live_kanban_db, names):
++    """The ssh `bash -ls` repro: its only `(` openers sit in a quoted `python3 -` body, which the
++    nested shell hands to Python, so they stay call arguments (mentions) under unknown names too.
++    Same for that body run by a local login shell."""
++    assert scan_gateway_lifecycle(_CARD_REPRO, cwd=str(tmp_path), session_aliases=names) == (
++        False, None)
++    body = _CARD_REPRO.split("<<'EOF'\n", 1)[1].rsplit("EOF", 1)[0]
++    local = "bash -l <<'OUT'\n" + body + "OUT"
++    assert scan_gateway_lifecycle(local, cwd=str(tmp_path), session_aliases=names) == (False, None)
++    # Control: the same body with a shell `NAME (` call next to it in the login shell refuses.
++    mixed = "bash -l <<'OUT'\n" + body + f"t ( bash {live_kanban_db} )\nOUT"
++    unsafe, refusal = scan_gateway_lifecycle(mixed, cwd=str(tmp_path), session_aliases=names)
++    assert unsafe is True and refusal is not None and "SQLite" in refusal
++
++
++def test_nested_shell_input_shapes():
++    """Which nested shells hold aliases of their own, and what of theirs is shell code."""
++    from cron.lifecycle_guard_nested_shells import _feeds_nested_shell, _iter_nested_shell_inputs
++
++    for owner in ("bash -l <<'E'", "sh -i <<'E'", "zsh <<'E'", "ssh h <<'E'",
++                  "ssh -p 22 -o X=1 h 'bash -s' <<'E'", "ssh h 'cd /x; bash' <<'E'",
++                  "sudo -i <<'E'", "sudo -u root -s <<'E'", "su - bob <<'E'",
++                  "timeout 9 bash --login <<'E'", "exec -l bash <<'E'", None):
++        assert _feeds_nested_shell(owner), owner
++    for owner in ("bash <<'E'", "bash -s <<'E'", "sh -e <<'E'", "python3 - <<'E'",
++                  "ssh h python3 - <<'E'", "ssh h 'cat > f' <<'E'", "bash -l x.sh <<'E'",
++                  "sudo -u bob python3 - <<'E'", "cat <<'E'"):
++        assert not _feeds_nested_shell(owner), owner
++    found = list(_iter_nested_shell_inputs("bash -l -c 'x ( y )'; zsh s.sh; bash -c 'z'", "", cwd="/"))
++    assert found == []  # *walk_command* holds the segments; *command* only its heredocs
++    text = "bash -l -c 'x ( y )'; bash -c 'z'"
++    assert list(_iter_nested_shell_inputs(text, text, cwd="/")) == [("x ( y )", None)]
+diff --git a/tools/shell_heredoc.py b/tools/shell_heredoc.py
+index ad5ae08381..653aa5f6fa 100644
+--- a/tools/shell_heredoc.py
++++ b/tools/shell_heredoc.py
+@@ -15,6 +15,7 @@ from __future__ import annotations
+ 
+ import re
+ import shlex
++from collections.abc import Iterator
+ 
+ from tools.shell_arith_sink import DATE_PRODUCER_BODY, substitution_in_arithmetic
+ 
+@@ -703,6 +704,45 @@ def strip_inert_heredoc_bodies(command: str, *, nested: bool = False, _depth: in
+     return result
+ 
+ 
++def iter_heredoc_bodies(command: str, *, _depth: int = 0) -> Iterator[tuple[str | None, str]]:
++    """``(owner, body)`` for every heredoc in *command*, bodies nested in bodies included.
++
++    *owner* is the text of the command reading the body: its simple command on the opener line,
++    or the whole opener line when several heredocs or a list operator share it. ``None`` means
++    the owner is unknown (nested past ``_MAX_NESTED_HEREDOC_DEPTH``). An opener whose operator
++    does not parse or whose body has no terminator yields the rest of *command* as its body, so a
++    caller that treats some owners' bodies as shell code fails closed."""
++    if "<<" not in command:
++        return
++    if _depth > _MAX_NESTED_HEREDOC_DEPTH:
++        yield None, command
++        return
++    last_opener_index = command.rfind("<<")
++    cursor = 0
++    while cursor <= last_opener_index:
++        end, specs, unknown_operator, post_list, owner_start = _scan_heredoc_command_unit(
++            command, cursor)
++        line = command[cursor:end]
++        if unknown_operator:
++            yield line, command[end + 1:]
++            return
++        if not specs:
++            if end >= len(command):
++                return
++            cursor = end + 1
++            continue
++        owner = line if len(specs) > 1 or post_list else command[owner_start:end]
++        bodies = _heredoc_bodies(command, end + 1, specs) if end < len(command) else None
++        if bodies is None:
++            yield owner, command[end + 1:]
++            return
++        for start, terminator, _after in bodies:
++            body = command[start:terminator]
++            yield owner, body
++            yield from iter_heredoc_bodies(body, _depth=_depth + 1)
++        cursor = bodies[-1][2]
++
++
+ def _apply_replacements(command: str, replacements: list[tuple[int, int, str, str]]) -> str:
+     """Single-pass rebuild (replacements are sorted and non-overlapping)."""
+     parts: list[str] = []
+-- 
+2.43.0
+

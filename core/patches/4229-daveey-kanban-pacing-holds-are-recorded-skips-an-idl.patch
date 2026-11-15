@@ -1,0 +1,656 @@
+From 9fe356932d337bcb5328714143e51de901714760 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 17:18:09 +0000
+Subject: [PATCH] [daveey] kanban: pacing holds are recorded skips; an idle
+ account's null five_hour counts as a fresh window
+
+Follow-ups to PR #3025 (LLM quota pacing governor), from exact-head review t_01a1dae9702e75d7
+(pullrequestreview-5905947357). Card t_01a1dafcb027ff7b.
+
+1. Paced holds read as "dispatcher skip reason unrecorded".
+   A pacing hold appended `respawn_guarded` to the in-memory DispatchResult and wrote its own `llm_paced`
+   event, but no `respawn_guarded` or `dispatch_skipped` event. `kanban_dispatch_skip._tick_skips` did not
+   know the governor, so queue position, the chat-wait and parent-unclaimed notices said "skip reason
+   unrecorded" after 30 min (and offered their generic advice), and `kanban diagnostics` called the card
+   `stranded_in_ready`.
+   Fix: the governor records `DispatchResult.llm_paced` (task, "<provider> <paced|held>, ...", until when
+   held, per-provider state/limit/running). `_tick_skips` turns it into one `dispatch_skipped
+   {reason: llm_paced}` row per episode. `words`/`advice` render "held: LLM quota pacing (anthropic paced
+   pool)" plus "starts on its own once its provider pool is back on pace ... priority changes do not lift
+   a pacing hold". Diagnostics read the episode's latest skip (`_episode_skip`, shared with the pinned
+   quota wall) and report `held_in_ready` with hold_reason `llm_paced` (with the reset when held). A held
+   skip whose reset has passed no longer counts as a hold. `llm_paced` is classified as a quiet-hold
+   DispatchResult field.
+
+2. An idle account added 0 sustainable rate.
+   Live `/api/oauth/usage` (read-only, worker-4 pool, 2026-11-14T16:57Z; card comment 77613) returns
+   `"five_hour": null` for 6 of 7 accounts: the whole window object, not `resets_at: null`.
+   `account_usage` skips it, so those accounts had no five_hour reading. `_factor` summed sustainable rate
+   only over headroom accounts with a reading and a reset. With account-secondary the only headroom account
+   (7d 34%, 5h idle), account-primary's 5h burn made the five_hour factor 0, so the pool was PACED with limit 0
+   while account-secondary was free.
+   Fix: `_sustainable` counts a headroom account's missing window, or a window with no reset, as a fresh full
+   window, `(target - used) / WINDOW_SECONDS[kind]`. Reserved accounts still add nothing.
+
+3. Config and docs.
+   `kanban.llm_pacing.*` is registered in config_defaults through the import-free
+   `hermes_cli/kanban_pacing_defaults.py` (the pattern of `kanban_workspace_source_config`). A test pins it
+   to `PacingConfig()`. The governor is documented in website/docs/user-guide/features/kanban.md (states,
+   recorded skip, key table). File-line caps are offset in config_defaults (two joined default lines) and
+   kanban_db_dispatch (one docstring as a comment).
+
+Tests: tests/hermes_cli/test_kanban_llm_pacing_followups.py (11).
+RED on origin/main be9b942274 with only the test file: 9 failed, 1 passed (the reserved-account guard
+already held; the config-registration test was added after the RED run). GREEN: 11/11.
+Dispatch-level tests also cover the reviewer's surviving mutants:
+- any->all: a class route with an ungoverned provider starts.
+- class_providers=[]: a class:deep card is paced on its class's providers.
+- local_running=0 and avg_running=0: avg 4 x factor 0.625 gives limit 2, so 2 of 3 cards start.
+- is_deferrable=False: a priority -1 card gets floor(2 x 0.5) = 1 and waits behind the normal card.
+scripts/check --base origin/main: ok.
+---
+ hermes_cli/config_defaults.py                 |   8 +-
+ hermes_cli/kanban_db_dispatch.py              |   4 +-
+ hermes_cli/kanban_db_dispatch_stuck.py        |   1 +
+ hermes_cli/kanban_diagnostics.py              |  51 +++-
+ hermes_cli/kanban_dispatch_skip.py            |   9 +-
+ hermes_cli/kanban_llm_pacing.py               |  14 +-
+ hermes_cli/kanban_llm_pacing_dispatch.py      |   4 +
+ hermes_cli/kanban_pacing_defaults.py          |  25 ++
+ .../test_kanban_llm_pacing_followups.py       | 267 ++++++++++++++++++
+ website/docs/user-guide/features/kanban.md    |  22 ++
+ 10 files changed, 385 insertions(+), 20 deletions(-)
+ create mode 100644 hermes_cli/kanban_pacing_defaults.py
+ create mode 100644 tests/hermes_cli/test_kanban_llm_pacing_followups.py
+
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index b0e404d05c..5a32ded5cd 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -21,6 +21,7 @@ LEGACY_VERCEL_RUNTIME = "node24"  # the seeded pre-49 default, never a user choi
+ from hermes_cli.config_env_registry import EnvVarRegistry as _EnvVarRegistry
+ from hermes_cli.config_defaults_routing import routing_defaults
+ from hermes_cli.kanban_workspace_source_config import DEFAULTS as _WORKSPACE_SOURCE_DEFAULTS
++from hermes_cli.kanban_pacing_defaults import DEFAULTS as _PACING_DEFAULTS
+ 
+ 
+ DEFAULT_CONFIG = {
+@@ -1980,16 +1981,15 @@ DEFAULT_CONFIG = {
+         # assignees ([] = all); default_model_keep_patterns are case-insensitive regexes on title+body.
+         # With a class default, review/retry/keep-pattern work requests class:deep instead;
+         # exact card pins remain unchanged. Class providers must be auto (or unset).
+-        "default_model": "",
+-        "default_provider": "",
+-        "default_model_profiles": [],
+-        "default_model_keep_patterns": [],
++        "default_model": "", "default_provider": "",
++        "default_model_profiles": [], "default_model_keep_patterns": [],
+         # Strong tier [daveey]: the model (+ optional provider; "" = inferred from the model) that
+         # review-lane, retry-after-failure and keep-pattern cards run on while default_model is set.
+         # "" = the old behaviour (the profile's own model, or class:deep with a class default), which
+         # silently followed every change of the profile's default model.
+         "strong_model": "", "strong_provider": "",
+         "pin_quota_reroute_min_hours": 6,  # a card pin walled this long runs on a same-class peer (kanban_pin_reroute)
++        "llm_pacing": dict(_PACING_DEFAULTS, providers=list(_PACING_DEFAULTS["providers"])),  # claim-time quota pacing
+         # Each tick, requeue 'running' cards with broken claim bookkeeping (claim_lock or
+         # claim_expires NULL with a dead worker) that TTL/crash/stale recovery can't see. False
+         # keeps orphans frozen for manual forensics.
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 6e281f645d..9bce46767f 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -202,10 +202,10 @@ class DispatchResult(QuietResultFields):
+     """``(task_id, reason)`` whose claim the Board lease deferred this tick (``lease_held``, ``labels_mismatch``,
+     ``offline``). The tick moves on to the next candidate; the stuck warning names these. [daveey]"""
+     admission_deferred: list[str] = field(default_factory=list)  # hub claim screen left unclaimed, unjudged [daveey]
+-    crashed: list[str] = field(default_factory=list)
+-    """Task ids reclaimed because their worker PID disappeared."""
++    crashed: list[str] = field(default_factory=list)  # task ids reclaimed because their worker PID disappeared
+     capsule_refused: list[tuple[str, str]] = field(default_factory=list)  # (task_id, code): kanban_capsule_admission [daveey]
+     pinned_quota_held: list = field(default_factory=list)  # (task_id, model, provider, reset): kanban_dispatch_skip
++    llm_paced: list = field(default_factory=list)  # (task_id, detail, until, extra): the quota-pace governor's holds
+     remote_archived: list[str] = field(default_factory=list)  # archived on another gateway's stop (kanban_remote_stop)
+     auto_blocked: list[str] = field(default_factory=list)
+     """Task ids auto-blocked by the spawn-failure circuit breaker."""
+diff --git a/hermes_cli/kanban_db_dispatch_stuck.py b/hermes_cli/kanban_db_dispatch_stuck.py
+index b4bb07c063..77c4cfd913 100644
+--- a/hermes_cli/kanban_db_dispatch_stuck.py
++++ b/hermes_cli/kanban_db_dispatch_stuck.py
+@@ -27,6 +27,7 @@ QUIET_COMPATIBLE_FIELDS = frozenset({
+ QUIET_HOLD_FIELDS = frozenset({
+     "spawned", "skipped_unassigned", "skipped_nonspawnable", "skipped_per_profile_capped", "owner_down",
+     "skipped_ineligible", "claim_deferred", "admission_deferred", "capsule_refused", "pinned_quota_held",
++    "llm_paced",
+     "auto_blocked", "respawn_guarded", "no_progress_held", "clock_held", "rate_limited",  # holds / guards
+     "crashed", "timed_out", "stale", "reclaimed", "reconciled_orphans", "released_leftover_claims",
+     "ownership_error",                                    # worker or claim failures
+diff --git a/hermes_cli/kanban_diagnostics.py b/hermes_cli/kanban_diagnostics.py
+index bb86560b4e..498d577fbf 100644
+--- a/hermes_cli/kanban_diagnostics.py
++++ b/hermes_cli/kanban_diagnostics.py
+@@ -790,24 +790,42 @@ def _foreign_machines(task, cfg) -> list[str]:
+             if str(l).startswith("machine:") and str(l).split(":", 1)[1] != own]
+ 
+ 
+-def _pinned_quota_hold_until(events, now) -> Optional[int]:
+-    """Reset time when the current ready episode's latest ``dispatch_skipped`` is a ``pinned_quota_wall``
+-    hold still in the future (``kanban_dispatch_skip``); else None. Same episode bounds as its reader."""
+-    from hermes_cli.kanban_dispatch_skip import EVENT, PINNED_QUOTA_WALL, _episode_kinds
++def _episode_skip(events) -> dict:
++    """Payload of the current ready episode's latest ``dispatch_skipped`` (``kanban_dispatch_skip``), or {} when a
++    later episode event (or none) ends it. Same episode bounds as its reader."""
++    from hermes_cli.kanban_dispatch_skip import EVENT, _episode_kinds
+     bounds = _episode_kinds() | {EVENT}
+     ordered = (events.quota_candidates if isinstance(events, EventHistory) else
+                sorted(events or [], key=lambda ev: (_event_ts(ev), _task_field(ev, "id", 0) or 0), reverse=True))
+     for ev in ordered:
+         if _event_kind(ev) not in bounds:
+             continue
+-        payload = _parse_payload(ev) if _event_kind(ev) == EVENT else {}
+-        until = payload.get("until")
+-        if payload.get("reason") == PINNED_QUOTA_WALL and isinstance(until, (int, float)) and until > now:
+-            return int(until)
+-        return None
++        return _parse_payload(ev) if _event_kind(ev) == EVENT else {}
++    return {}
++
++
++def _pinned_quota_hold_until(events, now) -> Optional[int]:
++    """Reset time when the current ready episode's latest ``dispatch_skipped`` is a ``pinned_quota_wall``
++    hold still in the future (``kanban_dispatch_skip``); else None."""
++    from hermes_cli.kanban_dispatch_skip import PINNED_QUOTA_WALL
++    payload = _episode_skip(events)
++    until = payload.get("until")
++    if payload.get("reason") == PINNED_QUOTA_WALL and isinstance(until, (int, float)) and until > now:
++        return int(until)
+     return None
+ 
+ 
++def _llm_paced_hold(events, now) -> Optional[dict]:
++    """The episode's latest skip when it is an LLM quota-pacing hold (``llm_paced``) whose pool reset, if it named
++    one, is still ahead; else None. A paced pool names no reset: the dispatcher re-reads it every interval."""
++    from hermes_cli.kanban_dispatch_skip import LLM_PACED
++    payload = _episode_skip(events)
++    until = payload.get("until")
++    if payload.get("reason") != LLM_PACED or (isinstance(until, (int, float)) and until <= now):
++        return None
++    return payload
++
++
+ def _ready_hold_reason(task, events, cfg, now=None) -> Optional[str]:
+     """Last observed guard or current foreign-machine pin, not a live admission verdict.
+ 
+@@ -823,8 +841,11 @@ def _ready_hold_reason(task, events, cfg, now=None) -> Optional[str]:
+         return "respawn_guarded"
+     if _foreign_machines(task, cfg):
+         return "foreign_runs_on"
+-    if _pinned_quota_hold_until(events, time.time() if now is None else now):
++    now = time.time() if now is None else now
++    if _pinned_quota_hold_until(events, now):
+         return "pinned_quota_wall"  # a fresh pin held on its live quota wall (kanban-dd62aef001)
++    if _llm_paced_hold(events, now):
++        return "llm_paced"  # the quota-pace governor holds it until its provider pool is back on pace
+     return None
+ 
+ 
+@@ -942,18 +963,26 @@ def _rule_held_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
+     guard_reason, hold_until = _guard_clock(events, runs, cfg, since) if reason == "respawn_guarded" else (None, None)
+     if reason == "pinned_quota_wall":
+         hold_until = _pinned_quota_hold_until(events, now)
++    paced = _llm_paced_hold(events, now) if reason == "llm_paced" else None
++    if paced:
++        guard_reason = str(paced.get("detail") or "") or None
++        hold_until = int(paced["until"]) if isinstance(paced.get("until"), (int, float)) else None
+     hold = f"{reason}: {guard_reason}" if guard_reason else reason
+     if hold_until:
+         stamp = time.strftime("%H:%M:%SZ", time.gmtime(hold_until))
+         hold += f", until {stamp}" if hold_until > now else f", expired {stamp}"
+     return [Diagnostic(
+         kind="held_in_ready", severity="warning",
+-        title=(f"Ready {int(age / 60)}m, last observed hold ({hold})" if reason == "respawn_guarded"
++        title=(f"Ready {int(age / 60)}m, last observed hold ({hold})" if reason in ("respawn_guarded", "llm_paced")
+                else f"Ready {int(age / 60)}m, held ({hold})"),
+         detail=("The last recorded dispatch decision was a guard hold; the current hold is not verified. "
+                 "A cleared blocker, capacity limit, or missing pickup can leave this historical event "
+                 "unchanged. Check the execution machine's current dispatcher verdict."
+                 if reason == "respawn_guarded" else
++                "The LLM quota-pace governor (kanban.llm_pacing) held its claim: the provider's OAuth pool burns "
++                "ahead of its sustainable rate (paced) or every account is past its reserve (held), so the "
++                "dispatcher keeps fewer runs on it. It starts on its own once the pool is back on pace; this "
++                "is the last recorded verdict, not a live one." if reason == "llm_paced" else
+                 "Its explicit model pin is quota-walled and no same-class reroute applies; it starts when "
+                 "the wall resets." if reason == "pinned_quota_wall" else
+                 "A foreign machine:* pin waits for that machine (or a re-file)."),
+diff --git a/hermes_cli/kanban_dispatch_skip.py b/hermes_cli/kanban_dispatch_skip.py
+index cc50420884..a9226db390 100644
+--- a/hermes_cli/kanban_dispatch_skip.py
++++ b/hermes_cli/kanban_dispatch_skip.py
+@@ -10,7 +10,7 @@ guessed a quota wall and parked the card. The tick logs had rotated, so the real
+   ONE ``dispatch_skipped {reason, detail, until?}`` event per (card, reason, detail) per ready episode for every
+   row the tick passed over: ``skipped_ineligible``, ``capsule_refused``, ``no_progress_held``,
+   ``per_profile_capped``, ``claim_deferred`` (Board lease refusals and this host's admission-gate refusals, told
+-  apart by the deferral's ``origin``), ``owner_down`` and ``pinned_quota_wall``.
++  apart by the deferral's ``origin``), ``owner_down``, ``pinned_quota_wall`` and ``llm_paced``.
+   A (reason, detail) the episode already holds adds nothing; a new one appends. At most :data:`MAX_PER_EPISODE` per
+   episode, so two dispatchers that disagree cannot grow a card's history without bound.
+ * :func:`pinned_quota_hold` holds a fresh card (no run yet) on the ready lane whose explicit pin's provider pool
+@@ -44,6 +44,8 @@ _log = logging.getLogger(__name__)
+ 
+ EVENT = "dispatch_skipped"
+ PINNED_QUOTA_WALL = "pinned_quota_wall"
++# The LLM quota-pace governor held the card (``kanban.llm_pacing``): detail ``<provider> <paced|held>, ...``.
++LLM_PACED = "llm_paced"
+ MAX_PER_EPISODE = 16
+ DETAIL_CHARS = 200
+ UNRECORDED_AFTER_SECONDS = 30 * 60
+@@ -214,6 +216,7 @@ def _tick_skips(result: Any) -> list[tuple[str, str, Any, Optional[float], dict[
+     out += [(tid, "owner_down", f"{who}:{code}", None, {}) for tid, who, code in getattr(result, "owner_down", ())]
+     out += [(tid, PINNED_QUOTA_WALL, f"{model} ({provider})", until, {"model": model, "provider": provider})
+             for tid, model, provider, until in getattr(result, "pinned_quota_held", ())]
++    out += [(tid, LLM_PACED, detail, until, extra) for tid, detail, until, extra in getattr(result, LLM_PACED, ())]
+     return out
+ 
+ 
+@@ -288,6 +291,7 @@ def _stamp(epoch: Any, now: Optional[float] = None) -> str:
+ 
+ _WORDS = {
+     PINNED_QUOTA_WALL: "held: pinned model {detail} quota-walled",
++    LLM_PACED: "held: LLM quota pacing ({detail} pool)",
+     "per_profile_capped": "skipped: assignee {detail} is at its per-profile worker cap",
+     "skipped_ineligible": "skipped: this machine cannot lease it ({detail})",
+     "capsule_refused": "skipped: capsule admission refused it ({detail})",
+@@ -332,6 +336,9 @@ def advice(skip: dict[str, Any], *, now: Optional[float] = None) -> str:
+     if _wall_passed(skip, now):
+         return ("that wall's reset has passed; the next dispatcher tick re-checks the pin. Priority changes do not "
+                 "clear a quota wall. Do not run its work outside the dispatcher")
++    if skip.get("reason") == LLM_PACED:
++        return ("it starts on its own once its provider pool is back on pace or a paced slot frees; priority changes "
++                "do not lift a pacing hold. Do not run its work outside the dispatcher")
+     if skip.get("reason") == PINNED_QUOTA_WALL:
+         return ("it starts on its own when that wall resets. Re-pin it (`hermes kanban set-model <id> ...`) only if it "
+                 "cannot wait; priority changes do not clear a quota wall. Do not run its work outside the dispatcher")
+diff --git a/hermes_cli/kanban_llm_pacing.py b/hermes_cli/kanban_llm_pacing.py
+index b97c227a19..3ab5bf610e 100644
+--- a/hermes_cli/kanban_llm_pacing.py
++++ b/hermes_cli/kanban_llm_pacing.py
+@@ -154,13 +154,23 @@ def _held_until(current: list[Reading], cfg: PacingConfig) -> Optional[float]:
+     return min(frees) if frees else None
+ 
+ 
++def _sustainable(reading: Optional[Reading], kind: str, cfg: PacingConfig) -> float:
++    """Percent per second a headroom account can burn in ``kind`` and reach ``target`` at its reset. A window not
++    started yet counts as a fresh full window: ``/api/oauth/usage`` reports an idle account's five_hour as
++    ``null`` (no reading at all; 6 of 7 accounts on 11-14 16:57Z), or a reading may carry no reset."""
++    used = reading.used if reading is not None else 0.0
++    if reading is None or reading.reset_at is None:
++        return max(0.0, cfg.target - used) / WINDOW_SECONDS[kind]
++    return max(0.0, cfg.target - used) / max(60.0, reading.reset_at - reading.ts)
++
++
+ def _factor(current: list[Reading], history: list[Reading], headroom: set[str], cfg: PacingConfig) -> float:
+     factor = math.inf
+     for kind in (FIVE_HOUR, SEVEN_DAY):
+         readings = [r for r in current if r.kind == kind]
+         burn = sum(burn_rate(r, history, cfg) for r in readings)
+-        sustainable = sum(max(0.0, cfg.target - r.used) / max(60.0, r.reset_at - r.ts)
+-                          for r in readings if r.account in headroom and r.reset_at is not None)
++        by_account = {r.account: r for r in readings}
++        sustainable = sum(_sustainable(by_account.get(account), kind, cfg) for account in headroom)
+         if burn > 0:
+             factor = min(factor, sustainable / burn)
+     return factor
+diff --git a/hermes_cli/kanban_llm_pacing_dispatch.py b/hermes_cli/kanban_llm_pacing_dispatch.py
+index 08bfd00f9c..3833743e97 100644
+--- a/hermes_cli/kanban_llm_pacing_dispatch.py
++++ b/hermes_cli/kanban_llm_pacing_dispatch.py
+@@ -239,6 +239,10 @@ def _record(conn: sqlite3.Connection, task_id: str, verdicts: list[dict], result
+     until = min((v["until"] for v in verdicts if v.get("until")), default=None)
+     result.respawn_guarded.append((task_id, lp.GUARD_REASON))
+     result.clock_held[task_id] = (lp.GUARD_REASON, int(until or now + cfg.read_interval))
++    # The tick's skip record (``kanban_dispatch_skip``): notices and diagnostics name the hold, not "unrecorded".
++    detail = ", ".join(f"{v['provider']} {v['state']}" for v in verdicts)
++    result.llm_paced.append((task_id, detail, int(until) if until else None, {"providers": [
++        {k: v.get(k) for k in ("provider", "state", "limit", "running")} for v in verdicts]}))
+     if dry_run:
+         return
+     last = conn.execute("SELECT payload, created_at FROM task_events WHERE task_id = ? AND kind = ? "
+diff --git a/hermes_cli/kanban_pacing_defaults.py b/hermes_cli/kanban_pacing_defaults.py
+new file mode 100644
+index 0000000000..75dd8afcbc
+--- /dev/null
++++ b/hermes_cli/kanban_pacing_defaults.py
+@@ -0,0 +1,25 @@
++"""``kanban.llm_pacing`` defaults: the LLM quota pacing governor (Kanban claim time only). [daveey]
++
++Import-free so ``config_defaults`` can embed them; the governor's ``PacingConfig`` keeps the same values (a test
++pins the two together). Before claiming a card the dispatcher holds it when its provider's OAuth pool
++(``five_hour``/``seven_day`` usage windows) burns fast enough to pass ``target_percent`` before a window resets
++(paced), or every account is past its reserve (held). It fails open when no account reads.
++
++- ``reserve_*_percent``: past this an account's window is left to chats, cron and notices.
++- ``providers``: governed providers; cards on any other provider always start.
++- ``read_interval_seconds``: usage read cadence per Hermes home. ``rate_window_seconds``: burn-rate and
++  average-concurrency lookback. ``min_rate_span_seconds``: shortest sample span a burn slope is measured over.
++- ``deferrable_share``: share of a paced limit review-lane, negative-priority and woken cards may use.
++"""
++
++DEFAULTS = {
++    "enabled": True,
++    "target_percent": 95,
++    "reserve_five_hour_percent": 80,
++    "reserve_seven_day_percent": 85,
++    "providers": ["anthropic", "openai-codex"],
++    "read_interval_seconds": 300,
++    "rate_window_seconds": 3600,
++    "min_rate_span_seconds": 600,
++    "deferrable_share": 0.5,
++}
+diff --git a/tests/hermes_cli/test_kanban_llm_pacing_followups.py b/tests/hermes_cli/test_kanban_llm_pacing_followups.py
+new file mode 100644
+index 0000000000..b00b7ffbfc
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_llm_pacing_followups.py
+@@ -0,0 +1,267 @@
++"""LLM pacing governor follow-ups (t_01a1dafcb027ff7b; review of PR #3025). [daveey]
++
++1. A pacing hold wrote ``llm_paced`` but no recognised skip, so queue position, the chat-wait and
++   parent-unclaimed notices read a paced card as "dispatcher skip reason unrecorded" after 30 min, and
++   ``kanban diagnostics`` called it stranded. It now records ``dispatch_skipped {reason: llm_paced}``.
++2. ``/api/oauth/usage`` reports an idle account's ``five_hour`` as ``null`` (6 of 7 accounts, 11-14 16:57Z), so the
++   account had no five_hour reading and added 0 sustainable rate: one other account's 5h burn drove the factor
++   to 0 (PACED, limit 0) while the idle account was free. A missing window (or one with no reset) now counts as a
++   fresh full window.
++3. Dispatch-level coverage for class selectors, a non-zero paced limit and the deferrable share.
++"""
++from __future__ import annotations
++
++import json
++import time
++
++import pytest
++
++from hermes_cli import kanban_chat_wait as cw
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_dispatch_skip as skips
++from hermes_cli import kanban_llm_pacing as lp
++from hermes_cli import kanban_llm_pacing_dispatch as pd
++from hermes_cli import kanban_parent_unclaimed as pu
++from hermes_cli import kanban_queue_position as qp
++from hermes_cli.kanban_diagnostics import compute_task_diagnostics
++from tests.hermes_cli.test_kanban_model_tier import board as _board_fixture
++
++board = _board_fixture
++
++OPUS = "claude-opus-5-5"
++HOUR, DAY = 3600.0, 86400.0
++CFG = lp.PacingConfig()
++PRIORITY_WORDS = ("bump", "priority to")
++
++
++# --- 2. idle account: five_hour null ------------------------------------------------------------------------
++
++def test_idle_account_without_a_five_hour_reading_adds_a_full_window_of_headroom():
++    """The 11-14 16:57Z pool, reduced: account-primary burns its 5h window; account-secondary has 7d headroom and an
++    idle (``null``) five_hour. Before the fix the 5h sustainable rate was 0 -> factor 0 -> PACED, limit 0."""
++    now = 1794675425.0
++    current = [lp.Reading(now, "account-primary", lp.FIVE_HOUR, 78, 1794687600.0),  # 19:20Z
++               lp.Reading(now, "account-primary", lp.SEVEN_DAY, 100, 1794700800.0),
++               lp.Reading(now, "account-secondary", lp.SEVEN_DAY, 34, 1795276800.0)]  # 11-21 16:00Z
++    history = [lp.Reading(now - HOUR, "account-primary", lp.FIVE_HOUR, 70, 1794687600.0),
++               lp.Reading(now - HOUR, "account-secondary", lp.SEVEN_DAY, 34, 1795276800.0)]  # 7d flat: 5h decides
++    pace = lp.pool_pace("anthropic", current, history, CFG)
++    five_hour = (95 / lp.WINDOW_SECONDS[lp.FIVE_HOUR]) / (8 / HOUR)  # account-secondary's fresh window vs 8%/h
++    assert pace.factor == pytest.approx(five_hour, abs=1e-4)
++    assert pace.state == lp.OPEN  # was PACED at factor 0, limit 0
++    assert lp.admit_limit(pace, 4, deferrable=False, cfg=CFG) is None
++
++
++def test_a_window_with_no_reset_counts_as_a_full_window():
++    now = 1_800_000_000.0
++    current = [lp.Reading(now, "a", lp.FIVE_HOUR, 60, now + HOUR),
++               lp.Reading(now, "b", lp.FIVE_HOUR, 0, None)]
++    history = [lp.Reading(now - HOUR, "a", lp.FIVE_HOUR, 30, now + HOUR)]
++    pace = lp.pool_pace("anthropic", current, history, CFG)
++    expected = ((95 - 60) / HOUR + 95 / lp.WINDOW_SECONDS[lp.FIVE_HOUR]) / (30 / HOUR)
++    assert pace.factor == pytest.approx(expected, rel=1e-3)
++
++
++def test_a_reserved_account_adds_no_headroom_even_without_a_reading():
++    """Only headroom accounts count: an account past its 7d reserve adds nothing for its missing five_hour."""
++    now = 1_800_000_000.0
++    current = [lp.Reading(now, "a", lp.FIVE_HOUR, 60, now + HOUR),
++               lp.Reading(now, "b", lp.SEVEN_DAY, 100, now + DAY)]  # capped: reserved, burns nothing more
++    history = [lp.Reading(now - HOUR, "a", lp.FIVE_HOUR, 30, now + HOUR)]
++    pace = lp.pool_pace("anthropic", current, history, CFG)
++    assert pace.factor == pytest.approx(((95 - 60) / HOUR) / (30 / HOUR), rel=1e-3)
++
++
++# --- config registration ------------------------------------------------------------------------------------
++
++def test_registered_config_defaults_match_the_governor_defaults():
++    from hermes_cli.config_defaults import DEFAULT_CONFIG
++    from hermes_cli.kanban_pacing_defaults import DEFAULTS
++    assert DEFAULT_CONFIG["kanban"]["llm_pacing"] == DEFAULTS
++    assert lp.config_from(DEFAULT_CONFIG["kanban"]["llm_pacing"]) == lp.PacingConfig()
++    assert set(DEFAULTS) == {"enabled", "target_percent", "reserve_five_hour_percent", "reserve_seven_day_percent",
++                             "providers", "read_interval_seconds", "rate_window_seconds", "min_rate_span_seconds",
++                             "deferrable_share"}
++
++
++# --- dispatch fixtures --------------------------------------------------------------------------------------
++
++@pytest.fixture
++def paced_board(board, monkeypatch):
++    monkeypatch.setattr(pd, "_CACHE", {})
++    monkeypatch.setattr(pd, "_CLASS_CACHE", {})
++    return board
++
++
++def _config(home, **extra):
++    # JSON is valid YAML (the test venv may have no PyYAML).
++    home.joinpath("config.yaml").write_text(json.dumps({"kanban": {}, **extra}), encoding="utf-8")
++
++
++def _paced_reads(monkeypatch):
++    """Every pool reads 20% used one day into the week: factor 0.625 (paced) with no history."""
++    def read(provider, now):
++        return [lp.Reading(now, f"{provider}-1", lp.SEVEN_DAY, 20, now + 6 * DAY)]
++    monkeypatch.setattr(pd, "read_pool", read)
++
++
++def _seed_concurrency(running: float):
++    """This host ran ``running`` cards on anthropic over the last rate window (the paced limit's base)."""
++    now = time.time()
++    pd.state_path().write_text(json.dumps({"anthropic": {"running": [[now - 60 * i, running] for i in range(1, 30)]}}),
++                               encoding="utf-8")
++
++
++def _tick(conn):
++    seen = []
++    result = kbd.dispatch_once(conn, dry_run=False, spawn_fn=lambda task, ws: seen.append(task.id))
++    return seen, result
++
++
++def _opus(conn, title, **kw):
++    return kb.create_task(conn, title=title, assignee="default", model_override=OPUS, provider_override="anthropic",
++                          **kw)
++
++
++def _skips(conn, tid):
++    return [kb._json_dict(r[0]) for r in conn.execute(
++        "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? ORDER BY id", (tid, skips.EVENT))]
++
++
++# --- 1. paced holds are recorded skips ----------------------------------------------------------------------
++
++def test_paced_hold_records_a_skip_the_notices_and_diagnostics_name(paced_board, monkeypatch):
++    _config(paced_board)
++    _paced_reads(monkeypatch)
++    monkeypatch.setattr(qp, "_running_and_limit", lambda *_a: (1, 7))  # free slots: the unrecorded case
++    start = time.time()
++    with kbc.connect() as conn:
++        tid = _opus(conn, "paced", session_id="chat")
++        seen, result = _tick(conn)
++        assert seen == [] and kb.get_task(conn, tid).status == "ready"
++        assert result.llm_paced and result.llm_paced[0][:3] == (tid, "anthropic paced", None)
++        [skip] = _skips(conn, tid)
++        assert (skip["reason"], skip["detail"]) == (skips.LLM_PACED, "anthropic paced")
++        assert skip["providers"] == [{"provider": "anthropic", "state": lp.PACED, "limit": 0, "running": 0}]
++        _tick(conn)
++        assert len(_skips(conn, tid)) == 1  # one row per episode, not one per tick
++
++        task = kb.get_task(conn, tid)
++        place = qp.position(conn, task)
++        assert place["skip"]["reason"] == skips.LLM_PACED
++        line = qp.describe(place)
++        assert "held: LLM quota pacing (anthropic paced pool)" in line
++        assert not any(w in line for w in PRIORITY_WORDS), line
++
++        later = start + 31 * 60
++        assert not skips.notice_fields(place, 31 * 60).get("skip_unrecorded")
++        monkeypatch.setattr(kb.time, "time", lambda: later)
++        assert cw.sweep(conn, now=later) == 1
++        payload = kb._json_dict(conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = ?",
++                                             (tid, cw.NOTICE_KIND)).fetchone()[0])
++        assert payload["dispatch_skip"] == {"reason": skips.LLM_PACED, "detail": "anthropic paced"}
++        assert "skip_unrecorded" not in payload
++        for text in (cw.notice_text(payload), pu.notice_text(payload), pu.ready_hint(conn, task, now=later)):
++            assert "held: LLM quota pacing (anthropic paced pool)" in text, text
++            assert skips.UNRECORDED not in text
++            assert not any(w in text for w in PRIORITY_WORDS), text
++
++        diags = compute_task_diagnostics(task, kb.list_events(conn, tid), kb.list_runs(conn, tid), now=later)
++    assert [(d.kind, d.severity) for d in diags] == [("held_in_ready", "warning")]
++    assert diags[0].data["hold_reason"] == "llm_paced"
++    assert "llm_paced: anthropic paced" in diags[0].title
++
++
++def test_held_pool_skip_carries_the_reset(paced_board, monkeypatch):
++    _config(paced_board)
++    reset = [0.0]
++
++    def read(provider, now):
++        reset[0] = now + 9 * HOUR
++        return [lp.Reading(now, f"{provider}-1", lp.SEVEN_DAY, 90, reset[0])]
++    monkeypatch.setattr(pd, "read_pool", read)
++    with kbc.connect() as conn:
++        tid = _opus(conn, "held")
++        _tick(conn)
++        [skip] = _skips(conn, tid)
++        assert (skip["reason"], skip["detail"], skip["until"]) == (skips.LLM_PACED, "anthropic held", int(reset[0]))
++        diags = compute_task_diagnostics(kb.get_task(conn, tid), kb.list_events(conn, tid), kb.list_runs(conn, tid),
++                                         now=time.time() + 3600)
++        assert diags[0].data["hold_until"] == int(reset[0])
++        # Past the reset the old skip no longer reads as a live pacing hold.
++        late = compute_task_diagnostics(kb.get_task(conn, tid), kb.list_events(conn, tid), kb.list_runs(conn, tid),
++                                        now=reset[0] + 60)
++    assert all(d.data.get("hold_reason") != "llm_paced" for d in late)
++
++
++def test_dry_run_records_the_hold_on_the_result_only(paced_board, monkeypatch):
++    _config(paced_board)
++    _paced_reads(monkeypatch)
++    with kbc.connect() as conn:
++        tid = _opus(conn, "paced")
++        result = kbd.dispatch_once(conn, dry_run=True, spawn_fn=lambda *_a: None)
++        assert [row[0] for row in result.llm_paced] == [tid]
++        assert _skips(conn, tid) == []
++
++
++# --- 3. dispatch-level limits -------------------------------------------------------------------------------
++
++def test_paced_limit_is_a_share_of_recent_concurrency_counted_against_running_cards(paced_board, monkeypatch):
++    """avg 4 running x factor 0.625 -> limit 2: two cards start, the third waits for a running one to end."""
++    _config(paced_board)
++    _paced_reads(monkeypatch)
++    _seed_concurrency(4)
++    with kbc.connect() as conn:
++        ids = [_opus(conn, f"c{i}") for i in range(3)]
++        seen, result = _tick(conn)
++        held = [row[0] for row in result.llm_paced]
++    assert len(seen) == 2 and held == [t for t in ids if t not in seen]
++    assert result.llm_paced[0][3]["providers"][0] == {"provider": "anthropic", "state": lp.PACED, "limit": 2,
++                                                       "running": 2}
++
++
++def test_deferrable_card_gets_only_its_share_of_the_paced_limit(paced_board, monkeypatch):
++    """Limit 2, deferrable share 0.5 -> 1: the normal card starts, the negative-priority card then waits."""
++    _config(paced_board)
++    _paced_reads(monkeypatch)
++    _seed_concurrency(4)
++    with kbc.connect() as conn:
++        normal = _opus(conn, "normal")
++        low = _opus(conn, "low", priority=-1)
++        seen, result = _tick(conn)
++    assert seen == [normal]
++    [(tid, _detail, _until, extra)] = result.llm_paced
++    assert tid == low
++    assert extra["providers"][0]["limit"] == 1 and extra["providers"][0]["running"] == 1
++
++
++ROUTE = {"billing": "subscription", "weight": 1, "eligible": True, "funding_verified": True,
++         "capabilities": {"tools": True, "streaming": True, "context_tokens": 1000000}}
++
++
++def _class_config(home, *providers):
++    routes = [dict(ROUTE, provider=p, model=f"{p}-deep") for p in providers]
++    _config(home, model_routing={"enabled": True, "routes": {"deep": routes}})
++
++
++def test_class_selector_is_paced_on_its_class_providers(paced_board, monkeypatch):
++    _class_config(paced_board, "anthropic")
++    _paced_reads(monkeypatch)
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="deep", assignee="default", model_override="class:deep",
++                             provider_override="auto")
++        seen, result = _tick(conn)
++    assert seen == [] and [row[0] for row in result.llm_paced] == [tid]
++
++
++def test_class_selector_with_an_ungoverned_route_always_starts(paced_board, monkeypatch):
++    """Any ungoverned candidate admits the card: it may run there whatever the governed pools say."""
++    _class_config(paced_board, "anthropic", "zai")
++    _paced_reads(monkeypatch)  # every pool, zai included, reads paced
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="deep", assignee="default", model_override="class:deep",
++                             provider_override="auto")
++        seen, result = _tick(conn)
++    assert seen == [tid] and result.llm_paced == []
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index aff60c6599..9227586f22 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -1522,6 +1522,28 @@ To see why a ready card is not spawning, run `hermes kanban dispatch --dry-run`
+ 
+ `recent_success` and `active_pr` hold the **ready** lane only — they are the inputs to a review handoff, not signals against one. To have a reviewer, closer or other recovery profile pick up a card whose PR is already open, either move it to the review lane with `hermes kanban request-review <id>` (accepted from `ready` as well as `running`; the review-lane spawn is not subject to either guard) or hand the ready card to that profile with `hermes kanban assign <id> <profile>`: a handoff recorded *after* the PR comment — an operator reassign, a reviewer's changes-requested verdict, or a review reopen — lifts `active_pr` for the profile now named on the card, because that PR is exactly what it must work on. Only a change to a *different* profile counts: re-assigning the same profile, unassigning, or the dispatcher's own `kanban.default_assignee` fill-in does not lift the guard, so the assignee that opened the PR is still not re-spawned against it after a crash, reclaim or no-op reassign, and a newer PR comment posted after the handoff guards again. A deliberate re-queue after a success (drag `done→ready`, `unblock`, re-promotion) also lifts `recent_success`, so a manual re-run is never silently held for the whole window.
+ 
++### LLM quota pacing (`kanban.llm_pacing`)
++
++Before claiming a ready or review card, the dispatcher checks the OAuth pool of the provider the card's next run would use (for a `class:*` selector, every provider the class may route to; the card waits only when all of them hold it). It reads each account's account-wide usage windows (`five_hour` and `seven_day` from `/api/oauth/usage`; Codex `Session`/`Weekly`) at most every `read_interval_seconds`, measures each window's burn rate from its recent samples, and compares the pool's burn with the rate that would bring every account with headroom to `target_percent` exactly at its window's reset. An account whose window has not started yet (the endpoint reports `null` for an idle `five_hour`) counts as a fresh full window.
++
++- **open**: the pool is on or behind pace, so claims proceed (just behind pace, this host may grow only to its recent concurrency × the pace factor, at least one run).
++- **paced**: the pool is ahead of pace, so this host keeps its recent average concurrency on that provider × the pace factor. Review-lane, negative-priority and continuation-woken cards get only `deferrable_share` of that limit.
++- **held**: every readable account is past its reserve (`reserve_five_hour_percent` / `reserve_seven_day_percent`), so no Kanban claim starts until the earliest reset frees one; the remaining headroom is left to chats, cron and notices.
++
++A held card stays `ready` and unclaimed. The dispatcher records an `llm_paced` event (providers, state, limit, running) and a `dispatch_skipped` row with reason `llm_paced`. Queue position, the chat-wait and parent-unclaimed notices, and `hermes kanban diagnostics` (`held_in_ready`) name the hold instead of "skip reason unrecorded". Raising the card's priority does not lift it. If no account can be read, the governor fails open, and mandatory model pins and ungoverned providers always start. Only Kanban dispatch consults it.
++
++| Config key | Default | What it does |
++|------------|---------|--------------|
++| `kanban.llm_pacing.enabled` | `true` | `false` restores ungoverned claims. |
++| `kanban.llm_pacing.target_percent` | `95` | Usage each window may reach by its reset. |
++| `kanban.llm_pacing.reserve_five_hour_percent` | `80` | Past this, an account's five-hour window counts as reserved for non-Kanban callers. |
++| `kanban.llm_pacing.reserve_seven_day_percent` | `85` | The same for the weekly window. |
++| `kanban.llm_pacing.providers` | `["anthropic", "openai-codex"]` | Governed providers; cards on other providers always start. |
++| `kanban.llm_pacing.read_interval_seconds` | `300` | Minimum seconds between usage reads per Hermes home (shared through `<kanban home>/llm_pacing.json`). |
++| `kanban.llm_pacing.rate_window_seconds` | `3600` | Lookback for burn rates and this host's average concurrency. |
++| `kanban.llm_pacing.min_rate_span_seconds` | `600` | Shortest sample span a burn slope is measured over. |
++| `kanban.llm_pacing.deferrable_share` | `0.5` | Share of a paced limit that deferrable cards may use (0-1). |
++
+ ### Dependency-review repair continuation
+ 
+ An owning worker can link independent review cards as parents with `kanban_link`,
+-- 
+2.43.0
+

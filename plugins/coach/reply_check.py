@@ -1365,7 +1365,9 @@ def status_only(user_ask: str, reply: str, tool_log: Optional[list] = None) -> O
     kinds = [k for k in (_tool_kind(l) for l in tool_log or []) if k]
     if "work" in kinds or "card" not in kinds:
         return None
-    if WALL_RE.search(reply[-1500:]):
+    # Opening and closing paragraphs: status_plain asks for "the one thing stopping it" first, so a long reply names
+    # its wall at the top (agent-fafbddd67a: "a choice only you can make" sat 1800 chars from the end).
+    if WALL_RE.search(reply[:1500]) or WALL_RE.search(reply[-1500:]):
         return None
     ops = [l.strip()[3:].split("(", 1)[0] for l in tool_log or [] if _tool_kind(l) == "card"]
     return f"asked \"{(user_ask or '').strip()[:80]}\"; this turn only ran {', '.join(dict.fromkeys(ops))}"
@@ -2008,6 +2010,24 @@ _PSC_READ_RE = re.compile(
     re.I)
 _PSC_HELP_RE = re.compile(r"(?:^|\s)(?:--help|-h)(?:\s|\)|$)")
 _PSC_META_RE = re.compile(r"\bpr_state_claim\b", re.I)
+# A PR the sentence itself calls merged is provenance, not the subject of its state claim (self-heal agent-aeca43a867:
+# "The update that adds the capsule-import fix (from merged state change #2532) to Ask Eve is approved by both of its
+# new reviewers." was true: two Kanban reviews approved an artifact built on #2532, which had merged 6 h earlier).
+# "merged [up to 3 words] #N" before the ref ("already-merged" too, never "unmerged"/"not-yet-merged"), or
+# "#N (merged", "#N, merged at", "#N, which merged/was merged/landed" after it. A sentence with any other PR ref, or
+# opening with it/that/this, still counts.
+_PSC_MERGED_BEFORE_RE = re.compile(r"(?:^|[^\w-]|\balready-)merged\s+(?:[\w-]+\s+){0,3}$", re.I)
+_PSC_MERGED_AFTER_RE = re.compile(
+    r"^\s*(?:\(\s*|,\s*)?(?:(?:which|that)\s+)?(?:(?:was|were|has\s+been|have\s+been|has|is|got)\s+)?(?:already\s+)?"
+    r"(?:merged|landed)\b", re.I)
+
+
+def _psc_only_merged_refs(s: str) -> bool:
+    """True when every PR ref in sentence `s` is one the sentence marks as merged (provenance, not the claim's
+    subject), and there is at least one."""
+    refs = list(_MF_PR_RE.finditer(s))
+    return bool(refs) and all(_PSC_MERGED_BEFORE_RE.search(s[:m.start()]) or _PSC_MERGED_AFTER_RE.search(s[m.end():])
+                              for m in refs)
 PR_STATE_CLAIM_NUDGE = (
     "[coach] pr_state_claim: your reply states a PR's current state (\"{evidence}\"), but this turn never read that PR. "
     "A read from earlier in the chat (before an update pause, a wait or a resumed run) may be stale: the PR may have "
@@ -2030,7 +2050,7 @@ def pr_state_claim(reply: str, tool_log: Optional[list] = None) -> Optional[str]
         m = _PSC_CLAIM_RE.search(s)
         if not m or _PSC_HEDGE_RE.search(s[:m.start()]):
             continue
-        if _MF_PR_RE.search(s) or _PSC_IT_RE.search(s):
+        if _PSC_IT_RE.search(s) or (_MF_PR_RE.search(s) and not _psc_only_merged_refs(s)):
             hit = s
             break
     if not hit:
@@ -3340,10 +3360,19 @@ CORE_JOB_RE = (r"\[ASYNC DELEGATION (?:BATCH COMPLETE|COMPLETE|TASK FAILED) — 
                r"|\[Background process \S+ heartbeat\b"
                r"|\[System note: background job results")
 
+# Every gateway Kanban watcher notice (core gateway/kanban_watchers_notifier.py + the gateway.kanban.ping locale
+# strings) opens "<glyph> {head}", head = [board] @assignee Kanban t_x with board and assignee optional
+# (changes_requested writes {board_tag}Kanban {task_id}): ✔ done, 👀 review, 🛑 triage/changes, ⛔ gave up, ⏱ timed
+# out, ⏸ blocked, ✖ crashed, 🔄 status, ⏳ waits, ⚠, ℹ. Matched by shape, not one glyph at a time: only ✔ was listed,
+# so a ⏸ needs_input notice whose card ask said "land and deploy it" scored status_only as David's own progress ask
+# (agent-fafbddd67a). self_heal.SYNTHETIC_RE uses the same shape.
+KANBAN_NOTICE_RE = (r"[\u2100-\u2bff\U0001F300-\U0001FAFF]\ufe0f?\s*(?:\[[^\]\n]+\]\s*)?(?:@\S+\s+)?"
+                    r"Kanban\s+t_\w+")
+
 # The Hermes-plugin envelopes stay case-insensitive; core's envelopes are fixed-case.
 NOTICE_RE = re.compile(
     r"^\s*(?:(?i:\[(?:chat-closeout|kanban close-out|false-stop recovery|owner-wake|goal continuation|babysitter)"
-    r"[^\]]*\]|[✔✓]\s*\[[^\]\n]+\]\s*@[^\n]+\bKanban\b|" + CROSS_SESSION_RE + r")|" + CORE_JOB_RE + r")")
+    r"[^\]]*\]|" + KANBAN_NOTICE_RE + r"|" + CROSS_SESSION_RE + r")|" + CORE_JOB_RE + r")")
 
 # Core's _SYNTHETIC_USER_ROW_PREFIXES (agent/context_compressor.py) that are deliberately NOT reply_check notices.
 # test_every_core_synthetic_user_prefix_is_classified fails on any core prefix that is neither here nor a notice.
@@ -3491,14 +3520,23 @@ def prev_turn_section(prev_turn: Optional[dict], tool_log: list[str]) -> str:
             f"PREVIOUS TURN'S FINAL MESSAGE (head):\n{head}\n\n")
 
 
+CONFIRM_POSITIVE = ("report_only", "offered")
+CONFIRM_NEGATIVE = ("fixed", "started", "proposed", "na")
+
+
 def parse_confirm(raw: str) -> Optional[tuple]:
-    """(p, evidence): p = 0.9 when the strong model labels the outcome report_only AND agent_fixable, else 0.1."""
+    """(p, evidence): p = 0.9 when the strong model labels the outcome report_only or offered AND agent_fixable, else 0.1.
+
+    "offered" counts (agent-fdfab26745): a vague "I can run a deeper live check next" on a fixable leftover is the
+    report_only stall the screen rule names ("a vague 'want me to look into it?' is not a proposal"). Scored 0.1 it
+    vetoed a 0.99 screen and the user had to type "resume" two days later. Every label CONFIRM_SYS offers is in
+    CONFIRM_POSITIVE or CONFIRM_NEGATIVE (test_every_confirm_outcome_label_is_classified)."""
     m = re.search(r"\{.*\}", raw or "", re.S)
     if not m:
         return None
     try:
         d = json.loads(m.group(0))
-        pos = d.get("outcome") == "report_only" and d.get("agent_fixable") is True
+        pos = d.get("outcome") in CONFIRM_POSITIVE and d.get("agent_fixable") is True
         return (0.9 if pos else 0.1), str(d.get("quote") or d.get("evidence") or "")[:300]
     except Exception:
         return None

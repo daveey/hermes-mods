@@ -7,8 +7,8 @@
  *                colours: red = needs you, green = ready, yellow = not ready (waiting / not started), grey = done,
  *                blue = running, orange = stuck
  *   Needs you    user-steps' decision cards (window.__userSteps.ActionQueue, embedded) and its earlier asks; a card
- *                no ask covers shows its own human_request as "Do this / Why you / Next" (askView), never its
- *                agent-written title or block reason; without a request it says so and offers Ask agent
+ *                no ask covers shows its own human_request as "Do this / Why you / Next" (askView), with its
+ *                plain card title as context; without a request it says so and offers Ask agent
  *   Stuck        a running card with no event for 2 h, a parked card whose agent-owned wait stalled
  *                (backend `wait.wait_state === 'stalled'`), or a sub-agent whose tool count has not moved
  *                for 30 min; each with numbered steps and Nudge agent / Open card. A stale chip (session-tasks'
@@ -33,7 +33,7 @@ import { useEffect, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'session-panel'
-const VERSION = 'session-panel-v2'
+const VERSION = 'session-panel-v3-board-status'
 export const STUCK_CARD_S = 2 * 3600 // running card with no event this long
 export const STUCK_SUB_MS = 30 * 60_000 // sub-agent with no new tool call this long
 const DONE_POLL_MS = 30_000
@@ -310,8 +310,17 @@ export function classify(chips, { nowMs = Date.now(), silence = new Map(), isAsk
     // observations array at all) cannot prove live or queued work either: its running/review/ready/todo card is
     // explicit unknown with its last known state; its waits and asks keep their sections.
     const ev = evidence(c)
-    if (ev?.sourced && ev.state === 'unknown' || legacyLive(c, ev)) {
-      out.waiting.push({ ...item(c), detail: `status unknown${ev.reason ? ` (${ev.reason.replace(/_/g, ' ')})` : ''} · last known: ${ev.lastKnown || c.state || 'unknown'}${ev.ageSec != null ? ` (observed ${span(ev.ageSec)} ago)` : ''}` })
+    // A parked card has a board lifecycle but need not have an execution generation.
+    // Keep the independent execution verdict below (including unknown progress); never
+    // turn a recent list read into a heartbeat or claim a running worker is alive.
+    const board = c.boardStatus
+    if ((!ev || ev.state === 'unknown') && board && board.state === c.state && ['scheduled', 'blocked', 'triage', 'review', 'ready', 'todo'].includes(c.state) &&
+        Number.isFinite(board.readAt) && nowMs >= board.readAt && nowMs - board.readAt <= 60_000) {
+      out.waiting.push({ ...item(c), detail: `${c.state} · ${board.source === 'replica' ? 'reported board status' : 'board status'}${on ? ` · ${on}` : ''}` })
+      continue
+    }
+    if (board && (!ev || ev.state === 'unknown') || ev?.sourced && ev.state === 'unknown' || legacyLive(c, ev)) {
+      out.waiting.push({ ...item(c), detail: `status unknown${ev?.reason ? ` (${ev.reason.replace(/_/g, ' ')})` : ''} · last known: ${ev?.lastKnown || c.state || 'unknown'}${ev?.ageSec != null ? ` (observed ${span(ev.ageSec)} ago)` : ''}` })
       continue
     }
     if (c.look === 'stalled') { out.stuck.push({ ...item(c), reason: 'stalled', detail: `stalled: ${on || 'agent-owned wait over 2 h'}` }); continue }
@@ -662,6 +671,7 @@ function AskRow({ i, session }) {
   const ask = () => { void host.composer?.setDraft?.(session, askAgentText(i)); host.composer?.focus?.(session) }
   const line = { fontSize: 12.5, lineHeight: 1.45, overflowWrap: 'anywhere', minWidth: 0 }
   return jsxs('div', { 'data-panel-row': i.key, 'data-ask-row': v.known ? 'known' : 'unknown', style: { border: `1px solid color-mix(in srgb, ${C.needsYou} 45%, transparent)`, borderRadius: 6, padding: '8px 10px', marginBottom: 6, minWidth: 0 }, children: [
+    jsx('div', { 'data-ask-title': '', style: { fontWeight: 600, overflowWrap: 'anywhere' }, children: i.label }),
     jsx('div', { 'data-ask-step': '', title: v.full || undefined, style: { fontWeight: 600, fontSize: 13, lineHeight: 1.45, overflowWrap: 'anywhere', minWidth: 0 }, children: v.known ? `Do this: ${v.step}` : v.step }),
     v.why && jsx('div', { 'data-ask-why': '', style: { ...line, color: 'var(--muted-foreground)' }, children: `Why you: ${v.why}` }),
     jsx('div', { 'data-ask-next': '', style: line, children: `Next: ${v.next}` }),

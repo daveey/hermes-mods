@@ -1,0 +1,295 @@
+From f6f374a723c992315f36ceae0d378221d6640ef8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 21:34:49 +0000
+Subject: [PATCH] [daveey] lifecycle guard: a redirection's `&` is never a
+ background operator (`cat r.sh 2>&1 | bash`)
+
+The shell tokenizer (shlex with `&` as punctuation) split `2>&1` into
+`2>`, `&`, `1`. The walk read that lone `&` as a background operator, so
+`cat r.sh 2>&1 | bash` became `cat r.sh 2>` (output routed nowhere) and
+`1 | bash`: the pipe fed `bash` nothing and scan_gateway_lifecycle
+returned (False, None) for a script that restarts the gateway. Same for
+`{ cat r.sh; } 2>&1 | bash`, `(cat r.sh) 2>&1 | bash`, `>&2`, `<&0`,
+`2>&-`, `>&f`, `&>f`, `&>>f`, and for a reader carrying one
+(`bash 2>&1 < r.sh`, `bash 2>&1 r.sh`).
+
+The data-sink exemption tokenized the same way, so `env >& grep hermes
+gateway restart` (env runs the words after the redirection target) was
+masked as grep data and allowed.
+
+Fix:
+- split_glued_redirections quotes an unquoted `&` that belongs to a
+  redirection operator (after an unquoted `<`/`>`, or `&>`/`&>>` not
+  preceded by `&`/`|`), so shlex keeps it in the redirection word.
+  `cmd & bash`, `&&` and `|&` stay control operators; a quoted or escaped
+  `>` before `&` is text.
+- _REDIRECTION also matches `&>` and `&>>`.
+- _mask_data_sink_arguments tokenizes through split_glued_redirections.
+- _split_redirections: `<&N` after `N<f` in the same command reads f
+  (`bash 3<r.sh <&3`, `{ bash; } 3<r.sh <&3`, `cat 3<r.sh <&3 | bash`
+  were also allowed).
+
+Over-blocking note: the walk does not model stdout redirections, so
+`cat r.sh &>/dev/null | bash` now blocks, as `cat r.sh >/dev/null | bash`
+already did (fail closed).
+
+RED/GREEN: tests/cron/test_lifecycle_guard_descriptor_dup.py: 28 failed /
+21 passed with cron/ at origin/main, 49 passed at head. tests/cron via
+run_tests.sh: 238 files, 2974 passed, 0 failed, 9 skipped.
+
+Card: t_01a1d655f3e69b6e (found in t_01a1d5c442ed5fc9).
+---
+ cron/lifecycle_guard.py                       |  12 +-
+ cron/lifecycle_guard_groups.py                |  16 +-
+ .../test_lifecycle_guard_descriptor_dup.py    | 139 ++++++++++++++++++
+ 3 files changed, 161 insertions(+), 6 deletions(-)
+ create mode 100644 tests/cron/test_lifecycle_guard_descriptor_dup.py
+
+diff --git a/cron/lifecycle_guard.py b/cron/lifecycle_guard.py
+index d2110590ef..2c78228066 100644
+--- a/cron/lifecycle_guard.py
++++ b/cron/lifecycle_guard.py
+@@ -373,7 +373,7 @@ _ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+ _PYTHON_RUNNER_RE = re.compile(r"^(?:pythonw?|pypy)(?:\d+(?:\.\d+)*)?(?:\.exe)?$|^py(?:\.exe)?$")
+ _PYTHON_SOURCE_SUFFIXES = (".py", ".pyw")
+ # A redirection word: optional fd or `{NAME}` (NAME may be an array element, `{a[1]}`),
+-# operator, optional glued target (`<f`, `0<f`, `2>>log`, `{fd}>&2`, `{a[1]}>/dev/null`).
++# operator, optional glued target (`<f`, `0<f`, `2>>log`, `{fd}>&2`, `{a[1]}>/dev/null`, `&>f`).
+ _REDIRECTION = re.compile(
+     r"^(\d*|\{[A-Za-z_][A-Za-z0-9_]*(?:\[.+?\])?\})(<<<|<<-|<<|<>|<&|>&|>>|>\||&>>|&>|<|>)(.*)$", re.DOTALL)
+ 
+@@ -923,9 +923,11 @@ def _runs_under_uv(segment: list[str], index: int) -> bool:
+ 
+ def _split_redirections(arguments: list[str]) -> tuple[list[str], list[str]]:
+     """``(arguments without redirections, files redirected to stdin)``. A heredoc, here-string or
+-    descriptor duplication is stripped but feeds no file; ``<`` and ``<>`` on fd 0 do."""
++    descriptor duplication is stripped but feeds no file; ``<`` and ``<>`` on fd 0 do, and so does
++    ``<&N`` after ``N<f`` opened a file on that descriptor (``bash 3<f.sh <&3``)."""
+     kept: list[str] = []
+     stdin: list[str] = []
++    opened: dict[str, str] = {}
+     index = 0
+     while index < len(arguments):
+         match = _REDIRECTION.match(arguments[index])
+@@ -937,6 +939,10 @@ def _split_redirections(arguments: list[str]) -> tuple[list[str], list[str]]:
+         if not target and index < len(arguments):
+             target = arguments[index]
+             index += 1
++        if operator in ("<", "<>") and target:
++            opened[fd or "0"] = target
++        elif operator == "<&" and fd in ("", "0") and target in opened:
++            operator, target = "<", opened[target]
+         if operator in ("<", "<>") and fd in ("", "0") and target:
+             stdin.append(target)
+     return kept, stdin
+@@ -1182,7 +1188,7 @@ def _mask_data_sink_arguments(text: str) -> str:
+             lines_out.append(line)
+             continue
+         try:
+-            tokens = _shlex_tokens(line)
++            tokens = _shlex_tokens(split_glued_redirections(line))
+         except ValueError:
+             lines_out.append(line)
+             continue
+diff --git a/cron/lifecycle_guard_groups.py b/cron/lifecycle_guard_groups.py
+index 3547ccc1fe..2f445ed98b 100644
+--- a/cron/lifecycle_guard_groups.py
++++ b/cron/lifecycle_guard_groups.py
+@@ -55,6 +55,8 @@ def split_glued_redirections(line: str) -> str:
+     the operator's own second character (``<<``, ``>>``, ``<>``) is never split off. The ``&``/``|``
+     of an unquoted ``>&``, ``<&`` or ``>|`` is escaped, so the tokenizer keeps the operator one word
+     instead of cutting the command there (``2>&1 bash x.sh`` is not ``2>`` then ``1 bash x.sh``).
++    An unquoted ``&>``/``&>>`` starts its own redirection word; its ``&`` is escaped too.
++    ``cmd & bash``, ``&&`` and ``|&`` remain control operators.
+ 
+     An array-element descriptor whose subscript the tokenizer cuts (``{a[$((1+1))]}>x bash x.sh``,
+     ``{a[`echo 1`]}>x bash x.sh``) fails closed: the text from the command's first unterminated
+@@ -73,8 +75,10 @@ def split_glued_redirections(line: str) -> str:
+     comment = ""  # the line's trailing `#` comment, verbatim
+     in_single = in_double = escape = False
+     operator = False  # the previous character is an unquoted, unescaped `<`/`>`
++    last = ""  # previous unquoted, unescaped character (else empty)
+     for index, ch in enumerate(line):
+         after_operator, operator = operator, False
++        previous, last = last, ""
+         if escape:
+             escape = False
+         elif ch == "\\" and not in_single:
+@@ -84,12 +88,18 @@ def split_glued_redirections(line: str) -> str:
+         elif ch == '"' and not in_single:
+             in_double = not in_double
+         elif not in_single and not in_double:
++            last = ch
+             if after_operator and (ch == "&" or (ch == "|" and word[-1] == ">")):
+                 out.append("\\" + ch)
+                 word += ch
+                 continue
+-            if ch == "&" and word and word[-1] not in "<>" and line[index + 1: index + 2] == ">":
+-                out.append(" ")
++            if ch == "&" and line[index + 1:index + 2] == ">" and previous not in ("&", "|"):
++                if word:
++                    out.append(" ")
++                word_out = len(out)
++                out.append("\\&")
++                word = "&"
++                continue
+             if ch.isspace() or ch in CONTROL_CHARS:
+                 if ch in CONTROL_CHARS:
+                     head_out = None
+@@ -106,7 +116,7 @@ def split_glued_redirections(line: str) -> str:
+             if ch in "<>":
+                 operator = True
+                 if (word and not word.isdigit() and not FD_VARIABLE.fullmatch(word)
+-                        and word[-1] not in "<>"):
++                        and word[-1] not in "<>" and not (word == "&" and previous == "&")):
+                     if word.endswith("]}"):
+                         start = word_out if head_out is None else head_out
+                         carried.append("".join(out[start:]))
+diff --git a/tests/cron/test_lifecycle_guard_descriptor_dup.py b/tests/cron/test_lifecycle_guard_descriptor_dup.py
+new file mode 100644
+index 0000000000..1e9d3efdbc
+--- /dev/null
++++ b/tests/cron/test_lifecycle_guard_descriptor_dup.py
+@@ -0,0 +1,139 @@
++"""A redirection's ``&`` is never a background operator (t_01a1d655f3e69b6e).
++
++The tokenizer split ``2>&1`` into ``2>``, ``&``, ``1``: the lone ``&`` was walked as a control
++operator, so ``cat f.sh 2>&1 | bash`` became ``cat f.sh 2>`` (backgrounded, its output routed
++nowhere) and ``1 | bash``, and the pipe fed ``bash`` nothing. The same split hid ``>&2``,
++``<&0``, ``>&f``, ``&>f`` and ``&>>f``, and let the data-sink exemption read ``env >& grep
++<lifecycle words>`` as a ``grep`` whose pattern is data, while ``env`` runs those words.
++
++``bash 3<f.sh <&3`` also ran ``f.sh`` unscanned: a ``<&N`` duplicating a descriptor opened on a
++file in the same command reads that file.
++"""
++
++from __future__ import annotations
++
++import shlex
++
++import pytest
++
++from cron.lifecycle_guard import _iter_command_token_lists, scan_gateway_lifecycle
++
++# Assembled so this file's own text never carries the literal command.
++LIFECYCLE = " ".join(["hermes", "gateway", "re" + "start"])
++
++
++@pytest.fixture
++def files(tmp_path) -> dict[str, str]:
++    sh = tmp_path / "r.sh"
++    sh.write_text(f"#!/bin/sh\necho hi\n{LIFECYCLE}\n", encoding="utf-8")
++    py = tmp_path / "r.py"
++    py.write_text(f"import os\nos.system({LIFECYCLE!r})\n", encoding="utf-8")
++    clean_sh = tmp_path / "clean.sh"
++    clean_sh.write_text("echo ok\n", encoding="utf-8")
++    return {name: shlex.quote(str(path)) for name, path in
++            {"sh": sh, "py": py, "clean_sh": clean_sh}.items()}
++
++
++@pytest.mark.parametrize(
++    "template",
++    [
++        # The card's three forms.
++        "cat {sh} 2>&1 | bash",
++        "{{ cat {sh}; }} 2>&1 | bash",
++        "(cat {sh}) 2>&1 | bash",
++        # Other descriptor duplications on the writer.
++        "cat {sh} 2>& 1 | bash",
++        "cat {sh} 2>&1|bash",
++        "cat {sh} 2>&- | bash",
++        "cat {sh} 1>&1 | bash",
++        "cat <&0 {sh} | bash",
++        "cat {sh} 2>&1 | cat 2>&1 | bash",
++        "cat {py} 2>&1 | python3",
++        # A duplication on the reader no longer drops its own stdin or script operand.
++        "bash 2>&1 < {sh}",
++        "bash 2>&1 {sh}",
++        "bash >&2 {sh}",
++        "bash &>/dev/null {sh}",
++        "bash &>>/tmp/log {sh}",
++        "bash&>/dev/null {sh}",
++        "python3 2>&1 {py}",
++        # `<&N` reads the file `N<f` opened in the same command.
++        "bash 3<{sh} <&3",
++        "bash 3< {sh} 0<& 3",
++        "{{ bash; }} 3<{sh} <&3",
++        "cat 3<{sh} <&3 | bash",
++    ],
++)
++def test_descriptor_duplication_keeps_the_command_whole(files, template):
++    assert scan_gateway_lifecycle(template.format(**files)) == (True, None)
++
++
++@pytest.mark.parametrize(
++    "command",
++    [
++        # `env` runs the words after the redirection target; they are not grep's data.
++        f"env >& grep {LIFECYCLE}",
++        f"env >&grep {LIFECYCLE}",
++        f"nohup 2>& rg {LIFECYCLE}",
++        f"env &> grep {LIFECYCLE}",
++    ],
++)
++def test_redirection_target_is_not_a_data_sink(command):
++    assert scan_gateway_lifecycle(command) == (True, None)
++
++
++@pytest.mark.parametrize(
++    "template",
++    [
++        # A real background `&` still splits: `cat` writes to the terminal, `bash` reads nothing.
++        "cat {sh} & bash",
++        "cat {sh} &bash",
++        # A clean script stays clean however its output is duplicated.
++        "cat {clean_sh} 2>&1 | bash",
++        "bash 2>&1 {clean_sh}",
++        "bash 3<{clean_sh} <&3",
++        # `<&N` on a descriptor no file opened here reads no known file.
++        "bash 3<{sh} <&4",
++        "bash 3<{sh}",
++    ],
++)
++def test_background_and_clean_forms_stay_allowed(files, template):
++    assert scan_gateway_lifecycle(template.format(**files)) == (False, None)
++
++
++@pytest.mark.parametrize(
++    "command",
++    [
++        # Mentions and data: the duplication must not turn them into commands.
++        f"grep -rn '{LIFECYCLE}' docs 2>&1 | head",
++        f"grep '{LIFECYCLE}' log &>/dev/null",
++        f"rg '{LIFECYCLE}' 2>&1",
++        "echo '2>&1' | bash",
++    ],
++)
++def test_mentions_and_data_stay_allowed(command):
++    assert scan_gateway_lifecycle(command) == (False, None)
++
++
++@pytest.mark.parametrize(
++    ("command", "tokens"),
++    [
++        ("(cat x) 2>&1 | bash", ["(", "cat", "x", ")", "2>&1", "|", "bash"]),
++        ("a 2>& 1", ["a", "2>&", "1"]),
++        ("a >&2 <&0 >&-", ["a", ">&2", "<&0", ">&-"]),
++        ("a &>f &>>g", ["a", "&>f", "&>>g"]),
++        ("a&>f", ["a", "&>f"]),
++        ("a 2&>f", ["a", "2", "&>f"]),
++        # Control operators keep their `&`.
++        ("a & b", ["a", "&", "b"]),
++        ("a&&>f b", ["a", "&&", ">f", "b"]),
++        ("a |&>f b", ["a", "|&", ">f", "b"]),
++        ("a >&2 & b", ["a", ">&2", "&", "b"]),
++        # A quoted or escaped `>` is text, so the `&` after it is a control operator.
++        ("a '>'& b", ["a", ">", "&", "b"]),
++        ("a \\>& b", ["a", ">", "&", "b"]),
++        ("echo '2>&1' x", ["echo", "2>&1", "x"]),
++    ],
++)
++def test_redirection_ampersand_tokenization(command, tokens):
++    assert list(_iter_command_token_lists(command)) == [tokens]
+-- 
+2.43.0
+

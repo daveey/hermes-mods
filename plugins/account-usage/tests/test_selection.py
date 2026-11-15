@@ -190,5 +190,63 @@ class Contract(unittest.TestCase):
                          'Selection must not swap the shared agent credential')
 
 
+def probe_custom_entry_choice(base_url, *, providers=None):
+    """Pick a built-in Anthropic row with no recorded address while config holds ``providers:``."""
+    from agent.account_usage_cache import _identity_id_for
+    selection = _load_selection()
+    row = PooledCredential(provider='anthropic', id='builtin', label='builtin', auth_type='api_key',
+                           priority=0, source='manual', access_token='fixture-builtin-not-a-secret',
+                           last_status='ok')
+    config = {'model': {'provider': 'anthropic', 'default': 'claude-fixture'},
+              'providers': providers or {}}
+    with patch('hermes_cli.config.load_config_readonly', return_value=config):
+        try:
+            return selection.choose_snapshot(
+                [row], provider='anthropic', model='claude-fixture',
+                account_id=_identity_id_for('anthropic', row), base_url=base_url).entry_id
+        except selection.SelectionRejected:
+            return None
+
+
+class CustomEntryOriginFence(unittest.TestCase):
+    """Core binds a custom entry's pool rows to their origin (load_route_pool, core bf42256630).
+    A snapshot reads raw rows, so a custom route must never be chosen from them."""
+    PROXY = 'https://proxy.example.com/v1'
+
+    def test_custom_entry_shadowing_builtin_cannot_take_builtin_key(self):
+        self.assertIsNone(
+            probe_custom_entry_choice(self.PROXY, providers={'anthropic': {'base_url': self.PROXY}}),
+            "A built-in account's key followed providers.anthropic to another host")
+
+    def test_classifier_exception_rejects_before_reading_credentials(self):
+        selection = _load_selection()
+        from agent.account_usage_cache import _identity_id_for
+        from unittest.mock import MagicMock
+        row = PooledCredential(provider='anthropic', id='builtin', label='builtin',
+                               auth_type='api_key', priority=0, source='manual',
+                               access_token='fixture-builtin-not-a-secret', last_status='ok')
+        account_id = _identity_id_for('anthropic', row)
+        entries = MagicMock()
+        entries.__iter__.return_value = iter([row])
+        # A route-classification failure must stop selection before even reading
+        # the supplied rows, not merely fail later because no account matches.
+        with patch('agent.custom_entry_pool.is_custom_runtime',
+                   side_effect=RuntimeError('fixture classifier failure')) as classify:
+            with self.assertRaisesRegex(selection.SelectionRejected, 'custom provider endpoint'):
+                selection.choose_snapshot(
+                    entries, provider='anthropic', model='claude-fixture',
+                    account_id=account_id, base_url=self.PROXY)
+        classify.assert_called_once_with('anthropic', None, self.PROXY)
+        self.assertEqual(entries.mock_calls, [])
+
+    def test_builtin_route_still_selects(self):
+        self.assertEqual(probe_custom_entry_choice('https://api.anthropic.com'), 'builtin')
+
+    def test_classifier_builtin_verdict_still_selects(self):
+        with patch('agent.custom_entry_pool.is_custom_runtime', return_value=False) as classify:
+            self.assertEqual(probe_custom_entry_choice('https://api.anthropic.com'), 'builtin')
+        classify.assert_called_once_with('anthropic', None, 'https://api.anthropic.com')
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

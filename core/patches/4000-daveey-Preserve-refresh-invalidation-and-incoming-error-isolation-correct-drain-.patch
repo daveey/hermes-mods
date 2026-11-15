@@ -1,0 +1,226 @@
+From 2d73320f23742385caf9f96cdaa4a448ba9a9464 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 00:27:45 +0000
+Subject: [PATCH] [daveey] Preserve refresh invalidation and incoming error
+ isolation; correct drain replay
+
+---
+ hermes_cli/kanban_capability_registry.py      |  8 ++--
+ hermes_cli/kanban_supervisor_gate.py          |  5 ++-
+ scripts/kanban_supervisor_replay_bench.py     | 37 +++++++++++++++---
+ .../test_kanban_capability_refresh_gate.py    | 23 ++++++++++-
+ .../test_kanban_supervisor_drain_gate.py      | 39 +++++++++++++++++++
+ 5 files changed, 101 insertions(+), 11 deletions(-)
+
+diff --git a/hermes_cli/kanban_capability_registry.py b/hermes_cli/kanban_capability_registry.py
+index 6c29718295..2cc636b886 100644
+--- a/hermes_cli/kanban_capability_registry.py
++++ b/hermes_cli/kanban_capability_registry.py
+@@ -96,11 +96,11 @@ def satisfies(held: str, need: str) -> bool:
+ _config_cache: tuple[float, dict] = (0.0, {})
+ 
+ 
+-def _config() -> dict:
++def _config(*, fresh: bool = False) -> dict:
+     """``kanban.capabilities`` (cached for CONFIG_TTL seconds: the dispatcher tick reads it)."""
+     global _config_cache
+     at, cached = _config_cache
+-    if time.monotonic() - at < CONFIG_TTL and at:
++    if not fresh and time.monotonic() - at < CONFIG_TTL and at:
+         return cached
+     try:
+         from hermes_cli.config import load_config_readonly
+@@ -342,7 +342,9 @@ def maybe_refresh_async(*, now: Optional[float] = None) -> bool:
+             if held is not None and held[0] == key and held[1] <= now < held[2]:
+                 return False
+             _refresh_gate = None
+-            cfg = _config()
++            # The outer due gate owns reuse: never stamp a changed signature with
++            # an old TTL-cached policy (disabled could otherwise stick forever).
++            cfg = _config(fresh=True)
+             if cfg.get("enabled") is False:
+                 _refresh_gate = (key, now, float("inf"))
+                 return False
+diff --git a/hermes_cli/kanban_supervisor_gate.py b/hermes_cli/kanban_supervisor_gate.py
+index 910ba22d9a..c4f8c28493 100644
+--- a/hermes_cli/kanban_supervisor_gate.py
++++ b/hermes_cli/kanban_supervisor_gate.py
+@@ -49,5 +49,8 @@ def dispatch(conn: sqlite3.Connection, board: str | None) -> list:
+                         extra=_key, due=_due, skipped={"processed": []})
+     # Replica calls, retry holds and label-process completions must not be hidden by
+     # a local-board/request gate. They retain their own scanner and watermark.
+-    kox.apply_incoming(conn)
++    try:
++        kox.apply_incoming(conn)
++    except Exception:  # health: allow BLE001 -- incoming retries next tick; keep committed local results
++        sr._log.warning("kanban: applying incoming operator calls failed", exc_info=True)
+     return result["processed"]
+diff --git a/scripts/kanban_supervisor_replay_bench.py b/scripts/kanban_supervisor_replay_bench.py
+index 2e6ff80875..6b036af4c0 100644
+--- a/scripts/kanban_supervisor_replay_bench.py
++++ b/scripts/kanban_supervisor_replay_bench.py
+@@ -22,27 +22,52 @@ def _refuse(*_args, **_kwargs):
+     raise AssertionError("supervisor replay must not access network or spawn processes")
+ 
+ 
++def _ungated_dispatch(conn):
++    """Pre-gate dispatcher composition, including its per-tick policy load."""
++    from hermes_cli import kanban_supervisor_requests as sr
++    from hermes_cli.config import load_config_readonly
++    if sr._non_worker_refusal():
++        raise AssertionError("replay requires an isolated non-worker home")
++    cfg = ((load_config_readonly() or {}).get("kanban") or {}).get("supervisor_requests") or {}
++    if cfg.get("enabled", True) is not False:
++        return sr.drain(conn)
++    return {"processed": []}
++
++
+ def replay(conn, ticks: int) -> dict:
+     from hermes_cli import kanban_supervisor_requests as sr
+     from hermes_cli import kanban_sweep_gate as gate
+ 
++    forbidden = []
++
++    def refuse(*args, **kwargs):
++        forbidden.append(True)  # production catches exceptions; retain independent evidence
++        _refuse(*args, **kwargs)
++
+     gate.reset()
+     start = int(time.time())
+     result = {}
+-    for name, run in (("ungated", sr.drain), ("gated", sr.dispatcher_drain)):
++    for name, run in (("ungated", _ungated_dispatch), ("gated", sr.dispatcher_drain)):
++        with patch.object(socket.socket, "connect", refuse), patch.object(subprocess, "Popen", refuse):
++            run(conn)  # imports/config bootstrap are not steady-state callback CPU
+         gate.reset()
+         # Reset the executor clock to the beginning of this identical simulated timeline.
+         conn.execute("DELETE FROM supervisor_executors")
+         conn.commit()
+         statements = []
+         conn.set_trace_callback(statements.append)
+-        cpu = time.thread_time()
+-        with patch.object(socket.socket, "connect", _refuse), patch.object(subprocess, "Popen", _refuse):
++        elapsed = 0.0
++        clock = [start]
++        with (patch.object(socket.socket, "connect", refuse),
++              patch.object(subprocess, "Popen", refuse),
++              patch.object(sr.time, "time", lambda: clock[0])):
+             for tick in range(ticks):
+-                with patch.object(sr.time, "time", return_value=start + 15 * tick):
+-                    run(conn)
+-        elapsed = time.thread_time() - cpu
++                clock[0] = start + 15 * tick
++                cpu = time.thread_time()
++                run(conn)
++                elapsed += time.thread_time() - cpu
+         conn.set_trace_callback(None)
++        assert not forbidden, "supervisor replay attempted network or process side effects"
+         result[name] = {
+             "ticks": ticks, "cpu_ms_per_tick": 1000 * elapsed / ticks,
+             "core_pct_at_15s": 100 * elapsed / (15 * ticks),
+diff --git a/tests/hermes_cli/test_kanban_capability_refresh_gate.py b/tests/hermes_cli/test_kanban_capability_refresh_gate.py
+index 14bc53b7fd..bb1831607a 100644
+--- a/tests/hermes_cli/test_kanban_capability_refresh_gate.py
++++ b/tests/hermes_cli/test_kanban_capability_refresh_gate.py
+@@ -9,6 +9,8 @@ import pytest
+ from hermes_cli import kanban_capability_registry as reg
+ from hermes_cli import kanban_sweep_gate as gate
+ 
++_REAL_CONFIG = reg._config
++
+ 
+ @pytest.fixture
+ def refresh_state(tmp_path, monkeypatch):
+@@ -17,7 +19,7 @@ def refresh_state(tmp_path, monkeypatch):
+     path.write_text(json.dumps({"schema": reg.SCHEMA, "refreshed_at": 1000}))
+     monkeypatch.setattr(reg, "registry_path", lambda: path)
+     config = {"refresh_seconds": 120}
+-    load = Mock(side_effect=lambda: dict(config))
++    load = Mock(side_effect=lambda **_kwargs: dict(config))
+     monkeypatch.setattr(reg, "_config", load)
+     revision = [1]
+     monkeypatch.setattr(gate, "config_key", lambda: revision[0])
+@@ -93,3 +95,22 @@ def test_clock_rollback_rechecks_record(refresh_state):
+     assert reg.maybe_refresh_async(now=1050) is False
+     assert reg.maybe_refresh_async(now=1000) is False
+     assert load.call_count == 2
++
++
++@pytest.mark.parametrize("old", [{"enabled": False}, {"refresh_seconds": 900}])
++def test_refresh_invalidation_bypasses_real_config_ttl(refresh_state, monkeypatch, old):
++    from hermes_cli import config
++    _, _, _, _, revision, factory = refresh_state
++    monkeypatch.setattr(reg, "_config", _REAL_CONFIG)
++    monkeypatch.setattr(reg, "_config_cache", (0.0, {}))
++    monotonic = Mock(return_value=100.0)
++    monkeypatch.setattr(reg.time, "monotonic", monotonic)
++    load = Mock(return_value={"kanban": {"capabilities": old}})
++    monkeypatch.setattr(config, "load_config_readonly", load)
++    assert reg.maybe_refresh_async(now=1050) is False
++    load.return_value = {"kanban": {"capabilities": {"enabled": True, "refresh_seconds": 60}}}
++    revision[0] += 1
++    monotonic.return_value = 101.0  # still inside the old inner cache's TTL
++    assert reg.maybe_refresh_async(now=1060) is True
++    factory.return_value.start.assert_called_once()
++    assert load.call_count == 2
+diff --git a/tests/hermes_cli/test_kanban_supervisor_drain_gate.py b/tests/hermes_cli/test_kanban_supervisor_drain_gate.py
+index 95d62ef4ac..544f5e4140 100644
+--- a/tests/hermes_cli/test_kanban_supervisor_drain_gate.py
++++ b/tests/hermes_cli/test_kanban_supervisor_drain_gate.py
+@@ -171,6 +171,39 @@ def test_terminal_request_update_invalidates_without_task_write(executor, board,
+     drain.assert_called_once()
+ 
+ 
++def test_incoming_failure_preserves_local_result(executor, board, monkeypatch):
++    executor.execute(
++        "INSERT INTO supervisor_requests(requester_task_id,ops_json,dedupe_key,created_at) "
++        "VALUES (?, '[]', 'incoming-error', 0)", (board["requester"],))
++    executor.commit()
++    monkeypatch.setattr(kox, "apply_incoming", Mock(side_effect=RuntimeError("incoming unavailable")))
++    assert sr.dispatcher_drain(executor) == [(1, "rejected")]
++    sr.dispatcher_drain(executor)
++    assert kox.apply_incoming.call_count == 2
++
++
++@pytest.mark.parametrize("kind", ["socket", "process"])
++def test_replay_rejects_swallowed_side_effects(executor, monkeypatch, kind):
++    import runpy
++    import socket
++    import subprocess
++    from pathlib import Path
++
++    def incoming(_conn):
++        if kind == "socket":
++            with socket.socket() as sock:
++                sock.connect(("127.0.0.1", 1))
++        else:
++            from tools.environments.local import build_subprocess_env
++            subprocess.Popen(["never-executed"], env=build_subprocess_env())
++
++    monkeypatch.setattr(kox, "apply_incoming", incoming)
++    script = Path(__file__).resolve().parents[2] / "scripts/kanban_supervisor_replay_bench.py"
++    replay = runpy.run_path(str(script))["replay"]
++    with pytest.raises(AssertionError, match="attempted network or process"):
++        replay(executor, 2)
++
++
+ def test_unstubbed_drain_replay(executor, monkeypatch, tmp_path):
+     import json
+     import runpy
+@@ -180,7 +213,13 @@ def test_unstubbed_drain_replay(executor, monkeypatch, tmp_path):
+     monkeypatch.setattr(kox, "apply_incoming", _APPLY_INCOMING)
+     script = Path(__file__).resolve().parents[2] / "scripts/kanban_supervisor_replay_bench.py"
+     replay = runpy.run_path(str(script))["replay"]
++    from hermes_cli import config
++    loads = Mock(return_value={})
++    monkeypatch.setattr(config, "load_config_readonly", loads)
+     report = replay(executor, 40)
++    # The old dispatcher loaded config each tick; benchmarking bare drain drops
++    # precisely the policy-read cost this gate removes. Include one warmup each.
++    assert loads.call_count == 43
+     (tmp_path / "supervisor-replay.json").write_text(json.dumps(report), encoding="utf-8")
+     assert report["ungated"]["executor_upserts"] == 40
+     assert report["gated"]["executor_upserts"] == 8
+-- 
+2.43.0
+

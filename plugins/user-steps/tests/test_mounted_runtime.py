@@ -20,6 +20,8 @@ def mounted(monkeypatch):
     plugin = dict(name='user-steps', source='bundled', _dir=str(ROOT / 'dashboard'),
                   _api_file='plugin_api.py')
     monkeypatch.setattr(web_server, '_get_dashboard_plugins', lambda **kw: [plugin])
+    # The per-request consent gate uses fresh cached discovery before rescanning.
+    monkeypatch.setattr(web_server, '_fresh_dashboard_plugins', lambda: [plugin])
     # Core now discovers each secondary profile independently. Publish this
     # synthetic bundled plugin there too; retain the real file/consent gate.
     from hermes_cli import web_server_plugin_profiles
@@ -127,9 +129,21 @@ def test_secondary_profile_recovers_only_its_outbox_and_routes_owner_events(owne
     assert terminal['params']['payload']['status'] == 'error'
     assert terminal['params']['payload']['error_surface']['code'] == 'agent_init_failed'
     assert session['transport'] is transport
+    # Agent-init failure closes the accepted user row with a durable assistant
+    # boundary. Snapshot it BEFORE retry so a duplicate dispatch cannot hide in
+    # a relaxed total-message count.
+    from agent.turn_failure_copy import FAILED_TURN_DISPLAY_KIND, FAILED_TURN_NOTICE
+    completed = db.get_messages(key)
+    assert [row['role'] for row in completed] == ['user', 'assistant']
+    assert oid in completed[0]['content']
+    assert completed[1]['content'] == FAILED_TURN_NOTICE
+    assert completed[1]['display_kind'] == FAILED_TURN_DISPLAY_KIND
+    assert launch_db.get_messages(key) == []
     # Retry reads the same durable admission, never schedules another turn.
     again = client.post(f'{base}/operations/{oid}/retry', params={'session': key, 'profile': 'secondary'})
     assert again.status_code == 200, again.text
+    assert again.json()['operation']['dispatchState'] == 'delivered'
     assert len(started) == 1
-    assert len(db.get_messages(key)) == 1
+    assert db.get_messages(key) == completed
+    assert launch_db.get_messages(key) == []
     db.close()

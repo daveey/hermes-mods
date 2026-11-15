@@ -1,0 +1,414 @@
+From 388e81fb72cdf4b7e001598f4dce9c4089ec2dcb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 03:35:56 +0000
+Subject: [PATCH] fix(kanban): preserve authoritative check ordering across
+ remote claims [daveey]
+
+Why: the quota fence folded losing tied successes, and absence from a local snapshot could not order unsynced remote claims. Select per-second winning receipts and use consistent UUIDv7 claim-initiation milliseconds as additional bounded clock evidence. No distributed clock-skew guarantee.
+
+Proof: tied-result and actual in-memory Board pre-recovery remote-claim tests fail before and pass after. Nine race mutants killed. Focused/scanner suites:1494 pass. Prior unchanged broad Kanban suite:789 files,14474 pass,24 skip. Non-executable profile-home checker executed. Historical replay remains counterfactual, not natural proof.
+---
+ docs/shared-blocker-recovery.md               | 10 ++-
+ hermes_cli/kanban_shared_blocker_checks.py    |  5 +-
+ hermes_cli/kanban_shared_blocker_fence.py     | 74 +++++++++++-----
+ .../test_kanban_shared_blocker_livelock.py    | 30 +++++++
+ .../test_kanban_shared_blocker_remote_race.py | 70 ++++++++++++++++
+ ...test_kanban_shared_blocker_result_order.py | 16 ++--
+ ...est_kanban_shared_blocker_uid_precision.py | 84 +++++++++++++++++++
+ 7 files changed, 256 insertions(+), 33 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_shared_blocker_remote_race.py
+ create mode 100644 tests/hermes_cli/test_kanban_shared_blocker_uid_precision.py
+
+diff --git a/docs/shared-blocker-recovery.md b/docs/shared-blocker-recovery.md
+index 02b8c56e82..1d26a28922 100644
+--- a/docs/shared-blocker-recovery.md
++++ b/docs/shared-blocker-recovery.md
+@@ -6,7 +6,7 @@ assertion still behind the wall when no probe has started.
+ 
+ `kanban.shared_blocker_checks` maps canonical blocker ids to shell commands.
+ The built-in `github-rest-quota` check is
+-`<Hermes home>/bin/github_quota.py --reserve-ok`. Install the companion quota
++`python3 <Hermes home>/bin/github_quota.py --reserve-ok`. Install the companion quota
+ helper with that flag before relying on this check. Override a command with an
+ empty string to disable it. Commands run as the dispatcher account, outside
+ SQLite write transactions, with a ten-second timeout. Configure only trusted,
+@@ -28,8 +28,12 @@ that family. Historical run and event payloads are normalized on read.
+ 
+ Workers with a registered check are told to run it when their next action
+ needs that capability, rather than blindly repeat context. A GitHub quota
+-assertion from a run started at or before the last verified recovery cannot
+-reopen the wall after that recovery. It remains eligible for release. A new
++assertion from a run known to have started before the last verified recovery
++cannot reopen the wall after that recovery. It remains eligible for release.
++An active-run snapshot handles local same-second claims; UUIDv7 claim-initiation
++milliseconds also identify earlier remote claims not yet synced at recovery.
++This is wall-clock evidence, not distributed causal order: clock skew, missing
++precision and exact ties retain the legacy timestamp/snapshot fallback. A new
+ run after the recovery can report a new outage. Other blocker families retain
+ their existing assertion semantics.
+ 
+diff --git a/hermes_cli/kanban_shared_blocker_checks.py b/hermes_cli/kanban_shared_blocker_checks.py
+index e5701e5080..29923df0a6 100644
+--- a/hermes_cli/kanban_shared_blocker_checks.py
++++ b/hermes_cli/kanban_shared_blocker_checks.py
+@@ -254,8 +254,9 @@ def run_due_checks(conn, *, cfg=None, now=None, due_out=None) -> list[str]:
+                 if due_out is not None:
+                     due_out.append(ts + CHECK_EVERY_SECONDS)
+                 continue
+-            # Runs open now were admitted while the command was in flight; later same-second
+-            # claims are absent, so the fence can tell them apart.
++            # Millisecond evidence complements the local snapshot for remote
++            # claims not yet synced. Explicit replay clocks have second precision.
++            payload['checked_at_ms'] = int(time.time() * 1000) if now is None else ts * 1000
+             payload["active_runs"] = _active_run_ids(conn)
+             kb._append_event(conn, homes[0], CHECK_EVENT, payload)
+         if rc == 0:
+diff --git a/hermes_cli/kanban_shared_blocker_fence.py b/hermes_cli/kanban_shared_blocker_fence.py
+index 0ec396b18f..a2ffb656c4 100644
+--- a/hermes_cli/kanban_shared_blocker_fence.py
++++ b/hermes_cli/kanban_shared_blocker_fence.py
+@@ -1,6 +1,45 @@
+ """Prevent old GitHub-quota context from undoing a verified recovery."""
+ from __future__ import annotations
+ 
++import uuid
++
++
++def _winning_checks(conn, bid, now):
++    """Historical recovery survives new cohorts, but losing tied results do not."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_shared_blockers import _LOOKBACK_SECONDS, normalize_blocker_id
++    from hermes_cli.kanban_shared_blocker_checks import CHECK_EVENT, _assertion_tokens, _checked, _result_key
++
++    token = _assertion_tokens(conn, now).get(bid)
++    winners = {}
++    for row in conn.execute('SELECT payload FROM task_events WHERE kind=? AND created_at>=?',
++                            (CHECK_EVENT, now - _LOOKBACK_SECONDS)):
++        payload = kb._json_dict(row['payload'])
++        checked = _checked(payload)
++        if normalize_blocker_id(payload.get('blocker_id')) != bid or checked > now:
++            continue
++        if checked not in winners or _result_key(payload, token) > _result_key(winners[checked], token):
++            winners[checked] = payload
++    return winners
++
++
++def _uid_before_check(identity, started, payload):
++    """UUIDv7 carries claim-initiation milliseconds, not remote commit order.
++
++    Use only consistent, strictly earlier clock evidence. Missing/invalid/tied
++    precision retains the legacy fallback; UUID random suffixes never order runs.
++    """
++    try:
++        uid = uuid.UUID(identity)
++    except (ValueError, AttributeError):
++        return False
++    checked_ms = payload.get('checked_at_ms')
++    if uid.version != 7 or type(checked_ms) is not int:
++        return False
++    claimed_ms = uid.int >> 80
++    return (claimed_ms // 1000 == started == checked_ms // 1000
++            and claimed_ms < checked_ms)
++
+ 
+ def fence_stale_quota_assertions(conn, states, asserting, *, now):
+     """Keep stale cards releasable, but don't treat their old runs as new evidence.
+@@ -10,30 +49,20 @@ def fence_stale_quota_assertions(conn, states, asserting, *, now):
+     on its next cheap check or a newly started worker can report it.
+     """
+     from hermes_cli import kanban_db as kb
+-    from hermes_cli.kanban_shared_blockers import _LOOKBACK_SECONDS, _mark_cleared, run_effect
+-    from hermes_cli.kanban_shared_blocker_checks import CHECK_EVENT, run_identity
++    from hermes_cli.kanban_shared_blockers import _mark_cleared, run_effect
++    from hermes_cli.kanban_shared_blocker_checks import run_identity
+ 
+     st = states.get('github-rest-quota')
+     if st is None:
+         return
+     in_flight = {}
+-    # Keep successful check evidence even when a delayed assertion supersedes
+-    # its race token. Token validation at write time already fenced concurrent
+-    # assertions. Legacy integer-token events are deliberately not accepted.
+-    for row in conn.execute(
+-            'SELECT payload FROM task_events WHERE kind=? AND created_at>=?',
+-            (CHECK_EVENT, now - _LOOKBACK_SECONDS)):
+-        payload = kb._json_dict(row['payload'])
+-        if (payload.get('blocker_id') == st.blocker_id and payload.get('rc') == 0
+-                and isinstance(payload.get('assertion_id'), str)):
+-            checked = kb._to_epoch(payload.get('checked_at')) or 0
+-            if checked <= now:
+-                _mark_cleared(st, '', None, checked, via='check')
+-                active = payload.get('active_runs')
+-                if isinstance(active, list):
+-                    in_flight.setdefault(checked, set()).update(map(str, active))
+-                else:
+-                    in_flight[checked] = None   # older receipt: strict timestamp fallback
++    receipts = _winning_checks(conn, st.blocker_id, now)
++    # A delayed assertion changes the cohort, not the historical recovery.
++    for checked, payload in receipts.items():
++        if payload.get('rc') == 0 and isinstance(payload.get('assertion_id'), str):
++            _mark_cleared(st, '', None, checked, via='check')
++            active = payload.get('active_runs')
++            in_flight[checked] = set(map(str, active)) if isinstance(active, list) else None
+     if not st.cleared_at:
+         return
+     eligible = []
+@@ -49,9 +78,12 @@ def fence_stale_quota_assertions(conn, states, asserting, *, now):
+         elif known is None:
+             admitted = started < st.cleared_at         # older receipt: strict timestamps
+         else:
+-            # Same-second claims are stale only if the receipt saw them running.
++            # Snapshot absence does not prove freshness: a remote claim may not
++            # have synced yet. Its portable UUID can carry earlier clock evidence.
++            identity = run_identity(conn, row['id'])
+             admitted = started < st.cleared_at or (
+-                started == st.cleared_at and run_identity(conn, row['id']) in known)
++                started == st.cleared_at and (identity in known or
++                    _uid_before_check(identity, started, receipts.get(st.cleared_at, {}))))
+         if admitted and st.cleared_at < ended:
+             if st.behind.get(row['task_id']) == ended:
+                 st.behind[row['task_id']] = st.cleared_at
+diff --git a/tests/hermes_cli/test_kanban_shared_blocker_livelock.py b/tests/hermes_cli/test_kanban_shared_blocker_livelock.py
+index 95095baa1d..9f0352ca47 100644
+--- a/tests/hermes_cli/test_kanban_shared_blocker_livelock.py
++++ b/tests/hermes_cli/test_kanban_shared_blocker_livelock.py
+@@ -104,3 +104,33 @@ def test_non_probe_context_requires_live_check(kanban_home):
+         assert '--reserve-ok' in text
+         assert 'Never re-assert without a live check' in text
+         assert 'instead of rediscovering' not in text
++
++
++def test_promoted_card_after_reset_checks_before_continuing(kanban_home, monkeypatch):
++    from hermes_cli import config, kanban_shared_blocker_checks as checks
++
++    clock = [1800000000]
++    monkeypatch.setattr(blockers.time, 'time', lambda: clock[0])
++    # The controlled checker represents the companion ledger after its reset.
++    cfg = {'kanban': {'shared_blocker_checks': {'github-rest-quota': 'exit 0'}}}
++    monkeypatch.setattr(config, 'load_config', lambda: cfg)
++    with kbc.connect_closing() as conn:
++        carrier = helpers._blocked_behind(conn, 'before reset', blocker_id=ALIASES[2])
++        parent = kb.create_task(conn, title='review', assignee='default')
++        child = kb.create_task(conn, title='landing needs GitHub', assignee='default', parents=[parent])
++        assert kb.get_task(conn, child).status == 'todo'
++        clock[0] += 120
++        assert kb.claim_task(conn, parent)
++        assert kb.complete_task(conn, parent, result='review done')
++        assert kb.get_task(conn, child).status == 'ready'
++        assert child not in blockers.blocker_states(conn)[ALIASES[0]].behind
++        text = blockers.render_blocker_context(conn, child)
++        assert 'exit 0' in text and 'Never re-assert without a live check' in text
++        assert 'instead of rediscovering' not in text
++        # Execute the rendered policy's command, not a fresh blocker assertion.
++        assert checks._run_check(checks.registered_checks(cfg)[ALIASES[0]])[0] == 0
++        assert checks.run_due_checks(conn, cfg=cfg) == [ALIASES[0]]
++        assert blockers.release_cleared_blockers(conn) == [carrier]
++        assert kb.claim_task(conn, child)
++        assert kb.complete_task(conn, child, result='continued after cheap check')
++        assert not blockers.blocker_states(conn)[ALIASES[0]].is_open
+diff --git a/tests/hermes_cli/test_kanban_shared_blocker_remote_race.py b/tests/hermes_cli/test_kanban_shared_blocker_remote_race.py
+new file mode 100644
+index 0000000000..06799381ed
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_shared_blocker_remote_race.py
+@@ -0,0 +1,70 @@
++"""A remote claim absent from the home snapshot still predates recovery."""
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_shared_blocker_checks as checks
++from hermes_cli import kanban_shared_blockers as blockers
++from hermes_cli import kanban_timed_park as park
++from tests.hermes_cli import test_kanban_shared_blocker_check_transport as transport
++from tests.hermes_cli import test_kanban_shared_blockers_copies as copies
++from tests.hermes_cli.test_kanban_wake_check_home import BUILD, _probe
++
++gws = copies.gws
++GH = 'github-rest-quota'
++
++
++@pytest.mark.parametrize('before', [True, False])
++def test_unsynced_same_second_claim_order(gws, tmp_path, monkeypatch, before):
++    home, worker = gws
++    monkeypatch.setattr(copies, 'BID', GH)
++    carrier = transport._park_with_remapped_run(home, worker, tmp_path / 'carrier')
++    home.enter()
++    tid = kb.create_task(home.conn, title='remote in flight', assignee='default', runs_on=['linux'])
++    home.round()
++    worker.round()
++    cfg = {'kanban': {'shared_blocker_checks': {GH: 'exit 0'}}}
++    second = int(time.time()) + 10
++    clock = [second + 0.1]
++    monkeypatch.setattr(time, 'time', lambda: clock[0])
++    monkeypatch.setattr(time, 'time_ns', lambda: int(clock[0] * 1_000_000_000))
++
++    def check():
++        clock[0] = second + 0.5
++        home.enter()
++        assert checks.run_due_checks(home.conn, cfg=cfg) == [GH]
++        receipt = checks._latest_results(home.conn)[GH]
++        assert receipt['active_runs'] == []
++        assert home.conn.execute('SELECT 1 FROM task_runs WHERE task_id=?', (tid,)).fetchone() is None
++
++    if not before:
++        check()
++    clock[0] = second + (0.1 if before else 0.9)
++    worker.enter()
++    worker.tick()
++    assert kb.get_task(worker.conn, tid).status == 'running'
++    if before:
++        check()
++    worker.enter()
++    clock[0] = second + 2.0
++    with kb.write_txn(worker.conn):
++        assert park.park(worker.conn, tid, reason='SCHEDULED_UNTIL=2099-01-01T00:00:00Z quota',
++                         requested_kind='time', source_status='running',
++                         wake_check=_probe(tmp_path / 'remote'), check_every=300,
++                         awaiting=BUILD, blocker_id=GH)
++    worker.round()
++    home.round()
++    worker.round()
++    runs = [g.conn.execute('SELECT id, uid, started_at FROM task_runs WHERE task_id=?', (tid,)).fetchone()
++            for g in (home, worker)]
++    assert runs[0]['uid'] == runs[1]['uid']
++    assert runs[0]['id'] != runs[1]['id']
++    assert int(runs[0]['started_at']) == second
++    for gateway in (home, worker):
++        assert blockers.blocker_states(gateway.conn)[GH].is_open is (not before)
++    worker.enter()
++    assert blockers.release_cleared_blockers(worker.conn) == []
++    home.enter()
++    released = blockers.release_cleared_blockers(home.conn)
++    assert set(released) == ({carrier, tid} if before else set())
+diff --git a/tests/hermes_cli/test_kanban_shared_blocker_result_order.py b/tests/hermes_cli/test_kanban_shared_blocker_result_order.py
+index 25e8b3de22..0c318a2b79 100644
+--- a/tests/hermes_cli/test_kanban_shared_blocker_result_order.py
++++ b/tests/hermes_cli/test_kanban_shared_blocker_result_order.py
+@@ -10,23 +10,25 @@ from tests.hermes_cli import test_kanban_shared_blockers as helpers
+ kanban_home = helpers.kanban_home
+ 
+ 
++@pytest.mark.parametrize('bid', ['test-wall', 'github-rest-quota'])
+ @pytest.mark.parametrize('reverse', [False, True])
+-def test_equal_second_failure_wins_over_success(kanban_home, reverse):
++def test_equal_second_failure_wins_over_success(kanban_home, reverse, bid):
+     with kbc.connect_closing() as conn:
+-        tid = helpers._blocked_behind(conn, 'wall', blocker_id='test-wall')
+-        now = blockers.blocker_states(conn)['test-wall'].asserted_at + 10
+-        token = checks._assertion_tokens(conn, now)['test-wall']
++        tid = helpers._blocked_behind(conn, 'wall', blocker_id=bid)
++        now = blockers.blocker_states(conn)[bid].asserted_at + 10
++        token = checks._assertion_tokens(conn, now)[bid]
+         results = [0, 1]
+         if reverse:
+             results.reverse()
+         with kb.write_txn(conn):
+             for rc in results:
+                 kb._append_event(conn, tid, checks.CHECK_EVENT, {
+-                    'blocker_id': 'test-wall', 'checked_at': now, 'started_at': now,
++                    'blocker_id': bid, 'checked_at': now, 'started_at': now,
+                     'assertion_id': token, 'command': 'probe', 'rc': rc, 'fails': 0,
+                 })
+-        assert checks._latest_results(conn, now)['test-wall']['rc'] == 1
+-        assert blockers.blocker_states(conn, now=now)['test-wall'].is_open
++        assert checks._latest_results(conn, now)[bid]['rc'] == 1
++        assert blockers.blocker_states(conn, now=now)[bid].is_open
++        assert blockers.release_cleared_blockers(conn, now=now) == []
+ 
+ 
+ @pytest.mark.parametrize('section', ['invalid', ['invalid'], 7])
+diff --git a/tests/hermes_cli/test_kanban_shared_blocker_uid_precision.py b/tests/hermes_cli/test_kanban_shared_blocker_uid_precision.py
+new file mode 100644
+index 0000000000..c5c4298cce
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_shared_blocker_uid_precision.py
+@@ -0,0 +1,84 @@
++"""Only consistent, strictly earlier UUIDv7 precision can fence a remote claim."""
++import uuid
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_shared_blocker_checks as checks
++from hermes_cli.kanban_shared_blocker_fence import _uid_before_check
++
++
++def _claim_uid(milliseconds, *, version=7, suffix=0):
++    return str(uuid.UUID(int=(milliseconds << 80) | (version << 76) | (2 << 62) | suffix))
++
++
++@pytest.mark.parametrize('identity', ['not-a-uuid', '', 17])
++def test_invalid_claim_uuid_retains_fallback(identity):
++    assert _uid_before_check(identity, 1, {'checked_at_ms': 1200}) is False
++
++
++def test_non_v7_uuid_retains_fallback_even_with_earlier_timestamp_bits():
++    identity = _claim_uid(1100, version=4)
++    assert uuid.UUID(identity).version == 4
++    assert _uid_before_check(identity, 1, {'checked_at_ms': 1200}) is False
++
++
++@pytest.mark.parametrize('payload', [
++    pytest.param({}, id='missing'),
++    pytest.param({'checked_at_ms': None}, id='null'),
++    pytest.param({'checked_at_ms': '200'}, id='numeric-string'),
++    pytest.param({'checked_at_ms': 200.0}, id='float'),
++    pytest.param({'checked_at_ms': []}, id='list'),
++    pytest.param({'checked_at_ms': {}}, id='dict'),
++    pytest.param({'checked_at_ms': True}, id='true-is-not-an-integer-clock'),
++    pytest.param({'checked_at_ms': False}, id='false-is-not-an-integer-clock'),
++])
++def test_missing_or_invalid_check_precision_retains_fallback(payload):
++    # Timestamp zero makes True satisfy the adjacent second/order predicates:
++    # changing the exact int check to isinstance(..., int) must fail this test.
++    assert _uid_before_check(_claim_uid(0), 0, payload) is False
++
++
++@pytest.mark.parametrize(('claimed_ms', 'started', 'checked_ms'), [
++    pytest.param(1100, 2, 2200, id='claim-second-disagrees'),
++    pytest.param(1100, 1, 2200, id='check-second-disagrees'),
++    pytest.param(1100, 2, 1200, id='started-second-disagrees-with-both'),
++])
++def test_inconsistent_seconds_retain_fallback(claimed_ms, started, checked_ms):
++    assert _uid_before_check(_claim_uid(claimed_ms), started,
++                             {'checked_at_ms': checked_ms}) is False
++
++
++@pytest.mark.parametrize('suffix', [0, (1 << 62) - 1])
++@pytest.mark.parametrize(('claimed_ms', 'expected'), [
++    pytest.param(1199, True, id='strictly-earlier'),
++    pytest.param(1200, False, id='equal-millisecond'),
++    pytest.param(1201, False, id='later-claim'),
++])
++def test_same_second_requires_strictly_earlier_milliseconds(claimed_ms, expected, suffix):
++    assert _uid_before_check(_claim_uid(claimed_ms, suffix=suffix), 1,
++                             {'checked_at_ms': 1200}) is expected
++
++
++@pytest.mark.platforms('posix')
++def test_default_registered_check_runs_nonexecutable_stub_in_profile_home_with_spaces(
++        tmp_path, monkeypatch):
++    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
++
++    monkeypatch.setattr(Path, 'home', lambda: tmp_path)
++    profile_home = tmp_path / 'hermes home' / 'profiles' / 'quota profile'
++    monkeypatch.setenv('HERMES_HOME', str(profile_home))
++    script = profile_home / 'bin' / 'github_quota.py'
++    script.parent.mkdir(parents=True)
++    script.write_text(
++        'import sys\n'
++        'assert sys.argv[1:] == ["--reserve-ok"], sys.argv\n'
++        'print("profile quota stub ran")\n', encoding='utf-8')
++    script.chmod(0o600)
++    assert script.stat().st_mode & 0o111 == 0
++    token = set_hermes_home_override(profile_home)
++    try:
++        command = checks.registered_checks({})['github-rest-quota']
++        assert checks._run_check(command) == (0, 'profile quota stub ran')
++    finally:
++        reset_hermes_home_override(token)
+-- 
+2.43.0
+

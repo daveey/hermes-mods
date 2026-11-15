@@ -1,0 +1,117 @@
+From af26d966acb1480a85a3bd6eb1119be531f5abb3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:14:10 +0000
+Subject: [PATCH] [daveey] fix(state): lease-less transcript writers honour the
+ post-wake turn-lease grace
+
+Review of PR #3127 (t_01a1dc8321ed0ebd): _check_transcript_write_guards' lease-less branch (producer and
+prompt admission, detached deliveries, mutations) still reclaimed a turn lease on bare expiry through
+_stale_holder, so right after a wake the first detached delivery deleted the live holder's lapsed row and
+the holder's refresh failed. It now uses _stale_turn_lease (dead holder, or lapsed_row_reclaimable), the
+same rule as acquisition. Compression-lock reclaim is unchanged.
+
+Self-heal t_01a1dae544d34841 (gateway-34796400a6).
+---
+ hermes_state_messages.py                      |  7 ++--
+ hermes_state_wake_grace.py                    |  9 ++++++
+ .../test_session_turn_lease_wake_grace.py     | 32 +++++++++++++++++++
+ 3 files changed, 44 insertions(+), 4 deletions(-)
+
+diff --git a/hermes_state_messages.py b/hermes_state_messages.py
+index 92a595cc4e..f64e1c756b 100644
+--- a/hermes_state_messages.py
++++ b/hermes_state_messages.py
+@@ -26,6 +26,7 @@ from hermes_state_common import (
+ from hermes_state_compaction_display import later_tool_copy_ids, not_a_later_tool_copy_sql
+ from hermes_state_detached_results import SessionDetachedResultsMixin
+ from hermes_state_todo import SessionTodoResultMixin
++from hermes_state_wake_grace import stale_turn_lease
+ from hermes_state_stored_reads import SessionStoredReadsMixin
+ from hermes_state_identity import (
+     _absorbed_uids_json, _restore_identity_columns, _stable_tool_key, _tool_call_uid_map, _tool_call_uid_or_none, _tool_call_uids_json, _uid_list)
+@@ -121,7 +122,6 @@ def _stale_holder(row, now: float) -> bool:
+     from hermes_state import _compression_lock_holder_process_is_dead
+     return float(row["expires_at"]) <= now or _compression_lock_holder_process_is_dead(row["holder"])
+ 
+-
+ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, SessionStoredReadsMixin):
+     """Message append/replace/rewind, reactions, resume conversations, replay dedupe (detached results: the base)."""
+ 
+@@ -257,9 +257,8 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin,
+                         "WHERE conversation_id = ? AND holder = ?",
+                         (now + max(0.1, float(turn_lease_ttl_seconds)), conversation_id, turn_lease_holder))
+             elif lease is not None:
+-                if not _stale_holder(lease, now):
+-                    raise SessionTurnLeaseLostError(
+-                        f"Session has an active turn lease; refusing transcript mutation for {session_id!r}")
++                if not stale_turn_lease(lease, now):  # post-wake grace included (hermes_state_wake_grace)
++                    raise SessionTurnLeaseLostError(f"Session has an active turn lease; refusing transcript mutation for {session_id!r}")
+                 # Same reclaim rule as acquisition; deleting also fences a stale late flush after the mutation.
+                 conn.execute("DELETE FROM session_turn_leases WHERE conversation_id = ? AND holder = ?",
+                     (conversation_id, lease["holder"]))
+diff --git a/hermes_state_wake_grace.py b/hermes_state_wake_grace.py
+index 3e294ded8d..b6f97c8010 100644
+--- a/hermes_state_wake_grace.py
++++ b/hermes_state_wake_grace.py
+@@ -71,6 +71,15 @@ def lapsed_row_reclaimable(holder: str, expires_at: float, now: float) -> bool:
+     return not recently_woke()
+ 
+ 
++def stale_turn_lease(row, now: float) -> bool:
++    """A turn-lease row a lease-less transcript writer may delete (``_check_transcript_write_guards``): a
++    provably dead holder, or the acquisition expiry rule above, so a wake does not let the first detached
++    delivery delete a live holder's lapsed row before its post-wake renewal."""
++    from hermes_state import _compression_lock_holder_process_is_dead
++    return (_compression_lock_holder_process_is_dead(row["holder"])
++            or lapsed_row_reclaimable(row["holder"], row["expires_at"], now))
++
++
+ def _reset_for_tests() -> None:
+     global _last_total, _woke_at
+     with _lock:
+diff --git a/tests/hermes_state/test_session_turn_lease_wake_grace.py b/tests/hermes_state/test_session_turn_lease_wake_grace.py
+index 192a762bdc..987218e7e0 100644
+--- a/tests/hermes_state/test_session_turn_lease_wake_grace.py
++++ b/tests/hermes_state/test_session_turn_lease_wake_grace.py
+@@ -137,6 +137,38 @@ def test_runtime_worker_acquire_honors_the_wake_grace(tmp_path, monkeypatch):
+     assert _owner(path) == holder
+ 
+ 
++def test_lease_less_writer_does_not_delete_live_holders_lease_right_after_a_suspend(tmp_path, monkeypatch):
++    """Producer/detached writers check the turn lease without holding one; their stale rule must match
++    acquisition, or the first post-wake delivery deletes the holder's row and the holder's refresh fails."""
++    from hermes_state_errors import SessionTurnLeaseLostError
++
++    clocks = _FakeClocks(monkeypatch)
++    path = tmp_path / "state.db"
++    db = SessionDB(path)
++    db.create_session("chat", source="desktop")
++    holder = f"pid={os.getpid()}:turn=tui"
++    assert db.try_acquire_session_turn_lease("chat", holder, ttl_seconds=300)
++    clocks.sleep(441)
++    _expire(path, holder)
++
++    with pytest.raises(SessionTurnLeaseLostError):
++        db.append_delegation_delivery("chat", "delegate answered", {"delegation_id": "d-1"})
++    assert _owner(path) == holder
++    assert db.refresh_session_turn_lease("chat", holder, ttl_seconds=300)
++
++
++def test_lease_less_writer_reclaims_a_lapsed_lease_without_a_suspend(tmp_path, monkeypatch):
++    _FakeClocks(monkeypatch)
++    path = tmp_path / "state.db"
++    db = SessionDB(path)
++    db.create_session("chat", source="desktop")
++    holder = f"pid={os.getpid()}:turn=old"
++    assert db.try_acquire_session_turn_lease("chat", holder, ttl_seconds=300)
++    _expire(path, holder)
++    db.append_delegation_delivery("chat", "delegate answered", {"delegation_id": "d-1"})
++    assert _owner(path) is None
++
++
+ @pytest.mark.parametrize("value", [None])
+ def test_tracker_without_a_suspend_clock_never_defers(monkeypatch, value):
+     monkeypatch.setattr(wake_grace, "suspended_total_s", lambda: value)
+-- 
+2.43.0
+

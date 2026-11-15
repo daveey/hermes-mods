@@ -1,0 +1,483 @@
+From 072ff2b67a80264f4db28503172b932634c4b353 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 22:38:05 +0000
+Subject: [PATCH] [daveey] update pause: passive rows wait while a turn is
+ parked; a drain-fenced automation head settles
+
+On laptop-1 on 2026-11-13 (agent.log through agent.log.3, re-counted 14:31 PST), a core update
+parked 15 gateway turns. 9 resumed ("auto-continue scheduled"). 6 automation turns (Kanban notice
+batches) were dropped ("Lost automation admission ... settled interrupted (not replayed)", at 09:59
+twice, 10:25, 10:38 and 13:58 twice). The discriminator: each dropped turn's chat got a
+"notice row written" between the park and the resume, and no resumed turn's chat did. In one chat (20261026_235722_bef6c6) the drain then paused the
+FIFO, and every turn was refused for 1 h 45 min until the next gateway boot.
+
+Five whys
+1. The parked turn's checkpoint was invalid on resume: its receipt was gone and the admission ended
+   terminal/interrupted (seq 5234).
+2. A passive Kanban notice row (914739, 12:13:06) was appended after the checkpointed tool suffix
+   (914622..914700). _binding requires the transcript tail to be that suffix, so the proof failed.
+3. Passive writers only defer on a live turn lease (SessionTurnLeaseLostError), and a parked turn
+   holds no lease. Nothing checked for a pending update checkpoint.
+4. (stall branch) The drain's invalid_checkpoint path called refuse_checkpoint and then _pause, and
+   never ran the GW-10 settle. An unattended head was settled only at boot or on a later claim, so
+   the paused queue waited for the next owner restart. _pause logged nothing.
+Root: the checkpoint ("nothing written after the suffix") and the passive-row writers ("append when
+no live lease") disagreed. Separately, the drain's fence path skipped GW-10.
+
+Fix
+- hermes_state_update_pause.parked_update_turn / refuse_parked_write: a started admission with a
+  gateway.update_checkpoint.v1.<id> receipt fences its logical target, the receipt's physical tip
+  and its physical chain. This is checked inside the writer transaction.
+- SessionDB._check_transcript_write_guards: every lease-less caller that opts in through
+  reject_active_turn_lease (passive writers and user mutations) now gets the same retryable
+  SessionTurnLeaseLostError ("busy") while the conversation's turn is parked. Callers already
+  rewind and retry on that error, so the notice rides the resumed turn or the next pass. Paths
+  covered: append_kanban_notice/record_kanban_notice (kanban_unloaded, kanban_remote_notices,
+  session_notifications, reap_notices), append_completion_note, append_delegation_delivery,
+  producer_admission.commit_delivery, prompt_admission.admit_prompt/mark_dispatch_failed,
+  replace_messages(reject_active_turn_lease), legacy refusal repair, and mutation guards. The lease
+  holder's own writes are not fenced.
+- SessionAuthority drain: after refuse_checkpoint fences a head, settle_unattended_unknown settles
+  it if it is unattended, and the drain continues to the queued follower. A turn a person sent still
+  pauses.
+- SessionAuthority._pause logs every pause: WARNING, or INFO for the transient session_busy and
+  runtime_draining reasons, which would otherwise log on every worker wait.
+
+Not fenced here (unguarded append_message writers, no lease check either): gateway/mirror.py
+(send_message mirror), the TUI model_switch marker, the Stop notice, the shutdown spool replay and
+the TUI submit row. These are follow-up material.
+
+Proof
+- RED on f4694c980f with only the tests applied: 19 failed. Passive-write store tests: DID NOT
+  RAISE. Drain fence test: the follower never ran (pause). Pause-logging tests: no log line.
+- GREEN: tests/hermes_state/test_parked_turn_passive_writes.py (15) and
+  tests/gateway/test_parked_automation_fence_settles.py (7) pass, plus 256 affected test files
+  (update pause, GW-10, Kanban notice and passive writer suites).
+- scripts/check --base origin/main: 20 checks ok (FILE_LINES on hermes_state_messages.py offset).
+
+Kanban: t_01a1d6f94ac774a2
+---
+ gateway/session_authority.py                  |  16 +-
+ hermes_state_messages.py                      |  14 +-
+ hermes_state_update_pause.py                  |  40 +++++
+ .../test_parked_automation_fence_settles.py   | 115 +++++++++++++
+ .../test_parked_turn_passive_writes.py        | 154 ++++++++++++++++++
+ 5 files changed, 329 insertions(+), 10 deletions(-)
+ create mode 100644 tests/gateway/test_parked_automation_fence_settles.py
+ create mode 100644 tests/hermes_state/test_parked_turn_passive_writes.py
+
+diff --git a/gateway/session_authority.py b/gateway/session_authority.py
+index 782cd64bd4..bfe90af958 100644
+--- a/gateway/session_authority.py
++++ b/gateway/session_authority.py
+@@ -521,7 +521,14 @@ class SessionAuthority:
+         will not run. The ingress turns that refusal into one user-facing notice per episode.
+         ``session_busy`` is transient (a registered worker finishes and wakes the FIFO), so only
+         the messaging delivery waiters are released for it; an API/webhook/Bot observer keeps
+-        waiting for the answer instead of reporting accepted work as a conflict."""
++        waiting for the answer instead of reporting accepted work as a conflict.
++
++        [daveey] t_01a1d6f94ac774a2: every pause is logged, WARNING unless transient: a silent
++        pause stalled a chat for 1 h 45 min with only INFO refusals to show for it."""
++        import logging
++        transient = reason in ('session_busy', 'runtime_draining')
++        logging.getLogger(__name__).log(logging.INFO if transient else logging.WARNING,
++                                        'Session %s paused: %s', ref.session_id, reason)
+         for row in list_session_admissions(self.db, session_id=ref.session_id):
+             admission_id = row['admission_id']
+             if reason == 'session_busy' and admission_id not in self.native_waiters:
+@@ -1302,6 +1309,11 @@ class SessionAuthority:
+                         from gateway.session_update_pause import refuse_checkpoint
+                         fenced = await refuse_checkpoint(self, ref, live, attempted)
+                         if fenced is not False:
++                            # [daveey] t_01a1d6f94ac774a2: a fenced automation head settles (GW-10) and the drain
++                            # runs its follower; pausing here stalled the chat until the next owner boot.
++                            from gateway.session_unattended_unknown import settle_unattended_unknown
++                            if fenced and await settle_unattended_unknown(self, ref):
++                                continue
+                             self._pause(ref, 'unknown_execution' if fenced else exc.reason)
+                             return None
+                         # It changed while preflight awaited: retry, never refuse its successor.
+@@ -1334,8 +1346,6 @@ class SessionAuthority:
+                             refusing = None
+                             if refused:
+                                 continue
+-                    import logging
+-                    logging.getLogger(__name__).warning('Session %s paused: %s', ref.session_id, exc.reason)
+                     self._pause(ref, exc.reason)
+                     return None
+             except (OSError, sqlite3.OperationalError) as exc:
+diff --git a/hermes_state_messages.py b/hermes_state_messages.py
+index c0e0c48385..a404204969 100644
+--- a/hermes_state_messages.py
++++ b/hermes_state_messages.py
+@@ -222,11 +222,9 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin,
+         summaries). Destructive user mutations opt in via ``reject_active_*`` so a compressor that captured
+         its watermark cannot resurrect the removed turn.
+ 
+-        Shared by :meth:`append_message` and :meth:`append_messages_batch` so the two writers can never
+-        diverge on these correctness invariants (this guard has already needed targeted fixes — see the
+-        #74478 patience note below). User-initiated transcript mutations may opt in to rejecting an active
+-        unowned turn lease in that same transaction.
+-        """
++        Shared by every writer so they never diverge on these invariants (#74478 patience note below). A
++        lease-less caller opting in via ``reject_active_turn_lease`` is refused while a turn holds the lease
++        or one is parked for an update (its checkpoint forbids any later row) [daveey t_01a1d6f94ac774a2]."""
+         from hermes_state import SessionCompressionInProgressError
+         from hermes_state_errors import CompressionSessionClosedError, SessionTurnLeaseLostError
+         # NOTE (#75316 redesign): appends do NOT check compression_locks. The lock's job is to stop two
+@@ -251,8 +249,7 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin,
+             now = time.time()
+             if turn_lease_holder:
+                 if lease is None or lease["holder"] != turn_lease_holder:
+-                    raise SessionTurnLeaseLostError(
+-                        f"Session turn lease lost; refusing transcript write for {session_id!r}")
++                    raise SessionTurnLeaseLostError(f"Session turn lease lost; refusing transcript write for {session_id!r}")
+                 if float(lease["expires_at"]) <= now:
+                     # Expiry makes the row reclaimable, not taken over; BEGIN IMMEDIATE serializes this
+                     # renewal with acquisition, so a still-matching owner recovers from a starved refresher.
+@@ -266,6 +263,9 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin,
+                 # Same reclaim rule as acquisition; deleting also fences a stale late flush after the mutation.
+                 conn.execute("DELETE FROM session_turn_leases WHERE conversation_id = ? AND holder = ?",
+                     (conversation_id, lease["holder"]))
++            if not turn_lease_holder:
++                from hermes_state_update_pause import refuse_parked_write
++                refuse_parked_write(conn, session_id, conversation_id)
+         if _ended_by_compression(conn.execute(_ENDED_ROW_SQL, (session_id,)).fetchone()) and not allow_closed_compression_parent:
+             raise CompressionSessionClosedError(session_id)
+ 
+diff --git a/hermes_state_update_pause.py b/hermes_state_update_pause.py
+index c21ca7d985..a82e23a72f 100644
+--- a/hermes_state_update_pause.py
++++ b/hermes_state_update_pause.py
+@@ -111,6 +111,46 @@ def _valid_checkpoint(conn, row):
+         return None
+ 
+ 
++def parked_update_turn(conn, session_ids):
++    """[daveey] t_01a1d6f94ac774a2: the admission id of a started turn parked by an update checkpoint
++    whose conversation covers any of ``session_ids``, else None.
++
++    A receipt proves its turn by "no row after the tool suffix", so a row a passive writer (a Kanban or
++    completion notice) appends while the turn is parked voids it and the turn is dropped on resume. A
++    parked turn holds no turn lease, so passive writers ask this instead. Receipt validity is not judged
++    here: an unreadable receipt still fences its logical target until resume or recovery settles it."""
++    wanted = {sid for sid in session_ids if sid}
++    end = CHECKPOINT_PREFIX[:-1] + chr(ord(CHECKPOINT_PREFIX[-1]) + 1)
++    for key, value in conn.execute('SELECT key,value FROM state_meta WHERE key>=? AND key<?',
++                                   (CHECKPOINT_PREFIX, end)).fetchall():
++        admission_id = key[len(CHECKPOINT_PREFIX):]
++        row = conn.execute("SELECT target_session_id FROM session_admissions WHERE admission_id=? "
++                           "AND status='started'", (admission_id,)).fetchone()
++        if row is None:
++            continue
++        bound = {row[0]}
++        try:
++            receipt = json.loads(value) if isinstance(value, str) and len(value) <= MAX_RECEIPT_BYTES else None
++        except (ValueError, RecursionError):
++            receipt = None
++        if isinstance(receipt, dict):
++            chain = receipt.get('physical_chain')
++            bound.update(s for s in [receipt.get('physical_session_id'), *(chain if isinstance(chain, list) else ())]
++                         if isinstance(s, str))
++        if wanted & bound:
++            return admission_id
++    return None
++
++
++def refuse_parked_write(conn, session_id, conversation_id):
++    """A passive (lease-less) transcript write's in-transaction guard: the same retryable "busy" refusal a
++    live turn lease gives, so callers rewind and retry after the parked turn resumes or is settled."""
++    from hermes_state_errors import SessionTurnLeaseLostError
++    if parked_update_turn(conn, (session_id, conversation_id)) is not None:
++        raise SessionTurnLeaseLostError(
++            f'Session has a turn parked for an update; refusing transcript mutation for {session_id!r}')
++
++
+ def delete_session_checkpoint(conn, admission_id):
+     """Same-transaction cleanup; never deletes unrelated state_meta receipts."""
+     conn.execute('DELETE FROM state_meta WHERE key=?', (CHECKPOINT_PREFIX + admission_id,))
+diff --git a/tests/gateway/test_parked_automation_fence_settles.py b/tests/gateway/test_parked_automation_fence_settles.py
+new file mode 100644
+index 0000000000..88a35f78ab
+--- /dev/null
++++ b/tests/gateway/test_parked_automation_fence_settles.py
+@@ -0,0 +1,115 @@
++"""t_01a1d6f94ac774a2: a parked automation turn whose proof dies under the drain must not stall its chat.
++
++laptop-1 2026-11-13 12:13: boot recovery kept a valid checkpoint for a parked Kanban-notice batch, a
++passive notice row landed (12:13:06) before the drain resumed it (12:13:15), the resume refused
++``invalid_checkpoint``, and ``refuse_checkpoint`` fenced the head ``unknown`` and PAUSED the FIFO. GW-10
++settles an unattended unknown, but only at boot or on a later claim, so every turn was refused for
++1 h 45 min until the next gateway boot. Now (a) the passive writer is refused while the turn is parked,
++so the turn resumes, and (b) a head fenced by the drain still settles when nobody waits on it.
++"""
++import logging
++
++import pytest
++
++from gateway.session_authority import LiveSession, SessionAuthority
++from hermes_state_errors import SessionTurnLeaseLostError
++from hermes_state_runtime import (admit_session_input, begin_runtime_epoch, get_session_admission,
++                                  recover_session_inputs)
++from hermes_state_update_pause import get_session_checkpoint
++from tests.gateway.test_authority_update_pause import parked_fixture
++from tests.gateway.test_session_authority_cancel_settlement import REF
++
++AUTOMATION = {'text': 'kanban batch', 'local_automation_v1': {'identity': 'kanban-batch-1', 'owner': 's'}}
++PERSON = {'text': 'kanban batch'}
++
++
++async def _after_boot(tmp_path, monkeypatch, payload):
++    """Owner 1 parks the head and queues a follower; owner 2 boots and recovers (checkpoint kept)."""
++    from gateway import session_finite
++    from gateway.session_unattended_unknown import settle_recovered_unattended
++    from hermes_cli import admission_fence
++    db, old, head = parked_fixture(tmp_path, monkeypatch, payload=payload)
++    follower = admit_session_input(db, epoch=old.epoch, principal_id='human', session_id='s',
++                                   request_id='follower', payload={'text': 'FOLLOWER'})
++    epoch = begin_runtime_epoch(db, instance_id='after-update')
++    assert recover_session_inputs(db, epoch=epoch) == 0
++    assert settle_recovered_unattended(db, epoch) == 0
++    assert get_session_checkpoint(db, session_id='s') is not None
++    owner = SessionAuthority(old.runner, profile_id='owned', instance_id='after-update', db=db, epoch=epoch)
++    owner.sessions['s'] = LiveSession(old.sessions['s'].source, 'route')
++    calls = []
++
++    async def execute(authority, ref, row):
++        calls.append('resumed' if row.get('update_resume') else row['payload']['text'])
++        return calls[-1]
++    monkeypatch.setattr(session_finite, 'execute_finite_admission', execute)
++    monkeypatch.setattr(admission_fence, 'is_held', lambda root: False)
++    return db, owner, head, follower, calls
++
++
++async def _drain(owner):
++    import asyncio
++    owner._schedule(REF)
++    await asyncio.wait_for(owner.sessions['s'].task, 10)
++
++
++def _status(db, admission):
++    row = get_session_admission(db, admission_id=admission['admission_id'])
++    return row['status'], row['outcome']
++
++
++@pytest.mark.asyncio
++async def test_notice_between_boot_recovery_and_resume_is_deferred_and_turn_resumes(tmp_path, monkeypatch):
++    """Race regression (acceptance 3): the notice arrives in the window and must not stop the chat."""
++    db, owner, head, follower, calls = await _after_boot(tmp_path, monkeypatch, AUTOMATION)
++    with db:
++        metadata = {'notice_id': 'default:t_x:0-1', 'kanban_event_keys': ['default:1']}
++        with pytest.raises(SessionTurnLeaseLostError):
++            db.append_kanban_notice('s', 'card t_x done', metadata)
++        await _drain(owner)
++        assert calls == ['resumed', 'FOLLOWER']
++        assert _status(db, head) == ('terminal', 'completed')
++        assert _status(db, follower) == ('terminal', 'completed')
++        # The deferred notice is delivered on its next pass, after the resumed turn.
++        assert db.append_kanban_notice('s', 'card t_x done', metadata) > 0
++
++
++@pytest.mark.asyncio
++async def test_drain_fenced_automation_head_settles_and_follower_runs_in_same_drain(tmp_path, monkeypatch, caplog):
++    """Acceptance 2: a proof voided after boot recovery (any writer) fences the automation head; GW-10 settles
++    it and the same drain runs the queued follower, with no pause."""
++    db, owner, head, follower, calls = await _after_boot(tmp_path, monkeypatch, AUTOMATION)
++    with db:
++        db.append_message('s', 'user', 'a row an unguarded writer appended')  # voids the proof
++        assert get_session_checkpoint(db, session_id='s') is None
++        with caplog.at_level(logging.INFO, logger='gateway.session_authority'):
++            await _drain(owner)
++        assert calls == ['FOLLOWER']
++        assert _status(db, head) == ('terminal', 'interrupted')
++        assert _status(db, follower) == ('terminal', 'completed')
++        assert not [r for r in caplog.records if 'paused' in r.getMessage()]
++
++
++@pytest.mark.asyncio
++async def test_drain_fenced_persons_head_still_pauses_and_says_so(tmp_path, monkeypatch, caplog):
++    db, owner, head, follower, calls = await _after_boot(tmp_path, monkeypatch, PERSON)
++    with db:
++        db.append_message('s', 'user', 'a row an unguarded writer appended')
++        with caplog.at_level(logging.INFO, logger='gateway.session_authority'):
++            await _drain(owner)
++        assert calls == []
++        assert _status(db, head) == ('unknown', None)
++        assert _status(db, follower) == ('queued', None)
++        paused = [r for r in caplog.records if r.getMessage() == 'Session s paused: unknown_execution']
++        assert paused and paused[0].levelno == logging.WARNING
++
++
++@pytest.mark.parametrize('reason,level', [('session_busy', logging.INFO), ('runtime_draining', logging.INFO),
++                                          ('unknown_execution', logging.WARNING),
++                                          ('admission_conflict', logging.WARNING)])
++def test_every_pause_is_logged(tmp_path, monkeypatch, caplog, reason, level):
++    from tests.gateway.test_session_authority_cancel_settlement import _authority
++    db, owner = _authority(tmp_path, monkeypatch)
++    with db, caplog.at_level(logging.INFO, logger='gateway.session_authority'):
++        owner._pause(REF, reason)
++    assert [(r.getMessage(), r.levelno) for r in caplog.records] == [(f'Session s paused: {reason}', level)]
+diff --git a/tests/hermes_state/test_parked_turn_passive_writes.py b/tests/hermes_state/test_parked_turn_passive_writes.py
+new file mode 100644
+index 0000000000..f104ef9940
+--- /dev/null
++++ b/tests/hermes_state/test_parked_turn_passive_writes.py
+@@ -0,0 +1,154 @@
++"""t_01a1d6f94ac774a2: a passive row may not land in a chat whose turn is parked for an update.
++
++The update checkpoint proves its parked turn by "nothing was written after its tool suffix". A
++parked turn holds no turn lease, so passive writers (Kanban notices, completion notes, detached
++results, legacy prompt rows) used to append freely and void the proof: the turn was dropped on
++resume (7 of 7 on laptop-1 2026-11-13). Each passive path now gets the same retryable "busy"
++refusal a live turn gives, the checkpoint stays valid, and the deferred row lands after the resume.
++"""
++import json
++
++import pytest
++
++import hermes_state_runtime as rt
++from hermes_state import SessionDB
++from hermes_state_errors import SessionTurnLeaseLostError
++
++
++@pytest.fixture
++def parked(tmp_path):
++    from hermes_state_update_pause import checkpoint_session_input
++    with SessionDB(tmp_path / 'state.db') as db:
++        db.create_session('s', source='test')
++        db.create_session('other', source='test')
++        epoch = rt.begin_runtime_epoch(db, instance_id='first')
++        rt.admit_session_input(db, epoch=epoch, principal_id='automation:kanban', session_id='s',
++                               request_id='one', payload={'text': 'notice batch'})
++        row = rt.claim_session_input(db, epoch=epoch, session_id='s')
++        db.append_messages_batch('s', [
++            {'role': 'user', 'content': 'notice batch'},
++            {'role': 'assistant', 'content': '', 'tool_calls': [
++                {'id': 'call-a', 'type': 'function', 'function': {'name': 'example', 'arguments': '{}'}}]},
++            {'role': 'tool', 'content': 'done', 'tool_call_id': 'call-a', 'tool_name': 'example'},
++        ])
++        checkpoint_session_input(db, epoch=epoch, admission_id=row['admission_id'], generation=row['generation'],
++                                 physical_session_id='s', transcript_mark=row['transcript_mark'])
++        yield db, epoch, row
++
++
++def _kanban_notice(db, sid, n=1):
++    return db.append_kanban_notice(sid, f'card {n} done', {'notice_id': f'default:t_{n}:0-1',
++                                                          'kanban_event_keys': [f'default:{n}']})
++
++
++def _record_kanban_notice(db, sid, n=2):
++    return db.record_kanban_notice(sid, f'card {n} done', {'notice_id': f'default:t_{n}:0-1'})[0]
++
++
++def _completion_note(db, sid):
++    return db.append_completion_note(sid, 'adm-x', 'process finished', 'completion_note', {})
++
++
++def _delegation(db, sid):
++    return db.append_delegation_delivery(sid, 'delegate answered', {'delegation_id': 'd-1'})
++
++
++def _legacy_prompt(db, sid):
++    from hermes_state_prompt_admission import admit_prompt, prompt_digest
++    return admit_prompt(db, sid, 'op-1', 'typed while parked', prompt_digest(sid, 'typed while parked'))
++
++
++PASSIVE = {'append_kanban_notice': _kanban_notice, 'record_kanban_notice': _record_kanban_notice,
++           'append_completion_note': _completion_note, 'append_delegation_delivery': _delegation,
++           'admit_prompt': _legacy_prompt}
++
++
++@pytest.mark.parametrize('write', PASSIVE.values(), ids=PASSIVE.keys())
++def test_passive_write_defers_and_parked_turn_resumes_then_row_lands(parked, write):
++    from hermes_state_update_pause import get_session_checkpoint, resume_session_checkpoint
++    db, epoch, row = parked
++    before = db.get_messages('s')
++    with pytest.raises(SessionTurnLeaseLostError, match='parked for an update'):
++        write(db, 's')
++    assert db.get_messages('s') == before
++    assert get_session_checkpoint(db, session_id='s') is not None, 'the refused write must not void the proof'
++    # A new owner (the post-update gateway) keeps the valid checkpoint and resumes it.
++    epoch = rt.begin_runtime_epoch(db, instance_id='second')
++    assert rt.recover_session_inputs(db, epoch=epoch) == 0
++    resumed = resume_session_checkpoint(db, epoch=epoch, admission_id=row['admission_id'])
++    assert resumed['update_resume']['admission_id'] == row['admission_id']
++    # The retried passive row is delivered once the turn is no longer parked.
++    write(db, 's')
++    assert len(db.get_messages('s')) == len(before) + 1
++
++
++def test_destructive_user_rewrite_is_refused_while_parked(parked):
++    from hermes_state_update_pause import get_session_checkpoint
++    db, _, _ = parked
++    with pytest.raises(SessionTurnLeaseLostError):
++        db.replace_messages('s', [{'role': 'user', 'content': 'rewritten'}], active_only=True,
++                            reject_active_turn_lease=True)
++    assert get_session_checkpoint(db, session_id='s') is not None
++
++
++def test_other_chats_and_unparked_turns_still_take_passive_rows(parked):
++    from hermes_state_update_pause import CHECKPOINT_PREFIX
++    db, _, row = parked
++    assert _kanban_notice(db, 'other') > 0  # a different conversation is not parked
++    # A fenced (unknown) head is no longer parked: its receipt is gone, the chat takes rows again.
++    db._execute_write(lambda c: c.execute('DELETE FROM state_meta WHERE key=?', (CHECKPOINT_PREFIX + row['admission_id'],)))
++    assert _kanban_notice(db, 's') > 0
++
++
++def test_settled_admission_with_leftover_receipt_does_not_fence(parked):
++    db, _, row = parked
++    db._execute_write(lambda c: c.execute("UPDATE session_admissions SET status='terminal',outcome='interrupted' "
++                                          "WHERE admission_id=?", (row['admission_id'],)))
++    assert _kanban_notice(db, 's') > 0
++
++
++def test_live_turn_owner_write_is_not_refused(parked):
++    """Only writers without the turn lease are passive: the lease holder's own rows are not fenced here."""
++    db, _, _ = parked
++    db._execute_write(lambda c: c.execute(
++        "INSERT INTO session_turn_leases(conversation_id, holder, acquired_at, expires_at) "
++        "VALUES('s','resumed',0,?)", (2e10,)))
++    assert db.append_message('s', 'assistant', 'resumed answer', turn_lease_holder='resumed') > 0
++
++
++@pytest.mark.parametrize('field', ['physical_session_id', 'physical_chain'])
++def test_receipt_physical_tip_is_fenced(parked, field):
++    """The notice writers address the conversation's physical tip, which can differ from the logical target."""
++    from hermes_state_update_pause import CHECKPOINT_PREFIX
++    db, _, row = parked
++    db.create_session('tip', source='test')
++    key = CHECKPOINT_PREFIX + row['admission_id']
++    receipt = json.loads(db._execute_write(lambda c: c.execute('SELECT value FROM state_meta WHERE key=?',
++                                                               (key,)).fetchone()[0]))
++    receipt['physical_session_id'] = 'tip' if field == 'physical_session_id' else 's'
++    receipt['physical_chain'] = ['s', 'tip'] if field == 'physical_chain' else ['s']
++    db._execute_write(lambda c: c.execute('UPDATE state_meta SET value=? WHERE key=?', (json.dumps(receipt), key)))
++    with pytest.raises(SessionTurnLeaseLostError):
++        _kanban_notice(db, 'tip')
++
++
++@pytest.mark.parametrize('raw', ['{', '[]', 'x' * 9000], ids=['truncated', 'list', 'oversized'])
++def test_unreadable_receipt_still_fences_its_logical_target(parked, raw):
++    from hermes_state_update_pause import CHECKPOINT_PREFIX
++    db, _, row = parked
++    db._execute_write(lambda c: c.execute('UPDATE state_meta SET value=? WHERE key=?',
++                                          (raw, CHECKPOINT_PREFIX + row['admission_id'])))
++    with pytest.raises(SessionTurnLeaseLostError):
++        _kanban_notice(db, 's')
++    assert _kanban_notice(db, 'other') > 0
++
++
++def test_neighbouring_state_meta_keys_are_not_receipts(parked):
++    """The receipt scan is a key range; a key just past the prefix range is not a checkpoint."""
++    from hermes_state_update_pause import CHECKPOINT_PREFIX, parked_update_turn
++    db, _, row = parked
++    db._execute_write(lambda c: c.execute('DELETE FROM state_meta WHERE key=?', (CHECKPOINT_PREFIX + row['admission_id'],)))
++    db._execute_write(lambda c: c.execute('INSERT INTO state_meta(key,value) VALUES(?,?)',
++                                          (CHECKPOINT_PREFIX[:-1] + '/' + row['admission_id'], '{}')))
++    with db._read_ctx() as conn:
++        assert parked_update_turn(conn, ['s']) is None
+-- 
+2.43.0
+

@@ -1,0 +1,396 @@
+From 7b196670ccdad2fa2155fb24775d65fc13718a7d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 16:57:31 +0000
+Subject: [PATCH] [daveey] Origin chats: a done replica card pending release
+ reads done_pending_release, not unknown
+
+Problem: origin chat 20261026_235722_bef6c6 (laptop-1, kanban.sync.links_reader=replica), 2026-11-13
+08:34-08:36 PST. Freshly finished worker cards (t_01a1d5ad588a78e9, t_01a1d5c0c1d54f8d, t_01a1d5c039be0093)
+were listed `unknown` by `hermes kanban chat-tasks` for 1-2 min, and the ask-gate showed one to David as
+`[unknown]` in "Cards linked to this chat". Row: reported_status done, source replica, released false.
+
+Why 1: `kanban_chat_links.replica_cards` labels every unreleased link to a closed card `unknown`
+(`unknown = missing or status in TERMINAL_STATUSES or status is None`), whatever the card's reported status.
+Why 2: the owner releases a chat link only after it has verified the completion, on its next reconcile
+pass; the replica carries the card's `done` one or two sync passes earlier. In that window the link is
+unreleased, so the card read `unknown` although its state was known: done, release pending.
+Why 3: one label served two states: "state unknown" (no card row, no status, archived without a completion)
+and "done, release not verified yet". Readers (`_replica_bucket`, parked/stalled counts, `session_tasks`,
+`_ledger_obligation`, ledger fallback, notice_fanout) only needed "closed and unfinished", which `unknown` +
+`unfinished` stood for.
+Root (happened): no distinct state for a done card whose release is pending; `unknown` was the only
+fail-closed bucket. (`missing_qualified_identity` on the row is the card's execution observation, a
+liveness field of a closed card; it does not drive the status.)
+Root (not caught): the tests pinned the conflation (`..._stays_an_unknown_chip_and_counts`) and checked
+counts/parity only, never the label a reader shows for a done card mid-release.
+Recurrence: first time for the label; same window as the 19 hub cards of chat 20261026_170127_f07c32.
+
+Fix:
+- `kanban_session_activity_release`: `DONE_PENDING_RELEASE`, `PENDING_RELEASE_STATUSES` (unknown +
+  done_pending_release) and `unreleased_obligation(card)`.
+- `replica_cards`: an unreleased link whose card row reports `done` reads `done_pending_release`; a missing
+  row, no status or `archived` stay `unknown`. Still `unfinished: True, released: False`: counted, listed and
+  never released until the owner releases the link.
+- Every reader of the "closed, unfinished" bucket accepts both labels (sidebar bucket, parked, stalled
+  exclusion, session_tasks listing, `_ledger_obligation`, ledger fallback, notice_fanout's remote change pass).
+- The origin-ledger path (links_reader=ledger) is unchanged: it still labels these `unknown`.
+
+Tests: tests/hermes_cli/test_kanban_chat_links_pending_release.py (done -> pending -> released one pass
+later; never-verified stays pending and counted; missing/None/archived stay unknown) and
+tests/tui_gateway/test_remote_card_outcomes.py::test_done_pending_release_stays_observed_until_released
+fail on origin/main (4 failed) and pass here; 5 existing assertions moved from `unknown` to the new label.
+152 test files touching these modules: 2536 passed.
+---
+ hermes_cli/kanban_chat_links.py               | 19 +++---
+ hermes_cli/kanban_session_activity.py         | 10 +--
+ hermes_cli/kanban_session_activity_release.py | 12 ++++
+ .../test_kanban_activity_revision.py          |  2 +-
+ tests/hermes_cli/test_kanban_chat_links.py    | 15 ++---
+ .../test_kanban_chat_links_parity.py          |  7 ++-
+ .../test_kanban_chat_links_pending_release.py | 61 +++++++++++++++++++
+ .../tui_gateway/test_remote_card_outcomes.py  | 14 +++++
+ tui_gateway/notice_fanout.py                  |  3 +-
+ 9 files changed, 118 insertions(+), 25 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_chat_links_pending_release.py
+
+diff --git a/hermes_cli/kanban_chat_links.py b/hermes_cli/kanban_chat_links.py
+index 4c88eebe68..6b4aa44bef 100644
+--- a/hermes_cli/kanban_chat_links.py
++++ b/hermes_cli/kanban_chat_links.py
+@@ -32,6 +32,8 @@ from typing import Any, Iterable, Optional
+ from hermes_cli import kanban_chat_links_released as _released
+ from hermes_cli.kanban_replica_execution import read_runs, run_evidence
+ from hermes_cli.kanban_run_machine import placement_select, run_machine
++from hermes_cli.kanban_session_activity_release import (DONE_PENDING_RELEASE, TERMINAL_STATUSES, UNKNOWN,
++                                                       unreleased_obligation)
+ 
+ _log = logging.getLogger(__name__)
+ 
+@@ -484,8 +486,6 @@ def reconcile(conn: sqlite3.Connection, board: str, gateway: str, *, ledger: boo
+     return {"added": added, "changed": changed, "released": released, "retired": retired}
+ 
+ 
+-TERMINAL_STATUSES = ("done", "archived")
+-UNKNOWN = "unknown"
+ # Rows last read from each replica, so an unreadable replica keeps its rows (stale) instead of dropping them.
+ _last_good: dict[tuple[str, str, str], tuple[list[dict[str, Any]], Optional[float], dict[str, dict]]] = {}
+ 
+@@ -630,7 +630,7 @@ def _ledger_fallback(board: str, gateway: str, profile: str, statuses: tuple[str
+         if (c.get("board") != board or c.get("origin_gateway") not in (None, gateway)
+                 or c.get("origin_profile") not in (None, profile) or not c.get("session") or c.get("released")):
+             continue
+-        if c.get("status") in statuses or (c.get("status") == UNKNOWN and c.get("unfinished")):
++        if c.get("status") in statuses or unreleased_obligation(c):
+             out.append({**c, "session_id": c["session"], "remote": True, "stale": True, "source": "ledger-fallback"})
+     return out
+ 
+@@ -730,8 +730,10 @@ def replica_cards(session_ids: Optional[Iterable[str]], gateway: str, statuses:
+     on OTHER gateways, from every board's replica, shaped like the origin-ledger rows ``session_tasks`` appends.
+ 
+     The sidebar counts read this too when ``links_reader`` is ``replica``, so both answers are one projection:
+-    - an unreleased link to a ``done``/``archived`` card, or to a card row the replica lacks, is an ``unknown``,
+-      unfinished obligation (the ledger's done-without-verified-release); only a released link drops it;
++    - an unreleased link to a ``done``/``archived`` card, or to a card row the replica lacks, is an unfinished
++      obligation (the ledger's done-without-verified-release); only a released link drops it. A ``done`` card reads
++      ``done_pending_release`` (the owner releases the link once it has verified the completion), anything else
++      ``unknown``;
+     - only this origin profile's links (``chat_profile``) count;
+     - ``stale``/``synced_at`` come from the replica's last successful pull;
+     - an unreadable replica keeps its last rows, stale; on a cold start the ledger's rows for that board, stale.
+@@ -799,7 +801,8 @@ def replica_cards(session_ids: Optional[Iterable[str]], gateway: str, statuses:
+             if pair in out:
+                 continue
+             out[pair] = {
+-                "title": r["title"], "status": UNKNOWN if unknown else status, "assignee": r["assignee"],
++                "title": r["title"], "status": (DONE_PENDING_RELEASE if not missing and status == "done" else UNKNOWN)
++                if unknown else status, "assignee": r["assignee"],
+                 "created_at": r["created_at"], "started_at": r["started_at"], "priority": r["priority"],
+                 "block_kind": r["block_kind"], "human_request": _decoded_request(r["human_request"]), "id": tid,
+                 "board": board,
+@@ -879,10 +882,10 @@ def _decoded_request(value: Any) -> Any:
+ 
+ 
+ def _ledger_obligation(card: dict[str, Any], statuses: tuple[str, ...]) -> bool:
+-    """An unreleased ledger row the sidebar counts: open, or ``unknown`` and unfinished (done, release unverified)."""
++    """An unreleased ledger row the sidebar counts: open, or closed and unfinished (``unreleased_obligation``)."""
+     if card.get("released"):
+         return False
+-    return card.get("status") in statuses or (card.get("status") == UNKNOWN and bool(card.get("unfinished")))
++    return card.get("status") in statuses or unreleased_obligation(card)
+ 
+ 
+ def _unlinked_chats(gateway: str, profiles: dict[str, set[Any]]) -> set[str]:
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index abd0db912e..f8cedbe4af 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -32,7 +32,7 @@ from hermes_cli.kanban_session_activity_hub import _hub_content_signature
+ from hermes_cli import kanban_scope_heartbeat as _scope_hb
+ from hermes_cli import kanban_replica_projection as _replica_projection, kanban_replica_execution as _replica_exec
+ from hermes_cli import kanban_replica_rows as _replica_rows
+-from hermes_cli.kanban_session_activity_release import TERMINAL_STATUSES
++from hermes_cli.kanban_session_activity_release import PENDING_RELEASE_STATUSES, TERMINAL_STATUSES
+ from hermes_cli.kanban_session_activity_release import owner_attests_terminal as _owner_attests_terminal
+ from hermes_cli.kanban_db_sync import sync_enabled as _board_sync_enabled
+ from hermes_cli.kanban_scope_heartbeat import scope_heartbeats as _scope_heartbeats
+@@ -516,7 +516,7 @@ def _replica_bucket(task: dict[str, Any]) -> str | None:
+     """'active' | 'blocked' | None, by the same rules as ``_status_filter`` for local boards. ``human_request`` may be
+     the decoded dict or the stored JSON text (``_stored_needs_human`` reads both). [daveey]"""
+     status = task.get("status")
+-    if status == "unknown" and task.get("unfinished"):
++    if status in PENDING_RELEASE_STATUSES and task.get("unfinished"):  # closed, release not yet verified
+         return "active"
+     if status in BLOCKED_STATUSES:
+         return "blocked" if _stored_needs_human(task.get("human_request"), task.get("block_kind")) else "active"
+@@ -1214,14 +1214,14 @@ def _recompute_all_counts(scope, now: float, fingerprint, *, include_waiting: bo
+         # replicated todo waits on a parent (parked). Held needs those links, so remote cards are never held.
+         # [daveey] An ``unknown`` card (done, release unverified) has no worker either: it waits like a parked one,
+         # or a chat whose other cards are all parked painted no stripe at all instead of waiting.
+-        is_parked = bucket == "active" and card.get("status") in (*PARKED_STATUSES, "todo", "unknown")
++        is_parked = bucket == "active" and card.get("status") in (*PARKED_STATUSES, "todo", *PENDING_RELEASE_STATUSES)
+         if is_parked:
+             parked[sid] = parked.get(sid, 0) + 1
+         remote_keys.setdefault(sid, set()).add((str(card.get("key")), str(bucket), is_parked))
+         _replica_exec.collect(card, execution)
+         # Same status test as parked/blocked above: a legacy row whose live status is unknown (reported_status is
+         # only its last report) is never counted stalled, so stalled can't exceed what the row shows parked.
+-        if card.get("status") != "unknown" and (_remote_wait(card) or {}).get("wait_state") == "stalled":
++        if card.get("status") not in PENDING_RELEASE_STATUSES and (_remote_wait(card) or {}).get("wait_state") == "stalled":
+             stalled[sid] = stalled.get(sid, 0) + 1
+             remote_keys.setdefault(sid, set()).add((str(card.get("key")), "stalled", False))
+         if card.get("stale"):
+@@ -1647,7 +1647,7 @@ def session_tasks(session_ids: Iterable[str], statuses: tuple[str, ...] = LISTED
+     wanted, seen = set(ids), set()
+     for card in _remote_cards(ids, statuses, stale_ok):
+         belongs = card['session'] in wanted or card.get('origin_session') in wanted
+-        listed = card.get('status') in statuses or (card.get('status') == 'unknown' and card.get('unfinished'))
++        listed = card.get('status') in statuses or (card.get('status') in PENDING_RELEASE_STATUSES and card.get('unfinished'))
+         if belongs and listed and card['key'] not in seen:
+             seen.add(card["key"])
+             row = {**card, "session_id": card["session"]}
+diff --git a/hermes_cli/kanban_session_activity_release.py b/hermes_cli/kanban_session_activity_release.py
+index 78e356285d..053067901a 100644
+--- a/hermes_cli/kanban_session_activity_release.py
++++ b/hermes_cli/kanban_session_activity_release.py
+@@ -11,6 +11,18 @@ from hermes_cli import kanban_scope_heartbeat as _scope_hb
+ 
+ 
+ TERMINAL_STATUSES = ("done", "archived")
++# An unreleased chat link to a closed card is the chat's unfinished obligation, listed under one of these. ``unknown``:
++# its state is not known (no card row, no status, archived without a completion). ``done_pending_release``: the card
++# is done and the owner has not released the link yet (it releases after verifying the completion, a sync pass or two
++# later). Origin chat 20261026_235722_bef6c6 showed such freshly finished cards ``[unknown]`` for 1-2 min. [daveey]
++UNKNOWN = "unknown"
++DONE_PENDING_RELEASE = "done_pending_release"
++PENDING_RELEASE_STATUSES = (UNKNOWN, DONE_PENDING_RELEASE)
++
++
++def unreleased_obligation(card: dict[str, Any]) -> bool:
++    """A closed card the chat still waits on: listed and counted (fail-closed), never released."""
++    return card.get("status") in PENDING_RELEASE_STATUSES and bool(card.get("unfinished"))
+ 
+ 
+ def owner_attests_terminal(task: dict[str, Any], gw: str, owner_profile: str | None, board: str,
+diff --git a/tests/hermes_cli/test_kanban_activity_revision.py b/tests/hermes_cli/test_kanban_activity_revision.py
+index 678a7b5ac6..f99de097ec 100644
+--- a/tests/hermes_cli/test_kanban_activity_revision.py
++++ b/tests/hermes_cli/test_kanban_activity_revision.py
+@@ -224,7 +224,7 @@ def test_replica_rows_are_reread_only_when_their_content_moves(home, monkeypatch
+         assert len(queries) == 1 and again[0]["synced_at"] == 12345.0  # the stamp is still read every time
+         with kbc.write_txn(conn):
+             conn.execute("UPDATE tasks SET status = 'done' WHERE id = 't_hub'")
+-        assert links.replica_cards(["s1"], ME, replicas=[("default", path)])[0]["status"] == links.UNKNOWN
++        assert links.replica_cards(["s1"], ME, replicas=[("default", path)])[0]["status"] == links.DONE_PENDING_RELEASE
+         assert len(queries) == 2
+     finally:
+         conn.close()
+diff --git a/tests/hermes_cli/test_kanban_chat_links.py b/tests/hermes_cli/test_kanban_chat_links.py
+index 1d32c099d7..c3febcbf83 100644
+--- a/tests/hermes_cli/test_kanban_chat_links.py
++++ b/tests/hermes_cli/test_kanban_chat_links.py
+@@ -186,10 +186,11 @@ def test_replica_answers_a_chats_open_cards_on_other_gateways(tmp_path):
+              [("t_open", ME, "s1", "shepherd", 0), ("t_done", ME, "s1", "shepherd", 0), ("t_mine", ME, "s1", "created", 0),
+               ("t_released", ME, "s1", "shepherd", 1), ("t_theirs", "mini", "s1", "shepherd", 0)])
+     got = links.replica_cards(["s1", "s0"], ME, replicas=[("default", rep)])
+-    # A done card whose link is not released is still the chat's (unknown, unfinished): the sidebar counts it, so the
+-    # list must too. Only a released link drops a card (t_released).
++    # A done card whose link is not released is still the chat's (done_pending_release, unfinished): the sidebar counts
++    # it, so the list must too. Only a released link drops a card (t_released).
+     assert sorted((c["id"], c["gateway"], c["board"], c["via"], c["session_id"], c["status"]) for c in got) == [
+-        ("t_done", OTHER, "default", "shepherd", "s1", "unknown"), ("t_open", OTHER, "default", "shepherd", "s1", "running")]
++        ("t_done", OTHER, "default", "shepherd", "s1", "done_pending_release"),
++        ("t_open", OTHER, "default", "shepherd", "s1", "running")]
+     got = {c["id"]: c for c in got}
+     assert got["t_open"]["title"] == "open card" and got["t_open"]["source"] == "replica"
+     assert got["t_done"]["reported_status"] == "done" and got["t_done"]["unfinished"] is True
+@@ -403,7 +404,7 @@ def test_a_released_sibling_link_does_not_settle_a_closed_cards_unreleased_link(
+               ("t_settled", ME, "s1", "created", 1), ("t_settled", ME, "s1", "shepherd", 1)])
+     got = sorted((c["session"], c["id"], c["status"])
+                  for c in links.replica_cards(None, ME, ksa.LISTED_STATUSES, replicas=[("default", rep)]))
+-    assert got == [("s1", "t_arch", "unknown"), ("s1", "t_done", "unknown"), ("s1", "t_open", "running")]
++    assert got == [("s1", "t_arch", "unknown"), ("s1", "t_done", "done_pending_release"), ("s1", "t_open", "running")]
+     _switch_to_replica(kanban_home, monkeypatch, rep)
+     assert ksa.active_task_counts() == {"s1": 3}
+     assert sorted(c["id"] for c in ksa.session_tasks(["s1"])) == ["t_arch", "t_done", "t_open"]  # names its count
+@@ -444,16 +445,16 @@ def test_a_released_link_to_a_closed_card_stays_listed_as_done_for_a_reader_of_c
+     closed = ksa.LISTED_STATUSES + ("done", "archived")
+     got = {c["id"]: c for c in links.replica_cards(["s1"], ME, closed, replicas=[("default", rep)])}
+     assert sorted((tid, c["status"], c["released"], c.get("release_reason")) for tid, c in got.items()) == [
+-        ("t_arch", "archived", True, "link_released"), ("t_hub", "unknown", False, None),
++        ("t_arch", "archived", True, "link_released"), ("t_hub", "done_pending_release", False, None),
+         ("t_open", "running", False, None), ("t_worker", "done", True, "link_released")]
+     assert got["t_worker"]["unfinished"] is False and got["t_worker"]["via"] == "origin"
+     assert got["t_worker"]["session_id"] == "s1" and got["t_worker"]["source"] == "replica"
+     # The open-status readers (sidebar counts, handover) still drop released links.
+     assert sorted(c["id"] for c in links.replica_cards(["s1"], ME, replicas=[("default", rep)])) == ["t_hub", "t_open"]
+     _switch_to_replica(kanban_home, monkeypatch, rep)
+-    assert ksa.active_task_counts() == {"s1": 2}  # t_hub (unknown) and t_open
++    assert ksa.active_task_counts() == {"s1": 2}  # t_hub (done_pending_release) and t_open
+     rows = {r["id"]: r["status"] for r in ksa.session_tasks(["s1"], closed)}
+-    assert rows == {"t_arch": "archived", "t_hub": "unknown", "t_open": "running", "t_worker": "done"}
++    assert rows == {"t_arch": "archived", "t_hub": "done_pending_release", "t_open": "running", "t_worker": "done"}
+ 
+ 
+ def _profile_board_row(task_id, session, profile="bb-tuner", **kw):
+diff --git a/tests/hermes_cli/test_kanban_chat_links_parity.py b/tests/hermes_cli/test_kanban_chat_links_parity.py
+index ca808fd624..3498fe5464 100644
+--- a/tests/hermes_cli/test_kanban_chat_links_parity.py
++++ b/tests/hermes_cli/test_kanban_chat_links_parity.py
+@@ -102,13 +102,14 @@ def test_blocked_for_review_counts_and_lists(env):
+     assert_parity("s1", expect=2)
+ 
+ 
+-def test_done_without_verified_release_stays_an_unknown_chip_and_counts(env):
++def test_done_without_verified_release_stays_a_pending_chip_and_counts(env):
+     """The Upkeep 14 vs 9: a done card whose link is not released is still an obligation in both places."""
+     replica(env, [("t_open", "running", HUB), ("t_done", "done", HUB), ("t_arch", "archived", HUB)],
+             [("t_open", "s1", "created", 0), ("t_done", "s1", "created", 0), ("t_arch", "s1", "shepherd", 0)])
+     _, rows = assert_parity("s1", expect=3)
+     done = {r["id"]: r for r in rows}
+-    assert (done["t_done"]["status"], done["t_done"]["reported_status"], done["t_done"]["unfinished"]) == ("unknown", "done", True)
++    assert (done["t_done"]["status"], done["t_done"]["reported_status"], done["t_done"]["unfinished"]) == (
++        "done_pending_release", "done", True)
+     assert done["t_arch"]["status"] == "unknown"
+ 
+ 
+@@ -307,7 +308,7 @@ def test_links_diff_agrees_on_a_done_unverified_card_whose_owner_written_sibling
+     env["ledger"].append(_unknown_row("t_done", "s1"))
+     report = links.links_diff(ME)
+     assert report["clean"], report
+-    assert [(c["id"], c["status"]) for c in links.replica_cards(["s1"], ME)] == [("t_done", "unknown")]
++    assert [(c["id"], c["status"]) for c in links.replica_cards(["s1"], ME)] == [("t_done", "done_pending_release")]
+ 
+ 
+ def test_links_diff_leaves_out_placement_placeholder_chats(env):
+diff --git a/tests/hermes_cli/test_kanban_chat_links_pending_release.py b/tests/hermes_cli/test_kanban_chat_links_pending_release.py
+new file mode 100644
+index 0000000000..949af0223c
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_chat_links_pending_release.py
+@@ -0,0 +1,61 @@
++"""A done replica card whose chat link is not yet released reads ``done_pending_release``, never ``unknown``. [daveey]
++
++Origin chat 20261026_235722_bef6c6 (laptop-1, ``links_reader: replica``, 2026-11-13 08:34-08:36 PST): worker cards
++that had just finished (t_01a1d5ad588a78e9, t_01a1d5c0c1d54f8d, t_01a1d5c039be0093) were listed ``unknown`` by
++``hermes kanban chat-tasks`` and shown to David as ``[unknown]`` by the ask-gate, for the one or two minutes between
++the replica carrying the owner's ``done`` and the owner releasing the link after it verified the completion. The
++card's state was known: done, release pending. These pin that label, and that it stays fail-closed: the card is still
++the chat's unfinished obligation and counts until the release arrives.
++"""
++
++from __future__ import annotations
++
++from hermes_cli import kanban_session_activity as ksa
++from tests.hermes_cli import test_kanban_chat_links_parity as parity
++
++HUB, assert_parity, counted, replica = parity.HUB, parity.assert_parity, parity.counted, parity.replica
++env = parity.env
++
++CLOSED = ksa.LISTED_STATUSES + ("done", "archived")  # what ``hermes kanban chat-tasks`` asks for
++
++
++def chat_tasks(*lineage):
++    return {r["id"]: r for r in ksa.session_tasks(list(lineage), CLOSED) if r.get("remote")}
++
++
++def test_done_card_reads_pending_release_then_released_one_pass_later(env):
++    # Pass 1: the replica has the owner's ``done``; the owner has not released the link yet.
++    replica(env, [("t_done", "done", HUB)], [("t_done", "s1", "created", 0)])
++    row = chat_tasks("s1")["t_done"]
++    assert (row["status"], row["reported_status"], row["unfinished"], row["released"]) == (
++        "done_pending_release", "done", True, False)
++    assert counted("s1")[0] == 1  # still the chat's obligation: never counted as released
++    # Pass 2: the owner verified the completion and released the link.
++    replica(env, [("t_done", "done", HUB)], [("t_done", "s1", "created", 1)])
++    row = chat_tasks("s1")["t_done"]
++    assert (row["status"], row["unfinished"], row["released"]) == ("done", False, True)
++    assert counted("s1")[0] == 0
++
++
++def test_done_card_that_never_verifies_is_never_released(env):
++    for _ in range(3):
++        replica(env, [("t_done", "done", HUB)], [("t_done", "s1", "shepherd", 0)])
++        row = chat_tasks("s1")["t_done"]
++        assert (row["status"], row["released"], row["unfinished"]) == ("done_pending_release", False, True)
++        assert counted("s1")[0] == 1
++
++
++def test_pending_release_lists_and_counts_like_the_unknown_obligation(env):
++    replica(env, [("t_open", "running", HUB), ("t_done", "done", HUB)],
++            [("t_open", "s1", "created", 0), ("t_done", "s1", "created", 0)])
++    _, rows = assert_parity("s1", expect=2)  # default listing (open statuses) still carries it
++    assert {r["id"]: r["status"] for r in rows} == {"t_open": "running", "t_done": "done_pending_release"}
++
++
++def test_rows_with_no_known_done_status_stay_unknown(env):
++    replica(env, [("t_none", None, HUB), ("t_arch", "archived", HUB)],
++            [("t_none", "s1", "created", 0), ("t_arch", "s1", "created", 0), ("t_gone", "s1", "created", 0)])
++    rows = chat_tasks("s1")
++    assert {tid: rows[tid]["status"] for tid in ("t_none", "t_arch", "t_gone")} == {
++        "t_none": "unknown", "t_arch": "unknown", "t_gone": "unknown"}
++    assert all(rows[t]["unfinished"] and not rows[t]["released"] for t in rows)
+diff --git a/tests/tui_gateway/test_remote_card_outcomes.py b/tests/tui_gateway/test_remote_card_outcomes.py
+index 4dcabc9126..a430ea3977 100644
+--- a/tests/tui_gateway/test_remote_card_outcomes.py
++++ b/tests/tui_gateway/test_remote_card_outcomes.py
+@@ -95,6 +95,20 @@ def test_unknown_unfinished_and_compression_tip(db, remote, monkeypatch):
+     assert seen == [(["compressed-tip"], "card_change", {"db": db})]
+ 
+ 
++def test_done_pending_release_stays_observed_until_released(db, remote, monkeypatch):
++    """[daveey] A done card whose link the owner has not released yet is still the chat's obligation: its move from
++    running is a change, and the release (the card leaving the projection) is another, so the outcome refreshes then."""
++    remote.append(card())
++    run(db)
++    seen = []
++    monkeypatch.setattr(so, "refresh_outcomes_quietly", lambda ids, trigger, **kw: (seen.append(trigger) or 1))
++    remote[0] = {**card(status="done_pending_release"), "unfinished": True}
++    assert len(run(db)) == 1
++    assert run(db) == []  # unchanged while pending
++    remote.clear()
++    assert len(run(db)) == 1 and seen == ["card_change", "card_change"]
++
++
+ @pytest.mark.parametrize("failure", ["read", "write", "missing"])
+ def test_failed_chat_retries_unchanged_projection(db, remote, monkeypatch, failure):
+     so.refresh_outcome(CHAT, "manual", db=db)
+diff --git a/tui_gateway/notice_fanout.py b/tui_gateway/notice_fanout.py
+index 93f7baa493..be4333b109 100644
+--- a/tui_gateway/notice_fanout.py
++++ b/tui_gateway/notice_fanout.py
+@@ -201,10 +201,11 @@ def _remote_change_pass(session_db: Callable) -> list[dict]:
+     from hermes_cli import kanban_session_activity as activity
+     from hermes_state_outcome import refresh_outcomes_quietly
+     from tui_gateway import notice_fanout_state as state
++    from hermes_cli.kanban_session_activity_release import PENDING_RELEASE_STATUSES
+     current: dict[str, set[tuple[str, str]]] = {}
+     for card in activity._remote_cards(None, activity.LISTED_STATUSES, stale_ok=True):
+         status = card.get("status")
+-        if status not in activity.LISTED_STATUSES and not (status == "unknown" and card.get("unfinished")):
++        if status not in activity.LISTED_STATUSES and not (status in PENDING_RELEASE_STATUSES and card.get("unfinished")):
+             continue
+         for chat in {card.get("session"), card.get("origin_session")} - {None, ""}:
+             current.setdefault(chat, set()).add((card["key"], status))
+-- 
+2.43.0
+

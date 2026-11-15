@@ -1,0 +1,142 @@
+From 800df5e171db4c3b549ff5fff8568e3acad7a28f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 18:19:37 +0000
+Subject: [PATCH] [daveey] worker policy root: deny by default, a durable
+ TMPDIR outside account and HOME never admits HERMES_TEST_POLICY_ROOT
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Follow-up to PR #2493 review 5895906933 (t_01a1d61a9e95f04b; card t_01a1d61e71d44a0a).
+
+#2493 dropped TMPDIR from the override roots only when it was an ancestor of the
+passwd account or HOME, or a durable dir inside the account. Any other durable
+TMPDIR still joined: TMPDIR=/srv/data honoured HERMES_TEST_POLICY_ROOT=/srv/data/x/.hermes.
+An honoured empty root makes worker_enabled() False, so refusal() fails open for
+that process, and the docstring ("no setting can move a worker's policy anywhere
+durable") overclaimed.
+
+_override_temp_roots() is now deny by default: TMPDIR joins /tmp, /var/tmp and
+/dev/shm only when it sits under one of them, is a macOS per-user temp dir
+(/var/folders/<xx>/<id>/T, realpath /private/var/folders/...; keeps Mac CI
+tmp_path working), or is inside the account's pruned .hermes/cache/scratch.
+A TMPDIR containing the account or HOME still never joins. Docstrings say so.
+
+RED (tests on #2493's code): 3 failed — TMPDIR=/srv/data-style dir, /var/folders/<xx>/<id>
+(no T), /var/folders/<xx>/<id>/C all honoured.
+GREEN: 23 importer files (worker_compute_capacity, worker_resources_unknown_alarm,
+worker_account_boards and every test importing them) 266/266.
+---
+ hermes_cli/worker_compute_capacity.py         | 31 ++++++++++++-------
+ .../test_worker_compute_capacity.py           | 25 +++++++++++----
+ 2 files changed, 38 insertions(+), 18 deletions(-)
+
+diff --git a/hermes_cli/worker_compute_capacity.py b/hermes_cli/worker_compute_capacity.py
+index 460d666595..b1c7f42029 100644
+--- a/hermes_cli/worker_compute_capacity.py
++++ b/hermes_cli/worker_compute_capacity.py
+@@ -151,8 +151,9 @@ def _test_policy_override(environ=None) -> Path | None:
+     registered its throwaway board in the REAL account inventory, and once the
+     test deleted it every claim on the host deferred ``worker_resources_unknown``
+     (worker-1, 2026-11-13, t_01a1d5bf526e1344). The suite points the policy at
+-    its shard dir instead. Temp roots only: no setting can move a worker's
+-    policy anywhere durable, so it cannot disable host CPU policy by accident.
++    its shard dir instead. Temp roots only (:func:`_override_temp_roots`, deny by
++    default): a durable path is never honoured, whatever TMPDIR says, so the
++    override cannot disable host CPU policy by accident.
+     """
+     import os
+     raw = (os.environ if environ is None else environ).get('HERMES_TEST_POLICY_ROOT', '')
+@@ -167,16 +168,18 @@ def _test_policy_override(environ=None) -> Path | None:
+ 
+ # no-tmp: ok — recognises a harness's temp root; nothing is written here
+ SYSTEM_TEMP_ROOTS: tuple[str, ...] = ('/tmp', '/var/tmp', '/dev/shm')
++# macOS per-user temp: TMPDIR=/var/folders/<xx>/<id>/T (realpath under /private/var/folders).
++MACOS_USER_TEMP_PARENTS: tuple[str, ...] = ('/var/folders', '/private/var/folders')
+ 
+ 
+ def _override_temp_roots() -> list[Path]:
+-    """Roots a policy override may live under: the system temp roots, plus TMPDIR only when it is ephemeral.
++    """Roots a policy override may live under: the system temp roots, plus TMPDIR only when it is known-ephemeral.
+ 
+-    An honoured empty root turns :func:`worker_enabled` off, so ``refusal()`` lets every claim through. An odd
+-    TMPDIR (``/``, a home, the account root, a durable dir inside the account) must not let the override move a
+-    worker's policy somewhere durable; inside the account only the pruned ``.hermes/cache/scratch`` qualifies.
+-    Same intent as ``worker_account_boards._ephemeral_roots``, judged against the passwd account, never the
+-    override itself.
++    An honoured empty root turns :func:`worker_enabled` off, so ``refusal()`` lets every claim through. Deny by
++    default: TMPDIR joins only when it sits under a system temp root, is a macOS per-user ``/var/folders/*/*/T``
++    dir, or is inside the account's pruned ``.hermes/cache/scratch``; any other TMPDIR (``/``, a home, the
++    account, ``/srv/data``) leaves only the fixed system roots. A TMPDIR that contains the passwd account or
++    HOME never joins either. Judged against the passwd account, never the override itself.
+     """
+     import os
+     import tempfile
+@@ -184,11 +187,15 @@ def _override_temp_roots() -> list[Path]:
+     roots = [Path(os.path.realpath(root)) for root in SYSTEM_TEMP_ROOTS]
+     account = Path(os.path.realpath(_account_home()))
+     home = Path(os.path.realpath(os.path.expanduser('~')))
+-    scratch = account / '.hermes' / 'cache' / 'scratch'
+     tmp = Path(os.path.realpath(tempfile.gettempdir()))
+-    durable = (account.is_relative_to(tmp) or home.is_relative_to(tmp)
+-               or (tmp.is_relative_to(account) and not tmp.is_relative_to(scratch)))
+-    if not durable:
++    if account.is_relative_to(tmp) or home.is_relative_to(tmp):
++        return roots
++    macos = [Path(os.path.realpath(parent)) for parent in MACOS_USER_TEMP_PARENTS]
++    ephemeral = (any(tmp.is_relative_to(root) for root in roots)
++                 or tmp.is_relative_to(account / '.hermes' / 'cache' / 'scratch')
++                 or any(tmp.is_relative_to(parent) and tmp.relative_to(parent).parts[2:3] == ('T',)
++                        for parent in macos))
++    if ephemeral:
+         roots.append(tmp)
+     return roots
+ 
+diff --git a/tests/hermes_cli/test_worker_compute_capacity.py b/tests/hermes_cli/test_worker_compute_capacity.py
+index 8db1afc050..5787636beb 100644
+--- a/tests/hermes_cli/test_worker_compute_capacity.py
++++ b/tests/hermes_cli/test_worker_compute_capacity.py
+@@ -74,21 +74,34 @@ def test_test_policy_root_is_honoured_only_under_a_temp_root(raw, honoured):
+     ('/', '/srv/policy/.hermes', False),  # TMPDIR=/ would admit anything
+     ('{account}/.hermes', '{account}/.hermes/x/.hermes', False),  # durable dirs inside the account
+     ('{account}/.hermes/cache/scratch', '{account}/.hermes/cache/scratch/t1/.hermes', True),  # the worker default
+-    ('{other}', '{other}/shard-1/account-policy/.hermes', True),  # an ordinary harness TMPDIR
++    ('{sys}/harness', '{sys}/harness/shard-1/account-policy/.hermes', True),  # a harness TMPDIR under /tmp
++    ('{folders}/ab/xyz/T', '{folders}/ab/xyz/T/shard-1/.hermes', True),  # macOS per-user temp (Mac CI)
++    # Deny by default (PR #2493 review, t_01a1d61e71d44a0a): a durable TMPDIR outside account and HOME.
++    ('{other}', '{other}/x/.hermes', False),  # TMPDIR=/srv/data
++    ('{folders}/ab/xyz', '{folders}/ab/xyz/x/.hermes', False),  # /var/folders but not its per-user T
++    ('{folders}/ab/xyz/C', '{folders}/ab/xyz/C/x/.hermes', False),  # the per-user cache dir is durable
++    ('{sys}', '{sys}/x/.hermes', True),  # a system root itself stays a root
+ ])
+ def test_an_odd_tmpdir_never_admits_a_durable_policy_root(tmp_path, monkeypatch, tmpdir, raw, honoured):
+     """PR #2454 review nit 2 (t_01a1d602f93945f1): TMPDIR=/home/ubuntu honoured /home/ubuntu/x/.hermes. An honoured
+-    empty root turns worker_enabled() off, so refusal() fails open; TMPDIR joins the roots only when ephemeral."""
++    empty root turns worker_enabled() off, so refusal() fails open. PR #2493 review (t_01a1d61e71d44a0a): TMPDIR=/srv/data
++    still honoured /srv/data/x/.hermes; TMPDIR now joins only under a system temp root, a macOS per-user T dir or
++    the account's cache/scratch."""
+     import os
+     import tempfile
+     from pathlib import Path
+     from hermes_cli import worker_compute_capacity as capacity
+-    account, home, other = tmp_path / 'account', tmp_path / 'home', tmp_path / 'harness-tmp'
+-    for path in (account / '.hermes' / 'cache' / 'scratch', home, other):
++    account, home, other = tmp_path / 'account', tmp_path / 'home', tmp_path / 'srv-data'
++    system, folders = tmp_path / 'sys', tmp_path / 'folders'
++    for path in (account / '.hermes' / 'cache' / 'scratch', home, other, system / 'harness',
++                 *(folders / 'ab' / 'xyz' / name for name in ('T', 'C'))):
+         path.mkdir(parents=True)
+-    names = {'account': str(account), 'home': str(home), 'other': str(other)}
++    names = {'account': str(account), 'home': str(home), 'other': str(other), 'sys': str(system),
++             'folders': str(folders)}
+     monkeypatch.setattr('hermes_constants._account_home', lambda: account)
+-    monkeypatch.setattr(capacity, 'SYSTEM_TEMP_ROOTS', ())  # tmp_path itself sits under /tmp
++    # tmp_path itself sits under /tmp (or the real scratch): stand-in system and macOS roots
++    monkeypatch.setattr(capacity, 'SYSTEM_TEMP_ROOTS', (str(system),))
++    monkeypatch.setattr(capacity, 'MACOS_USER_TEMP_PARENTS', (str(folders),))
+     monkeypatch.setenv('HOME', str(home))
+     monkeypatch.setattr(tempfile, 'tempdir', tmpdir.format(**names))
+     raw = raw.format(**names)
+-- 
+2.43.0
+

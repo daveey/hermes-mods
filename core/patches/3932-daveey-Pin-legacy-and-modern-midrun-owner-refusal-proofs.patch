@@ -1,0 +1,112 @@
+From 8c8aafea9da2e1d07f4dd0e56ef248a5cd6199bd Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 22:59:14 +0000
+Subject: [PATCH] [daveey] Pin legacy and modern midrun owner-refusal proofs
+
+The sweep identity gate masked missing direct classifier coverage for legacy claim/PID and exit-code guards. Existing owner-unavailable fixtures never marked receipts modern, leaving that production path untested.
+
+Add direct proven() negative controls and a two-receipt death_proof_version=1 owner-unavailable sweep, including ordinary-output rejection. Process death is stubbed only at the OS observation seam; receipt selection, proof classification and budget accounting remain real.
+
+Proof: 27 focused tests green; companion suites 48 green. mutants.py: B2, B3, P1 and B6 killed by the focused file (4 killed, 0 survivors). scripts/check: 20 checks ok. Test-only follow-up to #2658.
+---
+ .../test_kanban_owner_unreachable_midrun.py   | 77 +++++++++++++++++++
+ 1 file changed, 77 insertions(+)
+
+diff --git a/tests/hermes_cli/test_kanban_owner_unreachable_midrun.py b/tests/hermes_cli/test_kanban_owner_unreachable_midrun.py
+index f9a580bb62..f8e7e0cc90 100644
+--- a/tests/hermes_cli/test_kanban_owner_unreachable_midrun.py
++++ b/tests/hermes_cli/test_kanban_owner_unreachable_midrun.py
+@@ -5,6 +5,7 @@ after an aborted core-update drain, never answered the worker's ``transcript.app
+ rediscovery timed out and the bound interpreter died with ``WorkerPersistenceError: owner_unavailable``.
+ The sweep booked it ``crashed`` and charged the card, unlike the sibling ``storage_unavailable``.
+ """
++import json
+ import os
+ 
+ import pytest
+@@ -83,6 +84,82 @@ def test_receipt_not_tied_to_the_bound_claim_counts(home, field):
+         assert kb.get_task(conn, tid).consecutive_failures == 1
+ 
+ 
++@pytest.mark.parametrize("field,value", [("claim_lock", "other:1"), ("pid", 1)])
++def test_legacy_result_from_another_claim_or_pid_is_not_proof(home, field, value):
++    from hermes_cli import kanban_owner_storage_refusal as storage
++    with kbc.connect() as conn:
++        tid, _ = helpers._admitted_run(conn)
++        task = kb.get_task(conn, tid)
++        _result(conn, tid, **{field: value})
++        # Call the classifier directly: the sweep's separate identity gate otherwise masks this guard.
++        assert storage.proven(conn, tid, task.current_run_id, task.claim_lock) is None
++
++
++@pytest.mark.parametrize("exit_code", [0, 2, 75, None])
++def test_legacy_nonfailure_exit_is_not_owner_unreachable_proof(home, exit_code):
++    from hermes_cli import kanban_owner_storage_refusal as storage
++    with kbc.connect() as conn:
++        tid, _ = helpers._admitted_run(conn)
++        task = kb.get_task(conn, tid)
++        _result(conn, tid, exit_code=exit_code)
++        # Pin _proof's defence independently of owner_unavailable's dead.code == 1 gate.
++        assert storage.proven(conn, tid, task.current_run_id, task.claim_lock) is None
++
++
++def _modern_result(conn, tid, output):
++    from hermes_cli.kanban_failed_result_identity import result_identity_fields
++    task = kb.get_task(conn, tid)
++    context = {"task_id": tid, "run_id": task.current_run_id}
++    with kb.write_txn(conn):
++        fields = result_identity_fields(conn, context)
++        kb._append_event(conn, tid, "worker_result", {
++            "pid": os.getpid(), "claim_lock": task.claim_lock, "exit_code": 1,
++            "last_output": output, "death_proof_version": 1, **fields,
++        }, run_id=task.current_run_id)
++
++
++@pytest.mark.parametrize("output,owner_fault", [(_TERMINAL, True), (_TURN_TEXT, False)])
++def test_modern_receipt_midrun_owner_unreachable_requeues_without_spending_budget(home, monkeypatch, output, owner_fault):
++    from hermes_cli import kanban_host_refusal as hr
++    from hermes_cli import kanban_owner_storage_refusal as storage
++    from hermes_cli import kanban_failed_result as failed
++    from hermes_cli.kanban_failed_result_identity import modern_receipt
++    # This fixture's interpreter is still running; model its post-exit observation, not host PIDs.
++    monkeypatch.setattr(failed, "process_gone", lambda pid, birth: True)
++    with kbc.connect() as conn:
++        tid, _ = helpers._admitted_run(conn)
++        task = kb.get_task(conn, tid)
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET max_retries=1 WHERE id=?", (tid,))
++        # Run 207 emitted the turn result before the terminal exception envelope.
++        _modern_result(conn, tid, _TURN_TEXT)
++        _modern_result(conn, tid, output)
++        modern, selected = modern_receipt(conn, tid, task.current_run_id, task.claim_lock)
++        assert modern and selected is not None
++        receipt = selected[1]
++        assert receipt["death_proof_version"] == 1 and receipt["result_sequence"] == 2
++        bound = conn.execute("SELECT * FROM task_events WHERE task_id=? AND kind='worker_bound'", (tid,)).fetchone()
++        identity = {key: json.loads(bound["payload"])[key] for key in ("pid", "started_at", "claim_lock")}
++        if "uid" in bound.keys() and bound["uid"]:
++            identity["uid"] = bound["uid"]
++        assert receipt["bound_event_identity"] == identity
++        expected = {"kind": hr.OWNER_UNREACHABLE, "phase": "midrun", "reason": "owner_unavailable"}
++        assert storage.proven(conn, tid, task.current_run_id, task.claim_lock) == (expected if owner_fault else None)
++        kbd.detect_crashed_workers(conn)
++        task = kb.get_task(conn, tid)
++        assert task.consecutive_failures == (0 if owner_fault else 1)
++        run = helpers._runs(conn, tid)[-1]
++        assert run["outcome"] == ("owner_unavailable" if owner_fault else "crashed")
++        if owner_fault:
++            assert task.status == "ready"
++            assert "turn interrupted" in run["error"] and "no turn ran" not in run["error"]
++            assert not conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='gave_up'", (tid,)).fetchone()
++            (notice,) = helpers._notices(conn)
++            assert "could not reach its profile owner" in notice["body"]
++        else:
++            assert not helpers._notices(conn)
++
++
+ def test_unreachable_owner_streak_still_reaches_the_breaker(home):
+     from hermes_cli import kanban_owner_unavailable as ou
+     with kbc.connect() as conn:
+-- 
+2.43.0
+

@@ -37,7 +37,13 @@ unknown tables, or durable rows. There is no `hosted_room_*` wildcard. A populat
 runtime ledger excluded by core recovery is a refusal, not an invitation to reset it.
 Table presence is insufficient: recreated-empty tables are detected by counts and
 changed durable/security rows by exact row-hash multisets. `state_meta` permits only
-core's exact generated-index keys to differ; known FTS internal tables may be rebuilt.
+core's exact generated-index keys to differ; known FTS internal tables may be rebuilt, and
+the derived `session_change`/`session_change_revision` and
+`throughput_revision`/`throughput_anchors`/`throughput_changes` cursors may be rebuilt.
+Recovery creates fresh throughput epochs/nonces and regenerates its bounded journal from
+canonical sessions and usage. Readers reject stale epoch/anchor history and reload full
+contributions. This exception applies only in recovered-state mode and to these exact names;
+`session_model_usage` and unknown `throughput_*` tables remain durable.
 Epoch and AUTOINCREMENT sequence floors cannot decrease. Schema evolution, unreadable
 source tables and partial salvage with lost durable rows conservatively refuse.
 This helper is not a universal installer for `--allow-partial` outputs.

@@ -1,0 +1,133 @@
+From f5ab08da8fada3a20bc730f6951dcb8a72599fc1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 23:52:55 +0000
+Subject: [PATCH] [daveey] Ignore review workspace archival in dependency
+ continuation history
+
+---
+ hermes_cli/kanban_dependency_review.py        |  7 ++-
+ .../test_kanban_dependency_review_history.py  | 17 +++++-
+ .../test_kanban_review_workspace_archive.py   | 57 +++++++++++++++++++
+ 3 files changed, 77 insertions(+), 4 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_review_workspace_archive.py
+
+diff --git a/hermes_cli/kanban_dependency_review.py b/hermes_cli/kanban_dependency_review.py
+index 6d7d2dc6b4..2bbe732851 100644
+--- a/hermes_cli/kanban_dependency_review.py
++++ b/hermes_cli/kanban_dependency_review.py
+@@ -312,10 +312,11 @@ def _historical_parent_history(conn, parent_id, parked_at):
+     if ended is None or ended >= parked_at:
+         return False
+     events = conn.execute(
+-        # Archival, late process-exit receipts and the wake-episode snapshot a comment on a
+-        # finished card appends (kanban_wake_episode.EVIDENCE_EVENT) do not reopen it.
++        # Card/workspace archival, late process-exit receipts and comment wake snapshots
++        # do not reopen finished work. Keep this explicit: unknown events fail closed.
+         "SELECT created_at FROM task_events WHERE task_id = ? "
+-        "AND kind NOT IN ('commented', 'archived', 'worker_result', 'wake_episode_evidence')",
++        "AND kind NOT IN ('commented', 'archived', 'workspace_archived', "
++        "'worker_result', 'wake_episode_evidence')",
+         (parent_id,),
+     )
+     return all((kb._to_epoch(e["created_at"]) or float("inf")) < parked_at for e in events)
+diff --git a/tests/hermes_cli/test_kanban_dependency_review_history.py b/tests/hermes_cli/test_kanban_dependency_review_history.py
+index 6d9e420966..d3525f6b9d 100644
+--- a/tests/hermes_cli/test_kanban_dependency_review_history.py
++++ b/tests/hermes_cli/test_kanban_dependency_review_history.py
+@@ -106,7 +106,7 @@ def test_historical_parent_lifecycle_activity_invalidates_exemption(board, monke
+ 
+ 
+ @pytest.mark.parametrize("legacy", [False, True])
+-@pytest.mark.parametrize("event", ["archived", "worker_result", "wake_episode_evidence"])
++@pytest.mark.parametrize("event", ["archived", "workspace_archived", "worker_result", "wake_episode_evidence"])
+ def test_historical_parent_bookkeeping_does_not_rearm_hold(board, monkeypatch, legacy, event):
+     task, historical = mixed_park(board, monkeypatch, legacy=legacy)
+     with kb.write_txn(board):
+@@ -115,6 +115,21 @@ def test_historical_parent_bookkeeping_does_not_rearm_hold(board, monkeypatch, l
+         kb._append_event(board, historical, event, {})
+     monkeypatch.setattr(prs, "pr_state", lambda url: "MERGED" if url == OLD_PR else "OPEN")
+     assert dispatch.check_respawn_guard(board, task) is None
++    assert kb.claim_task(board, task) is not None
++    assert dispatch.check_respawn_guard(board, task) == "active_pr"
++    assert kb.reclaim_task(board, task, reason="crash", signal_fn=lambda *_: None)
++    assert dispatch.check_respawn_guard(board, task) == "active_pr"
++
++
++@pytest.mark.parametrize("legacy", [False, True])
++@pytest.mark.parametrize("event", ["unblocked", "claimed", "completed", "unknown_housekeeping"])
++def test_archive_does_not_hide_lifecycle_or_unknown_events(board, monkeypatch, legacy, event):
++    task, historical = mixed_park(board, monkeypatch, legacy=legacy)
++    with kb.write_txn(board):
++        kb._append_event(board, historical, "workspace_archived", {"reason": "disk_pressure"})
++        kb._append_event(board, historical, event, {})
++    monkeypatch.setattr(prs, "pr_state", lambda url: "CLOSED" if url == OLD_PR else "OPEN")
++    assert dispatch.check_respawn_guard(board, task) == "active_pr"
+ 
+ 
+ def test_comment_on_finished_historical_parent_does_not_rearm_hold(board, monkeypatch):
+diff --git a/tests/hermes_cli/test_kanban_review_workspace_archive.py b/tests/hermes_cli/test_kanban_review_workspace_archive.py
+new file mode 100644
+index 0000000000..2847b04a74
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_review_workspace_archive.py
+@@ -0,0 +1,57 @@
++"""Disk-pressure cleanup of an old review must not deadlock confirmation."""
++import sqlite3
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_dispatch as dispatch
++from hermes_cli import kanban_db_dispatch_pr_state as prs
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_foreign_card as foreign
++from tests.hermes_cli import test_kanban_dependency_review_history as history
++
++board = history.board
++
++
++@pytest.mark.parametrize("remote", [False, True])
++@pytest.mark.parametrize("legacy", [False, True])
++def test_archived_historical_review_and_reaped_park_release_once(board, monkeypatch, tmp_path, remote, legacy):
++    task, historical = history.mixed_park(board, monkeypatch, legacy=legacy)
++    fresh = next(p for p, _ in kb.parent_states(board, task) if p != historical)
++    now = time.time()
++    with kb.write_txn(board):
++        board.execute("UPDATE tasks SET title = 'Exact-head confirmation review' WHERE id = ?", (fresh,))
++        kb._append_event(board, task, "terminal_worker_reaped", {"terminated": True})
++        kb._append_event(board, historical, "workspace_archived", {"reason": "disk_pressure"})
++    # The owner parked orderly; a later reap is not a new failed run.
++    assert board.execute("SELECT outcome FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
++                         (task,)).fetchone()[0] == "blocked"
++    replica = None
++    if remote:
++        board.executescript(sync.SYNC_SCHEMA_SQL)
++        board.execute("ALTER TABLE kanban_sync_state ADD COLUMN pulled_at REAL")
++        board.execute("INSERT INTO kanban_sync_state (board_id, gateway_id, hlc_last, mode, pulled_at) "
++                      "VALUES ('board-test', 'home-test', '', 'primary', ?)", (now,))
++        board.commit()
++        path = tmp_path / "replica.db"
++        replica = sqlite3.connect(path)
++        board.backup(replica)
++        with kb.write_txn(board):
++            for parent in (historical, fresh):
++                board.execute("DELETE FROM task_runs WHERE task_id = ?", (parent,))
++                board.execute("DELETE FROM task_events WHERE task_id = ?", (parent,))
++                board.execute("DELETE FROM tasks WHERE id = ?", (parent,))
++                board.execute("INSERT INTO kanban_sync_remote_parents VALUES (?, 'done', ?)", (parent, now))
++        monkeypatch.setattr(foreign, "replica_path", lambda _: path)
++    monkeypatch.setattr(prs, "pr_state", lambda url: "CLOSED" if url == history.OLD_PR else "OPEN")
++    try:
++        assert dispatch.check_respawn_guard(board, task) is None
++        assert dispatch.check_respawn_guard(board, task) is None  # reads do not consume
++        assert kb.claim_task(board, task) is not None
++        assert dispatch.check_respawn_guard(board, task) == "active_pr"
++        assert kb.reclaim_task(board, task, reason="crash", signal_fn=lambda *_: None)
++        assert dispatch.check_respawn_guard(board, task) == "active_pr"
++    finally:
++        if replica is not None:
++            replica.close()
+-- 
+2.43.0
+

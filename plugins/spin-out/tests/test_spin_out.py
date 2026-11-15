@@ -218,3 +218,154 @@ def test_agent_hook_injects_note(tmp_path, monkeypatch):
     assert hooks["pre_llm_call"](session_id="") is None
     assert "@session:default/c9" in hooks["pre_llm_call"](session_id="sX")["context"]
     assert hooks["pre_llm_call"](session_id="sX") is None
+
+
+# ── a spun-out child takes over the parent's cards (kanban-abb8d6e8a7) ───────────────────────────────
+# Hub chat 20261113_195327_45059d was spun out with "Drive kanban card t_... to completion"; the parent owned the
+# card (task_chat_links 'created'), the child got no link, so its task list was empty while it waited on that card.
+
+BRIEF = ("Drive kanban card `t_01a1ce6d3d682365` (ring speed) to completion. Done cards like t_00000000000000aa "
+         "and t_00000000000000bb are context only.\n\n---\nSpun out of parent session "
+         "@session:default/20261111_091916_d2d36a (\"Add Pebble ring webhook ingestion\"). Read the parent transcript.")
+
+
+def make_kanban(tmp_path, name="kanban.db"):
+    p = tmp_path / name
+    p.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(p)
+    con.execute("create table tasks (id text, status text)")
+    con.execute("create table task_chat_links (task_id text, chat_gateway text, chat_profile text, chat_session text,"
+                " kind text, released integer)")
+    con.execute("create table kanban_notify_subs (task_id text, platform text, chat_id text)")
+    con.executemany("insert into tasks values (?,?)", [("t_01a1ce6d3d682365", "scheduled"),
+                                                       ("t_00000000000000aa", "done"),
+                                                       ("t_00000000000000bb", "running")])
+    con.executemany("insert into task_chat_links values (?,?,?,?,?,?)", [
+        ("t_01a1ce6d3d682365", "hub", None, "20261111_091916_d2d36a", "created", 0),
+        ("t_00000000000000aa", "hub", None, "20261111_091916_d2d36a", "created", 0),   # done: nothing to drive
+        ("t_00000000000000bb", "hub", None, "someone_else", "created", 0),             # not the parent's
+    ])
+    con.commit()
+    con.close()
+    return p
+
+
+def test_spun_child_links_parent_cards_named_in_brief(tmp_path):
+    make_kanban(tmp_path)
+    ran = []
+
+    def next_step(task_id, board, env):
+        return {"next_step": f"hermes-hub adopt-task macbook default/{board}/{task_id} --origin-session "
+                             f"{env['HERMES_SESSION_ID']} --id adopt:{task_id}", "complete": True}
+
+    def runner(argv):
+        ran.append(argv)
+        return 0, "adopt:x handoff pending: queued request"
+
+    out = core.link_spun_cards("20261113_195327_45059d", BRIEF, home=tmp_path, next_step=next_step, runner=runner)
+    assert [r["task_id"] for r in out] == ["t_01a1ce6d3d682365"]
+    assert ran == [["hermes-hub", "adopt-task", "macbook", "default/default/t_01a1ce6d3d682365", "--origin-session",
+                    "20261113_195327_45059d", "--id", "adopt:t_01a1ce6d3d682365"]]
+    assert out[0]["ok"] and out[0]["board"] == "default"
+    note = core.linked_note(out)
+    assert "t_01a1ce6d3d682365" in note and "linked" in note.lower()
+
+
+def test_spun_child_link_failure_names_the_command(tmp_path):
+    make_kanban(tmp_path / "kanban" / "boards" / "bb", "kanban.db")
+    out = core.link_spun_cards("child1", BRIEF, home=tmp_path,
+                               next_step=lambda t, b, env: {"next_step": f"hermes kanban --board {b} notify-subscribe "
+                                                                         f"{t} --platform tui --chat-id child1",
+                                                            "complete": True},
+                               runner=lambda argv: (1, "boom"))
+    assert len(out) == 1 and not out[0]["ok"] and out[0]["board"] == "bb"
+    note = core.linked_note(out)
+    assert "notify-subscribe t_01a1ce6d3d682365" in note and "boom" in note
+
+
+def test_non_spun_or_later_turn_links_nothing(tmp_path):
+    make_kanban(tmp_path)
+    boom = lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not run"))
+    assert core.link_spun_cards("c", "Drive kanban card t_01a1ce6d3d682365", home=tmp_path,
+                                next_step=boom, runner=boom) == []
+
+
+def test_agent_hook_links_cards_on_first_turn_only(tmp_path, monkeypatch):
+    import sys as _sys
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = load("so_plugin_link_test", ROOT / "__init__.py")
+    _sys.modules.pop("_spin_out_core", None)
+    c = plugin._core()
+    monkeypatch.setattr(c, "hermes_home", lambda: tmp_path)
+    calls = []
+    monkeypatch.setattr(c, "link_spun_cards", lambda sid, msg, **k: calls.append((sid, msg)) or
+                        [{"task_id": "t_01a1ce6d3d682365", "board": "default", "ok": True, "step": "x", "output": ""}])
+    ctx = plugin.pre_llm_call(session_id="child", user_message=BRIEF, is_first_turn=True)
+    assert calls == [("child", BRIEF)] and "t_01a1ce6d3d682365" in ctx["context"]
+    assert plugin.pre_llm_call(session_id="child", user_message=BRIEF, is_first_turn=False) is None
+    assert len(calls) == 1
+
+
+def _adopt_step(task_id, board, env):
+    return {"next_step": f"hermes-hub adopt-task macbook default/{board}/{task_id}", "complete": True}
+
+
+def test_spun_child_skips_released_parent_links(tmp_path):
+    # A released chat link no longer makes the card the parent's: the child must not take it over.
+    p = make_kanban(tmp_path)
+    con = sqlite3.connect(p)
+    con.execute("insert into tasks values ('t_00000000000000cc','running')")
+    con.execute("insert into task_chat_links values ('t_00000000000000cc','hub',null,'20261111_091916_d2d36a',"
+                "'created',1)")
+    con.commit(); con.close()
+    brief = "Also drive t_00000000000000cc. " + BRIEF
+    ran = []
+    out = core.link_spun_cards("child", brief, home=tmp_path, next_step=_adopt_step,
+                               runner=lambda argv: ran.append(argv) or (0, ""))
+    assert [r["task_id"] for r in out] == ["t_01a1ce6d3d682365"]
+    assert all("t_00000000000000cc" not in " ".join(a) for a in ran)
+
+
+def test_spun_child_incomplete_next_step_is_not_run(tmp_path):
+    make_kanban(tmp_path)
+    ran = []
+    out = core.link_spun_cards("child", BRIEF, home=tmp_path,
+                               next_step=lambda t, b, env: {"next_step": f"hermes-hub adopt-task x {t}",
+                                                            "complete": False},
+                               runner=lambda argv: ran.append(argv) or (0, "ok"))
+    assert ran == []
+    assert len(out) == 1 and not out[0]["ok"] and out[0]["output"] == "no complete link command"
+    assert out[0]["step"] == "hermes-hub adopt-task x t_01a1ce6d3d682365"
+
+
+def test_spun_child_links_a_card_on_two_boards_once(tmp_path):
+    # The same card id linked to the parent on two board dbs is taken over once (first board wins).
+    make_kanban(tmp_path)
+    make_kanban(tmp_path / "kanban" / "boards" / "bb", "kanban.db")
+    ran = []
+    out = core.link_spun_cards("child", BRIEF, home=tmp_path, next_step=_adopt_step,
+                               runner=lambda argv: ran.append(argv) or (0, ""))
+    assert [(r["task_id"], r["board"]) for r in out] == [("t_01a1ce6d3d682365", "default")]
+    assert len(ran) == 1
+
+
+def test_spun_child_ignores_card_ids_after_the_mark(tmp_path):
+    # Only the brief (text before the spin-out pointer) hands cards over; ids after the mark are not the brief's.
+    make_kanban(tmp_path)
+    brief = ("Look into the ring speed regression.\n\n---\nSpun out of parent session "
+             "@session:default/20261111_091916_d2d36a (\"t_01a1ce6d3d682365 ring speed\"). Read the parent transcript.")
+    boom = lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not run"))
+    assert core.link_spun_cards("child", brief, home=tmp_path, next_step=boom, runner=boom) == []
+
+
+def test_spun_child_link_exception_is_reported_not_swallowed(tmp_path):
+    make_kanban(tmp_path)
+
+    def next_step(task_id, board, env):
+        raise RuntimeError("core too old")
+
+    out = core.link_spun_cards("child", BRIEF, home=tmp_path, next_step=next_step,
+                               runner=lambda argv: (0, ""))
+    assert out == [{"task_id": "t_01a1ce6d3d682365", "board": "default", "ok": False, "step": "",
+                    "output": "RuntimeError: core too old"}]
+    assert "core too old" in core.linked_note(out)

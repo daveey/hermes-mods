@@ -1,0 +1,330 @@
+From 0ef3eae4ad70cd67642e2943f3f249e507d6b750 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 19:23:36 +0000
+Subject: [PATCH] [daveey] quiet-hold: preflight the gateway's host-file start
+ refusals before the lease commits the 2 h cooldown
+
+Five whys (live, worker-2, 11:04 PST 2026-11-13, gateway on dd75da236bca):
+1. Why did worker-2 lose its quiet proof slot for 2 h? `hermes kanban quiet-hold` took the
+   claim-quiet lease, which commits `last-started.json` (the 2 h cooldown), and only then did the
+   gateway's `quiet-observe-start` refuse with `update_window_stale` 0.46 s later.
+2. Why was the start doomed? `QuietControl.start()` refuses unless `cache/core-update/window.json`
+   is this host's, `idle`, and at most UPDATE_WINDOW_MAX_AGE_S = 120 s old; worker-2's record was
+   295 s old (workers republish it from the 10-minute hermes-core-update.timer), and Macs/hub are
+   often `batching`/`draining`.
+3. Why wasn't that seen first? `hold()` called `claim_quiet.acquire()` before reading anything,
+   although those refusals come from host files readable without a lease.
+
+Fix:
+- gateway/quiet_control.py: split the file-backed part of `_update_status` (drain/admission hold,
+  deploy window) into `_hold_reasons()` / `_window_status(now)`, and add
+  `start_preflight_reasons(now=None, margin_s=START_PREFLIGHT_MARGIN_S=30)`: the same readers and
+  reason spellings as `start()` (`update:<reason>`, then `update_window_stale`), with the freshness
+  bound tightened by 30 s so a window that goes stale during the observer's spawn/handshake is
+  refused up front. `start()` itself is unchanged in behaviour.
+- hermes_cli/kanban_quiet.py: `hold()` runs that preflight before `acquire`; any reason (or an
+  unreadable preflight) exits 78 (EXIT_PREFLIGHT) with no lease, no cooldown, no observer. Once a
+  start is attempted, lease and cooldown semantics are unchanged.
+- Runner-only refusals (attestation route, coverage pending, registry unknowns, drain/restart
+  flags) are exposed by no read-only control verb, so they remain the gateway's own refusal after
+  the lease; documented in the module docstring.
+- Pool workers: documented as not quiet-proof targets (the live quiet proof is owned on the Macs).
+  Their 10-minute window republish and batching make the 120 s bound usually unmet; the preflight
+  now turns a worker attempt into a free exit 78 instead of a burned cooldown, so no publisher
+  cadence or max-age change.
+
+Tests:
+- tests/hermes_cli/test_kanban_quiet.py: stale (295 s, worker-2's live age), batching and draining
+  windows exit 78 through the real CLI without writing last-started.json or starting the observer,
+  and an immediate retry with an idle window succeeds; missing window / inside-the-margin window
+  and an exploding preflight refuse. The `home` fixture now writes a fresh idle window.
+- tests/gateway/test_quiet_control.py: preflight(margin 0) equals start()'s refusal reasons for
+  draining/batching/stale/missing/idle windows; the margin refuses a 115 s-old window.
+RED on the parent (tests only): 11 failed, incl. "cooldown was committed" for all three windows.
+GREEN: test_kanban_quiet 19/19, test_quiet_control 57/57, test_observe_gateway_quiet 48/48,
+test_quiet_membership_seeding 8/8, test_code_attestation_deps.
+---
+ gateway/quiet_control.py              | 68 +++++++++++++++++++--------
+ hermes_cli/kanban_quiet.py            | 33 ++++++++++++-
+ tests/gateway/test_quiet_control.py   | 20 ++++++++
+ tests/hermes_cli/test_kanban_quiet.py | 50 ++++++++++++++++++++
+ 4 files changed, 149 insertions(+), 22 deletions(-)
+
+diff --git a/gateway/quiet_control.py b/gateway/quiet_control.py
+index 618b6921c0..468b4646d4 100644
+--- a/gateway/quiet_control.py
++++ b/gateway/quiet_control.py
+@@ -31,6 +31,8 @@ logger = logging.getLogger(__name__)
+ SCHEMA = 1
+ START, SNAPSHOT, END = QUIET_BOOKKEEPING_VERBS
+ UPDATE_WINDOW_MAX_AGE_S = 120  # stricter than hermes_cli.kanban_deploy_window.FRESH_SECONDS (1200)
++# quiet-hold's preflight wants this much freshness left for the observer's spawn + handshake.
++START_PREFLIGHT_MARGIN_S = 30
+ _MAX_TEXT = 256
+ _ENDED_KEPT = 8
+ 
+@@ -165,6 +167,49 @@ def _digest(token: str) -> bytes:
+     return hashlib.sha256(token.encode("utf-8")).digest()
+ 
+ 
++# ---- host-file update markers (shared with the lease-free preflight) -------------------------
++
++def _hold_reasons() -> list[str]:
++    try:
++        from gateway.session_notifier_drain import held
++        return ["update_hold"] if held() else []
++    except Exception:  # health: allow BLE001 -- unreadable marker is unknown, never idle
++        return ["update_hold_unreadable"]
++
++
++def _window_status(now: int) -> tuple[dict[str, Any], list[str]]:
++    status: dict[str, Any] = {"collision": False, "window_state": None, "window_age_s": None}
++    try:
++        from hermes_cli import kanban_deploy_window as window
++        record = window.read_window(now)
++    except Exception:  # health: allow BLE001 -- unreadable deploy window is reported as update_window_unavailable (not idle)
++        record = None
++    if record is None:
++        return status, ["update_window_unavailable"]
++    status["window_state"] = record["state"]
++    status["window_age_s"] = now - record["observed_at"]
++    return status, ([] if record["state"] == "idle" else [f"update_window_{record['state']}"])
++
++
++def start_preflight_reasons(*, now: int | None = None, margin_s: int = START_PREFLIGHT_MARGIN_S) -> list[str]:
++    """``quiet-observe-start`` refusals readable from host files alone, before any lease exists.
++
++    The same readers and spellings as :meth:`QuietControl.start` (``update:<reason>``, then
++    ``update_window_stale``), with the freshness bound tightened by ``margin_s`` so a window that
++    would go stale while the observer starts is refused here. Runner-only state (attestation,
++    coverage, drain/restart flags, registry unknowns) is not exposed by any read-only control verb
++    and stays the gateway's own refusal. Advisory: the gateway's start remains authoritative.
++    """
++    now = int(time.time()) if now is None else now
++    status, window_reasons = _window_status(now)
++    reasons = [f"update:{r}" for r in _hold_reasons() + window_reasons]
++    if reasons:
++        return reasons
++    if status["window_age_s"] is None or status["window_age_s"] > UPDATE_WINDOW_MAX_AGE_S - margin_s:
++        return ["update_window_stale"]
++    return []
++
++
+ # ---- the handlers --------------------------------------------------------------------------
+ 
+ class QuietControl:
+@@ -278,30 +323,13 @@ class QuietControl:
+     def _update_status(self) -> tuple[dict[str, Any], list[str]]:
+         """Collision with a core update, from the existing typed markers (never English parsing)."""
+         runner = self._runner
+-        reasons: list[str] = []
+-        status: dict[str, Any] = {"collision": False, "window_state": None, "window_age_s": None}
+-        try:
+-            from gateway.session_notifier_drain import held
+-            if held():
+-                reasons.append("update_hold")
+-        except Exception:  # health: allow BLE001 -- unreadable marker is unknown, never idle
+-            reasons.append("update_hold_unreadable")
++        reasons = _hold_reasons()
+         if getattr(runner, "_draining", False):
+             reasons.append("runner_draining")
+         if getattr(runner, "_restart_requested", False):
+             reasons.append("restart_requested")
+-        try:
+-            from hermes_cli import kanban_deploy_window as window
+-            record = window.read_window(int(time.time()))
+-        except Exception:  # health: allow BLE001 -- unreadable deploy window is reported as update_window_unavailable (not idle)
+-            record = None
+-        if record is None:
+-            reasons.append("update_window_unavailable")
+-        else:
+-            status["window_state"] = record["state"]
+-            status["window_age_s"] = int(time.time()) - record["observed_at"]
+-            if record["state"] != "idle":
+-                reasons.append(f"update_window_{record['state']}")
++        status, window_reasons = _window_status(int(time.time()))
++        reasons += window_reasons
+         status["collision"] = bool(reasons)
+         status["reasons"] = reasons
+         return status, reasons
+diff --git a/hermes_cli/kanban_quiet.py b/hermes_cli/kanban_quiet.py
+index 69494c8567..5a6d81bd7d 100644
+--- a/hermes_cli/kanban_quiet.py
++++ b/hermes_cli/kanban_quiet.py
+@@ -21,8 +21,22 @@ Lease identity is passed to the observer through the environment:
+ 
+ Exit codes: 0 observer succeeded; 2 usage; 69 lease unavailable (platform/filesystem/clock/record);
+ 70 observer failed (spawn failure or non-zero exit; the observer's own status is on stderr);
+-71 lease release failed; 75 busy (another lease is active); 76 cooldown; 124 deadline reached and the
+-observer was terminated; 125 observer group death could not be verified; 130 cancelled by signal.
++71 lease release failed; 75 busy (another lease is active); 76 cooldown; 78 preflight refused;
++124 deadline reached and the observer was terminated; 125 observer group death could not be
++verified; 130 cancelled by signal.
++
++Preflight (exit 78): before the lease is taken, so before the cooldown is committed, the host
++files the gateway's ``quiet-observe-start`` refuses on are read (``gateway.quiet_control.
++start_preflight_reasons``): a core-update drain/admission hold, and the deploy window, which must
++be this host's, ``idle`` and at most ``UPDATE_WINDOW_MAX_AGE_S - START_PREFLIGHT_MARGIN_S`` old.
++Nothing is written; retry when the window is fresh and idle. Runner-only refusals (attestation,
++coverage pending, unknowns) have no read-only control verb, so they still surface only from the
++gateway's start, after the lease. Once a start is attempted, lease and cooldown are unchanged.
++
++Proof targets: Board pool workers republish ``window.json`` only from the 10-minute
++``hermes-core-update.timer`` and batch updates, so their window is usually stale or ``batching``
++for the gateway's 120 s bound. Workers are not quiet-proof targets (the live quiet proof is owned on
++the Macs); on a worker this command normally exits 78 at no cost instead of spending a 2 h cooldown.
+ """
+ 
+ from __future__ import annotations
+@@ -42,6 +56,7 @@ EXIT_OBSERVER_FAILED = 70
+ EXIT_RELEASE_FAILED = 71
+ EXIT_BUSY = 75
+ EXIT_COOLDOWN = 76
++EXIT_PREFLIGHT = 78
+ EXIT_DEADLINE = 124
+ EXIT_UNRESOLVED = 125
+ EXIT_CANCELLED = 130
+@@ -134,11 +149,25 @@ def _release(owner) -> bool:
+     return True
+ 
+ 
++def _preflight() -> list[str]:
++    """Lease-free reasons the gateway's ``quiet-observe-start`` would refuse; never raises."""
++    try:
++        from gateway.quiet_control import start_preflight_reasons
++        return start_preflight_reasons()
++    except Exception as exc:  # health: allow BLE001 -- an unreadable preflight refuses, never passes
++        return [f"preflight_unreadable:{type(exc).__name__}"]
++
++
+ def hold(max_s: int, reason: str, argv: Sequence[str], *, clock=None) -> int:
+     """Acquire the lease, run ``argv`` under it, release in ``finally``; returns the exit code."""
+     from agent import claim_quiet as cq
+     from agent.claim_quiet_records import SystemClock
+ 
++    refused = _preflight()
++    if refused:
++        _err("gateway quiet start would refuse (no lease taken, no cooldown spent): "
++             + ", ".join(refused))
++        return EXIT_PREFLIGHT
+     clock = clock or SystemClock()
+     try:
+         owner = cq.acquire(max_s=max_s, reason=reason, clock=clock)
+diff --git a/tests/gateway/test_quiet_control.py b/tests/gateway/test_quiet_control.py
+index d67922b39d..423e973980 100644
+--- a/tests/gateway/test_quiet_control.py
++++ b/tests/gateway/test_quiet_control.py
+@@ -212,6 +212,26 @@ def test_start_refused_on_update_markers(env):
+     assert "update:update_window_unavailable" in ok(env, "quiet-observe-start", start_params(env))["reasons"]
+ 
+ 
++@pytest.mark.parametrize("state, age", [("draining", 0), ("batching", 0), ("idle", 500), ("idle", 0), (None, 0)])
++def test_start_preflight_matches_the_start_refusal_from_host_files(env, state, age):
++    """quiet-hold's lease-free preflight reads the same files, with the same spellings, as start."""
++    attest(env)
++    if state is None:
++        os.unlink(window.window_path())
++    else:
++        write_window(env.root, state, age=age)
++    result = ok(env, "quiet-observe-start", start_params(env))
++    refused = result["reasons"] if result["phase"] != "started" else []
++    assert quiet_control.start_preflight_reasons(margin_s=0) == refused
++    assert (result["phase"] == "started") == (state == "idle" and age == 0)
++
++
++def test_start_preflight_margin_refuses_a_window_about_to_go_stale(env):
++    write_window(env.root, "idle", age=quiet_control.UPDATE_WINDOW_MAX_AGE_S - 5)
++    assert quiet_control.start_preflight_reasons(margin_s=0) == []
++    assert quiet_control.start_preflight_reasons() == ["update_window_stale"]
++
++
+ # ---- schema / authentication ---------------------------------------------------------------
+ 
+ @pytest.mark.parametrize("mutate", [
+diff --git a/tests/hermes_cli/test_kanban_quiet.py b/tests/hermes_cli/test_kanban_quiet.py
+index 9b829aed4a..0bd601a1a5 100644
+--- a/tests/hermes_cli/test_kanban_quiet.py
++++ b/tests/hermes_cli/test_kanban_quiet.py
+@@ -13,11 +13,13 @@ import signal
+ import subprocess
+ import sys
+ import textwrap
++import time
+ from pathlib import Path
+ 
+ import pytest
+ 
+ from agent import claim_quiet as cq
++from hermes_cli import kanban_deploy_window as window
+ from hermes_cli import kanban_quiet as kq
+ from tests.waiting import wait_until
+ 
+@@ -31,10 +33,20 @@ def home(tmp_path, monkeypatch):
+     root = tmp_path / ".hermes"
+     root.mkdir()
+     monkeypatch.setenv("HERMES_HOME", str(root))
++    _write_window("idle")  # the gateway's quiet start (and so the preflight) needs a fresh idle window
+     yield root
+     assert cq._CUSTODY == set() and cq._OWNERS == {}, "lease descriptors left in custody"
+ 
+ 
++def _write_window(state: str, *, age: int = 0) -> None:
++    path = window.window_path()
++    path.parent.mkdir(parents=True, exist_ok=True)
++    now = int(time.time())
++    path.write_text(json.dumps({"version": 1, "host": window.host_identity(), "observed_at": now - age,
++                                "window_at": now + 600, "state": state, "state_since": now - age - 1,
++                                "drain_bound_s": 60}))
++
++
+ def _script(tmp_path: Path, name: str, body: str) -> str:
+     path = tmp_path / name
+     path.write_text(textwrap.dedent(body))
+@@ -154,6 +166,44 @@ def test_cooldown_refuses_a_second_hold_and_never_starts_the_observer(home, tmp_
+     assert not marker.exists()
+ 
+ 
++@pytest.mark.parametrize("state, age, reason", [
++    ("idle", 295, "update_window_stale"),  # worker-2's live record: fresh for read_window, not for start
++    ("batching", 0, "update:update_window_batching"),
++    ("draining", 0, "update:update_window_draining"),
++])
++def test_preflight_refuses_a_doomed_start_without_taking_the_lease_or_spending_the_cooldown(
++        home, tmp_path, state, age, reason):
++    _write_window(state, age=age)
++    marker = tmp_path / "ran"
++    observer = _script(tmp_path, "mark.py", "import sys; open(sys.argv[1], 'w').write('x')")
++    code, _out, err = _run(*_hold_argv(30, sys.executable, observer, str(marker)))
++    assert not (home / "kanban" / "claim-quiet" / "last-started.json").exists(), "cooldown was committed"
++    assert not marker.exists(), "the observer must never start"
++    assert code == kq.EXIT_PREFLIGHT and reason in err and "no cooldown spent" in err, err
++    _write_window("idle")  # once the window is fresh and idle the same host can hold at once
++    assert _run(*_hold_argv(30, sys.executable, observer, str(marker)))[0] == 0 and marker.exists()
++
++
++def test_preflight_refuses_a_missing_window_and_a_window_about_to_go_stale(home):
++    window.window_path().unlink()
++    assert kq.hold(30, "r", ["true"]) == kq.EXIT_PREFLIGHT
++    _write_window("idle", age=100)  # inside the gateway's 120 s, but not with the start margin left
++    assert kq.hold(30, "r", ["true"]) == kq.EXIT_PREFLIGHT
++    assert cq.inspect().state == "inactive"
++    assert not (home / "kanban" / "claim-quiet" / "last-started.json").exists()
++
++
++def test_an_unreadable_preflight_refuses_rather_than_passing(home, monkeypatch):
++    from gateway import quiet_control
++
++    def broken(**_kw):
++        raise RuntimeError("boom")
++
++    monkeypatch.setattr(quiet_control, "start_preflight_reasons", broken)
++    assert kq.hold(30, "r", ["true"]) == kq.EXIT_PREFLIGHT
++    assert not (home / "kanban" / "claim-quiet" / "last-started.json").exists()
++
++
+ @pytest.mark.live_system_guard_bypass  # we SIGKILL our own orphaned observer group
+ def test_busy_when_another_process_holds_the_lease(home, tmp_path):
+     pidfile = tmp_path / "pids"
+-- 
+2.43.0
+

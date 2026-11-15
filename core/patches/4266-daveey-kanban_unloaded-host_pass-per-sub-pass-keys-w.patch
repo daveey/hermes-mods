@@ -1,0 +1,1983 @@
+From b30c361e955a69f6fe78c72514eadfd765359ef7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 18:13:08 +0000
+Subject: [PATCH] [daveey] kanban_unloaded host_pass: per-sub-pass keys with
+ live set and due times (H2)
+
+host_pass ran six sub-passes unconditionally every 30 s. Each now goes through
+kanban_unloaded_gates.run with its own key, so one sub-pass's inputs never gate
+another. A key is made of three parts:
+
+- the sub-pass's own input revisions: board data_version + total_changes on the
+  kept reader, profile state.db revisions, replica fingerprint + remote ledger;
+- frozenset(live_session_ids()), re-read after the remote wake;
+- the earliest due time across its pending items: guarantee GRACE_S and
+  retry_at, and the delegation 300 s recovery floor.
+
+The keys are structural empty proofs, not caches of delivery results. A
+returned [] can still mean busy, slots full, a lost claim or a swallowed error.
+Any positive or unknown input is pending and runs every pass. That covers
+candidate subscriptions, held/live/budget guarantee rows, busy_attempts or
+non-numeric deferrals, reaped children, undelivered remote ledger rows, _woken,
+and probe failures. A pending busy-chat or wake-slot deferral therefore never
+skips (C11). The key is captured before the work runs. A raising sub-pass
+clears its stamp. The every_store=False kill-switch path never skips.
+
+card_change_pass stays hot by design. No cheap, complete fanout key exists:
+the strict remote projection depends on alias TTL, owner freshness, ledger,
+config and last-good state. A prototype proof that computed it as a probe cost
+about 4x the pass it would skip (v9 replay).
+
+Foreign-profile guarantee and killed-notice passes now read through the kept
+read-only state.db handle (hermes_state_kept_reader, card I). They no longer
+open a writer and reconcile the schema per profile per pass. Writes borrow the
+shared writer through notice_writer. An already-delivered killed notice is
+answered on the reader alone. The profile census is shared by a pass's probes
+only, through a ContextVar scope.
+
+Tests (RED on main: kanban_unloaded_gates does not exist):
+- test_kanban_unloaded_gates: an unchanged empty host skips; a busy deferral
+  is delivered after its due time with no other change; a guarantee backoff
+  skips only until it expires; a live-set change re-runs.
+- test_h2_gate_mutations (85): every key component moves only its own
+  sub-pass; due-time bounds; a slot-full notice is retried every pass; a chat
+  that unloads with a pending notice is reconsidered; probe failure and raising
+  work leave no stamp.
+- test_h2_kept_notice_readers, test_h2_killed_probe, test_h2_profile_census.
+
+Replay (bench_h2_v9.py): synthetic 5.8k tasks / 23k sessions / 40k replica
+rows, 1800 virtual s at the production 30 s cadence, base b8bed5dc vs this
+change, run sequentially. See the card for the numbers.
+---
+ tests/tui_gateway/test_h2_gate_mutations.py   | 624 ++++++++++++++++++
+ .../test_h2_kept_notice_readers.py            | 236 +++++++
+ tests/tui_gateway/test_h2_killed_probe.py     | 103 +++
+ tests/tui_gateway/test_h2_profile_census.py   |  82 +++
+ .../tui_gateway/test_kanban_unloaded_gates.py | 240 +++++++
+ tui_gateway/kanban_notice_session_store.py    |  20 +
+ tui_gateway/kanban_unloaded.py                |  26 +-
+ tui_gateway/kanban_unloaded_gates.py          | 271 ++++++++
+ tui_gateway/notice_guarantee.py               |  78 ++-
+ tui_gateway/reap_notices.py                   |  33 +-
+ 10 files changed, 1671 insertions(+), 42 deletions(-)
+ create mode 100644 tests/tui_gateway/test_h2_gate_mutations.py
+ create mode 100644 tests/tui_gateway/test_h2_kept_notice_readers.py
+ create mode 100644 tests/tui_gateway/test_h2_killed_probe.py
+ create mode 100644 tests/tui_gateway/test_h2_profile_census.py
+ create mode 100644 tests/tui_gateway/test_kanban_unloaded_gates.py
+ create mode 100644 tui_gateway/kanban_unloaded_gates.py
+
+diff --git a/tests/tui_gateway/test_h2_gate_mutations.py b/tests/tui_gateway/test_h2_gate_mutations.py
+new file mode 100644
+index 0000000000..867b9943c4
+--- /dev/null
++++ b/tests/tui_gateway/test_h2_gate_mutations.py
+@@ -0,0 +1,624 @@
++"""H2/C11/R12 mutation-proof pins for ``kanban_unloaded_gates``.
++
++Each test is written so one specific wrong gate (shared stamp, live set dropped, due ignored, pending stamped,
++probe failure swallowed, reader identity dropped, ...) turns it red. See the mutation report for the matrix.
++"""
++import contextlib
++import json
++import sqlite3
++
++import pytest
++
++from tui_gateway import delegation_unloaded as du
++from tui_gateway import kanban_unloaded as ku
++from tui_gateway import kanban_unloaded_gates as gates
++from tui_gateway import notice_fanout as nf
++from tui_gateway import notice_guarantee as ng
++from tui_gateway import reap_notices as rn
++
++KINDS = ['remote_notices', 'notices', 'delegation', 'card_change_pass', 'killed_notices', 'guarantee_pass']
++
++
++@pytest.fixture(autouse=True)
++def _clean():
++    gates.reset_for_tests()
++    yield
++    gates.reset_for_tests()
++
++
++@pytest.fixture
++def clock(monkeypatch):
++    now = [1000.0]
++    monkeypatch.setattr(gates.time, 'time', lambda: now[0])
++    return now
++
++
++@pytest.fixture
++def counted(monkeypatch):
++    """host_pass with every sub-pass stubbed to a counter and every probe a settable structural key."""
++    calls = {k: 0 for k in KINDS}
++    keys = {k: ('k', k) for k in KINDS}
++    live = [set()]
++    monkeypatch.setattr(ku, 'live_session_ids', lambda: set(live[0]))
++    monkeypatch.setattr(ku, 'sweep_remote_once', lambda *a, **k: calls.__setitem__('remote_notices', calls['remote_notices'] + 1) or [])
++    monkeypatch.setattr(ku, 'sweep_once', lambda *a, **k: calls.__setitem__('notices', calls['notices'] + 1) or [])
++    monkeypatch.setattr(du, 'sweep_once', lambda *a, **k: calls.__setitem__('delegation', calls['delegation'] + 1) or [])
++    monkeypatch.setattr(nf, 'card_change_pass', lambda: calls.__setitem__('card_change_pass', calls['card_change_pass'] + 1) or [])
++    monkeypatch.setattr(rn, 'retry_pending_killed_notices_all', lambda: calls.__setitem__('killed_notices', calls['killed_notices'] + 1) or [])
++    monkeypatch.setattr(ng, 'guarantee_pass', lambda: calls.__setitem__('guarantee_pass', calls['guarantee_pass'] + 1) or [])
++    monkeypatch.setattr(gates, 'probe', lambda kind, **kw: gates.Inputs(keys[kind], pending=False))
++    return calls, keys, live
++
++
++# --------------------------------------------------------------------------------------- independence
++def test_probe_returned_stamps_are_distinct_per_kind(monkeypatch):
++    monkeypatch.setattr(gates, 'probe', lambda kind, **kw: gates.Inputs(('same',), pending=False))
++    ran = []
++    for kind in KINDS:
++        gates.run(kind, lambda k=kind: ran.append(k) or [], live=set())
++    assert ran == KINDS
++    assert set(gates._last) == set(KINDS)
++    for kind in KINDS:
++        gates.run(kind, lambda k=kind: ran.append(k) or [], live=set())
++    assert ran == KINDS  # each skipped on its own stamp
++
++
++@pytest.mark.parametrize('hot', KINDS)
++def test_pending_kind_never_disables_its_siblings_skip(monkeypatch, hot):
++    monkeypatch.setattr(gates, 'probe', lambda kind, **kw: gates.Inputs(('s',), pending=(kind == hot)))
++    ran = []
++    for _ in range(2):
++        for kind in KINDS:
++            gates.run(kind, lambda k=kind: ran.append(k) or [], live=set())
++    assert ran.count(hot) == 2
++    assert all(ran.count(k) == 1 for k in KINDS if k != hot)
++
++
++@pytest.mark.parametrize('moved', KINDS)
++def test_host_pass_each_key_moves_only_its_own_subpass(counted, moved):
++    calls, keys, _ = counted
++    ku.host_pass()
++    ku.host_pass()
++    base = dict(calls)
++    assert all(v == 1 for v in base.values()), base
++    keys[moved] = ('moved', moved)
++    ku.host_pass()
++    for kind in KINDS:
++        assert calls[kind] == base[kind] + (1 if kind == moved else 0), (kind, calls)
++
++
++def test_host_pass_without_a_real_lease_never_skips_or_stamps(counted):
++    calls, _, _ = counted
++    for _ in range(3):
++        ku.host_pass(every_store=False)
++    assert gates._last == {}
++    assert calls['notices'] == 3 and calls['delegation'] == 3 and calls['card_change_pass'] == 3
++    assert calls['guarantee_pass'] == 3 and calls['remote_notices'] == 3
++
++
++# ------------------------------------------------------------------------------------------ live set
++@pytest.mark.parametrize('kind', KINDS)
++def test_live_set_change_and_return_each_rerun(monkeypatch, kind):
++    monkeypatch.setattr(gates, 'probe', lambda *a, **k: gates.Inputs(('s',), pending=False))
++    ran = []
++    work = lambda: ran.append(1) or []
++    for live in (set(), set(), {'chat'}, {'chat'}, set(), {'chat', 'other'}, {'other', 'chat'}):
++        gates.run(kind, work, live=live)
++    # empty, (skip), chat, (skip), empty again, chat+other, (skip: order-insensitive)
++    assert len(ran) == 4
++
++
++def test_loaded_then_unloaded_chat_is_reconsidered_even_if_stores_never_change(monkeypatch):
++    monkeypatch.setattr(gates, 'probe', lambda *a, **k: gates.Inputs(('s',), pending=False))
++    ran = []
++    work = lambda: ran.append(1) or []
++    gates.run('notices', work, live={'c'})
++    gates.run('notices', work, live={'c'})
++    assert len(ran) == 1
++    gates.run('notices', work, live=set())  # the chat unloaded: its deferred notice is deliverable now
++    assert len(ran) == 2
++
++
++def test_host_pass_notices_use_the_live_set_read_after_the_remote_wake(counted, monkeypatch):
++    calls, _, _ = counted
++    seq = iter([set(), {'woken'}, {'woken'}, {'woken'}])  # pass1: before/after remote; pass2: same
++    monkeypatch.setattr(ku, 'live_session_ids', lambda: next(seq))
++    ku.host_pass()
++    ku.host_pass()
++    # remote saw {} then {'woken'}: it must rerun; every later sub-pass saw {'woken'} twice: skip
++    assert calls['remote_notices'] == 2
++    assert all(calls[k] == 1 for k in KINDS if k != 'remote_notices'), calls
++
++
++# --------------------------------------------------------------------------------------- due times
++def test_stamp_expires_exactly_at_inputs_due(monkeypatch, clock):
++    monkeypatch.setattr(gates, 'probe', lambda *a, **k: gates.Inputs(('s',), pending=False, due=1100.0))
++    ran = []
++    work = lambda: ran.append(clock[0]) or []
++    gates.run('notices', work, live=set())
++    clock[0] = 1099.999
++    gates.run('notices', work, live=set())
++    assert ran == [1000.0]
++    clock[0] = 1100.0  # boundary is inclusive-due
++    gates.run('notices', work, live=set())
++    assert ran == [1000.0, 1100.0]
++
++
++def test_earlier_stamped_due_still_bounds_a_later_probe_due(monkeypatch, clock):
++    dues = iter([1100.0, 5000.0, 5000.0])
++    monkeypatch.setattr(gates, 'probe', lambda *a, **k: gates.Inputs(('s',), pending=False, due=next(dues)))
++    ran = []
++    work = lambda: ran.append(clock[0]) or []
++    gates.run('notices', work, live=set())   # stamps due 1100
++    clock[0] = 1100.0
++    gates.run('notices', work, live=set())   # probe says 5000, but the stamp's 1100 has passed
++    assert ran == [1000.0, 1100.0]
++
++
++def test_earlier_probe_due_beats_a_later_stamp(monkeypatch, clock):
++    dues = iter([5000.0, 1050.0])
++    monkeypatch.setattr(gates, 'probe', lambda *a, **k: gates.Inputs(('s',), pending=False, due=next(dues)))
++    ran = []
++    work = lambda: ran.append(clock[0]) or []
++    gates.run('notices', work, live=set())
++    clock[0] = 1050.0
++    gates.run('notices', work, live=set())
++    assert ran == [1000.0, 1050.0]
++
++
++def test_already_due_input_is_never_stamped(monkeypatch, clock):
++    monkeypatch.setattr(gates, 'probe', lambda *a, **k: gates.Inputs(('s',), pending=False, due=1000.0))
++    ran = []
++    for _ in range(2):
++        gates.run('notices', lambda: ran.append(1) or [], live=set())
++    assert len(ran) == 2 and 'notices' not in gates._last
++
++
++def test_due_that_passes_during_work_is_not_stamped(monkeypatch, clock):
++    monkeypatch.setattr(gates, 'probe', lambda *a, **k: gates.Inputs(('s',), pending=False, due=1010.0))
++    ran = []
++    def slow():
++        ran.append(1)
++        clock[0] = 1020.0
++        return []
++    gates.run('notices', slow, live=set())
++    gates.run('notices', slow, live=set())
++    assert len(ran) == 2
++
++
++# ---- real guarantee/delegation due arithmetic
++@pytest.fixture
++def store(tmp_path, monkeypatch):
++    from hermes_state import SessionDB
++    db = SessionDB(tmp_path / 'state.db')
++    db.create_session('chat', 'desktop')
++    db.append_message('chat', 'user', 'work')
++    msg = db.append_kanban_notice('chat', 'done', {'notice_id': 'n1'})
++    monkeypatch.setattr(gates, '_profile_paths', lambda every_store=True: [db.db_path])
++
++    def seed(closeout, ts=1000.0, raw=None):
++        meta = {} if closeout is ... else {'closeout': closeout}
++        db._write_rowcount('UPDATE messages SET timestamp=?, display_metadata=? WHERE id=?',
++                           (ts, raw if raw is not None else json.dumps(meta), msg))
++    yield db, seed
++    gates.reset_for_tests()
++    db.close()
++
++
++def test_guarantee_due_is_max_of_retry_and_grace(store, clock):
++    _, seed = store
++    clock[0] = 4950.0
++    seed({'state': 'deferred', 'retry_at': 1000.0}, ts=4900.0)  # grace (4900+300=5200) dominates retry
++    got = gates.probe('guarantee_pass')
++    assert not got.pending and got.due == 5200.0
++    seed({'state': 'deferred', 'retry_at': 9000.0}, ts=4900.0)  # retry dominates grace
++    assert gates.probe('guarantee_pass').due == 9000.0
++
++
++def test_guarantee_due_is_minimum_across_rows_and_stores(store, clock, tmp_path, monkeypatch):
++    from hermes_state import SessionDB
++    db, seed = store
++    seed({'state': 'deferred', 'retry_at': 9000.0}, ts=1.0)
++    other = SessionDB(tmp_path / 'other.db')
++    try:
++        other.create_session('c2', 'desktop')
++        other.append_message('c2', 'user', 'x')
++        m2 = other.append_kanban_notice('c2', 'done', {'notice_id': 'n2'})
++        other._write_rowcount('UPDATE messages SET timestamp=1.0, display_metadata=? WHERE id=?',
++                              (json.dumps({'closeout': {'state': 'deferred', 'retry_at': 7000.0}}), m2))
++        monkeypatch.setattr(gates, '_profile_paths', lambda every_store=True: sorted([db.db_path, other.db_path]))
++        got = gates.probe('guarantee_pass')
++        assert not got.pending and got.due == 7000.0
++        assert len(got.key) == 2
++    finally:
++        other.close()
++
++
++def test_guarantee_row_becoming_due_with_no_commit_reruns(store, clock, monkeypatch):
++    _, seed = store
++    seed({'state': 'deferred', 'retry_at': 1500.0}, ts=1.0)
++    ran = []
++    work = lambda: ran.append(clock[0]) or []
++    gates.run('guarantee_pass', work, live=set())
++    clock[0] = 1499.0
++    gates.run('guarantee_pass', work, live=set())
++    clock[0] = 1500.0
++    gates.run('guarantee_pass', work, live=set())
++    assert ran == [1000.0, 1500.0]
++
++
++def test_delegation_recovery_due_is_a_fixed_offset_from_now(store, clock):
++    inputs = gates.probe('delegation')
++    assert not inputs.pending and inputs.due == 1000.0 + du.RECOVER_EVERY_S
++    assert gates.probe('killed_notices').due == float('inf')
++
++
++# ------------------------------------------------------------------------------ busy / slot / pending hot
++@pytest.mark.parametrize('closeout, ts', [
++    (..., 1000.0),                                                        # never claimed (even inside grace)
++    (..., 999999.0),
++    ({'state': 'busy'}, 1000.0),                                          # legacy final busy: re-offered
++    ({'state': 'deferred', 'retry_at': 1000.0, 'busy_attempts': 2}, 1.0),  # timed busy deferral
++    ({'state': 'deferred', 'retry_at': 9e9, 'busy_attempts': 1}, 1.0),     # busy deferral, far future
++    ({'state': 'deferred', 'retry_at': 500.0}, 1.0),                      # due now
++    ({'state': 'deferred', 'retry_at': 1000.0}, 1.0),                     # due exactly now
++    ({'state': 'deferred'}, 1.0),                                         # no retry_at
++    ({'state': 'deferred', 'retry_at': True}, 1.0),                       # bool is not a time
++    ({'state': 'deferred', 'retry_at': float('nan')}, 1.0),
++    ({'state': 'deferred', 'retry_at': float('inf')}, 1.0),
++    ({'state': 'deferred', 'retry_at': '9999'}, 1.0),
++])
++def test_guarantee_pending_shapes_stay_hot(store, clock, closeout, ts):
++    _, seed = store
++    seed(closeout, ts=ts)
++    assert gates.probe('guarantee_pass').pending
++    ran = []
++    for _ in range(3):
++        gates.run('guarantee_pass', lambda: ran.append(1) or [], live=set())
++    assert len(ran) == 3 and 'guarantee_pass' not in gates._last
++
++
++@pytest.mark.parametrize('raw', ['not json', '[1]', '{"closeout": "x"}', '{"closeout": 7}', '{"closeout": [1]}'])
++def test_guarantee_malformed_metadata_stays_hot(store, raw):
++    _, seed = store
++    seed(None, raw=raw)
++    assert gates.probe('guarantee_pass').pending
++
++
++@pytest.mark.parametrize('closeout', [{'state': 'started'}, {'state': 'claimed', 'pid': 1},
++                                       {'state': 'error'}, {'state': 'superseded'}, {'state': 'busy', 'busy_attempts': 8}])
++def test_guarantee_settled_rows_are_the_only_ones_that_may_skip(store, closeout):
++    _, seed = store
++    seed(closeout)
++    got = gates.probe('guarantee_pass')
++    assert not got.pending and got.due == float('inf')
++
++
++def test_slot_full_unclaimed_notice_is_retried_every_pass_then_delivered(store, clock, monkeypatch):
++    from tui_gateway.wake_slots import WakeSlots
++    db, seed = store
++    seed(..., ts=1.0)  # unclaimed, older than GRACE
++    clock[0] = 5000.0
++    slots = WakeSlots(1)
++    assert slots.acquire()
++    monkeypatch.setattr(ng, '_wake_slots', slots)
++    woken, seen = [], []
++    @contextlib.contextmanager
++    def opener(sid):
++        yield db, sid
++    def guarantee():
++        seen.append(1)
++        return REAL(now=5000.0, stores=lambda: iter([db]), holders=list, session_db=opener,
++                    wake=lambda *a: woken.append(a) or 'started', spawn=lambda job: job())
++    REAL = ng.guarantee_pass
++    monkeypatch.setattr(ng, 'guarantee_pass', guarantee)
++    for name in ('live_session_ids',):
++        monkeypatch.setattr(ku, name, lambda: set())
++    monkeypatch.setattr(ku, 'sweep_remote_once', lambda *a, **k: [])
++    monkeypatch.setattr(ku, 'sweep_once', lambda *a, **k: [])
++    monkeypatch.setattr(du, 'sweep_once', lambda *a, **k: [])
++    monkeypatch.setattr(nf, 'card_change_pass', list)
++    monkeypatch.setattr(rn, 'retry_pending_killed_notices_all', list)
++    ku.host_pass()
++    ku.host_pass()
++    assert len(seen) == 2 and not woken
++    slots.release()
++    ku.host_pass()
++    assert len(seen) == 3 and woken  # delivered with no store commit between the refusal and the retry
++
++
++def test_remote_pending_inputs_stay_hot(monkeypatch, tmp_path):
++    from hermes_cli import kanban_origin
++    from tui_gateway import kanban_remote_notices as remote
++    from tui_gateway import kanban_replica_observer as observer
++    ledger = tmp_path / 'ledger.db'
++    with contextlib.closing(sqlite3.connect(ledger)) as conn:
++        conn.execute('CREATE TABLE notices(delivered INTEGER)')
++        conn.commit()
++    monkeypatch.setattr(kanban_origin, '_hub_db', lambda: tmp_path / 'hub.db')
++    monkeypatch.setattr(kanban_origin, 'gateway_names', lambda: ['me'])
++    monkeypatch.setattr(observer, 'fingerprint', lambda p: ('fp', 1))
++    monkeypatch.setattr(remote, '_sweep_snapshot', lambda p, me: ([], {}))
++    monkeypatch.setattr(remote, 'ledger_path', lambda: ledger)
++    remote._woken.clear()
++    base = gates.probe('remote_notices')
++    assert not base.pending and base.key[1] == 'me' and base.key[2] == ('fp', 1)
++    monkeypatch.setattr(remote, '_sweep_snapshot', lambda p, me: ([{'key': 'a'}], {}))
++    assert gates.probe('remote_notices').pending  # even delivered terminal cards are hot
++    monkeypatch.setattr(remote, '_sweep_snapshot', lambda p, me: ([], {}))
++    remote._woken[('x',)] = {}
++    try:
++        assert gates.probe('remote_notices').pending  # a woken running flag is not a DB commit
++    finally:
++        remote._woken.clear()
++    with contextlib.closing(sqlite3.connect(ledger)) as conn:
++        conn.execute('INSERT INTO notices(delivered) VALUES (0)')
++        conn.commit()
++    assert gates.probe('remote_notices').pending  # undelivered ledger row: stale-claim recovery
++    monkeypatch.setattr(observer, 'fingerprint', lambda p: None)
++    assert gates.probe('remote_notices').pending  # unknown replica state
++    monkeypatch.setattr(kanban_origin, 'gateway_names', lambda: [''])
++    monkeypatch.setattr(observer, 'fingerprint', lambda p: ('fp', 1))
++    assert gates.probe('remote_notices').pending  # unknown gateway name
++
++
++def test_remote_each_key_component_moves_the_key_independently(monkeypatch, tmp_path):
++    from hermes_cli import kanban_origin
++    from tui_gateway import kanban_remote_notices as remote
++    from tui_gateway import kanban_replica_observer as observer
++    ledger = tmp_path / 'ledger.db'
++    with contextlib.closing(sqlite3.connect(ledger)) as conn:
++        conn.execute('CREATE TABLE notices(delivered INTEGER)')
++        conn.execute('INSERT INTO notices(delivered) VALUES (1)')
++        conn.commit()
++    state = {'fp': ('fp', 1), 'me': 'me', 'ledger': ledger}
++    monkeypatch.setattr(kanban_origin, '_hub_db', lambda: tmp_path / 'hub.db')
++    monkeypatch.setattr(kanban_origin, 'gateway_names', lambda: [state['me']])
++    monkeypatch.setattr(observer, 'fingerprint', lambda p: state['fp'])
++    monkeypatch.setattr(remote, '_sweep_snapshot', lambda p, me: ([], {}))
++    monkeypatch.setattr(remote, 'ledger_path', lambda: state['ledger'])
++    remote._woken.clear()
++    base = gates.probe('remote_notices')
++    assert not base.pending
++    assert gates.probe('remote_notices').key == base.key  # stable
++    state['fp'] = ('fp', 2)
++    assert gates.probe('remote_notices').key != base.key
++    state['fp'] = ('fp', 1)
++    state['me'] = 'you'
++    assert gates.probe('remote_notices').key != base.key
++    state['me'] = 'me'
++    with contextlib.closing(sqlite3.connect(ledger)) as conn:  # delivered-row commit: no pending, key moves
++        conn.execute('INSERT INTO notices(delivered) VALUES (1)')
++        conn.commit()
++    after = gates.probe('remote_notices')
++    assert not after.pending and after.key != base.key
++    state['ledger'] = tmp_path / 'absent.db'
++    missing = gates.probe('remote_notices')
++    assert not missing.pending and missing.key != after.key
++
++
++def test_delegation_and_killed_pending_inputs_stay_hot(tmp_path, monkeypatch):
++    import tools.async_delegation_idle as idle
++    path = tmp_path / 'state.db'
++    with contextlib.closing(sqlite3.connect(path)) as conn:
++        conn.execute('CREATE TABLE async_delegations(state TEXT, delivery_state TEXT)')
++        conn.execute('CREATE TABLE sessions(id TEXT, parent_session_id TEXT, end_reason TEXT, ended_at REAL)')
++        conn.commit()
++    monkeypatch.setattr(gates, '_profile_paths', lambda every_store=True: [path])
++    assert not gates.probe('delegation').pending and not gates.probe('killed_notices').pending
++    monkeypatch.setattr(idle, 'ledger_quiet', lambda p: False)
++    assert gates.probe('delegation').pending
++    assert not gates.probe('killed_notices').pending  # independent of delegation
++    with contextlib.closing(sqlite3.connect(path)) as conn:
++        conn.execute("INSERT INTO sessions VALUES ('c','p','startup_orphan_reap',1.0)")
++        conn.commit()
++    assert gates.probe('killed_notices').pending  # no age predicate: delivered ones stay hot too
++
++
++# ---------------------------------------------------------------------------------- failure fallback
++def _boom(*a, **k):
++    raise sqlite3.OperationalError('unavailable')
++
++
++@pytest.mark.parametrize('kind, target', [
++    ('notices', ('hermes_cli.kanban_db', 'list_boards')),
++    ('guarantee_pass', ('tui_gateway.kanban_unloaded_gates', '_profile_paths')),
++    ('delegation', ('tui_gateway.kanban_unloaded_gates', '_profile_paths')),
++    ('killed_notices', ('tui_gateway.kanban_unloaded_gates', '_profile_paths')),
++    ('remote_notices', ('hermes_cli.kanban_origin', '_hub_db')),
++    ('card_change_pass', ('tui_gateway.notice_fanout_state', 'path')),
++])
++def test_probe_failure_is_pending_and_work_runs_every_pass(monkeypatch, kind, target):
++    import importlib
++    gates.reset_for_tests()
++    monkeypatch.setattr(importlib.import_module(target[0]), target[1], _boom)
++    got = gates.probe(kind)
++    assert got.pending and got.key == ()
++    ran = []
++    for _ in range(3):
++        gates.run(kind, lambda: ran.append(1) or [], live=set())
++    assert len(ran) == 3 and kind not in gates._last
++
++
++@pytest.mark.parametrize('kind', KINDS)
++def test_raising_work_clears_an_earlier_valid_stamp(monkeypatch, kind):
++    monkeypatch.setattr(gates, 'probe', lambda *a, **k: gates.Inputs(('s',), pending=False))
++    gates.run(kind, list, live=set())
++    assert kind in gates._last
++    def failed():
++        raise RuntimeError('mid-pass')
++    # same key would have skipped; a live change forces the work to run and raise
++    with pytest.raises(RuntimeError):
++        gates.run(kind, failed, live={'chat'})
++    assert kind not in gates._last
++    ran = []
++    gates.run(kind, lambda: ran.append(1) or [], live={'chat'})  # same key as the failed run: must not skip
++    assert ran == [1]
++
++
++def test_missing_board_store_is_unprovable_not_empty():
++    from hermes_cli.kanban_db_boards import create_board
++    create_board('only-nondefault')  # default board file never created: reading it fails
++    got = gates.probe('notices')
++    assert got.pending and got.key == ()
++
++
++def test_host_pass_failure_in_remote_does_not_stop_notices_and_leaves_no_stamp(counted, monkeypatch):
++    calls, _, _ = counted
++    def failed(*a, **k):
++        raise RuntimeError('remote down')
++    monkeypatch.setattr(ku, 'sweep_remote_once', failed)
++    ku.host_pass()
++    ku.host_pass()
++    assert 'remote_notices' not in gates._last
++    assert calls['notices'] == 1 and calls['guarantee_pass'] == 1  # others still ran and still skip on their stamp
++
++
++def test_unexpected_probe_error_in_host_pass_runs_everything_each_time(counted, monkeypatch):
++    calls, _, _ = counted
++    monkeypatch.setattr(gates, 'probe', lambda *a, **k: gates.Inputs())  # what probe() returns on any exception
++    for _ in range(2):
++        ku.host_pass()
++    assert all(v == 2 for v in calls.values()), calls
++
++
++# ----------------------------------------------------------------------------------- reader identity
++def test_revision_key_contains_the_reader_so_a_new_handle_never_matches(tmp_path):
++    path = tmp_path / 'x.db'
++    a = sqlite3.connect(path)
++    b = sqlite3.connect(path)
++    try:
++        a.execute('CREATE TABLE t(x)')
++        a.commit()
++        assert gates._revision(a) == gates._revision(a)
++        assert gates._revision(a) != gates._revision(b)  # same file, same counters, different handle
++        assert gates._revision(a)[0] is a
++    finally:
++        a.close()
++        b.close()
++
++
++def test_notices_probe_stable_on_the_kept_reader_but_rearms_on_a_swapped_reader(monkeypatch):
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_reader_retention as retention
++    from hermes_cli import kanban_db as kb
++    with contextlib.closing(kbc.connect()) as conn:
++        kb.create_task(conn, title='x', assignee='w')
++    first = gates.probe('notices')
++    assert not first.pending and gates.probe('notices').key == first.key  # kept handle reused
++    real = retention.reader
++    handles = []
++    @contextlib.contextmanager
++    def fresh(path):
++        conn = sqlite3.connect(f'{path.resolve().as_uri()}?mode=ro', uri=True)
++        handles.append(conn)
++        try:
++            yield conn
++        finally:
++            pass  # kept open so id() cannot be recycled
++    monkeypatch.setattr(retention, 'reader', fresh)
++    one, two = gates.probe('notices'), gates.probe('notices')
++    assert not one.pending and not two.pending
++    assert one.key != two.key  # new handle each time: never a "no change" proof
++    ran = []
++    for _ in range(2):
++        gates.run('notices', lambda: ran.append(1) or [], live=set())
++    assert len(ran) == 2
++    for h in handles:
++        h.close()
++    monkeypatch.setattr(retention, 'reader', real)
++
++
++def test_guarantee_key_is_stable_on_the_kept_reader_across_passes(store):
++    from tui_gateway.kanban_notice_session_store import profile_store, reader_of
++    db, seed = store
++    seed({'state': 'started'})
++    first, second = gates.probe('guarantee_pass'), gates.probe('guarantee_pass')
++    assert not first.pending and first.key == second.key
++    with profile_store(db.db_path) as s1:
++        r1 = reader_of(s1)
++    with profile_store(db.db_path) as s2:
++        r2 = reader_of(s2)
++    assert r1 is r2
++    assert first.key[0][1][0] is second.key[0][1][0]  # the key names the same kept handle every pass
++    ran = []
++    for _ in range(2):
++        gates.run('guarantee_pass', lambda: ran.append(1) or [], live=set())
++    assert len(ran) == 1
++
++
++def test_guarantee_commit_by_another_writer_moves_the_key(store):
++    db, seed = store
++    seed({'state': 'started'})
++    before = gates.probe('guarantee_pass')
++    other = sqlite3.connect(db.db_path)
++    try:
++        other.execute("UPDATE messages SET content='changed' WHERE display_kind='kanban_notice'")
++        other.commit()
++    finally:
++        other.close()
++    after = gates.probe('guarantee_pass')
++    assert not after.pending and after.key != before.key
++
++
++def test_guarantee_store_appearing_or_vanishing_moves_the_key(store, tmp_path, monkeypatch):
++    db, seed = store
++    seed({'state': 'started'})
++    ghost = tmp_path / 'ghost.db'
++    monkeypatch.setattr(gates, '_profile_paths', lambda every_store=True: sorted([db.db_path, ghost]))
++    with_ghost = gates.probe('guarantee_pass')
++    assert not with_ghost.pending and (str(ghost), None) in with_ghost.key
++    monkeypatch.setattr(gates, '_profile_paths', lambda every_store=True: [db.db_path])
++    assert gates.probe('guarantee_pass').key != with_ghost.key
++
++
++# ----------------------------------------------------------- board components move key independently
++def test_notices_second_board_change_moves_key_and_new_subscription_goes_hot():
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_db_notify as notify
++    from hermes_cli.kanban_db_boards import create_board
++    with contextlib.closing(kbc.connect()) as conn:
++        kb.create_task(conn, title='default board exists', assignee='w')
++    create_board('second')
++    base = gates.probe('notices')
++    assert not base.pending and len(base.key) == 2
++    with contextlib.closing(kbc.connect(board='second')) as conn:
++        tid = kb.create_task(conn, title='y', assignee='w')
++    moved = gates.probe('notices')
++    assert not moved.pending and moved.key != base.key
++    with contextlib.closing(kbc.connect(board='second')) as conn:
++        notify.add_notify_sub(conn, task_id=tid, platform='tui', chat_id='chat')
++    quiet = gates.probe('notices')
++    assert not quiet.pending and quiet.key != moved.key  # a sub on an open card is still an empty proof
++    with contextlib.closing(kbc.connect(board='second')) as conn:
++        kb.complete_task(conn, tid, summary='ready')
++    assert gates.probe('notices').pending  # the unseen terminal event on the OTHER board goes hot
++
++
++# ------------------------------------------------------------------ defence in depth (probe contract)
++@pytest.mark.parametrize('kind', KINDS)
++def test_pending_probe_never_skips_even_when_its_key_equals_a_live_stamp(monkeypatch, kind):
++    state = {'pending': False}
++    monkeypatch.setattr(gates, 'probe', lambda *a, **k: gates.Inputs(('same',), pending=state['pending']))
++    ran = []
++    gates.run(kind, lambda: ran.append(1) or [], live=set())
++    assert kind in gates._last
++    state['pending'] = True
++    gates.run(kind, lambda: ran.append(1) or [], live=set())
++    assert len(ran) == 2
++
++
++def test_revision_sees_a_commit_made_through_the_same_handle(tmp_path):
++    conn = sqlite3.connect(tmp_path / 'own.db')
++    try:
++        conn.execute('CREATE TABLE t(x)')
++        conn.commit()
++        before = gates._revision(conn)
++        conn.execute('INSERT INTO t VALUES (1)')
++        conn.commit()
++        after = gates._revision(conn)
++        assert after[1] == before[1]  # data_version only reflects OTHER connections' commits
++        assert after != before  # total_changes still moves the key
++    finally:
++        conn.close()
+diff --git a/tests/tui_gateway/test_h2_kept_notice_readers.py b/tests/tui_gateway/test_h2_kept_notice_readers.py
+new file mode 100644
+index 0000000000..c27c0c669b
+--- /dev/null
++++ b/tests/tui_gateway/test_h2_kept_notice_readers.py
+@@ -0,0 +1,236 @@
++"""H2: the notice guarantee and the orphan-reap notice retry read a FOREIGN profile's ``state.db`` through the kept
++read-only handle (``hermes_state_kept_reader``): no per-pass writer open or schema reconcile. Only an actual notice
++write or outcome refresh borrows the shared writer, through ``notice_writer``. The launch store stays the shared
++writable handle. [daveey]"""
++
++from __future__ import annotations
++
++import contextlib
++import time
++from pathlib import Path
++
++import pytest
++
++import hermes_state_kept_reader as kept
++import hermes_state_outcome as so
++import hermes_state_registry
++from hermes_state import SessionDB
++from tui_gateway import notice_candidates as nc
++from tui_gateway import notice_guarantee as ng
++from tui_gateway import reap_notices as rn
++from tui_gateway import server
++from tui_gateway.kanban_notice_session_store import NoticeSessionStore, notice_writer, reader_of
++
++CHAT = "20261114_090000_h2kept"
++
++
++@pytest.fixture
++def foreign(tmp_path, monkeypatch):
++    """A foreign profile's seeded ``state.db`` served as profile ``other``."""
++    so._reset_hooks_for_tests()
++    ng._reset_refreshed_for_tests()
++    home = tmp_path / "other"
++    home.mkdir()
++    path = home / "state.db"
++    seed = SessionDB(path)
++    seed.create_session(CHAT, "desktop")
++    seed.append_message(CHAT, "user", "run the deploy card")
++    seed.append_message(CHAT, "assistant", "Started it; I will report when it lands.")
++    seed.close()
++    monkeypatch.setattr(server, "_profile_home", lambda profile: home if profile == "other" else None)
++    monkeypatch.setattr(server, "_readopt_wake_profiles", lambda: ["other"])
++    monkeypatch.setattr(ng, "_this_gateway", lambda: "local-example")
++    monkeypatch.setattr(nc, "_cache", nc.OrderedDict())
++    yield path
++    kept.close_all_under(None)
++    hermes_state_registry.close_all()
++    so._reset_hooks_for_tests()
++
++
++@pytest.fixture
++def writer_borrows(monkeypatch):
++    """Every shared-writer borrow (``hermes_state_registry.acquire``)."""
++    calls: list = []
++    real = hermes_state_registry.acquire
++
++    def counting(path, *a, **kw):
++        calls.append(Path(path))
++        return real(path, *a, **kw)
++
++    monkeypatch.setattr(hermes_state_registry, "acquire", counting)
++    return calls
++
++
++def _notice(path, text="Card t_1 blocked on David", age=600.0, **meta):
++    db = hermes_state_registry.acquire(path)
++    try:
++        row = db.append_kanban_notice(CHAT, text, {"notice_id": f"n:{text}:{time.time()}", "display_text": text, **meta})
++        db._write_rowcount("UPDATE messages SET timestamp = ? WHERE id = ?", (time.time() - age, row))
++    finally:
++        hermes_state_registry.release(db)
++    return row
++
++
++def _pass(**kw):
++    return ng.guarantee_pass(stores=ng._stores, holders=kw.pop("holders", list), **kw)
++
++
++def test_foreign_profile_store_is_the_kept_read_only_handle(foreign, writer_borrows):
++    with ng._profile_store("other") as store:
++        assert isinstance(store, NoticeSessionStore)
++        assert reader_of(store).read_only
++        with pytest.raises(Exception):
++            store.append_kanban_notice(CHAT, "x", {"notice_id": "direct"})  # a direct write fails, never elsewhere
++    assert writer_borrows == []
++
++
++def test_missing_foreign_store_is_skipped_not_created(foreign):
++    foreign.unlink()
++    for side in foreign.parent.glob("state.db*"):
++        side.unlink()
++    with ng._profile_store("other") as store:
++        assert store is None
++    assert not foreign.exists()
++
++
++def test_candidate_scan_and_held_skip_borrow_no_writer(foreign, writer_borrows, monkeypatch):
++    _notice(foreign)
++    writer_borrows.clear()
++    monkeypatch.setattr(hermes_state_registry, "acquire", lambda *a, **k: pytest.fail("writer borrowed"))
++    holders = lambda: [{"pid": 1, "session_id": CHAT, "surface": "tui", "host": "x"}]
++    monkeypatch.setattr("tui_gateway.kanban_unloaded._other_holder", lambda h, ids: "pid 1")
++    out = _pass(holders=holders)
++    assert [r["result"] for r in out] == ["skipped:held"]
++    assert kept.stats["opens"] >= 1
++
++
++def test_candidates_cache_identity_is_stable_across_passes(foreign):
++    _notice(foreign)
++    keys = []
++    for _ in range(3):
++        with ng._profile_store("other") as store:
++            assert len(ng.candidates(store, time.time())) == 1
++        keys.append(set(nc._cache))
++    assert len(keys[0]) == 1 and keys[0] == keys[1] == keys[2]  # same kept reader: one entry, never a fresh key
++    [(key_db, _conn, _sql)] = keys[0]
++    assert not isinstance(key_db, NoticeSessionStore)
++
++
++def test_refresh_branch_writes_through_the_writer_once_per_row(foreign, writer_borrows):
++    _notice(foreign, blocked_on_human=True, gateway="remote-example")
++    writer_borrows.clear()
++    assert [r["result"] for r in _pass(holders=list)] == ["refreshed:human"]
++    assert writer_borrows, "the outcome refresh is an actual write: it borrows the shared writer"
++    assert so.get_outcome(CHAT, db=hermes_state_registry.acquire(foreign)) is not None
++    writer_borrows.clear()
++    assert [r["result"] for r in _pass(holders=list)] == ["skipped:refreshed"]
++    assert writer_borrows == []
++
++
++def test_claim_stamp_supersede_and_give_up_write_through_notice_writer(foreign, writer_borrows):
++    row = _notice(foreign)
++    with ng._profile_store("other") as store:
++        [cand] = ng.candidates(store, time.time())
++        writer_borrows.clear()
++        assert ng._claim(store, cand, time.time()) is True
++        assert writer_borrows
++        ng._stamp(store, row, "started")
++        # compare-and-swap: the stale raw_meta no longer matches, so neither supersede nor give-up overwrites it
++        assert ng._supersede(store, cand, time.time()) == "skipped:claimed"
++        assert ng._give_up(store, cand) == "error"
++        meta = store._read_one("SELECT display_metadata FROM messages WHERE id = ?", (row,))["display_metadata"]
++        assert '"started"' in meta
++        assert writer_borrows
++
++
++def test_supersede_and_give_up_stamp_a_fresh_candidate(foreign):
++    first, second = _notice(foreign, "one"), None
++    with ng._profile_store("other") as store:
++        [cand] = ng.candidates(store, time.time())
++        assert ng._supersede(store, cand, time.time()) == "superseded"
++        assert '"superseded"' in store._read_one(
++            "SELECT display_metadata FROM messages WHERE id = ?", (first,))["display_metadata"]
++    second = _notice(foreign, "two")
++    with ng._profile_store("other") as store:
++        [cand] = ng.candidates(store, time.time())
++        assert cand["msg_id"] == second
++        assert ng._give_up(store, cand) == "error"
++        assert '"error"' in store._read_one(
++            "SELECT display_metadata FROM messages WHERE id = ?", (second,))["display_metadata"]
++
++
++def test_dispatch_claims_and_closeout_stamps_through_the_writer(foreign, writer_borrows):
++    row = _notice(foreign)
++    jobs = []
++
++    @contextlib.contextmanager
++    def opener(chat_id):  # the close-out worker's own (writable) session store
++        db = hermes_state_registry.acquire(foreign)
++        try:
++            yield db, chat_id
++        finally:
++            hermes_state_registry.release(db)
++
++    out = _pass(session_db=opener, wake=lambda sid, mid: "started", spawn=jobs.append)
++    assert [r["result"] for r in out] == ["dispatched"]
++    jobs[0]()
++    with kept.read_only(foreign) as reader:
++        meta = reader._read_one("SELECT display_metadata FROM messages WHERE id = ?", (row,))["display_metadata"]
++    assert '"started"' in meta
++
++
++def test_launch_profile_store_is_still_the_shared_writable_handle(tmp_path, monkeypatch):
++    launch = SessionDB(tmp_path / "state.db")
++    monkeypatch.setattr(server, "_profile_home", lambda profile: None)
++    monkeypatch.setattr(server, "_get_db", lambda: launch)
++    try:
++        for profile in (None, "default"):
++            with ng._profile_store(profile) as db:
++                assert db is launch and not isinstance(db, NoticeSessionStore)
++    finally:
++        launch.close()
++
++
++def test_plain_handles_are_their_own_writer_and_reader():
++    class Fake:
++        pass
++
++    fake = Fake()
++    with notice_writer(fake) as w:
++        assert w is fake
++    assert reader_of(fake) is fake
++
++
++def _killed_child(path):
++    db = hermes_state_registry.acquire(path)
++    try:
++        db.create_session("parent", source="desktop")
++        db.append_message("parent", role="user", content="audit the repos")
++        db.append_message("parent", role="assistant", content="Delegated.")
++        db.create_session("child", source="subagent", parent_session_id="parent")
++        db.append_message("child", role="user", content="audit repo A")
++        db._conn.execute("UPDATE sessions SET end_reason = 'startup_orphan_reap', ended_at = ? WHERE id = 'child'",
++                         (time.time() - 60,))
++        db._conn.commit()
++    finally:
++        hermes_state_registry.release(db)
++
++
++def test_reap_retry_reads_kept_and_writes_notice_and_refresh_through_the_writer(foreign, writer_borrows):
++    _killed_child(foreign)
++    rn._reset_for_tests()
++    writer_borrows.clear()
++    with ng._profile_store("other") as store:
++        assert rn.retry_pending_killed_notices(store) == ["parent"]
++        assert writer_borrows, "the notice row and the parent's refresh are writes"
++        notices = [m for m in store.get_messages("parent") if m.get("display_kind") == "kanban_notice"]
++        assert len(notices) == 1
++        assert (so.get_outcome("parent", db=store)["reason"]) == "subagent_killed"
++        writer_borrows.clear()
++        assert rn.retry_pending_killed_notices(store) == []  # delivered: a read-only pass, no writer
++    assert writer_borrows == []
++
++
++def test_reap_retry_all_walks_foreign_stores_without_a_writer_when_nothing_is_owed(foreign, monkeypatch):
++    monkeypatch.setattr(hermes_state_registry, "acquire", lambda *a, **k: pytest.fail("writer borrowed"))
++    assert rn.retry_pending_killed_notices_all() == []
+diff --git a/tests/tui_gateway/test_h2_killed_probe.py b/tests/tui_gateway/test_h2_killed_probe.py
+new file mode 100644
+index 0000000000..dd08c70c6b
+--- /dev/null
++++ b/tests/tui_gateway/test_h2_killed_probe.py
+@@ -0,0 +1,103 @@
++"""Empty killed-notice proofs must avoid rescanning unchanged session tables."""
++import sqlite3
++
++from tui_gateway import kanban_unloaded_gates as gates
++
++
++def test_empty_scan_reuses_revision_but_rechecks_writes(tmp_path):
++    conn = sqlite3.connect(tmp_path / 'state.db')
++    conn.execute('CREATE TABLE sessions(parent_session_id TEXT, end_reason TEXT)')
++    conn.commit()
++    calls = []
++    conn.set_trace_callback(calls.append)
++    try:
++        assert gates._killed_empty(conn)
++        assert gates._killed_empty(conn)
++        assert sum('SELECT 1 FROM sessions' in q for q in calls) == 1
++        conn.execute("INSERT INTO sessions VALUES ('parent', 'startup_orphan_reap')")
++        conn.commit()
++        assert not gates._killed_empty(conn)
++        conn.execute('DELETE FROM sessions')
++        conn.commit()
++        assert gates._killed_empty(conn)
++    finally:
++        gates.reset_for_tests()
++        conn.close()
++
++
++def test_external_write_and_transactions_never_reuse_empty(tmp_path):
++    path = tmp_path / 'state.db'
++    conn = sqlite3.connect(path)
++    writer = sqlite3.connect(path)
++    conn.execute('CREATE TABLE sessions(parent_session_id TEXT, end_reason TEXT)')
++    conn.commit()
++    try:
++        assert gates._killed_empty(conn)
++        writer.execute("INSERT INTO sessions VALUES ('parent', 'startup_orphan_reap')")
++        writer.commit()
++        assert not gates._killed_empty(conn)
++        conn.execute('DELETE FROM sessions')
++        assert gates._killed_empty(conn)
++        conn.rollback()
++        assert not gates._killed_empty(conn)
++    finally:
++        gates.reset_for_tests()
++        writer.close()
++        conn.close()
++
++
++def test_reset_clears_empty_proof(tmp_path):
++    conn = sqlite3.connect(tmp_path / 'state.db')
++    conn.execute('CREATE TABLE sessions(parent_session_id TEXT, end_reason TEXT)')
++    conn.commit()
++    calls = []
++    conn.set_trace_callback(calls.append)
++    try:
++        assert gates._killed_empty(conn)
++        gates.reset_for_tests()
++        assert gates._killed_empty(conn)
++        assert sum('SELECT 1 FROM sessions' in q for q in calls) == 2
++    finally:
++        gates.reset_for_tests()
++        conn.close()
++
++
++def _store(path):
++    conn = sqlite3.connect(path)
++    conn.execute('CREATE TABLE sessions(parent_session_id TEXT, end_reason TEXT)')
++    conn.commit()
++    return conn
++
++
++def test_positive_result_is_never_memoized(tmp_path):
++    conn = _store(tmp_path / 'state.db')
++    try:
++        assert gates._killed_empty(conn)
++        conn.execute("INSERT INTO sessions VALUES ('parent', 'startup_orphan_reap')")
++        conn.commit()
++        assert not gates._killed_empty(conn)
++        assert not gates._killed_empty(conn)  # still positive, and no proof retained for it
++        assert conn not in gates._killed_empty_keys
++    finally:
++        gates.reset_for_tests()
++        conn.close()
++
++
++def test_retained_connections_are_bounded_and_not_shared(tmp_path):
++    conns = [_store(tmp_path / f'state{i}.db') for i in range(33)]
++    try:
++        for conn in conns[:32]:
++            assert gates._killed_empty(conn)
++        assert len(gates._killed_empty_keys) == 32
++        assert gates._killed_empty(conns[32])  # bound reached: older proofs dropped
++        assert len(gates._killed_empty_keys) == 1 and conns[32] in gates._killed_empty_keys
++        a, b = conns[0], conns[1]
++        gates.reset_for_tests()
++        assert gates._killed_empty(a)
++        b.execute("INSERT INTO sessions VALUES ('p', 'startup_orphan_reap')")
++        b.commit()
++        assert not gates._killed_empty(b)
++    finally:
++        gates.reset_for_tests()
++        for conn in conns:
++            conn.close()
+diff --git a/tests/tui_gateway/test_h2_profile_census.py b/tests/tui_gateway/test_h2_profile_census.py
+new file mode 100644
+index 0000000000..86304cffb3
+--- /dev/null
++++ b/tests/tui_gateway/test_h2_profile_census.py
+@@ -0,0 +1,82 @@
++"""A census is owned by one explicit host pass, never by elapsed time."""
++import pytest
++
++from tui_gateway import kanban_unloaded_gates as gates
++from tui_gateway import server
++
++
++def test_scoped_census_reuses_success_and_rediscovers_next_pass(monkeypatch, tmp_path):
++    profiles, calls = ['a'], []
++    monkeypatch.setattr(server, '_readopt_wake_profiles',
++                        lambda: calls.append(1) or [None, *profiles])
++    monkeypatch.setattr(server, '_profile_home', lambda p: tmp_path / p)
++    with gates.profile_census():
++        first = gates._profile_paths()
++        first.clear()  # callers cannot mutate the retained inventory
++        assert tmp_path / 'a' / 'state.db' in gates._profile_paths()
++        assert len(calls) == 1
++    profiles[:] = ['b']
++    with gates.profile_census():
++        current = gates._profile_paths()
++        assert tmp_path / 'b' / 'state.db' in current
++        assert tmp_path / 'a' / 'state.db' not in current
++    assert len(calls) == 2
++
++
++def test_nested_scope_and_exception_restore_outer_census(monkeypatch, tmp_path):
++    profiles, calls = ['outer'], []
++    monkeypatch.setattr(server, '_readopt_wake_profiles',
++                        lambda: calls.append(1) or [None, *profiles])
++    monkeypatch.setattr(server, '_profile_home', lambda p: tmp_path / p)
++    with gates.profile_census():
++        outer = gates._profile_paths()
++        profiles[:] = ['inner']
++        with pytest.raises(RuntimeError), gates.profile_census():
++            assert gates._profile_paths() != outer
++            raise RuntimeError('work failed')
++        assert gates._profile_paths() == outer
++    assert gates._profile_paths() != outer
++    assert len(calls) == 3
++
++
++def test_host_pass_owns_census_and_unwinds(monkeypatch, tmp_path):
++    from tui_gateway import kanban_unloaded as unloaded
++    calls = []
++    monkeypatch.setattr(server, '_readopt_wake_profiles', lambda: calls.append(1) or [None, 'a'])
++    monkeypatch.setattr(server, '_profile_home', lambda p: tmp_path / p)
++    monkeypatch.setattr(unloaded, 'live_session_ids', lambda: set())
++    def run(name, fn, *args, **kwargs):
++        gates._profile_paths()
++        if name == 'guarantee_pass':
++            raise ValueError('last pass failure')
++    monkeypatch.setattr(gates, 'run', run)
++    for _ in range(2):
++        with pytest.raises(ValueError, match='last pass failure'):
++            unloaded.host_pass()
++        assert gates._profile_census.get() is None
++    assert len(calls) == 2
++
++
++def test_launch_only_discovery_is_not_retained(monkeypatch):
++    # The existing discovery API suppresses filesystem errors into [None].
++    # Without a success certificate that result must not be retained.
++    calls = []
++    monkeypatch.setattr(server, '_readopt_wake_profiles',
++                        lambda: calls.append(1) or [None])
++    with gates.profile_census():
++        gates._profile_paths()
++        gates._profile_paths()
++    assert len(calls) == 2
++
++
++def test_failed_discovery_is_not_retained_and_probe_stays_fail_open(monkeypatch):
++    calls = []
++    def discover():
++        calls.append(1)
++        raise OSError('unreadable profile inventory')
++    monkeypatch.setattr(server, '_readopt_wake_profiles', discover)
++    with gates.profile_census():
++        assert gates.probe('delegation').pending
++        assert gates.probe('killed_notices').pending
++        assert gates.probe('guarantee_pass').pending
++    assert len(calls) == 3
+diff --git a/tests/tui_gateway/test_kanban_unloaded_gates.py b/tests/tui_gateway/test_kanban_unloaded_gates.py
+new file mode 100644
+index 0000000000..92049824e4
+--- /dev/null
++++ b/tests/tui_gateway/test_kanban_unloaded_gates.py
+@@ -0,0 +1,240 @@
++"""H2/C11: exercise the production host boundary, not delivery return values."""
++import contextlib
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_notify as notify
++from tui_gateway import delegation_unloaded as du
++from tui_gateway import kanban_unloaded as ku
++from tui_gateway import notice_fanout as nf
++from tui_gateway import notice_guarantee as ng
++from tui_gateway import reap_notices as rn
++
++REAL_GUARANTEE = ng.guarantee_pass
++REAL_SWEEP = ku.sweep_once
++
++
++@pytest.fixture
++def host(monkeypatch):
++    live, calls = set(), []
++    monkeypatch.setattr(ku, 'live_session_ids', lambda: set(live))
++    monkeypatch.setattr(ku, '_board_slugs', lambda _: ['default'])
++    monkeypatch.setattr(ku, 'sweep_remote_once', lambda *a, **k: [])
++    monkeypatch.setattr(ku, 'sweep_once', lambda *a, **k: calls.append('notices') or [])
++    monkeypatch.setattr(du, 'sweep_once', lambda **k: [])
++    monkeypatch.setattr(nf, 'card_change_pass', list)
++    monkeypatch.setattr(ng, 'guarantee_pass', list)
++    monkeypatch.setattr(rn, 'retry_pending_killed_notices_all', list)
++    with contextlib.closing(kbc.connect()) as conn:
++        tid = kb.create_task(conn, title='gate test', assignee='worker')
++        notify.add_notify_sub(conn, task_id=tid, platform='tui', chat_id='chat')
++    # Import lazily so RED exercises the original production host_pass.
++    try:
++        from tui_gateway import kanban_unloaded_gates as gates
++    except ImportError:
++        gates = None
++    if gates is not None:
++        gates.reset_for_tests()
++    yield tid, live, calls
++    if gates is not None:
++        gates.reset_for_tests()
++
++
++def test_host_skips_unchanged_structurally_empty_notices(host):
++    _, _, calls = host
++    ku.host_pass()
++    ku.host_pass()
++    assert calls == ['notices']
++
++
++def test_host_rechecks_live_set_even_when_stores_do_not_change(host):
++    _, live, calls = host
++    live.add('chat')
++    ku.host_pass()
++    ku.host_pass()
++    live.clear()
++    ku.host_pass()
++    assert calls == ['notices', 'notices']
++
++
++def test_pending_notice_returning_empty_keeps_busy_retry_hot(host):
++    tid, _, calls = host
++    with contextlib.closing(kbc.connect()) as conn:
++        kb.complete_task(conn, tid, summary='ready')
++    ku.host_pass()
++    ku.host_pass()
++    assert calls == ['notices', 'notices']
++
++
++@pytest.mark.parametrize('busy', [False, True])
++def test_host_deferred_guarantee_skips_only_until_backoff_expires(host, monkeypatch, tmp_path, busy):
++    import json
++    from hermes_state import SessionDB
++    from tui_gateway import kanban_unloaded_gates as gates
++
++    db = SessionDB(tmp_path / 'state.db')
++    try:
++        db.create_session('chat', 'desktop')
++        db.append_message('chat', 'user', 'work')
++        msg = db.append_kanban_notice('chat', 'done', {'notice_id': 'deferred'})
++        closeout = {'state': 'deferred', 'retry_at': 5000}
++        if busy:
++            closeout['busy_attempts'] = 1
++        db._write_rowcount('UPDATE messages SET timestamp=?, display_metadata=? WHERE id=?',
++                          (1000, json.dumps({'closeout': closeout}), msg))
++        monkeypatch.setattr(gates, '_profile_paths', lambda every_store=True: [db.db_path], raising=False)
++        clock, calls = [4000.0], []
++        monkeypatch.setattr(gates.time, 'time', lambda: clock[0])
++        real = REAL_GUARANTEE
++        @contextlib.contextmanager
++        def opener(sid):
++            yield db, sid
++        def guarantee():
++            calls.append(clock[0])
++            return real(now=clock[0], stores=lambda: iter([db]), holders=list, session_db=opener,
++                        wake=lambda *args: 'started', spawn=lambda job: job())
++        monkeypatch.setattr(ng, 'guarantee_pass', guarantee)
++        ku.host_pass()
++        ku.host_pass()
++        before_due = [4000.0, 4000.0] if busy else [4000.0]
++        assert calls == before_due
++        clock[0] = 5000.0
++        ku.host_pass()
++        assert calls == before_due + [5000.0]
++        assert db._read_one('SELECT display_metadata FROM messages WHERE id=?', (msg,))[0].find('started') >= 0
++    finally:
++        db.close()
++
++
++def test_independent_empty_subpasses_skip_but_fanout_stays_hot(host, monkeypatch, tmp_path):
++    import sqlite3
++    from tui_gateway import kanban_unloaded_gates as gates
++    from hermes_cli import kanban_origin
++
++    path = tmp_path / 'empty.db'
++    with contextlib.closing(sqlite3.connect(path)) as conn:
++        conn.execute('CREATE TABLE async_delegations(state TEXT, delivery_state TEXT)')
++        conn.execute('CREATE TABLE sessions(id TEXT, parent_session_id TEXT, end_reason TEXT, ended_at REAL)')
++        conn.commit()
++    monkeypatch.setattr(gates, '_profile_paths', lambda every_store=True: [path])
++    monkeypatch.setattr(kanban_origin, '_hub_db', lambda: None)
++    calls = []
++    monkeypatch.setattr(ku, 'sweep_remote_once', lambda *a, **k: calls.append('remote') or [])
++    monkeypatch.setattr(du, 'sweep_once', lambda: calls.append('delegation') or [])
++    monkeypatch.setattr(rn, 'retry_pending_killed_notices_all', lambda: calls.append('killed') or [])
++    monkeypatch.setattr(nf, 'card_change_pass', lambda: calls.append('fanout') or [])
++    ku.host_pass()
++    ku.host_pass()
++    assert calls == ['remote', 'delegation', 'fanout', 'killed', 'fanout']
++
++
++@pytest.mark.parametrize('kind', ['notices', 'remote_notices', 'delegation', 'card_change_pass',
++                                  'killed_notices', 'guarantee_pass'])
++def test_pending_empty_result_does_not_stamp_success(kind, monkeypatch):
++    from tui_gateway import kanban_unloaded_gates as gates
++    gates.reset_for_tests()
++    monkeypatch.setattr(gates, 'probe', lambda *a, **k: gates.Inputs(pending=True))
++    calls = []
++    for _ in range(2):
++        gates.run(kind, lambda: calls.append(kind) or [], live=set())
++    assert calls == [kind, kind]
++    assert kind not in gates._last
++
++
++@pytest.mark.parametrize('blocked', ['busy', 'live', 'slots'])
++def test_host_delivers_after_deferral_with_no_new_event(host, monkeypatch, tmp_path, blocked):
++    import time
++    from hermes_state import SessionDB
++    from hermes_state_errors import SessionTurnLeaseLostError
++    from tui_gateway.wake_slots import WakeSlots
++
++    tid, live, _ = host
++    db = SessionDB(tmp_path / 'chat.db')
++    db.create_session('chat', 'desktop')
++    db.append_message('chat', 'user', 'work')
++    with contextlib.closing(kbc.connect()) as conn:
++        kb.complete_task(conn, tid, summary='ready')
++    now = time.time() + 60
++    @contextlib.contextmanager
++    def opener(sid):
++        yield db, sid
++    original_append = db.append_kanban_notice
++    busy = [blocked == 'busy']
++    def append(*args):
++        if busy[0]:
++            raise SessionTurnLeaseLostError('busy')
++        return original_append(*args)
++    monkeypatch.setattr(db, 'append_kanban_notice', append)
++    monkeypatch.setenv('HERMES_KANBAN_UNLOADED_WAKE', '0' if blocked != 'slots' else '1')
++    slots = WakeSlots(1)
++    monkeypatch.setattr(ku, '_wake_slots', slots)
++    if blocked == 'slots':
++        assert slots.acquire()
++    if blocked == 'live':
++        live.add('chat')
++    monkeypatch.setattr(ku, 'sweep_once', lambda ids, **kwargs: REAL_SWEEP(
++        ids, now=now, session_db=opener, holders=list, wake=lambda *args: 'refused', spawn=lambda job: job()))
++    try:
++        ku.host_pass()
++        assert db._read_one("SELECT COUNT(*) FROM messages WHERE display_kind='kanban_notice'")[0] == 0
++        busy[0] = False
++        live.clear()
++        if blocked == 'slots':
++            slots.release()
++        ku.host_pass()
++        assert db._read_one("SELECT COUNT(*) FROM messages WHERE display_kind='kanban_notice'")[0] == 1
++    finally:
++        db.close()
++
++
++def test_delegation_quiet_proof_still_runs_300_second_recovery(host, monkeypatch):
++    from tui_gateway import kanban_unloaded_gates as gates
++    monkeypatch.setattr(gates, '_profile_paths', lambda every_store=True: [])
++    clock, calls = [1000.0], []
++    monkeypatch.setattr(gates.time, 'time', lambda: clock[0])
++    monkeypatch.setattr(du, 'sweep_once', lambda: calls.append(clock[0]) or [])
++    ku.host_pass()
++    clock[0] = 1299.0
++    ku.host_pass()
++    assert calls == [1000.0]
++    clock[0] = 1300.0
++    ku.host_pass()
++    assert calls == [1000.0, 1300.0]
++
++
++def test_prework_key_does_not_hide_commit_during_delivery(monkeypatch):
++    from tui_gateway import kanban_unloaded_gates as gates
++    gates.reset_for_tests()
++    revision, calls = [1], []
++    monkeypatch.setattr(gates, 'probe', lambda *a, **k: gates.Inputs((revision[0],), pending=False))
++    def raced():
++        calls.append(revision[0])
++        revision[0] += 1
++        return []
++    gates.run('notices', raced, live=set())
++    gates.run('notices', raced, live=set())
++    assert calls == [1, 2]
++
++
++def test_failed_work_leaves_no_skip_stamp(monkeypatch):
++    from tui_gateway import kanban_unloaded_gates as gates
++    gates.reset_for_tests()
++    monkeypatch.setattr(gates, 'probe', lambda *a, **k: gates.Inputs(('empty',), pending=False))
++    def failed():
++        raise RuntimeError('read failed')
++    with pytest.raises(RuntimeError, match='read failed'):
++        gates.run('notices', failed, live=set())
++    assert 'notices' not in gates._last
++
++
++def test_probe_failure_does_not_skip_host_work(host, monkeypatch):
++    from tui_gateway import kanban_unloaded_gates as gates
++    _, _, calls = host
++    def failed():
++        raise OSError('store unavailable')
++    monkeypatch.setattr(gates, '_notices', failed)
++    ku.host_pass()
++    ku.host_pass()
++    assert calls == ['notices', 'notices']
+diff --git a/tui_gateway/kanban_notice_session_store.py b/tui_gateway/kanban_notice_session_store.py
+index d23be50a27..0496325647 100644
+--- a/tui_gateway/kanban_notice_session_store.py
++++ b/tui_gateway/kanban_notice_session_store.py
+@@ -53,3 +53,23 @@ def session_store(path: Path, sid: str) -> Iterator[tuple[Optional[NoticeSession
+     with read_only(path) as reader:
+         store = NoticeSessionStore(reader, path)
+         yield (store, store.get_compression_tip(sid) or sid) if store.get_session(sid) else (None, None)
++
++
++def reader_of(db: Any) -> Any:
++    """The kept read-only handle behind a :class:`NoticeSessionStore`, else *db* itself. Caches keyed on the reader
++    (``notice_candidates``) must see the same object every pass, not a fresh facade. [daveey]"""
++    return db._reader if isinstance(db, NoticeSessionStore) else db
++
++
++@contextlib.contextmanager
++def profile_store(path: Path) -> Iterator[Optional[NoticeSessionStore]]:
++    """The store of a foreign profile's ``state.db`` at *path* for a notice pass: the kept read-only handle, with
++    no writer open and no schema reconcile per pass; writes go through :func:`notice_writer`. ``None`` when the
++    file does not exist (a pass never creates another profile's store)."""
++    if not path.is_file():
++        yield None
++        return
++    from hermes_state_kept_reader import read_only
++
++    with read_only(path) as reader:
++        yield NoticeSessionStore(reader, path)
+diff --git a/tui_gateway/kanban_unloaded.py b/tui_gateway/kanban_unloaded.py
+index 3b4339b4ea..4061c769ea 100644
+--- a/tui_gateway/kanban_unloaded.py
++++ b/tui_gateway/kanban_unloaded.py
+@@ -683,34 +683,46 @@ def host_pass(grace: float = GRACE_S, *, every_store: bool = True) -> None:
+     """Everything this loop does for the whole install; run by the ``kanban-unloaded`` lease holder only.
+     ``every_store=False`` (kill switch, lease failed open: every process runs this) retries killed-subagent
+     notices in this process's own store only. Each sub-pass is an ``unloaded.<sub>`` pass (loop_accounting)."""
++    from tui_gateway.kanban_unloaded_gates import profile_census
++    with profile_census():
++        _host_pass(grace, every_store=every_store)
++
++
++def _host_pass(grace: float, *, every_store: bool) -> None:
++    from tui_gateway.kanban_unloaded_gates import run
++    live = live_session_ids()
++    try:
++        run("remote_notices", sweep_remote_once, live, grace_s=grace, live=live, every_store=every_store)
++    except Exception:
++        logger.warning("remote kanban unloaded sweep failed", exc_info=True)
+     try:
+-        _la.timed("unloaded.remote_notices", sweep_remote_once, live_session_ids(), grace_s=grace)
+-        _la.timed("unloaded.notices", sweep_once, live_session_ids(), grace_s=grace)
++        live = live_session_ids()  # the remote wake may have loaded a chat in this very pass
++        run("notices", sweep_once, live, grace_s=grace, live=live, every_store=every_store)
+     except Exception:
+         logger.warning("kanban unloaded sweep failed", exc_info=True)
+     # [daveey] Async-delegation results no live poller delivers (parent unloaded, loaded headless, or held by
+     # another backend than the copy's): one turn in the parent, ledger-claimed (delegation_unloaded).
+     try:
+         from tui_gateway.delegation_unloaded import sweep_once as delegation_sweep_once
+-        _la.timed("unloaded.delegation", delegation_sweep_once)
++        run("delegation", delegation_sweep_once, live=live, every_store=every_store)
+     except Exception:
+         logger.warning("async delegation unloaded sweep failed", exc_info=True)
+     # [daveey] Session outcome: refresh chats whose cards moved, then make sure no notice ends a chat unanswered.
+     from tui_gateway.notice_fanout import card_change_pass
+     from tui_gateway.notice_guarantee import guarantee_pass
+-    _la.timed("unloaded.card_change_pass", card_change_pass)
++    run("card_change_pass", card_change_pass, live=live, every_store=every_store)
+     # [daveey] A parent that was mid-turn when the orphan reap killed its subagent refused that notice: re-offer
+     # it before the guarantee pass, so the same tick can wake the parent on it (desktop-ac1b365935). Every
+     # profile store, since one holder now retries for the whole install; without a real lease each process
+     # retries its own store, as before the lease.
+     if every_store:
+         from tui_gateway.reap_notices import retry_pending_killed_notices_all
+-        _la.timed("unloaded.killed_notices", retry_pending_killed_notices_all)
++        run("killed_notices", retry_pending_killed_notices_all, live=live, every_store=every_store)
+     else:
+         from tui_gateway import server
+         from tui_gateway.reap_notices import retry_pending_killed_notices
+-        _la.timed("unloaded.killed_notices", retry_pending_killed_notices, server._get_db())
+-    _la.timed("unloaded.guarantee_pass", guarantee_pass)
++        run("killed_notices", retry_pending_killed_notices, server._get_db(), live=live, every_store=every_store)
++    run("guarantee_pass", guarantee_pass, live=live, every_store=every_store)
+ 
+ 
+ @_la.accounted("unloaded.residual_pass")
+diff --git a/tui_gateway/kanban_unloaded_gates.py b/tui_gateway/kanban_unloaded_gates.py
+new file mode 100644
+index 0000000000..affd588513
+--- /dev/null
++++ b/tui_gateway/kanban_unloaded_gates.py
+@@ -0,0 +1,271 @@
++"""Conservative per-subpass admission for the unloaded host loop (H2/C11).
++
++These are structural *empty proofs*, not delivery-result caches. A returned []
++can mean busy, a lost claim, a swallowed error, or a future retry. Positive and
++unknown inputs always run. Fanout independently compares durable cursors and
++remote acknowledgements; a delivery return value is never a success receipt.
++"""
++from __future__ import annotations
++
++from contextlib import contextmanager
++from contextvars import ContextVar
++from dataclasses import dataclass
++import logging
++import math
++import time
++
++from hermes_cli import loop_accounting as accounting
++
++logger = logging.getLogger(__name__)
++
++
++_profile_census: ContextVar[dict | None] = ContextVar('unloaded_profile_census', default=None)
++
++
++@contextmanager
++def profile_census():
++    """Reuse successful profile inventories only inside this host-pass scope.
++
++    Nested passes get independent inventories; resetting the token restores the
++    outer pass even when a probe/work item raises. No readers or decisions are
++    retained here. Delivery work keeps its existing discovery behavior.
++    """
++    token = _profile_census.set({})
++    try:
++        yield
++    finally:
++        _profile_census.reset(token)
++
++
++@dataclass(frozen=True)
++class Inputs:
++    key: tuple = ()
++    pending: bool = True
++    due: float = float('inf')
++
++
++_last: dict[str, tuple] = {}
++_killed_empty_keys: dict[object, tuple] = {}
++
++
++def reset_for_tests() -> None:
++    _last.clear()
++    _killed_empty_keys.clear()
++
++
++def _killed_empty(conn) -> bool:
++    """Cache only structural emptiness, never a clock or delivery decision."""
++    stamp = _revision(conn)
++    transactional = conn.in_transaction
++    if not transactional and _killed_empty_keys.get(conn) == stamp:
++        return True
++    _killed_empty_keys.pop(conn, None)
++    empty = conn.execute("SELECT 1 FROM sessions WHERE parent_session_id IS NOT NULL "
++                         "AND end_reason='startup_orphan_reap' LIMIT 1").fetchone() is None
++    if empty and not transactional:
++        # Bound retained identities when profiles/readers turn over. Connection
++        # identity also prevents a replacement store inheriting an empty proof.
++        if len(_killed_empty_keys) >= 32:
++            _killed_empty_keys.clear()
++        _killed_empty_keys[conn] = stamp
++    return empty
++
++
++def _revision(conn) -> tuple:
++    return (conn, conn.execute('PRAGMA data_version').fetchone()[0], conn.total_changes)
++
++
++def _notices() -> Inputs:
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_reader_retention import reader
++    from tui_gateway.kanban_unloaded_candidates import _on_connection as subscriptions
++    from tui_gateway.session_notifications import _KANBAN_NOTIFY_KINDS
++
++    # Do not use _board_slugs' error-to-[] fallback as an empty proof.
++    boards = kb.list_boards(include_archived=False)
++    paths = {kb.kanban_db_path(b.get('slug') or kb.DEFAULT_BOARD).resolve() for b in boards}
++    keys = []
++    for path in sorted(paths):
++        with reader(path) as conn:
++            stamp = _revision(conn)  # capture BEFORE reading/working; never bless a later commit
++            if subscriptions(conn, _KANBAN_NOTIFY_KINDS):
++                return Inputs()
++            keys.append((str(path), stamp))
++    return Inputs(tuple(keys), pending=False)
++
++
++def _profile_paths(every_store: bool = True) -> list:
++    from pathlib import Path
++    from hermes_constants import get_hermes_home
++    from tui_gateway import server
++
++    census = _profile_census.get()
++    if census is not None and every_store in census:
++        return list(census[every_store])
++    paths = [Path(get_hermes_home()) / 'state.db']
++    proven = not every_store
++    if every_store:
++        for profile in server._readopt_wake_profiles():
++            if profile:
++                proven = True
++                home = server._profile_home(profile)
++                if home is None:
++                    raise ValueError('unknown profile home')
++                paths.append(Path(home) / 'state.db')
++    result = tuple(sorted(set(p.resolve() for p in paths)))
++    if census is not None and proven:
++        # The legacy discovery helper suppresses filesystem errors into [None].
++        # Do not retain launch-only results without a success certificate.
++        # Publish only after discovery AND all path resolution succeeded.
++        census[every_store] = result
++    return list(result)
++
++
++def _guarantee() -> Inputs:
++    from hermes_state_common import _sql_session_last_active
++    from tui_gateway.kanban_notice_session_store import profile_store, reader_of
++    from tui_gateway.notice_candidates import rows
++    from tui_gateway import notice_guarantee as ng
++    from tui_gateway.notice_fanout import _decode
++
++    keys, due = [], float('inf')
++    now = time.time()
++    sql = ng._CANDIDATES_SQL.format(last_active=_sql_session_last_active('s'))
++    for path in _profile_paths():
++        with profile_store(path) as store:
++            if store is None:
++                # Missing stores cannot own notice rows; appearance changes the key.
++                keys.append((str(path), None))
++                continue
++            db = reader_of(store)
++            stamp = db._read_retrying_ioerr(_revision)
++            for row in rows(db, sql):
++                meta = _decode(row['display_metadata'])
++                closeout = meta.get('closeout')
++                # Held/live and budget-only candidates remain hot: neither an
++                # active-session lease nor an hourly charge requires a DB write.
++                if closeout is None or ng._legacy_busy(meta):
++                    return Inputs()
++                if not isinstance(closeout, dict):
++                    return Inputs()
++                if closeout.get('state') == 'deferred':
++                    # C11: even a timed busy refusal remains a pending deferral.
++                    # Admission can recover without a database revision.
++                    if closeout.get('busy_attempts'):
++                        return Inputs()
++                    retry = closeout.get('retry_at')
++                    timestamp = row['timestamp']
++                    if (not isinstance(retry, (int, float)) or isinstance(retry, bool)
++                            or not isinstance(timestamp, (int, float))
++                            or not math.isfinite(retry) or not math.isfinite(timestamp)):
++                        return Inputs()
++                    deadline = max(retry, timestamp + ng.GRACE_S)
++                    if deadline <= now:
++                        return Inputs()
++                    due = min(due, deadline)
++            keys.append((str(path), stamp))
++    return Inputs(tuple(keys), pending=False, due=due)
++
++
++def _session_empty(kind: str) -> Inputs:
++    from hermes_cli.kanban_reader_retention import reader
++    from tools.async_delegation_idle import ledger_quiet
++
++    keys = []
++    for path in _profile_paths():
++        # Missing delegation ledgers do not require creation; a new file changes
++        # the key. Unreadable/existing-but-incompatible stores fail open.
++        if not path.exists():
++            keys.append((str(path), None))
++            continue
++        with reader(path) as conn:
++            stamp = _revision(conn)
++            if kind == 'delegation':
++                if not ledger_quiet(path):
++                    return Inputs()
++            else:
++                # No age predicate: positive reaped rows stay hot, including busy
++                # parents and previously delivered notices. Their lineage receipt
++                # is deliberately not interpreted by this admission layer.
++                if not _killed_empty(conn):
++                    return Inputs()
++            keys.append((str(path), stamp))
++    from tui_gateway.delegation_unloaded import RECOVER_EVERY_S
++    return Inputs(tuple(keys), pending=False,
++                  due=time.time() + RECOVER_EVERY_S if kind == 'delegation' else float('inf'))
++
++
++def _remote() -> Inputs:
++    from hermes_cli.kanban_origin import _hub_db, gateway_names
++    from hermes_cli.kanban_reader_retention import reader
++    from tui_gateway import kanban_remote_notices as remote
++    from tui_gateway.kanban_replica_observer import fingerprint
++
++    path = _hub_db()
++    if path is None:
++        return Inputs((None,), pending=False)
++    me = gateway_names()[0]
++    stamp = fingerprint(path)
++    if not me or stamp is None:
++        return Inputs()
++    cards, _states = remote._sweep_snapshot(path, me)
++    # Even already delivered terminal cards are conservatively hot. Freshness,
++    # live unloads, ledger releases and _woken running flags are not DB commits.
++    if cards:
++        return Inputs()
++    with remote._woken_lock:
++        if remote._woken:
++            return Inputs()
++    ledger = remote.ledger_path()
++    ledger_stamp = None
++    if ledger.exists():
++        with reader(ledger) as conn:
++            ledger_stamp = _revision(conn)
++            if conn.execute('SELECT 1 FROM notices WHERE delivered=0 LIMIT 1').fetchone():
++                return Inputs()  # preserve holder-death and stale-claim recovery
++    return Inputs((str(path), me, stamp, str(ledger), ledger_stamp), pending=False)
++
++
++def probe(kind: str, *, every_store: bool = True) -> Inputs:
++    """Fail open; never infer pending state from a delivery function's return."""
++    try:
++        if kind == 'card_change_pass':
++            # No cheap, complete fanout key exists: the strict remote projection
++            # depends on alias TTL, owner freshness, ledger, config and last-good
++            # state, and computing it as a probe cost ~4x the pass it would skip
++            # (v9 replay at the production 30 s cadence). Always run.
++            return Inputs()
++        if kind == 'notices':
++            return _notices()
++        if kind == 'guarantee_pass':
++            return _guarantee()
++        if kind == 'remote_notices':
++            return _remote()
++        if kind in ('delegation', 'killed_notices'):
++            return _session_empty(kind)
++    except Exception:  # health: allow BLE001 -- admission failure must retain the recovery path
++        logger.debug('unloaded %s admission unavailable', kind, exc_info=True)
++    return Inputs()
++
++
++def run(kind: str, work, *args, live: set[str], every_store: bool = True, **kwargs):
++    """Each pass owns its key; pending/busy/slots never acquire a skip stamp."""
++    with accounting.pass_('unloaded.' + kind) as count:
++        inputs = probe(kind, every_store=every_store) if every_store else Inputs()
++        key = (frozenset(live), every_store, inputs.key)
++        previous = _last.get(kind)
++        if (not inputs.pending and previous is not None and previous[0] == key
++                and time.time() < min(inputs.due, previous[1])):
++            count.skip()
++            return None
++        # Forget BEFORE work. A raised operation must not leave an earlier stamp.
++        _last.pop(kind, None)
++        count.fallback() if inputs.pending else count.change()
++        result = work(*args, **kwargs)
++        # Only an independent structural proof can be retained. In particular,
++        # swallowed per-row errors on positive inputs cannot stamp success.
++        if not inputs.pending and time.time() < inputs.due:
++            _last[kind] = (key, inputs.due)
++        if isinstance(result, (list, tuple)):
++            count.rows(len(result))
++        return result
+diff --git a/tui_gateway/notice_guarantee.py b/tui_gateway/notice_guarantee.py
+index 3891b7f1ee..a543bf7125 100644
+--- a/tui_gateway/notice_guarantee.py
++++ b/tui_gateway/notice_guarantee.py
+@@ -58,8 +58,10 @@ import logging
+ import os
+ import threading
+ import time
++from pathlib import Path
+ from typing import Any, Callable, Iterator, Optional
+ 
++from tui_gateway.kanban_notice_session_store import notice_writer, reader_of
+ from tui_gateway.wake_slots import WakeSlots
+ 
+ logger = logging.getLogger(__name__)
+@@ -115,6 +117,7 @@ def candidates(db: Any, now: float, only: Optional[set[str]] = None) -> list[dic
+     from tui_gateway.notice_candidates import rows as candidate_rows
+     from tui_gateway.notice_fanout import _decode
+     sql = _CANDIDATES_SQL.format(last_active=_sql_session_last_active("s"))
++    db = reader_of(db)  # the kept handle: a stable cache key (``notice_candidates`` keys on the reader object)
+     if only is not None:
+         ids = sorted(only)
+         if not ids:
+@@ -177,17 +180,19 @@ def _claim(db: Any, cand: dict, now: float) -> bool:
+     meta = {**cand["meta"], "closeout": {"state": "claimed", "at": now, "pid": os.getpid(),
+                                          "attempts": _attempts(cand["meta"]) + 1,
+                                          **({"busy_attempts": busy} if busy else {})}}
+-    return db._write_rowcount("UPDATE messages SET display_metadata = ? WHERE id = ? AND display_metadata IS ?",
+-                              (json.dumps(meta, ensure_ascii=False), cand["msg_id"], cand["raw_meta"])) == 1
++    with notice_writer(db) as wdb:
++        return wdb._write_rowcount("UPDATE messages SET display_metadata = ? WHERE id = ? AND display_metadata IS ?",
++                                   (json.dumps(meta, ensure_ascii=False), cand["msg_id"], cand["raw_meta"])) == 1
+ 
+ 
+ def _stamp(db: Any, msg_id: int, verdict: str, **extra: Any) -> None:
+     from tui_gateway.notice_fanout import _decode
+-    row = db._read_one("SELECT display_metadata FROM messages WHERE id = ?", (msg_id,))
+-    meta = _decode(row["display_metadata"] if row else None)
+-    meta["closeout"] = {**(meta.get("closeout") or {}), **extra, "state": verdict}
+-    db._write_rowcount("UPDATE messages SET display_metadata = ? WHERE id = ?",
+-                       (json.dumps(meta, ensure_ascii=False), msg_id))
++    with notice_writer(db) as wdb:
++        row = wdb._read_one("SELECT display_metadata FROM messages WHERE id = ?", (msg_id,))
++        meta = _decode(row["display_metadata"] if row else None)
++        meta["closeout"] = {**(meta.get("closeout") or {}), **extra, "state": verdict}
++        wdb._write_rowcount("UPDATE messages SET display_metadata = ? WHERE id = ?",
++                            (json.dumps(meta, ensure_ascii=False), msg_id))
+ 
+ 
+ def _this_gateway() -> str:
+@@ -266,10 +271,11 @@ def superseded(cand: dict) -> bool:
+ def _supersede(db: Any, cand: dict, now: float) -> str:
+     """Stamp the notice ``superseded`` (compare-and-swap like a claim) and refresh the chat's outcome."""
+     meta = {**cand["meta"], "closeout": {"state": "superseded", "at": now, "pid": os.getpid()}}
+-    if db._write_rowcount("UPDATE messages SET display_metadata = ? WHERE id = ? AND display_metadata IS ?",
+-                          (json.dumps(meta, ensure_ascii=False), cand["msg_id"], cand["raw_meta"])) != 1:
+-        return "skipped:claimed"
+-    _refresh(db, cand["sid"])
++    with notice_writer(db) as wdb:
++        if wdb._write_rowcount("UPDATE messages SET display_metadata = ? WHERE id = ? AND display_metadata IS ?",
++                               (json.dumps(meta, ensure_ascii=False), cand["msg_id"], cand["raw_meta"])) != 1:
++            return "skipped:claimed"
++        _refresh(wdb, cand["sid"])
+     return "superseded"
+ 
+ 
+@@ -288,7 +294,8 @@ def _spawn(job: Callable[[], Any]) -> None:
+ def _refresh(db: Any, sid: str) -> bool:
+     """Refresh one chat's outcome; True when it refreshed (``refresh_outcomes_quietly`` logs and swallows a failure)."""
+     import hermes_state_outcome as _outcome
+-    return _outcome.refresh_outcomes_quietly([sid], "notice", db=db) > 0
++    with notice_writer(db) as wdb:
++        return _outcome.refresh_outcomes_quietly([sid], "notice", db=wdb) > 0
+ 
+ 
+ def _retry_at(sid: str, now: float) -> float:
+@@ -358,19 +365,20 @@ def _refresh_once(db: Any, cand: dict, branch: str, seen: set) -> str:
+         return "skipped:refreshed"
+     from hermes_state_outcome import get_outcome
+ 
+-    refreshed = _refresh(db, cand["sid"])
+-    outcome = get_outcome(cand["sid"], db=db) if refreshed else None
+-    if branch == "human" and outcome and outcome.get("reason") == "notice_tail":
+-        # No owning decision/wait accounted for this intentionally passive notice.
+-        # Preserve the preceding turn instead of manufacturing an obligation for
+-        # an incidental recipient. Other outcomes need no metadata write.
+-        meta = {**cand["meta"], "outcome_informational": True}
+-        changed = db._write_rowcount(
+-            "UPDATE messages SET display_metadata = ? WHERE id = ? AND display_metadata IS ?",
+-            (json.dumps(meta, ensure_ascii=False), cand["msg_id"], cand["raw_meta"]))
+-        if changed != 1:
+-            return "skipped:changed"
+-        refreshed = _refresh(db, cand["sid"])
++    with notice_writer(db) as wdb:  # one writer borrow for the refresh, its readback and the marker
++        refreshed = _refresh(wdb, cand["sid"])
++        outcome = get_outcome(cand["sid"], db=wdb) if refreshed else None
++        if branch == "human" and outcome and outcome.get("reason") == "notice_tail":
++            # No owning decision/wait accounted for this intentionally passive notice.
++            # Preserve the preceding turn instead of manufacturing an obligation for
++            # an incidental recipient. Other outcomes need no metadata write.
++            meta = {**cand["meta"], "outcome_informational": True}
++            changed = wdb._write_rowcount(
++                "UPDATE messages SET display_metadata = ? WHERE id = ? AND display_metadata IS ?",
++                (json.dumps(meta, ensure_ascii=False), cand["msg_id"], cand["raw_meta"]))
++            if changed != 1:
++                return "skipped:changed"
++            refreshed = _refresh(wdb, cand["sid"])
+     if refreshed:
+         _refreshed.add(key)
+     return f"refreshed:{branch}"
+@@ -423,9 +431,10 @@ def _give_up(db, cand: dict) -> str:
+     Without the stamp the same row was retried and logged on every pass forever (349 warnings in one window). [daveey]"""
+     try:
+         meta = {**cand["meta"], "closeout": {"state": "error", "at": time.time(), "pid": os.getpid()}}
+-        db._write_rowcount("UPDATE messages SET display_metadata = ? WHERE id = ? AND display_metadata IS ?",
+-                           (json.dumps(meta, ensure_ascii=False), cand["msg_id"], cand["raw_meta"]))
+-        _refresh(db, cand["sid"])
++        with notice_writer(db) as wdb:
++            wdb._write_rowcount("UPDATE messages SET display_metadata = ? WHERE id = ? AND display_metadata IS ?",
++                                (json.dumps(meta, ensure_ascii=False), cand["msg_id"], cand["raw_meta"]))
++            _refresh(wdb, cand["sid"])
+     except Exception:
+         logger.debug("notice guarantee: could not stamp %s as error", cand["sid"], exc_info=True)
+     return "error"
+@@ -433,9 +442,18 @@ def _give_up(db, cand: dict) -> str:
+ 
+ @contextlib.contextmanager
+ def _profile_store(profile: Optional[str]) -> Iterator[Any]:
++    """The launch profile's shared writable store; a foreign profile's kept read-only store (no per-pass writer
++    open or schema reconcile: that store belongs to its own gateway). Notice writes and refreshes borrow the
++    shared writer through ``notice_writer``. [daveey]"""
+     from tui_gateway import server
+-    with server._profile_db({"profile": profile} if profile else None, writer=True) as db:
+-        yield db
++    home = server._profile_home(profile) if profile else None
++    if home is None:
++        with server._profile_db(None, writer=True) as db:
++            yield db
++        return
++    from tui_gateway.kanban_notice_session_store import profile_store
++    with profile_store(Path(home) / "state.db") as store:
++        yield store
+ 
+ 
+ def _stores() -> Iterator[Any]:
+diff --git a/tui_gateway/reap_notices.py b/tui_gateway/reap_notices.py
+index 95675f1170..cd66c725e6 100644
+--- a/tui_gateway/reap_notices.py
++++ b/tui_gateway/reap_notices.py
+@@ -21,6 +21,8 @@ import threading
+ import time
+ from typing import Any, Callable, Iterable, Optional
+ 
++from tui_gateway.kanban_notice_session_store import NoticeSessionStore, notice_writer
++
+ logger = logging.getLogger(__name__)
+ 
+ RETRY_WINDOW_S = 24 * 3600.0  # children reaped longer ago than this are not re-offered
+@@ -60,6 +62,17 @@ def killed_subagents(db: Any, swept: Iterable[str]) -> list[dict]:
+             for r in db._read_all(sql, tuple(ids)) if r["last_role"] in ("tool", "user")]
+ 
+ 
++def _delivered(db: Any, tip: str, notice_id: str) -> bool:
++    """True when the parent lineage already holds ``notice_id``, read on the kept read-only store. Only a
++    :class:`NoticeSessionStore` is asked; any other handle answers the same question inside ``record_kanban_notice``."""
++    if not isinstance(db, NoticeSessionStore):
++        return False
++    from hermes_state_common import _NOTICE_BY_ID_SQL
++    from hermes_state_notice_keys import existing_notice
++    with db._read_ctx() as conn:
++        return existing_notice(conn, tip, notice_id, [], _NOTICE_BY_ID_SQL) is not None
++
++
+ def _deliver(db: Any, child: dict) -> tuple[str, Optional[str]]:
+     """Write one child's notice to its parent's live tip. ``("written"|"present"|"busy"|"error", tip)``; never
+     raises. ``busy`` = the parent refused because a turn (or a compression) owns it right now."""
+@@ -71,7 +84,10 @@ def _deliver(db: Any, child: dict) -> tuple[str, Optional[str]]:
+                 f"{child['id']}); its result never came back. Check what it got done and redo or re-delegate the rest.")
+         metadata = {"notice_id": f"subagent-killed:{child['id']}", "display_text": text,
+                     "subagent_killed": child["id"]}
+-        _row, inserted = db.record_kanban_notice(tip, text, metadata)
++        if _delivered(db, tip, metadata["notice_id"]):  # a kept reader answers "already told": no writer borrow
++            return "present", tip
++        with notice_writer(db) as wdb:
++            _row, inserted = wdb.record_kanban_notice(tip, text, metadata)
+     except (SessionTurnLeaseLostError, CompressionSessionClosedError):
+         return "busy", tip
+     except Exception:
+@@ -80,11 +96,19 @@ def _deliver(db: Any, child: dict) -> tuple[str, Optional[str]]:
+     return ("written" if inserted else "present"), tip
+ 
+ 
++def _refresh_parents(db: Any, parents: list[str]) -> None:
++    """Refresh the told parents' outcomes through the writer (no writer borrow when nobody was told)."""
++    if not parents:
++        return
++    from hermes_state_outcome import refresh_outcomes_quietly
++    with notice_writer(db) as wdb:
++        refresh_outcomes_quietly(parents, "reap", db=wdb)
++
++
+ def notify_parents_of_killed_subagents(db: Any, swept: Iterable[str]) -> list[str]:
+     """Append one notice per killed child to its parent's tip and refresh that parent. Returns the parents
+     notified. Never raises. A parent mid-turn refuses the row: one INFO line, and the sweeper's
+     :func:`retry_pending_killed_notices` delivers it once the turn ends."""
+-    from hermes_state_outcome import refresh_outcomes_quietly
+     notified: list[str] = []
+     try:
+         children = killed_subagents(db, swept)
+@@ -98,7 +122,7 @@ def notify_parents_of_killed_subagents(db: Any, swept: Iterable[str]) -> list[st
+                         tip, child["id"])
+         elif result == "written":
+             notified.append(tip)
+-    refresh_outcomes_quietly(notified, "reap", db=db)
++    _refresh_parents(db, notified)
+     if notified:
+         logger.info("orphan reap: told %d parent chat(s) their subagent was stopped mid-work: %s",
+                     len(notified), ", ".join(notified))
+@@ -126,7 +150,6 @@ def retry_pending_killed_notices(db: Any, *, now: Optional[float] = None) -> lis
+     lineage does not have it yet (the inline write found the parent busy). Returns the parents newly told. A
+     still-busy parent is skipped quietly; ``OVERDUE_S`` after the reap it logs one WARNING per child. Already
+     delivered children cost one lineage read (no write lock). Never raises."""
+-    from hermes_state_outcome import refresh_outcomes_quietly
+     if db is None:
+         return []
+     now = time.time() if now is None else now
+@@ -154,5 +177,5 @@ def retry_pending_killed_notices(db: Any, *, now: Optional[float] = None) -> lis
+             _overdue_warned.add(child["id"])
+         logger.warning("killed-subagent notice for child %s to parent %s overdue %dm: %s", child["id"], tip,
+                        age // 60, "parent busy (a turn is running in it)" if result == "busy" else "write failed")
+-    refresh_outcomes_quietly(notified, "reap", db=db)
++    _refresh_parents(db, notified)
+     return notified
+-- 
+2.43.0
+

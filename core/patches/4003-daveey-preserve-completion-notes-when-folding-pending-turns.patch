@@ -1,0 +1,190 @@
+From 4a4d772a43886dae8091ae721ec17c04a54f90a9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 23:09:48 +0000
+Subject: [PATCH] [daveey] preserve completion notes when folding pending turns
+
+Share the claim note decision with pending-fold selection. Requested-stop results in unviewed chats keep their own claim and display card; viewed results and eligible parent resumptions still fold. Scans neither consume failed-result wake allowance nor log claim decisions.
+
+Proof: requested-stop FIFO regression fails on main after #2618 (unviewed text folded), viewed control passes. All 106 tests in eight importing/related gateway suites pass. scripts/check passes 20 checks. Six mutants killed: missing fold guard, scan spending, always-noted exception, viewer condition, missing-live guard and noted-only guard.
+---
+ gateway/session_completion_notes.py      | 24 +++++--
+ gateway/session_fold_pending.py          |  3 +-
+ tests/gateway/test_fold_pending_notes.py | 89 ++++++++++++++++++++++++
+ 3 files changed, 110 insertions(+), 6 deletions(-)
+ create mode 100644 tests/gateway/test_fold_pending_notes.py
+
+diff --git a/gateway/session_completion_notes.py b/gateway/session_completion_notes.py
+index 1be36886d4..5651220aba 100644
+--- a/gateway/session_completion_notes.py
++++ b/gateway/session_completion_notes.py
+@@ -74,7 +74,7 @@ def _closed_by_user(authority, session_id):
+     return bool(row.get('ended_at')) and row.get('end_reason') not in _RECOVERABLE_END_REASONS
+ 
+ 
+-def _wakes_unviewed_parent(authority, session_id, live, descriptor):
++def _wakes_unviewed_parent(authority, session_id, live, descriptor, *, consume=True):
+     """A result the parent carries on from (``resumes_parent``) or a failed async delegation
+     (``wakes_parent``) with no viewer attached: the parent dispatched that work and is waiting on it,
+     so it runs as the parent's turn instead of stalling until a human returns. Not in a chat the user
+@@ -87,16 +87,31 @@ def _wakes_unviewed_parent(authority, session_id, live, descriptor):
+     if not (failed or closed):
+         return True
+     if closed or live.unattended_wakes >= UNATTENDED_WAKE_LIMIT:
+-        if failed:
++        if failed and consume:
+             import logging
+             logging.getLogger(__name__).warning(
+                 'parent %s not woken: failed delegation result kept as a note (%s)', session_id,
+                 'its chat was closed' if closed else f'{UNATTENDED_WAKE_LIMIT} unattended wakes in a row')
+         return False
+-    live.unattended_wakes += 1
++    if consume:
++        live.unattended_wakes += 1
+     return True
+ 
+ 
++def completion_is_note(authority, ref, row, *, consume=False):
++    """Share the claim's note decision with fold scans without spending a wake on a read.
++
++    Only the row's own claim consumes its failed-result wake allowance.
++    """
++    live = authority.sessions.get(ref.session_id)
++    if not noted_completion(row) or live is None:
++        return False
++    descriptor = row['payload']['local_automation_v1']
++    if live.subscribers and _producer(descriptor['identity']) not in _ALWAYS_NOTED:
++        return False
++    return not _wakes_unviewed_parent(authority, ref.session_id, live, descriptor, consume=consume)
++
++
+ async def reopen_for_turn(authority, ref):
+     """A turn (never a note) makes *ref*'s finalized row live again: a local session's receipt tip, or
+     the row of a conversation its chat moved past (gateway/session_detached.py), which the chat's /new
+@@ -121,8 +136,7 @@ async def note_if_unviewed(authority, ref, row):
+         return None
+     from gateway.session_runtime_workers import tracked_write
+     descriptor = row['payload']['local_automation_v1']
+-    if (live is None or (live.subscribers and _producer(descriptor['identity']) not in _ALWAYS_NOTED)
+-            or _wakes_unviewed_parent(authority, ref.session_id, live, descriptor)):
++    if not completion_is_note(authority, ref, row, consume=True):
+         # The claim left a closed row closed for a note; the turn reopens it as any first turn does.
+         await reopen_for_turn(authority, ref)
+         return None
+diff --git a/gateway/session_fold_pending.py b/gateway/session_fold_pending.py
+index 1bd840acbf..4560db0122 100644
+--- a/gateway/session_fold_pending.py
++++ b/gateway/session_fold_pending.py
+@@ -80,13 +80,14 @@ def candidates(authority, ref, head):
+     producer rows (liveness ticks, loop ticks) are passed over; the first human input ends the scan, so a
+     notice never jumps a prompt queued before it."""
+     from gateway.session_notifier_drain import eligible
++    from gateway.session_completion_notes import completion_is_note
+     picked, category = [], _category(head)
+     for row in list_session_admissions(authority.db, session_id=ref.session_id):
+         if row['status'] != 'queued' or row['admission_id'] == head['admission_id']:
+             continue
+         if not _automation(row['payload']):
+             break
+-        if eligible(row) and _foldable(row, category):
++        if eligible(row) and _foldable(row, category) and not completion_is_note(authority, ref, row):
+             picked.append(row)
+     return picked
+ 
+diff --git a/tests/gateway/test_fold_pending_notes.py b/tests/gateway/test_fold_pending_notes.py
+new file mode 100644
+index 0000000000..99c12dce22
+--- /dev/null
++++ b/tests/gateway/test_fold_pending_notes.py
+@@ -0,0 +1,89 @@
++"""Pending folds preserve the completion-note decision and its display card."""
++import asyncio
++
++import pytest
++
++from tests.gateway.test_fold_pending_admissions import _completed, _harness, _idle
++from tests.waiting import async_wait_until
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize('viewed', [False, True])
++async def test_requested_stop_behind_kanban_keeps_unviewed_note(tmp_path, monkeypatch, viewed):
++    from gateway import session_completion_notes
++    gate = asyncio.Event()
++
++    async def behave(n, event):
++        if n == 1:
++            await gate.wait()
++        return _completed()
++
++    h = await _harness(tmp_path, monkeypatch, behave)
++    monkeypatch.setattr(session_completion_notes, '_refresh_outcome_after_note', lambda *args: None)
++    head, result = '[kanban] Task t_next blocked.', 'Delegation stopped on request'
++    try:
++        await h.notice('[kanban] Task t_first completed.', 'kanban-wake')
++        await async_wait_until(lambda: len(h.seen) == 1, timeout=10, what='first turn')
++        await h.notice(head, 'kanban-wake')
++        await h.notice(result, 'async_delegation', {
++            'completion_requested_stop': ['cancelled'], 'display_kind': 'async_delegation_complete',
++            'display_text': 'Stopped delegation',
++        })
++        if not viewed:
++            h.live.subscribers.clear()
++        gate.set()
++        await _idle(h, 2)
++        assert [e.text for e in h.seen][1:] == [f'{head}\n\n{result}' if viewed else head]
++        row = h.rows()[result]
++        assert row['outcome'] == ('steered' if viewed else 'completed')
++        notes = [m for m in h.db.get_messages(h.authority.physical_target(h.ref))
++                 if m.get('display_kind') == 'async_delegation_complete']
++        if viewed:
++            assert notes == []
++        else:
++            assert len(notes) == 1
++            assert notes[0]['content'] == result
++            assert notes[0]['display_metadata']['display_text'] == 'Stopped delegation'
++            assert notes[0]['display_metadata']['completion_note'] == [row['request_id']]
++    finally:
++        await h.close()
++
++
++@pytest.mark.parametrize(('producer', 'viewed', 'flags', 'closed', 'wakes', 'note'), [
++    ('async_delegation', False, {}, False, 0, True),
++    ('async_delegation', True, {}, False, 0, False),
++    ('completion', False, {'resumes_parent': True}, False, 99, False),
++    ('completion', False, {'resumes_parent': True}, True, 0, True),
++    ('async_delegation', False, {'wakes_parent': True}, False, 2, False),
++    ('async_delegation', False, {'wakes_parent': True}, False, 3, True),
++    ('async_delegation', False, {'wakes_parent': True}, True, 0, True),
++    ('cron', True, {}, False, 0, True),
++    ('cron', False, {}, False, 0, True),
++    ('kanban-wake', False, {}, False, 0, False),
++])
++def test_note_decision_scan_is_read_only(monkeypatch, producer, viewed, flags, closed, wakes, note):
++    import json
++    from types import SimpleNamespace
++    from gateway import session_completion_notes as notes
++    from gateway import session_fold_pending as folds
++
++    live = SimpleNamespace(subscribers={'viewer': object()} if viewed else {}, unattended_wakes=wakes)
++    authority = SimpleNamespace(sessions={'s': live}, db=object())
++    ref = SimpleNamespace(session_id='s')
++    identity = json.dumps([producer, 'result'])
++    row = {'principal_id': 'automation:test', 'request_id': identity, 'admission_id': 'result', 'status': 'queued', 'payload': {
++        'text': 'result', 'local_automation_v1': {'identity': identity, **flags}}}
++    head = {'admission_id': 'head', 'payload': {
++        'text': 'head', 'local_automation_v1': {'identity': '["kanban-wake","head"]'}}}
++    monkeypatch.setattr(notes, '_closed_by_user', lambda *args: closed)
++    monkeypatch.setattr(folds, 'list_session_admissions', lambda *args, **kwargs: [row])
++    for _ in range(2):
++        assert notes.completion_is_note(authority, ref, row) is note
++        assert folds.candidates(authority, ref, head) == (
++            [row] if not note and producer in folds.FOLDABLE_PRODUCERS else [])
++        assert live.unattended_wakes == wakes
++    assert notes.completion_is_note(authority, ref, row, consume=True) is note
++    spends = bool(flags.get('wakes_parent')) and not note and not viewed
++    assert live.unattended_wakes == wakes + int(spends)
++    authority.sessions.clear()
++    assert notes.completion_is_note(authority, ref, row) is False
+-- 
+2.43.0
+

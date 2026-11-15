@@ -1,0 +1,498 @@
+From 5fa17f4cfdefb1c441c222b772e59a0ab08f2212 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 23:38:22 +0000
+Subject: [PATCH] [daveey] explain same-label pool backlog before
+ capability-dropping moves
+
+A ready pool card's origin cannot lease its labels, but that does not mean
+no worker can. The prior notice omitted same-label queue evidence and
+recommended re-placement. That prompted removal of hub-write from work
+that later needed it. The local mismatch was mistaken for a fleet fault
+because the notice never connected recent matching worker claims with
+the waiting card's label set.
+
+Add approximate same-label predecessors using canonical dispatch order
+and distinct Board-holder claims in the last 30 minutes. Require exact
+labels, a currently available matching machine and no later move/edit;
+exclude ambiguous claims instead of treating current labels as history.
+Report board-view scope and no pickup-time guarantee. Preserve prior
+board/count/clock fixes and existing held/draining semantics.
+
+Refuse a ready card's capability-dropping move when usable recent claims
+contradict placement failure. Explicit force retains existing gates and
+records the capacity evidence in the moved audit event.
+
+Proof: the unchanged notice/move regression fails twice on base callers
+(missing queue count; capability drop accepted). With the patch, 21 new
+tests and 26 prior board/count/clock tests pass. Broader consumer suites,
+mutation coverage, live-row replay and shipping gates remain to verify.
+Task: t_01a1d6ec84eb29dc; lineage: t_01a1ce30a39b7172.
+---
+ hermes_cli/kanban_label_backlog.py            | 121 ++++++++++++
+ hermes_cli/kanban_move.py                     |   9 +
+ hermes_cli/kanban_parent_unclaimed.py         |  19 +-
+ hermes_cli/kanban_queue_position.py           |  10 +
+ .../test_kanban_label_backlog_wait.py         | 185 ++++++++++++++++++
+ 5 files changed, 342 insertions(+), 2 deletions(-)
+ create mode 100644 hermes_cli/kanban_label_backlog.py
+ create mode 100644 tests/hermes_cli/test_kanban_label_backlog_wait.py
+
+diff --git a/hermes_cli/kanban_label_backlog.py b/hermes_cli/kanban_label_backlog.py
+new file mode 100644
+index 0000000000..ed343cdc0c
+--- /dev/null
++++ b/hermes_cli/kanban_label_backlog.py
+@@ -0,0 +1,121 @@
++"""Read-only same-label queue evidence for pool wait notices and capability-preserving moves. [daveey]
++
++A host-local labels_mismatch is not a fleet placement failure. Report observed same-label claims instead of
++advising a capability-dropping move. Counts cover this board view, not guaranteed fleet capacity or pickup time.
++"""
++from __future__ import annotations
++
++import json
++import logging
++import sqlite3
++import time
++from typing import Any, Iterable, Optional
++
++_log = logging.getLogger(__name__)
++WINDOW_SECONDS = 30 * 60
++REASON = "matching_pool_busy"
++MOVE_REFUSED = "capacity_wait"
++ADVICE = ("do not re-place it or drop its labels merely for this wait; recent same-label claims show the placement "
++          "works. Check current admission holds if it persists; this is not a pickup-time guarantee")
++
++
++def _labels(raw: Any) -> Optional[frozenset[str]]:
++    try:
++        value = json.loads(raw) if isinstance(raw, str) else raw
++    except ValueError:
++        return None
++    if not isinstance(value, list) or not value or not all(isinstance(v, str) for v in value):
++        return None
++    return frozenset(value)
++
++
++def _holder(payload: Any) -> Optional[str]:
++    try:
++        data = json.loads(payload) if isinstance(payload, str) else (payload or {})
++    except ValueError:
++        return None
++    holder = data.get("holder") if isinstance(data, dict) else None
++    return holder if isinstance(holder, str) and holder else None
++
++
++def available(labels: Iterable[str], machines: Any) -> set[str]:
++    """Currently attested matching machines, excluding holds, inactive entries and fresh drains."""
++    from hermes_cli.kanban_queue_position import draining
++    from hermes_cli.kanban_worker_node import effective_labels
++    wanted = set(labels)
++    return {name for name, entry in machines.items() if entry and entry.get("state", "active") == "active"
++            and not entry.get("hold") and draining(entry) is None and wanted <= effective_labels(entry, name)}
++
++
++def read(conn: sqlite3.Connection, task_id: str, labels: Iterable[str], *,
++         machines: Iterable[str] = (), now: Optional[float] = None) -> dict[str, Any]:
++    """Exact-label ready predecessors and distinct recently claimed cards in this board view.
++
++    Use canonical worker dispatch ordering (including donated priority). Counts are approximate: admission may
++    skip a predecessor. Require a Board holder receipt from a currently matching available machine. Current task
++    labels are usable only without a subsequent move/edit/repin; ambiguous history is excluded, not guessed.
++    Unreadable evidence stays unknown and cannot refuse a move.
++    """
++    wanted, holders = frozenset(labels), set(machines)
++    out: dict[str, Any] = {"ahead": 0, "claimed_recent": 0, "claimers": [], "window_s": WINDOW_SECONDS,
++                           "approximate": True, "scope": "board_view", "known": False}
++    if not wanted:
++        return out
++    now = time.time() if now is None else now
++    try:
++        from hermes_cli.kanban_db_dispatch_queries import lane_rows
++        ordered = [row[0] for row in lane_rows(conn, "ready")]
++        if task_id not in ordered:
++            return out
++        before = set(ordered[:ordered.index(task_id)])
++        ahead = sum(row[0] in before and _labels(row[1]) == wanted for row in conn.execute(
++            "SELECT id, runs_on FROM tasks WHERE status = 'ready' AND claim_lock IS NULL"))
++        claimed: set[str] = set()
++        claimers: set[str] = set()
++        for row in conn.execute(
++            "SELECT e.task_id, e.payload, t.runs_on FROM task_events e JOIN tasks t ON t.id = e.task_id "
++            "WHERE e.kind = 'claimed' AND e.created_at >= ? AND e.created_at <= ? AND e.task_id != ? "
++            "AND NOT EXISTS (SELECT 1 FROM task_events m WHERE m.task_id=e.task_id "
++            "AND m.kind IN ('moved', 'edited') AND m.created_at >= e.created_at)",
++            (int(now - WINDOW_SECONDS), int(now), task_id),
++        ):
++            holder = _holder(row[1])
++            if _labels(row[2]) != wanted or holder not in holders:
++                continue
++            claimed.add(row[0])
++            claimers.add(holder)
++    except sqlite3.Error:
++        _log.debug("label backlog unavailable for %s", task_id, exc_info=True)
++        return out
++    out.update(ahead=ahead, claimed_recent=len(claimed), claimers=sorted(claimers), known=True)
++    return out
++
++
++def busy(backlog: Any) -> bool:
++    """Recent usable claims contradict a claim that no worker can lease these labels."""
++    return isinstance(backlog, dict) and backlog.get("known") is True and int(backlog.get("claimed_recent") or 0) > 0
++
++
++def words(backlog: Any) -> str:
++    if not isinstance(backlog, dict) or not backlog.get("known"):
++        return ""
++    ahead, claimed = int(backlog.get("ahead") or 0), int(backlog.get("claimed_recent") or 0)
++    who = ", ".join(backlog.get("claimers") or [])
++    return (f"{ahead} card(s) with matching labels ahead of it (approximate, this board view); matching workers claimed "
++            f"{claimed} such card(s) in the last 30 min" + (f" ({who})" if who and claimed else ""))
++
++
++def move_refusal(conn: sqlite3.Connection, task_id: str, status: Optional[str], previous: Optional[list[str]],
++                 labels: Iterable[str], *, machines: Any, now: Optional[float] = None) -> Optional[str]:
++    """Protect queued capabilities when recent usable claims contradict a placement-fault diagnosis."""
++    if status != "ready" or not previous:
++        return None
++    dropped = sorted(lb for lb in set(previous) - set(labels) if lb.startswith("capability:"))
++    if not dropped:
++        return None
++    backlog = read(conn, task_id, previous, machines=available(previous, machines), now=now)
++    if not busy(backlog):
++        return None
++    return (f"this move drops {', '.join(dropped)}, but recent claims contradict a placement fault: {words(backlog)} "
++            f"carrying {', '.join(previous)}. A machine without {', '.join(dropped)} cannot do work that needs it. "
++            "Pass force only if the card truly does not need the dropped label(s)")
+diff --git a/hermes_cli/kanban_move.py b/hermes_cli/kanban_move.py
+index 0a670723c5..1a5573d288 100644
+--- a/hermes_cli/kanban_move.py
++++ b/hermes_cli/kanban_move.py
+@@ -20,6 +20,9 @@ Guards:
+ * the card's ``requires`` must fit the assignee's profile on at least one matching machine whose profile
+   tools are known or unknown; every match known to lack one refuses ``capability_mismatch``, naming the
+   machine and the missing tool (:mod:`hermes_cli.kanban_runs_on_capabilities`);
++* a queued card's move that drops a ``capability:`` label is refused ``capacity_wait`` unless ``force`` while matching
++  machines claimed cards needing its current labels in the last 30 min (:mod:`hermes_cli.kanban_label_backlog`): the
++  card is queued behind them, and a machine without the label cannot do the work (kanban-b962867f17).
+ * the board must sync to the Board service (``runs_on`` is a Board placement field).
+ * a target must attest ``capability:host_repo`` when required and ``skill:<pin>`` for every pinned skill,
+   in addition to satisfying the assignee's existing profile-tool check.
+@@ -165,12 +168,16 @@ def check(conn: sqlite3.Connection, task_id: str, runs_on: Any, *, force: bool =
+     # A mandatory pin keeps its attestation label through every move (agent, operator, pickup-stall alarm):
+     # [pool:worker] alone would let an old core lease it; machine:<x> needs x to attest it. [daveey]
+     labels = carry(labels, dict(row), me=me)
++    from hermes_cli import kanban_label_backlog as klb
+     if machines is None:
+         reg = wn.registry()
+         if reg is None:
+             raise MoveRefused("registry_unavailable", "the Board machine registry is unreachable; try again")
+         machines = reg.get("machines") or {}
+     pool: Mapping[str, Mapping[str, Any]] = machines or {}
++    capacity_wait = klb.move_refusal(conn, task_id, row["status"], wn._parse(row["runs_on"]), labels, machines=pool)
++    if capacity_wait and not force:
++        raise MoveRefused(klb.MOVE_REFUSED, capacity_wait)
+     exclude_me = row["status"] == "running"
+     matches = matching_machines(labels, pool, me=me, exclude_me=exclude_me)
+     if not matches:
+@@ -210,6 +217,8 @@ def check(conn: sqlite3.Connection, task_id: str, runs_on: Any, *, force: bool =
+     if leaves_here(me, matches):  # git reads: check() runs before every caller's write transaction
+         if state := unpushed_here(conn, task_id, row["workspace_path"], me=me, force=force, checkpoint=checkpoint):
+             host = {**host, "left_unpushed_state": state}
++    if capacity_wait:  # forced past the capacity-wait guard: the audit keeps why it was a queue, not a fault
++        host = {**host, "capacity_wait_overridden": capacity_wait[:500]}
+     return {"runs_on": labels, "previous": wn._parse(row["runs_on"]), "matches": matches, "move_no": len(past) + 1,
+             "forced": bool(back and force), "me": me, "host": host}
+ 
+diff --git a/hermes_cli/kanban_parent_unclaimed.py b/hermes_cli/kanban_parent_unclaimed.py
+index c894b75d54..a23ee769ca 100644
+--- a/hermes_cli/kanban_parent_unclaimed.py
++++ b/hermes_cli/kanban_parent_unclaimed.py
+@@ -82,6 +82,13 @@ def _pool_sentence(place: dict[str, Any], now: Optional[float] = None) -> str:
+     return pool_words(place, advice=False)
+ 
+ 
++def _backlog(place: dict[str, Any]) -> dict[str, Any]:
++    """``{"label_backlog": ...}`` for a machine-lane place whose matching machines are busy with same-label cards
++    (``kanban_label_backlog``), else ``{}``."""
++    from hermes_cli import kanban_label_backlog as klb
++    return {"label_backlog": place["backlog"]} if klb.words(place.get("backlog")) else {}
++
++
+ def _pool_suffix(payload: dict[str, Any]) -> str:
+     """``" <pool hint>."`` for a notice payload that carries one, else ``""``."""
+     hint = str(payload.get("pool_hint") or "").strip()
+@@ -101,7 +108,11 @@ def _observation(payload: dict[str, Any]) -> str:
+ 
+ def _options(parent_id: str, evidence: Optional[dict[str, Any]] = None,
+              payload: Optional[dict[str, Any]] = None, now: Optional[float] = None) -> str:
+-    """Capacity advice, or the recorded skip's (or the unrecorded skip's) advice without priority changes."""
++    """Capacity advice, or the recorded skip's (or the unrecorded skip's) advice without priority changes. A card
++    whose matching machines claimed same-label cards during the wait is queued, so no re-place is offered."""
++    from hermes_cli import kanban_label_backlog as klb
++    if klb.busy((payload or {}).get("label_backlog")):
++        return f"Not a placement problem, do not re-place: {klb.ADVICE}"
+     from hermes_cli.kanban_dispatch_skip import notice_advice
+     from hermes_cli.kanban_priority import advice
+     return f"{NO_FIX}: " + (notice_advice(payload or {}, now=now) or advice(parent_id, evidence))
+@@ -137,7 +148,7 @@ def ready_hint(conn, task, *, now: Optional[float] = None) -> Optional[str]:
+         return f"Ready {_minutes(waited)} min, unclaimed; {kqp.describe(place)}. {checkpoint}".rstrip()
+     from hermes_cli.kanban_dispatch_skip import notice_fields
+     pool = _pool_sentence(place, now)
+-    fields = {**notice_fields(place, waited), **({"pool_hint": pool} if pool else {})}  # _options defers to it
++    fields = {**notice_fields(place, waited), **({"pool_hint": pool} if pool else {}), **_backlog(place)}
+     return (f"Ready {_minutes(waited)} min, unclaimed; {_queue_words(place, now)}. " + (f"{pool}. " if pool else "")
+             + checkpoint + _options(task.id, lane_evidence(conn, task.id), fields, now) + ".")
+ 
+@@ -211,11 +222,14 @@ def post_notice(conn, task_id: str, waiting_on: str, *, wait_key: Any, waited_se
+     from hermes_cli import kanban_db as kb
+     from hermes_cli import kanban_host_counts as khc
+     from hermes_cli import kanban_queue_position as kqp
++    from hermes_cli import kanban_label_backlog as klb
+     if _already_posted(conn, task_id, waiting_on, wait_key, kind):
+         return False  # before the queue place: every tick asks again for each long-ready card [daveey]
+     place = _place(conn, waiting_on)
++    busy = klb.busy(place.get("backlog"))
+     observed = {"board": place.get("board") or khc.board_of(conn), "observed_at": place.get("observed_at") or int(time.time()),
+                 "admission": ({"reason": "core_update_hold", "status": "held"} if (extra or {}).get("core_update_hold")
++                              else {"reason": klb.REASON, "status": "queued"} if busy
+                               else {"reason": None, "status": "unknown"})}
+     guard = place.get("reason") if place.get("lane") == "respawn_guard" else None
+     pool_hint = "" if guard else _pool_sentence(place, observed["observed_at"])  # outside the queue clause (#1821)
+@@ -235,6 +249,7 @@ def post_notice(conn, task_id: str, waiting_on: str, *, wait_key: Any, waited_se
+             **observed, **checkpoint,
+             **({"pool_hint": pool_hint} if pool_hint else {}),
+             **(extra or {}),
++            **_backlog(place),
+             "respawn_guard": guard,
+             "priority_evidence": lane_evidence(conn, waiting_on),
+             **({} if guard else notice_fields(place, ready_seconds)),
+diff --git a/hermes_cli/kanban_queue_position.py b/hermes_cli/kanban_queue_position.py
+index 5b976dd664..57b846adcf 100644
+--- a/hermes_cli/kanban_queue_position.py
++++ b/hermes_cli/kanban_queue_position.py
+@@ -122,6 +122,10 @@ def placement(conn: sqlite3.Connection, task_id: str) -> Optional[dict[str, Any]
+             until = [d["until_ms"] for d in drains.values() if "until_ms" in d]
+             if until:
+                 place["drain_until_ms"] = max(until)
++        from hermes_cli import kanban_label_backlog as klb
++        backlog = klb.read(conn, task_id, labels, machines=klb.available(labels, machines))
++        if klb.words(backlog):
++            place["backlog"] = backlog
+         return place
+     every = set().union(*carried.values())
+     return {"lane": "unplaceable", "runs_on": labels, "missing": [lb for lb in labels if lb not in every],
+@@ -263,6 +267,9 @@ def headline(place: dict[str, Any]) -> str:
+     words = f"waiting for {machines} (runs_on {runs_on}); this machine cannot lease it"
+     if place.get("draining"):
+         words += f" ({', '.join(place['draining'])} draining for a core update)"
++    from hermes_cli import kanban_label_backlog as klb
++    if backlog := klb.words(place.get("backlog")):
++        words += f"; {backlog}"
+     return words
+ 
+ 
+@@ -315,6 +322,9 @@ def _describe_lane(place: Optional[dict[str, Any]]) -> Optional[str]:
+                 "re-place it (`hermes kanban move <id> --runs-on <label> --reason ...`); do not re-create it, "
+                 "clear the drain, or run its work outside the dispatcher")
+     if lane == "machine":
++        from hermes_cli import kanban_label_backlog as klb
++        if klb.busy(place.get("backlog")):
++            return headline(place) + ". Queued behind same-label cards: " + klb.ADVICE
+         return headline(place) + ". " + _NOT_STUCK
+     if lane == "worker_pool":
+         return f"waiting for a pool worker ({place.get('reason') or 'no reason recorded'}). " + _NOT_STUCK
+diff --git a/tests/hermes_cli/test_kanban_label_backlog_wait.py b/tests/hermes_cli/test_kanban_label_backlog_wait.py
+new file mode 100644
+index 0000000000..636d5c7f85
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_label_backlog_wait.py
+@@ -0,0 +1,185 @@
++"""A busy same-label pool must not be diagnosed as a placement fault. [daveey]
++
++Fixture: an origin that cannot lease the card, two matching pool workers, two ready predecessors,
++and three distinct same-label cards claimed by those workers during the last 30 minutes.
++"""
++from __future__ import annotations
++
++import json
++import time
++
++import pytest
++
++from hermes_cli import kanban_chat_wait as kcw
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_db_sync as sync
++from hermes_cli import kanban_move as km
++from hermes_cli import kanban_parent_unclaimed as kpu
++from hermes_cli import kanban_queue_position as kqp
++from hermes_cli import kanban_worker_node as wn
++from tests.hermes_cli._placement_helpers import seen_now
++from tests.hermes_cli.kanban_sync_fake_board import FakeService
++from tests.hermes_cli.test_kanban_worker_node import HUB, MACHINES, Gateway
++
++LABELS = ["capability:hub-write", "pool:worker"]
++POOL = {
++    HUB: MACHINES[HUB],
++    **{name: {"name": name, "state": "active", "labels": list(LABELS), "pinned_only": False, "max_card_runs": 4,
++              "hold": False, "pickup": "all"} for name in ("worker-3", "worker-4")},
++}
++
++
++@pytest.fixture
++def hub(tmp_path, monkeypatch):
++    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: None)
++    sync.consume_dispatcher_wake()
++    gw = Gateway(tmp_path, HUB, FakeService(lease_runs=True, machines=POOL), monkeypatch, pickup=False)
++    gw.enter()
++    wn.set_registry_fetch(lambda: {"me": HUB, "machines": seen_now(POOL.values())})
++    yield gw
++    gw.conn.close()
++    sync.set_lease_client(None)
++    wn.set_registry_fetch(None)
++
++
++def _card(conn, title, created_at):
++    tid = kb.create_task(conn, title=title, assignee="default", runs_on=list(LABELS))
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET created_at = ? WHERE id = ?", (created_at, tid))
++    return tid
++
++
++def _seed(conn, *, claims: int):
++    now = int(time.time())
++    for i in range(2):
++        _card(conn, f"older {i}", now - 3600 + i)  # ready, same labels, older: ahead of the fix card
++    for i in range(claims):
++        tid = _card(conn, f"claimed {i}", now - 4000 + i)
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (tid,))
++            kb._append_event(conn, tid, "claimed", {"holder": f"worker-{3 + i % 2}", "run_uid": f"r{i}"})
++    return _card(conn, "BB CI fix", now - 1900)
++
++
++def _notice(conn, tid):
++    assert kpu.post_notice(conn, tid, tid, wait_key="ready@1", waited_seconds=1900, ready_seconds=1900,
++                           parent_title="BB CI fix", kind=kcw.NOTICE_KIND)
++    (payload,) = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = ?",
++                              (tid, kcw.NOTICE_KIND)).fetchone()
++    payload = json.loads(payload)
++    return payload, kcw.notice_text(payload)
++
++
++def test_busy_pool_notice_reports_queue_place_and_does_not_advise_re_placement(hub):
++    tid = _seed(hub.conn, claims=3)
++    payload, text = _notice(hub.conn, tid)
++    assert "2 card(s) with matching labels ahead of it" in text, text
++    assert "matching workers claimed 3 such card(s) in the last 30 min (worker-3, worker-4)" in text, text
++    assert "Not a placement problem, do not re-place" in text, text
++    assert "re-place on a capable gateway" not in text and "admission reason unknown" not in text, text
++    assert payload["admission"] == {"reason": "matching_pool_busy", "status": "queued"}, payload
++    assert payload["label_backlog"]["claimed_recent"] == 3 and payload["label_backlog"]["ahead"] == 2, payload
++    note = kqp.describe(kqp.placement(hub.conn, tid)) or ""
++    assert "claimed 3 such card(s)" in note and "do not re-place it or drop its labels" in note, note
++
++
++def test_no_recent_same_label_claims_keeps_the_capacity_advice(hub):
++    tid = _seed(hub.conn, claims=0)
++    payload, text = _notice(hub.conn, tid)
++    assert "2 card(s) with matching labels ahead of it" in text, text  # the queue place is still reported
++    assert "Not a placement problem" not in text and "re-place on a capable gateway" in text, text
++    assert payload["admission"]["reason"] is None, payload
++
++
++def test_move_dropping_a_capability_while_matching_workers_claim_same_label_cards_is_refused(hub):
++    tid = _seed(hub.conn, claims=3)
++    res = km.move_queued(hub.conn, tid, runs_on=["pool:worker"], machines=POOL, me=HUB,
++                         reason="labels_mismatch for 30 min: no worker advertises capability:hub-write")
++    assert res["ok"] is False and res["reason_code"] == "capacity_wait", res
++    assert "drops capability:hub-write" in res["error"] and "claimed 3 such card(s)" in res["error"], res
++    assert json.loads(hub.conn.execute("SELECT runs_on FROM tasks WHERE id = ?", (tid,)).fetchone()[0]) == LABELS
++    forced = km.move_queued(hub.conn, tid, runs_on=["pool:worker"], machines=POOL, me=HUB, force=True,
++                            reason="the card needs no hub write")
++    assert forced["ok"], forced
++    (payload,) = hub.conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = 'moved'",
++                                  (tid,)).fetchone()
++    assert "claimed 3 such card(s)" in json.loads(payload)["capacity_wait_overridden"], payload
++
++
++def test_move_dropping_a_capability_with_no_same_label_claims_is_allowed(hub):
++    tid = _seed(hub.conn, claims=0)
++    res = km.move_queued(hub.conn, tid, runs_on=["pool:worker"], machines=POOL, me=HUB, reason="no worker has it")
++    assert res["ok"], res
++
++
++@pytest.mark.parametrize("mutation", ["old", "future", "wrong_holder", "local_claim", "extra_label", "moved", "edited"])
++def test_ambiguous_or_nonmatching_claim_is_not_capacity_evidence(hub, mutation):
++    from hermes_cli import kanban_label_backlog as klb
++    tid = _seed(hub.conn, claims=1)
++    claimed = hub.conn.execute("SELECT id FROM tasks WHERE title = 'claimed 0'").fetchone()[0]
++    with kb.write_txn(hub.conn):
++        if mutation in ("old", "future"):
++            at = int(time.time()) + (60 if mutation == "future" else -1900)
++            hub.conn.execute("UPDATE task_events SET created_at=? WHERE task_id=? AND kind='claimed'", (at, claimed))
++        elif mutation in ("wrong_holder", "local_claim"):
++            payload = {"holder": "elsewhere"} if mutation == "wrong_holder" else {"lock": "worker-3:123"}
++            hub.conn.execute("UPDATE task_events SET payload=? WHERE task_id=? AND kind='claimed'", (json.dumps(payload), claimed))
++        elif mutation == "extra_label":
++            hub.conn.execute("UPDATE tasks SET runs_on=? WHERE id=?", (json.dumps([*LABELS, "machine:worker-3"]), claimed))
++        else:
++            kb._append_event(hub.conn, claimed, mutation, {})
++    backlog = klb.read(hub.conn, tid, LABELS, machines={"worker-3", "worker-4"})
++    assert backlog["known"] and backlog["claimed_recent"] == 0
++    assert not klb.busy(backlog)
++    assert klb.move_refusal(hub.conn, tid, "ready", LABELS, ["pool:worker"], machines=POOL) is None
++
++
++@pytest.mark.parametrize("state", ["held", "draining", "inactive", "wrong_labels"])
++def test_unavailable_matching_workers_do_not_override_current_holds(hub, state):
++    from hermes_cli import kanban_label_backlog as klb
++    tid = _seed(hub.conn, claims=1)
++    pool = {name: dict(entry) for name, entry in POOL.items()}
++    for name in ("worker-3", "worker-4"):
++        if state == "held":
++            pool[name]["hold"] = True
++        elif state == "draining":
++            pool[name]["metrics"] = {"drain_active": 1, "at": time.time() * 1000}
++        elif state == "inactive":
++            pool[name]["state"] = "inactive"
++        else:
++            pool[name]["labels"] = ["pool:worker"]
++    assert not klb.available(LABELS, pool)
++    assert klb.move_refusal(hub.conn, tid, "ready", LABELS, ["pool:worker"], machines=pool) is None
++    wn.set_registry_fetch(lambda: {"me": HUB, "machines": seen_now(pool.values())})
++    payload, text = _notice(hub.conn, tid)
++    assert payload["admission"]["reason"] is None
++    assert "Not a placement problem" not in text
++
++
++def test_claim_duplicates_count_once_and_priority_donation_orders_queue(hub):
++    from hermes_cli import kanban_label_backlog as klb
++    tid = _seed(hub.conn, claims=1)
++    claimed = hub.conn.execute("SELECT id FROM tasks WHERE title='claimed 0'").fetchone()[0]
++    later = _card(hub.conn, "later but urgent", int(time.time()))
++    waiter = _card(hub.conn, "urgent waiter", int(time.time()))
++    with kb.write_txn(hub.conn):
++        kb._append_event(hub.conn, claimed, "claimed", {"holder": "worker-3"})
++        hub.conn.execute("UPDATE tasks SET priority=100, status='todo' WHERE id=?", (waiter,))
++        hub.conn.execute("INSERT INTO task_links(parent_id, child_id) VALUES (?, ?)", (later, waiter))
++    backlog = klb.read(hub.conn, tid, LABELS, machines={"worker-3"})
++    assert backlog["ahead"] == 3 and backlog["claimed_recent"] == 1
++    assert "approximate, this board view" in klb.words(backlog)
++
++
++@pytest.mark.parametrize("status,previous,new", [
++    ("running", LABELS, ["pool:worker"]),
++    ("blocked", LABELS, ["pool:worker"]),
++    ("ready", None, ["pool:worker"]),
++    ("ready", LABELS, LABELS),
++    ("ready", LABELS, ["capability:hub-write"]),
++])
++def test_move_protection_only_for_ready_capability_drops(hub, status, previous, new):
++    from hermes_cli import kanban_label_backlog as klb
++    tid = _seed(hub.conn, claims=1)
++    assert klb.move_refusal(hub.conn, tid, status, previous, new, machines=POOL) is None
+-- 
+2.43.0
+

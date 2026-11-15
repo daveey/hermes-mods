@@ -791,9 +791,32 @@ def _norm_text(s) -> str:
     return re.sub(r"\s+", " ", str(s or "").lower()).strip()
 
 
+def _subject_stem(w: str) -> str:
+    """_stem, plus a doubled-consonant agent noun shares its verb's stem: "wrappers"/"wrapper" -> "wrapp" like
+    "wrapped" (plugin-488520f036 missed its owner card on that one word). Never used for fingerprints."""
+    s = _stem(w)
+    if len(s) > 5 and s.endswith("er") and s[-3] == s[-4] and s[-3] not in "aeiou":
+        return s[:-2]
+    return s
+
+
 def _subject_words(text) -> set:
-    return {_stem(w) for w in re.findall(r"[a-z][a-z0-9_]+", str(text or "").lower())
+    return {_subject_stem(w) for w in re.findall(r"[a-z][a-z0-9_]+", str(text or "").lower())
             if len(w) >= 4 and w not in _RELEVANCE_STOP and w not in _STOP and w not in _SUBJECT_GENERIC}
+
+
+def _clause_named(head: set, symptom) -> bool:
+    """A compound symptom ("merge guard fails open on wrapped commands; skipped skill and checklist step admitted")
+    fuses separate defects, so no fix card shares a third of ALL its words. A title naming at least max(3, half) of
+    one clause's distinctive words names the defect (plugin-488520f036)."""
+    clauses = [c for c in re.split(r";\s+", str(symptom or "")) if c.strip()]
+    if len(clauses) < 2:
+        return False
+    for clause in clauses:
+        want = _subject_words(clause)
+        if len(want) >= 3 and len(want & head) >= max(3, -(-len(want) // 2)):
+            return True
+    return False
 
 
 def card_names_defect(card: dict, d: dict, fp: Optional[str] = None) -> bool:
@@ -819,7 +842,9 @@ def card_names_defect(card: dict, d: dict, fp: Optional[str] = None) -> bool:
     # Word overlap counts against the title (and key) only: a 4000-char body shares a couple of words with almost
     # any symptom ("reported", "tests"), which once tied 4 unrelated defects to one user-steps card.
     head = _subject_words(" ".join(str(card.get(k) or "") for k in ("title", "idempotency_key")))
-    return len(want & head) >= max(2, -(-len(want) // 3))
+    if len(want & head) >= max(2, -(-len(want) // 3)):
+        return True
+    return _clause_named(head, d.get("error") if d.get("kind") == "repeat_failure" else d.get("symptom"))
 
 
 _SESSION_ID = re.compile(r"\b\d{8}_\d{6}_[0-9a-f]{6}\b")

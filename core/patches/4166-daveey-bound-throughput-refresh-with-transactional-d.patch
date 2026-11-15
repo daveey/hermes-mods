@@ -1,0 +1,1890 @@
+From 2dc2a453b63f7b013f0c60d9f99c9d991558c70f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 04:41:58 +0000
+Subject: [PATCH] [daveey] bound throughput refresh with transactional
+ dirty-session history
+
+---
+ hermes_cli/machine_throughput_incremental.py  | 154 +++++++
+ hermes_cli/machine_throughput_metrics.py      |  66 ++-
+ hermes_cli/session_throughput_repair.py       |  48 +++
+ hermes_cli/session_throughput_revision.py     | 386 ++++++++++++++++++
+ hermes_state_schema.py                        |   6 +-
+ .../test_machine_throughput_incremental.py    |  61 +++
+ .../hermes_cli/test_throughput_boundaries.py  |  53 +++
+ .../test_throughput_differential.py           | 228 +++++++++++
+ .../hermes_cli/test_throughput_integration.py |  93 +++++
+ .../test_throughput_protocol_guards.py        | 228 +++++++++++
+ tests/hermes_cli/test_throughput_recovery.py  | 199 +++++++++
+ tests/hermes_cli/test_throughput_revision.py  | 202 +++++++++
+ 12 files changed, 1711 insertions(+), 13 deletions(-)
+ create mode 100644 hermes_cli/machine_throughput_incremental.py
+ create mode 100644 hermes_cli/session_throughput_repair.py
+ create mode 100644 hermes_cli/session_throughput_revision.py
+ create mode 100644 tests/hermes_cli/test_machine_throughput_incremental.py
+ create mode 100644 tests/hermes_cli/test_throughput_boundaries.py
+ create mode 100644 tests/hermes_cli/test_throughput_differential.py
+ create mode 100644 tests/hermes_cli/test_throughput_integration.py
+ create mode 100644 tests/hermes_cli/test_throughput_protocol_guards.py
+ create mode 100644 tests/hermes_cli/test_throughput_recovery.py
+ create mode 100644 tests/hermes_cli/test_throughput_revision.py
+
+diff --git a/hermes_cli/machine_throughput_incremental.py b/hermes_cli/machine_throughput_incremental.py
+new file mode 100644
+index 0000000000..a08901b58c
+--- /dev/null
++++ b/hermes_cli/machine_throughput_incremental.py
+@@ -0,0 +1,154 @@
++"""Bounded, snapshot-local throughput contributions; unsupported data uses SQL.
++
++No connections survive a read. The caller serializes this memo and drops a path
++on any failure, including an interrupted in-place delta application.
++"""
++from __future__ import annotations
++
++from dataclasses import dataclass, field
++
++from hermes_cli import session_throughput_revision as revision
++
++MAX_IDS = 250_000
++MAX_MODELS = 4096
++MAX_ROWS = 1_000_000
++MAX_PATHS = 32
++INT64_MAX = (1 << 63) - 1
++_USAGE = ("SELECT session_id, model, input_tokens + output_tokens, "
++          "cache_read_tokens + cache_write_tokens FROM session_model_usage")
++_SESSIONS = "SELECT id, ended_at IS NOT NULL FROM sessions"
++
++
++class FullOnly(ValueError):
++    """The original SQL is required to preserve this snapshot's semantics."""
++
++
++@dataclass
++class Contribution:
++    started: int = 0
++    ended: int = 0
++    groups: dict = field(default_factory=dict)
++
++
++@dataclass
++class Memo:
++    identity: tuple
++    stamp: tuple
++    ids: dict = field(default_factory=dict)
++    groups: dict = field(default_factory=dict)
++    started: int = 0
++    ended: int = 0
++    rows: int = 0
++
++    def apply(self, item: Contribution, sign: int) -> None:
++        self.started += sign * item.started
++        self.ended += sign * item.ended
++        for model, values in item.groups.items():
++            target = self.groups.setdefault(model, [0, 0, 0])
++            for axis in range(3):
++                target[axis] += sign * values[axis]
++            self.rows += sign * values[2]
++            if target[2] == 0:
++                del self.groups[model]
++        if len(self.groups) > MAX_MODELS or self.rows > MAX_ROWS:
++            raise FullOnly("memory bound")
++
++    def result(self):
++        # Validate after all changed IDs are replaced: intermediate sums need not
++        # describe a real database snapshot (a transfer may subtract later).
++        if any(v[0] > INT64_MAX or v[1] > INT64_MAX for v in self.groups.values()):
++            raise FullOnly("SQL sum overflow")
++        return ([(m, v[0], v[1]) for m, v in self.groups.items()], self.started, self.ended)
++
++
++_memos: dict[str, Memo] = {}
++
++
++def reset() -> None:
++    _memos.clear()
++
++
++def prune(paths) -> None:
++    keep = {str(p.resolve()) for p in paths}
++    for key in list(_memos):
++        if key not in keep:
++            del _memos[key]
++
++
++def forget(key: str) -> None:
++    _memos.pop(key, None)
++
++
++def _item(ids, key):
++    if not isinstance(key, str):
++        raise FullOnly("non-text session key")
++    if key not in ids:
++        if len(ids) >= MAX_IDS:
++            raise FullOnly("ID bound")
++        ids[key] = Contribution()
++    return ids[key]
++
++
++def _load(conn, key=None):
++    ids = {}
++    args = () if key is None else (key,)
++    suffix = "" if key is None else " WHERE id = ?"
++    for sid, ended in conn.execute(_SESSIONS + suffix, args):
++        item = _item(ids, sid)
++        item.started += 1
++        item.ended += ended
++    suffix = "" if key is None else " WHERE session_id = ?"
++    rows = 0
++    models = set()
++    for sid, model, io, cache in conn.execute(_USAGE + suffix, args):
++        rows += 1
++        if rows > MAX_ROWS or not isinstance(model, (str, bytes)):
++            raise FullOnly("usage shape or bound")
++        models.add(model)
++        if len(models) > MAX_MODELS:
++            raise FullOnly("model bound")
++        for value in (io, cache):
++            if value is not None and (type(value) is not int or value < 0):
++                raise FullOnly("nonintegral or negative SQL pair")
++        target = _item(ids, sid).groups.setdefault(model, [0, 0, 0])
++        target[0] += io or 0
++        target[1] += cache or 0
++        target[2] += 1
++    return ids
++
++
++def read(conn, key: str, identity: tuple):
++    """Return raw groups/counts or None for a full SQL read, in caller's transaction."""
++    stamp = revision.read_stamp(conn)
++    old = _memos.pop(key, None)  # publish only after every operation succeeds
++    if stamp is None:
++        return None
++    try:
++        reusable = (old is not None and old.identity == identity
++                    and old.stamp[:2] == stamp[:2]
++                    and stamp[4] <= old.stamp[2] <= stamp[2]
++                    and revision.anchor_matches(conn, old.stamp[2], old.stamp[3]))
++        if reusable and old is not None:
++            memo = old
++            for sid in revision.changes_since(conn, old.stamp[2]):
++                previous = memo.ids.pop(sid, None)
++                if previous is not None:
++                    memo.apply(previous, -1)
++                incoming = _load(conn, sid).get(sid)
++                if incoming is not None:
++                    if len(memo.ids) >= MAX_IDS:
++                        raise FullOnly("ID bound")
++                    memo.ids[sid] = incoming
++                    memo.apply(incoming, 1)
++            memo.stamp = stamp
++        else:
++            memo = Memo(identity, stamp, ids=_load(conn))
++            for item in memo.ids.values():
++                memo.apply(item, 1)
++        result = memo.result()
++    except FullOnly:
++        return None
++    if len(_memos) >= MAX_PATHS:
++        _memos.pop(next(iter(_memos)))
++    _memos[key] = memo
++    return result
+diff --git a/hermes_cli/machine_throughput_metrics.py b/hermes_cli/machine_throughput_metrics.py
+index f7a70be929..eedea15ca2 100644
+--- a/hermes_cli/machine_throughput_metrics.py
++++ b/hermes_cli/machine_throughput_metrics.py
+@@ -19,12 +19,17 @@ a drop, and 0 would read as a reset.
+ """
+ from __future__ import annotations
+ 
+-from copy import deepcopy
+ import sqlite3
+ import time
++from copy import deepcopy
+ from pathlib import Path
++from threading import RLock
+ from typing import Callable, Optional
+ 
++from hermes_cli import machine_throughput_incremental as incremental
++
++_lock = RLock()
++
+ FIELDS = ("tokens_io_total", "tokens_cache_total", "sessions_started_total", "sessions_ended_total")
+ CACHE_TTL_S = 60.0
+ 
+@@ -66,16 +71,26 @@ def _bounded_models(models: dict[str, list[int]]) -> dict[str, list[int]]:
+ 
+ 
+ def _read(path: Path, models: Optional[dict[str, list[int]]] = None) -> tuple[int, int, int, int]:
+-    db = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=1)
++    with _lock:
++        return _read_locked(path, models)
++
++
++def _read_locked(path: Path, models=None):
++    path = path.resolve()
++    key = str(path)
++    before = path.stat()
++    identity = (before.st_dev, before.st_ino)
++    db = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=1)
+     try:
+-        has_usage = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='session_model_usage'"
+-                               ).fetchone()
+-        if has_usage:
+-            rows = db.execute(_USAGE_SQL.replace("SELECT ", "SELECT model, ", 1).format(
+-                table="session_model_usage") + " GROUP BY model").fetchall()
++        db.execute("BEGIN")
++        result = incremental.read(db, key, identity)
++        if result is not None:
++            rows, started, ended = result
+         else:
+-            # Older schemas cannot supply a ledger breakdown; preserve their totals.
+-            rows = [("unknown", *db.execute(_USAGE_SQL.format(table="sessions")).fetchone())]
++            rows, started, ended = _full_read(db)
++        after = path.stat()
++        if (after.st_dev, after.st_ino) != identity:
++            raise OSError("throughput database replaced during read")
+         io = cache = 0
+         for model, model_io, model_cache in rows:
+             io += int(model_io)
+@@ -84,18 +99,38 @@ def _read(path: Path, models: Optional[dict[str, list[int]]] = None) -> tuple[in
+                 target = models.setdefault(str(model or "unknown")[:64], [0, 0])
+                 target[0] += int(model_io)
+                 target[1] += int(model_cache)
+-        started, ended = db.execute(_SESSIONS_SQL).fetchone()
++        return int(io), int(cache), int(started), int(ended)
++    except (OSError, sqlite3.Error, TypeError, ValueError):
++        incremental.forget(key)
++        raise
+     finally:
+         db.close()
+-    return int(io), int(cache), int(started), int(ended)
++
++
++def _full_read(db):
++    has_usage = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='session_model_usage'"
++                           ).fetchone()
++    if has_usage:
++        rows = db.execute(_USAGE_SQL.replace("SELECT ", "SELECT model, ", 1).format(
++            table="session_model_usage") + " GROUP BY model").fetchall()
++    else:
++        rows = [("unknown", *db.execute(_USAGE_SQL.format(table="sessions")).fetchone())]
++    started, ended = db.execute(_SESSIONS_SQL).fetchone()
++    return rows, started, ended
+ 
+ 
+ def counters(root: Optional[Path] = None) -> dict:
+     """Host totals and model breakdown, or ``{}`` if any database is unreadable (or absent)."""
++    with _lock:
++        return _counters_locked(root)
++
++
++def _counters_locked(root):
+     totals, seen = [0, 0, 0, 0], set()
+     models: dict[str, list[int]] = {}
+     try:
+         paths = state_db_paths(root)
++        incremental.prune(paths)
+         for path in paths:
+             stat = path.stat()
+             identity = (stat.st_dev, stat.st_ino)
+@@ -114,6 +149,11 @@ def counters(root: Optional[Path] = None) -> dict:
+ 
+ 
+ def cached_counters(root: Optional[Path] = None, *, clock: Callable[[], float] = time.monotonic) -> dict:
++    with _lock:
++        return _cached_locked(root, clock)
++
++
++def _cached_locked(root, clock):
+     global _cache
+     now, key = clock(), str(root)
+     if _cache is not None and _cache[0] == key and 0 <= now - _cache[1] < CACHE_TTL_S:
+@@ -125,4 +165,6 @@ def cached_counters(root: Optional[Path] = None, *, clock: Callable[[], float] =
+ 
+ def reset_cache() -> None:
+     global _cache
+-    _cache = None
++    with _lock:
++        _cache = None
++        incremental.reset()
+diff --git a/hermes_cli/session_throughput_repair.py b/hermes_cli/session_throughput_repair.py
+new file mode 100644
+index 0000000000..f956a705d9
+--- /dev/null
++++ b/hermes_cli/session_throughput_repair.py
+@@ -0,0 +1,48 @@
++"""Disable provably owned triggers stranded by partial protocol-table loss."""
++from __future__ import annotations
++
++import sqlite3
++
++
++def disable_stranded(conn: sqlite3.Connection) -> bool | None:
++    """True disabled, False retryable error, None foreign/not a partial layout.
++
++    Preserve all surviving data. A partial layout remains full-SQL-only; do not
++    reconstruct a revision history from incomplete artifacts. Future schemas are
++    untouched when identifiable; absent revision metadata is proven only by the
++    exact current table/trigger definitions that remain.
++    """
++    from hermes_cli import session_throughput_revision as rev
++
++    try:
++        tables = rev._master(conn, "table")
++        present = set(rev._TABLE_SQL) & tables.keys()
++        if not 0 < len(present) < len(rev._TABLE_SQL):
++            return None
++        objects = {r[0] for r in conn.execute('SELECT name FROM sqlite_master')}
++        if any(name in objects for name in rev._TABLE_SQL if name not in present):
++            return None
++        if any(tables[name] != rev._TABLE_SQL[name] for name in present):
++            return None
++        if "throughput_changes" in present and rev._master(conn, "index").get(rev._INDEX_NAME) != rev._INDEX_SQL:
++            return None
++        if not rev._triggers_exact(conn):
++            return None
++        if "throughput_revision" in present:
++            rows = conn.execute('SELECT version FROM throughput_revision').fetchall()
++            if len(rows) != 1 or type(rows[0][0]) is not int or rows[0][0] != rev.SCHEMA_VERSION:
++                return None
++        conn.execute('SAVEPOINT throughput_disable')
++    except sqlite3.Error:
++        return False
++    try:
++        rev.drop_triggers(conn)
++        conn.execute('RELEASE throughput_disable')
++    except sqlite3.Error:
++        try:
++            conn.execute('ROLLBACK TO throughput_disable')
++            conn.execute('RELEASE throughput_disable')
++        except sqlite3.Error:
++            pass
++        return False
++    return True
+diff --git a/hermes_cli/session_throughput_revision.py b/hermes_cli/session_throughput_revision.py
+new file mode 100644
+index 0000000000..185fe34ce6
+--- /dev/null
++++ b/hermes_cli/session_throughput_revision.py
+@@ -0,0 +1,386 @@
++"""Writer-side change journal for incremental machine-throughput refresh.
++
++Design: throughput-design-v3 (kanban t_01a1d7c726355396).  Tables/triggers are installed at the very
++end of SessionDB schema init; every write that can change a throughput contribution stamps a
++monotonic revision, a bounded ring of (rev, nonce) anchors and a coalesced per-session journal.
++
++Public API (reader contract):
++    install(conn) -> bool
++    read_stamp(conn) -> (schema_version, epoch, rev, nonce, floor) | None
++    anchor_matches(conn, rev, nonce) -> bool
++    changes_since(conn, rev) -> list[str]
++    drop_triggers(conn)
++"""
++from __future__ import annotations
++
++import logging
++import re
++import sqlite3
++from typing import Optional
++
++logger = logging.getLogger(__name__)
++
++SCHEMA_VERSION = 1
++RING_SIZE = 65536
++KEY_CAP = 262144
++REV_LIMIT = (1 << 63) - (1 << 20)
++
++_TABLE_SQL = {
++    "throughput_revision": (
++        "CREATE TABLE throughput_revision (id INTEGER PRIMARY KEY CHECK (id = 1), "
++        "version INTEGER NOT NULL, epoch BLOB NOT NULL, rev INTEGER NOT NULL, "
++        "nonce BLOB NOT NULL, floor INTEGER NOT NULL, keys INTEGER NOT NULL)"
++    ),
++    "throughput_anchors": (
++        "CREATE TABLE throughput_anchors (slot INTEGER PRIMARY KEY, rev INTEGER NOT NULL, "
++        "nonce BLOB NOT NULL)"
++    ),
++    "throughput_changes": (
++        "CREATE TABLE throughput_changes (kind TEXT NOT NULL, session_id TEXT NOT NULL, "
++        "rev INTEGER NOT NULL, PRIMARY KEY (kind, session_id))"
++    ),
++}
++_INDEX_NAME = "throughput_changes_rev"
++_INDEX_SQL = "CREATE INDEX throughput_changes_rev ON throughput_changes(rev)"
++
++_ROTATE = "epoch = randomblob(16), floor = rev, keys = 0"
++
++
++def _stamp(kind: str, x: str, extra: str = "1") -> str:
++    """SQL statements stamping session key expression ``x`` (a NEW./OLD. reference)."""
++    text = f"typeof({x}) = 'text' AND ({extra})"
++    nontext = f"typeof({x}) IS NOT 'text' AND ({extra})"
++    absent = f"NOT EXISTS (SELECT 1 FROM throughput_changes WHERE kind = '{kind}' AND session_id = {x})"
++    return "\n".join([
++        # unsupported (NULL/non-text) key: invalidate every cursor, journal nothing
++        f"UPDATE throughput_revision SET {_ROTATE} WHERE {nontext};",
++        # key-cap rotation BEFORE the incoming key is counted
++        f"UPDATE throughput_revision SET {_ROTATE} WHERE {text} AND keys >= {KEY_CAP} AND {absent};",
++        # Indexed empty range on ordinary writes; do not scan the journal just
++        # to discover that no rotation happened. Clear before revision reset.
++        f"DELETE FROM throughput_changes WHERE rev <= (SELECT CASE WHEN keys = 0 "
++        f"OR (rev >= {REV_LIMIT} AND {text}) THEN rev ELSE -1 END FROM throughput_revision);",
++        # revision exhaustion: exceptional full reset
++        f"UPDATE throughput_revision SET epoch = randomblob(16), rev = 0, floor = 0, keys = 0 "
++        f"WHERE {text} AND rev >= {REV_LIMIT};",
++        f"UPDATE throughput_revision SET rev = rev + 1, nonce = randomblob(16), keys = keys + ({absent}) "
++        f"WHERE {text};",
++        f"INSERT INTO throughput_anchors(slot, rev, nonce) SELECT rev % {RING_SIZE}, rev, nonce "
++        f"FROM throughput_revision WHERE {text} "
++        "ON CONFLICT(slot) DO UPDATE SET rev = excluded.rev, nonce = excluded.nonce;",
++        f"INSERT INTO throughput_changes(kind, session_id, rev) SELECT '{kind}', {x}, rev "
++        f"FROM throughput_revision WHERE {text} "
++        "ON CONFLICT(kind, session_id) DO UPDATE SET rev = excluded.rev;",
++    ])
++
++
++_ROTATE_STMT = f"UPDATE throughput_revision SET {_ROTATE};\nDELETE FROM throughput_changes;"
++
++
++def _trigger(name: str, event: str, table: str, when: str, body: str) -> str:
++    when_sql = f"\nWHEN {when}" if when else ""
++    return f"CREATE TRIGGER {name}\n{event} ON {table}{when_sql}\nBEGIN\n{body}\nEND"
++
++
++def _build_triggers() -> dict[str, str]:
++    s_insert_guard = (
++        "(EXISTS (SELECT 1 FROM sessions WHERE rowid = NEW.rowid AND id IS NOT NEW.id) "
++        "OR (NEW.title IS NOT NULL AND EXISTS (SELECT 1 FROM sessions "
++        "WHERE title = NEW.title AND id IS NOT NEW.id)))"
++    )
++    s_update_guard = (
++        "(NEW.id IS NOT OLD.id OR NEW.title IS NOT OLD.title OR NEW.rowid IS NOT OLD.rowid) AND "
++        "(EXISTS (SELECT 1 FROM sessions WHERE rowid = NEW.rowid AND rowid IS NOT OLD.rowid) "
++        "OR (NEW.id IS NOT NULL AND EXISTS (SELECT 1 FROM sessions "
++        "WHERE id = NEW.id AND rowid IS NOT OLD.rowid)) "
++        "OR (NEW.title IS NOT NULL AND EXISTS (SELECT 1 FROM sessions "
++        "WHERE title = NEW.title AND rowid IS NOT OLD.rowid)))"
++    )
++    u_insert_guard = (
++        "EXISTS (SELECT 1 FROM session_model_usage WHERE rowid = NEW.rowid "
++        "AND session_id IS NOT NEW.session_id)"
++    )
++    u_update_guard = (
++        "NEW.rowid IS NOT OLD.rowid AND EXISTS (SELECT 1 FROM session_model_usage "
++        "WHERE rowid = NEW.rowid AND rowid IS NOT OLD.rowid AND session_id IS NOT NEW.session_id)"
++    )
++    changed_end = "OLD.id IS NOT NEW.id OR (OLD.ended_at IS NULL) IS NOT (NEW.ended_at IS NULL)"
++    return {
++        "throughput_sessions_bi": _trigger(
++            "throughput_sessions_bi", "BEFORE INSERT", "sessions", s_insert_guard, _ROTATE_STMT),
++        "throughput_sessions_bu": _trigger(
++            "throughput_sessions_bu", "BEFORE UPDATE", "sessions", s_update_guard, _ROTATE_STMT),
++        "throughput_sessions_ai": _trigger(
++            "throughput_sessions_ai", "AFTER INSERT", "sessions", "", _stamp("s", "NEW.id")),
++        "throughput_sessions_ad": _trigger(
++            "throughput_sessions_ad", "AFTER DELETE", "sessions", "", _stamp("s", "OLD.id")),
++        "throughput_sessions_au": _trigger(
++            "throughput_sessions_au", "AFTER UPDATE OF id, ended_at", "sessions", changed_end,
++            _stamp("s", "OLD.id") + "\n" + _stamp("s", "NEW.id", "NEW.id IS NOT OLD.id")),
++        "throughput_usage_bi": _trigger(
++            "throughput_usage_bi", "BEFORE INSERT", "session_model_usage", u_insert_guard, _ROTATE_STMT),
++        "throughput_usage_bu": _trigger(
++            "throughput_usage_bu", "BEFORE UPDATE", "session_model_usage", u_update_guard, _ROTATE_STMT),
++        "throughput_usage_ai": _trigger(
++            "throughput_usage_ai", "AFTER INSERT", "session_model_usage", "",
++            _stamp("u", "NEW.session_id")),
++        "throughput_usage_ad": _trigger(
++            "throughput_usage_ad", "AFTER DELETE", "session_model_usage", "",
++            _stamp("u", "OLD.session_id")),
++        "throughput_usage_au": _trigger(
++            "throughput_usage_au", "AFTER UPDATE", "session_model_usage", "",
++            _stamp("u", "OLD.session_id")
++            + "\n" + _stamp("u", "NEW.session_id", "NEW.session_id IS NOT OLD.session_id")),
++    }
++
++
++_TRIGGERS = _build_triggers()
++
++
++def drop_triggers(conn: sqlite3.Connection) -> None:
++    """Drop every throughput tracking trigger (for migrations that rebuild tracked tables)."""
++    for name in _TRIGGERS:
++        conn.execute(f"DROP TRIGGER IF EXISTS {name}")
++
++
++# --------------------------------------------------------------------------- shape checks
++
++def _norm(sql: Optional[str]) -> str:
++    return re.sub(r"\s+", " ", sql or "").strip().lower()
++
++
++def _master(conn, type_: str) -> dict[str, str]:
++    return {r[0]: r[1] for r in conn.execute(
++        "SELECT name, sql FROM sqlite_master WHERE type = ?", (type_,))}
++
++
++def _columns(conn, table: str) -> dict[str, tuple]:
++    # name -> (declared type upper, notnull, pk)
++    return {r[1]: (str(r[2]).upper(), r[3], r[5]) for r in conn.execute(f"PRAGMA table_info({table})")}
++
++
++def _unique_indexes(conn, table: str) -> Optional[list[tuple]]:
++    """[(name, origin, partial, [(column, collation)...])] for unique indexes; None if expression key."""
++    out = []
++    for _seq, name, unique, origin, partial in conn.execute(f"PRAGMA index_list({table})"):
++        if not unique:
++            continue
++        cols = []
++        for _s, cid, cname, _desc, coll, key in conn.execute(f"PRAGMA index_xinfo({name!r})"):
++            if not key:
++                continue
++            if cid < 0 or cname is None:
++                return None
++            cols.append((cname, str(coll).upper()))
++        out.append((name, origin, bool(partial), cols))
++    return out
++
++
++def _supported_shape(conn: sqlite3.Connection) -> bool:
++    try:
++        tables = _master(conn, "table")
++        for needed in ("sessions", "session_model_usage", "session_admissions", "worker_executions"):
++            if needed not in tables:
++                return False
++        for t in ("sessions", "session_model_usage"):
++            # Index collation can override a column's declared collation. The
++            # canonical tables declare none; unfamiliar declarations use SQL.
++            if re.search(r"\bcollate\b|without\s+rowid", tables[t] or "", re.IGNORECASE):
++                return False
++            if {n.lower() for n in _columns(conn, t)} & {"rowid", "_rowid_", "oid"}:
++                return False
++        sc = _columns(conn, "sessions")
++        if sc.get("id", ("", 0, 0))[0] != "TEXT" or sc["id"][2] != 1:
++            return False
++        if "ended_at" not in sc or "title" not in sc:
++            return False
++        if sum(1 for v in sc.values() if v[2]) != 1:
++            return False
++        idx_sql = _master(conn, "index")
++        uniq = _unique_indexes(conn, "sessions")
++        if uniq is None or not any(row[0] == "idx_sessions_title_unique" for row in uniq):
++            return False
++        for name, origin, partial, cols in uniq:
++            if origin == "pk" and not partial and cols == [("id", "BINARY")]:
++                continue
++            if (name == "idx_sessions_title_unique" and origin == "c" and partial
++                    and cols == [("title", "BINARY")]
++                    and _norm(idx_sql.get(name)).partition(" where ")[2] == "title is not null"):
++                continue
++            return False
++        uc = _columns(conn, "session_model_usage")
++        for col, typ in (("session_id", "TEXT"), ("model", "TEXT"), ("input_tokens", "INTEGER"),
++                         ("output_tokens", "INTEGER"), ("cache_read_tokens", "INTEGER"),
++                         ("cache_write_tokens", "INTEGER")):
++            if uc.get(col, ("", 0, 0))[0] != typ:
++                return False
++        if not (uc["session_id"][1] and uc["model"][1]):
++            return False
++        pk = ["session_id", "model", "billing_provider", "billing_base_url", "billing_mode", "task"]
++        uuniq = _unique_indexes(conn, "session_model_usage")
++        if uuniq is None or len(uuniq) != 1:
++            return False
++        name, origin, partial, cols = uuniq[0]
++        return origin == "pk" and not partial and cols == [(c, "BINARY") for c in pk]
++    except sqlite3.Error:
++        return False
++
++
++def _tables_exact(conn) -> Optional[bool]:
++    """True exact, False absent entirely, None present-but-different."""
++    tables = _master(conn, "table")
++    present = [n for n in _TABLE_SQL if n in tables]
++    if not present:
++        return False
++    if len(present) != len(_TABLE_SQL):
++        return None
++    if any(tables[n] != _TABLE_SQL[n] for n in _TABLE_SQL):
++        return None
++    if _master(conn, "index").get(_INDEX_NAME) != _INDEX_SQL:
++        return None
++    return True
++
++
++def _triggers_exact(conn) -> bool:
++    live = _master(conn, "trigger")
++    return all(live.get(n) == sql for n, sql in _TRIGGERS.items())
++
++
++def _invariant_ok(conn) -> bool:
++    row = conn.execute(
++        "SELECT version, rev, floor, keys, epoch, nonce FROM throughput_revision WHERE id = 1").fetchone()
++    if row is None or row[0] != SCHEMA_VERSION:
++        return False
++    _v, rev, floor, keys, epoch, nonce = row
++    if any(type(n) is not int for n in (_v, rev, floor, keys)):
++        return False
++    if any(not isinstance(n, bytes) or len(n) != 16 for n in (epoch, nonce)):
++        return False
++    if not (0 <= floor <= rev <= (1 << 63) - 1 and 0 <= keys <= KEY_CAP):
++        return False
++    mx = conn.execute("SELECT MAX(rev) FROM throughput_changes").fetchone()[0]
++    if mx is None:
++        return rev == floor and keys == 0
++    return mx == rev
++
++
++# --------------------------------------------------------------------------- install
++
++def settle_schema(conn: sqlite3.Connection) -> bool:
++    """Settled includes intentionally unsupported shapes; failures remain retryable."""
++    if install(conn):
++        return True
++    try:
++        if not _supported_shape(conn):
++            return True
++        if _tables_exact(conn) is None:
++            from hermes_cli.session_throughput_repair import disable_stranded
++
++            disabled = disable_stranded(conn)
++            return True if disabled is None else disabled
++        if _tables_exact(conn) is True:
++            row = conn.execute("SELECT version FROM throughput_revision WHERE id=1").fetchone()
++            if row is not None and type(row[0]) is int and row[0] > SCHEMA_VERSION:
++                return True
++    except sqlite3.Error:
++        pass
++    return False
++
++
++def install(conn: sqlite3.Connection) -> bool:
++    """Idempotently install/repair tracking. Atomic; returns True iff tracking is usable."""
++    try:
++        conn.execute("SAVEPOINT throughput_install")
++    except sqlite3.Error:
++        return False
++    ok = False
++    try:
++        ok = _install_inner(conn)
++    except sqlite3.Error as exc:
++        logger.debug("throughput tracking install failed: %s", exc)
++        ok = False
++    try:
++        if ok:
++            conn.execute("RELEASE throughput_install")
++        else:
++            conn.execute("ROLLBACK TO throughput_install")
++            conn.execute("RELEASE throughput_install")
++    except sqlite3.Error:
++        return False
++    return ok
++
++
++def _install_inner(conn: sqlite3.Connection) -> bool:
++    if not _supported_shape(conn):
++        return False
++    state = _tables_exact(conn)
++    if state is None:
++        return False  # foreign / future definition: leave untouched
++    if state is False:
++        for sql in _TABLE_SQL.values():
++            conn.execute(sql)
++        conn.execute(_INDEX_SQL)
++        conn.execute(
++            "INSERT INTO throughput_revision(id, version, epoch, rev, nonce, floor, keys) "
++            "VALUES (1, ?, randomblob(16), 0, randomblob(16), 0, 0)", (SCHEMA_VERSION,))
++        conn.execute(
++            "INSERT INTO throughput_anchors(slot, rev, nonce) SELECT 0, rev, nonce "
++            "FROM throughput_revision")
++    else:
++        row = conn.execute("SELECT version FROM throughput_revision WHERE id = 1").fetchone()
++        if row is None or row[0] != SCHEMA_VERSION:
++            return False  # future (or corrupt) version: never rewritten
++    if not _triggers_exact(conn):
++        drop_triggers(conn)
++        for sql in _TRIGGERS.values():
++            conn.execute(sql)
++        if state is not False:
++            # writes in the gap were invisible: invalidate every cursor
++            conn.execute(f"UPDATE throughput_revision SET {_ROTATE}")
++            conn.execute("DELETE FROM throughput_changes")
++    current = conn.execute("SELECT rev, nonce FROM throughput_revision WHERE id=1").fetchone()
++    if not _invariant_ok(conn) or current is None or not anchor_matches(conn, *current):
++        conn.execute(f"UPDATE throughput_revision SET {_ROTATE}")
++        conn.execute("DELETE FROM throughput_changes")
++        # rev may be < floor-consistent only if corrupt; anchor must exist for the current rev
++        conn.execute(
++            f"INSERT INTO throughput_anchors(slot, rev, nonce) SELECT rev % {RING_SIZE}, rev, nonce "
++            "FROM throughput_revision WHERE true "
++            "ON CONFLICT(slot) DO UPDATE SET rev = excluded.rev, nonce = excluded.nonce")
++        if not _invariant_ok(conn):
++            return False
++    return True
++
++
++# --------------------------------------------------------------------------- reader API
++
++def read_stamp(conn: sqlite3.Connection) -> Optional[tuple]:
++    """(schema_version, epoch, rev, nonce, floor) when tracking is fully valid, else None."""
++    try:
++        if not _supported_shape(conn) or _tables_exact(conn) is not True or not _triggers_exact(conn):
++            return None
++        if not _invariant_ok(conn):
++            return None
++        row = conn.execute(
++            "SELECT version, epoch, rev, nonce, floor FROM throughput_revision WHERE id = 1").fetchone()
++        if row is None or not anchor_matches(conn, row[2], row[3]):
++            return None
++        schema = conn.execute("PRAGMA schema_version").fetchone()[0]
++        return (schema, *tuple(row)[1:])
++    except sqlite3.Error:
++        return None
++
++
++def anchor_matches(conn: sqlite3.Connection, rev: int, nonce: bytes) -> bool:
++    try:
++        row = conn.execute(
++            "SELECT 1 FROM throughput_anchors WHERE slot = ? AND rev = ? AND nonce = ?",
++            (rev % RING_SIZE, rev, nonce)).fetchone()
++    except (sqlite3.Error, TypeError):
++        return False
++    return row is not None
++
++
++def changes_since(conn: sqlite3.Connection, rev: int) -> list[str]:
++    return [r[0] for r in conn.execute(
++        "SELECT DISTINCT session_id FROM throughput_changes WHERE rev > ?", (rev,))]
+diff --git a/hermes_state_schema.py b/hermes_state_schema.py
+index 4c38575cd6..f9959078b2 100644
+--- a/hermes_state_schema.py
++++ b/hermes_state_schema.py
+@@ -933,8 +933,10 @@ class SessionSchemaMixin:
+     def _run_throttled_heals(self, cursor: sqlite3.Cursor) -> bool:
+         """The data repairs a memoized open still owes the store, at most once per interval per store
+         (hermes_state_schema_memo._maybe_heal). True when both completed."""
++        from hermes_cli.session_throughput_revision import settle_schema
++        throughput_ok = settle_schema(cursor.connection)
+         delegate_ok = self._heal_reset_rows_carrying_a_delegate_marker(cursor)
+-        return self._heal_null_active_rows(cursor) and delegate_ok
++        return self._heal_null_active_rows(cursor) and delegate_ok and throughput_ok
+ 
+     def _index_healed_rows_for_trigram(self, cursor: sqlite3.Cursor, session_ids: list[str]) -> None:
+         """The marker kept these sessions' messages out of the external-content trigram index (the triggers
+@@ -1107,6 +1109,8 @@ class SessionSchemaMixin:
+         if fts5_available:
+             self._init_fts(cursor)
+             self._stamp_settled_fts_layout(cursor)
++        from hermes_cli.session_throughput_revision import settle_schema
++        healed = settle_schema(cursor.connection) and healed
+         self._conn.commit()
+         # After the commit: the repair takes its own write transaction, and only once per store.
+         advance_legacy_refusal_repair(self, self._conn)
+diff --git a/tests/hermes_cli/test_machine_throughput_incremental.py b/tests/hermes_cli/test_machine_throughput_incremental.py
+new file mode 100644
+index 0000000000..456b029d35
+--- /dev/null
++++ b/tests/hermes_cli/test_machine_throughput_incremental.py
+@@ -0,0 +1,61 @@
++"""Periodic throughput work must depend on changes, not session history size."""
++import sqlite3
++
++import pytest
++
++from hermes_cli import machine_throughput_metrics as mt
++from hermes_state import SessionDB
++
++
++@pytest.mark.parametrize("changed", [False, True])
++def test_periodic_refresh_vm_work_is_history_bounded(tmp_path, monkeypatch, changed):
++    """Instruction counts are deterministic; wall/CPU cadence is a separate benchmark."""
++    original_connect = sqlite3.connect
++    vm_steps = [0]
++
++    def count_steps():
++        vm_steps[0] += 100
++        return 0
++
++    def observed_connect(*args, **kwargs):
++        conn = original_connect(*args, **kwargs)
++        conn.set_progress_handler(count_steps, 100)
++        return conn
++
++    work = []
++    for size in (5000, 12000, 23000):
++        root = tmp_path / str(size)
++        root.mkdir()
++        store = SessionDB(db_path=root / "state.db")
++        store.close()
++        writer = original_connect(root / "state.db")
++        try:
++            writer.executemany(
++                "INSERT INTO sessions(id,source,started_at) VALUES (?,'test',1)",
++                ((f"s{i}",) for i in range(size)),
++            )
++            writer.executemany(
++                "INSERT INTO session_model_usage(session_id,model,input_tokens,output_tokens,"
++                "cache_read_tokens,cache_write_tokens) VALUES (?,'m',1,2,3,4)",
++                ((f"s{i}",) for i in range(size)),
++            )
++            writer.commit()
++            mt.reset_cache()
++            first = mt.cached_counters(root, clock=lambda: 100.0)
++            assert first["tokens_io_total"] == 3 * size
++            if changed:
++                writer.execute("UPDATE session_model_usage SET input_tokens=9 WHERE session_id='s0'")
++                writer.commit()
++            with monkeypatch.context() as patcher:
++                patcher.setattr(mt.sqlite3, "connect", observed_connect)
++                vm_steps[0] = 0
++                refreshed = mt.cached_counters(root, clock=lambda: 160.0)
++                work.append(vm_steps[0])
++            assert refreshed["tokens_io_total"] == 3 * size + (8 if changed else 0)
++            assert refreshed["tokens_cache_total"] == 7 * size
++            assert refreshed["sessions_started_total"] == size
++            assert refreshed["sessions_ended_total"] == 0
++        finally:
++            writer.close()
++            mt.reset_cache()
++    assert work[-1] <= 1.5 * max(work[0], 100), work
+diff --git a/tests/hermes_cli/test_throughput_boundaries.py b/tests/hermes_cli/test_throughput_boundaries.py
+new file mode 100644
+index 0000000000..b7fe315311
+--- /dev/null
++++ b/tests/hermes_cli/test_throughput_boundaries.py
+@@ -0,0 +1,53 @@
++"""Direct loading boundaries and ordinary writer events without fallback masking."""
++import sqlite3
++
++import pytest
++
++from hermes_cli import machine_throughput_incremental as inc
++from hermes_cli import machine_throughput_metrics as mt
++from hermes_cli import session_throughput_revision as rev
++from hermes_state import SessionDB
++
++
++@pytest.fixture
++def store(tmp_path):
++    path = tmp_path / 'state.db'
++    db = SessionDB(db_path=path)
++    db.close()
++    conn = sqlite3.connect(path)
++    conn.execute("INSERT INTO sessions(id,source,started_at) VALUES ('a','test',1)")
++    conn.executemany("INSERT INTO session_model_usage(session_id,model,input_tokens,task) VALUES ('a','m',1,?)", [('one',), ('two',)])
++    conn.commit()
++    mt.reset_cache()
++    yield path, conn
++    conn.close()
++    mt.reset_cache()
++
++
++def test_loading_row_bound_precedes_aggregate_bound(store, monkeypatch):
++    _path, conn = store
++    monkeypatch.setattr(inc, 'MAX_ROWS', 1)
++    with pytest.raises(inc.FullOnly, match='^usage shape or bound$'):
++        inc._load(conn)
++
++
++@pytest.mark.parametrize('sql,expected', [
++    ("INSERT INTO sessions(id,source,started_at) VALUES ('new','test',1)", (2, 0, 2, 0)),
++    ("DELETE FROM sessions WHERE id='a'", (2, 0, 0, 0)),
++    ("UPDATE sessions SET ended_at=2 WHERE id='a'", (2, 0, 1, 1)),
++    ("INSERT INTO session_model_usage(session_id,model,input_tokens,task) VALUES ('a','m',4,'new')", (6, 0, 1, 0)),
++    ("DELETE FROM session_model_usage WHERE task='one'", (1, 0, 1, 0)),
++    ("UPDATE session_model_usage SET input_tokens=3 WHERE task='one'", (4, 0, 1, 0)),
++])
++def test_each_ordinary_event_advances_and_reloads(store, sql, expected):
++    path, conn = store
++    assert mt._read(path) == (2, 0, 1, 0)
++    before = rev.read_stamp(conn)
++    conn.execute(sql)
++    conn.commit()
++    after = rev.read_stamp(conn)
++    # A conflict-rotation/schema fallback must not mask a missing event stamp.
++    assert before[:2] == after[:2]
++    assert after[2] > before[2]
++    assert mt._read(path) == expected
++    assert str(path.resolve()) in inc._memos
+diff --git a/tests/hermes_cli/test_throughput_differential.py b/tests/hermes_cli/test_throughput_differential.py
+new file mode 100644
+index 0000000000..1f98468921
+--- /dev/null
++++ b/tests/hermes_cli/test_throughput_differential.py
+@@ -0,0 +1,228 @@
++"""Compare refreshed incremental results with the unchanged SQL oracle."""
++import sqlite3
++
++import pytest
++
++from hermes_cli import machine_throughput_metrics as mt
++from hermes_cli import machine_throughput_incremental as inc
++from hermes_cli import session_throughput_revision as rev
++from hermes_state import SessionDB
++
++
++@pytest.fixture
++def store(tmp_path):
++    path = tmp_path / 'state.db'
++    db = SessionDB(db_path=path)
++    db.close()
++    conn = sqlite3.connect(path)
++    conn.executemany("INSERT INTO sessions(id,source,started_at,title) VALUES (?,'test',1,?)",
++                     [('a', 'A'), ('b', 'B'), ('c', 'C')])
++    conn.executemany('INSERT INTO session_model_usage(session_id,model,input_tokens) VALUES (?,?,?)',
++                     [('a', 'm', 10), ('b', 'm', 20), ('c', 'n', 30)])
++    conn.commit()
++    mt.reset_cache()
++    yield path, conn
++    conn.close()
++    mt.reset_cache()
++
++
++def assert_oracle(path, conn):
++    rows, started, ended = mt._full_read(conn)
++    expected = {}
++    for model, io, cache in rows:
++        values = expected.setdefault(str(model or 'unknown')[:64], [0, 0])
++        values[0] += int(io)
++        values[1] += int(cache)
++    actual = {}
++    counts = mt._read(path, actual)
++    assert actual == expected
++    assert counts == (sum(int(r[1]) for r in rows), sum(int(r[2]) for r in rows), started, ended)
++
++
++@pytest.mark.parametrize('sql', [
++    "INSERT OR REPLACE INTO sessions(rowid,id,source,started_at) VALUES ((SELECT rowid FROM sessions WHERE id='b'),'new','test',1)",
++    "INSERT OR REPLACE INTO session_model_usage(rowid,session_id,model,input_tokens) VALUES ((SELECT rowid FROM session_model_usage WHERE session_id='b'),'orphan','z',9)",
++    "UPDATE session_model_usage SET input_tokens=2 WHERE session_id='a'",
++    "UPDATE session_model_usage SET input_tokens=222 WHERE session_id='a'",
++    "UPDATE session_model_usage SET input_tokens=-2 WHERE session_id='a'",
++    "UPDATE session_model_usage SET input_tokens=2.5 WHERE session_id='a'",
++    "UPDATE session_model_usage SET input_tokens='abc' WHERE session_id='a'",
++    "UPDATE session_model_usage SET input_tokens=X'01' WHERE session_id='a'",
++    "UPDATE session_model_usage SET model='n' WHERE session_id='a'",
++    "UPDATE session_model_usage SET model=X'6d' WHERE session_id='a'",
++    "UPDATE session_model_usage SET session_id='orphan' WHERE session_id='a'",
++    "INSERT INTO session_model_usage(session_id,model,input_tokens,task) VALUES ('a','m',7,'aux')",
++    "DELETE FROM session_model_usage WHERE session_id='a'",
++    "DELETE FROM sessions WHERE id='a'",
++    "UPDATE sessions SET ended_at=5 WHERE id='a'",
++    "UPDATE sessions SET id='renamed' WHERE id='a'",
++    "INSERT OR REPLACE INTO sessions(id,source,started_at,title) VALUES ('a','test',1,'B')",
++    "UPDATE OR REPLACE sessions SET title='B' WHERE id='a'",
++    "UPDATE OR REPLACE sessions SET id='b' WHERE id='a'",
++    "UPDATE OR REPLACE sessions SET rowid=(SELECT rowid FROM sessions WHERE id='b') WHERE id='a'",
++    "UPDATE OR REPLACE sessions SET _rowid_=(SELECT rowid FROM sessions WHERE id='b') WHERE id='a'",
++    "UPDATE OR REPLACE sessions SET oid=(SELECT rowid FROM sessions WHERE id='b') WHERE id='a'",
++    "UPDATE OR REPLACE session_model_usage SET rowid=(SELECT rowid FROM session_model_usage WHERE session_id='b') WHERE session_id='a'",
++])
++@pytest.mark.parametrize('recursive', [0, 1])
++def test_mutations_match_original_sql(store, sql, recursive):
++    path, conn = store
++    conn.execute(f'PRAGMA recursive_triggers={recursive}')
++    assert_oracle(path, conn)
++    assert str(path.resolve()) in inc._memos
++    conn.execute(sql)
++    conn.commit()
++    assert_oracle(path, conn)
++    # Recovery after an opaque/full-only result must rebuild, not apply a delta
++    # to untracked totals. It must also see old-row, not just append, changes.
++    conn.execute('UPDATE session_model_usage SET input_tokens=42')
++    conn.commit()
++    assert_oracle(path, conn)
++
++
++@pytest.mark.parametrize('foreign_keys', [0, 1])
++@pytest.mark.parametrize('recursive', [0, 1])
++def test_replace_cascade_and_orphan_modes(store, foreign_keys, recursive):
++    path, conn = store
++    conn.execute(f'PRAGMA foreign_keys={foreign_keys}')
++    conn.execute(f'PRAGMA recursive_triggers={recursive}')
++    assert_oracle(path, conn)
++    conn.execute("INSERT OR REPLACE INTO sessions(id,source,started_at,title) VALUES ('a','test',1,'B')")
++    conn.commit()
++    assert_oracle(path, conn)
++
++
++@pytest.mark.parametrize('recursive', [0, 1])
++@pytest.mark.parametrize('foreign_keys', [0, 1])
++@pytest.mark.parametrize('sql', [
++    "UPDATE OR REPLACE sessions SET id='b' WHERE id='a'",
++    "UPDATE OR REPLACE sessions SET rowid=(SELECT rowid FROM sessions WHERE id='b') WHERE id='a'",
++    "UPDATE OR REPLACE sessions SET id='b',title='C' WHERE id='a'",
++    "UPDATE OR REPLACE session_model_usage SET rowid=(SELECT rowid FROM session_model_usage WHERE session_id='b') WHERE session_id='a'",
++])
++def test_conflict_matrix_and_statement_rollback(store, recursive, foreign_keys, sql):
++    path, conn = store
++    conn.execute(f'PRAGMA foreign_keys={foreign_keys}')
++    conn.execute(f'PRAGMA recursive_triggers={recursive}')
++    assert_oracle(path, conn)
++    before = {name: conn.execute(f'SELECT * FROM {name}').fetchall()
++              for name in ('sessions', 'session_model_usage', *rev._TABLE_SQL)}
++    try:
++        conn.execute(sql)
++    except sqlite3.IntegrityError:
++        assert foreign_keys
++        assert {name: conn.execute(f'SELECT * FROM {name}').fetchall()
++                for name in before} == before
++        conn.rollback()
++    else:
++        conn.commit()
++    assert_oracle(path, conn)
++
++
++def test_cap_rotation_preserves_oracle_and_existing_key(store, monkeypatch):
++    path, conn = store
++    monkeypatch.setattr(rev, 'KEY_CAP', 3)
++    monkeypatch.setattr(rev, '_TRIGGERS', rev._build_triggers())
++    assert rev.install(conn)
++    conn.commit()
++    for key in ('a', 'b', 'c'):
++        conn.execute('UPDATE session_model_usage SET input_tokens=input_tokens+1 WHERE session_id=?', (key,))
++    conn.commit()
++    assert conn.execute('SELECT keys FROM throughput_revision').fetchone()[0] == 3
++    assert_oracle(path, conn)
++    epoch = rev.read_stamp(conn)[1]
++    conn.execute("UPDATE session_model_usage SET input_tokens=input_tokens+1 WHERE session_id='a'")
++    conn.commit()
++    assert rev.read_stamp(conn)[1] == epoch
++    assert_oracle(path, conn)
++    conn.execute("INSERT INTO sessions(id,source,started_at) VALUES ('new','test',1)")
++    conn.commit()
++    assert rev.read_stamp(conn)[1] != epoch
++    assert conn.execute('SELECT keys FROM throughput_revision').fetchone()[0] == 1
++    assert_oracle(path, conn)
++
++
++def test_uncommitted_and_rollback_do_not_publish(store):
++    path, conn = store
++    before = mt._read(path)
++    conn.execute("UPDATE session_model_usage SET input_tokens=88 WHERE session_id='a'")
++    assert mt._read(path) == before
++    conn.rollback()
++    assert_oracle(path, conn)
++    conn.execute("UPDATE sessions SET ended_at=5 WHERE id='a'")
++    conn.commit()
++    assert_oracle(path, conn)
++    conn.execute("UPDATE sessions SET ended_at=NULL WHERE id='a'")
++    conn.commit()
++    assert_oracle(path, conn)
++
++
++def test_zero_groups_and_normalization_collisions(store):
++    path, conn = store
++    conn.executemany('INSERT INTO session_model_usage(session_id,model,input_tokens) VALUES (?,?,?)',
++                     [('a', f'zero{i}', 0) for i in range(40)] +
++                     [('a', 'z' * 64 + suffix, 3) for suffix in ('x', 'y')])
++    conn.commit()
++    assert_oracle(path, conn)
++    conn.execute("DELETE FROM session_model_usage WHERE model='zero0'")
++    conn.commit()
++    assert_oracle(path, conn)
++
++
++def test_trigger_gap_and_repair_rotates_cursor(store):
++    path, conn = store
++    assert_oracle(path, conn)
++    epoch = rev.read_stamp(conn)[1]
++    conn.execute('DROP TRIGGER throughput_usage_au')
++    conn.execute('UPDATE session_model_usage SET input_tokens=9')
++    conn.commit()
++    assert_oracle(path, conn)
++    assert str(path.resolve()) not in inc._memos
++    assert rev.install(conn)
++    conn.commit()
++    assert rev.read_stamp(conn)[1] != epoch
++    assert_oracle(path, conn)
++    conn.execute('UPDATE session_model_usage SET input_tokens=11')
++    conn.commit()
++    assert_oracle(path, conn)
++
++
++@pytest.mark.parametrize('sql', [
++    "UPDATE session_model_usage SET input_tokens=2.5 WHERE session_id='a'",
++    "UPDATE session_model_usage SET input_tokens=-1 WHERE session_id='a'",
++    "UPDATE session_model_usage SET input_tokens=9223372036854775807,output_tokens=1 WHERE session_id='a'",
++    "UPDATE session_model_usage SET cache_read_tokens=9223372036854775807,cache_write_tokens=1 WHERE session_id='a'",
++    "INSERT INTO sessions(id,source,started_at) VALUES (X'6162','test',1)",
++    "INSERT INTO sessions(id,source,started_at) VALUES (NULL,'test',1)",
++    "INSERT INTO session_model_usage(session_id,model,input_tokens) VALUES (X'6162','m',7)",
++])
++def test_unsupported_pairs_and_keys_drop_memo(store, sql):
++    path, conn = store
++    assert_oracle(path, conn)
++    conn.execute(sql)
++    conn.commit()
++    assert_oracle(path, conn)
++    assert str(path.resolve()) not in inc._memos
++    with pytest.raises(inc.FullOnly):
++        inc._load(conn)
++    mt.reset_cache()
++    assert_oracle(path, conn)
++    assert str(path.resolve()) not in inc._memos
++
++
++def test_initial_model_bound_is_enforced_during_loading(store, monkeypatch):
++    _path, conn = store
++    monkeypatch.setattr(inc, 'MAX_MODELS', 1)
++    with pytest.raises(inc.FullOnly, match='model bound'):
++        inc._load(conn)
++
++
++@pytest.mark.parametrize('bound,value', [('MAX_IDS', 2), ('MAX_MODELS', 1), ('MAX_ROWS', 2)])
++def test_memory_overflow_is_full_only_then_recovers(store, monkeypatch, bound, value):
++    path, conn = store
++    with monkeypatch.context() as scoped:
++        scoped.setattr(inc, bound, value)
++        assert_oracle(path, conn)
++        assert str(path.resolve()) not in inc._memos
++    assert_oracle(path, conn)
++    assert str(path.resolve()) in inc._memos
+diff --git a/tests/hermes_cli/test_throughput_integration.py b/tests/hermes_cli/test_throughput_integration.py
+new file mode 100644
+index 0000000000..70526ff26f
+--- /dev/null
++++ b/tests/hermes_cli/test_throughput_integration.py
+@@ -0,0 +1,93 @@
++"""Throughput tracking across real schema rebuild, recovery and scope boundaries."""
++import sqlite3
++
++from hermes_state import SessionDB
++from hermes_cli import machine_throughput_incremental as inc
++from hermes_cli import machine_throughput_metrics as mt
++from hermes_cli import session_throughput_revision as rev
++from tests.hermes_cli import test_throughput_differential as helpers
++
++store = helpers.store
++assert_oracle = helpers.assert_oracle
++
++
++def test_rebuild_usage_with_tracking_installed(store):
++    from hermes_state_schema import SessionSchemaMixin
++    path, conn = store
++    assert_oracle(path, conn)
++    old = inc._memos[str(path.resolve())]
++    ddl = conn.execute("SELECT sql FROM sqlite_master WHERE name='session_model_usage'").fetchone()[0]
++    SessionSchemaMixin._rebuild_table_statements(
++        conn.cursor(), 'session_model_usage', 'usage_old', ddl,
++        'INSERT INTO session_model_usage SELECT * FROM usage_old', [])
++    assert rev.read_stamp(conn) is None
++    conn.execute("UPDATE session_model_usage SET input_tokens=3 WHERE session_id='a'")
++    assert rev.install(conn)
++    conn.commit()
++    assert_oracle(path, conn)
++    assert inc._memos[str(path.resolve())] is not old
++    conn.execute("UPDATE session_model_usage SET input_tokens=17 WHERE session_id='b'")
++    conn.commit()
++    assert_oracle(path, conn)
++
++
++def test_nullable_sql_pairs_preserve_null_propagation(store):
++    from hermes_state_schema import SessionSchemaMixin
++    path, conn = store
++    ddl = conn.execute("SELECT sql FROM sqlite_master WHERE name='session_model_usage'").fetchone()[0]
++    for column in ('input_tokens', 'output_tokens', 'cache_read_tokens', 'cache_write_tokens'):
++        ddl = ddl.replace(f'{column} INTEGER NOT NULL', f'{column} INTEGER')
++    SessionSchemaMixin._rebuild_table_statements(
++        conn.cursor(), 'session_model_usage', 'usage_old', ddl,
++        'INSERT INTO session_model_usage SELECT * FROM usage_old', [])
++    assert rev.install(conn)
++    conn.execute("UPDATE session_model_usage SET input_tokens=NULL,output_tokens=999 WHERE session_id='a'")
++    conn.commit()
++    assert_oracle(path, conn)
++    assert str(path.resolve()) in inc._memos
++    conn.execute("UPDATE session_model_usage SET input_tokens=5,output_tokens=NULL,cache_read_tokens=NULL,cache_write_tokens=999 WHERE session_id='b'")
++    conn.commit()
++    assert_oracle(path, conn)
++
++
++def test_recovery_rebuilds_protocol_instead_of_copying_history(store, tmp_path):
++    from hermes_cli.session_recovery import recover_session_database
++    path, conn = store
++    before = rev.read_stamp(conn)
++    output = tmp_path / 'recovered.db'
++    report = recover_session_database(path, output)
++    assert output.exists(), report
++    with sqlite3.connect(output) as recovered:
++        assert mt._full_read(recovered) == mt._full_read(conn)
++        assert rev.read_stamp(recovered) is not None
++        assert rev.read_stamp(recovered)[1] != before[1]
++        assert_oracle(output, recovered)
++        recovered.execute("UPDATE session_model_usage SET input_tokens=4 WHERE session_id='a'")
++        recovered.commit()
++        assert_oracle(output, recovered)
++    assert rev.read_stamp(conn) == before
++
++
++def test_alternating_homes_profiles_and_symlinks(store, tmp_path):
++    path, conn = store
++    root = tmp_path / 'other'
++    profile = root / 'profiles' / 'worker'
++    profile.mkdir(parents=True)
++    other = profile / 'state.db'
++    with sqlite3.connect(other) as target:
++        conn.backup(target)
++        target.execute('UPDATE session_model_usage SET input_tokens=1')
++        target.commit()
++    alias = root / 'profiles' / 'alias'
++    alias.mkdir()
++    (alias / 'state.db').symlink_to(other)
++    first = mt.cached_counters(path.parent, clock=lambda: 100)
++    second = mt.cached_counters(root, clock=lambda: 100)
++    assert first['tokens_io_total'] == 60
++    assert second['tokens_io_total'] == 3
++    assert second['sessions_started_total'] == 3
++    assert mt.cached_counters(path.parent, clock=lambda: 100) == first
++    conn.execute('UPDATE session_model_usage SET input_tokens=2')
++    conn.commit()
++    assert mt.cached_counters(path.parent, clock=lambda: 160)['tokens_io_total'] == 6
++    assert mt.cached_counters(root, clock=lambda: 160) == second
+diff --git a/tests/hermes_cli/test_throughput_protocol_guards.py b/tests/hermes_cli/test_throughput_protocol_guards.py
+new file mode 100644
+index 0000000000..0d5a0cfa02
+--- /dev/null
++++ b/tests/hermes_cli/test_throughput_protocol_guards.py
+@@ -0,0 +1,228 @@
++"""Isolate protocol refusal boundaries so adjacent fences cannot mask them."""
++import sqlite3
++
++import pytest
++
++from hermes_cli import session_throughput_revision as rev
++from tests.hermes_cli import test_throughput_revision as helpers
++
++db = helpers.db
++
++
++@pytest.mark.parametrize('sql', [
++    'UPDATE throughput_revision SET floor=-1',
++    'UPDATE throughput_revision SET floor=rev+1',
++    'UPDATE throughput_revision SET keys=-1',
++    f'UPDATE throughput_revision SET keys={rev.KEY_CAP + 1}',
++    'UPDATE throughput_revision SET rev=-1, floor=-1',
++    'UPDATE throughput_changes SET rev=rev+1',
++    'DELETE FROM throughput_revision',
++    'UPDATE throughput_revision SET version=2',
++])
++def test_journal_invariant_refuses_invalid_state(db, sql):
++    db.execute("INSERT INTO sessions(id,source,started_at) VALUES ('a','test',1)")
++    assert rev._invariant_ok(db)
++    db.execute(sql)
++    assert not rev._invariant_ok(db)
++
++
++@pytest.mark.parametrize('column,value', [
++    ('rev', 'bad'), ('floor', 'bad'), ('keys', 'bad'),
++    ('epoch', '0123456789abcdef'), ('nonce', '0123456789abcdef'),
++    ('epoch', b'x'), ('nonce', b'x'),
++])
++def test_journal_type_and_blob_guards_direct(db, column, value):
++    db.execute(f'UPDATE throughput_revision SET {column}=?', (value,))
++    assert not rev._invariant_ok(db)
++
++
++@pytest.mark.parametrize('mutation', ['missing', 'definition', 'index'])
++def test_protocol_tables_must_be_exact(db, mutation):
++    if mutation == 'missing':
++        db.execute('DROP TABLE throughput_anchors')
++    elif mutation == 'definition':
++        db.execute('ALTER TABLE throughput_anchors ADD COLUMN alien TEXT')
++    else:
++        db.execute('DROP INDEX throughput_changes_rev')
++        db.execute('CREATE INDEX throughput_changes_rev ON throughput_changes(session_id)')
++    assert rev._tables_exact(db) is None
++    before = db.total_changes
++    assert not rev.install(db)
++    assert rev.settle_schema(db)
++    assert db.total_changes == before
++    assert rev.read_stamp(db) is None
++
++
++@pytest.mark.parametrize('table', ['session_admissions', 'worker_executions'])
++def test_required_schema_marker(db, table):
++    db.execute(f'DROP TABLE {table}')
++    assert not rev._supported_shape(db)
++
++
++@pytest.mark.parametrize('change', [
++    'id_type', 'id_pk', 'ended_at', 'title', 'compound_session_pk',
++    'usage_type', 'usage_nullable', 'usage_pk', 'without_rowid',
++])
++def test_column_shapes(db, change):
++    other = sqlite3.connect(':memory:')
++    try:
++        for table in ('sessions', 'session_model_usage', 'session_admissions', 'worker_executions'):
++            ddl = db.execute('SELECT sql FROM sqlite_master WHERE name=?', (table,)).fetchone()[0]
++            replacements = {
++                ('sessions', 'id_type'): ('id TEXT PRIMARY KEY', 'id BLOB PRIMARY KEY'),
++                ('sessions', 'id_pk'): ('id TEXT PRIMARY KEY', 'id TEXT'),
++                ('sessions', 'ended_at'): ('ended_at', 'ended_other'),
++                ('sessions', 'title'): ('title TEXT', 'other_title TEXT'),
++                ('sessions', 'compound_session_pk'): ('id TEXT PRIMARY KEY', 'id TEXT'),
++                ('session_model_usage', 'usage_type'): ('input_tokens INTEGER', 'input_tokens REAL'),
++                ('session_model_usage', 'usage_nullable'): ('model TEXT NOT NULL', 'model TEXT'),
++                ('session_model_usage', 'usage_pk'): ('billing_mode, task)', 'billing_mode)'),
++            }
++            replacement = replacements.get((table, change))
++            if replacement:
++                ddl = ddl.replace(*replacement, 1)
++            if table == 'sessions' and change == 'compound_session_pk':
++                ddl = ddl.rstrip()[:-1] + ', PRIMARY KEY(id, source))'
++            if table == 'sessions' and change == 'without_rowid':
++                ddl += ' WITHOUT ROWID'
++            other.execute(ddl)
++        title = 'other_title' if change == 'title' else 'title'
++        other.execute(f'CREATE UNIQUE INDEX idx_sessions_title_unique ON sessions({title}) WHERE {title} IS NOT NULL')
++        assert not rev._supported_shape(other), change
++    finally:
++        other.close()
++
++
++@pytest.mark.parametrize('sql', [
++    'CREATE UNIQUE INDEX unexpected_unique ON sessions(source)',
++    'CREATE UNIQUE INDEX expression_unique ON sessions(lower(source))',
++    'CREATE UNIQUE INDEX extra_usage_unique ON session_model_usage(model)',
++])
++def test_unexpected_unique_keys(db, sql):
++    db.execute(sql)
++    assert not rev._supported_shape(db)
++
++
++def test_missing_stamp_never_reuses_memo(db, monkeypatch):
++    from hermes_cli import machine_throughput_incremental as inc
++
++    inc.reset()
++    assert inc.read(db, 'fixture', (1, 2)) is not None
++    monkeypatch.setattr(rev, 'read_stamp', lambda _: None)
++    assert inc.read(db, 'fixture', (1, 2)) is None
++    assert 'fixture' not in inc._memos
++
++
++@pytest.mark.parametrize('lost', [
++    ('throughput_anchors',), ('throughput_changes',), ('throughput_revision',),
++    ('throughput_anchors', 'throughput_changes'),
++    ('throughput_anchors', 'throughput_revision'),
++    ('throughput_changes', 'throughput_revision'),
++])
++def test_partial_protocol_loss_does_not_break_session_writers(db, lost):
++    for table in lost:
++        db.execute(f'DROP TABLE {table}')
++    surviving = {name: db.execute(f'SELECT * FROM {name}').fetchall()
++                 for name in rev._TABLE_SQL if name not in lost}
++    assert not rev.install(db)
++    assert rev.settle_schema(db)
++    assert rev.read_stamp(db) is None
++    assert {name: db.execute(f'SELECT * FROM {name}').fetchall()
++            for name in surviving} == surviving
++    db.execute("INSERT INTO sessions(id,source,started_at) VALUES ('after-loss','test',1)")
++    db.execute("INSERT INTO session_model_usage(session_id,model,input_tokens) VALUES ('after-loss','m',7)")
++    assert db.execute("SELECT id FROM sessions WHERE id='after-loss'").fetchone() == ('after-loss',)
++
++
++@pytest.mark.parametrize('foreign', ['future', 'table', 'index', 'trigger', 'view'])
++def test_partial_cleanup_preserves_foreign_schema(db, foreign):
++    db.execute('DROP TABLE throughput_anchors')
++    statements = {
++        'future': ['UPDATE throughput_revision SET version=2'],
++        'table': ['ALTER TABLE throughput_revision ADD COLUMN alien TEXT'],
++        'index': ['DROP INDEX throughput_changes_rev',
++                  'CREATE INDEX throughput_changes_rev ON throughput_changes(session_id)'],
++        'trigger': ['DROP TRIGGER throughput_sessions_ai',
++                    'CREATE TRIGGER throughput_sessions_ai AFTER INSERT ON sessions BEGIN SELECT 1; END'],
++        'view': ['CREATE VIEW throughput_anchors AS SELECT 1 AS slot'],
++    }
++    for statement in statements[foreign]:
++        db.execute(statement)
++    before = db.execute('SELECT type,name,sql FROM sqlite_master ORDER BY name').fetchall()
++    assert rev.settle_schema(db)
++    assert db.execute('SELECT type,name,sql FROM sqlite_master ORDER BY name').fetchall() == before
++
++
++def test_partial_cleanup_failure_is_atomic_and_retryable(db):
++    db.execute('DROP TABLE throughput_anchors')
++    before = rev._master(db, 'trigger')
++
++    def refuse_late_drop(action, name, *args):
++        if action == sqlite3.SQLITE_DROP_TRIGGER and name == 'throughput_usage_ai':
++            return sqlite3.SQLITE_DENY
++        return sqlite3.SQLITE_OK
++
++    db.set_authorizer(refuse_late_drop)
++    assert not rev.settle_schema(db)
++    db.set_authorizer(None)
++    assert rev._master(db, 'trigger') == before
++    assert rev.settle_schema(db)
++    db.execute("INSERT INTO sessions(id,source,started_at) VALUES ('recovered','test',1)")
++
++
++def test_compound_pk_column_guard_independently(db, monkeypatch):
++    original = rev._columns
++
++    def columns(conn, table):
++        result = original(conn, table)
++        if table == 'sessions':
++            typ, nullable, _ = result['source']
++            result['source'] = (typ, nullable, 2)
++        return result
++
++    # Isolate the column guard from the redundant UNIQUE-index shape guard.
++    monkeypatch.setattr(rev, '_columns', columns)
++    assert not rev._supported_shape(db)
++
++
++@pytest.mark.parametrize('layout', ['complete', 'absent'])
++def test_partial_cleanup_requires_partial_layout(db, layout):
++    from hermes_cli.session_throughput_repair import disable_stranded
++
++    if layout == 'absent':
++        for table in rev._TABLE_SQL:
++            db.execute(f'DROP TABLE {table}')
++    before = rev._master(db, 'trigger')
++    assert disable_stranded(db) is None
++    assert rev._master(db, 'trigger') == before
++
++
++@pytest.mark.parametrize('version', [None, 'future', 2])
++def test_partial_cleanup_requires_known_single_version(db, version):
++    from hermes_cli.session_throughput_repair import disable_stranded
++
++    db.execute('DROP TABLE throughput_anchors')
++    if version is None:
++        db.execute('DELETE FROM throughput_revision')
++    else:
++        db.execute('UPDATE throughput_revision SET version=?', (version,))
++    before = rev._master(db, 'trigger')
++    assert disable_stranded(db) is None
++    assert rev._master(db, 'trigger') == before
++
++
++def test_partial_cleanup_closed_connection_is_retryable():
++    from hermes_cli.session_throughput_repair import disable_stranded
++
++    conn = sqlite3.connect(':memory:')
++    conn.close()
++    assert disable_stranded(conn) is False
++
++
++def test_closed_connection_is_unproven():
++    conn = sqlite3.connect(':memory:')
++    conn.close()
++    assert not rev._supported_shape(conn)
++    assert not rev.install(conn)
++    assert rev.read_stamp(conn) is None
++    assert not rev.anchor_matches(conn, 0, b'x' * 16)
+diff --git a/tests/hermes_cli/test_throughput_recovery.py b/tests/hermes_cli/test_throughput_recovery.py
+new file mode 100644
+index 0000000000..f5a258296f
+--- /dev/null
++++ b/tests/hermes_cli/test_throughput_recovery.py
+@@ -0,0 +1,199 @@
++"""History, snapshot and interrupted-delta recovery of throughput totals."""
++import sqlite3
++
++import pytest
++
++from hermes_cli import machine_throughput_incremental as inc
++from hermes_cli import machine_throughput_metrics as mt
++from hermes_cli import session_throughput_revision as rev
++from tests.hermes_cli import test_throughput_differential as helpers
++
++store = helpers.store
++assert_oracle = helpers.assert_oracle
++
++
++@pytest.mark.parametrize('extra', [0, 2])
++def test_same_inode_backup_fork_at_equal_or_higher_revision(store, extra):
++    path, conn = store
++    fork = sqlite3.connect(':memory:')
++    conn.backup(fork)
++    conn.execute("UPDATE session_model_usage SET input_tokens=90 WHERE session_id='a'")
++    conn.commit()
++    assert_oracle(path, conn)
++    old = inc._memos[str(path.resolve())]
++    inode = path.stat().st_ino
++    fork.execute("UPDATE session_model_usage SET input_tokens=7 WHERE session_id='b'")
++    for _ in range(extra):
++        fork.execute("UPDATE session_model_usage SET input_tokens=input_tokens+1 WHERE session_id='b'")
++    fork.commit()
++    fork.backup(conn)
++    fork.close()
++    # SQLite backup increments the destination schema cookie. Pin it back to
++    # isolate history proof from the independent schema fence.
++    conn.execute(f'PRAGMA schema_version={old.stamp[0]}')
++    assert path.stat().st_ino == inode
++    assert rev.read_stamp(conn)[2] >= old.stamp[2]
++    assert rev.read_stamp(conn)[:2] == old.stamp[:2]
++    assert_oracle(path, conn)
++    assert inc._memos[str(path.resolve())] is not old
++
++
++def test_ring_wrap_rebuilds_even_when_no_keys_were_lost(store, monkeypatch):
++    path, conn = store
++    monkeypatch.setattr(rev, 'RING_SIZE', 4)
++    monkeypatch.setattr(rev, '_TRIGGERS', rev._build_triggers())
++    assert rev.install(conn)
++    # Re-stamp into the newly small ring (the original fixture used 65536).
++    conn.execute("UPDATE session_model_usage SET input_tokens=input_tokens WHERE session_id='a'")
++    conn.commit()
++    assert_oracle(path, conn)
++    old = inc._memos[str(path.resolve())]
++    for _ in range(4):
++        conn.execute("UPDATE session_model_usage SET input_tokens=input_tokens+1 WHERE session_id='a'")
++    conn.commit()
++    assert_oracle(path, conn)
++    assert inc._memos[str(path.resolve())] is not old
++
++
++def test_partial_delta_exception_discards_memo_before_retry(store, monkeypatch):
++    path, conn = store
++    assert_oracle(path, conn)
++    conn.execute('UPDATE session_model_usage SET input_tokens=8')
++    conn.commit()
++    original = inc._load
++    calls = []
++
++    def fail_second(db, key=None):
++        calls.append(key)
++        if len(calls) == 2:
++            raise sqlite3.OperationalError('injected read failure')
++        return original(db, key)
++
++    with monkeypatch.context() as scoped:
++        scoped.setattr(inc, '_load', fail_second)
++        assert mt.counters(path.parent) == {}
++    assert len(calls) == 2
++    assert str(path.resolve()) not in inc._memos
++    assert_oracle(path, conn)
++
++
++def test_writer_commit_between_stamp_and_delta_keeps_one_snapshot(store, monkeypatch):
++    path, conn = store
++    conn.execute('PRAGMA journal_mode=WAL')
++    assert_oracle(path, conn)
++    conn.execute("UPDATE session_model_usage SET input_tokens=8 WHERE session_id='a'")
++    conn.commit()
++    expected = mt._full_read(conn)
++    original = rev.read_stamp
++
++    def commit_after_stamp(db):
++        stamp = original(db)
++        conn.execute("UPDATE session_model_usage SET input_tokens=99 WHERE session_id='a'")
++        conn.commit()
++        return stamp
++
++    with monkeypatch.context() as scoped:
++        scoped.setattr(rev, 'read_stamp', commit_after_stamp)
++        result = mt._read(path)
++        assert result == (sum(r[1] for r in expected[0]), sum(r[2] for r in expected[0]), *expected[1:])
++    assert_oracle(path, conn)
++
++
++def test_inode_replacement_during_read_rejects_result(store, monkeypatch, tmp_path):
++    path, conn = store
++    assert_oracle(path, conn)
++    replacement = tmp_path / 'replacement.db'
++    target = sqlite3.connect(replacement)
++    conn.backup(target)
++    target.close()
++    original = inc.read
++
++    def replace_after_read(db, key, identity):
++        result = original(db, key, identity)
++        replacement.replace(path)
++        return result
++
++    with monkeypatch.context() as scoped:
++        scoped.setattr(inc, 'read', replace_after_read)
++        assert mt.counters(path.parent) == {}
++    assert str(path.resolve()) not in inc._memos
++    assert_oracle(path, conn)
++
++
++def test_path_cap_prune_and_reset(store, monkeypatch, tmp_path):
++    path, conn = store
++    monkeypatch.setattr(inc, 'MAX_PATHS', 2)
++    for i in range(3):
++        other = tmp_path / f'copy{i}.db'
++        target = sqlite3.connect(other)
++        conn.backup(target)
++        target.close()
++        assert_oracle(other, conn)
++        assert len(inc._memos) <= 2
++    assert str((tmp_path / 'copy0.db').resolve()) not in inc._memos
++    mt.counters(path.parent)
++    assert set(inc._memos) == {str(path.resolve())}
++    mt.cached_counters(path.parent)
++    assert mt._cache is not None
++    mt.reset_cache()
++    assert not inc._memos and mt._cache is None
++
++
++@pytest.mark.parametrize('bound,limit,sql', [
++    ('MAX_IDS', 3, "INSERT INTO sessions(id,source,started_at) VALUES ('d','test',1)"),
++    ('MAX_MODELS', 2, "INSERT INTO session_model_usage(session_id,model,input_tokens) VALUES ('a','new',1)"),
++    ('MAX_ROWS', 3, "INSERT INTO session_model_usage(session_id,model,input_tokens,task) VALUES ('a','m',1,'aux')"),
++])
++def test_delta_global_caps_discard_then_recover(store, monkeypatch, bound, limit, sql):
++    path, conn = store
++    monkeypatch.setattr(inc, bound, limit)
++    assert_oracle(path, conn)
++    assert str(path.resolve()) in inc._memos
++    conn.execute(sql)
++    conn.commit()
++    assert_oracle(path, conn)
++    assert str(path.resolve()) not in inc._memos
++    monkeypatch.setattr(inc, bound, 100)
++    assert_oracle(path, conn)
++    assert str(path.resolve()) in inc._memos
++
++
++@pytest.mark.parametrize('guard', ['identity', 'schema', 'epoch', 'floor', 'regression'])
++def test_each_cursor_fence_rebuilds_independently(store, guard):
++    path, conn = store
++    assert_oracle(path, conn)
++    old = inc._memos[str(path.resolve())]
++    statements = {
++        'schema': ['CREATE TABLE unrelated_schema_change (id INTEGER)'],
++        'epoch': ['UPDATE throughput_revision SET epoch=randomblob(16)'],
++        'floor': ["UPDATE session_model_usage SET input_tokens=8 WHERE session_id='a'",
++                  'UPDATE throughput_revision SET floor=rev,keys=0',
++                  'DELETE FROM throughput_changes'],
++    }
++    for statement in statements.get(guard, []):
++        conn.execute(statement)
++    if guard == 'identity':
++        old.identity = (old.identity[0], old.identity[1] + 1)
++    if guard == 'regression':
++        # Keep history evidence valid while isolating the counter regression.
++        current = rev.read_stamp(conn)
++        old.stamp = (*old.stamp[:2], current[2] + 1, old.stamp[3], old.stamp[4])
++        conn.execute('INSERT OR REPLACE INTO throughput_anchors(slot,rev,nonce) VALUES (?,?,?)',
++                     ((current[2]+1) % rev.RING_SIZE, current[2]+1, old.stamp[3]))
++    conn.commit()
++    assert_oracle(path, conn)
++    assert inc._memos[str(path.resolve())] is not old
++
++
++def test_sql_int64_sum_overflow_omits_whole_host_then_recovers(store):
++    path, conn = store
++    assert_oracle(path, conn)
++    conn.execute("UPDATE session_model_usage SET input_tokens=? WHERE model='m'", ((1 << 63) - 1,))
++    conn.commit()
++    with pytest.raises(sqlite3.OperationalError, match='integer overflow'):
++        mt._full_read(conn)
++    assert mt.counters(path.parent) == {}
++    assert str(path.resolve()) not in inc._memos
++    conn.execute('UPDATE session_model_usage SET input_tokens=1')
++    conn.commit()
++    assert_oracle(path, conn)
+diff --git a/tests/hermes_cli/test_throughput_revision.py b/tests/hermes_cli/test_throughput_revision.py
+new file mode 100644
+index 0000000000..e007541f60
+--- /dev/null
++++ b/tests/hermes_cli/test_throughput_revision.py
+@@ -0,0 +1,202 @@
++"""Writer journal bounds and supported-shape refusal."""
++import sqlite3
++
++import pytest
++
++from hermes_state import SessionDB
++from hermes_cli import session_throughput_revision as rev
++
++
++@pytest.fixture
++def db(tmp_path):
++    path = tmp_path / 'state.db'
++    store = SessionDB(db_path=path)
++    store.close()
++    conn = sqlite3.connect(path)
++    yield conn
++    conn.close()
++
++
++def test_stamp_does_not_scan_historical_keys(db):
++    work = []
++    for count in (100, 1000):
++        db.executemany("INSERT INTO sessions(id,source,started_at) VALUES (?,'test',1)",
++                       ((f'{count}-{i}',) for i in range(count)))
++        steps = [0]
++
++        def progress():
++            steps[0] += 1
++            return 0
++
++        db.set_progress_handler(progress, 1)
++        db.execute("UPDATE sessions SET ended_at=2 WHERE id=?", (f'{count}-0',))
++        db.set_progress_handler(None, 0)
++        work.append(steps[0])
++    assert work[1] <= work[0] * 1.5, work
++
++
++@pytest.mark.parametrize('column', ['rowid', '_rowid_', 'oid'])
++def test_rowid_shadow_is_full_only(db, column):
++    assert rev.read_stamp(db) is not None
++    db.execute(f'ALTER TABLE sessions ADD COLUMN {column} INTEGER')
++    assert rev.read_stamp(db) is None
++
++
++@pytest.mark.parametrize('table,column', [('sessions', 'title'), ('session_model_usage', 'model')])
++@pytest.mark.parametrize('collation', ['NOCASE', 'RTRIM'])
++def test_declared_collation_cannot_hide_behind_binary_index(db, table, column, collation):
++    other = sqlite3.connect(':memory:')
++    try:
++        for name in ('sessions', 'session_model_usage', 'session_admissions', 'worker_executions'):
++            ddl = db.execute('SELECT sql FROM sqlite_master WHERE name=?', (name,)).fetchone()[0]
++            if name == table:
++                ddl = ddl.replace(f'{column} TEXT', f'{column} TEXT COLLATE {collation}')
++                # The index collation deliberately masks the column collation.
++                if column == 'model':
++                    ddl = ddl.replace('PRIMARY KEY (session_id, model,',
++                                      'PRIMARY KEY (session_id, model COLLATE BINARY,')
++            other.execute(ddl)
++        other.execute('CREATE UNIQUE INDEX idx_sessions_title_unique '
++                      'ON sessions(title COLLATE BINARY) WHERE title IS NOT NULL')
++        assert not rev.install(other)
++    finally:
++        other.close()
++
++
++def test_partial_title_predicate_must_be_exact(db):
++    db.execute('DROP INDEX idx_sessions_title_unique')
++    db.execute('CREATE UNIQUE INDEX idx_sessions_title_unique ON sessions(title) '
++               'WHERE title IS NOT NULL AND title != \'excluded\'')
++    assert rev.read_stamp(db) is None
++
++
++@pytest.mark.parametrize('column,value', [('rev', 'bad'), ('floor', 'bad'), ('keys', 'bad'),
++                                         ('epoch', b'x'), ('nonce', b'x')])
++def test_corrupt_stamp_falls_back_without_exception(db, column, value):
++    db.execute(f'UPDATE throughput_revision SET {column}=?', (value,))
++    if column == 'nonce':
++        db.execute('UPDATE throughput_anchors SET nonce=?', (value,))
++    assert rev.read_stamp(db) is None
++
++
++def test_rotation_cap_rollover_and_ring_wrap(db, monkeypatch):
++    # Small constants exercise the exact generated production SQL, not a
++    # hand-written substitute, without hundreds of thousands of writes.
++    monkeypatch.setattr(rev, 'KEY_CAP', 3)
++    monkeypatch.setattr(rev, 'RING_SIZE', 4)
++    monkeypatch.setattr(rev, 'REV_LIMIT', 12)
++    monkeypatch.setattr(rev, '_TRIGGERS', rev._build_triggers())
++    assert rev.install(db)
++    first = rev.read_stamp(db)
++    assert first is not None
++    for i in range(20):
++        db.execute("INSERT INTO sessions(id,source,started_at) VALUES (?,'test',1)", (str(i),))
++        stamp = rev.read_stamp(db)
++        assert stamp is not None
++        actual_keys = db.execute('SELECT COUNT(*) FROM throughput_changes').fetchone()[0]
++        keys = db.execute('SELECT keys FROM throughput_revision').fetchone()[0]
++        assert actual_keys == keys <= 3
++        assert db.execute('SELECT COUNT(*) FROM throughput_anchors').fetchone()[0] <= 4
++        assert rev.changes_since(db, stamp[2] - 1) == [str(i)]
++    assert stamp[1] != first[1]
++    assert stamp[2] < 20  # revision rollover really ran
++    assert not rev.anchor_matches(db, first[2], first[3])
++
++
++def test_empty_journal_requires_floor_and_zero_keys(db):
++    db.execute("INSERT INTO sessions(id,source,started_at) VALUES ('a','test',1)")
++    assert rev.read_stamp(db) is not None
++    db.execute('DELETE FROM throughput_changes')
++    assert rev.read_stamp(db) is None
++    db.execute('UPDATE throughput_revision SET floor=rev')
++    assert rev.read_stamp(db) is None  # nonzero keys is independently unsafe
++    db.execute('UPDATE throughput_revision SET keys=0')
++    assert rev.read_stamp(db) is not None
++    db.execute("UPDATE sessions SET ended_at=1 WHERE id='a'")
++    assert rev.read_stamp(db) is not None
++    assert db.execute('SELECT keys FROM throughput_revision').fetchone()[0] == 1
++
++
++def test_future_protocol_is_not_rewritten(db):
++    db.execute('UPDATE throughput_revision SET version=2')
++    before = db.execute('SELECT * FROM throughput_revision').fetchall()
++    assert not rev.install(db)
++    assert rev.read_stamp(db) is None
++    assert db.execute('SELECT * FROM throughput_revision').fetchall() == before
++
++
++def test_transient_install_failure_retries_on_memoized_open(tmp_path, monkeypatch):
++    import hermes_state_schema_memo as memo
++    from types import SimpleNamespace
++
++    path = tmp_path / 'retry.db'
++    memo.clear()
++    now = [1000.0]
++    monkeypatch.setattr(memo, 'time', SimpleNamespace(monotonic=lambda: now[0]))
++    original = rev.install
++    calls = []
++
++    def fail_once(conn):
++        calls.append(1)
++        return False if len(calls) == 1 else original(conn)
++
++    monkeypatch.setattr(rev, 'install', fail_once)
++    first = SessionDB(db_path=path)
++    first.close()
++    now[0] += memo.HEAL_RETRY_S
++    second = SessionDB(db_path=path)
++    try:
++        assert rev.read_stamp(second._conn) is not None
++        assert len(calls) == 2
++    finally:
++        second.close()
++        memo.clear()
++
++
++@pytest.mark.parametrize('future', [False, True])
++def test_unsupported_and_future_are_settled_without_writes(db, future):
++    if future:
++        db.execute('UPDATE throughput_revision SET version=2')
++    else:
++        db.execute('ALTER TABLE sessions ADD COLUMN rowid INTEGER')
++    db.commit()
++    before = db.total_changes
++    assert rev.settle_schema(db)
++    assert db.total_changes == before
++    assert rev.read_stamp(db) is None
++
++
++def test_install_failure_rolls_back_all_protocol_ddl(db):
++    rev.drop_triggers(db)
++    for name in rev._TABLE_SQL:
++        db.execute(f'DROP TABLE {name}')
++    db.commit()
++
++    def refuse_trigger(action, arg1, arg2, database, source):
++        if action == sqlite3.SQLITE_CREATE_TRIGGER and arg1 == 'throughput_usage_ai':
++            return sqlite3.SQLITE_DENY
++        return sqlite3.SQLITE_OK
++
++    db.set_authorizer(refuse_trigger)
++    assert not rev.install(db)
++    db.set_authorizer(None)
++    assert db.execute("SELECT name FROM sqlite_master WHERE name LIKE 'throughput_%'").fetchall() == []
++    assert rev.install(db)
++    assert rev.read_stamp(db) is not None
++
++
++def test_install_repairs_missing_current_anchor(db):
++    db.execute("INSERT INTO sessions(id,source,started_at) VALUES ('a','test',1)")
++    before = rev.read_stamp(db)
++    db.execute('DELETE FROM throughput_anchors')
++    assert rev.read_stamp(db) is None
++    assert rev.install(db)
++    after = rev.read_stamp(db)
++    assert after is not None
++    assert after[1] != before[1]
++
++
++def test_missing_title_index_is_full_only(db):
++    assert rev.read_stamp(db) is not None
++    db.execute('DROP INDEX idx_sessions_title_unique')
++    assert rev.read_stamp(db) is None
+-- 
+2.43.0
+

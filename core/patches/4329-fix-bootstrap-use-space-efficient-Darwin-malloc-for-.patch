@@ -1,0 +1,319 @@
+From c728182d4ab6d5efe59c1d52c94d7b4c300bb046 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 22:53:13 +0000
+Subject: [PATCH] fix(bootstrap): use space-efficient Darwin malloc for servers
+ [daveey]
+
+libmalloc reads MallocSpaceEfficient only at process start. Set it at the
+managed interpreter exec, or re-exec once from bootstrap for in-place
+server relaunches. Scrub Hermes-owned variables after exec so agent child
+commands keep their default allocator; preserve operator values and an
+environment-only opt-out. Share the existing server argv predicate.
+
+Register the new stdlib bootstrap module in the startup syntax inventory.
+No gateway restart or delivery is part of this change.
+
+Proof (Linux, patched/passed platform; native footprint effect untested):
+RED on parent 542663b487e8efb79038bcc834593ecc72a00608, new test file only:
+  hermes-core-wt test tests/hermes_cli/test_launch_malloc_env.py
+  7 failed in 0.99s; all seven fail importing absent launch_malloc.
+GREEN after implementation:
+  test_launch_malloc_env.py (7 passed)
+  Required seven existing regression files pass unchanged (90 passed).
+  Expanded run: 14 files, 1514 passed, 0 failed, 1 Windows-only skipped,
+  95.5s. Includes venv_sync consumers, startup syntax inventory and
+  subprocess encoding/environment guards.
+  scripts/check: 20 checks ok before main advanced; final gate reruns on
+  rebased head through canonical ship.
+
+The live macOS footprint effect belongs to the separate measurement card;
+these tests establish environment plumbing only.
+---
+ cli-config.yaml.example                    |   4 +
+ hermes_bootstrap.py                        |   6 +-
+ hermes_cli/launch_malloc.py                |  52 ++++++++++
+ hermes_cli/resource_limits.py              |  14 +--
+ hermes_cli/venv_sync.py                    |   7 +-
+ pyproject.toml                             |   2 +-
+ tests/hermes_cli/test_launch_malloc_env.py | 109 +++++++++++++++++++++
+ 7 files changed, 178 insertions(+), 16 deletions(-)
+ create mode 100644 hermes_cli/launch_malloc.py
+ create mode 100644 tests/hermes_cli/test_launch_malloc_env.py
+
+diff --git a/cli-config.yaml.example b/cli-config.yaml.example
+index 8be1b37d28..74cc3a5931 100644
+--- a/cli-config.yaml.example
++++ b/cli-config.yaml.example
+@@ -44,6 +44,10 @@ database:
+ # process (Linux/glibc only; child commands keep glibc's default). An explicit
+ # MALLOC_ARENA_MAX (exported or in .env) wins. 0, false, or null = glibc default
+ # (8 per CPU core). Default: 4.
++# On macOS, gateway / serve / dashboard start with MallocSpaceEfficient=1;
++# child commands do not inherit Hermes' setting. Export
++# HERMES_MALLOC_SPACE_EFFICIENT=0 to opt out (environment only: config is not
++# loaded at exec time). An operator-exported MallocSpaceEfficient value wins.
+ runtime:
+   nofile_soft_limit: 4096
+   malloc_arena_max: 4
+diff --git a/hermes_bootstrap.py b/hermes_bootstrap.py
+index 830e00bd29..6b26534cb8 100644
+--- a/hermes_bootstrap.py
++++ b/hermes_bootstrap.py
+@@ -634,7 +634,11 @@ if not _pm_repair:
+                 import subprocess
+ 
+                 raise RelaunchExit(subprocess.call(_command))
+-            exec_launch(_launch_python, _command)
++            exec_launch(_launch_python, _command, sys.argv[1:])
++        else:
++            from hermes_cli import launch_malloc
++
++            launch_malloc.ensure(sys.argv[1:])
+     except Exception as exc:
+         if isinstance(exc, PermissionError) and (message := install_state_permission_message(_root, exc)):
+             print(f"hermes: {message}", file=sys.stderr)
+diff --git a/hermes_cli/launch_malloc.py b/hermes_cli/launch_malloc.py
+new file mode 100644
+index 0000000000..99b87d971d
+--- /dev/null
++++ b/hermes_cli/launch_malloc.py
+@@ -0,0 +1,52 @@
++"""Exec-time Darwin malloc policy, scrubbed before servers launch child commands.
++
++Stdlib only: bootstrap imports this before activating dependencies.
++"""
++
++from __future__ import annotations
++
++import os
++import sys
++
++ENV = "MallocSpaceEfficient"
++MARK = "HERMES_LAUNCH_MALLOC_SET"
++OPT_OUT = "HERMES_MALLOC_SPACE_EFFICIENT"
++
++
++def server_argv(argv: list[str]) -> bool:
++    """True when *argv* (``sys.argv[1:]``) launches a long-lived server: ``serve``, ``dashboard`` or a
++    foreground ``gateway`` (``gateway`` / ``gateway run``)."""
++    from hermes_cli._parser import command_argv
++
++    args = command_argv(argv)
++    if not args:
++        return False
++    if args[0] in ("serve", "dashboard"):
++        return True
++    return args[0] == "gateway" and (len(args) == 1 or args[1] == "run" or args[1].startswith("-"))
++
++
++def launch_env(argv, environ=os.environ, platform=sys.platform) -> dict[str, str]:
++    """Environment delta for server exec; an operator's malloc setting always wins."""
++    if (platform != "darwin" or not server_argv(argv) or ENV in environ
++            or environ.get(OPT_OUT, "").lower() in ("0", "false", "no", "off")):
++        return {}
++    return {ENV: "1", MARK: "1"}
++
++
++def ensure(argv, *, execv=os.execv) -> None:
++    """Re-exec once so libmalloc reads the setting, then hide it from child commands."""
++    if MARK in os.environ:
++        os.environ.pop(MARK, None)
++        os.environ.pop(ENV, None)
++        return
++    settings = launch_env(argv, os.environ, sys.platform)
++    if not settings:
++        return
++    os.environ.update(settings)
++    try:
++        execv(sys.executable, sys.orig_argv)
++    except OSError:
++        # Best effort: a denied exec must neither break startup nor leak to children.
++        os.environ.pop(MARK, None)
++        os.environ.pop(ENV, None)
+diff --git a/hermes_cli/resource_limits.py b/hermes_cli/resource_limits.py
+index d47a169166..3db5d53f42 100644
+--- a/hermes_cli/resource_limits.py
++++ b/hermes_cli/resource_limits.py
+@@ -9,6 +9,7 @@ from collections.abc import Mapping
+ from typing import Any
+ 
+ from hermes_cli.config_defaults import DEFAULT_CONFIG
++from hermes_cli.launch_malloc import server_argv as server_process_argv
+ 
+ try:  # ``resource`` is POSIX-only (and unavailable on Windows).
+     import resource as _resource
+@@ -169,19 +170,6 @@ def apply_malloc_arena_max(config: Mapping[str, Any] | None = None) -> bool:
+         return False
+ 
+ 
+-def server_process_argv(argv: list[str]) -> bool:
+-    """True when *argv* (``sys.argv[1:]``) launches a long-lived server: ``serve``, ``dashboard`` or a
+-    foreground ``gateway`` (``gateway`` / ``gateway run``)."""
+-    from hermes_cli._parser import command_argv
+-
+-    args = command_argv(argv)
+-    if not args:
+-        return False
+-    if args[0] in ("serve", "dashboard"):
+-        return True
+-    return args[0] == "gateway" and (len(args) == 1 or args[1] == "run" or args[1].startswith("-"))
+-
+-
+ __all__ = [
+     "DEFAULT_MALLOC_ARENA_MAX", "DEFAULT_NOFILE_SOFT_LIMIT", "apply_malloc_arena_max",
+     "apply_nofile_soft_limit", "configured_nofile_soft_limit", "glibc_malloc", "server_process_argv"]
+diff --git a/hermes_cli/venv_sync.py b/hermes_cli/venv_sync.py
+index 85bfdeb95e..cefac2d356 100644
+--- a/hermes_cli/venv_sync.py
++++ b/hermes_cli/venv_sync.py
+@@ -521,13 +521,18 @@ def launch_handoff_env() -> dict[str, str]:
+     return {LAUNCH_HANDOFF_ENV: f"{verdict}:{os.getpid()}:{root}"}
+ 
+ 
+-def exec_launch(python: Path, command: list[str]) -> None:
++def exec_launch(python: Path, command: list[str], argv: list[str] | None = None) -> None:
+     """POSIX: exec into the managed interpreter, handing it this launch's verdict.
+ 
+     Only returns by raising. A failed exec keeps running in this process, so the verdict is
+     withdrawn first: it must not reach subprocesses or a later same-pid re-exec (which would
+     then skip its own currency check)."""
++    import sys
++
++    from hermes_cli.launch_malloc import launch_env
++
+     handoff = launch_handoff_env()
++    handoff.update(launch_env(argv or [], os.environ, sys.platform))
+     os.environ.update(handoff)
+     try:
+         os.execv(str(python), command)
+diff --git a/pyproject.toml b/pyproject.toml
+index ef8d272e6c..bd0021077a 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -610,7 +610,7 @@ opt-in-extras = ["kittentts"]
+ # files updates its path here.
+ update-startup-files = [
+   "hermes_bootstrap.py", "hermes_cli/_parser.py", "hermes_cli/_launchers.py", "hermes_cli/_launch_template.py",
+-  "hermes_cli/git_fingerprint.py", "hermes_cli/proof_home.py",
++  "hermes_cli/git_fingerprint.py", "hermes_cli/proof_home.py", "hermes_cli/launch_malloc.py",
+   "hermes_cli/code_attestation.py", "hermes_cli/local_work.py",
+   "hermes_cli/_early_recovery.py", "hermes_cli/update_lock.py", "hermes_cli/update_custody.py",
+   "hermes_cli/update_handoff.py", "hermes_cli/venv_sync.py", "pm/__init__.py", "pm/environments.py",
+diff --git a/tests/hermes_cli/test_launch_malloc_env.py b/tests/hermes_cli/test_launch_malloc_env.py
+new file mode 100644
+index 0000000000..7a05436a3e
+--- /dev/null
++++ b/tests/hermes_cli/test_launch_malloc_env.py
+@@ -0,0 +1,109 @@
++"""Portable coverage of exec-time Darwin malloc policy and child isolation."""
++
++import os
++import sys
++from pathlib import Path
++from unittest.mock import Mock
++
++import pytest
++
++
++def _policy(monkeypatch):
++    from hermes_cli import launch_malloc
++
++    for name in (launch_malloc.ENV, launch_malloc.MARK, launch_malloc.OPT_OUT):
++        monkeypatch.delenv(name, raising=False)
++    monkeypatch.setattr(sys, "platform", "darwin")  # os-marker: ok — pure environment policy; exec is stubbed
++    return launch_malloc
++
++
++def test_darwin_server_selection():
++    from hermes_cli import launch_malloc as policy
++
++    for argv in (["gateway", "run"], ["serve", "--port", "1"], ["dashboard"]):
++        assert policy.launch_env(argv, {}, "darwin") == {policy.ENV: "1", policy.MARK: "1"}
++    for argv in (["chat"], ["kanban", "list"], [], ["gateway", "status"]):
++        assert policy.launch_env(argv, {}, "darwin") == {}
++
++
++def test_other_platforms_unchanged():
++    from hermes_cli import launch_malloc as policy
++
++    for platform in ("linux", "win32"):
++        assert policy.launch_env(["serve"], {}, platform) == {}
++
++
++def test_operator_value_preserved(monkeypatch):
++    policy = _policy(monkeypatch)
++    execute = Mock()
++    for value in ("0", "1"):
++        monkeypatch.setenv(policy.ENV, value)
++        assert policy.launch_env(["serve"], os.environ, "darwin") == {}
++        policy.ensure(["serve"], execv=execute)
++        assert os.environ[policy.ENV] == value
++        assert policy.MARK not in os.environ
++    execute.assert_not_called()
++
++
++def test_opt_out(monkeypatch):
++    policy = _policy(monkeypatch)
++    for value in ("0", "false", "NO", "Off"):
++        assert policy.launch_env(["serve"], {policy.OPT_OUT: value}, "darwin") == {}
++    assert policy.launch_env(["serve"], {policy.OPT_OUT: "1"}, "darwin")
++
++
++def test_mark_scrubs_child_environment(monkeypatch):
++    policy = _policy(monkeypatch)
++    monkeypatch.setenv(policy.MARK, "1")
++    monkeypatch.setenv(policy.ENV, "1")
++    execute = Mock()
++    policy.ensure(["serve"], execv=execute)
++    assert policy.MARK not in os.environ
++    assert policy.ENV not in os.environ
++    execute.assert_not_called()
++
++
++def test_ensure_exec_once_and_withdraw_on_failure(monkeypatch):
++    policy = _policy(monkeypatch)
++    calls = []
++
++    def execute(python, command):
++        calls.append((python, command))
++        assert os.environ[policy.ENV] == os.environ[policy.MARK] == "1"
++
++    policy.ensure(["serve"], execv=execute)
++    assert calls == [(sys.executable, sys.orig_argv)]
++    policy.ensure(["serve"], execv=execute)
++    assert len(calls) == 1
++    assert policy.ENV not in os.environ
++    assert policy.MARK not in os.environ
++
++    def fail(python, command):
++        execute(python, command)
++        raise OSError("exec refused")
++
++    policy.ensure(["serve"], execv=fail)
++    assert len(calls) == 2
++    assert policy.ENV not in os.environ
++    assert policy.MARK not in os.environ
++
++
++def test_exec_launch_carries_and_withdraws_policy(monkeypatch):
++    from hermes_cli import venv_sync
++
++    policy = _policy(monkeypatch)
++    monkeypatch.setattr(venv_sync, "launch_handoff_env", lambda: {venv_sync.LAUNCH_HANDOFF_ENV: "test"})
++    calls = []
++
++    def execute(python, command):
++        calls.append((python, command))
++        assert os.environ[policy.ENV] == os.environ[policy.MARK] == "1"
++        assert os.environ[venv_sync.LAUNCH_HANDOFF_ENV] == "test"
++        raise OSError("exec refused")
++
++    monkeypatch.setattr(os, "execv", execute)
++    with pytest.raises(OSError, match="exec refused"):
++        venv_sync.exec_launch(Path("/python"), ["/python", "hermes", "serve"], ["serve"])
++    assert calls == [("/python", ["/python", "hermes", "serve"])]
++    for name in (policy.ENV, policy.MARK, venv_sync.LAUNCH_HANDOFF_ENV):
++        assert name not in os.environ
+-- 
+2.43.0
+

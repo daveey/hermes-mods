@@ -1,0 +1,358 @@
+From de1805afac39794c5362787573be95e0b6a5bf5f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 16:46:04 +0000
+Subject: [PATCH] [daveey] CI lint: advisory diff steps fetch through
+ fetch-merge-base, so git 2.55's promisor BUG no longer skips them
+
+Problem: in lint.yml's Python lints job, "Fetch the merge base" makes the checkout a partial
+clone (--filter=tree:0). The two advisory steps after it ("Profile-scope patterns on added
+lines", "Public-surface diff vs base") then ran their own `git fetch --deepen=200/1000` on that
+clone. On git 2.55.0 a fetch from the promisor remote can die in index-pack:
+  BUG: builtin/pack-objects.c:5004: should_include_obj should only be called on existing objects
+  fatal: could not finish pack-objects to repack local links
+  fatal: index-pack failed   (exit 128)
+On 2026-11-13 15:34-16:30Z this hit 11 of ~44 Python-lints jobs, both steps each (22 step
+failures; e.g. job 131987878957 of run 43455124649). Both steps are continue-on-error, so the
+job stayed green and the two checks silently never ran. PR #2268 (d5c84b2590) gave only
+fetch-merge-base.sh a fallback for this BUG.
+
+Five whys:
+1. Why did the checks not run? Their first `git fetch --deepen` exited 128 under bash -e.
+2. Why 128? git 2.55's index-pack, in promisor mode, aborts while repacking local links.
+3. Why promisor mode? Step "Fetch the merge base" had already made the repo a partial clone.
+4. Why didn't #2268's fallback catch it? These steps had their own inline fetch, not the script.
+5. Why was it invisible? continue-on-error with no annotation: a skipped advisory looks green.
+
+Fix: both steps now fetch the base branch and the PR head commit
+(github.event.pull_request.head.sha) with .github/actions/fetch-merge-base/fetch-merge-base.sh,
+the same script and fallback as step 1 (one unfiltered retry with the partial-clone config
+unset, then restored). It fetches complete commit histories, so the deepen loops are gone. They
+pass the head sha as --head (it is the PR head, not the synthetic merge commit, as before). If
+the fetch still fails, the step prints one `::warning title=... advisory skipped::` line and
+exits 0, so a skipped advisory check is visible and stays advisory. fetch-merge-base.sh is
+unchanged.
+
+Test: tests/ci/test_lint_advisory_fetch.py replays both real step scripts from lint.yml on a
+partial clone made by the real fetch-merge-base.sh, with a git shim that fails any fetch in
+promisor mode (or filtered) with the git 2.55 BUG text and exit 128, and a fake `python` that
+records the advisory script's argv and proves a three-dot diff and a blob read on those refs.
+- RED on origin/main's lint.yml: 4 failed (both steps exit 128 on the BUG, both steps' "cannot
+  succeed" case), 4 passed.
+- GREEN: 8 passed; with tests/ci/test_fetch_merge_base.py 18 passed; 9 related CI test files
+  (every file naming lint.yml, plus the workflow job graph) 89 passed.
+- Mutants, all killed: fallback skipped, fallback still filtered, fallback keeps promisor config,
+  config not restored, no ::warning:: line, failed fetch exits 1, wrong --head.
+---
+ .github/workflows/lint.yml           |  54 ++++---
+ tests/ci/test_lint_advisory_fetch.py | 217 +++++++++++++++++++++++++++
+ 2 files changed, 247 insertions(+), 24 deletions(-)
+ create mode 100644 tests/ci/test_lint_advisory_fetch.py
+
+diff --git a/.github/workflows/lint.yml b/.github/workflows/lint.yml
+index 02024cb1e2..a153c9ae12 100644
+--- a/.github/workflows/lint.yml
++++ b/.github/workflows/lint.yml
+@@ -155,47 +155,53 @@ jobs:
+       # raw os.getenv of a platform credential, HOME-only RPC binding, bare-PID liveness). One
+       # process serves many profiles; every pattern leaked the launch profile at least once. Printed
+       # into the log for the reviewer; never fails the job (root AGENTS.md § Rules that apply everywhere).
++      #
++      # Both advisory steps get the PR head's and the base's history from fetch-merge-base.sh, not
++      # from their own `git fetch --deepen`: "Fetch the merge base" above has already made the
++      # checkout a partial clone, and on git 2.55.0 any later fetch from that promisor remote can
++      # die in index-pack ("BUG: builtin/pack-objects.c:5004: should_include_obj ..." / "fatal:
++      # index-pack failed", exit 128). The plain deepen fetches hit it in 11 of ~44 Python-lints
++      # jobs on 2026-11-13 (e.g. run 43455124649) and both checks silently never ran. The script
++      # retries once without promisor mode and restores the partial-clone config (see its header).
++      # When even that fails, the step prints one ::warning:: and skips its check, still green.
+       - name: Profile-scope patterns on added lines (advisory)
+         if: ${{ !cancelled() && steps.setup.outcome == 'success' && inputs.python && github.event_name == 'pull_request' }}
+         continue-on-error: true
+         timeout-minutes: 3
+         env:
+-          PR_HEAD: "+refs/pull/${{ github.event.pull_request.number }}/head:refs/remotes/origin/pr-head"
++          BASE_REF: ${{ github.base_ref }}
++          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+         run: |
+-          git fetch --no-tags --deepen=200 origin "${{ github.base_ref }}" "$PR_HEAD"
+-          for i in 1 2 3; do
+-            git merge-base "origin/${{ github.base_ref }}" origin/pr-head >/dev/null 2>&1 && break
+-            git fetch --no-tags --deepen=1000 origin "${{ github.base_ref }}" "$PR_HEAD"
+-          done
+-          python scripts/check_profile_scope_patterns.py --base "origin/${{ github.base_ref }}" --head origin/pr-head
++          if ! .github/actions/fetch-merge-base/fetch-merge-base.sh "$BASE_REF" "$PR_HEAD_SHA" >/dev/null; then
++            echo "::warning title=Profile-scope advisory skipped::could not fetch ${BASE_REF} and PR head ${PR_HEAD_SHA} history (see the fetch-merge-base lines above)"
++            exit 0
++          fi
++          python scripts/check_profile_scope_patterns.py --base "origin/${BASE_REF}" --head "$PR_HEAD_SHA"
+ 
+       # Advisory: dropped public names / methods / test defs vs the PR base, printed into the log.
+       # A refactor that silently removes a public symbol breaks plugins that import it; the Sep 2026
+       # decomposition opened with 1,703 such drops that reviewers had to find by hand.
+-      # Advisory: it never fails the job. The checkout above is depth-1, so deepen both sides until
+-      # a merge-base exists (the script refuses to report a clean diff without one, by design).
+-      # Diff the PR head ref, not the checked-out refs/pull/N/merge commit: that synthetic commit
+-      # is recomputed server-side whenever main moves, and once it is unreachable no amount of
+-      # deepening ever reaches its parents (run 34285107265: 4 fetches, 4m15s, "no merge-base").
++      # Advisory: it never fails the job. The full commit history of both sides is fetched (see
++      # above), so a merge-base exists unless the histories are unrelated (the script refuses to
++      # report a clean diff without one, by design).
++      # Diff the PR head commit, not the checked-out refs/pull/N/merge commit: that synthetic commit
++      # is recomputed server-side whenever main moves (run 34285107265: "no merge-base").
+       - name: Public-surface diff vs base (advisory)
+         if: ${{ !cancelled() && steps.setup.outcome == 'success' && inputs.python && github.event_name == 'pull_request' }}
+         continue-on-error: true
+-        # Bound the advisory step so a long deepen/fetch (e.g. a distant or missing
+-        # merge-base) can't consume the blocking job's 5-minute budget and cancel it.
+-        # continue-on-error already keeps a step *failure* off the job; a step-level
++        # Bound the advisory step so a slow fetch can't consume the blocking job's budget and
++        # cancel it. continue-on-error already keeps a step *failure* off the job; a step-level
+         # timeout keeps a step *overrun* off the job-level timeout the same way.
+-        # Sizing: a --deepen=200 fetch took ~56s and a --deepen=1000 ~67s on the runner, and
+-        # main gains ~170 commits/day, so a day-old branch legitimately needs both (~2 min).
+         timeout-minutes: 3
+         env:
+-          PR_HEAD: "+refs/pull/${{ github.event.pull_request.number }}/head:refs/remotes/origin/pr-head"
++          BASE_REF: ${{ github.base_ref }}
++          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+         run: |
+-          git fetch --no-tags --deepen=200 origin "${{ github.base_ref }}" "$PR_HEAD"
+-          for i in 1 2 3; do
+-            git merge-base "origin/${{ github.base_ref }}" origin/pr-head >/dev/null 2>&1 && break
+-            git fetch --no-tags --deepen=1000 origin "${{ github.base_ref }}" "$PR_HEAD"
+-          done
+-          python scripts/ci/check_public_surface.py --base "origin/${{ github.base_ref }}" --head origin/pr-head
++          if ! .github/actions/fetch-merge-base/fetch-merge-base.sh "$BASE_REF" "$PR_HEAD_SHA" >/dev/null; then
++            echo "::warning title=Public-surface advisory skipped::could not fetch ${BASE_REF} and PR head ${PR_HEAD_SHA} history (see the fetch-merge-base lines above)"
++            exit 0
++          fi
++          python scripts/ci/check_public_surface.py --base "origin/${BASE_REF}" --head "$PR_HEAD_SHA"
+ 
+       # ── Pinned ruff (+ ty for the advisory diff) ──────────────────────────────────────────
+ 
+diff --git a/tests/ci/test_lint_advisory_fetch.py b/tests/ci/test_lint_advisory_fetch.py
+new file mode 100644
+index 0000000000..b628b2a203
+--- /dev/null
++++ b/tests/ci/test_lint_advisory_fetch.py
+@@ -0,0 +1,217 @@
++"""lint.yml's advisory diff steps survive git 2.55's promisor-fetch BUG on the partial clone.
++
++"Fetch the merge base" makes the Python-lints checkout a partial clone (--filter=tree:0). The two
++advisory steps after it ("Profile-scope patterns on added lines", "Public-surface diff vs base")
++used to run their own `git fetch --deepen` on that clone; on git 2.55.0 such a fetch from the
++promisor remote dies in index-pack ("BUG: builtin/pack-objects.c:5004 ...", exit 128), and in 11
++of ~44 jobs on 2026-11-13 (e.g. run 43455124649) both checks silently never ran. These tests
++replay the two real step scripts from lint.yml on such a clone, with a `git` shim that fails a
++fetch the way 2.55 does whenever the repo is in promisor mode or the fetch is filtered.
++"""
++from __future__ import annotations
++
++import os
++import shutil
++import subprocess
++from pathlib import Path
++
++import pytest
++from ruamel.yaml import YAML
++
++from tests.ci import _gha_expr as gha
++from tests.ci.test_fetch_merge_base import GIT_255_BUG, GIT_ENV, PARTIAL_CLONE_KEYS, commit, git
++
++ROOT = Path(__file__).resolve().parents[2]
++SCRIPT = ROOT / ".github/actions/fetch-merge-base/fetch-merge-base.sh"
++STEPS = ("Profile-scope patterns on added lines (advisory)", "Public-surface diff vs base (advisory)")
++ADVISORY_SCRIPTS = {STEPS[0]: "scripts/check_profile_scope_patterns.py",
++                    STEPS[1]: "scripts/ci/check_public_surface.py"}
++
++pytestmark = pytest.mark.platforms("posix")
++
++# Fails like git 2.55.0 on the runner: any fetch from a promisor remote (the partial clone's
++# remote.origin.promisor, or an explicit --filter that would make it one) prints the BUG text and
++# exits 128. LINT_FAIL=all fails every fetch (a fetch that cannot succeed at all).
++SHIM = """\
++#!/usr/bin/env bash
++is_fetch=0; filtered=0
++for a in "$@"; do
++  [[ $a == fetch ]] && is_fetch=1
++  [[ $a == --filter=* ]] && filtered=1
++done
++if (( is_fetch )); then
++  printf '%s\\x1f' "$@" >> "$LINT_ARGV_LOG"; printf '\\n' >> "$LINT_ARGV_LOG"
++  promisor=$("$LINT_REAL_GIT" config --get remote.origin.promisor || true)
++  if [[ $LINT_FAIL == all ]] || { [[ $LINT_FAIL == promisor ]] && { (( filtered )) || [[ $promisor == true ]]; }; }; then
++    "$LINT_REAL_GIT" config remote.origin.promisor true
++    "$LINT_REAL_GIT" config remote.origin.partialclonefilter tree:0
++    "$LINT_REAL_GIT" config extensions.partialclone origin
++    cat "$LINT_BUG_TEXT" >&2
++    exit 128
++  fi
++fi
++exec "$LINT_REAL_GIT" "$@"
++"""
++
++# Stands in for the setup-pm interpreter: records the advisory script's argv, then proves the
++# refs it was given answer a three-dot diff and a blob read on this clone (lazily fetched trees).
++FAKE_PYTHON = """\
++#!/usr/bin/env bash
++{ printf '%s\\x1f' "$@"; printf '\\n'; } > "$LINT_PYTHON_LOG"
++base=$3 head=$5
++git diff --no-renames --name-only "$base...$head" >> "$LINT_PYTHON_LOG"
++git show "$head:f2.txt" >> "$LINT_PYTHON_LOG"
++"""
++
++
++def lint_step(name: str) -> dict:
++    job = YAML(typ="safe").load((ROOT / ".github/workflows/lint.yml").read_text(encoding="utf-8"))
++    return next(s for s in job["jobs"]["lint"]["steps"] if s.get("name") == name)
++
++
++@pytest.fixture
++def origin(tmp_path: Path) -> Path:
++    """main m1..m4; feature (PR 7) f1, f2 off m2; refs/pull/7/merge = main + feature."""
++    repo = tmp_path / "origin"
++    repo.mkdir()
++    git(repo, "init", "-q", "-b", "main")
++    git(repo, "config", "uploadpack.allowFilter", "true")
++    git(repo, "config", "uploadpack.allowAnySHA1InWant", "true")
++    for i in (1, 2):
++        commit(repo, f"m{i}")
++    git(repo, "checkout", "-q", "-b", "feature")
++    commit(repo, "f1")
++    commit(repo, "f2")
++    git(repo, "checkout", "-q", "main")
++    for i in (3, 4):
++        commit(repo, f"m{i}")
++    git(repo, "update-ref", "refs/pull/7/head", "feature")
++    git(repo, "checkout", "-q", "--detach", "main")
++    git(repo, "merge", "-q", "--no-edit", "feature")
++    git(repo, "update-ref", "refs/pull/7/merge", "HEAD")
++    git(repo, "checkout", "-q", "main")
++    return repo
++
++
++def pr_checkout(origin: Path, tmp_path: Path) -> Path:
++    """actions/checkout (fetch-depth 2) of refs/pull/7/merge, then the real 'Fetch the merge base'."""
++    work = tmp_path / "work"
++    work.mkdir()
++    git(work, "init", "-q")
++    git(work, "remote", "add", "origin", origin.as_uri())
++    git(work, "fetch", "-q", "--no-tags", "--depth=2", "origin",
++        "+refs/pull/7/merge:refs/remotes/pull/7/merge")
++    git(work, "checkout", "-q", "--detach", "refs/remotes/pull/7/merge")
++    first = subprocess.run(["bash", str(SCRIPT), "main"], cwd=work, env={**os.environ, **GIT_ENV},
++                           capture_output=True, encoding="utf-8", timeout=120, check=False)
++    assert first.returncode == 0, first.stderr
++    assert git(work, "config", "--get", "remote.origin.promisor") == "true"
++    # The step's checkout carries the action script (untracked here, so commits are unchanged).
++    action = work / ".github/actions/fetch-merge-base"
++    action.mkdir(parents=True)
++    shutil.copy2(SCRIPT, action / SCRIPT.name)
++    # main moves on while the job runs: the advisory step must fetch, not reuse step 1's refs.
++    commit(origin, "m5")
++    return work
++
++
++def run_step(name: str, work: Path, tmp_path: Path, fail: str) -> tuple[subprocess.CompletedProcess[str], Path, Path]:
++    step = lint_step(name)
++    head = git(work.parent / "origin", "rev-parse", "feature")
++    ctx = {"github": {"base_ref": "main", "event_name": "pull_request",
++                      "event": {"pull_request": {"number": 7, "head": {"sha": head}}}},
++           "inputs": {"python": True, "event_name": "pull_request"},
++           "steps": {"setup": {"outcome": "success"}},
++           "__status__": {"cancelled": False, "success": True, "failure": False, "always": True}}
++    assert gha.condition(step["if"], ctx), f"{name}: disabled for a Python pull request"
++    bins = tmp_path / f"bin-{fail or 'ok'}-{STEPS.index(name)}"
++    bins.mkdir()
++    for tool, text in (("git", SHIM), ("python", FAKE_PYTHON)):
++        (bins / tool).write_text(text, encoding="utf-8")
++        (bins / tool).chmod(0o755)
++    argv_log, python_log, bug = bins / "fetch-argv.log", bins / "python.log", bins / "bug.txt"
++    argv_log.touch()
++    bug.write_text(GIT_255_BUG, encoding="utf-8")
++    env = {**os.environ, **GIT_ENV,
++           **{k: gha.to_string(gha.render(v, ctx)) for k, v in (step.get("env") or {}).items()},
++           "PATH": f"{bins}{os.pathsep}{os.environ['PATH']}", "LINT_REAL_GIT": shutil.which("git"),
++           "LINT_FAIL": fail, "LINT_ARGV_LOG": str(argv_log), "LINT_PYTHON_LOG": str(python_log),
++           "LINT_BUG_TEXT": str(bug)}
++    result = subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c",
++                             gha.render(step["run"], ctx)],
++                            cwd=work, env=env, capture_output=True, encoding="utf-8", timeout=120,
++                            check=False)
++    return result, argv_log, python_log
++
++
++def fetches(argv_log: Path) -> list[list[str]]:
++    return [line.split("\x1f")[:-1] for line in argv_log.read_text(encoding="utf-8").splitlines()]
++
++
++def partial_config(work: Path) -> dict[str, str | None]:
++    out = {}
++    for key in PARTIAL_CLONE_KEYS:
++        got = subprocess.run(["git", "config", "--get", key], cwd=work, env={**os.environ, **GIT_ENV},
++                             capture_output=True, encoding="utf-8", check=False)
++        out[key] = got.stdout.strip() if got.returncode == 0 else None
++    return out
++
++
++@pytest.mark.parametrize("name", STEPS)
++def test_step_stays_advisory(name):
++    step = lint_step(name)
++    assert step["continue-on-error"] is True
++    assert 0 < step["timeout-minutes"] <= 3
++
++
++@pytest.mark.parametrize("name", STEPS)
++def test_git_255_bug_on_the_partial_clone_falls_back_and_the_check_runs(name, origin, tmp_path):
++    """The incident: the step's fetch on step 1's partial clone dies with the BUG text."""
++    work = pr_checkout(origin, tmp_path)
++    before = partial_config(work)
++
++    result, argv_log, python_log = run_step(name, work, tmp_path, fail="promisor")
++
++    assert result.returncode == 0, result.stderr
++    assert "BUG: builtin/pack-objects.c:5004" in result.stderr
++    assert any(line.startswith("fetch-merge-base: filtered fetch failed (rc=128): ")
++               and line.endswith("; full-history fallback") for line in result.stderr.splitlines())
++    calls = fetches(argv_log)
++    assert len(calls) == 2, calls
++    assert "--filter=tree:0" in calls[0]
++    assert not any(a.startswith("--filter") for a in calls[1])
++    assert "::warning" not in result.stdout
++    head = git(origin, "rev-parse", "feature")
++    argv, *answer = python_log.read_text(encoding="utf-8").splitlines()
++    assert argv.split("\x1f")[:-1] == [ADVISORY_SCRIPTS[name], "--base", "origin/main", "--head", head]
++    assert answer == ["f1.txt", "f2.txt", "f2"]
++    assert git(work, "rev-parse", "refs/remotes/origin/main") == git(origin, "rev-parse", "main")
++    assert partial_config(work) == before
++
++
++@pytest.mark.parametrize("name", STEPS)
++def test_a_healthy_fetch_runs_the_check_with_no_fallback(name, origin, tmp_path):
++    work = pr_checkout(origin, tmp_path)
++
++    result, argv_log, python_log = run_step(name, work, tmp_path, fail="")
++
++    assert result.returncode == 0, result.stderr
++    assert "full-history fallback" not in result.stderr
++    assert "::warning" not in result.stdout
++    assert len(fetches(argv_log)) == 1
++    assert python_log.read_text(encoding="utf-8").splitlines()[1:] == ["f1.txt", "f2.txt", "f2"]
++
++
++@pytest.mark.parametrize("name", STEPS)
++def test_a_fetch_that_cannot_succeed_warns_once_and_skips(name, origin, tmp_path):
++    """Still advisory (exit 0), but the skipped check is visible as one ::warning:: line."""
++    work = pr_checkout(origin, tmp_path)
++
++    result, argv_log, python_log = run_step(name, work, tmp_path, fail="all")
++
++    assert result.returncode == 0, result.stderr
++    warnings = [line for line in result.stdout.splitlines() if line.startswith("::warning")]
++    assert len(warnings) == 1, result.stdout
++    assert "advisory skipped::" in warnings[0]
++    assert len(fetches(argv_log)) == 2  # the filtered fetch and its one fallback
++    assert not python_log.exists()
+-- 
+2.43.0
+

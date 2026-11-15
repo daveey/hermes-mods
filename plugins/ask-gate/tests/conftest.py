@@ -76,6 +76,14 @@ def gate(tmp_path, monkeypatch):
     # replica or ledger; tests/test_l1_remote_cards.py installs its own fake.
     projection = types.ModuleType("hermes_cli.kanban_session_activity")
     projection.session_tasks = lambda session_ids, statuses=(), *, stale_ok=False: []
+    # Only the projection read is faked: core's own writers (kanban_schedule's annotation scope reads
+    # ``_origin_scope``) still reach the real module's other names when a core is importable.
+    try:
+        real = importlib.import_module("hermes_cli.kanban_session_activity")
+    except ImportError:
+        real = None
+    if real is not None and real is not projection:
+        projection.__getattr__ = lambda name: getattr(real, name)
     monkeypatch.setitem(sys.modules, "hermes_cli.kanban_session_activity", projection)
     mod = _load()
     monkeypatch.setattr(mod.core, "capability_sheet", lambda *a, **k: SHEET)

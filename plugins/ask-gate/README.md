@@ -103,6 +103,22 @@ internal errors fail open (`agent_condition_error`). `STRUCTURED_SYSTEM` carries
 misses. Logs `agent_condition_hold`. Why: self-heal agent-ad97832ad7 (an orchestrator's own "ask before any new
 head" steer parked a test-only CI repair on David). Tests: `tests/test_agent_condition_hold.py`.
 
+**Merge-ask holds (L3, no model call).** `merge_ask.py` holds an ask that hands David the merge of a PR: a
+`kanban_block` / blocked `kanban_create` `human_request` whose action (before "Unblock =") reads "merge/landing
+PR N" (verb first, not past tense), or a user-steps `action_request` approval/choice whose title does, when action,
+why_human, scope (or the request's plan) name no limit only he can change: CI not green, no independent approval, a
+bypass / branch protection / admin merge, missing write access or a credential, an account setting, a red-tier merge
+policy, other people, or his own quoted words. "Owner-only", "owner identity", a card contract or a PR body that
+reserves the merge are agent conditions, not limits: the hold says to land it through the gate (`hermes-core-wt
+ship`, `push-guard/land.py`; `token-broker user/github` acts as the owner) and to ask only for any step that really
+is his. Runs before the chat-delivery check and the judge (which passed the incident's asks as "approval-tier");
+two holds per (session, tool, card or title), then it passes (`merge_ask_released`); errors fail open
+(`merge_ask_error`). Logs `merge_ask_hold`. Why: self-heal agent-b62d798d7d (an approved, 12/12-green state PR sat
+11 h on an agent-written "card contract reserves PR merge" block and a "Merge PR 1714 ... as you" approval request
+David never answered; another chat then merged it itself). Replay on the hub (2026-11-15: 300 human_request blocks,
+495 action_request revisions since 10-15): 5 hits, all that incident's PR 1714 asks. Tests:
+`tests/test_merge_ask_hold.py`.
+
 **Owner-recommendation holds (L3, no model call).** `owner_recommendation.py` holds a `kanban_block` / blocked
 `kanban_create` whose `human_request` (interaction reply/approval) asks David to pick between options (two or more
 `choices`, or "reply yes or no / A or B / pick / choose / decide" wording) and whose action, why_human and scope name
@@ -118,6 +134,18 @@ tool, blocked card), so a reworded ask does not restart the bound: two holds, th
 App permissions, macOS CI lane A/B/C, Fable route parity, David's own iPhone under the same limits). Tests:
 `tests/test_owner_recommendation_hold.py` (the four exact requests held; $ over-cap, recurring paid spend, threshold
 change, write permission, Rose, destructive, David-quoted rule and credential asks pass).
+
+**Approval reuse (action_request, no model call).** `approval_reuse.py` runs before the judge on every
+`action_request` approval. `approval_single_use` holds one whose limits, exclusions or outcomes forbid a rerun
+without asking again ("No rerun without asking you"): any fixable refusal before a write then becomes a new ask; the
+nudge gives retry terms instead. `approval_reuse` holds one that David already approved in this chat (a `Canonical
+user decision.` row with effect approve) when it shares a source card, carries no permission-required limit key the
+earlier one lacked, names no new target in those limits (tokens with a digit such as `worker-9`, `11`; file names,
+paths and hashes are execution details), is about the same thing (title and permission-limit words overlap at least
+half), and nothing ran under the earlier one (its receipts stayed acknowledged/not_applied). A scope line
+`New since your approval: <permission limit key> ...` releases it. Same per-(session, title) bound as the judge's
+holds; errors fail open (`approval_reuse_error`). Logs `action_request_held` with `rule`. Why: agent-159f5f5152 (one
+priority reset approved five times in one chat). Tests: `tests/test_approval_reuse.py`.
 
 **Chat-delivery asks (L3, no model call).** `chat_delivery.py` refuses a `kanban_block`, blocked `kanban_create` or
 worker `kanban_complete` leftover whose ask is for a human to type, send or relay a message into a Hermes chat: a

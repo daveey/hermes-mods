@@ -135,7 +135,22 @@ def test_decline_and_delivered_decisions_are_handled(tmp_path):
 
 # ---- end to end with the core clarify tool -----------------------------------------------------------------
 
-def test_blocked_clarify_returns_answered_elsewhere_and_marks_delivered(tmp_path):
+@pytest.fixture
+def no_host_plugins(tmp_path, monkeypatch):
+    """Keep the host's ~/.hermes plugins out of the core clarify path.
+
+    clarify_tool fires on_human_input_request, which discovers and loads every plugin under HERMES_HOME. On a
+    host whose plugins do slow work at register time (ask-gate warms a Kanban replica projection on the hub) the
+    clarify outlives t.join(5), and its leaked poller then answers the next test's decision."""
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path / 'hermes-home'))
+    try:
+        import tools.human_input_hooks as hooks
+    except ImportError:
+        return
+    monkeypatch.setattr(hooks, '_fire', lambda hook_name, payload: None)
+
+
+def test_blocked_clarify_returns_answered_elsewhere_and_marks_delivered(tmp_path, no_host_plugins):
     ce = pytest.importorskip('tools.clarify_early')
     from tools.clarify_tool import clarify_tool
     ce.reset_for_tests()
@@ -163,6 +178,7 @@ def test_blocked_clarify_returns_answered_elsewhere_and_marks_delivered(tmp_path
         op = s.decide(owner, decision(r))['operation']  # David decides in the For-you queue
         s.dispatch(owner, op['operationId'], BusyReceiver())  # the runtime refuses: the turn is active
         t.join(5)
+        assert not t.is_alive(), 'clarify did not return within 5s'
         assert box['out']['status'] == 'answered_elsewhere'
         done = s.operation(owner, oid=op['operationId'])['operation']
         assert done['dispatchState'] == 'delivered' and done['receipt']['run']['toolCallId'] == 'call_z'
@@ -182,7 +198,7 @@ def test_register_installs_the_provider_with_core():
         ce.reset_for_tests()
 
 
-def test_blocked_clarify_ignores_an_unrelated_same_session_decision_end_to_end(tmp_path):
+def test_blocked_clarify_ignores_an_unrelated_same_session_decision_end_to_end(tmp_path, no_host_plugins):
     """Negative control through the real core clarify tool: same session, different question."""
     ce = pytest.importorskip('tools.clarify_early')
     if not hasattr(ce, 'question_descriptor'):
@@ -210,6 +226,7 @@ def test_blocked_clarify_ignores_an_unrelated_same_session_decision_end_to_end(t
         time.sleep(0.5)
         assert t.is_alive(), 'an unrelated decision of the same session must not end the clarify'
         cb.event.set(); t.join(5)
+        assert not t.is_alive(), 'clarify did not return within 5s'
         assert box['out'].get('status') != 'answered_elsewhere'
         assert s.operation(owner, oid=op['operationId'])['operation']['dispatchState'] == 'failed'
     finally:

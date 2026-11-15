@@ -1,0 +1,799 @@
+From dda3fd76751553b250428a2a7d027aa7f628a390 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 17:04:49 +0000
+Subject: [PATCH] [daveey] fix(gateway): redeliver an automated wake a held
+ quota wall refused, once, after the reset
+
+A Kanban notifier (or background-process) wake committed to a chat whose pinned route sits behind a
+held subscription wall was refused before the agent was built; the held reply tells a person to
+"resend after the reset", but nobody resends an automated notice, so it was lost until another event
+woke the chat (hub chat local-be7f1ded..., 2026-11-14: three refused notifier wakes).
+
+- _resolution_failure_result stamps failure_resets_at from SubscriptionQuotaUnavailable.
+- gateway/session_wall_replay.py: after a pre-build wall refusal (api_calls 0, route_refused /
+  auth_permanent, a known reset) of an unattended route wake (kanban-wake / background-wake, principal
+  automation:<route>), plan one redelivery at max(reset + 60s, now + 60s) (none past 7 days), durable in
+  state_meta and armed in-process; re-armed at authority boot. It re-admits through admit_route_wake
+  under the deterministic identity tail wall-replay:<tail> (an exact replay, never folded into a
+  waiting Kanban wake). A redelivery refused again plans nothing. Transient admission refusals or a
+  missing adapter retry (bounded); permanent refusals drop. The refused reply (and error card) says
+  when the notice will be delivered again. A person's message keeps the held reply unchanged.
+
+Tests: tests/gateway/test_wall_replay_automation_wake.py (real runner, authority, FIFO, real held
+SubscriptionQuotaUnavailable; 23 tests; 21 mutants killed, 1 equivalent check removed).
+---
+ gateway/run_turn_runner.py                    |   6 +
+ gateway/session_authority.py                  |   3 +
+ gateway/session_automation.py                 |  18 +-
+ gateway/session_ingress.py                    |   3 +
+ gateway/session_wall_replay.py                | 302 ++++++++++++++++
+ .../test_wall_replay_automation_wake.py       | 341 ++++++++++++++++++
+ 6 files changed, 666 insertions(+), 7 deletions(-)
+ create mode 100644 gateway/session_wall_replay.py
+ create mode 100644 tests/gateway/test_wall_replay_automation_wake.py
+
+diff --git a/gateway/run_turn_runner.py b/gateway/run_turn_runner.py
+index 89cd4ac6d5..ebd2e45444 100644
+--- a/gateway/run_turn_runner.py
++++ b/gateway/run_turn_runner.py
+@@ -256,6 +256,12 @@ def _resolution_failure_result(exc: Exception, platform: Platform) -> dict:
+     text, reason, retryable = _resolution_failure_reply(exc, platform)
+     result = stamp_failure({"final_response": text, "messages": [], "api_calls": 0, "tools": [],
+                             "failed": True, "completed": False, "error": str(exc)}, reason, retryable)
++    from agent.model_routing_unavailable import SubscriptionQuotaUnavailable
++    resets_at = getattr(exc, "resets_at", None) if isinstance(exc, SubscriptionQuotaUnavailable) else None
++    if isinstance(resets_at, (int, float)) and not isinstance(resets_at, bool):
++        # [daveey] The held wall's reset: the card names it, and an automated wake refused here is
++        # redelivered once after it (gateway.session_wall_replay); a person resends it themselves.
++        result["failure_resets_at"] = float(resets_at)
+     if reason == "route_refused":
+         # [daveey] The router refused the chat's own route (a pinned subscription wall): the reply names
+         # the reset and /model, and a resend repeats the refusal. Like the policy refusals
+diff --git a/gateway/session_authority.py b/gateway/session_authority.py
+index 776342d361..00ed173d05 100644
+--- a/gateway/session_authority.py
++++ b/gateway/session_authority.py
+@@ -1636,4 +1636,7 @@ async def initialize_session_authority(runner, *, profile_id, instance_id, db=No
+     watch_routes(runner, store)
+     from gateway.session_local_recovery import recover_local_sessions
+     recover_local_sessions(authority)
++    # [daveey] Redeliveries of automated wakes a held quota wall refused, planned before a restart.
++    from gateway.session_wall_replay import arm_pending
++    await arm_pending(authority)
+     return authority
+diff --git a/gateway/session_automation.py b/gateway/session_automation.py
+index 9123a84119..75cf331026 100644
+--- a/gateway/session_automation.py
++++ b/gateway/session_automation.py
+@@ -963,12 +963,15 @@ async def reset_and_rehome_messages(runner, session_key, old_session_id):
+     return entry, release
+ 
+ 
+-async def admit_route_wake(runner, adapter, source, text, producer, metadata=None):
++async def admit_route_wake(runner, adapter, source, text, producer, metadata=None, replay_of=None):
+     """Commit a producer wake (Kanban push wake, /loop tick) for ``source``'s route into the
+     authority FIFO, like heartbeats and process completions, instead of a classic turn that
+     interrupts or races the admitted one. ``False`` when no authority serves the scope or the
+     route holds no committed human turn to borrow provenance from: the caller keeps the adapter
+-    path (nothing is queued there either). Raises ``RuntimeStoreError`` on a refusal."""
++    path (nothing is queued there either). Raises ``RuntimeStoreError`` on a refusal.
++    [daveey] ``replay_of``: the identity tail of a wake a held quota wall refused
++    (``gateway.session_wall_replay``). Its one redelivery takes the tail ``wall-replay:<tail>``, so a
++    second admission is an exact replay, and never folds into a waiting wake."""
+     from gateway.session_authorities import active_authority
+     from gateway.session_local_recovery import restore_completion_route
+     from gateway.session_detached import detached_live, detached_route_of, route_entry
+@@ -979,7 +982,8 @@ async def admit_route_wake(runner, adapter, source, text, producer, metadata=Non
+     if authority is None or entry is None:
+         return False
+     import uuid
+-    identity = json.dumps([producer, key, uuid.uuid4().hex], separators=(',', ':'))
++    tail = 'wall-replay:' + replay_of if replay_of else uuid.uuid4().hex
++    identity = json.dumps([producer, key, tail], separators=(',', ':'))
+     if source.platform == Platform.LOCAL or detached_route_of(source):
+         # A local route (or a conversation its chat moved past, answered by its app viewers) has no
+         # messaging provenance to borrow: its wake rides local_automation_v1 on the live session's own
+@@ -992,7 +996,7 @@ async def admit_route_wake(runner, adapter, source, text, producer, metadata=Non
+                              message_id=identity, metadata={'gateway_session_key': key,
+                                                             'gateway_session_id': entry.session_id,
+                                                             **(metadata or {})})
+-        await _admit_route_wake_event(runner, authority, adapter, event, identity, entry, producer)
++        await _admit_route_wake_event(runner, authority, adapter, event, identity, entry, producer, replay_of)
+         return True
+     from gateway.session_envelope import restore_native
+     envelope = committed_route_envelope(authority, entry)
+@@ -1005,11 +1009,11 @@ async def admit_route_wake(runner, adapter, source, text, producer, metadata=Non
+                          message_id=identity, metadata={'gateway_session_key': key,
+                                                         'gateway_session_id': entry.session_id,
+                                                         **(metadata or {})})
+-    await _admit_route_wake_event(runner, authority, adapter, event, identity, entry, producer)
++    await _admit_route_wake_event(runner, authority, adapter, event, identity, entry, producer, replay_of)
+     return True
+ 
+ 
+-async def _admit_route_wake_event(runner, authority, adapter, event, identity, entry, producer):
++async def _admit_route_wake_event(runner, authority, adapter, event, identity, entry, producer, replay_of=None):
+     """A Kanban wake carrying its cards folds into a Kanban wake still waiting at the FIFO tail
+     (``gateway.kanban_wake_fold``), so a busy chat runs ONE turn for every card event that piled up.
+     The waiting row is cancelled in this admission's own transaction (``_fold_queued``); when it was
+@@ -1017,7 +1021,7 @@ async def _admit_route_wake_event(runner, authority, adapter, event, identity, e
+     store refuses (``invalid_params``: e.g. past ``kanban_wake_fold._MAX_CARDS`` cards) while the
+     wake alone is valid: refusing it would refuse every later wake to the chat."""
+     from gateway import kanban_wake_fold
+-    if producer != kanban_wake_fold.PRODUCER or not event.metadata.get('kanban_cards'):
++    if replay_of or producer != kanban_wake_fold.PRODUCER or not event.metadata.get('kanban_cards'):
+         return await authority.admit_automation(adapter, event, identity)
+     import asyncio
+     async with kanban_wake_fold.wake_lock(runner):
+diff --git a/gateway/session_ingress.py b/gateway/session_ingress.py
+index 53476ec30c..373d086f28 100644
+--- a/gateway/session_ingress.py
++++ b/gateway/session_ingress.py
+@@ -398,6 +398,9 @@ async def execute_admission(authority, ref, row):
+                 if row.get('update_resume') or is_api or (row['payload'].get('finite') is True and not event.get_command()):
+                     result = {'final_response': '', 'messages': [], 'failed': True, 'completed': False,
+                               'error': response or 'The admitted turn failed.'}
++            # [daveey] An automated wake a held quota wall refused before it ran: one redelivery after the reset.
++            from gateway.session_wall_replay import after_turn
++            response = await after_turn(authority, row, event.source, result, response)
+             # The drain commits this under the stream lock so no viewer reads `terminal`
+             # before the completion event exists in the replay ring.
+             authority.pending_results[row['admission_id']] = {
+diff --git a/gateway/session_wall_replay.py b/gateway/session_wall_replay.py
+new file mode 100644
+index 0000000000..46365c5b46
+--- /dev/null
++++ b/gateway/session_wall_replay.py
+@@ -0,0 +1,302 @@
++"""[daveey] One redelivery of an automated wake that a held quota wall refused before it ran.
++
++A Kanban notifier (or other producer) wake is committed to the session FIFO (``admit_route_wake``), and the
++producer takes that receipt as final: it never resends. When the chat is pinned to a route whose subscription
++wall *holds* (an explicit pin, or a wall under ``model_routing_walls.WALL_REROUTE_MIN_SECONDS``), the turn is
++refused before the agent is built (``SubscriptionQuotaUnavailable``) and the reply tells a person to "resend
++after the reset". Nobody resends an automated notice, so it was lost until some other event woke the chat
++(hub chat local-be7f1ded…, 2026-11-14: three notifier wakes refused, none redelivered).
++
++This module is that resend, bounded so it cannot loop:
++
++- only an unattended route wake (principal ``automation:<route>``, a ``kanban-wake`` or ``background-wake``
++  identity) refused pre-build by a quota wall with a known reset (``failure_resets_at``, ``api_calls == 0``)
++  plans one; a person's message keeps today's held reply and nothing is scheduled;
++- the plan is durable (``state_meta`` key :data:`PREFIX` + admission id) and armed in this process; a gateway
++  restart re-arms it at boot (:func:`arm_pending`), so a multi-hour wall survives the hub's frequent restarts;
++- at ``max(resets_at + SLACK_S, now + MIN_DELAY_S)`` the wake is re-admitted through the same producer entry
++  (``admit_route_wake``) under the deterministic identity ``[producer, route, "wall-replay:<tail>"]``: a second
++  arm or a race re-admits the same row (an exact replay), never a second turn;
++- a replay that is refused again plans nothing (its identity says it is one) and the reply says so.
++"""
++from __future__ import annotations
++
++import asyncio
++import json
++import logging
++import time
++from typing import Any
++
++logger = logging.getLogger(__name__)
++
++PREFIX = 'automation_wall_replay:'
++REPLAY_TAG = 'wall-replay:'
++PRODUCERS = frozenset({'kanban-wake', 'background-wake'})
++# The replay runs this long after the recorded reset (a quota window rarely reopens on the exact second).
++SLACK_S = 60.0
++# Never sooner than this after the refusal or a boot (adapters connect after the authority is built).
++MIN_DELAY_S = 60.0
++# A wall further out than this is not worth a timer: the notice would be stale by then.
++MAX_DELAY_S = 7 * 86400.0
++# A replay that cannot be admitted yet (no adapter, a draining gateway) looks again this much later, this often.
++RETRY_S = 120.0
++RETRIES_MAX = 10
++# Descriptor keys a route wake stores (``snapshot_*automation``) and ``admit_route_wake`` accepts back.
++_CARRIED = ('notification_category', 'display_kind', 'display_text', 'kanban_cards', 'kanban_event_keys')
++_TRANSIENT = frozenset({'runtime_draining', 'busy', 'database_busy', 'stale_generation'})
++
++
++def _number(value: Any) -> float | None:
++    if isinstance(value, bool) or not isinstance(value, (int, float)):
++        return None
++    return float(value)
++
++
++def _identity(row: dict) -> list | None:
++    """``[producer, route, tail]`` of an unattended route wake, else None."""
++    principal = str(row.get('principal_id') or '')
++    try:
++        parts = json.loads(row.get('request_id') or '')
++    except (TypeError, ValueError):
++        return None
++    if (not isinstance(parts, list) or len(parts) != 3 or not all(isinstance(p, str) for p in parts)
++            or parts[0] not in PRODUCERS or principal != 'automation:' + parts[1]):
++        return None
++    return parts
++
++
++def is_replay(row: dict) -> bool:
++    parts = _identity(row)
++    return parts is not None and parts[2].startswith(REPLAY_TAG)
++
++
++def _descriptor(payload: dict) -> dict:
++    return payload.get('local_automation_v1') or (payload.get('native_text_v1') or {}).get('automation') or {}
++
++
++def wall_resets_at(result: Any) -> float | None:
++    """The reset of a pre-build quota-wall refusal (``_resolution_failure_result``), else None."""
++    if not isinstance(result, dict) or not result.get('failed') or result.get('api_calls'):
++        return None
++    if result.get('failure_reason') not in ('route_refused', 'auth_permanent'):
++        return None
++    return _number(result.get('failure_resets_at'))
++
++
++def plan_due(row: dict, result: Any, now: float | None = None) -> float | None:
++    """When to redeliver this refused automation wake, or None (a person's turn, a replay, another failure)."""
++    reset = wall_resets_at(result)
++    if reset is None or _identity(row) is None or is_replay(row):
++        return None
++    now = time.time() if now is None else now
++    due = max(reset + SLACK_S, now + MIN_DELAY_S)
++    return due if due - now <= MAX_DELAY_S else None
++
++
++def _when(ts: float) -> str:
++    from agent.model_routing_walls import reset_pt
++    return reset_pt(ts)
++
++
++def scheduled_line(due: float) -> str:
++    return (f"This was an automated notice, not a message you sent: Hermes will deliver it once more at "
++            f"{_when(due)}, after the reset.")
++
++
++GAVE_UP_LINE = ("This was the one automatic redelivery of an automated notice, refused again by the same wall; "
++                "nothing more is scheduled.")
++
++
++def _amend(result: dict, response: Any, line: str) -> Any:
++    """Append ``line`` to the reply (and the error card's own sentence, which is the same text)."""
++    old = result.get('final_response')
++    if isinstance(old, str) and old.strip():
++        result['final_response'] = f"{old}\n\n{line}"
++        surface = result.get('error_surface')
++        if isinstance(surface, dict) and surface.get('message') == old.strip():
++            surface['message'] = result['final_response'].strip()
++    if isinstance(response, str) and response.strip():
++        return f"{response}\n\n{line}"
++    return response
++
++
++def _intent(row: dict, source: Any, due: float) -> dict:
++    parts = _identity(row) or ['', '', '']
++    payload = row.get('payload') or {}
++    descriptor = _descriptor(payload)
++    to_dict = getattr(source, 'to_dict', None)
++    return {'admission_id': row['admission_id'], 'session_id': row.get('target_session_id'),
++            'producer': parts[0], 'route': parts[1], 'tail': parts[2], 'due': due, 'failed_at': time.time(),
++            'text': payload.get('text') if isinstance(payload.get('text'), str) else '',
++            'metadata': {k: descriptor[k] for k in _CARRIED if k in descriptor},
++            'source': to_dict() if callable(to_dict) else None}
++
++
++def _write(db, key: str, value: str | None) -> None:
++    def write(conn):
++        if value is None:
++            conn.execute('DELETE FROM state_meta WHERE key=?', (key,))
++        else:
++            conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET '
++                         'value=excluded.value', (key, value))
++    db._execute_write(write)
++
++
++def _load(db) -> list[dict]:
++    with db._read_ctx() as conn:
++        rows = conn.execute('SELECT value FROM state_meta WHERE key LIKE ?', (PREFIX + '%',)).fetchall()
++    intents = []
++    for (value,) in rows:
++        try:
++            intent = json.loads(value)
++        except (TypeError, ValueError):
++            continue
++        if isinstance(intent, dict) and intent.get('admission_id'):
++            intents.append(intent)
++    return intents
++
++
++async def after_turn(authority, row: dict, source: Any, result: Any, response: Any) -> Any:
++    """Plan (and arm) the redelivery of a refused automation wake; returns the reply to send, amended with
++    what happens next. Every other turn passes through unchanged. Never raises."""
++    try:
++        if wall_resets_at(result) is None:
++            return response
++        if is_replay(row):
++            logger.warning('wall-replay: the redelivery %s was refused again by the wall; giving up',
++                           row.get('admission_id'))
++            return _amend(result, response, GAVE_UP_LINE)
++        due = plan_due(row, result)
++        if due is None:
++            return response
++        intent = _intent(row, source, due)
++        if intent['source'] is None:
++            return response
++        await asyncio.to_thread(_write, authority.db, PREFIX + intent['admission_id'], json.dumps(intent))
++        _arm(authority, intent)
++        logger.info('wall-replay: automated wake %s on %s refused by a held quota wall; one redelivery at %s',
++                    intent['admission_id'], intent['route'], _when(due))
++        return _amend(result, response, scheduled_line(due))
++    except Exception:  # health: allow BLE001 -- planning a resend must never fail the refused turn's settlement
++        logger.warning('wall-replay: could not plan the redelivery of %s', row.get('admission_id'), exc_info=True)
++        return response
++
++
++def _armed(authority) -> dict:
++    armed = getattr(authority, '_wall_replay_timers', None)
++    if armed is None:
++        armed = authority._wall_replay_timers = {}
++    return armed
++
++
++def _arm(authority, intent: dict, delay: float | None = None, tries: int = 0) -> None:
++    loop = asyncio.get_running_loop()
++    admission_id = intent['admission_id']
++    armed = _armed(authority)
++    old = armed.pop(admission_id, None)
++    if old is not None:
++        old.cancel()
++    if delay is None:
++        delay = max(float(intent['due']) - time.time(), MIN_DELAY_S)
++
++    def fire():
++        armed.pop(admission_id, None)
++        task = loop.create_task(fire_replay(authority, admission_id, tries))
++        pending = getattr(authority, '_wall_replay_tasks', None)
++        if pending is None:
++            pending = authority._wall_replay_tasks = set()
++        pending.add(task)
++        task.add_done_callback(pending.discard)
++    armed[admission_id] = loop.call_later(max(delay, 0.0), fire)
++
++
++async def arm_pending(authority) -> int:
++    """Boot: re-arm every planned redelivery this authority's store holds (at least ``MIN_DELAY_S`` out, so
++    the adapters are connected first). Returns how many were armed. Never raises."""
++    try:
++        intents = await asyncio.to_thread(_load, authority.db)
++    except Exception:  # health: allow BLE001 -- an unreadable store loses only the redeliveries
++        logger.warning('wall-replay: could not read the planned redeliveries', exc_info=True)
++        return 0
++    for intent in intents:
++        _arm(authority, intent)
++    if intents:
++        logger.info('wall-replay: re-armed %d planned redelivery(ies) at boot', len(intents))
++    return len(intents)
++
++
++def _serving(authority) -> bool:
++    if getattr(authority, 'retiring', False):
++        return False
++    from gateway.session_authorities import serving_authorities
++    return any(a is authority for a in serving_authorities(authority.runner))
++
++
++async def fire_replay(authority, admission_id: str, tries: int = 0) -> str:
++    """Re-admit the planned wake once. Returns ``admitted``/``dropped``/``retry``/``gone``."""
++    key = PREFIX + admission_id
++    try:
++        raw = await asyncio.to_thread(lambda: _get(authority.db, key))
++    except Exception:  # health: allow BLE001 -- unreadable now: look again later
++        logger.warning('wall-replay: could not read %s', key, exc_info=True)
++        return await _retry(authority, {'admission_id': admission_id, 'due': time.time()}, tries)
++    if raw is None:
++        return 'gone'
++    intent = json.loads(raw)
++    if not _serving(authority):
++        return 'gone'  # a retired authority's store is re-armed by the process that serves it
++    verdict = await _admit(authority, intent)
++    if verdict == 'retry':
++        return await _retry(authority, intent, tries)
++    await asyncio.to_thread(_write, authority.db, key, None)
++    return verdict
++
++
++def _get(db, key: str) -> str | None:
++    with db._read_ctx() as conn:
++        row = conn.execute('SELECT value FROM state_meta WHERE key=?', (key,)).fetchone()
++    return None if row is None else row[0]
++
++
++async def _retry(authority, intent: dict, tries: int) -> str:
++    if tries >= RETRIES_MAX:
++        logger.warning('wall-replay: gave up admitting the redelivery of %s after %d tries',
++                       intent['admission_id'], tries)
++        try:
++            await asyncio.to_thread(_write, authority.db, PREFIX + intent['admission_id'], None)
++        except Exception:  # health: allow BLE001 -- the next boot re-arms it, still bounded by the identity
++            logger.debug('wall-replay: could not drop %s', intent['admission_id'], exc_info=True)
++        return 'dropped'
++    _arm(authority, intent, RETRY_S, tries + 1)
++    return 'retry'
++
++
++async def _admit(authority, intent: dict) -> str:
++    from gateway.run import _async_profile_runtime_scope
++    from gateway.session import SessionSource
++    from gateway.session_automation import admit_route_wake
++    from hermes_state_runtime import RuntimeStoreError
++    runner = authority.runner
++    try:
++        source = SessionSource.from_dict(intent['source'])
++    except (KeyError, TypeError, ValueError):
++        logger.warning('wall-replay: %s has no usable route source; dropped', intent.get('admission_id'))
++        return 'dropped'
++    adapter = runner._adapter_for_source(source)
++    if adapter is None:
++        return 'retry'  # not connected yet (boot), or a platform that comes back
++    try:
++        async with _async_profile_runtime_scope(runner._resolve_profile_home_for_source(source)):
++            admitted = await admit_route_wake(runner, adapter, source, intent.get('text') or '', intent['producer'],
++                                              dict(intent.get('metadata') or {}), replay_of=intent['tail'])
++    except RuntimeStoreError as exc:
++        if exc.reason in _TRANSIENT:
++            return 'retry'
++        logger.warning('wall-replay: redelivery of %s refused (%s); dropped', intent['admission_id'], exc.reason)
++        return 'dropped'
++    if not admitted:
++        logger.warning('wall-replay: the route of %s (%s) no longer takes wakes; dropped',
++                       intent['admission_id'], intent['route'])
++        return 'dropped'
++    logger.info('wall-replay: redelivered automated wake %s on %s', intent['admission_id'], intent['route'])
++    return 'admitted'
+diff --git a/tests/gateway/test_wall_replay_automation_wake.py b/tests/gateway/test_wall_replay_automation_wake.py
+new file mode 100644
+index 0000000000..6ac6a9ebf4
+--- /dev/null
++++ b/tests/gateway/test_wall_replay_automation_wake.py
+@@ -0,0 +1,341 @@
++"""An automated wake a held quota wall refused before it ran is redelivered once after the reset.
++
++Hub chat local-be7f1ded… (2026-11-14): three Kanban notifier wakes were committed to the chat's FIFO while
++its pinned anthropic/claude-opus-5-5 wall had under 6 h left. A wall that short holds the pin
++(``model_routing_walls.may_reroute`` is False), so each turn was refused before the agent was built with
++``held_reply`` ("resend after the reset"). The notifier took the FIFO receipt as final and nobody resent
++an automated notice: it was lost until another event woke the chat.
++
++These run the real gateway runner, authority, FIFO and resolution failure path; only the runtime
++resolver is replaced, by one that raises the real ``SubscriptionQuotaUnavailable`` (held) or resolves.
++"""
++import asyncio
++import json
++import time
++
++import pytest
++
++from agent.model_routing_unavailable import SubscriptionQuotaUnavailable
++
++
++def _held_wall(hours=2.0):
++    wall = SubscriptionQuotaUnavailable('anthropic', 'claude-opus-5-5', time.time() + hours * 3600)
++    from agent.model_routing_walls import may_reroute
++    assert may_reroute(wall, None, 'explicit') is False  # a wall this short holds the pin: no reroute
++    return wall
++
++
++async def _authority(tmp_path, monkeypatch, instance='wall-replay'):
++    from gateway.config import GatewayConfig
++    from gateway.run import GatewayRunner
++    from gateway.session_authority import initialize_session_authority
++    from hermes_state import SessionDB
++    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
++    runner = GatewayRunner(GatewayConfig(sessions_dir=tmp_path / 'sessions'))
++    db = SessionDB(tmp_path / 'state.db')
++    runner.session_store._db = runner._session_db = db
++    authority = await initialize_session_authority(runner, profile_id='default', instance_id=instance, db=db)
++    return runner, db, authority
++
++
++def _intents(db):
++    from gateway.session_wall_replay import PREFIX
++    with db._read_ctx() as conn:
++        return {k[len(PREFIX):]: json.loads(v) for k, v in
++                conn.execute('SELECT key, value FROM state_meta WHERE key LIKE ?', (PREFIX + '%',)).fetchall()}
++
++
++def _rows(db, sid):
++    from hermes_state_runtime import list_session_admissions
++    return list_session_admissions(db, session_id=sid, pending_only=False)
++
++
++async def _settled(db, sid, count):
++    from tests.waiting import async_wait_until
++    await async_wait_until(lambda: len(_rows(db, sid)) >= count
++                           and all(r['status'] == 'terminal' for r in _rows(db, sid)),
++                           timeout=20, what=f'{count} admission(s) settled')
++    return _rows(db, sid)
++
++
++async def _stop(authority, db):
++    tasks = [live.task for live in authority.sessions.values() if live.task]
++    for task in tasks:
++        if not task.done():
++            task.cancel()
++    await asyncio.gather(*tasks, return_exceptions=True)
++    for handle in getattr(authority, '_wall_replay_timers', {}).values():
++        handle.cancel()
++    db.close()
++
++
++async def _local_session(authority, tmp_path):
++    from gateway.session_contract import SessionActor
++    from gateway.session_local import create_local_session
++    viewer = SessionActor('test-owner', 'default', frozenset(
++        {'session:create', 'session:submit', 'session:read'}), 'viewer')
++    ref = create_local_session(authority, viewer, dict(request_id='cli', source='tui', model='fixture',
++                                                      cwd=str(tmp_path), toolsets=[]))
++    await authority.attach(viewer, ref, history=False)
++    return viewer, ref
++
++
++def _wall_gate(runner, monkeypatch, walls):
++    """The real turn path up to runtime resolution; resolution raises the head of ``walls`` (a held
++    wall) or, once ``walls`` is empty, the turn 'runs' and records what it saw."""
++    from gateway.session_results import execution_result
++    seen = []
++
++    def resolve(**_kwargs):
++        if walls:
++            raise walls[0]
++        raise AssertionError('a lifted wall is answered by the stub turn below')
++
++    monkeypatch.setattr(runner, '_resolve_session_agent_runtime', resolve)
++    original = runner._handle_message_with_agent
++
++    async def turn(event, source, quick_key, run_generation):
++        seen.append(event)
++        if walls:
++            return await original(event, source, quick_key, run_generation)
++        execution_result.get()['result'] = {'final_response': 'handled', 'messages': []}
++        return 'handled'
++
++    monkeypatch.setattr(runner, '_handle_message_with_agent', turn)
++    return seen
++
++
++@pytest.mark.asyncio
++async def test_refused_kanban_wake_is_redelivered_once_after_the_reset(tmp_path, monkeypatch):
++    from gateway import session_wall_replay as replay
++    from gateway.session_automation import admit_route_wake
++    runner, db, authority = await _authority(tmp_path, monkeypatch)
++    wall = _held_wall()
++    walls = [wall]
++    seen = _wall_gate(runner, monkeypatch, walls)
++    try:
++        _viewer, ref = await _local_session(authority, tmp_path)
++        live = authority.sessions[ref.session_id]
++        adapter = runner._adapter_for_source(live.source)
++        notice = 'kanban: task t_01a1d9725dc575c5 ready with no worker (chat_wait_unclaimed)'
++        assert await admit_route_wake(runner, adapter, live.source, notice, 'kanban-wake') is True
++        [refused] = await _settled(db, ref.session_id, 1)
++        assert refused['outcome'] == 'failed'
++        # The refusal ran the real pre-build path: the held reply, nothing reached a provider.
++        assert len(seen) == 1
++        intents = _intents(db)
++        assert list(intents) == [refused['admission_id']]
++        intent = intents[refused['admission_id']]
++        assert intent['due'] == pytest.approx(wall.resets_at + replay.SLACK_S)
++        assert intent['producer'] == 'kanban-wake' and intent['text'] == notice
++        assert refused['admission_id'] in authority._wall_replay_timers  # armed in this process
++        from gateway.session_results import admission_result
++        stored = admission_result(db, refused['admission_id'])['result']
++        assert 'subscription quota is out' in stored['final_response']
++        assert 'deliver it once more' in stored['final_response']
++        assert stored['failure_resets_at'] == pytest.approx(wall.resets_at)
++        assert 'deliver it once more' in stored['error_surface']['message']  # the card says it too
++
++        # The reset passes: the planned timer fires (driven directly; it is armed hours out).
++        walls.clear()
++        assert await replay.fire_replay(authority, refused['admission_id']) == 'admitted'
++        rows = await _settled(db, ref.session_id, 2)
++        redelivered = rows[1]
++        assert redelivered['outcome'] == 'completed'
++        assert json.loads(redelivered['request_id'])[2] == replay.REPLAY_TAG + json.loads(refused['request_id'])[2]
++        assert seen[-1].text == notice and seen[-1].internal
++        assert _intents(db) == {}
++        # Once only: a late second timer finds nothing, and the deterministic identity is an exact replay.
++        assert await replay.fire_replay(authority, refused['admission_id']) == 'gone'
++        tail = json.loads(refused['request_id'])[2]
++        assert await admit_route_wake(runner, adapter, live.source, notice, 'kanban-wake', replay_of=tail) is True
++        await asyncio.sleep(0)
++        assert len(_rows(db, ref.session_id)) == 2
++    finally:
++        await _stop(authority, db)
++
++
++@pytest.mark.asyncio
++async def test_a_redelivery_refused_again_gives_up(tmp_path, monkeypatch):
++    from gateway import session_wall_replay as replay
++    from gateway.session_automation import admit_route_wake
++    runner, db, authority = await _authority(tmp_path, monkeypatch)
++    _wall_gate(runner, monkeypatch, [_held_wall()])
++    try:
++        _viewer, ref = await _local_session(authority, tmp_path)
++        live = authority.sessions[ref.session_id]
++        adapter = runner._adapter_for_source(live.source)
++        assert await admit_route_wake(runner, adapter, live.source, 'kanban: t_1 blocked', 'kanban-wake') is True
++        [refused] = await _settled(db, ref.session_id, 1)
++        # The wall was renewed past its reset: the one redelivery is refused too.
++        assert await replay.fire_replay(authority, refused['admission_id']) == 'admitted'
++        rows = await _settled(db, ref.session_id, 2)
++        assert rows[1]['outcome'] == 'failed'
++        assert _intents(db) == {}  # nothing more is scheduled
++        from gateway.session_results import admission_result
++        assert replay.GAVE_UP_LINE in admission_result(db, rows[1]['admission_id'])['result']['final_response']
++    finally:
++        await _stop(authority, db)
++
++
++@pytest.mark.asyncio
++async def test_a_person_s_message_keeps_the_held_reply_and_schedules_nothing(tmp_path, monkeypatch):
++    from agent.model_routing_walls import held_reply
++    from gateway.session_contract import Submission
++    runner, db, authority = await _authority(tmp_path, monkeypatch)
++    wall = _held_wall()
++    _wall_gate(runner, monkeypatch, [wall])
++    try:
++        viewer, ref = await _local_session(authority, tmp_path)
++        await authority.submit(viewer, Submission('human-1', ref, {'text': 'please check the board'}, 'queue'))
++        [row] = await _settled(db, ref.session_id, 1)
++        assert row['outcome'] == 'failed'
++        assert _intents(db) == {}
++        from gateway.session_results import admission_result
++        assert admission_result(db, row['admission_id'])['result']['final_response'] == held_reply(wall)
++    finally:
++        await _stop(authority, db)
++
++
++@pytest.mark.asyncio
++async def test_a_planned_redelivery_survives_a_restart(tmp_path, monkeypatch):
++    """The plan is durable: a fresh authority on the same store re-arms it at boot."""
++    from gateway import session_wall_replay as replay
++    from gateway.session_automation import admit_route_wake
++    runner, db, authority = await _authority(tmp_path, monkeypatch)
++    _wall_gate(runner, monkeypatch, [_held_wall()])
++    try:
++        _viewer, ref = await _local_session(authority, tmp_path)
++        live = authority.sessions[ref.session_id]
++        adapter = runner._adapter_for_source(live.source)
++        assert await admit_route_wake(runner, adapter, live.source, 'kanban: t_1 blocked', 'kanban-wake') is True
++        [refused] = await _settled(db, ref.session_id, 1)
++        assert list(_intents(db)) == [refused['admission_id']]
++    finally:
++        await _stop(authority, db)
++    _runner2, db2, authority2 = await _authority(tmp_path, monkeypatch, instance='wall-replay-2')
++    try:
++        assert refused['admission_id'] in authority2._wall_replay_timers
++        handle = authority2._wall_replay_timers[refused['admission_id']]
++        assert handle.when() - asyncio.get_running_loop().time() >= replay.MIN_DELAY_S - 1
++    finally:
++        await _stop(authority2, db2)
++
++
++@pytest.mark.parametrize('request_id,principal,result,planned', [
++    (['kanban-wake', 'r', 'x'], 'automation:r', {'failure_reason': 'route_refused'}, True),
++    (['background-wake', 'r', 'x'], 'automation:r', {'failure_reason': 'auth_permanent'}, True),
++    (['kanban-wake', 'r', 'wall-replay:x'], 'automation:r', {'failure_reason': 'route_refused'}, False),
++    (['loop-tick', 'r', 'x'], 'automation:r', {'failure_reason': 'route_refused'}, False),
++    (['kanban-wake', 'r', 'x'], 'automation:other', {'failure_reason': 'route_refused'}, False),
++    (['kanban-wake', 'r', 'x'], 'automation:r', {'failure_reason': 'rate_limit'}, False),
++    (['kanban-wake', 'r', 'x'], 'automation:r', {'failure_reason': 'route_refused', 'api_calls': 1}, False),
++    (['kanban-wake', 'r', 'x'], 'automation:r', {'failure_reason': 'route_refused', 'failed': False}, False),
++    (['kanban-wake', 'r', 'x'], 'automation:r', {'failure_reason': 'route_refused', 'failure_resets_at': None}, False),
++    ('human-1', 'viewer:local', {'failure_reason': 'route_refused'}, False),
++], ids=['kanban', 'background', 'replay', 'loop-tick', 'foreign-route', 'rate-limit', 'ran', 'not-failed',
++        'no-reset', 'human'])
++def test_only_a_pre_build_wall_refusal_of_an_automated_wake_plans_one(request_id, principal, result, planned):
++    from gateway.session_wall_replay import MAX_DELAY_S, plan_due
++    now = 1_900_000_000.0
++    row = {'request_id': request_id if isinstance(request_id, str) else json.dumps(request_id),
++           'principal_id': principal}
++    full = {'failed': True, 'api_calls': 0, 'failure_resets_at': now + 3600, **result}
++    assert (plan_due(row, full, now=now) is not None) is planned
++    if planned:
++        assert plan_due(row, {**full, 'failure_resets_at': now + MAX_DELAY_S + 1}, now=now) is None
++        assert plan_due(row, {**full, 'failure_resets_at': now - 10}, now=now) == now + 60
++
++
++def test_resolution_failure_result_carries_the_wall_reset():
++    from gateway.config import Platform
++    from gateway.run_turn_runner import _resolution_failure_result
++    wall = SubscriptionQuotaUnavailable('anthropic', 'claude-opus-5-5', 1794665999.37)
++    for platform in (Platform.LOCAL, Platform.TELEGRAM):
++        result = _resolution_failure_result(wall, platform)
++        assert result['failure_resets_at'] == pytest.approx(1794665999.37)
++        assert result['api_calls'] == 0
++    assert 'failure_resets_at' not in _resolution_failure_result(RuntimeError('no creds'), Platform.LOCAL)
++
++
++@pytest.mark.asyncio
++async def test_a_redelivery_never_folds_into_a_waiting_kanban_wake(tmp_path, monkeypatch):
++    """A waiting Kanban wake keeps its own row (and its own redelivery if refused); the replay is its own."""
++    from gateway import kanban_wake_fold
++    from gateway.session_automation import admit_route_wake
++    runner, db, authority = await _authority(tmp_path, monkeypatch)
++    _wall_gate(runner, monkeypatch, [])
++    admitted = []
++    try:
++        _viewer, ref = await _local_session(authority, tmp_path)
++        live = authority.sessions[ref.session_id]
++        adapter = runner._adapter_for_source(live.source)
++
++        def no_fold(_runner):
++            raise AssertionError('a redelivery entered the Kanban wake fold')
++
++        async def admit(_adapter, event, identity):
++            admitted.append(json.loads(identity))
++
++        monkeypatch.setattr(kanban_wake_fold, 'wake_lock', no_fold)
++        monkeypatch.setattr(authority, 'admit_automation', admit)
++        metadata = {'kanban_cards': [{'task_id': 't_1', 'board': 'default'}]}
++        assert await admit_route_wake(runner, adapter, live.source, 'kanban: t_1 blocked', 'kanban-wake',
++                                      metadata, replay_of='abc') is True
++        assert [parts[2] for parts in admitted] == ['wall-replay:abc']
++    finally:
++        await _stop(authority, db)
++
++
++def _seed(db, admission_id='adm-1'):
++    from gateway import session_wall_replay as replay
++    intent = {'admission_id': admission_id, 'producer': 'kanban-wake', 'route': 'r', 'tail': 'x',
++              'due': time.time(), 'text': 'kanban: t_1 blocked', 'metadata': {},
++              'source': {'platform': 'local', 'chat_id': 'local-x', 'chat_type': 'dm'}}
++    replay._write(db, replay.PREFIX + admission_id, json.dumps(intent))
++    return intent
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize('case,verdict,kept', [
++    ('admitted', 'admitted', False),
++    ('no-adapter', 'retry', True),        # not connected yet (boot): looks again, plan kept
++    ('draining', 'retry', True),          # a transient store refusal: looks again
++    ('refused', 'dropped', False),        # a permanent refusal: dropped, never retried
++    ('no-route', 'dropped', False),       # the route takes no wakes any more
++    ('exhausted', 'dropped', False),      # the retry budget is spent
++    ('retired', 'gone', True),            # a retired authority leaves it to the store's next owner
++])
++async def test_fire_replay_outcomes(tmp_path, monkeypatch, case, verdict, kept):
++    from gateway import session_automation, session_wall_replay as replay
++    from hermes_state_runtime import RuntimeStoreError
++    runner, db, authority = await _authority(tmp_path, monkeypatch)
++    calls = []
++    try:
++        intent = _seed(db)
++
++        async def admit(_runner, _adapter, source, text, producer, metadata, replay_of=None):
++            calls.append((source.chat_id, text, producer, replay_of))
++            if case == 'draining':
++                raise RuntimeStoreError('runtime_draining')
++            if case == 'refused':
++                raise RuntimeStoreError('permission_denied')
++            return case != 'no-route'
++
++        monkeypatch.setattr(session_automation, 'admit_route_wake', admit)
++        monkeypatch.setattr(runner, '_adapter_for_source', lambda source: None if case == 'no-adapter' else object())
++        if case == 'retired':
++            authority.retiring = True
++        tries = replay.RETRIES_MAX if case == 'exhausted' else 0
++        if case == 'exhausted':
++            monkeypatch.setattr(runner, '_adapter_for_source', lambda source: None)
++        assert await replay.fire_replay(authority, intent['admission_id'], tries) == verdict
++        assert (intent['admission_id'] in _intents(db)) is kept
++        assert (intent['admission_id'] in getattr(authority, '_wall_replay_timers', {})) is (verdict == 'retry')
++        if case == 'admitted':
++            assert calls == [('local-x', 'kanban: t_1 blocked', 'kanban-wake', 'x')]
++        if case in ('retired', 'no-adapter', 'exhausted'):
++            assert calls == []
++    finally:
++        authority.retiring = False
++        await _stop(authority, db)
+-- 
+2.43.0
+

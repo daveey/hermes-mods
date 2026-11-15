@@ -1,0 +1,624 @@
+From 62b08999c2902c1a948976cf102d516d307e6a8b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 16:26:04 +0000
+Subject: [PATCH] [daveey] Kanban workers: lean skills index + compact
+ kanban_show payload
+
+A dispatcher-owned Kanban worker re-reads its whole system prompt on every API call, and the first
+tool result of every run is kanban_show. Both carried bytes a worker never uses.
+
+1. Skills index (`skills.index_in_kanban_worker: full|compact|names`, default compact). Only when
+   `owned_kanban_task()` is set: `compact` drops each row's `Asks:`/`Not for:` trigger text (it
+   matches a user's own phrasing; a worker has a card, not a user), `names` demotes every category
+   to a names-only line. No mode hides a skill name. Chats keep the full index. Snapshot v7 rows
+   carry the exact `triggers` suffix so a cold start strips it without re-parsing SKILL.md, and the
+   LRU key carries the mode.
+2. kanban_show (dispatcher worker, no `verbose=true`): drops `capacity_evidence` and
+   `execution_observations` (`capacity_note` keeps the one-line reading), collapses consecutive
+   same-run heartbeat/dispatch_skipped/respawn_guarded/wake_episode_evidence rows into the newest
+   one with `repeated`/`first_at`, strips `_`-prefixed internal payload keys, and replaces every
+   text of 64+ bytes that `worker_context` already carries verbatim (`task.body`, comment bodies,
+   run summary/error/metadata) with "(in worker_context)"; a text the context caps (8 KB body,
+   2 KB comment, 4 KB run field) or tail-drops stays whole. `verbose=true` returns the old payload;
+   interactive and orchestrator callers are unchanged.
+
+Card: t_01a1dadad13bd037 (follow-up of t_01a1d975f8eb8e3f).
+---
+ agent/prompt_builder.py                       |  49 +++++--
+ agent/skill_utils.py                          |  13 ++
+ agent/system_prompt.py                        |   7 +-
+ tests/agent/test_skill_index_kanban_worker.py | 105 +++++++++++++++
+ tests/tools/test_kanban_show_compact.py       | 124 ++++++++++++++++++
+ tools/kanban_show.py                          |  74 ++++++++++-
+ tools/kanban_tools_schemas.py                 |   5 +-
+ website/docs/user-guide/configuration.md      |  11 ++
+ 8 files changed, 371 insertions(+), 17 deletions(-)
+ create mode 100644 tests/agent/test_skill_index_kanban_worker.py
+ create mode 100644 tests/tools/test_kanban_show_compact.py
+
+diff --git a/agent/prompt_builder.py b/agent/prompt_builder.py
+index ffacd1e711..55eb2f3f17 100644
+--- a/agent/prompt_builder.py
++++ b/agent/prompt_builder.py
+@@ -25,7 +25,7 @@ from agent.skill_utils import (
+     EXCLUDED_SKILL_DIRS, SKILL_SUPPORT_DIRS,
+     TIER_LOCAL, extract_skill_conditions, extract_skill_description,
+     get_disabled_skill_names, get_skill_search_roots,
+-    iter_skill_index_files, parse_frontmatter, skill_index_triggers_enabled, skill_matches_apps,
++    iter_skill_index_files, parse_frontmatter, render_skill_triggers, skill_index_triggers_enabled, skill_matches_apps,
+     skill_matches_environment, skill_matches_platform, skill_matches_platform_list,
+ )
+ from tools.threat_patterns import scan_for_threats as _scan_for_threats
+@@ -1216,8 +1216,9 @@ _SKILLS_PROMPT_CACHE: OrderedDict[tuple, str] = OrderedDict()
+ _SKILLS_PROMPT_CACHE_LOCK = threading.Lock()
+ # v2 added org provenance fields (org_id/org_author); v4 adds ``rel`` (SKILL.md path relative to its root) for
+ # duplicate-name resolution; v5 stores descriptions clipped at a word boundary; v6 rows carry ``triggers:`` and the
+-# snapshot records ``index_triggers`` (the skills.index_triggers value they were built with). Older ones are rebuilt.
+-_SKILLS_SNAPSHOT_VERSION = 6
++# snapshot records ``index_triggers`` (the skills.index_triggers value they were built with); v7 rows carry
++# ``triggers`` (the suffix their description ends with) so a Kanban worker's index can drop it. Older ones are rebuilt.
++_SKILLS_SNAPSHOT_VERSION = 7
+ 
+ 
+ def _skills_prompt_snapshot_path() -> Path:
+@@ -1281,12 +1282,15 @@ def _build_snapshot_entry(skill_file: Path, skills_dir: Path, frontmatter: dict,
+     category = "general" if len(parts) < 2 else "/".join(parts[:-2]) if len(parts) > 2 else parts[0]
+     platforms = frontmatter.get("platforms") or []
+     platforms = [platforms] if isinstance(platforms, str) else platforms
++    triggers = render_skill_triggers(frontmatter)
+     entry = {
+         "skill_name": skill_name, "category": category, "frontmatter_name": str(frontmatter.get("name", skill_name)),
+         "rel": skill_file.relative_to(skills_dir).as_posix(),
+         "description": description, "platforms": [str(p).strip() for p in platforms if str(p).strip()],
+         "conditions": extract_skill_conditions(frontmatter),
+         "requires_apps": _requires_apps_list(frontmatter),
++        # The trigger suffix the description carries ("" when index_triggers is off or there is none).
++        "triggers": triggers if triggers and description.endswith(triggers) else "",
+     }
+     return entry
+ 
+@@ -1374,12 +1378,15 @@ def _current_session_platform_hint() -> str:
+ def build_skills_system_prompt(
+     available_tools: set[str] | None = None, available_toolsets: set[str] | None = None,
+     compact_categories: frozenset[str] | None = None, skills_dir_override: Path | None = None,
++    index_mode: str = "full",
+ ) -> str:
+     """Compact skill index for the system prompt.
+ 
+     Same-named skills resolve like skill_view: project > local > create_dir > external_dirs, and a
+     same-tier duplicate is listed under its exact relative path (``agent.skill_utils.resolve_skill_catalog``).
+     ``compact_categories`` (coding posture) demotes categories to a names-only line — nothing is ever hidden.
++    ``index_mode`` (``skills.index_in_kanban_worker`` for a Kanban worker): ``full``, ``compact`` (rows
++    without their ``triggers:`` text) or ``names`` (every category names-only).
+     ``skills_dir_override`` makes home resolution EXPLICIT: a build thread that never bound the HERMES_HOME
+     ContextVar would otherwise leak the default profile's skills into a bot's prompt.
+     """
+@@ -1401,7 +1408,7 @@ def build_skills_system_prompt(
+         if not skills_dir.exists() and not extra_roots:
+             return ""
+         return _build_skills_system_prompt_inner(
+-            skills_dir, extra_roots, available_tools, available_toolsets, compact_categories)
++            skills_dir, extra_roots, available_tools, available_toolsets, compact_categories, index_mode)
+     finally:
+         if _home_token is not None:
+             reset_hermes_home_override(_home_token)
+@@ -1423,11 +1430,16 @@ def _scan_extra_root(root: Path, skill_files, tier: int, log_fmt: str) -> list[t
+     return rows
+ 
+ 
+-def _label_visible_entries(visible_entries: list[dict], skills_by_category: dict[str, list[tuple[str, str]]]) -> None:
+-    """Index rows under each entry's ``load_name`` (what skill_view accepts)."""
++def _label_visible_entries(visible_entries: list[dict], skills_by_category: dict[str, list[tuple[str, str]]],
++                           with_triggers: bool = True) -> None:
++    """Index rows under each entry's ``load_name`` (what skill_view accepts); ``with_triggers=False`` drops
++    the ``triggers:`` suffix a row's description carries."""
+     from agent.skill_utils import TIER_PROJECT
+     for entry in (e for e in visible_entries if e["load_name"]):
+         desc = entry.get("description", "")
++        triggers = entry.get("triggers") or ""
++        if not with_triggers and triggers and desc.endswith(triggers):
++            desc = desc[:-len(triggers)]
+         if entry["tier"] == TIER_PROJECT:
+             desc = f"[project] {desc}".strip()
+         category = entry.get("category") or "general"
+@@ -1437,15 +1449,22 @@ def _label_visible_entries(visible_entries: list[dict], skills_by_category: dict
+ def _render_skills_index(
+     skills_by_category: dict[str, list[tuple[str, str]]],
+     compact_categories: frozenset[str] | None, available_tools: set[str] | None, unloadable: list[str] = (),
++    index_mode: str = "full",
+ ) -> str:
+     """Render the ## Skills block; "" when there is nothing to list. *unloadable* names (different skills
+-    sharing a name AND relative path within one tier — one root or several) get a rename note instead of a row skill_view would refuse."""
++    sharing a name AND relative path within one tier — one root or several) get a rename note instead of a row skill_view would refuse.
++    ``index_mode="names"`` demotes every category (a one-skill category is a bare ``- name`` row)."""
+     if not skills_by_category:
+         return ""
++    names_only = index_mode == "names"
+     # Demoted categories collapse to one names-only line. NEVER drop entries — agent-created skills are the
+     # model's project memory and it won't rediscover them via skills_list. Nested categories follow their parent.
+-    demoted = frozenset(cat for cat in skills_by_category if cat.split("/", 1)[0] in (compact_categories or frozenset()))
++    demoted = frozenset(skills_by_category) if names_only else frozenset(
++        cat for cat in skills_by_category if cat.split("/", 1)[0] in (compact_categories or frozenset()))
+     hidden_note = (
++        "\n(This Kanban worker's index lists skill names only, to keep per-call context small — every skill "
++        "loads with skill_view(name) as usual, and skills_list shows descriptions.)"
++    ) if names_only else (
+         "\n(Categories marked [names only] are outside the current coding "
+         "context, so their descriptions are omitted — the skills work "
+         "normally and load with skill_view(name) as usual.)"
+@@ -1460,7 +1479,11 @@ def _render_skills_index(
+     for category in sorted(skills_by_category):
+         entries = skills_by_category[category]
+         if category in demoted:
+-            index_lines.append(f"  {category} [names only]: {', '.join(sorted({n for n, _ in entries}))}")
++            names = sorted({n for n, _ in entries})
++            if names_only and names == [category]:
++                index_lines.append(f"  - {category}")
++                continue
++            index_lines.append(f"  {category}{'' if names_only else ' [names only]'}: {', '.join(names)}")
+             continue
+         rows: dict[str, str] = {}
+         for name, desc in sorted(entries, key=lambda x: x[0]):  # stable: first entry per name wins
+@@ -1508,7 +1531,7 @@ def _oneshot_prompt_variant() -> bool:
+ 
+ def _build_skills_system_prompt_inner(
+     skills_dir: Path, extra_roots: list[tuple[int, Path]], available_tools: set[str] | None,
+-    available_toolsets: set[str] | None, compact_categories: frozenset[str] | None,
++    available_toolsets: set[str] | None, compact_categories: frozenset[str] | None, index_mode: str = "full",
+ ) -> str:
+     # The resolved platform is part of the key: per-platform disabled-skill lists need distinct cache entries.
+     _platform_hint = _current_session_platform_hint()
+@@ -1527,7 +1550,7 @@ def _build_skills_system_prompt_inner(
+         tuple(sorted(str(t) for t in (available_tools or set()))),
+         tuple(sorted(str(ts) for ts in (available_toolsets or set()))),
+         _platform_hint, tuple(sorted(disabled)), tuple(sorted(compact_categories or ())),
+-        _oneshot_prompt_variant(), tuple(plugin_rows), skill_index_triggers_enabled(),
++        _oneshot_prompt_variant(), tuple(plugin_rows), skill_index_triggers_enabled(), index_mode,
+     )
+     snapshot = _load_skills_snapshot(skills_dir, manifest)
+     app_gated = snapshot is not None and any(
+@@ -1573,7 +1596,7 @@ def _build_skills_system_prompt_inner(
+         for entry, ok in rows])
+     visible_entries = [e for e in resolved
+                        if e["visible"] and e["status"] != "shadowed" and not is_disabled_entry(e, disabled)]
+-    _label_visible_entries(visible_entries, skills_by_category)
++    _label_visible_entries(visible_entries, skills_by_category, with_triggers=index_mode == "full")
+     if plugin_rows:
+         # Same category label skills_list gives registry skills; qualified names are already
+         # namespaced (plugin:skill) so they cannot collide with on-disk load_names.
+@@ -1593,7 +1616,7 @@ def _build_skills_system_prompt_inner(
+             logger.debug("Could not write skills prompt snapshot: %s", e)
+ 
+     unloadable = sorted({e["name"] for e in visible_entries if not e["load_name"]})
+-    result = _render_skills_index(skills_by_category, compact_categories, available_tools, unloadable)
++    result = _render_skills_index(skills_by_category, compact_categories, available_tools, unloadable, index_mode)
+     with _SKILLS_PROMPT_CACHE_LOCK:
+         _SKILLS_PROMPT_CACHE[cache_key] = result
+         _SKILLS_PROMPT_CACHE.move_to_end(cache_key)
+diff --git a/agent/skill_utils.py b/agent/skill_utils.py
+index 4e9f554e35..11b369bdbd 100644
+--- a/agent/skill_utils.py
++++ b/agent/skill_utils.py
+@@ -886,6 +886,19 @@ def skill_index_triggers_enabled() -> bool:
+     return is_truthy_value(_skills_cfg_get("index_triggers"), default=True)
+ 
+ 
++KANBAN_WORKER_INDEX_MODES = ("full", "compact", "names")
++
++
++def kanban_worker_skill_index_mode() -> str:
++    """``skills.index_in_kanban_worker`` for a dispatcher-owned Kanban worker's skills index. [daveey]
++
++    ``full``: the chat index. ``compact`` (default): descriptions without the ``triggers:`` text, which
++    matches a user's own phrasing and so earns its ~8 KB per call only in chats. ``names``: every
++    category on one names-only line. No mode hides a skill name; an unknown value reads as ``compact``."""
++    raw = str(_skills_cfg_get("index_in_kanban_worker") or "").strip().lower()
++    return raw if raw in KANBAN_WORKER_INDEX_MODES else "compact"
++
++
+ def _one_line(value: Any) -> str:
+     return " ".join(str(value).split())
+ 
+diff --git a/agent/system_prompt.py b/agent/system_prompt.py
+index c06e70d0a6..eb40a3341a 100644
+--- a/agent/system_prompt.py
++++ b/agent/system_prompt.py
+@@ -316,8 +316,13 @@ def _skills_prompt(agent: Any) -> str:
+         _compact_cats = coding_compact_skill_categories(platform=agent.platform, cwd=resolve_context_cwd())
+     except Exception:
+         _compact_cats = frozenset()
++    # A dispatcher-owned Kanban worker re-reads this index on every call with no user phrasing to match:
++    # skills.index_in_kanban_worker (default compact) trims it. Chats keep the full index. [daveey]
++    from agent.skill_utils import kanban_worker_skill_index_mode
++    index_mode = kanban_worker_skill_index_mode() if owned_kanban_task() else "full"
+     return _pb.build_skills_system_prompt(available_tools=agent.valid_tool_names, available_toolsets=avail_toolsets,
+-                                         compact_categories=_compact_cats or None, skills_dir_override=_agent_skills_dir(agent))
++                                         compact_categories=_compact_cats or None, skills_dir_override=_agent_skills_dir(agent),
++                                         index_mode=index_mode)
+ 
+ 
+ def _auto_load_parts(agent: Any) -> list[str]:
+diff --git a/tests/agent/test_skill_index_kanban_worker.py b/tests/agent/test_skill_index_kanban_worker.py
+new file mode 100644
+index 0000000000..e33e41a8b7
+--- /dev/null
++++ b/tests/agent/test_skill_index_kanban_worker.py
+@@ -0,0 +1,105 @@
++"""Leaner skills index for dispatcher-owned Kanban workers (``skills.index_in_kanban_worker``). [daveey]
++
++A worker re-reads the whole system prompt on every API call; the ``triggers:`` text (user phrasings) earns
++its bytes only in a chat. No mode may hide a skill name."""
++
++import json
++from types import SimpleNamespace
++
++import pytest
++
++from agent import prompt_builder
++from agent import system_prompt
++from agent.prompt_builder import build_skills_system_prompt, clear_skills_system_prompt_cache
++from agent.skill_utils import kanban_worker_skill_index_mode
++
++DESC = "Use when my Mac disk is full."
++TRIGGERS = ' Asks: "my disk is full". Not for: the CI runner disk.'
++
++
++@pytest.fixture(autouse=True)
++def home(monkeypatch, tmp_path):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    clear_skills_system_prompt_cache(clear_snapshot=True)
++    _skill(tmp_path, "apple", "mac-disk-cleanup", DESC, triggers=True)
++    _skill(tmp_path, "apple", "apple-notes", "Use when reading Apple Notes.")
++    _skill(tmp_path, "email-triage", None, "Triage an inbox.")  # a one-skill top-level category
++    yield tmp_path
++    clear_skills_system_prompt_cache(clear_snapshot=True)
++
++
++def _skill(home, category, name, desc, triggers=False):
++    d = home / "skills" / category / name if name else home / "skills" / category
++    d.mkdir(parents=True, exist_ok=True)
++    trig = '\ntriggers:\n  asks:\n    - "my disk is full"\n  not_for: "the CI runner disk"' if triggers else ""
++    (d / "SKILL.md").write_text(
++        f"---\nname: {name or category}\ndescription: {desc}{trig}\n---\n\nBody.\n", encoding="utf-8")
++
++
++def _config(home, body):
++    (home / "config.yaml").write_text(f"skills:\n{body}\n", encoding="utf-8")
++
++
++def _row(prompt, name="mac-disk-cleanup"):
++    return next(line for line in prompt.splitlines() if name in line)
++
++
++def test_full_mode_is_the_unchanged_chat_index():
++    assert _row(build_skills_system_prompt()).endswith(f"- mac-disk-cleanup: {DESC}{TRIGGERS}")
++    assert build_skills_system_prompt(index_mode="full") == build_skills_system_prompt()
++
++
++def test_compact_mode_drops_trigger_text_but_keeps_descriptions(home):
++    full = build_skills_system_prompt()
++    compact = build_skills_system_prompt(index_mode="compact")
++    assert _row(compact).endswith(f"- mac-disk-cleanup: {DESC}")
++    assert "Asks:" not in compact and "Not for:" not in compact
++    assert "- apple-notes: Use when reading Apple Notes." in compact
++    assert len(compact) < len(full)
++    # Cold start: the disk snapshot alone must carry what compact strips.
++    clear_skills_system_prompt_cache()
++    assert json.loads((home / ".skills_prompt_snapshot.json").read_text())["version"] == 7
++    assert build_skills_system_prompt(index_mode="compact") == compact
++    assert build_skills_system_prompt() == full  # and full still renders them (separate LRU keys)
++
++
++def test_compact_strips_only_the_exact_trigger_suffix(home):
++    # A description that merely mentions "Asks:" is not trigger text.
++    _skill(home, "apple", "apple-notes", "Use when David Asks: notes.")
++    assert "- apple-notes: Use when David Asks: notes." in build_skills_system_prompt(index_mode="compact")
++
++
++def test_names_mode_lists_every_skill_name_and_no_description():
++    names = build_skills_system_prompt(index_mode="names")
++    for name in ("mac-disk-cleanup", "apple-notes", "email-triage"):
++        assert name in names
++    assert "  apple: apple-notes, mac-disk-cleanup" in names
++    assert "  - email-triage\n" in names  # not "email-triage: email-triage"
++    assert DESC not in names and "Asks:" not in names and "[names only]" not in names
++    assert "skill_view(name)" in names and "skills_list shows descriptions" in names
++
++
++@pytest.mark.parametrize(("body", "mode"), [
++    ("  index_triggers: true", "compact"),  # unset -> compact
++    ("  index_in_kanban_worker: names", "names"),
++    ("  index_in_kanban_worker: FULL", "full"),
++    ("  index_in_kanban_worker: everything", "compact"),  # unknown -> compact
++])
++def test_config_knob(home, body, mode):
++    _config(home, body)
++    assert kanban_worker_skill_index_mode() == mode
++
++
++@pytest.mark.parametrize(("owned", "config", "mode"), [
++    ("", "  index_in_kanban_worker: names", "full"),  # a chat never gets the lean index
++    ("t_worker", "  index_triggers: true", "compact"),
++    ("t_worker", "  index_in_kanban_worker: names", "names"),
++])
++def test_skills_prompt_picks_the_mode_from_worker_ownership(home, monkeypatch, owned, config, mode):
++    _config(home, config)
++    seen = {}
++    monkeypatch.setattr(system_prompt, "owned_kanban_task", lambda: owned)
++    monkeypatch.setattr(prompt_builder, "build_skills_system_prompt", lambda **kw: seen.update(kw) or "")
++    agent = SimpleNamespace(valid_tool_names={"skill_view"}, platform="cli")
++    system_prompt._skills_prompt(agent)
++    assert seen["index_mode"] == mode
+diff --git a/tests/tools/test_kanban_show_compact.py b/tests/tools/test_kanban_show_compact.py
+new file mode 100644
+index 0000000000..121210b5a3
+--- /dev/null
++++ b/tests/tools/test_kanban_show_compact.py
+@@ -0,0 +1,124 @@
++"""kanban_show's compact worker payload: diagnostics out, repeated bookkeeping events collapsed. [daveey]
++
++The first tool result of every worker run is this read; the full shape stays one ``verbose=true`` away
++and is unchanged for interactive and orchestrator callers."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from tests.tools import test_kanban_tools as helpers
++from tools import kanban_show
++from tools import kanban_tools as kt
++
++worker_env = helpers.worker_env
++BODY = "Fix the widget so it stops dropping events.\n\nDone when the widget works and has a regression test."
++
++
++@pytest.fixture
++def card(worker_env):
++    with kbc.connect() as conn:
++        conn.execute("UPDATE tasks SET body = ? WHERE id = ?", (BODY, worker_env))
++        run_id = kb._current_run_id(conn, worker_env)
++        with kb.write_txn(conn):
++            for _ in range(6):
++                kb._append_event(conn, worker_env, "heartbeat", {"note": None}, run_id=run_id)
++            kb._append_event(conn, worker_env, "commented", {"author": "x", "_internal": {"id": "i"}}, run_id=run_id)
++            for note in ("a", "b"):
++                kb._append_event(conn, worker_env, "heartbeat", {"note": note}, run_id=run_id)
++    return worker_env
++
++
++def _kinds(out):
++    return [e["kind"] for e in out["events"]]
++
++
++def test_worker_default_is_compact(card):
++    full = json.loads(kt._handle_show({"verbose": True}))
++    out = json.loads(kt._handle_show({}))
++    assert {"capacity_evidence", "execution_observations"} <= full.keys()
++    assert not {"capacity_evidence", "execution_observations"} & out.keys()
++    assert out["capacity_note"] == full["capacity_note"]
++    assert "verbose=true" in out["compact"] and "compact" not in full
++    # Heartbeat runs collapse to their newest row; the commented event between them survives.
++    assert _kinds(full).count("heartbeat") == 8
++    assert _kinds(out)[-3:] == ["heartbeat", "commented", "heartbeat"]
++    first, last = out["events"][-3], out["events"][-1]
++    assert first["repeated"] == 6 and last["repeated"] == 2 and last["payload"] == {"note": "b"}
++    assert last["first_at"] <= last["created_at"]
++    # Internal stamps never reach the worker; the full payload keeps them.
++    assert any(k.startswith("_") for e in full["events"] for k in (e["payload"] or {}))
++    assert not any(k.startswith("_") for e in out["events"] for k in (e["payload"] or {}))
++    # The body is read once, from worker_context.
++    assert full["task"]["body"] == BODY and BODY in out["worker_context"]
++    assert out["task"]["body"] == "(in worker_context)"
++    assert len(json.dumps(out)) < len(json.dumps(full))
++
++
++@pytest.mark.parametrize("verbose", [True, "true", 1])
++def test_verbose_restores_the_full_payload(card, verbose):
++    out = json.loads(kt._handle_show({"verbose": verbose}))
++    assert {"capacity_evidence", "execution_observations"} <= out.keys() and "compact" not in out
++    assert out["task"]["body"] == BODY and _kinds(out).count("heartbeat") == 8
++
++
++def test_non_worker_callers_keep_the_full_payload(card, monkeypatch):
++    monkeypatch.delenv("HERMES_KANBAN_TASK")
++    out = json.loads(kt._handle_show({"task_id": card}))
++    assert {"capacity_evidence", "execution_observations"} <= out.keys() and "compact" not in out
++    assert out["task"]["body"] == BODY and _kinds(out).count("heartbeat") == 8
++
++
++def test_a_body_worker_context_truncates_stays_in_task(card):
++    long_body = "x" * (20 * 1024)
++    with kbc.connect() as conn:
++        conn.execute("UPDATE tasks SET body = ? WHERE id = ?", (long_body, card))
++    out = json.loads(kt._handle_show({}))
++    assert long_body not in out["worker_context"]
++    assert out["task"]["body"] == long_body
++
++
++def test_texts_worker_context_carries_are_pointed_and_others_kept(card):
++    long_comment = "Please also cover the gizmo path; the widget fix alone leaves gizmo users broken."
++    huge_comment = "y" * (3 * 1024)  # over the 2 KB per-comment context cap: rendered truncated
++    with kbc.connect() as conn:
++        kb.add_comment(conn, card, "operator", long_comment)
++        kb.add_comment(conn, card, "operator", huge_comment)
++        kb.add_comment(conn, card, "operator", "short")
++    full = json.loads(kt._handle_show({"verbose": True}))
++    out = json.loads(kt._handle_show({}))
++    bodies = [c["body"] for c in out["comments"]]
++    assert bodies == ["(in worker_context)", huge_comment, "short"]
++    assert [c["body"] for c in full["comments"]] == [long_comment, huge_comment, "short"]
++    assert [(c["author"], c["created_at"]) for c in out["comments"]] == [
++        (c["author"], c["created_at"]) for c in full["comments"]]
++
++
++def test_run_texts_point_only_when_rendered_whole():
++    meta = {"pr": "https://github.com/o/r/pull/1", "tests_run": 12, "notes": "z" * 40}
++    summary = "Implemented the widget fix and added regression tests for the gizmo path."
++    context = f"### Attempt 1\n{summary}\n_metadata_: `{json.dumps(meta, sort_keys=True)}`\n"
++    other = {"id": 2, "summary": "s" * 80, "error": None, "metadata": {"k": "v" * 80}}
++    out = kanban_show.compact({"worker_context": context, "task": {"body": None}, "comments": [], "events": [],
++                               "runs": [{"id": 1, "summary": summary, "error": None, "metadata": meta}, other]})
++    assert out["runs"][0] == {"id": 1, "summary": "(in worker_context)", "error": None,
++                              "metadata": "(in worker_context)"}
++    assert out["runs"][1] == other  # not in the context: kept whole
++
++
++def test_collapse_keeps_distinct_runs_kinds_and_rows():
++    rows = [
++        {"kind": "heartbeat", "payload": None, "created_at": 1, "run_id": 1},
++        {"kind": "heartbeat", "payload": None, "created_at": 2, "run_id": 2},  # another run: kept
++        {"kind": "claimed", "payload": {"a": 1, "_x": 2}, "created_at": 3, "run_id": 2},
++        {"kind": "claimed", "payload": {"a": 2}, "created_at": 4, "run_id": 2},  # not a repeated kind: kept
++        {"kind": "respawn_guarded", "payload": {"reason": "r"}, "created_at": 5, "run_id": None},
++        {"kind": "respawn_guarded", "payload": {"reason": "r"}, "created_at": 6, "run_id": None},
++        {"kind": "respawn_guarded", "payload": {"reason": "r"}, "created_at": 7, "run_id": None},
++    ]
++    out = kanban_show.collapse_events(rows)
++    assert [(e["kind"], e.get("repeated")) for e in out] == [
++        ("heartbeat", None), ("heartbeat", None), ("claimed", None), ("claimed", None), ("respawn_guarded", 3)]
++    assert out[2]["payload"] == {"a": 1} and out[-1]["first_at"] == 5 and out[-1]["created_at"] == 7
++    assert rows[2]["payload"] == {"a": 1, "_x": 2}  # input rows are not mutated
+diff --git a/tools/kanban_show.py b/tools/kanban_show.py
+index 3c0ecf3532..18a5c94a27 100644
+--- a/tools/kanban_show.py
++++ b/tools/kanban_show.py
+@@ -23,10 +23,11 @@ def show(args: dict) -> str:
+         })
+     # Retain board grants before consulting a replica; a foreign read is not a
+     # cross-board permission grant, and never imports a writable local card.
++    view = compact if compact_view(args) else (lambda out: out)
+     with kt._granted_board(args.get("board"), tid) as (kb, conn, _):
+         task = kb.get_task(conn, tid)
+         if task is not None:
+-            return json.dumps(_detail(kb, conn, task, args, replica=False))
++            return json.dumps(view(_detail(kb, conn, task, args, replica=False)))
+         with kfc.open_replica(kfc._live_db_file(conn)) as replica:
+             task = kb.get_task(replica, tid) if replica is not None else None
+             if replica is not None and task is not None:
+@@ -36,7 +37,7 @@ def show(args: dict) -> str:
+                 from hermes_cli.kanban_pickup_stall import latest as pickup_skip
+                 if skip := pickup_skip(conn, tid):  # why this host's pickup has not imported it [daveey]
+                     out["pickup_skip"] = skip
+-                return json.dumps(out)
++                return json.dumps(view(out))
+         kt._existing_task(kb, conn, tid)  # preserve the existing not-found error
+     raise AssertionError("missing task lookup must reject")
+ 
+@@ -88,3 +89,72 @@ def _detail(kb, conn, task, args, *, replica: bool) -> dict:
+         "runs": [kt._fields(r, kt._RUN_FIELDS) for r in kb.list_runs(conn, tid)],
+         "supervisor_requests": kt._graph.supervisor_requests(conn, tid),
+         "worker_context": worker_context}
++
++
++# Kinds a worker never acts on one by one: a run of them collapses to its newest row plus a count. [daveey]
++_REPEATED_EVENT_KINDS = frozenset({"heartbeat", "dispatch_skipped", "respawn_guarded", "wake_episode_evidence"})
++_DIAGNOSTIC_FIELDS = ("capacity_evidence", "execution_observations")
++
++
++def compact_view(args: dict) -> bool:
++    """True when this read gets the compact payload: a dispatcher-owned worker that did not pass
++    ``verbose=true``. Interactive and orchestrator callers keep the full shape."""
++    from agent.delegation_context import owned_kanban_task
++    from utils import is_truthy_value
++    return not is_truthy_value(args.get("verbose"), default=False) and bool(owned_kanban_task())
++
++
++def compact(out: dict) -> dict:
++    """The worker-facing payload: capacity/observation diagnostics dropped (``capacity_note`` keeps
++    the one-line reading), runs of repeated bookkeeping events collapsed, ``_``-prefixed internal
++    payload keys stripped, and every long text ``worker_context`` already carries verbatim (the body,
++    comment bodies, run summaries/errors/metadata) replaced by a pointer: a text the context caps or
++    tail-drops stays. ``kanban_show(verbose=true)`` returns everything."""
++    out = {k: v for k, v in out.items() if k not in _DIAGNOSTIC_FIELDS}
++    context = out.get("worker_context") or ""
++    if isinstance(out.get("task"), dict):
++        out["task"] = _point(out["task"], ("body",), context)
++    out["comments"] = [_point(c, ("body",), context) if isinstance(c, dict) else c
++                       for c in out.get("comments") or []]
++    out["runs"] = [_point(r, ("summary", "error", "metadata"), context) if isinstance(r, dict) else r
++                   for r in out.get("runs") or []]
++    out["events"] = collapse_events(out.get("events") or [])
++    out["compact"] = ("diagnostics and repeated events omitted, texts shown in worker_context not repeated; "
++                      "kanban_show(verbose=true) for the full payload")
++    return out
++
++
++_IN_CONTEXT = "(in worker_context)"
++_MIN_POINTED_BYTES = 64  # shorter texts cost less than the pointer is worth
++
++
++def _point(row: dict, keys: tuple[str, ...], context: str) -> dict:
++    """``row`` with each of ``keys`` whose rendering appears verbatim in ``context`` replaced by a pointer."""
++    out = dict(row)
++    for key in keys:
++        value = row.get(key)
++        if key == "metadata":  # rendered as sorted JSON; a capped rendering never contains the whole dump
++            text = json.dumps(value, ensure_ascii=False, sort_keys=True) if isinstance(value, dict) and value else ""
++        else:
++            text = value.strip() if isinstance(value, str) else ""
++        if len(text.encode()) >= _MIN_POINTED_BYTES and text in context:
++            out[key] = _IN_CONTEXT
++    return out
++
++
++def collapse_events(events: list[dict]) -> list[dict]:
++    """Collapse consecutive same-kind, same-run rows of ``_REPEATED_EVENT_KINDS`` into the newest one
++    with ``repeated`` (count) and ``first_at``; strip ``_``-prefixed payload keys from every row."""
++    rows: list[dict] = []
++    for event in events:
++        payload = event.get("payload")
++        if isinstance(payload, dict):
++            event = {**event, "payload": {k: v for k, v in payload.items() if not str(k).startswith("_")}}
++        prev = rows[-1] if rows else None
++        if (prev is not None and event.get("kind") in _REPEATED_EVENT_KINDS
++                and prev.get("kind") == event.get("kind") and prev.get("run_id") == event.get("run_id")):
++            rows[-1] = {**event, "repeated": prev.get("repeated", 1) + 1,
++                        "first_at": prev.get("first_at", prev.get("created_at"))}
++            continue
++        rows.append(event)
++    return rows
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index eff8d2791f..6cfcfeab08 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -67,10 +67,13 @@ KANBAN_SHOW_SCHEMA = _schema(
+         "pre-formatted ``worker_context`` string suitable for inclusion "
+         "verbatim in your reasoning. Outside a dispatcher-spawned worker "
+         "there is no default task: a bare call returns a pointer to "
+-        "``kanban_list`` instead of task state."
++        "``kanban_list`` instead of task state. A dispatcher worker gets a compact payload "
++        "(repeated heartbeat/guard events collapsed, capacity diagnostics omitted); "
++        "pass verbose=true for everything."
+     ),
+     {
+         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
++        "verbose": _prop("boolean", "Full diagnostic payload (every event row, capacity evidence)."),
+     },
+     [],
+ )
+diff --git a/website/docs/user-guide/configuration.md b/website/docs/user-guide/configuration.md
+index 1a1bef2875..d6b55bb498 100644
+--- a/website/docs/user-guide/configuration.md
++++ b/website/docs/user-guide/configuration.md
+@@ -986,6 +986,17 @@ skills:
+ 
+ Resolved once per session when the system prompt is first built (so the prompt stays cache-stable; edits apply to the next session). Missing or disabled skills warn and are skipped; `--ignore-rules` / `HERMES_IGNORE_RULES=1` suppresses the list. Profile-scoped. See [CLI — persistent auto-load](./cli.md#persistent-auto-load-via-config).
+ 
++### Skills index in Kanban workers
++
++A dispatcher-spawned Kanban worker re-reads its system prompt on every API call, and has no user phrasing for the skills' `triggers:` text to match. Its skills index is trimmed:
++
++```yaml
++skills:
++  index_in_kanban_worker: compact   # full | compact | names (default: compact)
++```
++
++`full` is the chat index. `compact` keeps each description and drops the `Asks:` / `Not for:` trigger text. `names` lists only skill names, grouped by category. No mode hides a skill: every listed name loads with `skill_view` as usual. Chats are unaffected.
++
+ ### Guard on agent-created skill writes
+ 
+ When the agent uses `skill_manage` to create, edit, patch, or delete a skill, Hermes can optionally scan the new/updated content for dangerous keyword patterns (credential harvesting, obvious prompt injection, exfil instructions). The scanner is **off by default** — real agent workflows that legitimately touch `~/.ssh/` or mention `$OPENAI_API_KEY` were tripping the heuristic too often. Turn it back on if you want the scanner to prompt you before the agent's skill writes land:
+-- 
+2.43.0
+

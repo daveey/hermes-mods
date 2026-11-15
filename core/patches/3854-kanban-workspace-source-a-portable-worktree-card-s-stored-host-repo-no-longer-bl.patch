@@ -1,0 +1,170 @@
+From f1f5a77f1016892210d25ed027d271706605eca2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 20:59:43 +0000
+Subject: [PATCH] kanban workspace_source: a portable worktree card's stored
+ host_repo no longer blocks its move or pickup
+
+create_task stores validate_assignment's merged requirement list, so every worktree card's
+`requires` column holds the implicit host_repo. kanban_move._requirement_matches and the pickup
+gate (runs_on_capabilities.claim_refusal) read that stored list, so a card with published custody
+was still refused on any worker without capability:host_repo. LIVE t_01a1d5b1c1798e2a (custody
+published at manifest rev 1, wt/t_01a1d5b1c1798e2a @1c14bc9c12) was refused
+`capability_mismatch: machine worker-2 lacks capability:host_repo`.
+
+kanban_source_move.effective_requires drops host_repo when capability_kind is worktree_source
+(portable custody); move check and pickup use it. Non-portable worktree and dir cards keep it.
+
+Tests (red on base, green with the fix):
+- test_portable_worktree_moves_to_worker_without_host_repo_label (the LIVE refusal)
+- test_effective_requires_drops_host_repo_only_when_portable
+- test_pickup_claims_portable_worktree_on_profile_without_host_repo
+
+Card: t_01a1cc30806b0e62
+---
+ hermes_cli/kanban_move.py                   |  5 +-
+ hermes_cli/kanban_runs_on_capabilities.py   |  4 +-
+ hermes_cli/kanban_source_move.py            | 19 ++++++-
+ tests/hermes_cli/test_kanban_source_move.py | 58 +++++++++++++++++++++
+ 4 files changed, 80 insertions(+), 6 deletions(-)
+
+diff --git a/hermes_cli/kanban_move.py b/hermes_cli/kanban_move.py
+index 1beef78aba..0a670723c5 100644
+--- a/hermes_cli/kanban_move.py
++++ b/hermes_cli/kanban_move.py
+@@ -189,11 +189,12 @@ def check(conn: sqlite3.Connection, task_id: str, runs_on: Any, *, force: bool =
+         requires = json.loads(row["requires"]) if row["requires"] else []
+     except ValueError:
+         requires = []
++    source_card = {**dict(row), **({"workspace_source": fresh[0], "workspace_custody": fresh[1]} if fresh else {})}
++    requires = ksm.effective_requires(source_card, requires)  # a portable worktree needs no host checkout
+     matches = _requirement_matches(matches, pool, requires, wn._parse(row["skills"]) or [],
+                                    me=me, assignee=row["assignee"])
+     try:
+-        roc.check(labels, assignee=row["assignee"], requires=requires, workspace_kind=ksm.capability_kind(
+-                      {**dict(row), **({"workspace_source": fresh[0], "workspace_custody": fresh[1]} if fresh else {})}),
++        roc.check(labels, assignee=row["assignee"], requires=requires, workspace_kind=ksm.capability_kind(source_card),
+                   me=me, machines={m: pool[m] for m in matches}, exclude_me=exclude_me)
+     except roc.PlacementCapabilityMismatch as exc:
+         raise MoveRefused("capability_mismatch", str(exc)) from exc
+diff --git a/hermes_cli/kanban_runs_on_capabilities.py b/hermes_cli/kanban_runs_on_capabilities.py
+index 19c653dbdb..3d32670ea5 100644
+--- a/hermes_cli/kanban_runs_on_capabilities.py
++++ b/hermes_cli/kanban_runs_on_capabilities.py
+@@ -251,9 +251,9 @@ def claim_refusal(card: Mapping[str, Any], *, me: str = "") -> Optional[str]:
+     if not assignee:
+         return None
+     from hermes_cli.kanban_capabilities import validate_assignment
+-    from hermes_cli.kanban_source_move import capability_kind
++    from hermes_cli.kanban_source_move import capability_kind, effective_requires
+     try:
+-        validate_assignment(assignee, requires=_loads(card.get("requires"), []) or [],
++        validate_assignment(assignee, requires=effective_requires(card, _loads(card.get("requires"), []) or []),
+                             workspace_kind=capability_kind(card),
+                             skills=_loads(card.get("skills"), None) or None)
+     except CapabilityMismatchError as exc:
+diff --git a/hermes_cli/kanban_source_move.py b/hermes_cli/kanban_source_move.py
+index 05cb3a25ef..74c5e890fb 100644
+--- a/hermes_cli/kanban_source_move.py
++++ b/hermes_cli/kanban_source_move.py
+@@ -7,8 +7,8 @@
+ * A RUNNING card publishes first (§4 steps 1-8) and is checked against that fresh result (:func:`publish_for_move`);
+   the ``continue_task`` that ends the run carries the receipt.
+ * ``--reclaim`` refuses worktree cards and manifest-bearing cards (``reclaim_source_unsupported``).
+-* A portable worktree card is not host-only: its capability needs drop the implicit ``host_repo``
+-  (:func:`capability_kind`); an explicit ``host_repo`` in ``requires`` is unchanged.
++* A portable worktree card is not host-only: its capability needs drop ``host_repo`` (:func:`capability_kind`,
++  :func:`effective_requires`), also the copy ``create_task`` stored in ``requires``.
+ """
+ 
+ from __future__ import annotations
+@@ -110,3 +110,18 @@ def capability_kind(card: Mapping[str, Any]) -> str:
+     if kind == "worktree" and portable(card.get("workspace_source"), card.get("workspace_custody")) is None:
+         return "worktree_source"
+     return kind
++
++
++def effective_requires(card: Mapping[str, Any], requires: Any) -> list:
++    """``requires`` as the move and pickup checks must read it: a portable worktree card drops ``host_repo``.
++
++    ``create_task`` stores ``validate_assignment``'s merged list, so every worktree card's stored ``requires`` holds
++    the implicit ``host_repo`` and an explicit one is indistinguishable from it. Portable custody already proves the
++    source travels (the Board's repo proof gates the grant), so ``host_repo`` is dropped whenever
++    :func:`capability_kind` is ``worktree_source``; any other host need is a gateway need (``ssh:<host>`` ...) or a
++    ``runs_on`` label, which stay. LIVE t_01a1d5b1c1798e2a: a published card was refused
++    ``machine worker-2 lacks capability:host_repo``."""
++    needs = list(requires or [])
++    if capability_kind(card) == "worktree_source":
++        needs = [n for n in needs if n != "host_repo"]
++    return needs
+diff --git a/tests/hermes_cli/test_kanban_source_move.py b/tests/hermes_cli/test_kanban_source_move.py
+index c9e28126e5..74045dfa2b 100644
+--- a/tests/hermes_cli/test_kanban_source_move.py
++++ b/tests/hermes_cli/test_kanban_source_move.py
+@@ -162,6 +162,64 @@ def test_portable_worktree_is_not_host_only(conn):
+     assert ksm.capability_kind({"workspace_kind": "dir"}) == "dir"
+ 
+ 
++# create_task stores validate_assignment's merged list, so a worktree card's ``requires`` always holds the implicit
++# ``host_repo`` (LIVE t_01a1d5b1c1798e2a's created event: ["terminal","file","git","host_repo","kanban"]).
++CREATED_WORKTREE_REQUIRES = ["terminal", "file", "git", "host_repo", "kanban"]
++
++
++def _stored_requires(conn, tid, requires):
++    with kbc.write_txn(conn):
++        conn.execute("UPDATE tasks SET requires=? WHERE id=?", (json.dumps(requires), tid))
++
++
++def test_portable_worktree_moves_to_worker_without_host_repo_label(conn, monkeypatch):
++    """LIVE t_01a1d5b1c1798e2a: published custody at rev 1, yet the move to machine:worker-2 was refused
++    `capability_mismatch: machine worker-2 lacks capability:host_repo`, read from the stored requires."""
++    from hermes_cli import kanban_move as km
++    from hermes_cli import kanban_runs_on_capabilities as roc
++    sync.set_mode(conn, "primary")
++    monkeypatch.setattr(roc, "_remote_tools", lambda name: None)
++    monkeypatch.setattr(ksm, "_local_matches", lambda path, commit: commit == C1)  # holder's tree is clean at C1
++    machines = {"worker-2": {"state": "active", "pickup": "all", "labels": ["pool:worker", "capability:terminal"]}}
++    tid = card(conn, source=manifest(), cust=custody(source_holder="worker-4"))
++    _stored_requires(conn, tid, CREATED_WORKTREE_REQUIRES)
++    plan = km.check(conn, tid, ["machine:worker-2"], machines=machines, me="worker-4", host_reason="registered clone")
++    assert plan["matches"] == ["worker-2"]
++    # Not portable (custody retained): the stored host_repo still binds the card to a host checkout.
++    held = card(conn, source=manifest(), cust=custody(source_holder="worker-4", state="retained"))
++    _stored_requires(conn, held, CREATED_WORKTREE_REQUIRES)
++    with pytest.raises(km.MoveRefused) as err:
++        km.check(conn, held, ["machine:worker-2"], machines=machines, me="worker-4", host_reason="registered clone")
++    assert err.value.code == "custody_retained"
++
++
++def test_effective_requires_drops_host_repo_only_when_portable(conn):  # conn: workspace_source enabled
++    portable = {"workspace_kind": "worktree", "workspace_source": json.dumps(manifest()),
++                "workspace_custody": json.dumps(custody())}
++    assert ksm.effective_requires(portable, CREATED_WORKTREE_REQUIRES) == ["terminal", "file", "git", "kanban"]
++    assert ksm.effective_requires(portable, ["host_repo", "ssh:mini"]) == ["ssh:mini"]
++    retained = {**portable, "workspace_custody": json.dumps(custody(state="retained"))}
++    assert ksm.effective_requires(retained, CREATED_WORKTREE_REQUIRES) == CREATED_WORKTREE_REQUIRES
++    assert ksm.effective_requires({"workspace_kind": "dir"}, ["host_repo"]) == ["host_repo"]
++    assert ksm.effective_requires(portable, None) == []
++
++
++def test_pickup_claims_portable_worktree_on_profile_without_host_repo(conn, monkeypatch):
++    """The pickup gate (claim_refusal) reads the same stored requires: a portable card runs on a profile whose
++    terminal backend is not local (no host_repo); a retained one still needs it."""
++    from hermes_cli import kanban_capabilities as caps
++    from hermes_cli import kanban_runs_on_capabilities as roc
++    monkeypatch.setattr(caps, "_profile_capabilities", lambda assignee, required=None: {"terminal", "file", "git",
++                                                                                          "kanban"})
++    monkeypatch.setattr("hermes_cli.kanban_placement_coordination.claim_refusal", lambda card, me: None)
++    monkeypatch.setattr("hermes_cli.kanban_mandatory_pin.refusal", lambda card, me=None: None)
++    base = {"id": "t_pick", "assignee": "worker", "workspace_kind": "worktree", "skills": None,
++            "requires": json.dumps(CREATED_WORKTREE_REQUIRES), "workspace_source": json.dumps(manifest())}
++    assert roc.claim_refusal({**base, "workspace_custody": json.dumps(custody())}, me="worker-2") is None
++    assert "host_repo" in str(roc.claim_refusal({**base, "workspace_custody": json.dumps(custody(state="retained"))},
++                                                me="worker-2"))
++
++
+ # --- CLI --------------------------------------------------------------------------------------------------------
+ 
+ def test_cli_claim_custody_card_refused(conn):
+-- 
+2.43.0
+

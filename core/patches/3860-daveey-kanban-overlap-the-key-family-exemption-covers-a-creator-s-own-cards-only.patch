@@ -1,0 +1,345 @@
+From 32206064f69da1a8f1c96052150d78dcd71da18e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 19:40:27 +0000
+Subject: [PATCH] [daveey] kanban overlap: the key-family exemption covers a
+ creator's own cards only from its current run
+
+Incident (macbook default board, 2026-11-13): t_01a1d6354e5847dd filed review-nit follow-up
+t_01a1d6505a3d1591 (key followup:t_01a1d6354e5847dd:pr2545-nits) in run 42703. A hermes-sync core
+update reclaimed that run. The next run (42734) filed the same work again as t_01a1d6546c5bcdd9
+(key followup:t_01a1d6354e5847dd:pause-config-bounds). A worker ran on it until a supervisor closed it
+as a duplicate. (Card t_01a1d65c3b4d419f.)
+
+Replay of the second create through kanban_overlap._find: the titles share 11 words (ratio 0.61), so
+the normal match fires and none of the own_distinct rules separates them. The rule that admitted it is
+the idempotency-key family skip `family and card.key_family == family`: both keys are in family
+"followup", and the skip runs before the same-creator comparison. The hub caught the same pair only
+because replica cards carry no creator.
+
+Fix: that skip no longer covers a card the same creator task made in an EARLIER run
+(kanban_overlap_own.earlier_run: card.created_at < the creator's current run start). A keyed batch
+filed in one run (rollout:<card>:<leg>, plugin-suites-red:plugins/<name>, review:<card>:<model>:<sha>)
+stays exempt, because that run knows every leg. An unknown run start keeps the exemption.
+
+Replay, 14 days, same-creator pairs in one key family with the first card open:
+- hub 1721 pairs (71 first-from-earlier-run): before 0 refused, after 1 refused
+  (two [selfheal-probe] live checks, a false pair that distinct_from overrides);
+- macbook 6 pairs (3 earlier-run): before 0, after 1 (the incident).
+Dropping the family skip for every own card instead refused 27 hub pairs, nearly all one-run batch legs.
+
+Tests: the replay fixture gains the incident as a 4th duplicate and 4 same-run keyed fan-outs from the
+hub (each first card now carries its real key, so the family skip is exercised); a targeted test shows
+the earlier-run pair is refused, while the same pair in one run, or with an unknown run start, is
+admitted. RED before the fix: 3 failures (the incident is admitted); GREEN after.
+---
+ hermes_cli/kanban_overlap.py                  |   6 +-
+ hermes_cli/kanban_overlap_own.py              |  21 +++
+ .../kanban_overlap_same_creator_replay.json   | 148 +++++++++++++++++-
+ ...test_kanban_create_overlap_same_creator.py |  33 +++-
+ 4 files changed, 201 insertions(+), 7 deletions(-)
+
+diff --git a/hermes_cli/kanban_overlap.py b/hermes_cli/kanban_overlap.py
+index e25f6799b7..f2a15c14a1 100644
+--- a/hermes_cli/kanban_overlap.py
++++ b/hermes_cli/kanban_overlap.py
+@@ -698,7 +698,8 @@ def _sibling_owner(card_title: str, waiting_id: str) -> bool:
+ def find(*, title: str, body: str, target_board: str, session_id: Optional[str], self_tid: Optional[str],
+          parents: Iterable[str], family: Optional[str] = None) -> list[dict]:
+     """Open cards elsewhere that already cover this work, best match first. Never raises. ``family`` (the new
+-    card's idempotency-key family) skips cards from the same keyed creator, except singleton jobs."""
++    card's idempotency-key family) skips cards from the same keyed creator, except singleton jobs and the
++    creator task's own keyed cards from an earlier run (:func:`kanban_overlap_own.earlier_run`)."""
+     try:
+         from hermes_cli import kanban_capability_registry as reg
+         return _find(title=title, body=body, target_board=target_board, session_id=session_id, self_tid=self_tid,
+@@ -744,7 +745,8 @@ def _find(*, title: str, body: str, target_board: str, session_id: Optional[str]
+         if not singleton and (card["id"] in skip
+                 or (waiting and _sibling_owner(card.get("title") or "", waiting))
+                 or (session_id and card["session_id"] == session_id and not own)
+-                or (family and card.get("key_family") == family)):
++                or (family and card.get("key_family") == family
++                    and not (own and _own.earlier_run(card, run_started)))):
+             continue
+         seen.add((card["gateway"], card["id"]))
+         reasons, score = _reasons(card, new_words, title, body, target_board, gateways, failure)
+diff --git a/hermes_cli/kanban_overlap_own.py b/hermes_cli/kanban_overlap_own.py
+index d518d1d161..6301279177 100644
+--- a/hermes_cli/kanban_overlap_own.py
++++ b/hermes_cli/kanban_overlap_own.py
+@@ -34,6 +34,13 @@ Removing the exemption outright would have refused 517 pairs.
+ 
+ A card from the same chat but another creator (the session match) keeps the old exemption. Every card in a chat's
+ tree inherits that session, and the 10-11 race of two creators is another cause.
++
++The idempotency-key family exemption (one keyed creator's batch) covers the creator's own cards only from its
++current run (:func:`earlier_run`). Replay of 14 days (hub 1721 and macbook 6 same-creator same-family pairs, the
++first card open): 74 had the first card from an earlier run; comparing those refuses the macbook duplicate
++t_01a1d6505a3d1591 -> t_01a1d6546c5bcdd9 and 1 false pair (two ``[selfheal-probe]`` live checks, which
++``distinct_from`` overrides). Comparing every same-family own card instead would have refused 26 more hub
++pairs, nearly all legs of one run's keyed batch.
+ """
+ 
+ from __future__ import annotations
+@@ -219,6 +226,20 @@ def reissue(card: dict, self_tid: Optional[str], run_started: Optional[int], sco
+                 and (_epoch(card.get("created_at")) or 0) >= started and score >= REISSUE_SCORE)
+ 
+ 
++def earlier_run(card: dict, run_started: Optional[int]) -> bool:
++    """The creator made ``card`` in an EARLIER run than the current one (the key-family exemption's limit).
++
++    One creator keys a batch in one family (``rollout:<card>:<leg>``, ``plugin-suites-red:plugins/<name>``,
++    ``review:<card>:<model>:<sha>``) and files it in one run, knowing every leg: those stay exempt. A keyed card
++    from an earlier run is not known to this run (a reclaim or restart drops the transcript), so it is compared:
++    11-13 macbook t_01a1d6505a3d1591 (``followup:t_01a1d6354e5847dd:pr2545-nits``, run reclaimed by a core update)
++    was filed again by the creator's next run as t_01a1d6546c5bcdd9 (``followup:...:pause-config-bounds``).
++    An unknown run start keeps the exemption."""
++    started = _epoch(run_started)
++    created = _epoch(card.get("created_at"))
++    return started is not None and created is not None and created < started
++
++
+ def _epoch(value) -> Optional[int]:
+     try:
+         return int(value) if value is not None else None
+diff --git a/tests/tools/fixtures/kanban_overlap_same_creator_replay.json b/tests/tools/fixtures/kanban_overlap_same_creator_replay.json
+index 1a1e28e85b..169c7fc9e4 100644
+--- a/tests/tools/fixtures/kanban_overlap_same_creator_replay.json
++++ b/tests/tools/fixtures/kanban_overlap_same_creator_replay.json
+@@ -93,7 +93,8 @@
+     "body": "Load probe for the worker autoscaling live acceptance (delivery owner t_01a1a0299f33da86, plan gate L1 / L-N1). It only has to hold one pool-worker slot for 75 minutes and report where it ran. Do nothing else: no repo work, no cards, no fixes.\n\nSteps (terminal, in this order):\n1. `hostname; date -u +%FT%TZ; curl -s -m 3 -H \"X-aws-ec2-metadata-token: $(curl -s -m 3 -X PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 60')\" http://169.254.169.254/latest/meta-data/instance-id; echo`\n2. `sleep 4500` in the foreground with the terminal timeout set to 5000. If the call returns early, run `sleep` again for the remaining time until 75 minutes have passed since step 1.\n3. `date -u +%FT%TZ`\n4. `kanban_complete` with summary exactly of the form `SLEEP-PROBE w1-01 host=<hostname> iid=<instance id> start=<step 1 time> end=<step 3 time>`.\n\nDone when: the summary line above is recorded. If the run is interrupted, a retry starts again from step 1 (that is fine).",
+     "assignee": "default",
+     "created_at": 1794568233,
+-    "has_key": true
++    "has_key": true,
++    "key": "autoscale-l1-sleep:w1-01"
+    },
+    "b": {
+     "id": "t_01a1d49a65e217c3",
+@@ -446,7 +447,8 @@
+     "body": "Independent exact-head review of https://github.com/example-org/hermes/pull/1260 at head 5d2e512cbb5dea43b7be3fd8887a3a11520a497b (implementer card t_01a1ce7ed2addb09; you must not be that card's session).\n\nBackground: a Kanban \"blocked; needs attention\" wake is rendered when the card blocks, then can wait in a chat's admission FIFO for hours. The PR re-reads the card at delivery (`gateway/session_ingress.execute_admission` -> `hermes_cli/kanban_stale_ask.refresh_payload`, producer rows only). When the card has moved past the block, the \"Next action for the user\" and \"Why only the user\" lines become one `Since then: ... No action needed.` line. A card still blocked on the same block keeps the text byte-identical, and any doubt leaves the text unchanged.\n\nRound 2 (t_01a1cee06436bbba, head cba1de5f14) approved with three non-blocking findings. The branch has since been rebased onto origin/main, and the new commit 5d2e512cbb addresses them:\n- N1: a scope that quotes an `Open task: @task:<b>/<other>` line redirected the read to <other>. Fix: each field stops at the next field's line mark, and a second `\\nOpen task: ` before the notice ends (blank line / next actor line) makes the notice ambiguous, so it is left unchanged. Tests: test_open_task_line_inside_scope_does_not_redirect_the_read (RED on cba1de5f14), test_open_task_line_inside_scope_of_a_done_card_is_left_alone.\n- N2: quadratic backtracking (3000 lines took about 3.9 s). Fix: fields cannot contain the next mark, which makes the match linear. Test: test_pathological_producer_text_is_bounded (<0.5 s; RED on cba1de5f14 at 3.9 s).\n- N3: legacy tui_gateway `_kanban_pending` is not covered. Disposition: the observed 22:14 PST notice was MacBook state.db session_admissions seq 3264, request_id [\"kanban-wake\",\u2026], local_automation_v1 set, so it went through execute_admission. The legacy path is a separate follow-up card, not this PR.\n\nTask: trace `git diff d1af1dff3c~1..5d2e512cbb` (focus on commit 5d2e512cbb in hermes_cli/kanban_stale_ask.py and its tests) and report what you observe. Check that N1 and N2 are resolved and that no regression appears in the earlier behaviour: still-blocked notices stay byte-identical, the stray-mark and joined-notice cases hold, and the user-terminal hint is still swallowed. Run `hermes-core-wt test tests/gateway/test_kanban_stale_block_ask.py tests/tui_gateway/test_actionable_block_notices.py` from a detached worktree of that sha. Then do one adversarial pass that tries to refute your own findings, and report only the findings that survive it.\n\nComplete with kanban_complete metadata: `verdict` (approve | request_changes), `reviewed_sha` = 5d2e512cbb5dea43b7be3fd8887a3a11520a497b, `reviewed_pr` = https://github.com/example-org/hermes/pull/1260, `findings` list. If you cannot comment on t_01a1ce7ed2addb09, put the findings in metadata. Remove any worktree you add.",
+     "assignee": "default",
+     "created_at": 1794473542,
+-    "has_key": true
++    "has_key": true,
++    "key": "review:pr1260:5d2e512cbb"
+    },
+    "b": {
+     "id": "t_01a1cef54517ae54",
+@@ -663,7 +665,8 @@
+     "body": "Terraform milestone 1a, Wave 3 (gods without a model, plan Phase 3), Task 16b part 1 of 3: write the energy-filter tool. Orchestration spec: `docs/HANDOFF.md` in example-org/coworld-terraform (hub checkout `~/code/coworld-terraform`). Read the Phase 3 introduction of the plan and design 4.9 before starting. The task text below is copied from the plan at commit 95253d6. Task 18 (`gods.nim`) and everything under it are on main.\n\nYour part is Step 1 and the first half of Step 4 (commit `tools/balance.nim`). Do NOT run Step 2 on hermes-hub and do not write `docs/spikes/energy-balance.md`: the next two cards do those. The checks, the gods, the floor of the careful culler and the seeds are fixed in this text.\n\nDecided here so the run card needs no judgement: `build/balance` takes `--source=allowance|life|sacrifice` (default: all three) and `--seeds=A..B` (default `1000..1019`); it prints the CSV header and rows to stdout and the pass/fail lines after them, each starting with `CHECK`, as `CHECK <source> <1-5> PASS|FAIL <the numbers behind it>`; the exit code is 0 whatever the checks say (a failing source is a finding, not an error).\n\n## What to build\n\n### Task 16b: The scripted energy filter\n\nDesign 4.9: before any model plays, check with scripted gods whether an energy source can be broken. This is a\nfilter. The default is chosen in Phase 8 with a model playing; until then it is the allowance.\n\n**Files:**\n- Create: `tools/balance.nim`\n- Create: `docs/spikes/energy-balance.md`\n\n**Step 1: Write the tool**\n\n`tools/balance.nim` imports `terraform/[world, energy, actions, metrics, objectives, episode, gods]`. Its exploit\ngods are the two cullers from `gods.nim` (`cullGod()`, which culls to the last fox, and `cullGod(floor = 3)`,\nwhich stops at three) and these, each a `God` like those in `gods.nim`:\n\n```nim\nproc spammer(): God =\n  ## As many of the cheapest action as it can pay for, every turn.\n  result = proc(run: var Run) =\n    for n in 0 ..< 400:\n      if not run.act(Action(kind: Rain, cell: int16(n mod Cells), amount: 1, text: \"spam\")).accepted: break\n\nproc hoarder(): God =\n  ## Saves to the cap, then spends it all on rabbits on its last turn.\n  result = proc(run: var Run) =\n    if run.world.epoch == GodEpochs - 1:\n      for cell in 0 ..< Cells:\n        discard run.act(Action(kind: Spawn, species: Rabbit, cell: int16(cell), amount: 5, text: \"dump\"))\n\nproc lateStarter(inner: God): God =\n  ## Does harm for 20 epochs, then plays the heuristic: can a bad start be recovered?\n  let harm = badGod()\n  result = proc(run: var Run) =\n    if run.world.epoch < 20: harm(run) else: inner(run)\n```\n\nFor each `EnergySource`, each `Objective` and seeds 1000-1019 it plays: heuristic, do-nothing, bad, spammer,\nthe all-out culler, the careful culler, hoarder, and the late-starting heuristic (`newRun(seed, objective, source)`), and prints one CSV row per\nsource and objective with the mean score of each god, the heuristic's energy spent by action kind, and the\ncorrelation between energy spent and score across gods. Then, per source, the five checks of design 4.9:\n\n1. no exploit god (spammer, either culler, hoarder) has a higher mean score than the heuristic\n2. heuristic > do-nothing > bad\n3. the late-starting heuristic scores at least 70% of the heuristic\n4. no one action kind takes more than 80% of the heuristic's spend\n5. the god that spends most is not the god that scores most, or two gods within 10% of each other's spend differ\n   by more than 20% in score\n\nThe careful culler is the exploit design 4.9 prices against: \"maximize rabbits by killing every fox\", stopped\njust short of the extinction that scores zero. The all-out culler alone would hide it. In the plan review's probe\n(seeds 1000-1009, Allowance, `maximize_rabbits`) the all-out culler lost on mean score (2120 against the\nheuristic's 3040, do-nothing 2365) only because 4 of its 10 runs ended in extinction. On the 6 seeds where a fox\nsurvived it beat the heuristic on every one (mean 3533 against 3022). So expect the Allowance to fail check 1\nagainst the careful culler at the current prices. That is a finding for `energy-balance.md` and for the choice\nof source and prices in Phase 8. It is not a reason to change the check, the floor or the culler.\n\n**Step 2: Run it (Haiku, pool worker)**\n\nRun: `nim c -d:release -o:build/balance tools/balance.nim && build/balance > tmp/balance.csv`\nExpected: 6 CSV rows and a pass/fail line per source and check. About 960 runs, 30 minutes on one core; split\n`--source` across cores if it has that flag.\n\n**Step 3: Write `docs/spikes/energy-balance.md`** (Fable reads the CSV)\n\nThe table, which sources pass all five, and for a failing source which god broke it and how. A source that fails\nis not removed: it is reported, and Phase 8 runs only the sources that pass. If no source passes check 1, say\nso plainly with the numbers and stop there: block the Fable card with a `human_request` (the options are a higher\nkill price, a score that counts foxes, or accepting the exploit for 1a). Do not change a price in this task.\n\n**Step 4: Commit**\n\n```bash\ngit add tools/balance.nim docs/spikes/energy-balance.md\ngit commit -m \"Scripted energy filter: three sources against exploit gods\"\n```\n\n## Done when\n- `nim check tools/balance.nim` is clean, and a debug build plays one seed of one source to the end and prints 2 CSV rows and 5 `CHECK` lines (`nim c -o:build/balance_debug tools/balance.nim && timeout 1500 build/balance_debug --source=allowance --seeds=1000..1000`; 16 runs, slow in debug). Paste both. One seed says nothing about the checks; report the lines as a smoke test only.\n- A unit test `tests/test_balance.nim` covers the three gods above on a 3-epoch run each (spammer only rains and ends the turn unable to pay for one more; hoarder does nothing before the last god epoch; lateStarter plays `badGod` before epoch 20) and the correlation and check-5 arithmetic on made-up numbers; written first and seen failing. To make that possible keep the gods and the arithmetic in importable procs and guard the tool's main with `when isMainModule`.\n- `tools/balance.nim` and the test are committed and pushed to main; branch and worktree removed. Steps 2 and 3 are reported as left to the next cards.\n\n## Rules (from docs/HANDOFF.md; read it and the plan before starting)\n- Spec: `docs/plans/2026-11-10-terraform-1a-plan.md` (the task named above, verbatim; if main's text of that task is newer than the copy in this body, main wins) and `docs/plans/2026-11-10-terraform-design.md` (rev 4). Repo `example-org/coworld-terraform` (private), main branch. Engine `example-org/polyworld` pinned at `6fe65dc38ec24579907d10c8c427957e6ee6218f` (its `terraform` branch). If the files are missing on your host, `git clone git@github.com:example-org/coworld-terraform.git`; never implement from memory.\n- The \"Decided. Do not reopen.\" list in HANDOFF.md is fixed. If you find one of those decisions is wrong, stop and report on this card (kanban_block with the evidence); do not route around it.\n- Test first: write the test, run it, see it fail, then write the code. Commit after each task.\n- The plan's definition of done is fixed. Weakening or skipping a test to pass is failure. An unimplemented piece is reported as incomplete in your summary, never a silent TODO.\n- The plan's code blocks were compiled and tested as one prototype, except where a phase says otherwise. A compile error is still a plan bug: fix the plan text in the same commit as the code.\n- Integer-only simulation state in `src/terraform/`; never `std/random` (use `terraform/keyrng`).\n- One writer per file set: work only in your own git worktree/branch. Land by rebasing on origin/main, fast-forwarding main and pushing (`git push origin HEAD:main`) after review passes; then delete your branch and remove any worktree you added.\n- Unit tests and debug builds are fine anywhere. Release builds, multi-seed batches, sweeps, the oracle and docker builds run on a pool w",
+     "assignee": "default",
+     "created_at": 1794408887,
+-    "has_key": true
++    "has_key": true,
++    "key": "terraform-1a:w3:16b-write"
+    },
+    "b": {
+     "id": "t_01a1cb1c9b83c25f",
+@@ -947,6 +950,145 @@
+    "b_parents": [],
+    "run_started": 1794589900,
+    "background": []
++  },
++  {
++   "kind": "duplicate",
++   "creator": "t_01a1d6354e5847dd",
++   "a": {
++    "id": "t_01a1d6505a3d1591",
++    "title": "turn_session_activity: TUI update-pause reader should use configured desktop.auto_continue (enabled/freshness/max_attempts), not hard-coded defaults",
++    "body": "Follow-up to PR https://github.com/example-org/hermes/pull/2545 (review nit 1, review 5896585581).\n\n`hermes_cli/turn_session_activity.py` counts a TUI `core_update_pause` marker in `desktop/interrupted_turns.json` as `turn_live` using hard-coded 15 min / 2 attempts / enabled. `session_auto_continue` reads the configured `desktop.auto_continue.enabled`, `freshness_minutes`, `max_attempts`. With auto_continue disabled or lower bounds, a marker that will never continue reads live for up to 15 min.\n\nFix: read the same config (reuse session_auto_continue's loader) so the reader's bounds equal the producer's. Also fix the comment that says the gateway 1 h bound \"matches agent.gateway_auto_continue_freshness\" (it's the reader's own fail-closed cap) and move `import json` to module top in tests/hermes_cli/test_turn_session_activity.py.\n\nAcceptance: tests next to existing ones in tests/hermes_cli/test_turn_session_activity.py: disabled auto_continue \u2192 not live; freshness_minutes=5 with a 10-min-old marker \u2192 not live; max_attempts exhausted \u2192 not live; they fail on current main. Land via hermes-core-wt ship with independent exact-head review.",
++    "assignee": "default",
++    "created_at": 1794596952,
++    "has_key": true,
++    "key": "followup:t_01a1d6354e5847dd:pr2545-nits"
++   },
++   "b": {
++    "id": "t_01a1d6546c5bcdd9",
++    "title": "turn_session_activity: TUI update-pause reader should use configured desktop.auto_continue bounds",
++    "body": "Follow-up from review 5896585581 on PR https://github.com/example-org/hermes/pull/2545 (lands first; this card waits on t_01a1d6354e5847dd).\n\nIn core `hermes_cli/turn_session_activity.py`, the TUI `core_update_pause` reader (desktop/interrupted_turns.json) hard-codes desktop.auto_continue defaults (enabled, 15 min freshness, 2 attempts). session_auto_continue reads the configured `desktop.auto_continue` enabled/freshness_minutes/max_attempts. With auto_continue disabled or lower bounds, a pause marker that will never continue reads turn_live for up to 15 min (false non-red).\n\nAcceptance: reader uses the same config values as session_auto_continue (disabled => never live; freshness/max_attempts honoured); tests in tests/hermes_cli/test_turn_session_activity.py for disabled, lower freshness and lower max_attempts, each RED on current main. Also: reword the gateway 1 h bound comment (it is the reader's own fail-closed cap; resume_checkpoint has no age bound) and move `import json` to module top in the test helpers. Mirror in ~/.hermes/scripts/session_status_audit.py `_update_paused_*_turns`. Land via hermes-core-wt ship with exact-head review.",
++    "assignee": "default",
++    "created_at": 1794597219,
++    "has_key": true,
++    "key": "followup:t_01a1d6354e5847dd:pause-config-bounds"
++   },
++   "b_key": "followup:t_01a1d6354e5847dd:pause-config-bounds",
++   "b_parents": [
++    "t_01a1d6354e5847dd"
++   ],
++   "run_started": 1794597143,
++   "background": [],
++   "note": "macbook 11-13: same followup: key family, first card filed by the creator's run that a core update reclaimed; the next run filed it again (t_01a1d65c3b4d419f)"
++  },
++  {
++   "kind": "fan-out",
++   "creator": "t_01a19ffd473a225f",
++   "a": {
++    "id": "t_01a1a3483debc1fe",
++    "title": "hermes-mods plugins/coach: 20 collection errors without core in plugin-suites CI (hermes_state/hermes_constants imports); make core-backed tests skip",
++    "body": "**Red suite found by the new plugin-suites CI (t_01a19ffd473a225f).** `.github/workflows/plugin-suites.yml` in daveey/hermes-mods runs every test-all suite on GitHub-hosted ubuntu-latest, Python 3.11 + 3.14, with NO Hermes core checkout (core is private; the hub-side gate covers core). `plugins/coach` is red on main there, identically on both Pythons: workflow_dispatch run https://github.com/daveey/hermes-mods/actions/runs/41719353012 (main be00681d): **0 passed, 0 failed, 20 errors, 4 skipped** (collection interrupted).\n\nFailure output (3.14):\n```\nE   ModuleNotFoundError: No module named 'hermes_state'\nImportError while importing test module '.../plugins/coach/tests/test_state_paths.py'.\nE   ModuleNotFoundError: No module named 'hermes_constants'\nERROR plugins/coach/tests/test_goal_electron_acceptance.py\nERROR plugins/coach/tests/test_goal_native_remediation.py\nERROR plugins/coach/tests/test_goal_process_adapter.py\nERROR plugins/coach/tests/test_goal_process_gateway.py ... (20 modules)\n```\nCause: test modules import core (`hermes_state`, `hermes_constants`) at module level, so without core the whole suite fails to collect and none of the core-free coach tests run.\n\n**Fix:** core-backed tests skip with an explicit reason when core is not importable (e.g. `pytest.importorskip(\"hermes_state\", reason=...)` at module top, or a shared skip helper in the suite's conftest); core-free tests must still run without core. Do not delete or weaken tests; with core the suite must run the same number of tests as before.\n\n**Acceptance:**\n1. Without core (HOME pointed at an empty dir so `~/.hermes/hermes-agent` isn't found, `HERMES_MODS_PYTHON=$(uv python find 3.14)`, `UV_PYTHON_INSTALL_DIR`/`UV_CACHE_DIR` kept): `scripts/test-all --exact -k plugins/coach` exits 0, with skips counted.\n2. On the hub with core: `scripts/test-all -k coach` passes with a passed count >= today's.\n3. The plugin-suites run for the fix's push to main is green for plugins/coach on 3.11 and 3.14 (link the run).\nWork in a detached hermes-mods worktree (repo AGENTS.md).",
++    "assignee": "default",
++    "created_at": 1793740783,
++    "has_key": true,
++    "key": "plugin-suites-red:plugins/coach"
++   },
++   "b": {
++    "id": "t_01a1a34842e5ed69",
++    "title": "hermes-mods plugins/session-outcome: real-core fixture errors without core in plugin-suites CI (2 errors); skip with visible reason",
++    "body": "**Red suite found by the new plugin-suites CI (t_01a19ffd473a225f).** `.github/workflows/plugin-suites.yml` in daveey/hermes-mods runs every test-all suite on GitHub-hosted ubuntu-latest, Python 3.11 + 3.14, with NO Hermes core checkout (core is private; the hub-side gate covers core). `plugins/session-outcome` is red on main there, identically on both Pythons: workflow_dispatch run https://github.com/daveey/hermes-mods/actions/runs/41719353012 (main be00681d): **50 passed, 2 errors, 10 skipped**.\n\nFailure output (3.14):\n```\n    @pytest.fixture\n    def real(tmp_path, monkeypatch):\n>       assert (CORE / \"hermes_state_outcome.py\").is_file(), f\"missing real core at {CORE}\"\nE       AssertionError: missing real core at /home/runner/.hermes/hermes-agent\nplugins/session-outcome/tests/test_real_core.py:24: AssertionError\nERROR at setup of test_gate_against_real_core\nERROR at setup of test_open_step_makes_real_core_say_decision\n=================== 50 passed, 10 skipped, 2 errors in 2.39s ===================\n```\nContext: test-all already runs this suite with `-vv -rs` and `show_output` so \"required real-core coverage must be visible even when the suite succeeds\". Keep that intent: the fix is to `pytest.skip` with an explicit reason when no core is present (visible in -rs output and in plugin-suites' skipped column), not to drop the fixture's assertion when core IS present (a present core missing hermes_state_outcome.py must still fail). Do not delete or weaken tests.\n\n**Acceptance:**\n1. Without core (HOME pointed at an empty dir, `HERMES_MODS_PYTHON=$(uv python find 3.14)`): `scripts/test-all --exact -k plugins/session-outcome` exits 0 and prints the two skips with reason.\n2. Hub with core: `scripts/test-all -k session-outcome` passes, both real-core tests PASS.\n3. plugin-suites run for the fix's push to main green for this suite on 3.11 and 3.14 (link it).\nWork in a detached hermes-mods worktree (repo AGENTS.md).",
++    "assignee": "default",
++    "created_at": 1793740784,
++    "has_key": true,
++    "key": "plugin-suites-red:plugins/session-outcome"
++   },
++   "b_key": "plugin-suites-red:plugins/session-outcome",
++   "b_parents": [],
++   "run_started": 1793738508,
++   "background": [],
++   "note": "one run keys a per-plugin batch in one family (plugin-suites-red:plugins/<name>)"
++  },
++  {
++   "kind": "fan-out",
++   "creator": "t_01a19400313cfbda",
++   "a": {
++    "id": "t_01a1a660eb16e393",
++    "title": "Worker-first live acceptance: bounded idle slot holder",
++    "body": "Bounded acceptance fixture for rollout t_01a19400313cfbda. Normal automatic ingress, do not override placement. Immediately run terminal hostname and a Python monotonic wait of exactly180 seconds (foreground, no busy-loop, no resource load). Print hostname and start/end UTC timestamps and elapsed time in the terminal result. This briefly holds one real worker slot so rollout owner can safely test capacity fencing; no resources or config changes. Then kanban_complete with hostname and elapsed output. If interrupted, report actual outcome; do not restart the wait. No other tasks/reviews/workloads.",
++    "assignee": "default",
++    "created_at": 1793792731,
++    "has_key": true,
++    "key": "rollout:t_01a19400313cfbda:overflow-saturation-holder1"
++   },
++   "b": {
++    "id": "t_01a1a66585e8b7de",
++    "title": "Worker-first live acceptance: bounded refusal-window holder",
++    "body": "Bounded acceptance fixture for rollout t_01a19400313cfbda. Normal automatic ingress; no placement overrides. Immediately execute one foreground terminal command: hostname plus Python time.sleep(300), recording monotonic elapsed and UTC start/end. No busy loop or CPU/memory load. This holds one real slot while the rollout owner exercises refusal-only synthetic telemetry and rollback. Never restart an interrupted wait. Then complete with actual hostname/timestamps/elapsed and exit code. No config changes or additional work.",
++    "assignee": "default",
++    "created_at": 1793793033,
++    "has_key": true,
++    "key": "rollout:t_01a19400313cfbda:refusal-rollback-holder2"
++   },
++   "b_key": "rollout:t_01a19400313cfbda:refusal-rollback-holder2",
++   "b_parents": [],
++   "run_started": 1793792121,
++   "background": [],
++   "note": "one run keys rollout legs in one family (rollout:<card>:<leg>)"
++  },
++  {
++   "kind": "fan-out",
++   "creator": "t_01a1a0aa6ed835a1",
++   "a": {
++    "id": "t_01a1a0d2ed5dce27",
++    "title": "Neutral review: Ask Eve stage receipts + Slack at-most-once (state ad95c16f4d)",
++    "body": "Read-only review. NO activation, no staging into ~/.hermes/askeve-runtime (dry-run only), no board writes on the askeve board, no Slack posts.\n\nTarget: private daveey/hermes branch `state` commit ad95c16f4da3b2c77ebf451afeeda3f6a5cda80e, path hosts/hermes-hub/askeve-runtime. Diff: `git show ad95c16f4d -- hosts/hermes-hub/askeve-runtime` (use ~/.hermes/repos/hermes-state; make your own sparse worktree, never checkout branches in ~/code/hermes; remove your worktree when done).\nBase = deployed app ~/.hermes/askeve-runtime/app-3988529d98eb (byte-identical to the published overlay for the 3 changed source files). Pinned core ~/.hermes/askeve-runtime/core-14a1244773e6.\nWhat it claims to fix: FINAL-NEUTRAL-REVIEW.md F2 and FINAL-OPUS-REVIEW.md F2 in /home/ubuntu/.hermes/kanban/workspaces/t_ec4bfa2a/integration. Implementation notes + operator recipe: hosts/hermes-hub/askeve-runtime/evidence/stage-receipts-20261103.md.\n\nTrace the logic and report what you observe:\n1. Does every production seal path (observed_lifecycle.poll -> observer_host.Receiver.finish -> HostRecorder.finish, and the restart path observed_lifecycle ~L144 recorder.finish) run collect_stage_evidence before the seal, and is the result idempotent and crash-safe (append then crash then restart)?\n2. Can any non-approved artifact (findings, other SHA, prose, missing/tool-call final message) yield a review receipt? Can a receipt be appended after seal? Is the worker-exit gate correct?\n3. Release: is the manifest target only host config (askeve_host.release_manifest, PRIVATE/release-manifest.json), and does an absent/404/wrong-revision manifest refuse instead of reducing evidence? Is the Slack production client (askeve_host.slack_client) at-most-once and is compose's retry_handlers guard sound?\n4. Do the tests exercise the real chain (test_stage_receipts.py: no injected receipts; test_slack_post_at_most_once.py: actual factory)? Reproduce: stage base+overlay in a scratch dir (copy app-3988529d98eb, overlay the state dir *.py + run_isolated_tests.sh, plus test_*.py from the t_ec4bfa2a/integration dir only where missing) and run `ASKEVE_TEST_CORE=<core> ./run_isolated_tests.sh test_stage_receipts test_slack_post_at_most_once test_composition test_native_attestations test_managed_lifecycle test_review_completion test_handoff test_scheduler`.\nOut of scope (separate owners): native completion synthesizing unattested runs / handoff.advance (t_01a19fbc65432ce3); owner-chat guard plugin (t_01a1a07b14bb0979); pre-intent prerequisite guard (t_01a1a05dda0415ca).\nDeliver: a verdict (approve / request_changes) with each finding's evidence (file:line, reproduced output), written to the card's completion summary + metadata {verdict, findings[]}. If request_changes, create a fix card assigned default parented on this card with exact required changes.",
++    "assignee": "default",
++    "created_at": 1793699540,
++    "has_key": true,
++    "key": "review:t_01a1a0aa6ed835a1:neutral:ad95c16f4d"
++   },
++   "b": {
++    "id": "t_01a1a0d32160658d",
++    "title": "Opus adversarial review: Ask Eve stage receipts + Slack at-most-once (state ad95c16f4d)",
++    "body": "Adversarial architecture/security re-review (pinned Opus). Read-only: NO activation, no staging into ~/.hermes/askeve-runtime (dry-run only), no askeve board writes, no Slack posts.\n\nTarget: private daveey/hermes `state` commit ad95c16f4da3b2c77ebf451afeeda3f6a5cda80e, hosts/hermes-hub/askeve-runtime (`git show ad95c16f4d`; use ~/.hermes/repos/hermes-state with your own sparse worktree, remove it when done). Base = deployed app-3988529d98eb; pinned core core-14a1244773e6. Claimed fixes: FINAL-NEUTRAL-REVIEW F2 (review/release receipt producers not wired into the serving path) and FINAL-OPUS-REVIEW F2 (Slack chat.postMessage resend) in /home/ubuntu/.hermes/kanban/workspaces/t_ec4bfa2a/integration. Notes/recipe: hosts/hermes-hub/askeve-runtime/evidence/stage-receipts-20261103.md.\n\nTry to defeat the change and report only findings that survive your own refutation attempt:\n- Can a worker (model output, files, env, a crafted transcript) cause an approval receipt it should not get, a duplicate/late receipt, a delivery receipt without a real deployed-revision readback, or a seal that skips collection?\n- Can the pre-seal collection be made to hang/raise in a way that wedges the lifecycle poll unsafely, or leak private data via exceptions?\n- Is the release definition (approved Ask Eve plan = publish verified result to Slack thread, no deployment) vs the required pinned deployed-revision manifest a genuine product ambiguity, and is leaving release seals refusing until release-manifest.json is configured the right fail-closed behaviour? (Implementer routed the decision to integrator t_ec4bfa2a; do not decide it yourself, assess it.)\n- Slack: is retry_handlers=[] sufficient for every production post path (plan + result), and does recover_result's exact client_msg_id readback cover the uncertain-send case?\n- Do test_stage_receipts.py / test_slack_post_at_most_once.py prove the claims (mutation-sensitive, no injected receipts, actual production factory)? Rerun them via run_isolated_tests.sh with ASKEVE_TEST_CORE=/home/ubuntu/.hermes/askeve-runtime/core-14a1244773e6 on a scratch base+overlay copy.\nOut of scope (separate owners): native completion synthesizing runs (t_01a19fbc65432ce3), owner-chat plugin (t_01a1a07b14bb0979), pre-intent guard (t_01a1a05dda0415ca).\nDeliver: verdict approve/request_changes + surviving findings (severity, file:line, reproduction) in completion summary + metadata {verdict, findings[]}. If request_changes, create a fix card assigned default parented on this card with the exact required changes.",
++    "assignee": "default",
++    "created_at": 1793699553,
++    "has_key": true,
++    "key": "review:t_01a1a0aa6ed835a1:opus:ad95c16f4d"
++   },
++   "b_key": "review:t_01a1a0aa6ed835a1:opus:ad95c16f4d",
++   "b_parents": [
++    "t_01a1a0aa6ed835a1"
++   ],
++   "run_started": 1793697069,
++   "background": [],
++   "note": "one run keys a neutral and an adversarial review in one family (review:<card>:<model>:<sha>)"
++  },
++  {
++   "kind": "fan-out",
++   "creator": "t_01a190cd7094f169",
++   "a": {
++    "id": "t_01a19105bb2061b1",
++    "title": "Portable pytest execution placement proof for PR428",
++    "body": "One-shot execution proof, no implementation. Run hostname and python3 -c 'import platform; print(platform.node())'. Record exact outputs, current task/run IDs and run_uid from kanban_show, and claimed holder in completion metadata. The pytest title is an intentional heavy-work classification probe; no suite or install is needed. Do not change any settings or create additional cards. Complete after recording the real command outputs. Acceptance: a real execution receipt with hostname and holder; report what you observe, not an expected host.",
++    "assignee": "default",
++    "created_at": 1793434434,
++    "has_key": true,
++    "key": "pr428:portable-heavy-proof"
++   },
++   "b": {
++    "id": "t_01a19105e9ab3d49",
++    "title": "Host-specific pytest execution placement proof for PR428",
++    "body": "One-shot host-specific execution proof for hermes-hub, not implementation. Run hostname and python3 -c 'import platform; print(platform.node())'. Record exact outputs, task/run IDs, run_uid and claimed holder from kanban_show in completion metadata. The pytest title intentionally exercises heavy-work classification alongside the hermes-hub host marker. No suite or install is needed. Do not change settings or create more cards. Complete after recording real command outputs.",
++    "assignee": "default",
++    "created_at": 1793434446,
++    "has_key": true,
++    "key": "pr428:host-specific-heavy-proof"
++   },
++   "b_key": "pr428:host-specific-heavy-proof",
++   "b_parents": [],
++   "run_started": 1793434386,
++   "background": [],
++   "note": "one run keys portable and host-specific proofs in one family (pr428:<proof>)"
+   }
+  ]
+ }
+\ No newline at end of file
+diff --git a/tests/tools/test_kanban_create_overlap_same_creator.py b/tests/tools/test_kanban_create_overlap_same_creator.py
+index dc1771f34b..826b8e5306 100644
+--- a/tests/tools/test_kanban_create_overlap_same_creator.py
++++ b/tests/tools/test_kanban_create_overlap_same_creator.py
+@@ -12,6 +12,10 @@ work its own earlier card already covered, and each duplicate ran a worker until
+ The replay fixture holds those 3 pairs and 14 real legitimate same-creator fan-outs from the same 7 days
+ (enumerated legs, implement + exact-head review, one review's distinct follow-ups, cross-repo pairs), plus the
+ background cards that name the same code identifiers, so the rarity filter counts what the board held.
++
++A fourth duplicate (macbook 11-13, t_01a1d6505a3d1591 -> t_01a1d6546c5bcdd9) got past the key-family exemption:
++both follow-ups were keyed ``followup:<creator>:...``, the first by a run a core update reclaimed. Four keyed
++fan-outs filed in one run (same family) are in the fixture so that exemption still admits a batch.
+ """
+ 
+ from __future__ import annotations
+@@ -32,7 +36,8 @@ GATEWAYS = {"hub", "hermes-hub"}
+ def _card(c: dict, *, creator, local=True, status="running") -> dict:
+     return {"id": c["id"], "board": "default", "gateway": "hub", "status": status, "title": c["title"],
+             "body": c["body"], "assignee": c.get("assignee"), "created_at": c.get("created_at"),
+-            "session_id": None, "creator_task_id": creator, "local": local, "key_family": None,
++            "session_id": None, "creator_task_id": creator, "local": local,
++            "key_family": ko.key_family(c.get("key")),
+             "has_key": c.get("has_key", False), "placed_as": None, "awaits": None, "chats": []}
+ 
+ 
+@@ -57,7 +62,31 @@ def _cid(case):
+ 
+ def test_fixture_covers_the_incident_and_ten_fan_outs():
+     kinds = [c["kind"] for c in CASES]
+-    assert kinds.count("duplicate") == 3 and kinds.count("fan-out") >= 10
++    assert kinds.count("duplicate") == 4 and kinds.count("fan-out") >= 10
++    # Same-key-family fan-outs filed in one run (rollout legs, per-plugin batch, two review models) stay admitted.
++    keyed = [c for c in CASES if c["kind"] == "fan-out"
++             and ko.key_family(c["a"].get("key")) == ko.key_family(c["b_key"])]
++    assert len(keyed) >= 4
++
++
++def _incident():
++    return next(c for c in CASES if c["b"]["id"] == "t_01a1d6546c5bcdd9")
++
++
++def test_same_key_family_from_an_earlier_run_is_compared():
++    """macbook 11-13: the creator keyed both follow-ups ``followup:<creator>:...``. The first was filed by a run a
++    core update reclaimed; the next run filed it again. The key-family exemption admitted it (task
++    t_01a1d65c3b4d419f); only a card from this same run is exempt by family."""
++    case = _incident()
++    assert ko.key_family(case["a"]["key"]) == ko.key_family(case["b_key"]) == "followup"
++    assert case["a"]["created_at"] < case["run_started"] <= case["b"]["created_at"]
++    match = _replay(case)
++    assert match is not None and match["why"].startswith("titles share")
++    assert ko.verdict([match], [], "")["code"] == ko.EVENT  # another run: a refusal, never a silent reuse
++    same_run = {**case, "run_started": case["a"]["created_at"]}
++    assert _replay(same_run) is None, "a keyed batch filed in one run stays exempt by family"
++    unknown = {**case, "run_started": None}
++    assert _replay(unknown) is None, "an unknown run start keeps the exemption"
+ 
+ 
+ @pytest.mark.parametrize("case", [c for c in CASES if c["kind"] == "duplicate"], ids=_cid)
+-- 
+2.43.0
+

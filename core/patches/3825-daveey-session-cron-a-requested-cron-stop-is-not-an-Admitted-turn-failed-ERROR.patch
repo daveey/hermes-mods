@@ -1,0 +1,174 @@
+From 153d1e31bf2c8ef6c970e6184b90bf1c0efb4244 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 19:47:28 +0000
+Subject: [PATCH] =?UTF-8?q?[daveey]=20session=5Fcron:=20a=20requested=20cr?=
+ =?UTF-8?q?on=20stop=20is=20not=20an=20"Admitted=20turn=20=E2=80=A6=20fail?=
+ =?UTF-8?q?ed"=20ERROR?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+After f63c16cf50 (cron-7c04faf754) removing a running cron job logs one
+`WARNING cron.scheduler: Job '<name>' stopped on request: CronRunCancelled: …`
+and books the ledger `cancelled`, but the owner's admitted turn still raised a
+plain RuntimeError from `session_cron.execute`, so `_execute_claimed` logged
+`ERROR gateway.session_authority: Admitted turn <id> failed` with a full
+traceback for the same deliberate stop (hub agent.log 2026-11-13 19:36:32 and
+2026-11-12 23:12:44).
+
+Five whys: the ERROR comes from `_execute_claimed`'s catch-all `.exception`;
+it fires because `execute` turns every failed cron result into a bare
+RuntimeError; that loses the scheduler's expected-stop classification, which
+only lived in `run_job`'s own log call (`_log_expected_stop`); nothing carried
+it across the owner boundary.
+
+Fix: `execute` raises `CronTurnStopped` (a RuntimeError with
+`expected_stop = True`) when run_job's error is `CronRunCancelled: …` or
+`CronShutdownInterrupted: …` — exactly the `<type>: <message>` text
+`_job_error_message` builds for the two exceptions `_log_expected_stop`
+quiets. `_execute_claimed` logs such a turn at INFO ("Admitted turn <id>
+stopped: …", no traceback). Settlement is unchanged: still
+('The admitted turn failed.', 'failed') and the same pending_results.
+Real failures (lost ownership, any other error) keep the ERROR + traceback.
+
+Proof: new test_requested_cron_stop_is_not_an_admitted_turn_failure composes
+`_execute_claimed` -> real `session_cron.execute` with run_job's except-branch
+(message + `_log_expected_stop`). RED before the fix for CronRunCancelled and
+CronShutdownInterrupted (ERROR at session_authority.py:1425, traceback through
+session_cron.py:411 — the hub excerpt); the RuntimeError control keeps its
+ERROR. GREEN after; every test file importing session_cron/_execute_claimed/
+CronRunCancelled: 57 files, 444 passed. scripts/check --base origin/main ok.
+
+Undo: revert this commit.
+---
+ gateway/session_authority.py       |  7 +++-
+ gateway/session_cron.py            | 18 +++++++++
+ tests/gateway/test_session_cron.py | 60 ++++++++++++++++++++++++++++++
+ 3 files changed, 83 insertions(+), 2 deletions(-)
+
+diff --git a/gateway/session_authority.py b/gateway/session_authority.py
+index e9b4f0b78a..782cd64bd4 100644
+--- a/gateway/session_authority.py
++++ b/gateway/session_authority.py
+@@ -1420,9 +1420,12 @@ class SessionAuthority:
+                 return None, 'settled_unknown'
+             self._pause(ref, 'unknown_execution')
+             raise
+-        except Exception:
++        except Exception as exc:
+             import logging
+-            logging.getLogger(__name__).exception('Admitted turn %s failed', row['admission_id'])
++            if getattr(exc, 'expected_stop', False):  # a requested/shutdown cron stop: no traceback
++                logging.getLogger(__name__).info('Admitted turn %s stopped: %s', row['admission_id'], exc)
++            else:
++                logging.getLogger(__name__).exception('Admitted turn %s failed', row['admission_id'])
+             return 'The admitted turn failed.', 'failed'
+ 
+     async def _drain(self, ref):
+diff --git a/gateway/session_cron.py b/gateway/session_cron.py
+index b83f366b90..363e2249a6 100644
+--- a/gateway/session_cron.py
++++ b/gateway/session_cron.py
+@@ -330,6 +330,22 @@ def _run_identified(run_job, job, execution_id, **kwargs):
+         exit_cron_execution(token)
+ 
+ 
++class CronTurnStopped(RuntimeError):
++    """A cron turn that ended in a stop someone asked for (CronRunCancelled) or in this gateway's own
++    shutdown (CronShutdownInterrupted). ``run_job`` already logged it as one WARNING; the authority
++    still settles the turn ``failed`` but logs it without the ERROR traceback (cron-7c04faf754)."""
++    expected_stop = True
++
++
++def _expected_stop(error):
++    """Whether ``run_job``'s error is one of its expected stops, read from the ``<type>: <message>``
++    text it builds (``scheduler._job_error_message``) for exactly the exceptions ``_log_expected_stop``
++    logs as a WARNING."""
++    from cron.cancellation import CronRunCancelled, CronShutdownInterrupted
++    return isinstance(error, str) and error.startswith(
++        tuple(f'{cls.__name__}: ' for cls in (CronRunCancelled, CronShutdownInterrupted)))
++
++
+ async def execute(authority, ref, row, policy):
+     from cron.scheduler import run_job
+     from gateway.run import _profile_runtime_scope
+@@ -408,6 +424,8 @@ async def execute(authority, ref, row, policy):
+             'result': {'final_response': result[2], 'cron_result': list(result), 'cron_job_flags': flags,
+                        'failed': not result[0], 'completed': result[0]}, 'usage': {}}
+         if not result[0]:
++            if _expected_stop(result[3]):
++                raise CronTurnStopped(result[3])
+             raise RuntimeError(result[3] or 'cron execution failed')
+         return result[2]
+     finally:
+diff --git a/tests/gateway/test_session_cron.py b/tests/gateway/test_session_cron.py
+index 9296efb041..27affc5d5f 100644
+--- a/tests/gateway/test_session_cron.py
++++ b/tests/gateway/test_session_cron.py
+@@ -379,3 +379,63 @@ async def test_restart_cut_reports_the_attempts_awake_and_wall_clock(tmp_path, m
+     flags = authority.pending_results[row['admission_id']]['result']['cron_job_flags']
+     assert flags.get(RESTART_CUT_FLAG) is True
+     assert flags.get(AWAKE_FLAG) == {'awake': 50.0, 'wall': 900.0}
++
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize('error_name', ['CronRunCancelled', 'CronShutdownInterrupted', 'RuntimeError'])
++async def test_requested_cron_stop_is_not_an_admitted_turn_failure(tmp_path, monkeypatch, caplog, error_name):
++    """A deliberate stop (remove_job / ``hermes cron cancel``: CronRunCancelled; this gateway's own
++    shutdown: CronShutdownInterrupted) already logs one ``cron.scheduler`` WARNING. The admitted turn
++    that carried it must not add ``ERROR gateway.session_authority: Admitted turn … failed`` with a
++    traceback; a real failure (lost ownership: a plain RuntimeError) keeps it. Composed through
++    ``_execute_claimed`` and the real ``session_cron.execute``; the turn still settles ``failed``."""
++    from contextlib import nullcontext
++    import json
++    import logging
++    from cron import cancellation, scheduler
++    from gateway import run, session_cron, session_finite
++    from gateway.session_authority import LiveSession, SessionAuthority
++    from gateway.session_contract import SessionRef
++    from hermes_state import SessionDB
++    from hermes_state_runtime import admit_session_input, begin_runtime_epoch, claim_session_input
++
++    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
++    db = SessionDB(tmp_path / 'state.db')
++    db.create_session('s', source='cron')
++    authority = SessionAuthority(SimpleNamespace(_draining=False), profile_id='p', instance_id='test', db=db,
++                                 epoch=begin_runtime_epoch(db, instance_id='test'))
++    live = authority.sessions['s'] = LiveSession(SimpleNamespace(platform=None, user_id='cron-owner'), 'route')
++    monkeypatch.setattr(run, '_profile_runtime_scope', lambda home: nullcontext())
++    error = getattr(cancellation, error_name, RuntimeError)
++
++    def run_job(job, *, extra_prompt, execution_id, cancel_event):
++        # run_job's own except-branch: the scheduler's message and log for the raised stop.
++        exc = error("Cron job 'probe' was stopped: job removed while running")
++        message = scheduler._job_error_message(exc)
++        if not scheduler._log_expected_stop('probe', message, exc):
++            scheduler.logger.error("Job '%s' failed: %s", 'probe', message)
++        return (False, 'doc', '', message)
++    monkeypatch.setattr(scheduler, 'run_job', run_job)
++    policy = SimpleNamespace(request_json=json.dumps({
++        'extra_prompt': None, 'request_id': 'cron:job:fire', 'cron_job': {'id': 'job', 'name': 'probe'}}))
++
++    async def execute_finite_admission(authority, ref, row):
++        return await session_cron.execute(authority, ref, row, policy)
++    monkeypatch.setattr(session_finite, 'execute_finite_admission', execute_finite_admission)
++    caplog.set_level(logging.DEBUG, logger='gateway.session_authority')
++
++    with db:
++        admit_session_input(db, epoch=authority.epoch, principal_id='cron-owner', session_id='s',
++                            request_id='cron:job:fire', payload={'text': ''})
++        row = claim_session_input(db, epoch=authority.epoch, session_id='s')
++        response, outcome = await authority._execute_claimed(SessionRef('p', 's'), live, row)
++    assert (response, outcome) == ('The admitted turn failed.', 'failed')
++    assert authority.pending_results[row['admission_id']]['result']['failed'] is True
++    records = [r for r in caplog.records if r.name == 'gateway.session_authority']
++    if error is RuntimeError:
++        assert [(r.levelno, bool(r.exc_info)) for r in records] == [(logging.ERROR, True)], records
++        return
++    assert len(records) <= 1, records
++    assert all(r.levelno <= logging.WARNING and not r.exc_info for r in records), records
++    assert all('failed' not in r.getMessage() for r in records), records
+-- 
+2.43.0
+

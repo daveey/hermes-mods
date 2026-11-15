@@ -1,0 +1,706 @@
+From b12ba67b28f24ec48794664adf943288e2c24d1a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 21:56:43 +0000
+Subject: [PATCH] [daveey] kanban: close kept board handles once the board file
+ is removed
+
+A removed board is never read again, so every kept-handle cache that
+revalidates a path only on its next read pinned the deleted kanban.db,
+-wal and -shm until the process exited. hermes-hub 2026-11-13: the probe
+board auw-probe-t01a1d6ae was removed at 21:06:46 and the askeve-builder
+and askeve-reviewer gateways still held fds on its deleted files 30+ min
+later (stranded_sqlite_watch filed t_01a1d6bf4dc0c0e0 and
+t_01a1d6bfa283d189). The reviewer also held a read-write main-db fd: the
+shared cached_ro reader falls back to mode=rw on a fresh board whose WAL
+sidecars do not exist yet.
+
+Holders on main, each now with a release_gone() that closes only idle
+handles whose path no longer exists (FileNotFoundError/NotADirectoryError;
+EACCES keeps the handle), never one under its borrower:
+- sync loop BoardWatch (_WATCH), moved to kanban_sync_board_watch.py so
+  kanban_sync_client stays under its FILE_LINES cap;
+- kanban_session_activity._RO_CACHE (cached_ro), in kanban_reader_retention;
+- kanban_kept_reader per-thread connections (any thread);
+- sqlite_safe_read pread fds (release_unlinked_fds).
+
+kanban_gone_board_handles.sweep() runs them all (skipping caches whose
+module was never imported) from the sync loop right after board_paths()
+every round, and from gateway housekeeping every tick, so gateways that do
+not run the sync loop are covered too.
+
+Proof: tests/hermes_cli/test_kanban_gone_board_handles.py (13 tests; 15 mutants of
+the new clauses all killed, including the borrow-race rechecks).
+RED on main: the loop test (query through _WATCH, rmtree the board dir,
+one more loop pass) found 4 descriptors on the deleted board files
+(kanban.db (deleted), -wal, -shm ...); GREEN with this change.
+
+Task: t_01a1d6d62dab2970
+---
+ gateway/run.py                                |   6 +-
+ gateway/run_housekeeping_disk.py              |   7 +
+ hermes_cli/kanban_gone_board_handles.py       |  51 ++++
+ hermes_cli/kanban_kept_reader.py              |  27 +-
+ hermes_cli/kanban_reader_retention.py         |  26 ++
+ hermes_cli/kanban_sync_board_watch.py         | 109 ++++++++
+ hermes_cli/kanban_sync_client.py              |  77 +-----
+ .../test_kanban_gone_board_handles.py         | 258 ++++++++++++++++++
+ 8 files changed, 483 insertions(+), 78 deletions(-)
+ create mode 100644 hermes_cli/kanban_gone_board_handles.py
+ create mode 100644 hermes_cli/kanban_sync_board_watch.py
+ create mode 100644 tests/hermes_cli/test_kanban_gone_board_handles.py
+
+diff --git a/gateway/run.py b/gateway/run.py
+index b96ba9f8dd..e193e1ebd8 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -4335,7 +4335,7 @@ def _start_gateway_housekeeping(
+     Cadences are ticks of ``interval``; inner gates own the real cadence."""
+     from gateway.run_delivery_queue_watch import DRAIN_LABEL, DeliveryQueueWatch, wait_for_next_tick
+     from gateway.run_profile_reconcile import _mcp_config_reconciler, profile_scoped_chore
+-    from gateway.run_housekeeping_disk import housekeeping_media_caches, maybe_post_auto_prune_prompt
++    from gateway.run_housekeeping_disk import housekeeping_gone_board_handles, housekeeping_media_caches, maybe_post_auto_prune_prompt
+     chores: list[tuple[int, str, Any]] = [
+         # First every tick: re-stamp ``updated_at`` in gateway_state.json so it is a real heartbeat.
+         # ``hermes gateway status`` / ``/api/status`` warn when it ages past 2x ``interval`` with the
+@@ -4348,8 +4348,8 @@ def _start_gateway_housekeeping(
+         chores.append((1, DRAIN_LABEL, lambda: _drain_restart_safe_cron_deliveries(adapters, loop, runner)))
+     chores += [
+         (5, "Channel directory refresh", lambda: adapters and _housekeeping_channel_directory(adapters, loop)),
+-        (60, "Media cache cleanup", housekeeping_media_caches),
+-        (60, "Paste sweep", _housekeeping_paste_sweep)]
++        (60, "Media cache cleanup", housekeeping_media_caches), (60, "Paste sweep", _housekeeping_paste_sweep),
++        (1, "Removed-board handle sweep", housekeeping_gone_board_handles)]
+     # Low disk + auto-prune undecided: ask on the home channel (two syscalls; snoozed per post).
+     chores.append((1, "Auto-prune low-disk prompt", lambda: maybe_post_auto_prune_prompt(runner, loop)))
+     if cron_provider is not None:
+diff --git a/gateway/run_housekeeping_disk.py b/gateway/run_housekeeping_disk.py
+index 4b6a3162f7..2568e5eae7 100644
+--- a/gateway/run_housekeeping_disk.py
++++ b/gateway/run_housekeeping_disk.py
+@@ -17,6 +17,13 @@ from pathlib import Path
+ logger = logging.getLogger(__name__)
+ 
+ 
++def housekeeping_gone_board_handles() -> None:
++    """Close kept board readers whose board file was removed: they pin its deleted db, -wal and -shm on disk."""
++    from hermes_cli.kanban_gone_board_handles import sweep
++
++    sweep()
++
++
+ def housekeeping_media_caches() -> None:
+     """Hourly media-cache prune (24h max age); spillover (None) keeps the session retention window."""
+     from gateway.platforms.base import (
+diff --git a/hermes_cli/kanban_gone_board_handles.py b/hermes_cli/kanban_gone_board_handles.py
+new file mode 100644
+index 0000000000..94d9a3a138
+--- /dev/null
++++ b/hermes_cli/kanban_gone_board_handles.py
+@@ -0,0 +1,51 @@
++"""Close this process's kept handles on boards whose files were removed. [daveey]
++
++Several process-wide caches keep a connection (or a raw fd) per board file and revalidate it only when that same
++path is read again: the sync loop's ``BoardWatch``, the shared ``cached_ro`` readers, the per-thread
++``kanban_kept_reader`` connections and ``sqlite_safe_read``'s pread fds. Once a whole board directory is removed,
++nothing reads that path again, so the kept handle pinned the deleted ``kanban.db``, ``-wal`` and ``-shm`` inodes
++until the process exited (hermes-hub 2026-11-13: two gateways held the removed probe board
++``auw-probe-t01a1d6ae`` 30+ min after its removal; ``stranded_sqlite_watch`` filed a card per gateway).
++
++:func:`sweep` closes every idle kept handle whose path no longer exists. It is cheap (one ``stat`` per kept
++handle) and runs from the sync loop every round and from gateway housekeeping every tick. A cache whose module
++was never imported holds nothing, so it is skipped without importing it. Closing such a handle cannot cancel
++another connection's locks on a live board: the file it opened is gone, and SQLite closes an inode's descriptors
++only with its last connection in this process.
++"""
++from __future__ import annotations
++
++import logging
++import sqlite3
++import sys
++
++_log = logging.getLogger(__name__)
++
++
++def sweep() -> int:
++    """Close idle kept handles on removed board files; returns how many connections closed."""
++    closed = 0
++    client = sys.modules.get("hermes_cli.kanban_sync_client")
++    if client is not None:
++        closed += client._WATCH.release_gone()
++    if "hermes_cli.kanban_session_activity" in sys.modules:
++        from hermes_cli.kanban_reader_retention import release_gone as release_shared
++        closed += _guarded(release_shared)
++    kept = sys.modules.get("hermes_cli.kanban_kept_reader")
++    if kept is not None:
++        closed += _guarded(kept.release_gone)
++    safe_read = sys.modules.get("hermes_cli.sqlite_safe_read")
++    if safe_read is not None:
++        safe_read.release_unlinked_fds()
++    if closed:
++        _log.info("kanban: closed %d kept connection(s) on removed board files", closed)
++    return closed
++
++
++def _guarded(release) -> int:
++    """One cache's sweep; a SQLite error closing a dead handle must not stop the others."""
++    try:
++        return release()
++    except sqlite3.Error as exc:
++        _log.debug("kanban: kept-handle sweep failed: %s", exc)
++        return 0
+diff --git a/hermes_cli/kanban_kept_reader.py b/hermes_cli/kanban_kept_reader.py
+index a1ba94bbfc..d011d1eedf 100644
+--- a/hermes_cli/kanban_kept_reader.py
++++ b/hermes_cli/kanban_kept_reader.py
+@@ -293,4 +293,29 @@ def close_all() -> int:
+     return closed
+ 
+ 
+-__all__ = ["MAX_PER_THREAD", "close_all", "reading", "stats"]
++def release_gone() -> int:
++    """Close every idle kept connection, on any thread, whose board file no longer exists; returns how many.
++
++    A borrow revalidates only the board it is asked for, so a board whose directory was removed is never borrowed
++    again and its kept connection pinned the deleted db, -wal and -shm until the process exited (hermes-hub
++    2026-11-13). The owning thread's map keeps the closed entry until it is evicted or that key is borrowed (which
++    reopens: ``_still_live`` refuses a closed entry). A borrowed entry is left to its borrower."""
++    from hermes_cli.kanban_sync_board_watch import path_gone
++
++    _drain_orphans()
++    with _registry_lock:
++        entries = [e for e in _registry if not e.closed]
++    closed = 0
++    for entry in entries:
++        if not path_gone(entry.key) or not entry.lock.acquire(blocking=False):
++            continue
++        try:
++            if not entry.closed:
++                _close(entry)
++                closed += 1
++        finally:
++            entry.lock.release()
++    return closed
++
++
++__all__ = ["MAX_PER_THREAD", "close_all", "reading", "release_gone", "stats"]
+diff --git a/hermes_cli/kanban_reader_retention.py b/hermes_cli/kanban_reader_retention.py
+index f93e1a83fc..ec4d453a93 100644
+--- a/hermes_cli/kanban_reader_retention.py
++++ b/hermes_cli/kanban_reader_retention.py
+@@ -39,6 +39,32 @@ def prune(*, missing: str | None = None) -> None:
+             entry[2].release()
+ 
+ 
++def release_gone() -> int:
++    """Close every idle shared reader whose board file no longer exists; returns how many.
++
++    ``cached_ro`` revalidates only the path it is asked for, so a removed board's reader pinned the deleted db,
++    -wal and -shm until the process exited (hermes-hub 2026-11-13). A borrowed reader is left to its borrower."""
++    from hermes_cli import kanban_session_activity as activity
++    from hermes_cli.kanban_sync_board_watch import path_gone
++
++    with activity._RO_CACHE_LOCK:
++        entries = list(activity._RO_CACHE.items())
++    closed = 0
++    for key, entry in entries:
++        if not path_gone(key) or not entry[2].acquire(blocking=False):
++            continue
++        try:
++            with activity._RO_CACHE_LOCK:
++                if activity._RO_CACHE.get(key) is not entry:
++                    continue
++                del activity._RO_CACHE[key]
++            entry[0].close()
++            closed += 1
++        finally:
++            entry[2].release()
++    return closed
++
++
+ def close_all() -> None:
+     """Shutdown cleanup; idle readers only, with active borrowers left alone."""
+     from hermes_cli import kanban_session_activity as activity
+diff --git a/hermes_cli/kanban_sync_board_watch.py b/hermes_cli/kanban_sync_board_watch.py
+new file mode 100644
+index 0000000000..5607c19551
+--- /dev/null
++++ b/hermes_cli/kanban_sync_board_watch.py
+@@ -0,0 +1,109 @@
++"""The sync loop's kept read-only board connections (moved out of ``kanban_sync_client``). [daveey]"""
++from __future__ import annotations
++
++import os
++import sqlite3
++import threading
++from pathlib import Path
++from typing import Any, Optional
++
++from hermes_cli import kanban_lockguard as _kanban_lockguard
++
++
++def path_gone(path: str) -> bool:
++    """True when nothing is at *path* any more (it, or a directory above it, was removed or renamed away).
++
++    Only a missing path counts: a transient error such as EACCES says nothing about the file, so its kept
++    handle stays until a read of that path revalidates it."""
++    try:
++        os.stat(path)
++    except (FileNotFoundError, NotADirectoryError):
++        return True
++    except OSError:
++        return False
++    return False
++
++
++class BoardWatch:
++    """One long-lived read-only connection per board file, for the sync loop's cheap questions.
++
++    ``outbox_pending`` runs every 0.5 s on every synced board. Opening a connection per call re-read the schema
++    each time (about 13 ms of CPU per pass over 10 boards, 2.5% of a core in the gateway, 2026-10-31). A kept
++    connection answers the same indexed query in microseconds. Repair scans use a transactional
++    input-table revision rather than data_version: dispatcher-clock commits must not invalidate them.
++    A file replaced on disk (new inode) is reopened with a new generation, so a restored revision
++    never equals a cached key for the old file. A board whose file is removed is never queried again, so
++    ``release_gone`` closes its connection from the loop; otherwise it pinned the deleted db, -wal and -shm
++    until the gateway restarted (hermes-hub 2026-11-13). [daveey]"""
++
++    MAX = 64
++
++    def __init__(self) -> None:
++        self._lock = threading.Lock()
++        self._conns: dict[str, tuple[tuple[int, int], sqlite3.Connection, int]] = {}
++        self._gen = 0
++        self._answers: dict[str, tuple[int, str, Any]] = {}
++
++    def _conn(self, path: Path) -> Optional[tuple[sqlite3.Connection, int]]:
++        key = os.path.realpath(path)
++        try:
++            st = os.stat(key)
++        except OSError:
++            self._drop(key)
++            return None
++        ent = self._conns.get(key)
++        if ent is not None and ent[0] == (st.st_dev, st.st_ino):
++            return ent[1], ent[2]
++        self._drop(key)
++        if len(self._conns) >= self.MAX:
++            self._drop(next(iter(self._conns)))
++        conn = _kanban_lockguard.connect(f"{Path(key).as_uri()}?mode=ro", uri=True, timeout=1,
++                                         check_same_thread=False)
++        self._gen += 1
++        self._conns[key] = ((st.st_dev, st.st_ino), conn, self._gen)
++        return conn, self._gen
++
++    def _drop(self, key: str) -> None:
++        self._answers.pop(key, None)
++        ent = self._conns.pop(key, None)
++        if ent is not None:
++            try:
++                ent[1].close()
++            except sqlite3.Error:
++                pass
++
++    def query(self, path: Path, sql: str, *, unchanged_ok: bool = False) -> Optional[tuple[int, Any]]:
++        """(generation, first row) or None when the file cannot be read."""
++        with self._lock:
++            try:
++                got = self._conn(path)
++                if got is None:
++                    return None
++                conn, gen = got
++                key = os.path.realpath(path)
++                version = conn.execute("PRAGMA data_version").fetchone()[0] if unchanged_ok else None
++                cached = self._answers.get(key)
++                if unchanged_ok and cached is not None and cached[:2] == (version, sql):
++                    return gen, cached[2]
++                answer = conn.execute(sql).fetchone()
++                if unchanged_ok:
++                    # Version is read BEFORE the query: a concurrent commit may cause
++                    # one extra read, but cannot publish a stale answer as current.
++                    self._answers[key] = (version, sql, answer)
++                return gen, answer
++            except sqlite3.Error:
++                self._drop(os.path.realpath(path))
++                return None
++
++    def release_gone(self) -> int:
++        """Close every kept connection whose board path no longer exists; returns how many."""
++        with self._lock:
++            gone = [key for key in self._conns if path_gone(key)]
++            for key in gone:
++                self._drop(key)
++        return len(gone)
++
++    def reset(self) -> None:
++        with self._lock:
++            for key in list(self._conns):
++                self._drop(key)
+diff --git a/hermes_cli/kanban_sync_client.py b/hermes_cli/kanban_sync_client.py
+index c8f3818e68..19d3f093b6 100644
+--- a/hermes_cli/kanban_sync_client.py
++++ b/hermes_cli/kanban_sync_client.py
+@@ -22,7 +22,6 @@ gateway's hub enrollment (``~/.config/hermes-mail/{config.json,gateway.key}``),
+ 
+ from __future__ import annotations
+ 
+-from hermes_cli import kanban_lockguard as _kanban_lockguard
+ import json
+ import logging
+ import os
+@@ -1343,79 +1342,8 @@ def reconcile_links(boards: list[tuple[str, Path]], gateway: str, *, skip_unchan
+         _log.info("kanban sync: chat links pass over %d board(s) took %.1fs", len(boards), took)
+ 
+ 
+-class _BoardWatch:
+-    """One long-lived read-only connection per board file, for the sync loop's cheap questions.
+-
+-    ``outbox_pending`` runs every 0.5 s on every synced board. Opening a connection per call re-read the schema
+-    each time (about 13 ms of CPU per pass over 10 boards, 2.5% of a core in the gateway, 2026-10-31). A kept
+-    connection answers the same indexed query in microseconds. Repair scans use a transactional
+-    input-table revision rather than data_version: dispatcher-clock commits must not invalidate them.
+-    A file replaced on disk (new inode) is reopened with a new generation, so a restored revision
+-    never equals a cached key for the old file. [daveey]"""
+-
+-    MAX = 64
+-
+-    def __init__(self) -> None:
+-        self._lock = threading.Lock()
+-        self._conns: dict[str, tuple[tuple[int, int], sqlite3.Connection, int]] = {}
+-        self._gen = 0
+-        self._answers: dict[str, tuple[int, str, Any]] = {}
+-
+-    def _conn(self, path: Path) -> Optional[tuple[sqlite3.Connection, int]]:
+-        key = os.path.realpath(path)
+-        try:
+-            st = os.stat(key)
+-        except OSError:
+-            self._drop(key)
+-            return None
+-        ent = self._conns.get(key)
+-        if ent is not None and ent[0] == (st.st_dev, st.st_ino):
+-            return ent[1], ent[2]
+-        self._drop(key)
+-        if len(self._conns) >= self.MAX:
+-            self._drop(next(iter(self._conns)))
+-        conn = _kanban_lockguard.connect(f"{Path(key).as_uri()}?mode=ro", uri=True, timeout=1,
+-                                         check_same_thread=False)
+-        self._gen += 1
+-        self._conns[key] = ((st.st_dev, st.st_ino), conn, self._gen)
+-        return conn, self._gen
+-
+-    def _drop(self, key: str) -> None:
+-        self._answers.pop(key, None)
+-        ent = self._conns.pop(key, None)
+-        if ent is not None:
+-            try:
+-                ent[1].close()
+-            except sqlite3.Error:
+-                pass
+-
+-    def query(self, path: Path, sql: str, *, unchanged_ok: bool = False) -> Optional[tuple[int, Any]]:
+-        """(generation, first row) or None when the file cannot be read."""
+-        with self._lock:
+-            try:
+-                got = self._conn(path)
+-                if got is None:
+-                    return None
+-                conn, gen = got
+-                key = os.path.realpath(path)
+-                version = conn.execute("PRAGMA data_version").fetchone()[0] if unchanged_ok else None
+-                cached = self._answers.get(key)
+-                if unchanged_ok and cached is not None and cached[:2] == (version, sql):
+-                    return gen, cached[2]
+-                answer = conn.execute(sql).fetchone()
+-                if unchanged_ok:
+-                    # Version is read BEFORE the query: a concurrent commit may cause
+-                    # one extra read, but cannot publish a stale answer as current.
+-                    self._answers[key] = (version, sql, answer)
+-                return gen, answer
+-            except sqlite3.Error:
+-                self._drop(os.path.realpath(path))
+-                return None
+-
+-    def reset(self) -> None:
+-        with self._lock:
+-            for key in list(self._conns):
+-                self._drop(key)
++from hermes_cli.kanban_sync_board_watch import BoardWatch as _BoardWatch  # moved out, re-exported
++from hermes_cli.kanban_gone_board_handles import sweep as sweep_gone_board_handles
+ 
+ 
+ _WATCH = _BoardWatch()
+@@ -1547,6 +1475,7 @@ def _run_forever(keep_running: Callable[[], bool], interval: Optional[float], ru
+     try:
+         while keep_running():
+             boards = board_paths()
++            sweep_gone_board_handles()  # a removed board is never read again: close what it pins (2026-11-13)
+             for slug, _path in boards:
+                 if slug not in watchers or not watchers[slug].is_alive():
+                     watcher = FeedWatcher(ident, slug, wake, keep_running, on_change=work.changed,
+diff --git a/tests/hermes_cli/test_kanban_gone_board_handles.py b/tests/hermes_cli/test_kanban_gone_board_handles.py
+new file mode 100644
+index 0000000000..052f4c3528
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_gone_board_handles.py
+@@ -0,0 +1,258 @@
++"""A removed board leaves no kept handle pinning its deleted files (``kanban_gone_board_handles``). [daveey]
++
++hermes-hub 2026-11-13: the probe board ``auw-probe-t01a1d6ae`` was removed at 21:06:46, and two gateways still
++held descriptors on its deleted ``kanban.db``, ``-wal`` and ``-shm`` 30+ minutes later. Every kept-handle cache
++revalidated a path only when that path was read again, and nothing reads a removed board again.
++"""
++from __future__ import annotations
++
++import os
++import shutil
++import sqlite3
++import threading
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_gone_board_handles as gone
++from hermes_cli import kanban_kept_reader as kept
++from hermes_cli import kanban_reader_retention as retention
++from hermes_cli import kanban_session_activity as activity
++from hermes_cli import kanban_sync_client as ksc
++from hermes_cli import sqlite_safe_read
++from hermes_cli.kanban_sync_board_watch import BoardWatch, path_gone
++from tests.hermes_cli import test_kanban_sync_push_starvation as loop_support
++
++pytestmark = pytest.mark.skipif(not os.path.isdir("/proc/self/fd"), reason="reads /proc/self/fd")
++
++SQL = "SELECT COUNT(*) FROM tasks"
++
++
++@pytest.fixture
++def home(tmp_path, monkeypatch):
++    hermes = tmp_path / ".hermes"
++    hermes.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(hermes))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    for key in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_DB",
++                "HERMES_KANBAN_BOARD", "HERMES_DELEGATED_CHILD_CONTEXT", "HERMES_SESSION_ID"):
++        monkeypatch.delenv(key, raising=False)
++    yield hermes
++    ksc._WATCH.reset()
++    kept.close_all()
++    retention.close_all()
++
++
++def _board(slug: str) -> Path:
++    kb.create_board(slug)
++    return Path(kb.kanban_db_path(board=slug))
++
++
++def _fds_under(directory: Path) -> list[str]:
++    """This process's descriptors on files under *directory* (a deleted file reads ``<path> (deleted)``)."""
++    prefix = os.path.realpath(directory) + os.sep
++    found = []
++    for name in os.listdir("/proc/self/fd"):
++        try:
++            target = os.readlink(f"/proc/self/fd/{name}")
++        except OSError:
++            continue
++        if target.startswith(prefix):
++            found.append(target)
++    return found
++
++
++def _remove(path: Path) -> Path:
++    directory = path.parent
++    shutil.rmtree(directory)
++    assert _fds_under(directory), "precondition: the kept handle pins the deleted board"
++    return directory
++
++
++def test_one_sync_loop_pass_closes_the_watch_connection_of_a_removed_board(home, monkeypatch, tmp_path):
++    """The acceptance shape: query a board through ``_WATCH`` in one round, remove its directory, and the next
++    pass of the real loop (which no longer lists it) leaves no descriptor on its deleted files."""
++    path = _board("probe")
++    boards = [("probe", path)]
++    rounds, _waits = loop_support._fake_loop(monkeypatch, tmp_path, boards)
++    removed: list[Path] = []
++
++    def sync_board(slug, board_path, *args):
++        rounds[-1].append(slug)
++        assert ksc._WATCH.query(board_path, SQL)[1] == (0,)
++        removed.append(_remove(board_path))
++        boards.clear()  # board_paths() stops listing it, as after a real rmtree
++        return ksc.RoundResult(board=slug, mode="primary")
++
++    monkeypatch.setattr(ksc, "sync_board", sync_board)
++    ksc.run_forever(lambda: len(rounds) < 3, interval=30)
++    assert rounds[0] == ["probe"] and removed
++    assert _fds_under(removed[0]) == []
++
++
++def test_watch_keeps_a_live_board_and_closes_only_the_removed_one(home):
++    live, doomed = _board("live"), _board("doomed")
++    watch = BoardWatch()
++    try:
++        first = watch.query(live, SQL)
++        assert watch.query(doomed, SQL)[1] == (0,)
++        directory = _remove(doomed)
++        assert watch.release_gone() == 1
++        assert _fds_under(directory) == []
++        assert list(watch._conns) == [os.path.realpath(live)]
++        assert watch.query(live, SQL)[0] == first[0]  # same kept connection: no reopen
++        assert watch.release_gone() == 0
++    finally:
++        watch.reset()
++
++
++def test_shared_cached_reader_of_a_removed_board_is_closed(home):
++    live, doomed = _board("live"), _board("doomed")
++    for path in (live, doomed):
++        with activity.cached_ro(path) as conn:
++            assert tuple(conn.execute(SQL).fetchone()) == (0,)
++    directory = _remove(doomed)
++    assert gone.sweep() == 1
++    assert _fds_under(directory) == []
++    assert list(activity._RO_CACHE) == [str(live)]
++
++
++def test_a_borrowed_shared_reader_is_never_closed_under_its_borrower(home):
++    doomed = _board("doomed")
++    with activity.cached_ro(doomed) as conn:
++        _remove(doomed)
++        assert retention.release_gone() == 0
++        assert tuple(conn.execute(SQL).fetchone()) == (0,)  # still usable: the open inode survives the unlink
++    assert retention.release_gone() == 1
++
++
++def test_kept_reader_of_a_removed_board_is_closed_from_another_thread(home):
++    """The sweep runs on the housekeeping or sync thread; the kept connections belong to the reading threads."""
++    live, doomed = _board("live"), _board("doomed")
++    read, release = threading.Event(), threading.Event()
++    reopened: list[bool] = []
++
++    def reader():
++        for path in (live, doomed):
++            with kept.reading(path) as conn:
++                assert tuple(conn.execute(SQL).fetchone()) == (0,)
++        read.set()
++        release.wait(10)
++        before = kept.stats["reopens"]
++        with kept.reading(live) as conn:  # the live board's kept connection is still served
++            assert tuple(conn.execute(SQL).fetchone()) == (0,)
++        reopened.append(kept.stats["reopens"] != before)
++
++    thread = threading.Thread(target=reader)
++    thread.start()
++    try:
++        assert read.wait(10)
++        directory = _remove(doomed)
++        assert gone.sweep() == 1
++        assert _fds_under(directory) == []
++    finally:
++        release.set()
++        thread.join(10)
++    assert reopened == [False]
++
++
++def test_a_borrowed_kept_reader_is_never_closed_under_its_borrower(home):
++    doomed = _board("doomed")
++    with kept.reading(doomed) as conn:
++        _remove(doomed)
++        assert kept.release_gone() == 0
++        assert tuple(conn.execute(SQL).fetchone()) == (0,)
++    assert kept.release_gone() == 1
++
++
++def test_sweep_releases_lock_safe_pread_fds_of_a_removed_board(home):
++    doomed = _board("doomed")
++    assert sqlite_safe_read.pread_lock_safe(doomed, 0, 16) == b"SQLite format 3\x00"
++    directory = _remove(doomed)
++    gone.sweep()
++    assert _fds_under(directory) == []
++
++
++def test_only_a_missing_path_counts_as_gone(tmp_path, monkeypatch):
++    present = tmp_path / "kanban.db"
++    present.write_bytes(b"")
++    assert not path_gone(str(present))
++    assert path_gone(str(tmp_path / "removed" / "kanban.db"))
++    assert path_gone(str(present / "under-a-file"))  # NotADirectoryError: a file now where a directory was
++
++    def denied(_path, *a, **kw):
++        raise PermissionError("EACCES")
++
++    monkeypatch.setattr(os, "stat", denied)
++    assert not path_gone(str(present))  # unreadable is not removed: the handle stays until a read revalidates
++
++
++def test_sweep_skips_caches_whose_module_was_never_imported(monkeypatch):
++    for name in ("hermes_cli.kanban_sync_client", "hermes_cli.kanban_session_activity",
++                 "hermes_cli.kanban_kept_reader", "hermes_cli.sqlite_safe_read"):
++        monkeypatch.delitem(__import__("sys").modules, name)
++    assert gone.sweep() == 0
++
++
++def test_a_sqlite_error_closing_one_cache_does_not_stop_the_others(home, monkeypatch):
++    doomed = _board("doomed")
++    with kept.reading(doomed):
++        pass
++
++    def broken():
++        raise sqlite3.OperationalError("disk I/O error")
++
++    monkeypatch.setattr(retention, "release_gone", broken)
++    _remove(doomed)
++    assert gone.sweep() == 1  # the kept reader still closed
++
++
++def test_a_kept_reader_closed_meanwhile_is_not_counted_twice(home, monkeypatch):
++    """Generation recovery may close the entry between the registry snapshot and the sweep's lock."""
++    from hermes_cli import kanban_sync_board_watch as watch_module
++
++    doomed = _board("doomed")
++    with kept.reading(doomed):
++        pass
++    entry = next(e for e in kept._registry if not e.closed)
++
++    def closed_meanwhile(path):
++        entry.closed = True  # what kept._close sets first
++        return True
++
++    monkeypatch.setattr(watch_module, "path_gone", closed_meanwhile)
++    try:
++        assert kept.release_gone() == 0
++    finally:
++        entry.closed = False
++
++
++def test_a_shared_reader_reopened_meanwhile_is_kept(home, monkeypatch):
++    """A borrower may replace the cache entry (a reopen) between the sweep's snapshot and its lock."""
++    from hermes_cli import kanban_sync_board_watch as watch_module
++
++    doomed = _board("doomed")
++    with activity.cached_ro(doomed):
++        pass
++    key = str(doomed)
++    old = activity._RO_CACHE[key]
++    newer = (old[0], old[1], threading.Lock(), old[3])
++
++    def reopened_meanwhile(path):
++        activity._RO_CACHE[key] = newer
++        return True
++
++    monkeypatch.setattr(watch_module, "path_gone", reopened_meanwhile)
++    assert retention.release_gone() == 0
++    assert activity._RO_CACHE[key] is newer
++
++
++def test_gateway_housekeeping_runs_the_sweep(monkeypatch):
++    import gateway.run as gateway_run
++    from tests.gateway.test_checkpoint_prune_housekeeping import _OneTickStopEvent
++
++    calls = []
++    monkeypatch.setattr(gone, "sweep", lambda: calls.append(True) or 0)
++    gateway_run._start_gateway_housekeeping(_OneTickStopEvent(), interval=0)
++    assert calls == [True]
+-- 
+2.43.0
+

@@ -12,6 +12,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -99,6 +101,37 @@ def aux_llm(system: str, user: str) -> str:
 
 def _ledger():
     return core.Ledger()
+
+
+# One extraction per reply. The pre-send gate (publication_buffer) and the transform (process_reply) read the same
+# reply with the same listing (core.reply_listing); each calling the model separately let the two disagree, and a
+# restated ask the gate had read as a plain repeat was minted by the transform as a second tile with no hold
+# (MacBook chat ..bef6c6). The transform reuses the gate's answer for the identical prompt instead. Keyed by the
+# model function too, so a different extractor (tests swap aux_llm) never sees another's answer.
+EXTRACTION_TTL_S = 900
+_EXTRACTION_CAP = 64
+_EXTRACTIONS: dict[tuple, tuple[float, str]] = {}
+_EXTRACTIONS_LOCK = threading.Lock()  # sessions of one gateway extract concurrently
+
+
+def shared_llm(system: str, user: str) -> str:
+    import hashlib
+    import time as _time
+    fn = aux_llm
+    key = (id(fn), hashlib.sha256(f"{system}\0{user}".encode()).hexdigest())
+    now = _time.time()
+    with _EXTRACTIONS_LOCK:
+        hit = _EXTRACTIONS.get(key)
+    if hit is not None and now - hit[0] < EXTRACTION_TTL_S:
+        return hit[1]
+    out = fn(system, user)  # outside the lock: one slow model call never stalls another session's lookup
+    with _EXTRACTIONS_LOCK:
+        _EXTRACTIONS[key] = (now, out)
+        for k in [k for k, (t, _) in _EXTRACTIONS.items() if now - t >= EXTRACTION_TTL_S]:
+            _EXTRACTIONS.pop(k, None)
+        while len(_EXTRACTIONS) > _EXTRACTION_CAP:
+            _EXTRACTIONS.pop(next(iter(_EXTRACTIONS)))
+    return out
 
 
 def _declared_steps(session_id: str) -> list[dict]:
@@ -222,6 +255,83 @@ def _open_asks_index(pending: list, created: dict, *, now: float, budget: int | 
         entries.pop()
 
 
+# ---- decision-panel letters ----------------------------------------------------------------------------
+
+# A reply that is (or starts with) one option letter: "a", "(a)", "a.", "a: go", "b, please", "b - reason",
+# "(c) because". An English article ("a new idea") has no separator after the letter. After the letter a separator
+# must be followed by whitespace or the end, and a dash needs whitespace before it, so abbreviations and hyphenated
+# words ("e.g.", "i.e.", "a.k.a.", "e-mail", "A-OK") never read as option letters (PR #188 review).
+_LETTER_REPLY = re.compile(
+    r"^\s*(?:option\s+)?[(\[]?([A-Za-z])[)\]]?"
+    r"(?:\s*$|[.:,](?:\s+\S|\s*$)|\s+[-\u2013\u2014]\s*\S|(?<=[)\]])\s+\S)", re.I)
+
+
+def _presenter(st):
+    """The Desktop queue's presenter (kanban_mirror.Mirror.present adds the lettered card-ask presentation)."""
+    try:
+        from . import kanban_mirror  # type: ignore[attr-defined]
+    except ImportError:
+        import importlib.util as ilu
+        import sys as _s
+        mod = _s.modules.get("user_steps_kanban_mirror")
+        if mod is None:
+            spec = ilu.spec_from_file_location("user_steps_kanban_mirror", Path(__file__).with_name("kanban_mirror.py"))
+            mod = ilu.module_from_spec(spec)  # type: ignore[arg-type]
+            spec.loader.exec_module(mod)  # type: ignore[union-attr]
+            mod = _s.modules.setdefault("user_steps_kanban_mirror", mod)
+        kanban_mirror = mod
+    return kanban_mirror.Mirror(core, st)
+
+
+def _panel_rows(request: dict) -> list[str]:
+    """The labels the Desktop panel badges A, B, C... for one request, in display order; [] when it shows no letters.
+
+    Mirrors desktop-plugins/user-steps/plugin.js DecisionRow: only a 'kanban-question' presentation gets lettered
+    rows (`letter(index)`), the recommended choice first, then the rest in order, then Skip, then Other."""
+    p = request.get("presentation") if isinstance(request, dict) else None
+    if not (isinstance(p, dict) and p.get("kind") == "kanban-question"
+            and isinstance(p.get("question"), str) and isinstance(p.get("details"), str)):
+        return []
+    shown = [c for c in request.get("choices") or [] if isinstance(c, dict)
+             and not (c.get("id") == "request-context" and c.get("effect") == "revise"
+                      and c.get("label") == "Request complete action")]
+    rec = next((c for c in shown if c.get("id") == p.get("recommendedChoiceId") or c.get("recommended") is True), None)
+    ordered = ([rec] + [c for c in shown if c is not rec]) if rec else shown
+    rows = [re.sub(r"\s*\(recommended\)\s*$", "", str(c.get("label") or ""), flags=re.I) for c in ordered]
+    rows.append("Skip")
+    if p.get("other") is True:
+        rows.append("Other (type your answer)")
+    return rows
+
+
+def _panel_letter_hint(message: str, requests: list) -> str:
+    """Context line mapping a typed option letter to the decision panel's lettered option (empty when none applies).
+
+    The panel badges card-ask options A, B, C; the agent's context names them only by id (card-0...). Without this,
+    a typed "a" reads as whatever the agent's own prose called A (incident agent-d61f5b16f5: a plan's part A)."""
+    m = _LETTER_REPLY.match(message or "")
+    if not m:
+        return ""
+    code = m.group(1).upper()
+    hits = []
+    for r in requests or []:
+        rows = _panel_rows(r)
+        i = ord(code) - 65
+        if 0 <= i < len(rows):
+            title = str(r.get("title") or "")[:INDEX_TITLE_CHARS]
+            table = ", ".join(f'{chr(65 + j)} = {json.dumps(label, ensure_ascii=False)}' for j, label in enumerate(rows))
+            hits.append(f'"{title}" (requestId {str(r.get("requestId") or "")[:8]}): {table}')
+    if not hits:
+        return ""
+    head = (f'[Decision panel letters: the user\'s reply starts with "{m.group(1)}". The Desktop decision panel badges '
+            'each open card-ask option with a letter, in this order. Read the letter as that panel option, NOT as a '
+            'part, step or option your own prose or plan labelled with the same letter; check the label before '
+            'narrowing or widening scope.')
+    if len(hits) > 1:
+        head += f' {len(hits)} open asks have a "{code}": ask which one before acting.'
+    return head + "\n" + "\n".join(f"- {h}" for h in hits) + "]"
+
+
 # ---- hooks ---------------------------------------------------------------------------------------------
 
 # Runtime-written user rows (Kanban notices, auto-continue): a turn they start was not started by the user.
@@ -286,6 +396,16 @@ def pre_llm_call(session_id: str = "", user_message: str = "", platform: str = "
             import time
             created = {r['requestId']: st.created_at(own, r['requestId']) for r in pending}
             note = _open_asks_index(pending, created, now=time.time(), budget=_head_budget()) + '\n' + note
+            if _LETTER_REPLY.match(user_message if isinstance(user_message, str) else ""):
+                # Only a letter-shaped reply pays for presentation; first in the context so no spill hides it.
+                try:
+                    presenter = _presenter(st)
+                    letters = _panel_letter_hint(user_message, [presenter.present(r) for r in pending])
+                except Exception:
+                    log.exception("user-steps panel letter mapping failed")
+                    letters = ''
+                if letters:
+                    note = letters + '\n' + note
         incomplete = [r for r in pending if r['kind'] == 'approval' and not r['scope']['complete']]
         if incomplete:
             # Missing plans are agent work: the user has no button for them.
@@ -330,7 +450,7 @@ def transform_llm_output(response_text: str = "", session_id: str = "", platform
                 _trace(hook="transform", session=session_id, platform=platform, reconcile_error=repr(exc)[:300])
         user_msg = _USER_MSG.pop(session_id, "")
         out = core.process_reply(
-            response_text, session_id, user_msg=user_msg, llm=aux_llm, ledger=_ledger(),
+            response_text, session_id, user_msg=user_msg, llm=shared_llm, ledger=_ledger(),
             cards=None, framed=_framed(session_id),
             action_store=core.ActionStore(timeout=HOOK_DB_TIMEOUT) if action_owner else None,
             action_owner=action_owner, turn_requests=_TURN_PUBLISHED.pop(session_id, set()),
@@ -458,17 +578,18 @@ def publication_buffer(session_id='', platform='', final_response='', attempt=0,
     # A blocked card's own ask is a request too: a reply relaying it needs no new approval (no hold, no nudge to
     # publish a second, unlinked one).
     card_asks = _card_asks(session_id, _USER_MSG.get(session_id, ''))
-    res = core.extract(final_response, [{'id': a['id'], 'kind': a['kind'], 'text': a['title']} for a in open_asks]
-                       + [{'id': e['id'], 'kind': e['kind'], 'text': core.card_ask_listing(e)} for e in card_asks],
-                       '', aux_llm, continuity=True, elsewhere=core.elsewhere_titles(store, owner) if relay else [])
+    # The transform's own listing, user message and extraction (core.reply_listing, shared_llm): the gate must
+    # judge the asks the transform will mint, not a second model reading of the reply.
+    listed, tiles = core.reply_listing(_ledger().open_steps(session_id), store, owner, card_asks)
+    res = core.extract(final_response, listed, _USER_MSG.get(session_id, ''), shared_llm, continuity=True,
+                       elsewhere=core.elsewhere_titles(store, owner) if relay else [])
     steps = [s for s in res.get('steps', []) if isinstance(s, dict)]
     approvals = [s for s in steps if s.get('kind') == 'approve']
     if not approvals and not open_asks:
         return None
     # An uncorroborated model repeat maps nothing (core.split_repeats): the other rules judge that sentence.
-    tiles = {a['id']: core.tile_texts(a) for a in open_asks}
+    tiles.update({a['id']: core.tile_texts(a) for a in open_asks})
     tiles.update({a['step']['id']: core.tile_texts(a) for a in open_asks if a.get('step') and a['step'].get('id')})
-    tiles.update({e['id']: core.tile_texts(e) for e in card_asks})
     res['repeats'] = core.split_repeats(res.get('repeats') or (), tiles, final_response)[0]
     ready = {r['requestId'] for r in store.requests(owner)
              if r['kind'] == 'approval' and r['state'] == 'open' and r['scope']['complete'] and not r.get('resolution')
@@ -495,6 +616,13 @@ def publication_buffer(session_id='', platform='', final_response='', attempt=0,
     held = open_ask_hold(session_id, final_response, open_asks, [s for s, hit in hits if hit is None], relay,
                          store, owner, attempt, hold_budget, turn_messages,
                          candidates=[s for s, hit in hits if hit is None or hit[0] != 'card'])
+    if open_asks and held is None:
+        # A pass with an open request is the decision this gate can get wrong silently: record what it read, so a
+        # tile minted beside an open one can be traced to the gate's reading (none was written for ..bef6c6).
+        _trace(hook='publication_buffer', session=session_id, verdict='pass', attempt=attempt,
+               open=[a['id'] for a in open_asks], steps=len(steps),
+               unmapped=[str(s.get('verbatim_span') or '')[:120] for s, hit in hits if hit is None],
+               repeats=[r.get('id') for r in res.get('repeats') or () if isinstance(r, dict)])
 
     def covered(hit):
         return hit is not None and (hit[0] == 'card' or hit[1]['id'] in ready)
@@ -817,6 +945,19 @@ def _register_clarify_early() -> None:
 
 def register(ctx) -> None:
     _require_publication_contract()
+    # The dashboard's _user_steps_kanban_mirror is a different, process-owned
+    # lifetime. Only retire a mirror imported into THIS plugin package; never
+    # look up a replacement package by its reusable sys.modules name at unload.
+    on_unload = getattr(ctx, 'on_unload', None)
+    if callable(on_unload):
+        owned = globals()
+
+        def close_readers():
+            mirror = owned.get('kanban_mirror')
+            if mirror is not None:
+                mirror.close_pool()
+
+        on_unload(close_readers)
     _register_clarify_early()
     ctx.register_hook("pre_final_gate", publication_buffer)
     ctx.register_hook("pre_llm_call", pre_llm_call)

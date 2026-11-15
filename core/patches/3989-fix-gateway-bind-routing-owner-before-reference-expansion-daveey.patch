@@ -1,0 +1,186 @@
+From 9e89363d2eed1b3f9c09271164a4c5ac4cf0c62d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 00:15:26 +0000
+Subject: [PATCH] fix(gateway): bind routing owner before reference expansion
+ [daveey]
+
+Pre-turn context-length lookup precedes TurnRunner routing_session. Carry the authorized local chat identity into policy resolution while preserving an ambient owner and restoring scope on errors. No-session quota deferral is an error and gateway tests reject it.
+
+Proof: regression fails on 7b52fcc7030 with quota refusal and missing payload; fixed routing/reference/session-policy suites pass 61 tests. All 21 importer suites exercised; four minimal-source fakes retained via optional chat_id lookup. Ambient-owner, missing-binding and severity mutants fail; injected no-session guard fails teardown. Live wall/payload verification remains with VERIFY after normal deployment.
+---
+ agent/model_routing_walls.py                  |  5 +-
+ gateway/run_turn_prepare.py                   | 12 ++--
+ tests/agent/test_walled_default_pin.py        |  2 +
+ tests/gateway/conftest.py                     | 11 +++
+ tests/gateway/test_walled_reference_lookup.py | 71 +++++++++++++++++++
+ 5 files changed, 95 insertions(+), 6 deletions(-)
+ create mode 100644 tests/gateway/test_walled_reference_lookup.py
+
+diff --git a/agent/model_routing_walls.py b/agent/model_routing_walls.py
+index 70e2fbe0cb..ec399c3385 100644
+--- a/agent/model_routing_walls.py
++++ b/agent/model_routing_walls.py
+@@ -125,8 +125,9 @@ def log_not_deferred(wall, reason):
+     if episode in _NOT_DEFERRED_SEEN:
+         return
+     _NOT_DEFERRED_SEEN.add(episode)
+-    logger.warning("routing: walled pin not deferred (reason=%s) %s/%s until %s", reason, wall.provider,
+-                   wall.model, reset_pt(reset))
++    emit = logger.error if reason == "no-session" else logger.warning
++    emit("routing: walled pin not deferred (reason=%s) %s/%s until %s", reason, wall.provider,
++         wall.model, reset_pt(reset))
+ 
+ 
+ def predicted_target(config, level, wall):
+diff --git a/gateway/run_turn_prepare.py b/gateway/run_turn_prepare.py
+index c38f427a1b..11078bbc1b 100644
+--- a/gateway/run_turn_prepare.py
++++ b/gateway/run_turn_prepare.py
+@@ -41,7 +41,7 @@ logger = logging.getLogger("gateway.run")
+ _TIER_FROM_RUNNER = object()
+ 
+ 
+-def _resolve_policy_agent_runtime(runner, policy, *, fallback=True) -> tuple[str, dict]:
++def _resolve_policy_agent_runtime(runner, policy, *, fallback=True, session_id=None) -> tuple[str, dict]:
+     """``_resolve_session_agent_runtime`` for a session bound to a launch policy: the route's FROZEN
+     config and launch credential, walking its own fallback chain on an AuthError unless
+     ``fallback=False`` (a session control asking which route the session itself runs). Module-level
+@@ -54,8 +54,11 @@ def _resolve_policy_agent_runtime(runner, policy, *, fallback=True) -> tuple[str
+     # A follow_profile_config session's route is the profile's current one, model and endpoint from one read.
+     frozen, model = policy.effective(authority)
+     provider = (frozen.get('model') or {}).get('provider')
+-    runtime, fallback_entry = route_runtime(policy, frozen, model, route_launch_key(authority, policy, frozen),
+-                                            fallback=fallback)
++    from agent.model_routing_runtime import current_routing_session, routing_session
++    # Reference expansion precedes TurnRunner's scope, but already owns a local session.
++    with routing_session(current_routing_session() or session_id):
++        runtime, fallback_entry = route_runtime(policy, frozen, model, route_launch_key(authority, policy, frozen),
++                                                fallback=fallback)
+     if fallback_entry is not None:
+         from hermes_cli.fallback_config import pre_agent_fallback_notice
+         runner._pre_agent_fallback_notice = pre_agent_fallback_notice(
+@@ -205,7 +208,8 @@ class GatewayTurnPrepareMixin:
+         self._pre_agent_fallback_notice = None
+         policy = policy_for_source(self, source) if source is not None else None
+         if policy is not None:
+-            return _resolve_policy_agent_runtime(self, policy, fallback=fallback)
++            return _resolve_policy_agent_runtime(self, policy, fallback=fallback,
++                                                 session_id=getattr(source, 'chat_id', None))
+         skey = self._resolve_session_key_or_none(source, session_key)
+         model = _resolve_gateway_model(user_config)
+         if skey:
+diff --git a/tests/agent/test_walled_default_pin.py b/tests/agent/test_walled_default_pin.py
+index 8eaf98c408..0d5c3cdbdb 100644
+--- a/tests/agent/test_walled_default_pin.py
++++ b/tests/agent/test_walled_default_pin.py
+@@ -357,6 +357,8 @@ def test_walled_pin_on_a_foreign_endpoint_refuses_before_deferral_and_says_why(h
+ def test_walled_pin_outside_a_routing_session_logs_no_session(home, monkeypatch, caplog):
+     skipped = _injected_wall_refusal(home, monkeypatch, caplog, session=False)
+     assert len(skipped) == 1 and 'reason=no-session' in skipped[0], skipped
++    assert any(r.levelno == logging.ERROR and 'reason=no-session' in r.getMessage()
++               for r in caplog.records)
+ 
+ 
+ def test_walled_pin_with_nothing_else_in_its_class_logs_no_target(home, monkeypatch, caplog):
+diff --git a/tests/gateway/conftest.py b/tests/gateway/conftest.py
+index 40dd3b0f05..eb10d621c5 100644
+--- a/tests/gateway/conftest.py
++++ b/tests/gateway/conftest.py
+@@ -40,6 +40,17 @@ from unittest.mock import MagicMock
+ import pytest
+ 
+ 
++@pytest.fixture(autouse=True)
++def _reject_unbound_routing_session(caplog):
++    """A gateway quota deferral without an owner is a broken pre-turn binding."""
++    yield
++    records = [record for phase in ('setup', 'call') for record in caplog.get_records(phase)]
++    failures = [record.getMessage() for record in records
++                if record.name == 'agent.model_routing_walls'
++                and 'reason=no-session' in record.getMessage()]
++    assert not failures, failures
++
++
+ @pytest.fixture(autouse=True)
+ def _join_api_turn_workers():
+     """Join the API turn workers a test left running, as its loop's teardown used to.
+diff --git a/tests/gateway/test_walled_reference_lookup.py b/tests/gateway/test_walled_reference_lookup.py
+new file mode 100644
+index 0000000000..c5ad0ab363
+--- /dev/null
++++ b/tests/gateway/test_walled_reference_lookup.py
+@@ -0,0 +1,71 @@
++"""Pre-turn reference lookup must carry the local session's routing identity."""
++import logging
++from types import SimpleNamespace
++
++import pytest
++from tests.agent import test_walled_default_pin as fixtures
++from tests.agent.test_walled_default_pin import (
++    ASTRA, SID, LEGACY_ECHO, _legacy_row, _wall, _gui_policy,
++)
++
++home = fixtures.home
++
++
++@pytest.mark.asyncio
++async def test_gui_at_reference_expands_before_turn_scope(home, monkeypatch, caplog):
++    from gateway.config import Platform
++    from gateway.run_turn_prepare import GatewayTurnPrepareMixin
++    from gateway.run_model_context import inbound_model_context_length
++    from gateway.session_context_refs import inbound_references
++    from agent.model_routing_runtime import current_routing_session
++
++    _legacy_row(home, LEGACY_ECHO)
++    _wall(home, 'openai-codex', ASTRA, 110)
++    policy = _gui_policy(home)
++    source = SimpleNamespace(platform=Platform.LOCAL, chat_id=SID)
++    monkeypatch.setattr('gateway.session_policy.policy_for_source', lambda *a: policy)
++    monkeypatch.setattr('gateway.session_authorities.active_authority', lambda *a: None)
++    runner = SimpleNamespace(_pre_agent_fallback_notice=None)
++    runner._resolve_session_agent_runtime = GatewayTurnPrepareMixin._resolve_session_agent_runtime.__get__(runner)
++    async def context(source, key):
++        return await inbound_model_context_length(runner, source, key)
++    runner._inbound_model_context_length = context
++    (home / 'x').write_text('reference payload marker')
++    assert current_routing_session() is None
++    with caplog.at_level(logging.WARNING):
++        expanded, refusal = await inbound_references(runner, source, SID, 'see @file:x')
++    assert refusal is None
++    assert 'reference payload marker' in expanded, caplog.text
++    assert 'context reference expansion failed' not in caplog.text
++    assert 'reason=no-session' not in caplog.text
++    assert current_routing_session() is None
++
++
++@pytest.mark.parametrize('ambient', [None, 'existing-owner'])
++@pytest.mark.parametrize('raises', [False, True])
++def test_policy_lookup_preserves_owner_and_restores_scope(home, monkeypatch, ambient, raises):
++    from agent.model_routing_runtime import current_routing_session, routing_session
++    from gateway.run_turn_prepare import _resolve_policy_agent_runtime
++
++    policy = _gui_policy(home)
++    monkeypatch.setattr('gateway.session_authorities.active_authority', lambda *a: None)
++    monkeypatch.setattr('gateway.session_policy.route_launch_key', lambda *a: None)
++    monkeypatch.setattr('gateway.run._runtime_agent_kwargs', lambda runtime: runtime)
++    seen = []
++
++    def route(*args, **kwargs):
++        seen.append(current_routing_session())
++        if raises:
++            raise ValueError('controlled route failure')
++        return {'provider': 'openai-codex'}, None
++
++    monkeypatch.setattr('gateway.session_worker_construct.route_runtime', route)
++    with routing_session(ambient):
++        if raises:
++            with pytest.raises(ValueError, match='controlled route failure'):
++                _resolve_policy_agent_runtime(SimpleNamespace(), policy, session_id=SID)
++        else:
++            _resolve_policy_agent_runtime(SimpleNamespace(), policy, session_id=SID)
++        assert current_routing_session() == ambient
++    assert seen == [ambient or SID]
++    assert current_routing_session() is None
+-- 
+2.43.0
+

@@ -104,14 +104,17 @@ For each answer:
 **For a slow agent, read the execution log before explaining the delay.** Resolve the active worker session from its task/run, read timestamped tool calls and results, then inspect the output paths those calls actually used and query live publication state. Heartbeats prove liveness, not progress; an unchanged data directory says nothing about a separate build directory. Show the user a compact timeline of concrete operations/errors rather than another supervision promise. Separate dependency waits, productive execution, tool timeouts, recovery, rework and deployment; run counts alone do not measure wasted work. Tie resource failures to the operation stopped: a per-worker OOM does not establish global concurrency pressure. Preserve useful work before taking over. On a laptop host, rule out sleep before
 blaming software for a wall-clock gap: minutes with no lines at all in the agent log, plus `pmset -g log`
 Sleep/DarkWake entries, mean the machine was asleep, and timers on the monotonic clock (pause, resume and
-replacement watchers) don't advance during sleep. A gap that spans a sleep is not a software delay.
+replacement watchers) don't advance during sleep. A gap that spans a sleep is not a software delay. DarkWakes do
+advance it: a laptop alarm with no pmset `Wake from` between its start and filing is a detector misfire.
 
 **When state changed and no code path explains it** (a counter reset, a row rewritten, a file swapped), look for
 another actor before filesystem or log forensics: open cards on that subsystem on every board and host, their latest
 comments, and sessions working on the same object. Agents often write to a host over ssh from another host, so the
 target host's logs, process list and session DB never show the change; the actor's card or transcript does.
 
-**Before profiling a live service, rule out observer-induced stalls.** Use `py-spy record/top --nonblocking` for attached production targets, with a bounded duration. Default ptrace sampling can suspend threads long enough to create the timeout being investigated; a requested duration is not a bound when sampling falls behind. Correlate profiler start/end and lag warnings with server loop coverage gaps and client failures, and discard those intervals as ordinary-load evidence. Never reproduce blocking attachment against the user's live backend; use a separate fixture. The coach profiler-safety pre-tool guard enforces common command forms, not dynamically generated scripts; on the hub and MacBook `~/.local/bin/py-spy` is a wrapper (hermes-mods `tools/process-safety/py_spy_nonblocking.py`) that adds `--nonblocking` to every attached record/top/dump, so check `ls -l ~/.local/bin/py-spy` still points there before profiling another host. When a backend stalls, grep the host's `journalctl` for `COMMAND=.*py-spy` in the window before blaming load.
+**Before profiling a live service, rule out observer-induced stalls:** read `references/resource-observability-pitfalls.md` (non-blocking py-spy, the profiler guard and wrapper, the journalctl check).
+
+Before superseding a duplicate transcript row, inspect whether its carrier already folded unrelated input. A retained notice ID identifies the original row, not necessarily all current content. Exercise interleaved A/B/A rows and both sidecar orders; guard differing composite content from wholesale retirement, and verify unrelated text and durable row identities survive.
 
 ### 3. Branch where causes split
 
@@ -188,8 +191,10 @@ the update). Write that precondition into the live-check acceptance and confirm 
 it was absent, report "no regression; prevention not yet observed live". The reverse holds for a check that the old
 symptom stopped: count only hits from processes started after the fix landed (a worker spawned before the update keeps
 the old code until it exits; date each line by its session-id stamp or the run's `spawned` time), and anchor the
-match at line start (timestamp, level, emitting logger, then the message), never the bare phrase: card titles,
-comments and your own grep commands (desktop.log echoes tool-call arguments) quote it in the same logs. Dry-run the probe on the live log and on one synthetic hit right after filing it, before parking. A guard that "works"
+match at line start (timestamp, level, optional `[<session>] ` tag, emitting logger, then the message), never the bare
+phrase: card titles, comments and your own grep commands (desktop.log echoes tool-call arguments) quote it in the same
+logs. Dry-run the probe on the live log (rotated files too) and on one synthetic hit copied from a real line of that
+logger, right after filing it, before parking: a hit typed from an assumed format passes a probe sharing the error. A guard that "works"
 often moves the failure somewhere quieter: a loud error that falls back to a slow path, an estimate that drifted from
 the real count, an urgent route parked by an unrelated hold. Each of those is a new why-chain.
 
@@ -231,7 +236,8 @@ For a chain going into a new card's body, check the draft before `kanban_create`
 - [ ] Every why cites evidence (log line, test, `file:line`, commit, metric) or is labelled `(hypothesis)`?
 - [ ] The write-up has both `Root (happened)` and `Root (not caught)`, and neither is "human error", "flaky" or "transient"?
 - [ ] A `Recurrence:` line names the earlier occurrence it searched for (or says first time)?
-- [ ] Every countermeasure has a `proof:` (test fails before/passes after, command output) or a card/issue link?
+- [ ] Every countermeasure has a `proof:` (test fails before/passes after, command output) or a card/issue link, and each live check ran at once, never as an N-hour soak?
+- [ ] Each log-line probe (wake or live check) wakes on the precondition's own line, not only the outcomes you expect, matched a real line of its logger copied from the live log (session tag and rotated files included) and missed a line that only quotes its phrase?
 - [ ] The chain is posted where the fix lives (PR body, issue, card comment), not only in chat?
 
 ## Blameless
@@ -243,11 +249,11 @@ too: "I didn't read the file first" leads to "why did nothing stop me from editi
 
 ## Known weaknesses, and how this procedure covers them
 
-When evaluating a why-chain's rigor, read `references/method-limitations.md` (known criticisms, neutral review, evidence gathering and multi-cause analysis).
+When evaluating a why-chain's rigor, read `references/method-limitations.md` (criticisms, neutral review, evidence, multi-cause).
 
 ## Example (software)
 
-When writing a software failure report, read `references/software-example.md` (a complete disk-full why-chain and tested countermeasures).
+When writing a software failure report, read `references/software-example.md` (a disk-full chain with tested countermeasures).
 
 ## Pitfalls
 
@@ -257,11 +263,11 @@ When diagnosing scheduling or observation flakes, read `references/concurrency-t
 
 When investigating authorization or plugin isolation, read `references/scope-and-dependency-pitfalls.md` (spend authority, credential scope, module lifetime and dependency identity).
 
-When fixtures depend on event chronology or expiry, read `references/clock-fixture-pitfalls.md` (PR assignment ordering and receipt TTL clocks).
+When fixtures depend on event chronology or expiry, read `references/clock-fixture-pitfalls.md` (PR assignment ordering and receipt TTL clocks). For exact-boundary virtual-clock tests, inject fractional origins: subtraction can round below the boundary and defer a whole poll. Pin an exact fixture epoch, not longer budgets; prove inherited failures on the unchanged base.
 
 - For bounded readers that repeatedly return empty partial results, distinguish per-query exhaustion from shared quota exhaustion before raising any cap. Test eventual service across polls, including new arrivals and completed/disappearing cursor anchors: a fixed newest-first window can starve older active work forever. Preserve incomplete-coverage semantics and verify useful rows from the actual post-deploy collector, not just direct API probes; a concurrent maintenance stop makes that live check inconclusive.
 
-- For enrollment shell fixtures, explicitly model the remote login HOME/PATH in the fake sudo/transport instead of running the host's login profile. Refuse network Git operations in fixtures before testing policy: otherwise a failed fake-origin lookup can turn a local unit test into a real clone. A simulated HOME leak is not proof of the exact CI cause; retain that evidence boundary until CI confirms the repaired path.
+- Isolate enrollment shell fixtures' HOME/PATH and refuse network Git. Diagnose login failures with a profile marker, bash trace and final HOME/PATH from the failing CI harness; local or simulated leaks are not CI proof. Mirror core's init sourcing with paths resolved before login bash can change HOME, then verify the repair in CI.
 
 - Before exercising fork/timeout cleanup, validate exact integer PID ownership at the signal boundary and mock destructive signal/exit calls locally in unit tests. A bare fork mock can coerce to PID 1 and turn killpg into a broad user-process signal; a systemd scope alone does not contain that syscall. Use module-local process-control aliases rather than patching shared os functions, refuse external SIGCHLD reapers, and preserve unreaped-child identity through signalling. Test invalid/coercible IDs and lost-child ownership without real signals; real timeout integration must restrict signals to its own child.
 
@@ -271,6 +277,8 @@ When fixtures depend on event chronology or expiry, read `references/clock-fixtu
 - Stopping at the first fact that sounds technical. "The pump shaft was worn" is a fact, not the root.
 - Going so deep that the root is outside anyone's control ("because physics", "because the company was underfunded").
   Back up to the last level you can change.
+- For a live failed-result observer, inspect the entire restart/continuation event chain before treating it as a process hang. A modern restart receipt can cease to cover the history after a successor binding; if that worker dies without its own result, strict attribution may veto both the observer and legacy expiry. Compare native claim/PID fields with replica projections, preserve real receipts/checkpoints, and reproduce restart → rebind → loss with distinct process identities. Measure admission using the host's enabled policy; an out-of-gateway cgroup census need not equal row-based admission.
+
 - Checking for a parallel fix only during diagnosis. Right before you implement, fetch the repo, read its branch log
   since the incident and search open cards on every board for the same symptom: another session reading the same
   logs often lands the fix first. If one did, run your tests against its commit instead of pushing a second fix.

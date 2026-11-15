@@ -1,0 +1,111 @@
+From c67e01a240e919c6a7fc98a6c88462ac0b053e72 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 18:29:11 +0000
+Subject: [PATCH] [daveey] kanban pickup-stall: read the registry hold by
+ truthiness, like pickup's eligible()
+
+Problem: the pickup-stall alarm modules counted a machine as held only when the registry's `hold` was
+exactly `True` (`kanban_pickup_stall.expected_hold`, `kanban_pickup_stall_held.stranded`,
+`kanban_pickup_stall_resolve._hold_lifted`), while pickup's `kanban_worker_node.eligible()` and the
+placement readers (`kanban_placement*`, `kanban_move`, `kanban_runs_on_capabilities`) hold on any truthy
+`hold`. A non-bool truthy value (e.g. "yes", "1") made pickup record `hold` skips while the alarm read the
+hold as lifted: no hold repair was filed, and the resolve sweep would close an open one as `hold_lifted`.
+Latent only (the Board writes a bool today); review nit 1 of PR #2439 (t_01a1d5edccfabef8).
+
+Fix: the three readers use `not entry.get("hold")` / `entry.get("hold")`, so lifted = readable entry with no
+truthy hold. An unreadable registry still fails toward alerting (unchanged).
+
+Proof: tests/hermes_cli/test_kanban_pickup_stall_lifted.py adds
+- test_a_non_bool_truthy_hold_is_held_like_pickup_reads_it: hold="yes" files the hold repair and a later
+  sweep leaves it ready (no "lifted" note).
+- test_expected_hold_reads_a_non_bool_truthy_hold_as_held: hold="1" inside a rollout window is expected;
+  hold="" is not.
+RED on main (both fail: no repair filed / expected_hold None); GREEN with the fix: 234 tests across every
+test file importing kanban_pickup_stall pass.
+---
+ hermes_cli/kanban_pickup_stall.py             |  2 +-
+ hermes_cli/kanban_pickup_stall_held.py        |  2 +-
+ hermes_cli/kanban_pickup_stall_resolve.py     |  2 +-
+ .../test_kanban_pickup_stall_lifted.py        | 30 +++++++++++++++++++
+ 4 files changed, 33 insertions(+), 3 deletions(-)
+
+diff --git a/hermes_cli/kanban_pickup_stall.py b/hermes_cli/kanban_pickup_stall.py
+index f88b2adf9a..3a26e1faca 100644
+--- a/hermes_cli/kanban_pickup_stall.py
++++ b/hermes_cli/kanban_pickup_stall.py
+@@ -467,7 +467,7 @@ def expected_hold(entry: Optional[Mapping[str, Any]], *, now_ms: int, stall_s: i
+     Expected: a hold with a known start (``hold_at``, Board epoch ms) whose reason states ``release by HH:MMZ``,
+     or whose owner is the core rollout (implied release: start + :data:`ROLLOUT_MAX_SECONDS`), until that release
+     plus ``stall_s``. An unknown start, no release and no rollout owner, or a passed window fail toward alerting."""
+-    if not isinstance(entry, Mapping) or entry.get("hold") is not True:
++    if not isinstance(entry, Mapping) or not entry.get("hold"):
+         return None
+     at = entry.get("hold_at")
+     if isinstance(at, bool) or not isinstance(at, (int, float)) or not math.isfinite(at) or at <= 0:
+diff --git a/hermes_cli/kanban_pickup_stall_held.py b/hermes_cli/kanban_pickup_stall_held.py
+index bb72ab7c4a..4a15846746 100644
+--- a/hermes_cli/kanban_pickup_stall_held.py
++++ b/hermes_cli/kanban_pickup_stall_held.py
+@@ -67,7 +67,7 @@ def stranded(conn, own: str, machines: Optional[Mapping[str, Mapping[str, Any]]]
+     from hermes_cli import kanban_pickup_held as kph
+     from hermes_cli import kanban_pickup_stall as kps
+     entry = (machines or {}).get(own)
+-    if machines is None or not entry or entry.get("hold") is not True:
++    if machines is None or not entry or not entry.get("hold"):
+         return []
+     held_ms = _hold_ms(entry)
+     out = []
+diff --git a/hermes_cli/kanban_pickup_stall_resolve.py b/hermes_cli/kanban_pickup_stall_resolve.py
+index 369a908d08..33bd32f626 100644
+--- a/hermes_cli/kanban_pickup_stall_resolve.py
++++ b/hermes_cli/kanban_pickup_stall_resolve.py
+@@ -84,7 +84,7 @@ def _hold_lifted(own: str) -> Optional[str]:
+     unreadable: fail toward keeping the alarm)."""
+     from hermes_cli import kanban_worker_node as wn
+     entry = ((wn.registry() or {}).get("machines") or {}).get(own)
+-    if not entry or entry.get("hold") is True:
++    if not entry or entry.get("hold"):
+         return None
+     return f"state={entry.get('state')!r}, hold={entry.get('hold')!r}, hold_owner={entry.get('hold_owner')!r}"
+ 
+diff --git a/tests/hermes_cli/test_kanban_pickup_stall_lifted.py b/tests/hermes_cli/test_kanban_pickup_stall_lifted.py
+index 917cbf32a4..333ecdfc5b 100644
+--- a/tests/hermes_cli/test_kanban_pickup_stall_lifted.py
++++ b/tests/hermes_cli/test_kanban_pickup_stall_lifted.py
+@@ -151,3 +151,33 @@ def test_a_claimed_repair_is_left_to_its_run(gws):
+     _lift(worker)
+     kps.sweep(worker.conn)  # (no dispatcher tick: it would reclaim this fake claim)
+     assert kb.get_task(worker.conn, repair["id"]).status == "running"
++
++
++def test_a_non_bool_truthy_hold_is_held_like_pickup_reads_it(gws):
++    """Pickup's ``eligible()`` holds on any truthy ``hold``; so must the alarm and its resolve sweep, or a ``"yes"``
++    hold records ``hold`` skips while reading as lifted: no alarm, and an open repair closed as lifted."""
++    from hermes_cli import kanban_pickup_stall as kps
++    hub, worker = gws
++    a = base._pinned(hub, title="a")
++    worker.round()
++    worker.enter()
++    held = dict(hold="yes", hold_owner="ops@hub", hold_at=int(time.time() * 1000), hold_reason="disk migration")
++    _registry(**held)
++    wn.pickup(worker.conn, budget=4)
++    base._age(worker, a, 900)
++    assert kps.latest(worker.conn, a)["reason"] == "hold"
++    kps.sweep(worker.conn)
++    [repair] = base._repairs(worker.conn)
++    assert "held" in repair["title"].lower() and a in repair["title"]
++    _registry(**held)
++    kps.sweep(worker.conn)  # the resolve sweep must not read the truthy hold as lifted
++    assert kb.get_task(worker.conn, repair["id"]).status == "ready"
++    assert not [c for c in _states(worker, repair["id"]) if "lifted" in c]
++
++
++def test_expected_hold_reads_a_non_bool_truthy_hold_as_held():
++    from hermes_cli import kanban_pickup_stall as kps
++    now_ms = int(time.time() * 1000)
++    entry = {"hold": "1", "hold_at": now_ms, "hold_owner": kps.ROLLOUT_OWNER_PREFIX + "x"}
++    assert kps.expected_hold(entry, now_ms=now_ms, stall_s=600) is not None
++    assert kps.expected_hold({**entry, "hold": ""}, now_ms=now_ms, stall_s=600) is None
+-- 
+2.43.0
+

@@ -1,0 +1,483 @@
+From 99cfe20e67e3bcf93ee2184bcfae6060793cefbf Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 17:45:09 +0000
+Subject: [PATCH] =?UTF-8?q?[daveey]=20lifecycle=20guard:=20keep=20stdin=20?=
+ =?UTF-8?q?feeds=20through=20`2>&1`,=20`>(=E2=80=A6)`,=20bare=20`cat`/`tee?=
+ =?UTF-8?q?`=20and=20a=20pipe=20ending=20a=20line?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Each of these ran a lifecycle .py/.sh that scan_gateway_lifecycle never opened ((False, None) on
+fb2398dd9bf, found in the review of PR #2393):
+
+1. A descriptor duplication on the feeding command: `cat f.py 2>&1 | python3`,
+   `{ cat f.py; } 2>&1 | python3`, `{ cat f.py; } >&2 | python3`, `(cat f.py) 2>&1 | python3`.
+   _shlex_tokens splits on `&`, so `2>&1` became `2>`, `&`, `1`; the walk read the `&` as the
+   background operator and the feed became cat_operands(['1']) = [].
+2. Output process substitution: `cat f.py > >(python3)`. The `>(…)` body read nothing.
+3. A `cat` with no file operand passing its stdin on: `cat f.py | cat | python3`,
+   `cat f.py | if true; then cat; fi | python3` (`tee` too).
+4. A pipe continued on the next line: `cat f.py |` newline `python3`. Each line was walked alone.
+
+Fix (the walk is in cron/lifecycle_guard_groups.py; lifecycle_guard.py stays under its cap):
+
+- protect_redirection_ampersands swaps the `&` of an unquoted, unescaped `>&`, `<&`, `&>`, `&>>`
+  for a private-use word character before shlex, and _shlex_tokens restores it per token, so a
+  redirection stays one word. `&&`, `|&` and a lone `&` keep their meaning. _REDIRECTION learns
+  `&>`/`&>>`, so `python3 &>log` still reads its program from the pipe.
+- A closed `( … )` keeps its output across the redirection words after it, like `}`/`fi` already
+  did; the next operator ends it.
+- `>(…)` feeds its body what its command writes so far; the outer command's own feed is restored
+  when the substitution closes.
+- Bare `cat` reuses main's _cat_relays_stdin (#2586), which now also covers `tee` (its operands
+  are files it writes); _LineWalk.writes adds the feed for such a segment, both when a segment
+  flushes and when `>(…)` takes what its command writes.
+- The two cron.lifecycle_guard_groups imports in lifecycle_guard.py are folded into one.
+- join_continued_lines joins a line ending in `|`, `|&`, `&&` or `||` with the next one before the
+  walk (comments are already dropped by shlex, so `| # note` continues too).
+
+Still allowed: `cat f.py &>/dev/null | python3 c.py`, `cat f.py 2>&1 | wc -l`,
+`cat f.py > out; python3 c.py`, `cat f.py 2>&1 & python3`, `cat clean | tee f.py | python3`.
+
+Proof:
+- New tests/cron/test_lifecycle_guard_feed_routing.py (49 cases). On the base 28 fail: 27 of the
+  34 must-scan cases plus the tokenizer contract; the other 7 must-scan cases are regression
+  guards. Every must-allow case passes on base and head.
+- 22 mutants of the added conditions: all killed (one equivalent clause removed).
+- Every test file importing the guard, terminal_tool_guards, approval_detection, shell_heredoc
+  or code_execution_tool: 69 files, 2995 passed, 0 failed.
+- Replay of 22,531 distinct real terminal commands from a worker's state.db through
+  scan_gateway_lifecycle, base vs head: 0 changed verdicts, 0 errors (17 blocked on both).
+- scripts/check --only health: 0 blocking.
+
+Not covered here: a compound command spread over several lines (`{` newline `cat f.py` newline
+`} | python3`, `| while …; do` newline `python3` newline `done`) is still walked line by line.
+---
+ cron/lifecycle_guard.py                       |  35 +++--
+ cron/lifecycle_guard_groups.py                | 109 +++++++++++---
+ .../cron/test_lifecycle_guard_feed_routing.py | 133 ++++++++++++++++++
+ 3 files changed, 243 insertions(+), 34 deletions(-)
+ create mode 100644 tests/cron/test_lifecycle_guard_feed_routing.py
+
+diff --git a/cron/lifecycle_guard.py b/cron/lifecycle_guard.py
+index e72feddcf6..e8d8920998 100644
+--- a/cron/lifecycle_guard.py
++++ b/cron/lifecycle_guard.py
+@@ -21,7 +21,9 @@ from typing import Callable, Iterator, Optional
+ 
+ from cron.lifecycle_guard_aliases import _may_define_alias, _session_aliases_shadow_consumers
+ from cron.lifecycle_guard_groups import CONTROL_CHARS as _CONTROL_CHARS
+-from cron.lifecycle_guard_groups import iter_line_segment_contexts, split_glued_redirections
++from cron.lifecycle_guard_groups import (
++    iter_line_segment_contexts, join_continued_lines, protect_redirection_ampersands,
++    restore_redirection_ampersands, split_glued_redirections)
+ from cron.lifecycle_guard_lines import (  # newlines outside quotes, word-start `#` comments
+     _split_logical_lines, join_line_continuations, strip_shell_comments,
+ )
+@@ -373,7 +375,7 @@ _PYTHON_SOURCE_SUFFIXES = (".py", ".pyw")
+ # A redirection word: optional fd or `{NAME}` (NAME may be an array element, `{a[1]}`),
+ # operator, optional glued target (`<f`, `0<f`, `2>>log`, `{fd}>&2`, `{a[1]}>/dev/null`).
+ _REDIRECTION = re.compile(
+-    r"^(\d*|\{[A-Za-z_][A-Za-z0-9_]*(?:\[.+?\])?\})(<<<|<<-|<<|<>|<&|>&|>>|>\||<|>)(.*)$", re.DOTALL)
++    r"^(\d*|\{[A-Za-z_][A-Za-z0-9_]*(?:\[.+?\])?\})(<<<|<<-|<<|<>|<&|>&|>>|>\||&>>|&>|<|>)(.*)$", re.DOTALL)
+ 
+ # Bound the walk: a pathological token run must not spin here.
+ _MAX_PREFIX_PEELS = 8
+@@ -709,12 +711,13 @@ def _refuse_unreadable(budget: _LifecycleScanBudget, path: Path, reason: str) ->
+ # --- shell tokenization -----------------------------------------------------------------------
+ 
+ def _shlex_tokens(line: str) -> list[str]:
+-    """POSIX-tokenize one shell line, honoring quotes and `#` comments; raises ValueError. Only a
+-    word-start `#` comments (shlex's own commenters would also cut `a#b`, which bash keeps)."""
+-    lexer = shlex.shlex(strip_shell_comments(line), posix=True, punctuation_chars=";&|()")
++    """POSIX-tokenize a shell line; only word-start `#` comments. A redirection's
++    ``&`` stays in its word, never a background operator. Raises ValueError."""
++    lexer = shlex.shlex(protect_redirection_ampersands(strip_shell_comments(line)),
++                        posix=True, punctuation_chars=";&|()")
+     lexer.whitespace_split = True
+     lexer.commenters = ""
+-    return list(lexer)
++    return [restore_redirection_ampersands(token) for token in lexer]
+ 
+ 
+ def _split_segments(tokens: list[str], *, keep_controls: bool = False) -> Iterator[list[str]]:
+@@ -815,12 +818,12 @@ def _iter_segment_contexts(
+     """``(segment, call_argument, piped_files)``: whether the segment is the argument list of a
+     call (the segment right after a ``(`` that follows an ordinary word), and the files a ``cat``
+     pipes into its stdin (``cat f.sh | bash``), through groups, compound commands and process
+-    substitution too (``{ cat f; } | bash``, ``cat f | if …; fi``, ``bash <(cat f)``). A ``(``
+-    whose opener holds any word in *alias_names* is never a call: the alias may expand to a
+-    keyword prefix (``alias t='time '``)."""
++    substitution too (``{ cat f; } | bash``, ``cat f | if …; fi``, ``bash <(cat f)``), across a
++    line ending in a pipe. A ``(`` whose opener holds any word in *alias_names* is never a call:
++    the alias may expand to a keyword prefix (``alias t='time '``)."""
+     def opens_call(segment: list[str]) -> bool:
+         return _opens_call_arguments(segment) and alias_names.isdisjoint(segment)
+-    for tokens in _iter_command_token_lists(command):
++    for tokens in join_continued_lines(_iter_command_token_lists(command)):
+         yield from iter_line_segment_contexts(
+             tokens, cat_operands=_cat_operands, cat_relays_stdin=_cat_relays_stdin,
+             opens_call_arguments=opens_call,
+@@ -951,12 +954,13 @@ def _cat_operands(segment: Optional[list[str]]) -> list[str]:
+ 
+ 
+ def _cat_relays_stdin(segment: list[str]) -> bool:
+-    """Whether a ``cat`` segment writes the stdin it is fed (``… | cat | bash``, ``{ cat; } <
+-    f``): no file operand or a ``-`` one, and no redirection, heredoc or here-string of its own
+-    on fd 0 (``cat < x``, ``cat <<< x`` and ``cat x.txt`` ignore the feed)."""
++    """Whether a ``cat`` or ``tee`` segment writes the stdin it is fed (``… | cat | bash``,
++    ``{ cat; } < f``, ``… | tee log | bash``): no redirection, heredoc or here-string of its own
++    on fd 0 (``cat < x``, ``cat <<< x`` ignore the feed) and, for ``cat``, no file operand or a
++    ``-`` one (``cat x.txt`` ignores it; ``tee``'s operands are files it writes)."""
+     for view in _command_segment_views(segment):
+         index = _executed_command_index(view)
+-        if index is not None and _executable_name(view[index]) == "cat":
++        if index is not None and (name := _executable_name(view[index])) in ("cat", "tee"):
+             words, arguments = iter(view[index + 1 :]), []
+             for word in words:
+                 match = _REDIRECTION.match(word)
+@@ -967,7 +971,8 @@ def _cat_relays_stdin(segment: list[str]) -> bool:
+                 target = target or next(words, "")
+                 if fd in ("", "0") and operator.startswith("<") and (operator, target) != ("<&", "0"):
+                     return False  # `cat < x`, `cat <<< x`, `cat <&3` read their own stdin
+-            return "-" in arguments or all(argument.startswith("-") for argument in arguments)
++            return name == "tee" or "-" in arguments \
++                or all(argument.startswith("-") for argument in arguments)
+     return False
+ 
+ 
+diff --git a/cron/lifecycle_guard_groups.py b/cron/lifecycle_guard_groups.py
+index c611febc30..85886743ca 100644
+--- a/cron/lifecycle_guard_groups.py
++++ b/cron/lifecycle_guard_groups.py
+@@ -5,8 +5,10 @@ done``, ``| case … esac``) feeds every command in it, and a group writes on wh
+ commands writes (``{ cat f.py; } | python3``) unless that output is piped elsewhere inside it.
+ A stdin redirection on a compound command (``{ true; bash; } < f.sh``, ``(bash) < f.sh``,
+ ``while read l; do bash; done < f.sh``) feeds it the same way. A process substitution
+-(``python3 <(cat f.py)``, ``bash < <(cat f.sh)``) puts what it writes where the ``<(…)`` stands.
+-Shell words come from the caller's tokenizer; this module only walks
++(``python3 <(cat f.py)``, ``bash < <(cat f.sh)``) puts what it writes where the ``<(…)`` stands,
++and ``cat f.py > >(python3)`` feeds the ``>(…)`` body. A ``cat`` or ``tee`` reading its stdin
++passes the feed on (``cat f.py | cat | python3``), and a pipe ending a line continues on the
++next. Shell words come from the caller's tokenizer; this module only walks
+ them, so it never imports ``cron.lifecycle_guard``.
+ """
+ 
+@@ -14,7 +16,7 @@ from __future__ import annotations
+ 
+ import re
+ from dataclasses import dataclass, field
+-from typing import Callable, Iterator, Optional
++from typing import Callable, Iterable, Iterator, Optional
+ 
+ CONTROL_CHARS = frozenset(";&|()")
+ _CONTROL_OPERATOR = re.compile(r"\|\||&&|\|&|;;|[;&|()]")
+@@ -25,6 +27,10 @@ _COMMAND_OPENERS = {"for": "done", "select": "done", "case": "esac"}
+ _CLOSERS = frozenset({"}", "fi", "done", "esac"})
+ # Stands where a `<(…)` that writes no known file was: NUL keeps it from ever naming a path.
+ PROCESS_SUBSTITUTION = "\x00<(…)"
++# Operators that carry a command on past the end of its line.
++_CONTINUING_OPERATORS = frozenset({"|", "|&", "&&", "||"})
++# Stands, while tokenizing, for the `&` of `>&`, `<&`, `&>` and `&>>` (a private-use character).
++_REDIRECTION_AMPERSAND = "\ue000"
+ 
+ Context = tuple[list[str], bool, list[str]]
+ 
+@@ -119,6 +125,57 @@ def split_glued_redirections(line: str) -> str:
+     return body + comment
+ 
+ 
++def protect_redirection_ampersands(line: str) -> str:
++    """*line* with the ``&`` of each unquoted, unescaped redirection operator (``2>&1``, ``<&0``,
++    ``&>f``, ``&>>f``) swapped for a word character, so a tokenizer splitting on ``&`` keeps the
++    redirection whole instead of reading a background ``&``. ``&&``, ``|&`` and a lone ``&``
++    keep theirs. Undo per token with ``restore_redirection_ampersands``."""
++    out: list[str] = []
++    in_single = in_double = escape = False
++    previous = ""  # the last character when it was unquoted and unescaped
++    for position, ch in enumerate(line):
++        shell_character = False
++        if escape:
++            escape = False
++        elif ch == "\\" and not in_single:
++            escape = True
++        elif ch == "'" and not in_double:
++            in_single = not in_single
++        elif ch == '"' and not in_single:
++            in_double = not in_double
++        elif not in_single and not in_double:
++            shell_character = True
++            after = line[position + 1: position + 2]
++            if ch == "&" and (previous in ("<", ">")
++                              or (after == ">" and previous not in ("&", "|"))):
++                ch = _REDIRECTION_AMPERSAND
++        previous = ch if shell_character else ""
++        out.append(ch)
++    return "".join(out)
++
++
++def restore_redirection_ampersands(token: str) -> str:
++    """*token* as written (see ``protect_redirection_ampersands``)."""
++    return token.replace(_REDIRECTION_AMPERSAND, "&")
++
++
++def join_continued_lines(token_lists: Iterable[list[str]]) -> Iterator[list[str]]:
++    """Each line's tokens, a line ending in ``|``, ``|&``, ``&&`` or ``||`` joined with the
++    lines after it (``cat f.py |`` newline ``python3`` is one pipeline), blank lines included."""
++    carried: list[str] = []
++    for tokens in token_lists:
++        tokens = carried + tokens
++        last = tokens[-1] if tokens else ""
++        if last and set(last) <= CONTROL_CHARS \
++                and _CONTROL_OPERATOR.findall(last)[-1] in _CONTINUING_OPERATORS:
++            carried = tokens
++            continue
++        carried = []
++        yield tokens
++    if carried:
++        yield carried
++
++
+ @dataclass
+ class _Group:
+     closer: str
+@@ -126,8 +183,9 @@ class _Group:
+     # Open order on the line: the key a redirection read after the closer is recorded under.
+     ordinal: int = -1
+     output: list[str] = field(default_factory=list)
+-    # A process substitution suspends the command it stands in: (words, call_argument, subs).
+-    outer: Optional[tuple[list[str], bool, list[tuple[int, list[str]]]]] = None
++    # A process substitution suspends the command it stands in: (words, call_argument, subs,
++    # feed); the group's own feed is what its body reads.
++    outer: Optional[tuple[list[str], bool, list[tuple[int, list[str]]], list[str]]] = None
+ 
+ 
+ def _opened_groups(segment: list[str], peel_reserved_words: Callable[[list[str]], int]) -> list[str]:
+@@ -175,12 +233,14 @@ class _LineWalk:
+         self.closed: Optional[list[str]] = None
+         self.groups: list[_Group] = []
+ 
+-    def open_group(self, closer: str, outer=None) -> _Group:
++    def open_group(self, closer: str, outer=None, feed: Optional[list[str]] = None) -> _Group:
+         """A new group on the current feed, unless its own redirection replaces that. The
+-        commands after the opener (``{ bash``, ``{ { bash``) run on the group's feed."""
++        commands after the opener (``{ bash``, ``{ { bash``) run on the group's feed. A process
++        substitution (*outer* set) reads *feed* when given (``>(…)``), else the current feed."""
+         ordinal, self.opened = self.opened, self.opened + 1
+         if outer is not None:
+-            group = _Group(closer, self.feed, ordinal=ordinal, outer=outer)
++            group = _Group(closer, self.feed if feed is None else feed, ordinal=ordinal,
++                           outer=outer)
+         else:
+             self.feed = self.redirected.get(ordinal) or self.feed
+             group = _Group(closer, self.feed, ordinal=ordinal)
+@@ -200,14 +260,20 @@ class _LineWalk:
+         written: list[str] = []
+         for variant in _substituted_variants(self.segment, self.subs):
+             yield variant, self.call_argument, self.feed
+-            written += self.cat_operands(variant)
+-            # A bare `cat` (or `cat -`) writes what it is fed: `cat f | cat | bash`, `{ cat; } < f`.
+-            if self.feed and self.cat_relays_stdin(variant):
+-                written += self.feed
++            written += self.writes(variant)
+         self.pending = self.closed if self.closed is not None else written
+         self.closed = None
+         self.segment, self.subs = [], []
+ 
++    def writes(self, segment: list[str]) -> list[str]:
++        """Files *segment* writes to its stdout. A bare ``cat`` (or ``cat -``, ``tee``) writes
++        what it is fed: ``cat f | cat | bash``, ``{ cat; } < f``, ``cat f | tee log | bash``."""
++        written = self.cat_operands(segment)
++        # Only asked with a feed: the 8000-line heredoc perf case keeps its timing.
++        if self.feed and self.cat_relays_stdin(segment):
++            written = written + self.feed
++        return written
++
+     def route(self) -> None:
+         if self.groups:
+             self.groups[-1].output.extend(self.pending)
+@@ -220,10 +286,9 @@ class _LineWalk:
+         """Back in the command a closed ``<(…)`` stands in."""
+         if group.outer is None:
+             return
+-        self.segment, self.call_argument, self.subs = group.outer
++        self.segment, self.call_argument, self.subs, self.feed = group.outer
+         self.subs.append((len(self.segment), group.output))
+         self.segment.append(PROCESS_SUBSTITUTION)
+-        self.feed = group.feed
+ 
+     def word(self, token: str) -> None:
+         # A closer right after the closers that started this segment closes the next group too
+@@ -243,10 +308,16 @@ class _LineWalk:
+         self.segment.append(token)
+ 
+     def operator(self, operator: str) -> Iterator[Context]:
+-        if operator == "(" and self.segment and self.segment[-1] == "<":
+-            self.segment.pop()
+-            self.open_group(")", outer=(self.segment, self.call_argument, self.subs))
+-            self.segment, self.subs, self.call_argument = [], [], False
++        if not self.segment:
++            # A closed `( … )` writes on until an operator routes it; its redirections
++            # (`(cat f.py) 2>&1 | python3`) are a segment of their own.
++            self.closed = None
++        if operator == "(" and self.segment and self.segment[-1] in ("<", ">"):
++            # `>(…)` reads what its command writes so far (`cat f.py > >(python3)`).
++            feed = self.feed if self.segment.pop() == "<" else self.writes(self.segment)
++            self.open_group(")", outer=(self.segment, self.call_argument, self.subs, self.feed),
++                            feed=feed)
++            self.segment, self.subs, self.call_argument, self.feed = [], [], False, feed
+             return
+         next_is_call = operator == "(" and bool(self.segment) \
+             and self.opens_call_arguments(self.segment)
+@@ -296,7 +367,7 @@ def iter_line_segment_contexts(
+     """``(segment, call_argument, piped_files)`` for one line's shell *tokens* (see
+     ``cron.lifecycle_guard._iter_segment_contexts``). *cat_operands* names the files a segment
+     writes to its stdout, *cat_relays_stdin* whether it also writes the feed on its stdin (a
+-    bare ``cat``); *stdin_redirections* the files some words redirect to stdin.
++    bare ``cat``, ``tee``); *stdin_redirections* the files some words redirect to stdin.
+ 
+     A group's own redirection follows its closer, after its commands were read, so the line is
+     walked twice: the first walk only collects those redirections, the second feeds each group
+diff --git a/tests/cron/test_lifecycle_guard_feed_routing.py b/tests/cron/test_lifecycle_guard_feed_routing.py
+new file mode 100644
+index 0000000000..f4256d8236
+--- /dev/null
++++ b/tests/cron/test_lifecycle_guard_feed_routing.py
+@@ -0,0 +1,133 @@
++"""Stdin feeds lost between a ``cat`` and the program reading it (PR #2393 review).
++
++Each case below ran a lifecycle ``.py``/``.sh`` the guard never opened:
++
++1. A descriptor duplication on the feeding command (``cat f.py 2>&1 | python3``): the tokenizer
++   split ``2>&1`` into ``2>``, ``&``, ``1`` and the walk read the ``&`` as the background
++   operator, so the feed became ``cat_operands(['1'])``. ``&>file`` split the same way.
++2. Output process substitution (``cat f.py > >(python3)``): the ``>(…)`` body read nothing.
++3. A ``cat`` (or ``tee``) with no file operand passes its stdin through
++   (``cat f.py | cat | python3``).
++4. A pipe continued on the next line (``cat f.py |`` newline ``python3``): each line was walked
++   alone.
++"""
++
++from __future__ import annotations
++
++import shlex
++
++import pytest
++
++from cron.lifecycle_guard import scan_gateway_lifecycle
++
++# Assembled so this file's own text never carries the literal command.
++LIFECYCLE = " ".join(["hermes", "gateway", "re" + "start"])
++
++
++@pytest.fixture
++def files(tmp_path) -> dict[str, str]:
++    sh = tmp_path / "restart.sh"
++    sh.write_text(f"#!/bin/sh\necho hi\n{LIFECYCLE}\n", encoding="utf-8")
++    py = tmp_path / "f.py"
++    py.write_text(f"import os\nos.system({LIFECYCLE!r})\n", encoding="utf-8")
++    clean = tmp_path / "c.py"
++    clean.write_text("import sys\nprint(sys.stdin.read())\n", encoding="utf-8")
++    return {"sh": shlex.quote(str(sh)), "py": shlex.quote(str(py)),
++            "clean": shlex.quote(str(clean)), "out": shlex.quote(str(tmp_path / "out"))}
++
++
++@pytest.mark.parametrize(
++    "template",
++    [
++        # 1. Descriptor duplication on the feeding command or group.
++        "cat {py} 2>&1 | python3",
++        "cat {py} 2>&1|python3",
++        "{{ cat {py}; }} 2>&1 | python3",
++        "{{ cat {py}; }} >&2 | python3",
++        "(cat {py}) 2>&1 | python3",
++        "(cat {py}) | python3",
++        "if true; then cat {py}; fi 2>&1 | python3",
++        "cat {sh} 2>&1 | bash",
++        "cat {py} 2>&1 |& python3",
++        "cat {py} 2>/dev/null 2>&1 | python3",
++        # 2. Output process substitution.
++        "cat {py} > >(python3)",
++        "cat {sh} > >(bash)",
++        "cat {py} | tee >(python3)",
++        # 3. A `cat`/`tee` with no file operand passes its stdin through.
++        "cat {py} | cat | python3",
++        "cat {py} | cat - | python3",
++        "cat {py} | if true; then cat; fi | python3",
++        "cat {py} | {{ cat; }} | python3",
++        "cat {py} | tee /dev/null | python3",
++        "cat {py} | cat | cat | python3",
++        # 4. A pipe continued on the next line.
++        "cat {py} |\npython3",
++        "cat {py} |\nif true; then python3; fi",
++        "cat {py} |\n\npython3",
++        "cat {py} | # comment\npython3",
++        "cat {py} |&\npython3",
++        "(cat {py})|\npython3",
++        "{{ cat {py} &&\ntrue; }} | python3",
++        "{{ false ||\ncat {py}; }} | python3",
++        "python3 {py} |",
++        # The program reader's own `&>`/`>&` redirections leave it reading the pipe.
++        "cat {py} | python3 &>{out}",
++        "cat {py} | python3 2>&1",
++        # A `cat` reading the pipe inside `<(…)`, and beside a file.
++        "cat {sh} | bash <(cat)",
++        "cat {py} | cat {clean} - | python3",
++    ],
++)
++def test_routed_stdin_feeds_are_scanned(files, template):
++    assert scan_gateway_lifecycle(template.format(**files)) == (True, None)
++
++
++@pytest.mark.parametrize(
++    "template",
++    [
++        "cat {py} &>/dev/null | python3 {clean}",
++        "cat {py} &>>{out} | python3 {clean}",
++        "cat {py} 2>&1 | wc -l",
++        "cat {py} > {out}; python3 {clean}",
++        # A real background `&` still ends the feed, beside a duplication.
++        "cat {py} 2>&1 & python3",
++        "cat {py} & python3",
++        # A `cat` reading a file (or its own redirected stdin) does not pass the pipe through.
++        "cat {py} | cat {clean} | python3",
++        "cat {py} | cat < {clean} | python3",
++        "cat | python3",
++        # `tee`'s operands are files it writes, not reads.
++        "cat {clean} | tee {py} | python3",
++        # A closed subshell's output ends at the next operator.
++        "(cat {py}); echo hi | python3",
++        "(cat {py}) > {out}; echo hi | python3",
++        # Only a trailing pipe continues a line.
++        "cat {py};\npython3",
++        "cat {py} &&\npython3",
++        "cat {py}\npython3",
++        "echo '>&' | python3 {clean}",
++    ],
++)
++def test_routing_mentions_stay_allowed(files, template):
++    assert scan_gateway_lifecycle(template.format(**files)) == (False, None)
++
++
++def test_redirection_ampersands_survive_tokenizing():
++    from cron.lifecycle_guard_groups import protect_redirection_ampersands as protect
++    from cron.lifecycle_guard_groups import restore_redirection_ampersands as restore
++
++    def words(line: str) -> list[str]:
++        lexer = shlex.shlex(protect(line), posix=True, punctuation_chars=";&|()")
++        lexer.whitespace_split = True
++        return [restore(token) for token in lexer]
++
++    assert words("a 2>&1 >&2 <&0 &>x &>>y b") == ["a", "2>&1", ">&2", "<&0", "&>x", "&>>y", "b"]
++    # Control operators keep their `&`.
++    assert words("a & b && c |& d") == ["a", "&", "b", "&&", "c", "|&", "d"]
++    assert words("a&&>x") == ["a", "&&", ">x"]
++    assert words("a|&>x") == ["a", "|&", ">x"]
++    # Quoted or escaped text is not a redirection, and the scan leaves it as written.
++    assert words("echo '2>&1' \"&>\" 'a&'>x") == ["echo", "2>&1", "&>", "a&>x"]
++    assert words("echo \\>&1") == ["echo", ">", "&", "1"]
++    assert words("echo '>'&1") == ["echo", ">", "&", "1"]
+-- 
+2.43.0
+

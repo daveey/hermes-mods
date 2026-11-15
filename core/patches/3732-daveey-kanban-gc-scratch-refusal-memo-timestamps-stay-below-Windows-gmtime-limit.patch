@@ -1,0 +1,113 @@
+From 693ab87cf3670da1c479dc4b89f553c7beec7d24 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 18:12:05 +0000
+Subject: [PATCH] [daveey] kanban gc: scratch refusal memo timestamps stay
+ below Windows' gmtime limit; skip_logged never raises
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Follow-up to PR #2448 (review 5895735550). The memo loader accepted retry_at up to
+1e11, but CPython's time.gmtime on Windows raises past 3000-12-31 (~3.25e10).
+skip_logged formats retry_at outside the archive try in the aged-scratch loop, so
+one hand-edited entry could abort a board's GC pass on Windows (fail-closed:
+nothing deleted, but the pass never completes).
+
+Fix, two layers:
+- _finite bounds loaded timestamps by MAX_EPOCH_S = 3.2e10 (year ~2984); larger
+  entries are dropped as malformed (tree retried as never refused).
+- skip_logged formats through _utc(), which falls back to the raw epoch number on
+  OverflowError/OSError/ValueError, so the INFO line can never raise.
+
+Custody, owner_unverified and protection guards are untouched.
+
+RED (before fix): 4 failed — test_memo_loader_drops_each_malformed_field[retry_at=9.9e10]
+and test_skip_logged_keeps_the_tree_when_retry_at_cannot_be_formatted[OSError|OverflowError|ValueError].
+GREEN: test_kanban_scratch_gc_backoff + custody_backoff + gc_archive: 120 passed;
+scripts/check --base origin/main ok.
+---
+ hermes_cli/kanban_scratch_backoff.py          | 16 ++++++++++++---
+ .../test_kanban_scratch_gc_backoff.py         | 20 +++++++++++++++++++
+ 2 files changed, 33 insertions(+), 3 deletions(-)
+
+diff --git a/hermes_cli/kanban_scratch_backoff.py b/hermes_cli/kanban_scratch_backoff.py
+index 00b35f88a1..a2b63ce578 100644
+--- a/hermes_cli/kanban_scratch_backoff.py
++++ b/hermes_cli/kanban_scratch_backoff.py
+@@ -37,6 +37,7 @@ CAP_S = 24 * 3600
+ FORGET_S = 14 * 86400
+ MAX_COUNT = 64  # count saturates here: CAP_S is reached at 4, and 2 ** count must stay cheap
+ DEFAULT_BUDGET_S = 1200  # the worker/Mac GC wrappers kill a board's pass at 1800 s
++MAX_EPOCH_S = 3.2e10  # loaded timestamps stay below Windows' gmtime limit (~3.25e10, year 3000)
+ 
+ 
+ class Budget:
+@@ -75,9 +76,18 @@ def fingerprint(path: Path, completed_at) -> Optional[list]:
+ 
+ 
+ def _finite(value) -> bool:
+-    """A real epoch-seconds number ``time.gmtime`` can format (no bool, NaN, inf or year > 5000)."""
++    """A real epoch-seconds number ``time.gmtime`` can format on every host (no bool, NaN, inf or
++    year > ~2984: Windows' gmtime raises past 3000-12-31, about 3.25e10)."""
+     return (isinstance(value, (int, float)) and not isinstance(value, bool)
+-            and math.isfinite(value) and abs(value) < 1e11)
++            and math.isfinite(value) and abs(value) < MAX_EPOCH_S)
++
++
++def _utc(epoch) -> str:
++    """ISO UTC for a log line; the raw number when the platform cannot format it (never raises)."""
++    try:
++        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
++    except (OverflowError, OSError, ValueError):
++        return f"{epoch:.0f}"
+ 
+ 
+ def _well_formed(entry) -> bool:
+@@ -157,5 +167,5 @@ def skip_logged(refusals: Refusals, key: str, path: Path, completed_at, task_id:
+         return False
+     log.info("Keeping aged scratch workspace for task %s: %s (archive refused %d time(s), "
+              "next retry after %s; last: %s)", task_id, path, entry["count"],
+-             time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(entry["retry_at"])), entry.get("reason"))
++             _utc(entry["retry_at"]), entry.get("reason"))
+     return True
+diff --git a/tests/hermes_cli/test_kanban_scratch_gc_backoff.py b/tests/hermes_cli/test_kanban_scratch_gc_backoff.py
+index 238894a7c9..6872e48608 100644
+--- a/tests/hermes_cli/test_kanban_scratch_gc_backoff.py
++++ b/tests/hermes_cli/test_kanban_scratch_gc_backoff.py
+@@ -145,6 +145,7 @@ def test_malformed_memo_entry_is_dropped_and_the_aged_pass_completes(remote, arc
+     {"retry_at": "x"}, {"count": None}, {"count": "2"}, {"count": True}, {"count": 0},
+     {"last_at": "y"}, {"retry_at": float("inf")}, {"retry_at": 1e300}, {"retry_at": None},
+     {"fingerprint": "p"}, {"reason": 5}, {"count": 10**10},
++    {"retry_at": 9.9e10},  # below 1e11 but past Windows' gmtime limit (~year 3000)
+ ])
+ def test_memo_loader_drops_each_malformed_field(tmp_path, bad):
+     tree = tmp_path / "tree"
+@@ -161,6 +162,25 @@ def test_memo_loader_drops_each_malformed_field(tmp_path, bad):
+     assert bo.skip_logged(refusals, "ok", tree, 5, "t") is True
+ 
+ 
++@pytest.mark.parametrize("exc", [OSError, OverflowError, ValueError])
++def test_skip_logged_keeps_the_tree_when_retry_at_cannot_be_formatted(tmp_path, monkeypatch, caplog, exc):
++    """Windows ``time.gmtime`` raises past ~year 3000; the INFO line must never abort the GC pass."""
++    tree = tmp_path / "tree"
++    tree.mkdir()
++    now = 1_000_000.0
++    refusals = bo.Refusals("default", now=lambda: now)
++    refusals.entries["t"] = {"fingerprint": bo.fingerprint(tree, 5), "count": 1, "last_at": now,
++                             "retry_at": now + 60, "reason": "r"}
++
++    def boom(*_a):
++        raise exc("timestamp out of range for platform time_t")
++
++    monkeypatch.setattr(bo.time, "gmtime", boom)
++    caplog.set_level(logging.INFO, logger="hermes_cli.kanban_scratch_backoff")
++    assert bo.skip_logged(refusals, "t", tree, 5, "t") is True
++    assert "next retry after 1000060" in caplog.text
++
++
+ def test_record_saturates_count_so_the_backoff_exponent_stays_small(tmp_path):
+     """A tree refused forever stops growing ``count`` at MAX_COUNT (else 2 ** count stalls)."""
+     tree = tmp_path / "tree"
+-- 
+2.43.0
+

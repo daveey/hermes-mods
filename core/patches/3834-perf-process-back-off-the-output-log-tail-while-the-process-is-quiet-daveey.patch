@@ -1,0 +1,187 @@
+From 34627fdc90251c52e46013cb4cb6832b6c5a2768 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 20:08:16 +0000
+Subject: [PATCH] perf(process): back off the output-log tail while the process
+ is quiet [daveey]
+
+A file-backed background process is tailed every 0.2 s for as long as it
+runs. On the hub each idle reader cost ~0.16% of a core (P1 thread CPU of
+proc-log-reader-* in the gateway, card t_01a1d59ed9eb75fe; design
+t_01a1d563324d7e8e section 6 serve-residue lever).
+
+Each empty read now doubles the wait up to 2 s; the next byte the process
+writes is ingested on the next poll and resets the wait to 0.2 s. The wait
+is on _reader_finish_requested, so a poll()/wait() reconcile still ends it
+at once.
+
+RED->GREEN: tests/tools/test_process_output_log_idle_backoff.py
+---
+ .../test_process_output_log_idle_backoff.py   | 115 ++++++++++++++++++
+ tools/process_registry_output_log.py          |  10 +-
+ 2 files changed, 124 insertions(+), 1 deletion(-)
+ create mode 100644 tests/tools/test_process_output_log_idle_backoff.py
+
+diff --git a/tests/tools/test_process_output_log_idle_backoff.py b/tests/tools/test_process_output_log_idle_backoff.py
+new file mode 100644
+index 0000000000..4cb783c812
+--- /dev/null
++++ b/tests/tools/test_process_output_log_idle_backoff.py
+@@ -0,0 +1,115 @@
++"""The output-log tail backs off while its process is quiet and picks new output up on the next poll.
++
++Card t_01a1d59ed9eb75fe (design t_01a1d563324d7e8e §6, serve residue): a fixed 0.2 s tail cost ~0.16% of a core
++per idle reader on the hub. [daveey]
++"""
++from types import SimpleNamespace
++import time
++
++import tools.process_registry_output_log as olog
++from tools.process_registry import ProcessRegistry
++
++
++class _ScriptedFinish:
++    """Stands in for ``session._reader_finish_requested``: records each wait and runs the test's hook."""
++
++    def __init__(self, on_wait):
++        self.waits: list[float] = []
++        self._set = False
++        self._on_wait = on_wait
++
++    def is_set(self) -> bool:
++        return self._set
++
++    def set(self) -> None:
++        self._set = True
++
++    def wait(self, timeout=None) -> bool:
++        self.waits.append(timeout)
++        self._on_wait(len(self.waits))
++        return self._set
++
++
++def _reader(tmp_path, monkeypatch, on_wait, *, polls_alive):
++    """Run ``_log_reader_loop`` on an adopted (no Popen) session whose process stays 'running' for
++    ``polls_alive`` liveness checks. Waits go through the scripted finish event; a plain ``time.sleep`` in
++    the loop is recorded too (it is what the pre-backoff reader called)."""
++    log = tmp_path / "proc_quiet.log"
++    log.write_bytes(b"")
++    (tmp_path / "proc_quiet.exit").write_text("0\n")
++    registry = ProcessRegistry()
++    session = registry._new_session("c", "t", "t", "k", str(tmp_path), persist_on_release=True)
++    session.output_log = str(log)
++    session.process = None
++    finish = _ScriptedFinish(lambda n: on_wait(n, log))
++    session._reader_finish_requested = finish
++    slept: list[float] = []
++
++    def sleep(seconds):
++        slept.append(seconds)
++        on_wait(len(slept), log)
++
++    monkeypatch.setattr(olog, "time", SimpleNamespace(sleep=sleep, time=time.time))
++    checks = []
++
++    def fate(pid, start):
++        checks.append(1)
++        return "running" if len(checks) <= polls_alive else "gone"
++
++    monkeypatch.setattr(registry, "_detached_host_fate", fate)
++    finished = []
++    monkeypatch.setattr(registry, "_finish_exited", lambda s, code, **k: finished.append(code))
++    ingested: list[tuple[int, str]] = []
++    real_ingest = registry._ingest_output
++    monkeypatch.setattr(registry, "_ingest_output",
++                        lambda s, text: ingested.append((len(finish.waits) + len(slept), text)) or real_ingest(s, text))
++    registry._log_reader_loop(session)
++    return finish.waits + slept, ingested, finished, session
++
++
++def test_quiet_log_backs_off_to_the_cap(tmp_path, monkeypatch):
++    waits, _ingested, finished, _session = _reader(tmp_path, monkeypatch, lambda n, log: None, polls_alive=8)
++    assert waits == [0.2, 0.4, 0.8, 1.6, 2.0, 2.0, 2.0, 2.0]
++    assert finished == [0]
++
++
++def test_output_after_a_quiet_spell_is_picked_up_on_the_next_poll_and_resets_the_wait(tmp_path, monkeypatch):
++    def on_wait(n, log):
++        if n == 5:  # the reader is now waiting the full cap
++            with open(log, "ab") as fh:
++                fh.write(b"late line\n")
++
++    waits, ingested, finished, session = _reader(tmp_path, monkeypatch, on_wait, polls_alive=8)
++    # Read right after the 5th wait returned, before any further wait.
++    assert ingested[0] == (5, "late line\n")
++    assert waits[:5] == [0.2, 0.4, 0.8, 1.6, 2.0]
++    assert waits[5:] == [0.2, 0.4]  # the wait starts short again after output
++    assert session.output_buffer == "late line\n"
++    assert finished == [0]
++
++
++def test_a_finish_request_ends_the_tail(tmp_path, monkeypatch):
++    """poll()/wait() reconcile sets ``_reader_finish_requested``; the idle wait is on that event, so the
++    reader drains and returns."""
++    import threading
++
++    log = tmp_path / "proc_fin.log"
++    log.write_bytes(b"")
++    registry = ProcessRegistry()
++    session = registry._new_session("c", "t", "t", "k", str(tmp_path), persist_on_release=True)
++    session.output_log = str(log)
++    session.process = None
++    monkeypatch.setattr(registry, "_detached_host_fate", lambda pid, start: "running")
++    done = threading.Event()
++    monkeypatch.setattr(registry, "_finish_exited", lambda s, code, **k: done.set())
++    reader = threading.Thread(target=registry._log_reader_loop, args=(session,), daemon=True)
++    reader.start()
++    from tests.waiting import wait_until
++    wait_until(lambda: reader.is_alive())
++    with open(log, "ab") as fh:
++        fh.write(b"tail\n")
++    wait_until(lambda: session.output_buffer == "tail\n", what="the written line")
++    session._reader_finish_requested.set()
++    reader.join(5)
++    assert done.is_set()
++    assert not reader.is_alive()
+diff --git a/tools/process_registry_output_log.py b/tools/process_registry_output_log.py
+index df2284fb2e..d625e9f1a3 100644
+--- a/tools/process_registry_output_log.py
++++ b/tools/process_registry_output_log.py
+@@ -22,6 +22,11 @@ from hermes_constants import get_hermes_home
+ logger = logging.getLogger("tools.process_registry")
+ 
+ _TAIL_SECONDS = 0.2
++# A quiet process is polled less often: each empty read doubles the wait up to this cap, and the next byte
++# it writes resets it (picked up on the next poll). A poll()/wait() reconcile still ends the wait at once:
++# it sets ``_reader_finish_requested``, which the wait is on. Measured on the hub (t_01a1d59ed9eb75fe): a
++# fixed 0.2 s tail cost ~0.16% of a core per idle reader. [daveey]
++_IDLE_TAIL_MAX_SECONDS = 2.0
+ # After the process ended: an orphaned grandchild may keep appending; stop draining after this.
+ _FINAL_DRAIN_MAX_BYTES = 1 << 20
+ 
+@@ -189,11 +194,13 @@ class ProcessOutputLogMixin:
+         try:
+             with open(session.output_log, "rb") as stream:
+                 drained = 0
++                idle_wait = _TAIL_SECONDS
+                 while True:
+                     # Decided BEFORE the read: once the process is gone every byte it wrote is readable.
+                     alive = running()
+                     chunk = stream.read(65536)
+                     if chunk:
++                        idle_wait = _TAIL_SECONDS
+                         if text := decoder.decode(chunk):
+                             ingest(text)
+                         drained += 0 if alive else len(chunk)
+@@ -201,7 +208,8 @@ class ProcessOutputLogMixin:
+                             continue
+                     if not alive:
+                         break
+-                    time.sleep(_TAIL_SECONDS)
++                    session._reader_finish_requested.wait(idle_wait)
++                    idle_wait = min(idle_wait * 2, _IDLE_TAIL_MAX_SECONDS)
+         except OSError as exc:
+             logger.warning("Process output log %s unreadable: %s", session.output_log, exc)
+         ingest(decoder.decode(b"", final=True), final=True)
+-- 
+2.43.0
+

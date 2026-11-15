@@ -26,6 +26,8 @@ def _no_land_turn(monkeypatch):
     # These cases pin the preflight's other gh calls; the land turn has its own fakes in tests_turn.py.
     monkeypatch.setattr(g, "_live_turns", lambda *a: [])
     monkeypatch.setattr(g, "_turn_acquire", lambda *a: "")
+    # Nor do they own the carry's head fetch, which starts with its ancestry walk (tests_carry.py).
+    monkeypatch.setattr(g._CarryObjects, "_fetch", lambda self: "git fetch is not run in these tests")
 
 
 @pytest.fixture
@@ -175,6 +177,64 @@ def test_python_comment_does_not_authorize(repo, code):
 ])
 def test_python_allow_direction(repo, code):
     assert g.check_python(code, str(repo)) is None
+
+
+@pytest.mark.parametrize("code", [
+    # Incident plugin-e90850b9da: a kanban_attach upload whose calls list holds non-literal values.
+    'import base64\nfrom pathlib import Path\np = Path("r.md")\n'
+    'tool_call(calls=[{"name": "kanban_attach", "arguments": {"filename": p.name, '
+    '"content_base64": base64.b64encode(p.read_bytes()).decode()}}])',
+    'tool_call(calls=build_calls())',
+    'tool_call(calls=None)',
+    'tool_call()',
+])
+def test_python_nonliteral_tool_call_allows(repo, code):
+    # The guard reads literals only; a non-literal calls list is allowed, never a TypeError.
+    assert g.check_python(code, str(repo)) is None
+
+
+@pytest.mark.parametrize("entry", ["python", "tool", "hook-python", "hook-tool"])
+@pytest.mark.parametrize("command, blocked", [
+    ("gh pr merge -R example/protected 12", True),
+    ("gh pr view -R example/protected 12", False),
+])
+def test_literal_tuple_tool_call(repo, entry, command, blocked):
+    # Classify only: never execute the nested terminal command. repr preserves
+    # the singleton tuple's trailing comma through the real Python AST reader.
+    calls = ({"name": "functions.terminal", "arguments": {"command": command}},)
+    code = f"tool_call(calls={calls!r})"
+    if entry == "python":
+        result = g.check_python(code, str(repo))
+    elif entry == "tool":
+        result = g.check_tool("tool_call", {"calls": calls}, str(repo))
+    else:
+        hooks = {}
+
+        class Context:
+            def register_hook(self, name, fn):
+                hooks[name] = fn
+
+        plugin.register(Context())
+        name, args = (("execute_code", {"code": code}) if entry == "hook-python"
+                      else ("tool_call", {"calls": calls}))
+        result = hooks["pre_tool_call"](tool_name=name, args=args)
+    if blocked:
+        assert result
+        if entry.startswith("hook-"):
+            assert result["action"] == "block"
+    else:
+        assert result is None
+
+
+@pytest.mark.parametrize("calls", [None, 7, "terminal", {"name": "terminal"}])
+def test_tool_call_malformed_calls_does_not_raise(repo, calls):
+    assert g.check_tool("tool_call", {"calls": calls}, str(repo)) is None
+    hooks = {}
+    class Context:
+        def register_hook(self, name, fn):
+            hooks[name] = fn
+    plugin.register(Context())
+    assert hooks["pre_tool_call"](tool_name="tool_call", args={"calls": calls}) is None
 
 
 def test_python_cwd(repo, tmp_path):

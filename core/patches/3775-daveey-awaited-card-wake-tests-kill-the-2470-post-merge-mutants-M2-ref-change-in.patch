@@ -1,0 +1,112 @@
+From 8dd21118e91b80c40bc95e52869dd8b36637b4a4 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 19:06:26 +0000
+Subject: [PATCH] [daveey] awaited-card wake tests: kill the #2470 post-merge
+ mutants M2 (ref change in one episode) and M5 (expedite re-arm)
+
+Tests only. Post-merge check t_01a1d61ded25690f found two non-equivalent mutants of
+hermes_cli/kanban_awaited_card_wake.py that survived tests/hermes_cli/test_kanban_awaited_card_wake.py:
+
+- M2: `_rearm` comparing the warned mark by episode alone (`mark[1] == _episode(...)`). The existing
+  re-park test changes the awaited ref only together with a new episode, so nothing pinned the docstring's
+  "names another finished card" re-warn inside one park episode.
+  New test: one park naming two cards (probe `wait-check task REVIEW --until review` + `awaiting` card
+  ref to a lower-sorted second card). REVIEW finishes and is warned; then the second card finishes with
+  no re-park. The next scan re-arms for the new ref (same episode) and report_lag warns again.
+- M5: `_remember` keeping the pre-#2470 `(key, task_id) not in _WARNED` check on the expedite path
+  (review 5895271396 follow-up nit 2 on #2470: no test drove expedite -> _remember -> _rearm).
+  New test: a warned park re-parks; expedite hands the done status 5 s into the scan throttle window;
+  the park is watched from that moment and report_lag at applied + LAG_WARN_SECONDS + 1 warns
+  (lag_s=121). Under M5 the warning is delayed to a later scan and measured from it.
+
+Proof (scripts/run_tests.sh tests/hermes_cli/test_kanban_awaited_card_wake.py):
+- main + new tests: 27 passed, 0 failed, 0 skipped
+- M2 applied (single exact-string replacement): 1 failed (the new same-episode test), 26 passed
+- M5 applied: 1 failed (the new expedite test), 26 passed
+
+Card: t_01a1d63b4baaa813
+---
+ .../test_kanban_awaited_card_wake.py          | 67 +++++++++++++++++++
+ 1 file changed, 67 insertions(+)
+
+diff --git a/tests/hermes_cli/test_kanban_awaited_card_wake.py b/tests/hermes_cli/test_kanban_awaited_card_wake.py
+index bac5fa38a0..12ccaaaebf 100644
+--- a/tests/hermes_cli/test_kanban_awaited_card_wake.py
++++ b/tests/hermes_cli/test_kanban_awaited_card_wake.py
+@@ -483,6 +483,73 @@ def test_a_warned_park_that_re_parks_within_one_scan_window_on_a_finished_card_i
+     assert len(lags()) == 2
+ 
+ 
++def test_a_warned_park_whose_other_named_card_finishes_in_the_same_episode_is_warned_again(
++        live, svc, kanban_home, probes, caplog, monkeypatch):
++    """A park naming two cards (its probe's and its ``awaiting`` ref) is warned for the first to finish; when the
++    other, lower-sorted one finishes later without a re-park, the scan's awaited card changes inside the same
++    episode and is warned again (t_01a1d63b4baaa813, mutant M2: a mark compared by episode alone never re-arms)."""
++    from hermes_cli import kanban_awaiting as ka
++    caplog.set_level("WARNING", logger=acw.__name__)
++    assert UNRELATED < REVIEW  # the scan picks the lowest-sorted finished card a park names
++    monkeypatch.setitem(ka._REMOTE_CONFIRMED, (OTHER, UNRELATED), (time.monotonic(), f"{UNRELATED} running"))
++    _other(svc, UNRELATED, {"status": "running"})
++    owner, t0 = _setup(live, svc, kanban_home, probes, f"hermes kanban wait-check task {REVIEW} --until review",
++                       awaiting={"kind": "card", "ref": UNRELATED, "gateway": OTHER, "why": "second card"})
++    assert acw.named_cards(live, owner, f"hermes kanban wait-check task {REVIEW}") == {REVIEW, UNRELATED}
++    _other(svc, REVIEW, {"status": "done"})
++    ksc._pull_replica(BOARD, svc.hub(ME), ME, kanban_home / "kanban.db", diagnostic=True)
++
++    def lags():
++        return [r.getMessage() for r in caplog.records if "awaited_card_done_park_lag" in r.getMessage()]
++
++    scanned = t0 + acw._SCAN_SECONDS
++    assert acw.report_lag(live, now=scanned) == []
++    warned_at = scanned + acw.LAG_WARN_SECONDS + 1
++    assert acw.report_lag(live, now=warned_at) == [owner]
++    assert len(lags()) == 1 and f"task={owner} awaited={REVIEW} lag_s=" in lags()[-1]
++    episode = acw._episode(live, owner)
++    _other(svc, UNRELATED, {"status": "done"})  # the other named card finishes; the park does not re-park
++    ksc._pull_replica(BOARD, svc.hub(ME), ME, kanban_home / "kanban.db", diagnostic=True)
++    rescanned = warned_at + acw._SCAN_SECONDS
++    assert acw.report_lag(live, now=rescanned) == []  # the scan re-arms the park for the new awaited card
++    assert acw._episode(live, owner) == episode and _status(live, owner) == "scheduled"
++    assert acw.report_lag(live, now=rescanned + acw.LAG_WARN_SECONDS + 1) == [owner]  # M2: []
++    assert len(lags()) == 2 and f"task={owner} awaited={UNRELATED} lag_s=" in lags()[-1]
++    for later in range(2, 12):  # that awaited card across later scans: warned once
++        acw.report_lag(live, now=rescanned + acw.LAG_WARN_SECONDS + 60 * later)
++    assert len(lags()) == 2
++
++
++def test_a_warned_park_that_re_parks_is_re_armed_by_expedite_inside_the_scan_window(
++        live, svc, kanban_home, monkeypatch, caplog):
++    """The expedite path re-arms a warned park that re-parked (``_remember`` -> ``_rearm``), so its lag counts from
++    when expedite applied the status, not from the next replica scan (t_01a1d63b4baaa813, mutant M5; review
++    5895271396 follow-up nit 2 on #2470)."""
++    caplog.set_level("WARNING", logger=acw.__name__)
++    owner = _local_park(live, monkeypatch)
++    _other(svc, REVIEW, {"status": "done"})
++    ksc._pull_replica(BOARD, svc.hub(ME), ME, kanban_home / "kanban.db", diagnostic=True)
++
++    def lags():
++        return [r.getMessage() for r in caplog.records if "awaited_card_done_park_lag" in r.getMessage()]
++
++    s0 = time.time()
++    assert acw.report_lag(live, now=s0) == []  # the replica scan records it
++    warned_at = s0 + acw.LAG_WARN_SECONDS + 1  # this call also scans: the throttle window starts here
++    assert acw.report_lag(live, now=warned_at) == [owner] and len(lags()) == 1
++    # The park wakes, runs and re-parks on the same (still done) card: a new episode.
++    with kb.write_txn(live):
++        live.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (owner,))
++    assert kb.claim_task(live, owner, claimer="worker") is not None
++    assert kb.schedule_task(live, owner, reason="SCHEDULED_UNTIL=2099-01-01T00:00:00Z still waiting",
++                            wake_check=f"hermes kanban wait-check task {REVIEW} --until review", check_every=EVERY)
++    applied = warned_at + 5  # inside the scan throttle: only expedite can re-arm it now
++    acw.expedite(live, {REVIEW: "done"}, now=applied)
++    assert acw._WATCH.get((acw._db_key(live), owner)) == (REVIEW, "done", applied)  # M5: not watched
++    assert acw.report_lag(live, now=applied + acw.LAG_WARN_SECONDS + 1) == [owner]  # M5: [] (seen at this scan)
++    assert len(lags()) == 2 and f"lag_s={acw.LAG_WARN_SECONDS + 1}" in lags()[-1]
++
++
+ def test_the_replica_read_is_throttled_and_skipped_without_a_replica(live, monkeypatch):
+     calls = []
+     monkeypatch.setattr(acw, "_replica_finished", lambda conn: calls.append(1) or None)
+-- 
+2.43.0
+

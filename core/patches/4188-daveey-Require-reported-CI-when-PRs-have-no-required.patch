@@ -1,0 +1,415 @@
+From a0d7b9615f1bfdc71fa4d87d149ad33a7c4d1a56 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 00:15:36 +0000
+Subject: [PATCH] [daveey] Require reported CI when PRs have no required checks
+
+Collect complete exact-head evidence before considering an absence waiver. Apply all-check fallback, preserve merge cutoff and required contexts, and refuse empty suites and malformed pages. Keep CLOSED and landing dispositions unchanged.
+
+Proof: initial regressions 12 failed/1 passed before fix; canonical consumer suites 589 passed, 1 skipped. Five fallback mutants killed; restored fallback suite green. Read-only replay rejects historical mods PR101/102 without rerunning CI. Local preliminary review caught empty-suite CI; added fail-closed coverage. Independent published-head review and required CI remain landing gates.
+---
+ hermes_cli/kanban_pr_acceptance.py            |  26 ++--
+ hermes_cli/kanban_pr_acceptance_store.py      |   4 +-
+ hermes_cli/kanban_pr_fallback.py              |  42 +++++
+ tests/hermes_cli/test_kanban_pr_acceptance.py |  14 +-
+ tests/hermes_cli/test_kanban_pr_fallback.py   | 147 ++++++++++++++++++
+ tests/hermes_cli/test_kanban_pr_landing.py    |   3 +-
+ tests/hermes_cli/test_kanban_pr_transport.py  |  12 +-
+ 7 files changed, 226 insertions(+), 22 deletions(-)
+ create mode 100644 hermes_cli/kanban_pr_fallback.py
+ create mode 100644 tests/hermes_cli/test_kanban_pr_fallback.py
+
+diff --git a/hermes_cli/kanban_pr_acceptance.py b/hermes_cli/kanban_pr_acceptance.py
+index 8d52600887..6b10449c3e 100644
+--- a/hermes_cli/kanban_pr_acceptance.py
++++ b/hermes_cli/kanban_pr_acceptance.py
+@@ -37,10 +37,10 @@ def validate_contract(value: str | None) -> str:
+ 
+ 
+ NO_REQUIRED_CHECKS_DETAIL = (
+-    "No repository-required checks are configured on {where}, so this PR contract can never pass CI "
+-    "acceptance. If the work is verified another way, retry completion with "
++    "No repository-required checks are configured on {where}. All reported exact-head checks must pass; "
++    "only when complete evidence is empty, and the work is verified another way, retry completion with "
+     "metadata.contract_waiver={{\"reason\": \"<how it was verified>\"}} (honoured only while the repo has "
+-    "no required checks; logged as a contract_waived event). Otherwise {repoint} Never edit "
++    "no required checks AND no reported CI; logged as a contract_waived event). Otherwise {repoint} Never edit "
+     "completion_contract in kanban.db.")
+ 
+ 
+@@ -237,13 +237,7 @@ def collect_acceptance(contract: str, published_pr: str | None,
+                     required.update((r["context"], r.get("integration_id"))
+                                     for r in rule["parameters"]["required_status_checks"])
+         receipt["required"] = [{"context": c, "app_id": a} for c, a in sorted(required, key=str)]
+-        if not required:
+-            # A contract that can never pass. Name the one supported way out: nothing can edit
+-            # completion_contract after creation, so "use local-only" sent workers to hand-edit
+-            # kanban.db (agent-650ad5206a). [daveey]
+-            receipt.update(classification="no_required_checks", detail=NO_REQUIRED_CHECKS_DETAIL.format(
+-                where=f"{repo}@{branch}", repoint=_REPOINT_HINT))
+-            return receipt
++
+         phase = "reading check runs"
+         # OPEN: GitHub's latest view (each suite's latest attempt), proven complete
+         # against every suite's latest_check_runs_count. MERGED: every run, cut at merge.
+@@ -251,15 +245,18 @@ def collect_acceptance(contract: str, published_pr: str | None,
+         run_filter = "all" if pr["state"] == "MERGED" else "latest"
+         pages = _api(f"repos/{repo}/commits/{sha}/check-runs?per_page=100&filter={run_filter}",
+                      paginate=True, profile_home=profile_home)
+-        if run_filter == "latest":
++        suites = []
++        if run_filter == "latest" or not required:
+             suites = _api(f"repos/{repo}/commits/{sha}/check-suites?per_page=100",
+                           paginate=True, profile_home=profile_home)
++        if run_filter == "latest":
+             runs = proven_latest_runs(pages, suites, sha)
+         else:
+             runs = complete_runs(pages)
+         phase = "reading commit statuses"
+-        statuses = [{**s, "sha": sha} for page in _api(f"repos/{repo}/commits/{sha}/statuses?per_page=100",
+-                                                       paginate=True, profile_home=profile_home) for s in page]
++        from hermes_cli.kanban_pr_fallback import complete_statuses, fallback_outcomes, mark_absence
++        statuses = complete_statuses(_api(f"repos/{repo}/commits/{sha}/statuses?per_page=100",
++                                          paginate=True, profile_home=profile_home), sha)
+         phase = "selecting merge-time evidence"
+         runs, statuses = merge_evidence(receipt, pr, repo, runs, statuses)
+         outcomes = []
+@@ -280,6 +277,8 @@ def collect_acceptance(contract: str, published_pr: str | None,
+                 evidence = check_receipt(check, sha)
+                 outcomes.append(evidence["classification"])
+                 receipt["checks"].append(evidence)
++        outcomes = fallback_outcomes(receipt, required, outcomes, runs, statuses, suites,
++                                     merged=pr["state"] == "MERGED")
+         # Re-read after all pages: old-head successes are never transferable.
+         phase = "re-reading the PR head"
+         current = _api(f"repos/{repo}/pulls/{number}", profile_home=profile_home)
+@@ -294,6 +293,7 @@ def collect_acceptance(contract: str, published_pr: str | None,
+         receipt["pr_state"] = "MERGED" if current.get("merged") else current["state"].upper()
+         receipt["classification"] = next((x for x in outcomes if x != "success"), "missing" if not outcomes else "success")
+         receipt["ok"] = receipt["classification"] == "success"
++        mark_absence(receipt, required, outcomes, suites, f"{repo}@{branch}")
+         return receipt
+     except _GateSetupError as exc:
+         receipt.update(classification="setup", detail=str(exc))
+diff --git a/hermes_cli/kanban_pr_acceptance_store.py b/hermes_cli/kanban_pr_acceptance_store.py
+index ec3d7a6449..1689b81342 100644
+--- a/hermes_cli/kanban_pr_acceptance_store.py
++++ b/hermes_cli/kanban_pr_acceptance_store.py
+@@ -67,8 +67,8 @@ def prepare_acceptance(conn, task_id, expected_run_id, metadata):
+     annotate_main_health_owner(conn, receipt)
+     reason = _kpa.waiver_reason(metadata)
+     if reason and receipt.get("classification") == "no_required_checks":
+-        # The only waivable classification, judged on THIS fresh read: a repo that gained
+-        # required checks (or a failing/missing/pending check) is never waived. [daveey]
++        # The collector proves no required contexts AND no reported CI on THIS
++        # fresh read. Failed, pending, missing and unreadable evidence is never waived.
+         receipt["waived"] = {"reason": reason}
+     from hermes_cli.kanban_pr_landing import check_landing
+     check_landing(conn, task_id, receipt, metadata)
+diff --git a/hermes_cli/kanban_pr_fallback.py b/hermes_cli/kanban_pr_fallback.py
+new file mode 100644
+index 0000000000..edb1369e30
+--- /dev/null
++++ b/hermes_cli/kanban_pr_fallback.py
+@@ -0,0 +1,42 @@
++"""All-check acceptance when a repository configures no required contexts."""
++from hermes_cli.kanban_pr_check_runs import _complete
++from hermes_cli.kanban_pr_merge_time import check_receipt
++
++
++def complete_statuses(pages, sha):
++    """gh --paginate --slurp must return pages, including one empty page for none."""
++    if not isinstance(pages, list) or not pages or any(not isinstance(p, list) for p in pages):
++        raise ValueError("Missing or malformed commit-status pages")
++    return [{**status, "sha": sha} for page in pages for status in page]
++
++
++def fallback_outcomes(receipt, required, outcomes, runs, statuses, suites, *, merged):
++    """Keep required semantics, otherwise require every current producer's success."""
++    if required:
++        return outcomes
++    suite_rows = _complete(suites, "check_suites", "check-suite")
++    sha = receipt["head_sha"]
++    latest = {}
++    for status in sorted(statuses, key=lambda s: s["id"]):
++        latest[(status["context"], (status.get("creator") or {}).get("id"))] = status
++    receipt["checks"] = [check_receipt(c, sha) for c in runs + list(latest.values())]
++    if not merged:
++        for suite in suite_rows:
++            # An empty latest attempt can be queued CI, not absence, even if
++            # other producers already succeeded. Required-context logic is separate.
++            if suite["latest_check_runs_count"] == 0:
++                receipt["checks"].append({"name": f"check suite {suite['id']}",
++                    "classification": "missing", "head_sha": sha})
++    return [c["classification"] for c in receipt["checks"]]
++
++
++def mark_absence(receipt, required, outcomes, suites, where):
++    """Waive only proven absence, never missing/pending or post-merge-only CI."""
++    from hermes_cli.kanban_pr_acceptance import NO_REQUIRED_CHECKS_DETAIL, _REPOINT_HINT
++
++    if required or outcomes or receipt["post_merge_checks"]:
++        return
++    if _complete(suites, "check_suites", "check-suite"):
++        return
++    receipt.update(classification="no_required_checks", detail=NO_REQUIRED_CHECKS_DETAIL.format(
++        where=where, repoint=_REPOINT_HINT))
+diff --git a/tests/hermes_cli/test_kanban_pr_acceptance.py b/tests/hermes_cli/test_kanban_pr_acceptance.py
+index 7874b250a8..f746096674 100644
+--- a/tests/hermes_cli/test_kanban_pr_acceptance.py
++++ b/tests/hermes_cli/test_kanban_pr_acceptance.py
+@@ -59,6 +59,10 @@ def github(tmp_path, monkeypatch):
+             else:
+                 self.send_error(404)
+                 return
++            if state.get("no_ci") and "/check-runs" in self.path:
++                value = [{"total_count": 0, "check_runs": []}]
++            if state.get("no_ci") and "/check-suites" in self.path:
++                value = [{"total_count": 0, "check_suites": []}]
+             self.send_response(200)
+             self.end_headers()
+             self.wfile.write(json.dumps(value).encode())
+@@ -292,7 +296,7 @@ def test_assigned_card_with_unresolvable_profile_is_auth_not_ambient(tmp_path, m
+ # --- contract waiver: an OWNER/REPO contract on a repo with NO required checks (agent-650ad5206a) ---
+ # Such a contract could never pass acceptance and nothing could change it after creation, so workers
+ # stalled and then rewrote completion_contract in kanban.db by hand. The supported way out is
+-# metadata.contract_waiver, honoured only when a fresh read shows zero required checks.
++# metadata.contract_waiver, honoured only when a fresh read shows no required or reported CI.
+ 
+ _PR7 = "https://github.com/acme/repo/pull/7"
+ _WAIVER = {"reason": "repo has no CI; tests ran locally"}
+@@ -307,7 +311,7 @@ def _events(conn, tid, kind):
+ def test_no_required_checks_names_the_waiver_and_waiver_completes(github):
+     from hermes_cli.kanban_origin_ledger import observe_owner_task
+ 
+-    github["no_required"] = True
++    github.update(no_required=True, no_ci=True)
+     with connect() as conn:
+         tid = kb.create_task(conn, title="Publish", completion_contract="acme/repo")
+         assert not kb.complete_task(conn, tid, result="done", metadata={"published_pr": _PR7})
+@@ -354,7 +358,7 @@ def test_waiver_never_bypasses_configured_required_checks(github):
+ def test_waiver_via_kanban_complete_tool(github, monkeypatch):
+     from tools import kanban_tools as kt
+ 
+-    github["no_required"] = True
++    github.update(no_required=True, no_ci=True)
+     with connect() as conn:
+         tid = kb.create_task(conn, title="Publish", completion_contract="acme/repo")
+         run_id = kb.claim_task(conn, tid).current_run_id
+@@ -374,7 +378,7 @@ def test_waiver_via_kanban_complete_tool(github, monkeypatch):
+ def test_waiver_via_cli_complete(github):
+     from hermes_cli import kanban as kc
+ 
+-    github["no_required"] = True
++    github.update(no_required=True, no_ci=True)
+     with connect() as conn:
+         tid = kb.create_task(conn, title="Publish", completion_contract="acme/repo")
+     meta = json.dumps({"published_pr": _PR7})
+@@ -393,7 +397,7 @@ def test_create_warns_when_contract_repo_has_no_required_checks(github, monkeypa
+     from tools import kanban_tools as kt
+ 
+     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+-    github["no_required"] = True
++    github.update(no_required=True, no_ci=True)
+     out = json.loads(kt._handle_create({"title": "pr work", "assignee": "default", "requires": [],
+                                         "completion_contract": "acme/repo"}))
+     assert out["ok"] is True and "contract_waiver" in out.get("contract_warning", "")
+diff --git a/tests/hermes_cli/test_kanban_pr_fallback.py b/tests/hermes_cli/test_kanban_pr_fallback.py
+new file mode 100644
+index 0000000000..3740746dfc
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_pr_fallback.py
+@@ -0,0 +1,147 @@
++"""No-required policy must inspect CI before offering an absence waiver."""
++import pytest
++
++from hermes_cli import kanban_pr_acceptance as gate
++
++SHA = "a" * 40
++URL = "https://github.com/acme/repo/pull/7"
++
++
++@pytest.fixture
++def evidence(monkeypatch):
++    state = {"runs": [], "statuses": [], "merged": False}
++
++    def api(endpoint, **kwargs):
++        if endpoint == "graphql":
++            return {"data": {"repository": {"pullRequest": {
++                "headRefOid": SHA, "baseRefName": "main",
++                "state": "MERGED" if state["merged"] else "OPEN",
++                "mergedAt": "2026-11-02T13:00:00Z",
++                "baseRef": {"branchProtectionRule": None}}}}}
++        if "/rules/" in endpoint:
++            return [[]]
++        if state.get("unreadable"):
++            raise ValueError("unreadable evidence")
++        if "/check-runs?" in endpoint:
++            return [{"total_count": len(state["runs"]) + state.get("missing", 0),
++                     "check_runs": state["runs"]}]
++        if "/check-suites?" in endpoint:
++            if state.get("missing_suites"):
++                return [{"total_count": 1, "check_suites": []}]
++            if not state["runs"] and not state.get("empty_suite"):
++                return [{"total_count": 0, "check_suites": []}]
++            return [{"total_count": 1, "check_suites": [{"id": 7, "app": {"id": 1},
++                     "head_sha": SHA, "latest_check_runs_count": len(state["runs"])}]}]
++        if "/statuses?" in endpoint:
++            return state.get("status_pages", [state["statuses"]])
++        if "/pulls/" in endpoint:
++            return {"head": {"sha": SHA}, "base": {"ref": "main"},
++                    "state": "closed" if state["merged"] else "open", "merged": state["merged"]}
++        raise AssertionError(endpoint)
++
++    monkeypatch.setattr(gate, "_api", api)
++    return state
++
++
++def run(outcome, *, id=1, started="2026-11-02T12:00:00Z"):
++    return {"id": id, "name": "ci", "head_sha": SHA, "app": {"id": 1},
++            "check_suite": {"id": 7}, "started_at": started,
++            "completed_at": started, "status": "in_progress" if outcome == "pending" else "completed",
++            "conclusion": outcome}
++
++
++@pytest.mark.parametrize("outcome,expected", [("failure", "failure"), ("pending", "pending"),
++                                             ("cancelled", "infra"), ("success", "success")])
++@pytest.mark.parametrize("merged", [False, True])
++def test_fallback_run_outcomes(evidence, outcome, expected, merged):
++    evidence.update(runs=[run(outcome)], merged=merged)
++    receipt = gate.collect_acceptance(URL, None)
++    assert receipt["classification"] == expected
++    assert receipt["ok"] is (expected == "success")
++    assert receipt["checks"][0]["id"] == 1
++
++
++@pytest.mark.parametrize("fault", ["unreadable", "missing", "missing_suites"])
++def test_fallback_incomplete_is_not_waivable(evidence, fault):
++    evidence[fault] = 1
++    assert gate.collect_acceptance(URL, None)["classification"] == "infra"
++
++
++@pytest.mark.parametrize("merged", [False, True])
++def test_fallback_empty_is_explicit_absence(evidence, merged):
++    evidence["merged"] = merged
++    receipt = gate.collect_acceptance(URL, None)
++    assert receipt["classification"] == "no_required_checks"
++    assert receipt["ok"] is False
++    assert receipt["checks"] == []
++
++
++@pytest.mark.parametrize("merged", [False, True])
++def test_fallback_empty_suite_is_not_absence(evidence, merged):
++    evidence.update(merged=merged, empty_suite=True)
++    receipt = gate.collect_acceptance(URL, None)
++    assert receipt["classification"] == "missing"
++    assert receipt["ok"] is False
++
++
++@pytest.mark.parametrize("pages", [[], {}, [None], [{}]])
++def test_fallback_status_pages_must_be_present(evidence, pages):
++    evidence["status_pages"] = pages
++    assert gate.collect_acceptance(URL, None)["classification"] == "infra"
++
++
++def test_empty_suite_cannot_hide_behind_successful_status(evidence):
++    evidence.update(empty_suite=True, statuses=[{"id": 1, "context": "ci", "state": "success"}])
++    assert gate.collect_acceptance(URL, None)["classification"] == "missing"
++
++
++def test_post_merge_evidence_is_not_absence_after_suite_disappears():
++    from hermes_cli.kanban_pr_fallback import mark_absence
++
++    receipt = {"classification": "missing", "post_merge_checks": [{"classification": "success"}]}
++    mark_absence(receipt, set(), [], [{"total_count": 0, "check_suites": []}], "acme/repo@main")
++    assert receipt["classification"] == "missing"
++
++
++def test_fallback_merge_cutoff(evidence):
++    evidence.update(merged=True, runs=[run("failure"), run("success", id=2, started="2026-11-02T14:00:00Z")])
++    receipt = gate.collect_acceptance(URL, None)
++    assert receipt["classification"] == "failure"
++    assert receipt["post_merge_checks"][0]["classification"] == "success"
++    evidence["runs"] = evidence["runs"][1:]
++    assert gate.collect_acceptance(URL, None)["classification"] == "missing"
++
++
++@pytest.mark.parametrize("outcome,expected", [("failure", "failure"), ("pending", "pending"),
++                                             ("cancelled", "infra"), ("success", "success")])
++def test_waiver_cannot_hide_fallback_ci(evidence, tmp_path, monkeypatch, outcome, expected):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_db_connect import connect
++    import json
++
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
++    kb.init_db()
++    evidence.update(merged=True, runs=[run(outcome)])
++    with connect() as conn:
++        tid = kb.create_task(conn, title="Publish", completion_contract=URL)
++        ok = kb.complete_task(conn, tid, summary="verified", metadata={
++            "contract_waiver": {"reason": "local tests passed"}})
++        assert ok is (expected == "success")
++        receipt = json.loads(conn.execute(
++            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)
++        ).fetchone()[0])
++        assert receipt["classification"] == expected
++        assert (kb.get_task(conn, tid).status == "done") is ok
++        assert not conn.execute(
++            "SELECT 1 FROM task_events WHERE task_id=? AND kind='contract_waived'", (tid,)
++        ).fetchone()
++
++
++def test_fallback_statuses_keep_producers_distinct(evidence):
++    evidence["statuses"] = [
++        {"id": 1, "context": "ci", "state": "failure", "creator": {"id": 1}},
++        {"id": 2, "context": "ci", "state": "success", "creator": {"id": 2}},
++    ]
++    assert gate.collect_acceptance(URL, None)["classification"] == "failure"
++    evidence["statuses"].append({"id": 3, "context": "ci", "state": "success", "creator": {"id": 1}})
++    assert gate.collect_acceptance(URL, None)["classification"] == "success"
+diff --git a/tests/hermes_cli/test_kanban_pr_landing.py b/tests/hermes_cli/test_kanban_pr_landing.py
+index 5e393c84d5..2e536f4f37 100644
+--- a/tests/hermes_cli/test_kanban_pr_landing.py
++++ b/tests/hermes_cli/test_kanban_pr_landing.py
+@@ -126,7 +126,7 @@ def test_no_landing_bypasses(github, monkeypatch, surface, mode):
+     github["pr_state"] = "OPEN"
+     metadata = {"published_pr": PR}
+     if mode == "waiver":
+-        github["no_required"] = True
++        github.update(no_required=True, no_ci=True)
+         metadata["contract_waiver"] = {"reason": "Local tests green"}
+     if mode == "blank_reason":
+         metadata["pr_left_open"] = {"reason": " "}
+@@ -156,6 +156,7 @@ def test_left_open_exception_preserves_ci_gate(github, monkeypatch, surface, fau
+         github[fault] = True
+     metadata = {"pr_left_open": {"reason": "Intentional draft"}}
+     if fault == "no_required":
++        github["no_ci"] = True
+         metadata["contract_waiver"] = {"reason": "Local tests passed; no repo checks configured"}
+     with connect() as conn:
+         tid = kb.create_task(conn, title="CI still applies", completion_contract=PR)
+diff --git a/tests/hermes_cli/test_kanban_pr_transport.py b/tests/hermes_cli/test_kanban_pr_transport.py
+index 817182f62b..75ffd7792f 100644
+--- a/tests/hermes_cli/test_kanban_pr_transport.py
++++ b/tests/hermes_cli/test_kanban_pr_transport.py
+@@ -125,7 +125,17 @@ def test_no_required_checks_names_the_repoint_path(monkeypatch):
+     pr = {"data": {"repository": {"pullRequest": {
+         "headRefOid": "a" * 40, "baseRefName": "feature/stack", "state": "OPEN",
+         "baseRef": {"branchProtectionRule": None}}}}}
+-    monkeypatch.setattr(gate, "_api", lambda endpoint, **kw: pr if endpoint == "graphql" else [[]])
++    def api(endpoint, **kwargs):
++        if endpoint == "graphql":
++            return pr
++        if "/check-runs?" in endpoint:
++            return [{"total_count": 0, "check_runs": []}]
++        if "/check-suites?" in endpoint:
++            return [{"total_count": 0, "check_suites": []}]
++        if "/pulls/" in endpoint:
++            return {"head": {"sha": "a" * 40}, "base": {"ref": "feature/stack"}, "state": "open"}
++        return [[]]
++    monkeypatch.setattr(gate, "_api", api)
+     receipt = gate.collect_acceptance("https://github.com/acme/repo/pull/7", None)
+     # Its own classification (the only waivable one), naming the worker's waiver AND the re-point.
+     assert receipt["ok"] is False and receipt["classification"] == "no_required_checks"
+-- 
+2.43.0
+

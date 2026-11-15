@@ -1,0 +1,129 @@
+From eb641f4d19278f50249eaab87e2fff1535ee0497 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 22:04:23 +0000
+Subject: [PATCH] [daveey] TUI pause reader tests: pin the freshness boundary,
+ unreadable config, negative window floor and unparseable max_attempts
+
+Post-merge mutation check t_01a1d6a623306970 of #2598 found four mutants that
+survived in hermes_cli/turn_session_activity.py (`_update_paused_tui_turns`,
+`_auto_continue_bounds`) and tui_gateway/turn_marker.auto_continue_bounds.
+This change only adds tests. Each new test kills its mutant:
+
+- A4 `now - since <= fresh_s` -> `<`: killed by
+  test_tui_pause_exactly_at_the_freshness_window_counts. It pins `now` and puts the
+  marker exactly 900 s old. The producer continues a pause at age == window, so
+  the reader must count it too.
+- A7 `except Exception: cfg = {}` -> `raise`: killed by
+  test_unreadable_home_config_falls_open_to_default_bounds, where the loader raises
+  PermissionError. A garbage or undecodable config.yaml never reaches this branch:
+  load_profile_config_effective recovers to defaults on its own.
+  test_garbage_home_config_falls_open_to_default_bounds pins that path separately.
+- A10 `max(0.0, minutes) * 60.0` -> `minutes * 60.0`: killed by
+  test_tui_pause_with_negative_freshness_floors_the_window_at_zero (with
+  `freshness_minutes: -5`, a pause of age 0 still counts) and by the extended
+  test_producer_and_reader_parse_auto_continue_bounds_alike.
+- A12 max_attempts `except: attempts = DEFAULT` -> `raise`: killed by
+  test_tui_pause_with_unparseable_max_attempts_uses_the_default_cap (reader), by
+  test_unparseable_max_attempts_keeps_the_default_cap in
+  tests/tui_gateway/test_auto_continue.py (producer: `max_attempts: "abc"` still
+  schedules attempt 1), and by the extended parse test.
+
+Mutation run: each mutant applied in turn against
+test_turn_session_activity.py, test_auto_continue.py, test_update_pause_recovery.py,
+test_refused_turn_retry.py, test_retirement_continuations.py and
+test_tui_completion_obligation.py. Result: 4/4 KILLED. Unmutated, all 142 tests
+in those files pass.
+---
+ .../hermes_cli/test_turn_session_activity.py  | 56 +++++++++++++++++++
+ tests/tui_gateway/test_auto_continue.py       | 11 ++++
+ 2 files changed, 67 insertions(+)
+
+diff --git a/tests/hermes_cli/test_turn_session_activity.py b/tests/hermes_cli/test_turn_session_activity.py
+index ec7454a87c..d616aaad43 100644
+--- a/tests/hermes_cli/test_turn_session_activity.py
++++ b/tests/hermes_cli/test_turn_session_activity.py
+@@ -283,3 +283,59 @@ def test_producer_and_reader_parse_auto_continue_bounds_alike():
+         "enabled": "off", "freshness_minutes": "5", "max_attempts": -1}}}) == (False, 300.0, 2)
+     assert auto_continue_bounds({"desktop": {"auto_continue": {"freshness_minutes": "x", "max_attempts": 0}}}) \
+         == (True, 900.0, 0)
++    # Unparseable max_attempts falls back to the default; a negative window floors at 0 (never negative).
++    assert auto_continue_bounds({"desktop": {"auto_continue": {"max_attempts": "abc"}}}) == (True, 900.0, 2)
++    assert auto_continue_bounds({"desktop": {"auto_continue": {"freshness_minutes": -5}}}) == (True, 0.0, 2)
++
++
++_PINNED_NOW = 1_800_000_000.0  # integral, so now - (now - 900.0) is exactly 900.0
++
++
++def test_tui_pause_exactly_at_the_freshness_window_counts(home):
++    """The producer continues a pause whose age equals the window (it drops only ``age > window``), so the
++    reader must count it too, or the row reads idle while its turn is about to resume."""
++    _marker(home, "tui_chat", reason="core_update_pause", auto_continue=True, attempts=0,
++            started_at=_PINNED_NOW - 7200, paused_at=_PINNED_NOW - 900.0)
++    assert tsa._update_paused_tui_turns(home, _PINNED_NOW) == {"tui_chat"}
++    assert tsa._update_paused_tui_turns(home, _PINNED_NOW + 0.5) == set()  # just past it: stale
++
++
++def test_tui_pause_with_negative_freshness_floors_the_window_at_zero(home):
++    """``freshness_minutes: -5`` floors at a zero window: a pause of age 0 still counts (as the producer
++    continues it); without the floor the window is -300 s and nothing ever counts."""
++    _auto_continue_config(home, freshness_minutes=-5)
++    _marker(home, "tui_chat", reason="core_update_pause", auto_continue=True, attempts=0,
++            started_at=_PINNED_NOW - 7200, paused_at=_PINNED_NOW)
++    assert tsa._update_paused_tui_turns(home, _PINNED_NOW) == {"tui_chat"}
++    assert tsa._update_paused_tui_turns(home, _PINNED_NOW + 1) == set()
++
++
++def test_tui_pause_with_unparseable_max_attempts_uses_the_default_cap(home):
++    """``max_attempts: "abc"`` parses as the default cap (2), as the producer parses it: attempt 1 counts,
++    attempt 2 is exhausted. The reader must not raise on it."""
++    _auto_continue_config(home, max_attempts="abc")
++    for attempts, expected in ((1, {"tui_chat"}), (2, set())):
++        _marker(home, "tui_chat", reason="core_update_pause", auto_continue=True, attempts=attempts,
++                started_at=_PINNED_NOW - 7200, paused_at=_PINNED_NOW - 60)
++        assert tsa._update_paused_tui_turns(home, _PINNED_NOW) == expected
++
++
++def test_garbage_home_config_falls_open_to_default_bounds(home):
++    """A torn/invalid home config.yaml reads as the defaults (enabled, 15 min, 2 attempts), never raises."""
++    (home / "config.yaml").write_bytes(b"\xff\xfe desktop: [unclosed\n  - : :")
++    assert tsa._auto_continue_bounds(home) == (True, 900.0, 2)
++
++
++def test_unreadable_home_config_falls_open_to_default_bounds(home, monkeypatch):
++    """When loading the home's config raises (unreadable file, loader bug), the reader falls open to the
++    defaults like the producer's ``_load_cfg``, so a fresh pause still counts instead of the sweep raising."""
++    from hermes_cli import config_effective
++
++    def _unreadable(path, **_kw):
++        raise PermissionError(13, "Permission denied", str(path))
++
++    monkeypatch.setattr(config_effective, "load_profile_config_effective", _unreadable)
++    assert tsa._auto_continue_bounds(home) == (True, 900.0, 2)
++    _marker(home, "tui_chat", reason="core_update_pause", auto_continue=True, attempts=0,
++            started_at=_PINNED_NOW - 7200, paused_at=_PINNED_NOW - 60)
++    assert tsa._update_paused_tui_turns(home, _PINNED_NOW) == {"tui_chat"}
+diff --git a/tests/tui_gateway/test_auto_continue.py b/tests/tui_gateway/test_auto_continue.py
+index e84dc7eaba..146d1918cd 100644
+--- a/tests/tui_gateway/test_auto_continue.py
++++ b/tests/tui_gateway/test_auto_continue.py
+@@ -500,6 +500,17 @@ def test_disabled_by_config(schedule_env, marker_home, monkeypatch):
+     assert not schedule_env
+ 
+ 
++def test_unparseable_max_attempts_keeps_the_default_cap(schedule_env, marker_home, monkeypatch):
++    """``max_attempts: "abc"`` parses as the default cap (2), the same parse the sidebar reader uses
++    (``auto_continue_bounds``): attempt 1 still continues instead of the config raising."""
++    monkeypatch.setattr(server, "_load_cfg", lambda: {"desktop": {"auto_continue": {"max_attempts": "abc"}}})
++    assert server._auto_continue_config() == (True, 900.0, 2)
++    record_turn_start(marker_home, "session-key", "prompt", attempts=1)
++
++    assert server._maybe_schedule_auto_continue("sid", _session(), "session-key") is not None
++    assert len(schedule_env) == 1
++
++
+ def test_no_marker_means_no_continuation(schedule_env, marker_home):
+     assert server._maybe_schedule_auto_continue("sid", _session(), "session-key") is None
+     assert not schedule_env
+-- 
+2.43.0
+

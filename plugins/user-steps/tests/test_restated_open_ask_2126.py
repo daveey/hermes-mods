@@ -1,0 +1,569 @@
+"""A reply restating an open ask (MacBook chat ..bef6c6, sanitized): one open For-you request, then a reply whose
+fourth status bullet restated that question, and a later section that quoted another card's ask line and said
+"Reply here." Live, the reply minted a second request with no pre-send hold, the new request's scope was the
+header plus all four bullets, and "Reply here." was booked as a restatement of an unrelated card.
+
+Decided behavior:
+(a) While the chat has an open request, a final reply that yields an ask nothing maps is held once by the
+    pre-send gate, in a fresh, resumed or Kanban-notice turn. The gate and the transform read one extraction, so
+    a tile is never minted beside an open one unless the gate held first; a re-sent reply follows the old rules.
+(b) A minted request's scope and the step's paragraph are the text frame() put in the directive's ``t``.
+(c) A sentence restates card X's ask only when its paragraph names X or quotes X's ask line (or its section
+    quotes X's ask line); text in a section quoting another card's ask line is never booked to X.
+Every placeholder (card ids, PR numbers, URLs, names) is invented. Stores and ledgers live under tmp_path.
+"""
+import importlib.util
+import json
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[1]
+OWNER = {'gatewayId': 'test-gateway', 'profile': 'default', 'storedSessionId': 'session-a'}
+
+OPEN_ASK = ("Reply A or B here. If you don't, the card stays blocked and nothing ships. The half-built change "
+            "stays saved on worker-9.")
+OPEN_STEP = {'text': "Reply A or B to the stalled card's proof choice (live window vs. old replay)", 'kind': 'choose',
+             'verbatim_span': "Reply A or B here. If you don't, the card stays blocked and nothing ships.",
+             'options': ['A: live window', 'B: old replay']}
+
+PAD = ("The review approved the exact version of the change, the required checks went green after one rerun of "
+       "an unrelated flaky test whose fix is already on main, and the owning card is landing it now; nothing here "
+       "needs the user. ")
+RESTATED = "One answer, in either place, covers both."
+SAME_Q = "it's the same question I asked at 8:45."
+BULLET4 = (f"- **Stalled-card proof question:** {SAME_Q} The other chat that owns that card asked you too, with one "
+           f"added condition. {RESTATED}")
+UPDATES = ("**The four updates:**\n"
+           f"- **PR-1 (example inventory):** {PAD}https://example.invalid/runs/1\n"
+           f"- **#1001 (example quota clear):** {PAD}https://example.invalid/runs/2\n"
+           f"- **#1002 (example command guard):** {PAD}https://example.invalid/runs/3\n"
+           f"{BULLET4}")
+QUOTED_ASK = ("Choose whether to accept the bounded investigation and waive the old replay, keeping live proof "
+              "required. Unblock = resume under your selected acceptance; archive = stop without claiming it passed.")
+REPLY = ("The quota fix is installed on the hub and most workers, and it works live.\n\n"
+         f"{UPDATES}\n\n"
+         "**One decision for you: how to prove the landing fix works**\n"
+         "Two of its acceptance checks need history that was never recorded.\n\n"
+         f"> {QUOTED_ASK}\n\n"
+         "Reply here. My pick: accept the investigation, waive the replay, keep live proof.\n")
+LOCAL_CARD = 't_0e0e0e0e'  # a blocked local card the reply never names
+LOCAL_ASK = ("Reply here with yes to submit the example app build to the store review queue, or keep it local. "
+             "Unblock = submit; archive = keep it local.")  # shares "reply", "here", "keep" with "Reply here. ..."
+
+
+def load_module(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+core = load_module('restated_open_ask_core', ROOT / 'core.py')
+
+
+def card_entry(tid=LOCAL_CARD, action=LOCAL_ASK, title='Example app store submission'):
+    return {'id': f'kanban:default:{tid}', 'kind': core.KANBAN_ASK, 'text': action, 'board': 'default',
+            'task_id': tid, 'labels': [], 'title': title}
+
+
+def payload(steps=(), repeats=()):
+    return json.dumps({'steps': list(steps), 'resolved': [], 'repeats': list(repeats)})
+
+
+def new_step():
+    return {'text': "Pick A or B for the stalled card's proof choice (live window vs. old replay)", 'kind': 'choose',
+            'verbatim_span': RESTATED, 'options': ['Use live proof', 'Keep the old replay']}
+
+
+def repeat_of(open_ids, span=SAME_Q):
+    # The extractor names the open ask by whichever id the prompt listed it under (ledger step or request id);
+    # extract() keeps only listed ids.
+    return [{'id': i, 'verbatim_span': span} for i in open_ids]
+
+
+# ---- (b) scope = the directive's text ---------------------------------------------------------------------
+
+def env(tmp_path):
+    return core.ActionStore(tmp_path / 'actions.sqlite3'), core.Ledger(tmp_path / 'ledger', tmp_path / 'missing.db')
+
+
+def open_first_ask(store, ledger):
+    out = core.process_reply(OPEN_ASK, 'session-a', ledger=ledger, action_store=store, action_owner=OWNER,
+                             llm=lambda s, u: payload([OPEN_STEP]))
+    (step,) = out['steps']
+    return step
+
+
+def decode_t(framed):
+    import re
+    m = re.search(r'::user-step\{id="([^"]+)" s="[^"]*" t="((?:[^"\\]|\\.)*)"\}', framed)
+    return m.group(1).split(','), core.dec(m.group(2))
+
+
+def test_fixture_block_is_over_the_attr_budget():
+    block = core.locate(REPLY, RESTATED)
+    assert block['text'] == UPDATES and len(core.enc(UPDATES)) > core.ATTR_BUDGET
+
+
+def test_minted_scope_is_the_framed_line_never_the_whole_list(tmp_path):
+    store, ledger = env(tmp_path)
+    first = open_first_ask(store, ledger)
+    out = core.process_reply(REPLY, 'session-a', ledger=ledger, action_store=store, action_owner=OWNER,
+                             llm=lambda s, u: payload([new_step()], repeat_of([first['id'], first['requestId']])))
+    minted = [s for s in out['steps'] if s['id'] != first['id']]
+    assert len(minted) == 1  # no gate in this path: the transform alone still mints the step
+    ids, t = decode_t(out['text'])
+    assert set(ids) == {minted[0]['id'], first['id']}  # one directive groups the new step and the open tile
+    assert t == BULLET4
+    assert minted[0]['paragraph'] == t
+    request = store.get(OWNER, minted[0]['requestId'])
+    assert request['scope']['markdown'] == t
+    for unrelated in ('PR-1', '#1001', '#1002', 'The four updates'):
+        assert unrelated not in request['scope']['markdown']
+
+
+def test_paragraph_under_the_budget_is_still_the_whole_paragraph(tmp_path):
+    store, ledger = env(tmp_path)
+    text = "**Next:**\n- The deploy is done.\n- Want me to restart the example service now?"
+    out = core.process_reply(text, 'session-a', ledger=ledger, action_store=store, action_owner=OWNER,
+                             llm=lambda s, u: payload([{'text': 'Approve restarting the example service',
+                                                        'kind': 'approve', 'options': [],
+                                                        'verbatim_span': 'Want me to restart the example service now?'}]))
+    (step,) = out['steps']
+    _, t = decode_t(out['text'])
+    assert t == step['paragraph'] == text
+
+
+def test_framed_text_matches_frame_for_a_grouped_directive():
+    # The mint decides its text before the block's id group is final; reserve makes it pick what frame() picks.
+    steps = [{'id': 'us_aaaaaaaaaa', 'verbatim_span': RESTATED}, {'id': 'us_bbbbbbbbbb', 'verbatim_span': SAME_Q}]
+    _, t = decode_t(core.frame(REPLY, steps, 'session-a'))
+    assert core.framed_text(REPLY, RESTATED, 'session-a', reserve=2) == t
+
+
+# ---- (c) card-ask booking needs a citation -----------------------------------------------------------------
+
+def test_reply_here_under_another_cards_quoted_ask_is_not_booked_to_an_unnamed_card(tmp_path):
+    store, ledger = env(tmp_path)
+    entry = card_entry()
+    out = core.process_reply(REPLY, 'session-a', ledger=ledger, action_store=store, action_owner=OWNER,
+                             card_asks=[entry], llm=lambda s, u: payload([], [{'id': entry['id'],
+                                                                              'verbatim_span': 'Reply here.'}]))
+    assert 'card_asks' not in out
+    assert ledger.read('session-a').get('card_asks', []) == []
+
+
+def test_a_step_in_a_section_quoting_another_cards_ask_is_never_that_unnamed_card(tmp_path):
+    entry = card_entry()
+    step = {'text': 'Reply here', 'kind': 'choose', 'verbatim_span': 'Reply here.', 'options': []}
+    assert core.card_ask_for(step, [entry], [{'id': entry['id'], 'verbatim_span': 'Reply here.'}], REPLY) is None
+    assert core.cited_cards('Reply here.', REPLY, [entry]) == []
+
+
+def test_quoting_or_naming_the_card_still_books_the_restatement(tmp_path):
+    entry = card_entry(tid='t_0a0a0a0a', action=QUOTED_ASK, title='Landing fix acceptance')
+    other = card_entry()
+    rep = [{'id': entry['id'], 'verbatim_span': 'Reply here.'}]
+    store, ledger = env(tmp_path)
+    out = core.process_reply(REPLY, 'session-a', ledger=ledger, action_store=store, action_owner=OWNER,
+                             card_asks=[other, entry], llm=lambda s, u: payload([], rep))
+    assert out.get('card_asks') == [entry['id']]
+    named = f"Card {LOCAL_CARD} still waits: approve the store submission there."
+    assert core.cited_cards(named, named, [other, entry]) == [other]  # naming the card cites it, and only it
+
+
+# Headingless close-outs answer several cards in plain paragraphs: a quote of one card's ask must not hide a
+# paraphrased relay of another card elsewhere in the reply (review of PR 194), while the reply right under the
+# quote ("Reply here.") still books to nothing else.
+KITCHEN = 't_0123456789abcdef'
+KITCHEN_ASK = ("Pick 'Turn it back on' or 'Keep it off' for the kitchen speaker microphone. It has been muted since "
+               "Tuesday after someone told it to stop listening. Unblock = the agent turns the microphone back on; "
+               "archive = it stays off.")
+PARAPHRASE = 'The kitchen speaker microphone is still muted: should the agent turn it back on, or keep it off?'
+PARA_STEP = {'text': 'Decide whether to turn the kitchen speaker microphone back on or keep it off', 'kind': 'input',
+             'verbatim_span': PARAPHRASE, 'options': []}
+
+
+def kitchen():
+    return card_entry(tid=KITCHEN, action=KITCHEN_ASK, title='Kitchen speaker microphone muted')
+
+
+def headingless(*middle):
+    return "\n\n".join(["Two cards still wait on you.", f"> {QUOTED_ASK}",
+                        "Reply here. My pick: accept the investigation, waive the replay, keep live proof.",
+                        *middle, PARAPHRASE])
+
+
+def test_headingless_quote_of_an_unlisted_card_does_not_hide_a_paraphrased_relay():
+    reply = headingless("Separately, the kitchen card from this morning:")
+    assert core.card_ask_for(PARA_STEP, [kitchen()], (), PARAPHRASE)['id'] == kitchen()['id']  # alone: maps
+    assert core.card_ask_for(PARA_STEP, [kitchen()], (), reply)['id'] == kitchen()['id']
+    assert core.cited_cards('Reply here.', reply, [kitchen(), card_entry()]) == []
+
+
+def test_headingless_quote_of_a_listed_card_does_not_hide_another_listed_cards_relay():
+    quoted = card_entry(tid='t_0a0a0a0a', action=QUOTED_ASK, title='Landing fix acceptance')
+    reply = headingless("Separately, the kitchen card from this morning:")
+    assert core.card_ask_for(PARA_STEP, [quoted, kitchen()], (), reply)['id'] == kitchen()['id']
+    assert core.cited_cards('Reply here.', reply, [quoted, kitchen(), card_entry()]) == [quoted]
+
+
+def test_headingless_reply_one_context_paragraph_below_a_quote_is_not_booked_to_an_unnamed_card():
+    # The ..bef6c6 shape with no heading: a context sentence sits between the quoted ask and "Reply here.".
+    reply = "\n\n".join(["Two cards still wait on you.", f"> {QUOTED_ASK}",
+                         "Two of its acceptance checks need history that was never recorded.",
+                         "Reply here. My pick: accept the investigation, waive the replay, keep live proof."])
+    entry = card_entry()
+    step = {'text': 'Reply here', 'kind': 'choose', 'verbatim_span': 'Reply here.', 'options': []}
+    assert core.card_ask_for(step, [entry], [{'id': entry['id'], 'verbatim_span': 'Reply here.'}], reply) is None
+    assert core.cited_cards('Reply here.', reply, [entry]) == []
+    quoted = card_entry(tid='t_0a0a0a0a', action=QUOTED_ASK, title='Landing fix acceptance')
+    assert core.cited_cards('Reply here.', reply, [entry, quoted]) == [quoted]
+
+
+@pytest.mark.parametrize('context, quoted_only', [
+    ('A little context.\n\n', True),
+    ('', False),
+], ids=['distant-non-ask-quote', 'adjacent-non-ask-quote-control'])
+def test_headingless_non_ask_quote_only_yields_to_an_earlier_ask_when_distant(context, quoted_only):
+    quoted = card_entry(tid='t_0a0a0a0a', action=QUOTED_ASK, title='Landing fix acceptance')
+    other = card_entry()
+    reply = f"> {QUOTED_ASK}\n\n> The checks passed.\n\n{context}Reply here."
+    # A distant status quote must not hide the earlier complete ask and admit the unrelated card.
+    # Right next to the reply, however, a non-ask quote intentionally retains the old broad scope.
+    expected = [quoted] if quoted_only else [quoted, other]
+    assert core.cited_cards('Reply here.', reply, [quoted, other]) == expected
+
+
+def test_headingless_quote_region_stops_at_a_paragraph_naming_another_card():
+    reply = "\n\n".join([f"> {QUOTED_ASK}", "Two of its acceptance checks need history that was never recorded.",
+                         f"Card {LOCAL_CARD} is separate.", "Reply here to submit it."])
+    assert core.cited_cards('Reply here to submit it.', reply, [card_entry()]) == [card_entry()]
+
+
+@pytest.mark.parametrize('middle, target, expected', [
+    ('Its acceptance checks need history.', 'Reply here.', 'quoted'),
+    (f'Card {LOCAL_CARD} is separate.', 'Reply here.', 'both'),
+    ('Its acceptance checks need history.', f'Card {LOCAL_CARD}: reply here.', 'own'),
+    (f'Card {LOCAL_CARD} is separate.', f'Card {LOCAL_CARD}: reply here.', 'own'),
+], ids=['listed-quote-context', 'listed-quote-other-card-boundary',
+        'own-paragraph-id', 'own-paragraph-id-after-boundary'])
+def test_headingless_listed_quote_respects_card_id_boundary_and_own_citation(middle, target, expected):
+    # Unlike the unlisted-quote fixture above, the quote can narrow to a listed card.
+    # Crossing an intervening card ID must not apply that narrowing to "Reply here.".
+    quoted = card_entry(tid='t_0a0a0a0a', action=QUOTED_ASK)
+    own = card_entry()
+    cards = [quoted, own]
+    reply = f"> {quoted['text']}\n\n{middle}\n\n{target}"
+    wanted = {'quoted': [quoted], 'both': cards, 'own': [own]}
+    assert core.cited_cards(target, reply, cards) == wanted[expected]
+
+
+def test_headingless_quote_region_stops_at_a_paragraph_restating_another_listed_cards_ask():
+    reply = "\n\n".join([f"> {QUOTED_ASK}", PARAPHRASE, "Reply here."])
+    assert core.cited_cards('Reply here.', reply, [kitchen(), card_entry()]) == [kitchen(), card_entry()]
+    # The quoted card's own restatement on the way up does not stop it.
+    quoted = card_entry(tid='t_0a0a0a0a', action=QUOTED_ASK, title='Landing fix acceptance')
+    reply = "\n\n".join([f"> {QUOTED_ASK}", "Accept the bounded investigation and waive the old replay, keeping "
+                         "live proof required.", "Reply here."])
+    assert core.cited_cards('Reply here.', reply, [quoted, card_entry()]) == [quoted]
+
+
+def test_headingless_reply_right_under_a_quote_still_names_its_card_by_id():
+    reply = f"> {QUOTED_ASK}\n\nAbout card {LOCAL_CARD} instead: reply here."
+    assert core.cited_cards('reply here.', reply, [card_entry(), kitchen()]) == [card_entry()]
+
+
+def test_headingless_explicit_id_excludes_a_different_listed_quote():
+    quoted = card_entry(tid='t_0a0a0a0a', action=QUOTED_ASK)
+    own = card_entry()
+    reply = f"> {QUOTED_ASK}\n\nAbout card {LOCAL_CARD} instead: reply here."
+    assert core.cited_cards('reply here.', reply, [quoted, own]) == [own]
+
+
+def test_headingless_previous_prose_is_not_a_quoted_citation():
+    # An action mentioned as prose above is not a citation for this separate paragraph.
+    other = card_entry(tid='t_0a0a0a0a', action=QUOTED_ASK)
+    reply = f"{QUOTED_ASK}\n\n{PARAPHRASE}"
+    assert core.cited_cards(PARAPHRASE, reply, [other, kitchen()]) == [other, kitchen()]
+    assert core.card_ask_for(PARA_STEP, [other, kitchen()], (), reply) == kitchen()
+    # A generic reply does not have the strong ask-word match that stops the current scan.
+    generic = f"{QUOTED_ASK}\n\nReply here."
+    assert core.cited_cards('Reply here.', generic, [other, card_entry()]) == [other, card_entry()]
+
+
+def test_headingless_first_paragraph_does_not_wrap_to_a_trailing_quote():
+    reply = f"{PARAPHRASE}\n\n> {QUOTED_ASK}"
+    assert core.cited_cards(PARAPHRASE, reply, [kitchen()]) == [kitchen()]
+    assert core.card_ask_for(PARA_STEP, [kitchen()], (), reply) == kitchen()
+
+
+def test_quote_only_span_has_no_prose_target_and_cannot_expand_a_section():
+    # A6 is caller-equivalent: locate never returns a quote as the own paragraph.
+    reply = f"> {QUOTED_ASK}\n\n> {PARAPHRASE}"
+    assert core.locate(reply, PARAPHRASE) is None
+    assert core._section(reply, PARAPHRASE) == ''
+    assert core.cited_cards(PARAPHRASE, reply, [kitchen()]) == [kitchen()]
+    mixed = reply + f"\n\n{PARAPHRASE}"
+    target = core.locate(mixed, PARAPHRASE)
+    assert target is not None and not target['quote'] and target['text'] == PARAPHRASE
+
+
+# ---- (a) the gate holds what the transform would mint -------------------------------------------------------
+
+FRESH = 'how are the four PRs doing?'
+RESUMED = ('[System note: Your previous turn was interrupted by an update restart. Continue the task from where '
+           'you left off.]')
+NOTICE = ('\u23f8 [hub:default] @default Kanban t_0a0a0a0a blocked \u2014 actor: agent (task t_0a0a0a0a)\n'
+          'Next action for the user: ' + QUOTED_ASK)
+
+
+@pytest.fixture
+def plugin(tmp_path, monkeypatch):
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    monkeypatch.delenv('HERMES_KANBAN_TASK', raising=False)
+    monkeypatch.delenv('HERMES_USER_STEPS_OFF', raising=False)
+    mod = load_module('restated_open_ask_plugin', ROOT / '__init__.py')
+    monkeypatch.setattr(mod.core, 'home', lambda: tmp_path)
+    monkeypatch.setattr(mod.core, 'server_owner', lambda sid: dict(OWNER, storedSessionId=sid))
+    monkeypatch.setattr(mod.core, 'kanban_asks', lambda *a, **k: [])
+    monkeypatch.setattr(mod, '_eligible', lambda *a, **k: True)
+    monkeypatch.setattr(mod, '_framed', lambda *a: True)
+    return mod
+
+
+def test_shared_extraction_hot_lookup_progresses_during_another_model_call(plugin, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError
+    from threading import Event
+
+    started, release = Event(), Event()
+
+    def model(system, user):
+        if user == 'slow':
+            started.set()
+            assert release.wait(5), 'fixture did not release the slow model'
+        return 'answer:' + user
+
+    monkeypatch.setattr(plugin, 'aux_llm', model)
+    assert plugin.shared_llm('system', 'hot') == 'answer:hot'
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        slow = pool.submit(plugin.shared_llm, 'system', 'slow')
+        try:
+            assert started.wait(5), 'slow model did not start'
+            hot = pool.submit(plugin.shared_llm, 'system', 'hot')
+            try:
+                assert hot.result(timeout=2) == 'answer:hot'
+            except TimeoutError:
+                pytest.fail('cached lookup stalled behind an unrelated model callback')
+        finally:
+            release.set()
+        assert slow.result(timeout=5) == 'answer:slow'
+
+
+def test_shared_extraction_serializes_iteration_against_another_writer(plugin, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event, Lock, current_thread
+
+    traversing, second_boundary = Event(), Event()
+    first_thread = []
+
+    class CoordinatedLock:
+        def __init__(self):
+            self.lock = Lock()
+
+        def __enter__(self):
+            # Tell the paused iterator the other caller has reached the cache boundary.
+            if traversing.is_set() and current_thread() is not first_thread[0]:
+                second_boundary.set()
+            self.lock.acquire()
+            return self
+
+        def __exit__(self, *exc):
+            self.lock.release()
+
+    class PausedTraversal(dict):
+        def __setitem__(self, key, value):
+            super().__setitem__(key, value)
+            if traversing.is_set() and current_thread() is not first_thread[0]:
+                # Without serialization the insertion, rather than lock admission, releases the iterator.
+                second_boundary.set()
+
+        def items(self):
+            iterator = iter(super().items())
+            if not first_thread:
+                first_thread.append(current_thread())
+                yield next(iterator)
+                traversing.set()
+                assert second_boundary.wait(5), 'second caller never reached the cache boundary'
+            yield from iterator
+
+    monkeypatch.setattr(plugin, '_EXTRACTIONS', PausedTraversal())
+    monkeypatch.setattr(plugin, '_EXTRACTIONS_LOCK', CoordinatedLock())
+    monkeypatch.setattr(plugin, 'aux_llm', lambda system, user: 'answer:' + user)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(plugin.shared_llm, 'system', 'one')
+        assert traversing.wait(5), 'first writer never reached eviction traversal'
+        second = pool.submit(plugin.shared_llm, 'system', 'two')
+        assert first.result(timeout=5) == 'answer:one'
+        assert second.result(timeout=5) == 'answer:two'
+    assert plugin.shared_llm('system', 'one') == 'answer:one'
+    assert plugin.shared_llm('system', 'two') == 'answer:two'
+
+
+def test_shared_extraction_expires_at_900_seconds_without_sliding_on_hits(plugin, monkeypatch):
+    import time
+
+    clock = [10_000.0]
+    monkeypatch.setattr(time, 'time', lambda: clock[0])
+    outputs = [payload(), payload([new_step()]), payload([OPEN_STEP])]
+    llm, calls = sequenced(outputs)
+    monkeypatch.setattr(plugin, 'aux_llm', llm)
+    system, user = 'Extract the open asks.', REPLY
+
+    assert plugin.shared_llm(system, user) == outputs[0]
+    clock[0] = 10_899.0  # fixed contract: reuse before 900s, not a value derived from the implementation
+    assert plugin.shared_llm(system, user) == outputs[0]
+    assert calls == [user]
+    clock[0] = 10_900.0  # a hit at 899s must not extend the original entry's lifetime
+    assert plugin.shared_llm(system, user) == outputs[1]
+    assert calls == [user, user]
+    clock[0] = 11_799.0
+    assert plugin.shared_llm(system, user) == outputs[1]
+    assert calls == [user, user]
+    clock[0] = 11_800.0  # refreshed entries expire too; no response can stay cached forever
+    assert plugin.shared_llm(system, user) == outputs[2]
+    assert calls == [user, user, user]
+
+
+def test_shared_extraction_isolates_exact_prompts_and_model_functions(plugin, monkeypatch):
+    import time
+
+    monkeypatch.setattr(time, 'time', lambda: 10_000.0)
+    calls = []
+
+    def first(system, user):
+        calls.append(('first', system, user))
+        return f'first response {len(calls)}'
+
+    def second(system, user):
+        calls.append(('second', system, user))
+        return 'second response'
+
+    monkeypatch.setattr(plugin, 'aux_llm', first)
+    # These two pairs would collide if the system/user separator were dropped.
+    for system, user, expected in [('ab', 'c', 'first response 1'), ('a', 'bc', 'first response 2'),
+                                   ('ab', 'c ', 'first response 3')]:
+        assert plugin.shared_llm(system, user) == expected
+        assert plugin.shared_llm(system, user) == expected
+    assert calls == [('first', 'ab', 'c'), ('first', 'a', 'bc'), ('first', 'ab', 'c ')]
+    monkeypatch.setattr(plugin, 'aux_llm', second)
+    assert plugin.shared_llm('ab', 'c') == 'second response'
+    assert plugin.shared_llm('ab', 'c') == 'second response'
+    assert calls[-1] == ('second', 'ab', 'c') and len(calls) == 4
+    monkeypatch.setattr(plugin, 'aux_llm', first)
+    assert plugin.shared_llm('ab', 'c') == 'first response 1'
+    assert len(calls) == 4
+
+
+def open_requests(plugin):
+    return [r for r in plugin.core.ActionStore().requests(OWNER)
+            if r['state'] in ('open', 'needs_context') and not r.get('resolution')]
+
+
+def first_turn(plugin, monkeypatch):
+    monkeypatch.setattr(plugin, 'aux_llm', lambda s, u: payload([OPEN_STEP]))
+    plugin.pre_llm_call(session_id='session-a', user_message='status?', platform='cli')
+    plugin.transform_llm_output(response_text=OPEN_ASK, session_id='session-a', platform='cli')
+    (req,) = open_requests(plugin)
+    (step,) = plugin.core.Ledger().open_steps('session-a')
+    return [step['id'], req['requestId']]
+
+
+@pytest.mark.parametrize('unmapped', [False, True], ids=['no-new-ask', 'hold-budget-exhausted'])
+def test_passing_publication_with_an_open_ask_records_its_reading(plugin, monkeypatch, tmp_path, unmapped):
+    """A silent pass must leave enough evidence to explain a tile minted beside the open request.
+
+    Drive the real gate, matcher and trace writer; only the external extractor response is scripted.
+    The exhausted-budget case proves the trace contains the actual unmapped span, not empty defaults.
+    """
+    open_ids = first_turn(plugin, monkeypatch)
+    (request,) = open_requests(plugin)
+    plugin.pre_llm_call(session_id='session-a', user_message=FRESH, platform='cli')
+    llm, calls = sequenced([payload([new_step()] if unmapped else [])])
+    monkeypatch.setattr(plugin, 'aux_llm', llm)
+    reply = REPLY if unmapped else 'The checks passed; nothing else changed.'
+    attempt = 2 if unmapped else 0
+
+    verdict = plugin.publication_buffer(session_id='session-a', platform='cli', final_response=reply,
+                                         attempt=attempt, hold_budget=2, turn_messages=[])
+
+    assert verdict is None  # an actual pass, not a hold/error path that happened to log
+    assert len(calls) == 1
+    assert open_ids[0] in calls[0]  # mirrored request is listed under its ledger step id
+    assert OPEN_STEP['text'] in calls[0]
+    trace_path = tmp_path / 'cache' / 'user-steps' / 'trace.jsonl'
+    traces = [json.loads(line) for line in trace_path.read_text().splitlines()]
+    passes = [row for row in traces if row.get('hook') == 'publication_buffer']
+    assert len(passes) == 1
+    trace = passes[0]
+    assert trace['verdict'] == 'pass'
+    assert trace['session'] == 'session-a'
+    assert trace['attempt'] == attempt
+    assert trace['open'] == [request['requestId']]
+    assert trace['steps'] == (1 if unmapped else 0)
+    assert trace['unmapped'] == ([RESTATED] if unmapped else [])
+    assert trace['repeats'] == []
+    assert open_requests(plugin) == [request]  # the gate only observed scratch requests
+
+
+def sequenced(outputs):
+    calls = []
+
+    def llm(system, user):
+        calls.append(user)
+        return outputs[min(len(calls), len(outputs)) - 1]
+    return llm, calls
+
+
+def deliver(plugin, user_message):
+    """One turn as core runs it: pre_llm_call, the pre-send gate (re-sent once after a hold, like core's loop with
+    the nudge in the turn), then the transform on the delivered reply. Returns the gate's first verdict."""
+    plugin.pre_llm_call(session_id='session-a', user_message=user_message, platform='cli')
+    first = plugin.publication_buffer(session_id='session-a', platform='cli', final_response=REPLY, attempt=0,
+                                      hold_budget=2, turn_messages=[])
+    if first and first.get('hold'):
+        nudged = [{'role': 'user', 'content': first['nudge'], '_pre_final_gate_synthetic': True}]
+        again = plugin.publication_buffer(session_id='session-a', platform='cli', final_response=REPLY, attempt=1,
+                                          hold_budget=2, turn_messages=nudged)
+        assert not (again and again.get('hold')), 'the open-request check holds once per turn'
+    plugin.transform_llm_output(response_text=REPLY, session_id='session-a', platform='cli')
+    return first
+
+
+@pytest.mark.parametrize('user_message', [FRESH, RESUMED, NOTICE], ids=['fresh', 'resumed', 'kanban-notice'])
+def test_restated_ask_with_a_new_step_is_held_once_in_every_turn_kind(plugin, monkeypatch, user_message):
+    open_ids = first_turn(plugin, monkeypatch)
+    monkeypatch.setattr(plugin, 'aux_llm', lambda s, u: payload([new_step()], repeat_of(open_ids)))
+    first = deliver(plugin, user_message)
+    assert first and first.get('hold') is True and plugin.OPEN_ASK_NUDGE_HEAD in first['nudge']
+    assert RESTATED in first['nudge']
+
+
+@pytest.mark.parametrize('order', ['gate-reads-repeat-only', 'gate-reads-new-step'])
+@pytest.mark.parametrize('user_message', [FRESH, RESUMED, NOTICE], ids=['fresh', 'resumed', 'kanban-notice'])
+def test_no_tile_is_minted_beside_an_open_one_unless_the_gate_held(plugin, monkeypatch, user_message, order):
+    """The live failure: the gate's own extractor call read the restated bullet as a repeat only (no hold) while
+    the transform's call read a new step there and minted it. Whatever the model answers, the two now agree."""
+    open_ids = first_turn(plugin, monkeypatch)
+    repeat_only, with_step = payload([], repeat_of(open_ids)), payload([new_step()], repeat_of(open_ids))
+    outputs = [repeat_only, with_step] if order == 'gate-reads-repeat-only' else [with_step, repeat_only]
+    llm, calls = sequenced(outputs)
+    monkeypatch.setattr(plugin, 'aux_llm', llm)
+    first = deliver(plugin, user_message)
+    held = bool(first and first.get('hold'))
+    minted = len(open_requests(plugin)) - 1
+    assert minted == 0 or held, f'minted {minted} tile(s) beside the open request with no pre-send hold'
+    assert len(calls) == 1  # one extraction for the reply: the gate's, reused by the re-send and the transform
+    if held:
+        assert minted == 1  # a re-sent reply follows the existing rules: the agent kept it, so it is its own tile

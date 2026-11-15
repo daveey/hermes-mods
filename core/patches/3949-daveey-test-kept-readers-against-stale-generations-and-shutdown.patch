@@ -1,0 +1,170 @@
+From 9619532248cd6ed295d766c61bff2a601cec6070 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 23:15:53 +0000
+Subject: [PATCH] [daveey] test kept readers against stale generations and
+ shutdown
+
+Pin six surviving staleness/lifecycle mutants from #2654. Isolate recovery-closed handles with a second connection so SHM deletion cannot mask the guard; replace state.db in DELETE mode so sidecar changes cannot mask inode checks. Cover open transaction retirement and registry close_all.
+
+Proof: 25 focused tests pass; spec-2654.json all 15 mutants killed, zero survivors (bounded slices). No production changes.
+---
+ tests/hermes_cli/test_kanban_kept_reader.py  | 54 +++++++++++++++++
+ tests/hermes_state/test_state_kept_reader.py | 63 ++++++++++++++++++++
+ 2 files changed, 117 insertions(+)
+
+diff --git a/tests/hermes_cli/test_kanban_kept_reader.py b/tests/hermes_cli/test_kanban_kept_reader.py
+index 911994c3b9..5ee25f402f 100644
+--- a/tests/hermes_cli/test_kanban_kept_reader.py
++++ b/tests/hermes_cli/test_kanban_kept_reader.py
+@@ -123,6 +123,60 @@ def test_dropped_init_state_reopens_through_connect(board, prepares):
+     assert str(board.resolve()) in kbc._INITIALIZED_PATHS
+ 
+ 
++def test_recreated_shm_reopens_kept_connection(board):
++    """A new or missing ``-shm`` is a new WAL generation (kanban-759104eb56): a kept connection still maps the
++    deleted one and must be reopened, although the board file itself (inode, init state) did not change."""
++    from hermes_cli.kanban_lockguard import shm_identity
++
++    with kept.reading() as conn:
++        old = conn
++        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
++    key = gen._resolved(str(board))
++    assert getattr(old, "_hermes_generation_shm", None) == shm_identity(key) is not None
++    os.unlink(str(board) + "-shm")  # the idle kept connection now maps a deleted WAL index
++    with kept.reading() as conn:
++        assert conn is not old
++        assert getattr(conn, "_hermes_generation_shm", None) == shm_identity(key) is not None
++        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
++    assert _is_closed(old)
++
++
++def test_recovery_closed_connection_is_not_reused(board):
++    """Generation recovery closes a stale handle with ``conn.close()``, which only ``forget``s it in
++    ``kanban_generation``; the kept entry is not told. The next borrow must notice and reopen."""
++    from hermes_cli.kanban_lockguard import shm_identity
++
++    # Keep the WAL generation alive: otherwise last-close removes -shm and its
++    # independent identity check masks a missing recovery-closed check.
++    with kbc.connect_closing(board):
++        with kept.reading() as conn:
++            old = conn
++        key = gen._resolved(str(board))
++        identity = shm_identity(key)
++        assert identity is not None
++        old.close()  # recovery's close/forget boundary, without retiring the kept entry
++        assert old not in gen._connections
++        assert shm_identity(key) == identity
++        assert key in kbc._INITIALIZED_PATHS and key not in gen._poisoned
++        with kept.reading() as conn:
++            assert conn is not old
++            assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
++
++
++def test_connection_left_in_transaction_is_not_kept_and_next_read_sees_new_write(board):
++    """A body that leaves a read transaction open must not leave that connection kept: its snapshot would serve
++    every later read stale."""
++    with kept.reading() as conn:
++        first = conn
++        conn.execute("BEGIN")
++        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0  # the snapshot starts here
++    assert _is_closed(first)
++    tid = _triage("written after the open snapshot")
++    with kept.reading() as conn:
++        assert conn is not first
++        assert [r["id"] for r in conn.execute("SELECT id FROM tasks")] == [tid]
++
++
+ def test_idle_kept_connection_on_another_thread_is_evicted_by_recovery(board):
+     """Generation recovery must be able to retire an idle kept connection parked on another thread; otherwise
+     every other thread's open of a stranded board fails until that thread reads again."""
+diff --git a/tests/hermes_state/test_state_kept_reader.py b/tests/hermes_state/test_state_kept_reader.py
+index e9ae8825dc..90cd682999 100644
+--- a/tests/hermes_state/test_state_kept_reader.py
++++ b/tests/hermes_state/test_state_kept_reader.py
+@@ -6,6 +6,7 @@ read-only handle reconciles nothing and opens once per file identity.
+ """
+ from __future__ import annotations
+ 
++import contextlib
+ import os
+ import sqlite3
+ from pathlib import Path
+@@ -101,6 +102,56 @@ def test_replaced_file_reopens_the_kept_handle(state_db, opens):
+     assert old._conn is None  # the stale handle was closed, not left on the old inode
+ 
+ 
++def test_state_sidecars_changed_reopens(state_db, opens):
++    """Same ``state.db`` inode, new WAL generation (its ``-wal``/``-shm`` deleted under the kept handle): the
++    handle may be stranded on the deleted index, so it is retired and a fresh one opened."""
++    with kept.read_only(state_db) as db:
++        old = db
++        assert db.get_session("s1") is not None
++    before = os.stat(state_db)
++    assert kept._sidecars(state_db), "a WAL reader keeps its sidecars while open"
++    for suffix in ("-wal", "-shm"):
++        try:
++            os.unlink(str(state_db) + suffix)
++        except FileNotFoundError:
++            pass
++    assert (os.stat(state_db).st_dev, os.stat(state_db).st_ino) == (before.st_dev, before.st_ino)
++    with kept.read_only(state_db) as db:
++        assert db is not old
++        assert db.get_session("s1") is not None
++    assert len(opens) == 2
++    assert old._conn is None
++
++
++def test_state_db_replaced_reopens(state_db, opens):
++    """A replaced ``state.db`` whose sidecar identities happen to match (here: rollback-journal files with no
++    sidecars at all) is caught by the file identity alone."""
++    with contextlib.closing(sqlite3.connect(state_db)) as conn:
++        conn.execute("PRAGMA journal_mode=DELETE")
++    other = state_db.with_name("other.db")
++    fresh = SessionDB(other)
++    try:
++        fresh.create_session("s2", source="cli")
++    finally:
++        fresh.close()
++    with contextlib.closing(sqlite3.connect(other)) as conn:
++        conn.execute("PRAGMA journal_mode=DELETE")
++    for base in (state_db, other):
++        for suffix in ("-wal", "-shm"):
++            assert not os.path.exists(str(base) + suffix)
++    with kept.read_only(state_db) as db:
++        old = db
++        assert db.get_session("s1") is not None
++    sidecars = kept._sidecars(state_db)
++    os.replace(other, state_db)
++    assert kept._sidecars(state_db) == sidecars  # only the file identity tells the two files apart
++    with kept.read_only(state_db) as db:
++        assert db is not old
++        assert db.get_session("s2") is not None and db.get_session("s1") is None
++    assert len(opens) == 2
++    assert old._conn is None
++
++
+ def test_closed_handle_is_replaced(state_db, opens):
+     with kept.read_only(state_db) as db:
+         db.close()
+@@ -135,6 +186,18 @@ def test_registry_close_all_under_retires_kept_handles(state_db):
+     assert db._conn is None
+ 
+ 
++def test_registry_close_all_retires_kept_handles(state_db):
++    """Gateway shutdown's ``close_all`` must retire kept read handles too, not only the shared writers."""
++    import hermes_state_registry
++
++    with kept.read_only(state_db) as db:
++        pass
++    hermes_state_registry.close_all()
++    assert db._conn is None
++    with kept.read_only(state_db) as again:
++        assert again is not db
++
++
+ def test_notice_write_goes_through_the_shared_writer(state_db, monkeypatch):
+     from tui_gateway.kanban_notice_session_store import notice_writer, session_store
+ 
+-- 
+2.43.0
+

@@ -80,9 +80,10 @@ the same turn (this checker, or `gh pr view N --json state,mergeStateStatus,revi
 and list every open step: failing or pending checks and whether main fails the same ones, whether the approval
 still holds after a rebase (no review at the new head doesn't settle it: `hermes-core-wt ship`'s own clean rebase
 carries the approval when the range-diff from the approved head is all `=`, and the owner card's ship result says
-which; read that before reporting a re-review), the merge queue or slot position (core PRs: the land lane, patching-local-hermes-workflow `references/land-lane-stalls.md`), and the owner card's real state
+which; read that before reporting a re-review), the merge queue or slot position (core PRs: the land lane, patching-local-hermes-workflow `references/land-lane-stalls.md`; state PRs: other PRs' land-turn refs on its files, kanban-worker `references/state-pr-landing.md`), and the owner card's real state
 (claimed and moving, or just ready). Give no clock time and no "merges once X" unless X is the only open step. CI is
-rarely the only one: a hub merge slot or the land lane can hold a green PR for hours.
+rarely the only one: a hub merge slot or the land lane can hold a green PR for hours. A parked landing card's reason names
+only the first blocker its run hit (the GitHub quota, say), so look for the rest yourself before promising "once X".
 
 Admin override: only with explicit per-PR user authorization. Before offering it, read
 `gh api repos/O/R/rulesets/<id> --jq .current_user_can_bypass`: `pull_requests_only` cannot skip a required

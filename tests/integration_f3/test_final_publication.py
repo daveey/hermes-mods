@@ -132,8 +132,9 @@ def test_exact_source_action_before_publication(harness, monkeypatch, state, fra
     canonical_before = requests(h)
     model = Model(h.agent, monkeypatch, [ASK])
     result = h.agent.run_conversation("Continue the case discussion.")
-    # Approval readiness previews extraction before the final output transform.
-    assert events == [("judge", ASK), ("extract", ASK), ("extract", ASK)]
+    # Approval readiness extracts before the final output transform, and the transform
+    # reuses that same extraction (user-steps shared_llm), so the model is asked once.
+    assert events == [("judge", ASK), ("extract", ASK)]
     after = ledger._read(ledger.root(sid))
     assert len(model.requests) == 1
     if state == "resolved":
@@ -180,9 +181,9 @@ def test_held_draft_never_publishes_source_actions(harness, monkeypatch):
     result = h.agent.run_conversation("Help me choose a case.")
     assert_delivery(result, model, plain=OTHER)
     # The readiness gate may preview rejected drafts, but only the accepted draft
-    # may reach the source-writing transform.
+    # may reach the source-writing transform (which reuses the gate's extraction).
     assert events == [("judge", ASK), ("extract", ASK), ("judge", OTHER),
-                      ("extract", OTHER), ("extract", OTHER)]
+                      ("extract", OTHER)]
     assert len(model.requests) == 2
     assert ASK not in model.shown + str(result["messages"]) + str(cards.calls)
     assert ASK not in str(h.db.get_messages(h.agent.session_id))

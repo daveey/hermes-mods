@@ -1,0 +1,350 @@
+From aeac57d2c96c6ed3cf443d978d181db30863d6c0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 04:55:33 +0000
+Subject: [PATCH] fix(cron): bound repeated raw quote expansion in lifecycle
+ walks [daveey]
+
+Why: HOME expansion exposes a benign wrapper graph whose overlapping quoted
+output spans recursively enumerate pairs already enumerated by their parent.
+The repeated work exhausts the shared 16384-line budget, despite no lifecycle
+action. The old baseline misses the newly HOME-reachable helper entirely.
+
+Carry explicit raw-quote provenance and an immutable interpretation snapshot.
+Only omit contained quote enumeration for unchanged raw spans in the same
+cwd/execution/alias/masking scope. Continue scanning every payload and file;
+decoded strings, printer assembly and shell command payloads keep full expansion.
+Move output expansion to a topical sibling; caps and path safety are unchanged.
+
+Proof: reduced budget regression is red without coverage and green with it;
+9 exact-anchor mutants killed; 2063 lifecycle/backend tests and 1719 additional
+focused/cross-cutting tests passed (overlapping selections). All 20 checks pass.
+Unmemoized 54-input frozen same-byte replay of baseline, HOME PR and HOME+fix
+clears exactly core-wt indices 181/182/2366. The separate gh-shim log refusal
+at index6985 remains, traced to disabled date exemption after PATH/source
+changes; HOME owner retains that gate and complete final 7052-input replay.
+No stored commands were executed; referenced-file cache remains private.
+---
+ cron/lifecycle_guard.py                       | 73 ++-------------
+ cron/lifecycle_guard_output.py                | 73 +++++++++++++++
+ .../cron/test_lifecycle_guard_comment_sink.py |  5 +-
+ .../test_lifecycle_guard_quote_coverage.py    | 93 +++++++++++++++++++
+ 4 files changed, 178 insertions(+), 66 deletions(-)
+ create mode 100644 cron/lifecycle_guard_output.py
+ create mode 100644 tests/cron/test_lifecycle_guard_quote_coverage.py
+
+diff --git a/cron/lifecycle_guard.py b/cron/lifecycle_guard.py
+index 853c2e37fb..d2110590ef 100644
+--- a/cron/lifecycle_guard.py
++++ b/cron/lifecycle_guard.py
+@@ -1494,61 +1494,6 @@ def _iter_shell_command_payloads(command: str) -> Iterator[str]:
+                 break
+ 
+ 
+-# Quoted string literals (shell or interpreter quoting alike), each kind on its own; a literal may
+-# span lines (`eval "$( cat <<'PY'` … `)"`). The lookahead yields the span after EVERY quote up to
+-# the next one of its kind, not just alternate pairs: an apostrophe inside the other kind
+-# (`print("it's")`) must not shift which spans count as literals (review 5890784121 nit 1).
+-_QUOTED_LITERAL_RES = (re.compile(r"(?='([^']+)')"), re.compile(r"(?=\"([^\"]+)\")"))
+-# Producers that print their own arguments, quoted or not (`echo bash /x/a.sh | bash`).
+-_ARGUMENT_PRINTERS = frozenset({"echo", "printf"})
+-
+-
+-def _iter_printed_shell_payloads(command: str) -> Iterator[str]:
+-    """When some output in *command* is run as shell code (``python3 - <<'PY' | bash``,
+-    ``eval "$(…)"``, ``bash <(…)``), yield what a producer may print as the shell's command:
+-    every quoted string literal (``print('bash /x/big.sh')``) and the argument line of every
+-    ``echo``/``printf`` (``echo bash /x/big.sh``, also without leading option words:
+-    ``echo -n bash /x/big.sh``), each also with ``\\n``-style escapes turned into
+-    newlines and decoded the way printf, ``%b`` and ``echo -e`` decode them
+-    (with_escapes_decoded). Their paths are executed, not mentions. Single and double quotes
+-    are matched independently, so a literal nested in the other kind
+-    (``python3 -c "print('bash x')"``) is
+-    yielded too, and every span between two consecutive quotes of a kind is yielded, so a stray
+-    apostrophe (``print("it's")``) cannot pair the quotes around a later literal the wrong way.
+-
+-    Fails closed by design (review 5890191993 nits): every yielded literal is walked as an
+-    executed command, so a producer that merely reads an oversized data file
+-    (``sqlite3.connect('/d/big.db')``) refuses on the scan cap, and the literals charge the shared
+-    line/byte budget, so a generator of ~16k lines piped to a shell refuses on the line cap (~8k
+-    lines when each prints a literal; the between-quote spans dedupe and leave both unchanged)."""
+-    from tools.shell_heredoc import output_reaches_shell
+-
+-    if not output_reaches_shell(command):
+-        return
+-    seen: set[str] = set()
+-
+-    def unseen(text: str) -> Iterator[str]:
+-        for variant in _with_escapes_decoded(text):
+-            if variant not in seen:
+-                seen.add(variant)
+-                yield variant
+-
+-    for pattern in _QUOTED_LITERAL_RES:
+-        for match in pattern.finditer(command):
+-            yield from unseen(match[1])
+-    if not any(name in command for name in _ARGUMENT_PRINTERS):
+-        return  # skip a second tokenization of a large generator that never echoes
+-    for segment in _iter_command_segments(command):
+-        segment = segment[_peel_reserved_words(segment):]  # `{ echo …; }`, `then echo …`
+-        index = _executed_command_index(segment)
+-        if index is None:
+-            continue
+-        name = _executable_name(segment[index])
+-        if name in _ARGUMENT_PRINTERS:
+-            for line in _printed_argument_lines(name, segment[index + 1 :]):
+-                yield from unseen(line)
+-
+-
+ # --- referenced-script reading ----------------------------------------------------------------
+ 
+ def _has_binary_magic(data: bytes) -> bool:
+@@ -1738,7 +1683,7 @@ def _walk_candidates(
+ def _contains_unsafe_gateway_action(
+     command: str, *, cwd: Optional[str], depth: int, visited: set[object], budget: _LifecycleScanBudget,
+     read_remote_script: Optional[_ReadRemoteScriptFn] = None, executed: bool = True,
+-    source: Optional[str] = None,
++    source: Optional[str] = None, covered_quote_scope: Optional[tuple] = None,
+ ) -> bool:
+     """``executed=False`` means *command* is the content of a file that is only MENTIONED in inert
+     (masked) text: it is still scanned for a literal lifecycle command, but "could not scan" (budget,
+@@ -1755,7 +1700,7 @@ def _contains_unsafe_gateway_action(
+ 
+     def recurse(
+         text: str, cwd: Optional[str], executed: bool, source: Optional[str], python_source: bool = False,
+-        nested: bool = False,
++        nested: bool = False, covered_quotes: Optional[tuple] = None,
+     ) -> bool:
+         if python_source:
+             return _python_source_is_unsafe(text, budget)
+@@ -1763,6 +1708,7 @@ def _contains_unsafe_gateway_action(
+             return _contains_unsafe_gateway_action(
+                 text, cwd=cwd, depth=depth + 1, visited=visited, budget=budget,
+                 read_remote_script=read_remote_script, executed=executed, source=source,
++                covered_quote_scope=covered_quotes,
+             )
+ 
+     # The walks below must see the same masked view `_direct_lifecycle_scan` sees (#110422): a
+@@ -1779,13 +1725,12 @@ def _contains_unsafe_gateway_action(
+ 
+     nested_texts, nested_scripts = collect_nested_shell_inputs(
+         command, walk_command, cwd=cwd, budget=budget)
+-    for payload, nested in itertools.chain(
+-            zip(nested_texts, itertools.repeat(True)),
+-            zip(itertools.chain(_iter_shell_command_payloads(walk_command),
+-                                _iter_printed_shell_payloads(walk_command)), itertools.repeat(False))):
+-        # An `sh -c` payload is text of the same file (or command) it appears in; so is a string
+-        # an interpreter prints when its output is fed to a shell.
+-        if recurse(payload, cwd, executed, source, nested=nested):
++    from cron.lifecycle_guard_output import iter_recursive_payloads
++
++    for payload, nested, covered in iter_recursive_payloads(
++            walk_command, nested_texts, cwd=cwd, executed=executed,
++            budget=budget, covered_scope=covered_quote_scope):
++        if recurse(payload, cwd, executed, source, nested=nested, covered_quotes=covered):
+             return True
+ 
+     for script_path, candidate_executed, python_source in _walk_candidates(
+diff --git a/cron/lifecycle_guard_output.py b/cron/lifecycle_guard_output.py
+new file mode 100644
+index 0000000000..dfbc297d7f
+--- /dev/null
++++ b/cron/lifecycle_guard_output.py
+@@ -0,0 +1,73 @@
++"""Printed shell payloads and coverage of unchanged quoted substrings.
++
++A sink expands *every* adjacent pair of each quote kind, including overlapping
++pairs. Every pair inside an unchanged raw span is also a pair in its parent.
++Re-expanding those pairs recursively adds no coverage, but can exhaust the walk
++budget. Decoded/printer/command payloads are new text and retain full expansion.
++"""
++from __future__ import annotations
++
++import re
++from collections.abc import Iterator
++
++_QUOTED_LITERAL_RES = (re.compile(r"(?='([^']+)')"), re.compile(r'(?="([^"]+)")'))
++_ARGUMENT_PRINTERS = frozenset({"echo", "printf"})
++
++
++def quote_scope(cwd, executed, budget) -> tuple:
++    """Snapshot the interpretation under which a parent's quotes are walked."""
++    return cwd, executed, budget.alias_names, budget.mask_heredocs
++
++
++def iter_recursive_payloads(command, nested_texts, *, cwd, executed, budget, covered_scope):
++    from cron import lifecycle_guard as guard
++
++    for payload in nested_texts:
++        yield payload, True, None
++    for payload in guard._iter_shell_command_payloads(command):
++        yield payload, False, None
++    # Snapshot after preceding nested-shell walks; shared budget state may have changed.
++    scope = quote_scope(cwd, executed, budget)
++    for payload, raw_quote in iter_printed_shell_payloads(
++            command, include_quoted=covered_scope != scope):
++        yield payload, False, scope if raw_quote else None
++
++
++def iter_printed_shell_payloads(
++    command: str, *, include_quoted: bool = True,
++) -> Iterator[tuple[str, bool]]:
++    """Yield (payload, raw_quote) when output may execute as shell code.
++
++    A raw quote's interior quote pairs are already enumerated by this call; its
++    consumer may omit ONLY their enumeration in the same interpretation scope.
++    Keep both quote kinds and overlapping pairs: apostrophes inside the other
++    kind must not hide later literals. Unknown producers remain conservative.
++    """
++    from cron import lifecycle_guard as guard
++    from tools.shell_heredoc import output_reaches_shell
++
++    if not output_reaches_shell(command):
++        return
++    seen: set[str] = set()
++
++    def unseen(text: str, raw_quote: bool) -> Iterator[tuple[str, bool]]:
++        for variant in guard._with_escapes_decoded(text):
++            if variant not in seen:
++                seen.add(variant)
++                yield variant, raw_quote and variant == text
++
++    if include_quoted:
++        for pattern in _QUOTED_LITERAL_RES:
++            for match in pattern.finditer(command):
++                yield from unseen(match[1], True)
++    if not any(name in command for name in _ARGUMENT_PRINTERS):
++        return
++    for segment in guard._iter_command_segments(command):
++        segment = segment[guard._peel_reserved_words(segment):]
++        index = guard._executed_command_index(segment)
++        if index is None:
++            continue
++        name = guard._executable_name(segment[index])
++        if name in _ARGUMENT_PRINTERS:
++            for line in guard._printed_argument_lines(name, segment[index + 1:]):
++                yield from unseen(line, False)
+diff --git a/tests/cron/test_lifecycle_guard_comment_sink.py b/tests/cron/test_lifecycle_guard_comment_sink.py
+index eca6bd1ea9..f6d142849d 100644
+--- a/tests/cron/test_lifecycle_guard_comment_sink.py
++++ b/tests/cron/test_lifecycle_guard_comment_sink.py
+@@ -4,7 +4,8 @@ import subprocess
+ 
+ import pytest
+ 
+-from cron.lifecycle_guard import _iter_printed_shell_payloads, scan_gateway_lifecycle
++from cron.lifecycle_guard import scan_gateway_lifecycle
++from cron.lifecycle_guard_output import iter_printed_shell_payloads
+ from tools.shell_heredoc import output_reaches_shell
+ 
+ 
+@@ -21,7 +22,7 @@ from tools.shell_heredoc import output_reaches_shell
+ def test_comment_is_not_an_output_sink(prefix, indent, comment):
+     text = prefix + indent + comment + '\nlog="$HOME/data.log"\n'
+     assert not output_reaches_shell(text)
+-    assert list(_iter_printed_shell_payloads(text)) == []
++    assert list(iter_printed_shell_payloads(text)) == []
+ 
+ 
+ def test_wrapper_does_not_execute_oversized_data_assignment(tmp_path):
+diff --git a/tests/cron/test_lifecycle_guard_quote_coverage.py b/tests/cron/test_lifecycle_guard_quote_coverage.py
+new file mode 100644
+index 0000000000..ca4ec37ec9
+--- /dev/null
++++ b/tests/cron/test_lifecycle_guard_quote_coverage.py
+@@ -0,0 +1,93 @@
++"""Overlapping quoted output spans must not recursively re-enumerate covered pairs."""
++import itertools
++import os
++import shlex
++import subprocess
++
++import pytest
++
++from cron import lifecycle_guard as guard
++from cron.lifecycle_guard_output import iter_printed_shell_payloads, quote_scope
++from tools.environments.local import build_subprocess_env
++
++
++def test_repeated_nested_quotes_fit_existing_walk_budget(monkeypatch, tmp_path):
++    # Reduced from a wrapper containing many quoted programs, each with a sink.
++    # Unknown producers stay visible; there is no executable-name exemption.
++    command = "\n".join(f'''item{i}="producer 'value{i}' | bash"''' for i in range(20))
++    monkeypatch.setattr(guard, "_MAX_LIFECYCLE_SCAN_LINES", 150)
++    assert guard.scan_gateway_lifecycle(command, cwd=str(tmp_path)) == (False, None)
++
++
++def test_literal_coverage_does_not_remove_budget_enforcement(monkeypatch, tmp_path):
++    monkeypatch.setattr(guard, "_MAX_LIFECYCLE_SCAN_LINES", 20)
++    command = "\n".join(f'''item{i}="producer 'value{i}' | bash"''' for i in range(20))
++    unsafe, reason = guard.scan_gateway_lifecycle(command, cwd=str(tmp_path))
++    assert unsafe and reason and "20-line scan cap" in reason
++
++
++def test_payload_provenance_distinguishes_decoding_and_argument_assembly():
++    payloads = list(iter_printed_shell_payloads(r'''producer 'x\x27y\x27z' | bash'''))
++    assert (r"x\x27y\x27z", True) in payloads
++    assert ("x'y'z", False) in payloads
++    assert ("bash ./target.sh", False) in list(
++        iter_printed_shell_payloads("echo bash ./target.sh | bash", include_quoted=False))
++
++
++@pytest.mark.parametrize("changed", ["cwd", "executed", "aliases", "mask"])
++def test_changed_interpretation_reexpands_covered_quotes(monkeypatch, tmp_path, changed):
++    budget = guard._LifecycleScanBudget()
++    cwd, executed = str(tmp_path), True
++    covered = quote_scope(cwd, executed, budget)
++    if changed == "cwd":
++        cwd = str(tmp_path / "other")
++    elif changed == "executed":
++        executed = False
++    elif changed == "aliases":
++        budget.alias_names = None
++    else:
++        budget.mask_heredocs = False
++    # No lifecycle spelling in the scanned text: only the referenced file contains it.
++    target = tmp_path / "target.sh"
++    target.write_text("hermes gateway restart\n")
++    command = f'''producer '{target}' | bash'''
++    assert guard._contains_unsafe_gateway_action(
++        command, cwd=cwd, depth=0, visited=set(), budget=budget,
++        executed=executed, covered_quote_scope=covered)
++
++
++@pytest.mark.parametrize("prefix", ["", "env ", "command "])
++@pytest.mark.parametrize("shell", ["bash", "bash -l", "sh"])
++@pytest.mark.parametrize("producer", ["printf '%s\\n'", "echo"])
++def test_real_nested_output_wrappers_stay_blocked(tmp_path, prefix, shell, producer):
++    target = tmp_path / "target.sh"
++    marker = tmp_path / "marker"
++    target.write_text("hermes gateway 'restart'\n")
++    fake = tmp_path / "hermes"
++    fake.write_text('#!/bin/sh\nprintf reached > "$MARKER"\n')
++    fake.chmod(0o755)
++    # A quoted action defeats the direct spelling regex; the file walk is necessary.
++    inner = f"{producer} {shlex.quote('bash ' + str(target))} | {shell}"
++    command = f"{prefix}{producer} {shlex.quote(inner)} | {shell}"
++    env = build_subprocess_env()
++    env.update(PATH=f"{tmp_path}:" + os.environ["PATH"], MARKER=str(marker))
++    # Login shells reset PATH: define the fake command in a fixture BASH_ENV too.
++    setup = tmp_path / "env.sh"
++    setup.write_text(f"hermes() {{ printf reached > {shlex.quote(str(marker))}; }}\nexport -f hermes\n")
++    env["BASH_ENV"] = str(setup)
++    result = subprocess.run(["bash", "-c", command], env=env, capture_output=True,
++                            text=True, encoding="utf-8", timeout=10, check=False)
++    assert result.returncode == 0, result.stderr
++    assert marker.read_text() == "reached"
++    assert guard.scan_gateway_lifecycle(command, cwd=str(tmp_path)) == (True, None)
++
++
++def test_quote_containment_for_generated_literal_shapes():
++    from cron.lifecycle_guard_output import _QUOTED_LITERAL_RES
++
++    for chars in itertools.product("'\"x\\", repeat=6):
++        text = "".join(chars)
++        spans = {match[1] for pattern in _QUOTED_LITERAL_RES for match in pattern.finditer(text)}
++        for span in spans:
++            nested = {match[1] for pattern in _QUOTED_LITERAL_RES for match in pattern.finditer(span)}
++            assert nested <= spans
+-- 
+2.43.0
+

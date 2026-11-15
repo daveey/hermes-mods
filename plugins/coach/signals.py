@@ -210,6 +210,14 @@ GUARD_RES = (
     ("key-owner-mismatch", re.compile(r"^Credential auth failure: the failing key belongs to pool entry \S+, but the "
                                       r"session is attributed to entry \S+")),
 )
+# Core's designed recovery when a pinned entry is disabled/expired/removed mid-session (client_lifecycle
+# _resolve_anthropic_refresh_token): "pool entry X left the pool; re-resolving" then "moved ... off pool entry X
+# (now Y)". Since the pin fix a pinned session only moves when its entry is gone, so that pair (same session, same
+# entry, within LEFT_POOL_PAIR_S, attributed to a new entry) is not drift and is not filed (agent-47adfc1ed2).
+# "(now unattributed)" or a move with no left-the-pool line still files.
+LEFT_POOL_RE = re.compile(r"^(?:\w+ )?pool entry (\S+) left the pool\b")
+MOVED_OFF_RE = re.compile(r"moved the session off pool entry (\S+) \(now ([^)]+)\)")
+LEFT_POOL_PAIR_S = 120
 # A platform adapter's "[X] Failed to connect to X" whose final exception says the host is unreachable (laptop
 # asleep/offline, DNS down, Wi-Fi switch): the adapter marks it retryable and the gateway retries with backoff, so
 # one attempt is not a defect (plugin-0561bb7919). A real outage is the gateway's own NEEDS_ATTENTION warning after
@@ -435,6 +443,29 @@ def _cron_held_failures(recs: List[dict]) -> set:
     return held
 
 
+# A subscription wall that resets within core's WALL_REROUTE_MIN_SECONDS (agent/model_routing_walls.py) holds every
+# pin by design ("waiting beats a provider switch"): the turn gets held_reply, and the caller logs the
+# SubscriptionQuotaUnavailable traceback. Fingerprints key on exception + frames, so that designed hold reopened two
+# real defects of the same frames as "came back" (selfheal agent-13b91b3e1b: walls 2.9-4.3 h out on 11-14). Only the
+# exact class with a parseable reset strictly after the record and inside the window is a hold: a far wall (a pin
+# that should have rerouted) and a refusal at/after its own reset (a stale wall) stay defects.
+# tests/test_signals_held_wall.py asserts HELD_WALL_S equals core's constant when core is on the path.
+HELD_WALL_S = 6 * 3600
+HELD_WALL_EXC = "SubscriptionQuotaUnavailable"
+HELD_WALL_RESET_RE = re.compile(r"; resets at (\d+(?:\.\d+)?)\s*$")
+
+
+def held_wall(exc_type: str, exc_line: str, at: float) -> bool:
+    """True for core's designed short-wall refusal of a pinned route (see HELD_WALL_S)."""
+    if exc_type.rsplit(".", 1)[-1] != HELD_WALL_EXC:
+        return False
+    m = HELD_WALL_RESET_RE.search(exc_line)
+    if not m:
+        return False
+    left = float(m.group(1)) - at
+    return 0 < left < HELD_WALL_S
+
+
 def parse_errors(lines: List[str], reconnects: Optional[list] = None, auth: Optional[list] = None,
                  host: str = "", prof: str = "default") -> List[dict]:
     """Records (header + continuation lines) -> traceback, hook-exception and credential-guard signals. Library
@@ -452,10 +483,20 @@ def parse_errors(lines: List[str], reconnects: Optional[list] = None, auth: Opti
             cur["cont"].append(ln)
     held = _cron_held_failures(recs)
     lease_lines: dict = {}  # session -> its latest selection_lease_missing record (agent-235b66c443)
+    left_pool: dict = {}  # (session, entry id) -> when core logged that entry left the pool (agent-47adfc1ed2)
     out = []
     for i, r in enumerate(recs):
         if SELECTION_LEASE_RE.match(r["msg"]):
             lease_lines[r["sid"]] = f"{r['level']} {r['logger']}: {r['msg']}"
+        lp = LEFT_POOL_RE.match(r["msg"])
+        if lp:
+            left_pool[(r["sid"], lp.group(1))] = r["at"]
+            continue
+        mo = MOVED_OFF_RE.search(r["msg"])
+        if mo and mo.group(2) != "unattributed":
+            left_at = left_pool.get((r["sid"], mo.group(1)))
+            if left_at is not None and 0 <= r["at"] - left_at <= LEFT_POOL_PAIR_S:
+                continue
         if SKIP_LOGGERS.match(r["logger"]) or i in held:
             continue
         stalled = re.match(r"^SLACK_FOLLOW_STALLED engagement=(eng_[0-9a-f]+) fingerprint=([0-9a-f]{64}) failures=(\d+) rc=(-?\d+):", r["msg"])
@@ -556,6 +597,8 @@ def parse_errors(lines: List[str], reconnects: Optional[list] = None, auth: Opti
         if (TRANSIENT_RE.search(text) or EXIT_NOISE_RE.search(exc_line) or OFFLINE_EXC_RE.fullmatch(exc_line)
                 or provider_5xx(exc_type, exc_line, exc_body)):
             continue
+        if held_wall(exc_type, exc_line, r["at"]):
+            continue  # a short wall holding a pin: core's designed refusal (held_reply), not a defect
         last = exc_line or (block[ei] if ei is not None else "")  # socket.gaierror
         if CONNECT_FAIL_RE.match(r["msg"]) and (NETWORK_EXC_RE.match(last) or NETWORK_RE.match(last)):
             continue  # a retried platform connect with no network; a long outage files via NEEDS_ATTENTION
@@ -1971,6 +2014,9 @@ def _cron_failure_exempt(r: dict) -> Optional[str]:
 RECHECKS: Dict[str, Callable[[dict], Optional[str]]] = {
     "template_hold": lambda r: _template_hold_exempt(str(r.get("rule") or ""), str(r.get("head") or "")),
     "cron_failure": _cron_failure_exempt,
+    "held_wall": lambda r: (f"held wall: {str(r.get('line') or '')[-120:]} (a pin's designed short-wall hold)"
+                            if held_wall(str(r.get("exc") or ""), str(r.get("line") or ""), float(r.get("at") or 0))
+                            else None),
 }
 
 
@@ -2004,6 +2050,12 @@ def defect_recheck(d: dict) -> Optional[dict]:
         m = _CRON_DETAILS_RE.match(details)
         if m and fp("cron", d.get("host"), m.group(2), m.group(1)) == d.get("fingerprint"):
             return cron_recheck(details[m.end():])  # legacy rows carry no last_failure kind: prose fallback
+    if d.get("kind") == "errors" and isinstance(d.get("at"), (int, float)):
+        # a traceback row queued before held_wall existed: its last line is the raised exception (agent-13b91b3e1b)
+        last = str(d.get("details") or "").rstrip("\n").rsplit("\n", 1)[-1]
+        m = EXC_RE.match(last)
+        if m and m.group(1).rsplit(".", 1)[-1] == HELD_WALL_EXC:
+            return {"kind": "held_wall", "exc": m.group(1), "line": last, "at": d["at"]}
     return None
 
 

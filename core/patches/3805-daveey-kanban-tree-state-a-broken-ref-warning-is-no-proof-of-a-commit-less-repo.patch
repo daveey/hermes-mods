@@ -1,0 +1,115 @@
+From 2148c6560f57ec71d59f971abb6a58fd8e202788 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 19:14:11 +0000
+Subject: [PATCH] [daveey] kanban tree_state: a broken-ref warning is no proof
+ of a commit-less repo
+
+_commit_less (#2524) read a clean tree as commit-less when `rev-parse
+--verify -q HEAD` exits 1 and `for-each-ref --count=1` exits 0 with empty
+stdout. for-each-ref skips a broken ref (garbage or zero-length loose ref
+file) with only a stderr warning, exit 0 and no stdout, so a clean repo with
+an empty index whose only ref is broken read as commit-less although its
+commit is in the object store; tree_state returned None and the card could
+leave the machine without that commit.
+
+Fix: any stderr from for-each-ref makes _commit_less False, so the unpushed
+check and its fail-safe decide ("unpushed commits in <dir>").
+
+Also pins the rev-parse "exactly exit 1" contract (review 5896374165): a
+faked rev-parse exit 128 with an empty ref list keeps the fail-safe.
+
+Proof (worker-5, git 2.43.0; the hub repro on 2.55.0 matches):
+- garbage ref and zero-length ref both: status clean, rev-parse rc 1,
+  for-each-ref rc 0, stdout empty, stderr "warning: ignoring broken ref
+  refs/heads/main".
+- test_a_clean_repo_whose_only_ref_is_garbage_keeps_the_fail_safe and
+  test_a_clean_repo_whose_only_ref_file_is_empty_keeps_the_fail_safe are
+  RED on the main source (tree_state None) and GREEN here.
+- Mutant "drop the stderr check" turns the garbage-ref test RED; mutant
+  `head.returncode != 1` -> `== 0` turns
+  test_a_head_probe_git_error_keeps_the_fail_safe_even_with_no_refs_listed RED.
+- An empty `git init` still has no state (existing test green).
+---
+ hermes_cli/kanban_move_pool.py                |  6 ++-
+ .../test_kanban_tree_state_unborn.py          | 41 +++++++++++++++++++
+ 2 files changed, 45 insertions(+), 2 deletions(-)
+
+diff --git a/hermes_cli/kanban_move_pool.py b/hermes_cli/kanban_move_pool.py
+index a51c0b2598..0247b31463 100644
+--- a/hermes_cli/kanban_move_pool.py
++++ b/hermes_cli/kanban_move_pool.py
+@@ -238,7 +238,8 @@ def _commit_less(tree: str, budget: Callable[[float], float]) -> bool:
+     """Whether a clean ``tree`` has no commits at all: HEAD is unborn and the repo has no ref. A scratch fixture
+     (``git init``, nothing committed) then holds nothing another worker would miss, though the unpushed check's
+     fail-safe reads its unborn HEAD as unpushed (11-13: it pinned t_01a1d5e41b24e463 to worker-6). Any other
+-    answer, a git error included, is False: the unpushed check and its fail-safe decide. Timeouts come from
++    answer, a git error or a ref listing with any stderr (a skipped broken ref) included, is False: the unpushed
++    check and its fail-safe decide. Timeouts come from
+     ``budget``, whose end raises ``GitUnchecked``."""
+     from hermes_cli.git_budget import timeout_for
+     from hermes_cli.worktree_ops import _git
+@@ -248,7 +249,8 @@ def _commit_less(tree: str, budget: Callable[[float], float]) -> bool:
+         if head.returncode != 1:
+             return False
+         refs = _git(["for-each-ref", "--count=1"], tree, timeout=timeout_for(budget, 10), stdin=subprocess.DEVNULL)
+-        return refs.returncode == 0 and not refs.stdout.strip()
++        # A broken ref is skipped with only a stderr warning (exit 0, no stdout): that is no proof of an empty repo.
++        return refs.returncode == 0 and not refs.stdout.strip() and not refs.stderr.strip()
+     except (OSError, subprocess.SubprocessError, ValueError):
+         return False
+ 
+diff --git a/tests/hermes_cli/test_kanban_tree_state_unborn.py b/tests/hermes_cli/test_kanban_tree_state_unborn.py
+index 029d1af1a4..d13eb40128 100644
+--- a/tests/hermes_cli/test_kanban_tree_state_unborn.py
++++ b/tests/hermes_cli/test_kanban_tree_state_unborn.py
+@@ -88,6 +88,47 @@ def test_a_failing_ref_listing_keeps_the_fail_safe(tmp_path, monkeypatch):
+     assert kmp.tree_state([str(tree)]) == f"unpushed commits in {tree}"
+ 
+ 
++def _commit_behind_a_broken_ref(tmp_path, ref_text):
++    """A clean repo holding commit c1 whose only ref is broken: index and file gone, so status reads clean, HEAD
++    does not resolve, and ``for-each-ref`` skips the ref with a stderr warning, exit 0 and no output."""
++    tree = _init(tmp_path / "core-fixture")
++    pq._commit(tree, "f")
++    (tree / ".git" / "index").unlink()
++    (tree / "f").unlink()
++    branch = subprocess.run(["git", "symbolic-ref", "HEAD"], cwd=tree, check=True, capture_output=True,
++                            text=True).stdout.strip()
++    (tree / ".git" / branch).write_text(ref_text)
++    return tree
++
++
++def test_a_clean_repo_whose_only_ref_is_garbage_keeps_the_fail_safe(tmp_path):
++    """11-13 hub repro: c1 is in the object store, so the tree is not commit-less."""
++    tree = _commit_behind_a_broken_ref(tmp_path, "garbage-not-a-sha\n")
++    assert kmp.tree_state([str(tree)]) == f"unpushed commits in {tree}"
++
++
++def test_a_clean_repo_whose_only_ref_file_is_empty_keeps_the_fail_safe(tmp_path):
++    """A zero-length ref file (a crash mid-write): git 2.43/2.55 skip it as broken just like garbage."""
++    tree = _commit_behind_a_broken_ref(tmp_path, "")
++    assert kmp.tree_state([str(tree)]) == f"unpushed commits in {tree}"
++
++
++def test_a_head_probe_git_error_keeps_the_fail_safe_even_with_no_refs_listed(tmp_path, monkeypatch):
++    """Only rev-parse exit 1 means unborn: exit 128 (a git error) is no proof, however empty the ref list."""
++    from hermes_cli import worktree_ops
++    real = worktree_ops._git
++
++    def git(args, cwd, *a, **kw):
++        if args[:2] == ["rev-parse", "--verify"]:
++            return subprocess.CompletedProcess(["git", *args], 128, "", "fatal: broken\n")
++        if args and args[0] == "for-each-ref" and "refs/remotes" not in args:
++            return subprocess.CompletedProcess(["git", *args], 0, "", "")
++        return real(args, cwd, *a, **kw)
++    monkeypatch.setattr(worktree_ops, "_git", git)
++    tree = _init(tmp_path / "core-fixture")
++    assert kmp.tree_state([str(tree)]) == f"unpushed commits in {tree}"
++
++
+ def test_a_head_probe_that_times_out_keeps_the_fail_safe(tmp_path, monkeypatch):
+     from hermes_cli import worktree_ops
+     real = worktree_ops._git
+-- 
+2.43.0
+

@@ -1,0 +1,95 @@
+From 48ce28ab8e24ca91f95066ef5f68634c86599334 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 22:43:47 +0000
+Subject: [PATCH] [daveey] test(gateway): await completed SIGUSR2 dump before
+ child shutdown
+
+The parent killed a healthy but unscheduled child after a fixed 0.5s sleep, leaving an empty dump. Retry passed because scheduling changed. Wait for handler readiness and the complete dump, then release stdin and require clean exit, proving signal handling returned. Bound all waits and retain stack-content assertions. No production or retry policy changes.
+
+Proof: original fails with child SIGSTOP at SIGUSR2 and SIGCONT 1.5s later; revised test passes the same probe. Canonical file passes with HERMES_TEST_FILE_RETRIES=0. scripts/check --base origin/main: 20 checks OK.
+---
+ tests/gateway/test_faulthandler_no_stderr.py | 44 ++++++++++++++------
+ 1 file changed, 31 insertions(+), 13 deletions(-)
+
+diff --git a/tests/gateway/test_faulthandler_no_stderr.py b/tests/gateway/test_faulthandler_no_stderr.py
+index 3641a3b0d0..af8587dd81 100644
+--- a/tests/gateway/test_faulthandler_no_stderr.py
++++ b/tests/gateway/test_faulthandler_no_stderr.py
+@@ -6,43 +6,61 @@ import sys
+ 
+ import pytest
+ 
+-
++from tests.waiting import wait_until
+ 
+ 
+ _SIGUSR2_CHILD = """
+-import os, signal, sys, time
++import sys
++from pathlib import Path
+ from types import SimpleNamespace
+ sys.path.insert(0, sys.argv[2])
+ from gateway.run_startup import GatewayStartupMixin
+ runner = object.__new__(GatewayStartupMixin)
+ runner.config = SimpleNamespace(log_dir=sys.argv[1])
+ runner._start_install_faulthandler()
+-print("ready", flush=True)
+-time.sleep(30)
++Path(sys.argv[1], "ready").touch()
++assert sys.stdin.readline() == "exit\\n"
+ """
+ 
+ 
+-@pytest.mark.skipif(not hasattr(__import__("signal"), "SIGUSR2"), reason="POSIX-only signal")
++@pytest.mark.platforms("posix")
+ def test_sigusr2_stack_dump_leaves_the_gateway_running(tmp_path):
+     """#110437 — SIGUSR2 must dump stacks to the log and return; chaining to the
+     signal's default disposition (terminate) killed the process being inspected."""
+     import os
+     import signal
+     import subprocess
+-    import time
+ 
+     repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+     child = subprocess.Popen(
+         [sys.executable, "-c", _SIGUSR2_CHILD, str(tmp_path), repo_root],
+-        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, text=True,
++        stdin=subprocess.PIPE, text=True, encoding="utf-8",
+     )
++
++    def alive():
++        assert child.poll() is None, f"gateway exited before handshake (rc={child.returncode})"
++        return True
++
++    dump_path = tmp_path / "gateway_faulthandler.log"
++
++    def dumped():
++        alive()
++        return "--- end SIGUSR2 stack dump ---" in dump_path.read_text(encoding="utf-8")
++
+     try:
+-        assert child.stdout.readline().strip() == "ready"
++        wait_until(lambda: alive() and (tmp_path / "ready").exists(),
++                   timeout=30, what="gateway signal handler installed")
+         child.send_signal(signal.SIGUSR2)
+-        time.sleep(0.5)
+-        assert child.poll() is None, f"gateway died on SIGUSR2 (rc={child.returncode})"
++        # A scheduled child may not run within 0.5s. Observe the complete dump
++        # before releasing it, rather than killing it with its signal pending.
++        wait_until(dumped, timeout=30, what="complete SIGUSR2 stack dump")
++        child.communicate("exit\n", timeout=30)
++        assert child.returncode == 0, f"gateway died on SIGUSR2 (rc={child.returncode})"
+     finally:
+-        child.kill()
+-        child.wait()
+-    dump = (tmp_path / "gateway_faulthandler.log").read_text(encoding="utf-8")
++        if child.poll() is None:
++            child.kill()
++        child.wait(timeout=30)
++        if child.stdin is not None:
++            child.stdin.close()
++    dump = dump_path.read_text(encoding="utf-8")
+     assert "Thread 0x" in dump or "Current thread" in dump
+-- 
+2.43.0
+

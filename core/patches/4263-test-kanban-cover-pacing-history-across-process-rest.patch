@@ -1,0 +1,95 @@
+From 751e2876443443c5a66020796095140499be9bdd Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 22:59:21 +0000
+Subject: [PATCH] test(kanban): cover pacing history across process restart
+ [daveey]
+
+Exercise real disk persistence through two fresh interpreters with scratch HOME/HERMES_HOME/HERMES_KANBAN_HOME. Verify measured burn changes open to paced, concurrency average and admission limit, and retained samples. Exact M04 no-save mutation: 20 passed, 1 failed at pacing decision; restored source: 21 passed, zero skipped. No production or configuration changes.
+---
+ .../test_kanban_llm_pacing_persistence.py     | 74 +++++++++++++++++++
+ 1 file changed, 74 insertions(+)
+ create mode 100644 tests/hermes_cli/test_kanban_llm_pacing_persistence.py
+
+diff --git a/tests/hermes_cli/test_kanban_llm_pacing_persistence.py b/tests/hermes_cli/test_kanban_llm_pacing_persistence.py
+new file mode 100644
+index 0000000000..022e891685
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_llm_pacing_persistence.py
+@@ -0,0 +1,74 @@
++"""Dispatch burn history must survive the process that sampled it. [daveey]"""
++from __future__ import annotations
++
++import json
++import os
++from pathlib import Path
++import subprocess
++import sys
++
++import pytest
++
++
++_SAMPLE = """
++import json
++import sqlite3
++import sys
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_llm_pacing as lp
++from hermes_cli import kanban_llm_pacing_dispatch as pd
++
++now, used, running = map(int, sys.argv[1:])
++# Only the external usage endpoint is replaced; persistence, reload, rate math,
++# local concurrency SQL and the in-process cache all use production code.
++pd.read_pool = lambda provider, ts: [lp.Reading(ts, 'a', lp.SEVEN_DAY, used, 1800036000)]
++assert not pd._CACHE
++with sqlite3.connect(':memory:') as conn:
++    conn.executescript('''
++        CREATE TABLE tasks (id TEXT, current_run_id INTEGER, status TEXT, claim_lock TEXT);
++        CREATE TABLE task_events (task_id TEXT, run_id INTEGER, kind TEXT, payload TEXT);
++    ''')
++    for i in range(running):
++        conn.execute('INSERT INTO tasks VALUES (?, ?, ?, ?)', (str(i), i, 'running', kb._host_prefix() + 'fixture'))
++        conn.execute('INSERT INTO task_events VALUES (?, ?, ?, ?)',
++                     (str(i), i, 'run_route', json.dumps({'model': 'claude-opus-5-5', 'provider': 'anthropic'})))
++    cfg = lp.PacingConfig()
++    pace = pd.pace_for(conn, 'anthropic', cfg, now)
++    average = pd.avg_running('anthropic', now, cfg)
++    print(json.dumps({'pace': pace.as_dict(), 'average': average,
++                      'limit': lp.admit_limit(pace, average, deferrable=False, cfg=cfg)}))
++"""
++
++
++def test_dispatch_rate_history_survives_process_restart(tmp_path):
++    home = tmp_path / 'home'
++    state = home / '.hermes'
++    state.mkdir(parents=True)
++    env = {**os.environ, 'HOME': str(home), 'HERMES_HOME': str(state),
++           'HERMES_KANBAN_HOME': str(state)}
++    root = Path(__file__).resolve().parents[2]
++
++    def sample(now, used, running):
++        result = subprocess.run(
++            [sys.executable, '-c', _SAMPLE, str(now), str(used), str(running)],
++            cwd=root, env=env, capture_output=True, text=True, timeout=30, check=True,
++        )
++        return json.loads(result.stdout)
++
++    # The week-average fallback is open. Only the saved 54 -> 60%/hour
++    # measurement can make the next fresh interpreter pace this pool.
++    first = sample(1799996400, 54, 6)
++    assert first['pace']['state'] == 'open'
++    restarted = sample(1800000000, 60, 2)
++    assert restarted['pace']['state'] == 'paced'
++    assert restarted['pace']['factor'] == pytest.approx(0.5833)
++    assert restarted['average'] == 4
++    assert restarted['limit'] == 2
++    saved = json.loads((state / 'llm_pacing.json').read_text())['anthropic']
++    assert saved['samples'] == [
++        [1799996400, 'a', 'seven_day', 54, 1800036000],
++        [1800000000, 'a', 'seven_day', 60, 1800036000],
++    ]
++    assert saved['running'] == [[1799996400, 6], [1800000000, 2]]
++    assert saved['read_at'] == 1800000000
++    assert saved['pace'] == restarted['pace']
+-- 
+2.43.0
+

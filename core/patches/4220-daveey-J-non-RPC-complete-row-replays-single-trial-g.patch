@@ -1,0 +1,1080 @@
+From 6dc2e38f94894bcabe89030a918699f1d5da8221 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 16:44:09 +0000
+Subject: [PATCH] [daveey] J non-RPC complete-row replays; single-trial gate
+ benches
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Card J t_01a1d862f6e2fc9e (design t_01a1d563 §3 J/§5). The component benches measured one signature at a
+time and passed on the best of 3-5 trials. This adds whole-row replays of the measured streams through the
+real code, run once (no best-of, no retry), with the budgets unchanged:
+
+- tests/tui_gateway/test_j_nonrpc_rows.py: serve change_watcher + notification pollers <= 0.7% of a core
+  (asserted for the gateway's 0.8% row too) over 600 s: every production watch with real frames to ten
+  transports, the chg1 state stream, the hub's skill roots, two real _notification_poller_scoped_loop
+  pollers (P1 run11: 1.85 serve / 1.17 gateway) with PollerStop deadlines, SQL, claims and custody, and the
+  rf2 replica stream with the remote-index holder. Cells: base, tasks 5.8k/20k, replicas 40k, sessions 23k,
+  all-max, all-max and base with a real >= 400 MiB WAL; each non-base cell <= 1.5x base. Zero span fallbacks
+  (the P1 run11 ceiling). A RED control replays base without the reader deferral.
+- tests/tui_gateway/test_j_nonrpc_producer_pid_rows.py: producer <= 0.2% (11 stores, sessions 5k/23k,
+  checkpointed and >= 400 MiB WAL) and PID memo <= 0.05% (11 profiles, 300 lists, RECHECK_S backstop).
+  Dimensions a path never reads are named as inapplicable in each docstring.
+- The minutes-long cells run with J_ROWS_RUN=1 (operator benchmark); PID memo runs in the default suite.
+- test_producer_admission_gate / test_status_pid_memo / test_watch_store_gate / test_notify_subs_gate:
+  single trial instead of min-of-N; rates and thresholds unchanged.
+- test_kanban_remote_index_defer: an absolute one-poll bound (a 1e9 DEFER_MAX_S mutant survived the
+  relative tests); the no-holder cases as a table.
+
+Measured at this tree (worker-5, load 19-40, one run each, 14 passed): rows 0.51-0.60% of a core, growth
+<= 1.13x base, reader computes 0, 0 fallbacks, max notice latency 5.0 s; RED control 0.98% with 20 reader
+computes. Producer 0.0095-0.0107%, PID memo 0.018%. Remote-index holder CPU (2.0-2.2% at 10k replicas,
+8.3-10.0% at 40k) is recorded, not charged: design §3 books the remote index to H3. Gate mutation audit:
+13 mutants, all RED.
+---
+ tests/gateway/test_status_pid_memo.py         |  16 +-
+ tests/tui_gateway/j_nonrpc_scheduler.py       |  85 +++
+ .../test_j_nonrpc_producer_pid_rows.py        | 148 +++++
+ tests/tui_gateway/test_j_nonrpc_rows.py       | 592 ++++++++++++++++++
+ .../test_kanban_remote_index_defer.py         |  33 +-
+ tests/tui_gateway/test_notify_subs_gate.py    |  30 +-
+ .../test_producer_admission_gate.py           |  21 +-
+ tests/tui_gateway/test_watch_store_gate.py    |  24 +-
+ 8 files changed, 891 insertions(+), 58 deletions(-)
+ create mode 100644 tests/tui_gateway/j_nonrpc_scheduler.py
+ create mode 100644 tests/tui_gateway/test_j_nonrpc_producer_pid_rows.py
+ create mode 100644 tests/tui_gateway/test_j_nonrpc_rows.py
+
+diff --git a/tests/gateway/test_status_pid_memo.py b/tests/gateway/test_status_pid_memo.py
+index a422478007..af7d4351c9 100644
+--- a/tests/gateway/test_status_pid_memo.py
++++ b/tests/gateway/test_status_pid_memo.py
+@@ -202,16 +202,14 @@ def test_replay_budget_polled_profile_list(files, monkeypatch):
+     try:
+         for p in paths:
+             memo.running_pid(p, probe=probe)
+-        best = float("inf")
+-        for _ in range(5):
+-            t0 = time.thread_time()
+-            for _ in range(50):
+-                for p in paths:
+-                    assert memo.running_pid(p, probe=probe) == pid
+-            best = min(best, (time.thread_time() - t0) / 50)
++        t0 = time.thread_time()
++        for _ in range(50):
++            for p in paths:
++                assert memo.running_pid(p, probe=probe) == pid
++        per_list = (time.thread_time() - t0) / 50
+     finally:
+         for h in held:
+             h.close()
+     assert probe.calls == len(paths)
+-    per_second = best / 2.0  # one profile list every 2 s
+-    assert per_second <= 0.0005, f"{best * 1000:.3f} ms per list = {per_second:.4%} of a core"
++    per_second = per_list / 2.0  # one profile list every 2 s
++    assert per_second <= 0.0005, f"{per_list * 1000:.3f} ms per list = {per_second:.4%} of a core"
+diff --git a/tests/tui_gateway/j_nonrpc_scheduler.py b/tests/tui_gateway/j_nonrpc_scheduler.py
+new file mode 100644
+index 0000000000..35b0a67257
+--- /dev/null
++++ b/tests/tui_gateway/j_nonrpc_scheduler.py
+@@ -0,0 +1,85 @@
++"""Deterministic scheduling at the real poller's blocking queue boundary.
++
++No production subpoll is replaced. Only queue waiting is virtual: each waiter
++uses the actual production due_timeout, and real take_ready keeps event custody.
++Single-file benchmark callers must finish all workers before undoing patches.
++"""
++import threading
++import time
++from collections import defaultdict
++
++
++class PollerScheduler:
++    def __init__(self, clock, real_take):
++        self.clock = clock
++        self.real_take = real_take
++        self.condition = threading.Condition()
++        self.waiting = {}
++        self.permits = set()
++        self.errors = []
++        self.threads = []
++        self.stops = []
++        self.samples = defaultdict(list)
++        self.timeouts = defaultdict(list)
++        self.starts = {}
++        self.closed = False
++
++    def take(self, queue, timeout, **kwargs):
++        ident = threading.get_ident()
++        ready = self.real_take(queue, 0, **kwargs)
++        if ready or timeout <= 0 or self.closed:
++            return ready
++        with self.condition:
++            self.samples[ident].append(time.thread_time() - self.starts[ident])
++            self.timeouts[ident].append(timeout)
++            self.waiting[ident] = self.clock[0] + timeout
++            self.condition.notify_all()
++            assert self.condition.wait_for(lambda: ident in self.permits or self.closed, 30), "scheduler stalled"
++            self.permits.discard(ident)
++            self.waiting.pop(ident, None)
++        self.starts[ident] = time.thread_time()
++        return self.real_take(queue, 0, **kwargs)
++
++    def start(self, target, stop, sid, session):
++        def run():
++            ident = threading.get_ident()
++            self.starts[ident] = time.thread_time()
++            try:
++                target(stop, sid, session)
++            except BaseException as exc:
++                self.errors.append(repr(exc))
++            finally:
++                with self.condition:
++                    self.samples[ident].append(time.thread_time() - self.starts[ident])
++                    self.condition.notify_all()
++        thread = threading.Thread(target=run, name=f"replay-{sid}", daemon=True)
++        self.threads.append(thread)
++        self.stops.append(stop)
++        thread.start()
++        with self.condition:
++            assert self.condition.wait_for(lambda: thread.ident in self.waiting or self.errors, 30)
++            assert not self.errors, self.errors
++
++    def advance(self, now):
++        # No worker runs while the controller changes inputs and the shared clock.
++        with self.condition:
++            assert len(self.waiting) == len(self.threads)
++            self.clock[0] = now
++            due = [ident for ident, deadline in self.waiting.items() if deadline <= now]
++            for ident in due:
++                before = len(self.samples[ident])
++                self.permits.add(ident)
++                self.condition.notify_all()
++                assert self.condition.wait_for(lambda: len(self.samples[ident]) > before or self.errors, 30)
++                assert not self.errors, self.errors
++
++    def close(self):
++        for stop in self.stops:
++            stop.set()
++        with self.condition:
++            self.closed = True
++            self.condition.notify_all()
++        for thread in self.threads:
++            thread.join(30)
++            assert not thread.is_alive(), thread.name
++        assert not self.errors, self.errors
+diff --git a/tests/tui_gateway/test_j_nonrpc_producer_pid_rows.py b/tests/tui_gateway/test_j_nonrpc_producer_pid_rows.py
+new file mode 100644
+index 0000000000..366e5e27cd
+--- /dev/null
++++ b/tests/tui_gateway/test_j_nonrpc_producer_pid_rows.py
+@@ -0,0 +1,148 @@
++"""J complete producer and PID-memo rows over a 600 s window. [daveey]
++
++Card J (t_01a1d862f6e2fc9e), design t_01a1d563324d7e8e §3: producer_admission <= 0.2% of a core, gateway PID
++memo <= 0.05%. The component benches in test_producer_admission_gate.py and test_status_pid_memo.py time a few
++passes; these replay the whole 600 s window of the measured stream through the real code, once (no best-of).
++
++Producer: 11 profile stores (the hub's count), the real ``sweep_once`` every ``INTERVAL_S`` (40 passes), each
++store committing before every pass (state.db's data_version moved in 140 of 300 2 s windows, so every 15 s pass
++sees one: the measured stream's worst case). The root store carries the sessions (5k / 23k), checkpointed or
++with a real >= 400 MiB WAL held by a long reader. Board tasks and replica rows are not read by the producer (its
++only query is ``producer_admissions`` on each state.db), so those dimensions do not apply.
++
++PID memo: 11 profiles listed every 2 s (300 lists) on a virtual clock, so the ``RECHECK_S`` backstop fires as it
++does live (every 30 s, each profile reprobed). The probe is the real ``get_running_pid`` against real PID and
++lock files whose lock this process holds; only the gateway identity matcher is replaced, because a pytest
++process's command line is not a gateway's. This path reads no SQLite store, session, task or replica row, so
++none of the scale or WAL dimensions apply. It takes well under a second, so it runs in the default suite; the
++producer cells (each pads a 400 MiB WAL or compares growth on millisecond passes) need ``J_ROWS_RUN=1``.
++"""
++import contextlib
++import fcntl
++import json
++import os
++import sqlite3
++import time
++
++import pytest
++
++from tests.tui_gateway.test_j_nonrpc_rows import WAL_BYTES, _pad_wal, _production_io, _write_evidence
++from tests.tui_gateway.test_producer_admission import _db
++from tui_gateway import producer_admission as delivery
++
++SECONDS, PROFILES = 600, 11
++PRODUCER_CELLS = {
++    "s5k": {"sessions": 5000, "large_wal": False},
++    "s23k": {"sessions": 23_000, "large_wal": False},
++    "s5k_wal400m": {"sessions": 5000, "large_wal": True},
++    "s23k_wal400m": {"sessions": 23_000, "large_wal": True},
++}
++_PRODUCER: dict = {}
++
++
++@pytest.fixture(autouse=True)
++def _fresh_observers():
++    delivery.reset_observers()
++    yield
++    delivery.reset_observers()
++
++
++@pytest.mark.skipif(not os.environ.get("J_ROWS_RUN"), reason="J full-row benchmark: set J_ROWS_RUN=1 on a quiet host")
++@pytest.mark.parametrize("name", list(PRODUCER_CELLS))
++def test_complete_producer_row(name):
++    cell = PRODUCER_CELLS[name]
++    stores = [_db(None)] + [_db(f"p{n}") for n in range(PROFILES - 1)]
++    holders = []
++    try:
++        for db in stores:
++            db.create_session("s0", "desktop")
++        root = stores[0].db_path
++        with contextlib.closing(sqlite3.connect(root)) as writer:
++            writer.executemany("INSERT INTO sessions(id, source, started_at) VALUES (?, 'cli', 1)",
++                               [(f"r{n}",) for n in range(cell["sessions"])])
++            writer.commit()
++        if cell["large_wal"]:
++            _pad_wal(root, holders)
++        else:
++            with contextlib.closing(sqlite3.connect(root)) as conn:
++                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
++        assert delivery.sweep_once() == []  # cold pass: opens the observers, not part of the window
++        passes = int(SECONDS / delivery.INTERVAL_S)
++        samples = []
++        with _production_io():
++            for i in range(passes):
++                for db in stores:
++                    db.append_message("s0", "user", f"tick {i}")
++                started = time.thread_time()
++                assert delivery.sweep_once() == []
++                samples.append(time.thread_time() - started)
++        wal = os.path.getsize(f"{root}-wal") if os.path.exists(f"{root}-wal") else 0
++    finally:
++        for db in stores:
++            db.close()
++        for conn in holders:
++            conn.close()
++    evidence = {"row": "producer", "cell": cell, "name": name, "passes": passes, "stores": PROFILES,
++                "cpu_s": sum(samples), "samples_s": samples, "core": sum(samples) / SECONDS, "root_wal_bytes": wal}
++    _write_evidence(evidence)
++    _PRODUCER[name] = evidence
++    assert passes == 40
++    if cell["large_wal"]:
++        assert wal >= WAL_BYTES, evidence
++    assert evidence["core"] <= 0.002, evidence
++    if name != "s5k":
++        base = _PRODUCER.get("s5k")
++        assert base is not None, "run the whole parametrization: growth compares with the s5k cell"
++        assert evidence["core"] / base["core"] <= 1.5, (evidence["core"], base["core"])
++
++
++def test_complete_pid_memo_row(tmp_path, monkeypatch):
++    from gateway import status
++    from gateway import status_pid_memo as memo
++
++    memo.clear()
++    me = os.getpid()
++    monkeypatch.setattr(status, "_record_matches_live_gateway_pid",
++                        lambda record, pid, **kwargs: pid == me)  # the identity matcher: not a gateway argv
++    record = {"pid": me, "kind": "hermes-gateway", "start_time": status._get_process_start_time(me)}
++    paths, held = [], []
++    for n in range(PROFILES):
++        home = tmp_path / f"p{n}"
++        home.mkdir()
++        pid_path = home / "gateway.pid"
++        pid_path.write_text(json.dumps(dict(record, hermes_home=str(home))))
++        lock = status._get_gateway_lock_path(pid_path)
++        lock.write_text(json.dumps(dict(record, hermes_home=str(home))))
++        handle = open(lock, "r+")  # a real held lock, so the real probe takes its live-gateway branch
++        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
++        held.append(handle)
++        paths.append(pid_path)
++    probes = []
++    real_probe = memo._default_probe
++
++    def probe(path):
++        probes.append(path)
++        return real_probe(path)
++
++    monkeypatch.setattr(memo, "_default_probe", probe)
++    try:
++        for path in paths:  # the Desktop's first list: every profile probed once, outside the window
++            assert memo.running_pid(path, now=0.0) == me
++        probes.clear()
++        lists = SECONDS // 2
++        with _production_io():
++            started = time.thread_time()
++            for i in range(1, lists + 1):
++                for path in paths:
++                    assert memo.running_pid(path, now=2.0 * i) == me
++            cpu = time.thread_time() - started
++    finally:
++        for handle in held:
++            handle.close()
++        memo.clear()
++    rechecks = len(probes) // PROFILES
++    evidence = {"row": "pid_memo", "lists": lists, "profiles": PROFILES, "probes": len(probes),
++                "rechecks_per_profile": rechecks, "cpu_s": cpu, "core": cpu / SECONDS}
++    _write_evidence(evidence)
++    assert len(probes) % PROFILES == 0 and rechecks == int(SECONDS // memo.RECHECK_S), evidence
++    assert evidence["core"] <= 0.0005, evidence
+diff --git a/tests/tui_gateway/test_j_nonrpc_rows.py b/tests/tui_gateway/test_j_nonrpc_rows.py
+new file mode 100644
+index 0000000000..47f8c4b22f
+--- /dev/null
++++ b/tests/tui_gateway/test_j_nonrpc_rows.py
+@@ -0,0 +1,592 @@
++"""J complete serve/gateway rows: change_watcher + session notification pollers on a moving replica. [daveey]
++
++Card J (t_01a1d862f6e2fc9e). P1 run11 measured the rows as watcher + notification pollers in one process:
++serve <= 0.7% of a core, gateway <= 0.8%. This replays 600 s of measured input against the real code, with the
++virtual clock only at the blocking waits (``tests/tui_gateway/j_nonrpc_scheduler.py``):
++
++- watcher: every production watch, real frames to ten transports, the chg1 state stream
++  (140 commits: 83 message, 2 title, 55 activity), and the hub's three skill roots (exact counts);
++- pollers: the real ``_notification_poller_scoped_loop`` with PollerStop deadlines, SQL, claims and custody.
++  The poller count is P1's: 202 serve poll_kanban runs in 547 s (1.85 pollers) and 871 gateway runs in 3721 s
++  (1.17), both rounded up to 2. Only ``_notif_run_submit`` (the model turn) is replaced, by a recorder;
++- local board: ``tasks`` cards (1k / 5.8k / 20k) plus 12 new subscribed cards completed during the window;
++- replica: ``replicas`` task rows (10k / 40k, real hub schema and indexes, ~4.7 KB payloads like the live
++  replica) with the rf2 task stream doubled to 600 s: 80 change windows, 568 row changes, 12 of them new done
++  cards for the two chats;
++- holder: the lease ``kanban-remote-index`` beats and ``kanban_remote_index.refresh`` republishes on the first
++  whole second at least 1 s after a replica commit (P1: 1 s poll + build). Its CPU is recorded, not charged to
++  the row: it is its own host loop (``remote_index.refresh``), held by one process per host, and design §3
++  books the remote index, like ``links_refresh`` (its own refresher thread), to H3, not J.
++
++This is a count-preserving reconstruction: rf2/chg1 record counts per window, not the original order.
++Sessions (5k / 23k) only enter the watcher and lineage reads; tasks only the local board polls; replica rows
++only the remote collect. Each cell varies one dimension from the base, plus all-max with each WAL state, so
++the <= 1.5x growth checks compare like with like. A >= 400 MiB WAL is held by a long reader on all three
++databases (the only way a live WAL stays that large). Every cell runs once: no best-of, no retry.
++The gateway row (<= 0.8%) runs the same watcher and pollers (P1: notifications.* spans in the gateway, 1.17
++pollers), so the stricter serve bound is asserted for both.
++
++These cells are minutes long, so they run only with ``J_ROWS_RUN=1`` (an operator benchmark, like the P1
++profile it reproduces): CPU shares need a host that is not running sixteen other test files, and the
++default suite's per-file cap is 300 s. The per-gate RED/GREEN tests stay in the default suite.
++"""
++import builtins
++import contextlib
++import io
++import json
++import os
++import shutil
++import sqlite3
++import threading
++import time
++from collections import Counter
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_constants import reset_hermes_home_override, set_hermes_home_override
++from hermes_state import SessionDB
++from tui_gateway import server, watch_store
++
++CHATS = ("20261114_090000_a1b2c3", "20261114_090000_d4e5f6")
++# Operator benchmark: J_ROWS_RUN=1 J_ROWS_EVIDENCE=<abs .jsonl> python -m pytest <this file> -p no:randomly
++pytestmark = pytest.mark.skipif(not os.environ.get("J_ROWS_RUN"),
++                                reason="J full-row benchmark: minutes per cell, set J_ROWS_RUN=1 on a quiet host")
++SECONDS, TICK, POLLERS, WARM_TICKS = 600, 0.5, 2, 60
++WAL_BYTES = 400 * 1024 * 1024
++BASE = {"tasks": 1000, "replicas": 10_000, "sessions": 5000, "large_wal": False}
++CELLS = {
++    "base": BASE,
++    "tasks5800": dict(BASE, tasks=5800),
++    "tasks20k": dict(BASE, tasks=20_000),
++    "replicas40k": dict(BASE, replicas=40_000),
++    "sessions23k": dict(BASE, sessions=23_000),
++    "max": {"tasks": 20_000, "replicas": 40_000, "sessions": 23_000, "large_wal": False},
++    "max_wal400m": {"tasks": 20_000, "replicas": 40_000, "sessions": 23_000, "large_wal": True},
++    "base_wal400m": dict(BASE, large_wal=True),
++}
++_RESULTS: dict = {}
++# Every function tests/home_io_guard.py wraps (it keeps the original in __wrapped__).
++_GUARDED = ((builtins, "open"), (io, "open"), (os, "mkdir"), (os, "unlink"), (os, "remove"), (os, "rmdir"),
++            (os, "chmod"), (os, "utime"), (os, "stat"), (os, "lstat"), (os, "readlink"), (os, "access"),
++            (os, "makedirs"), (os, "listdir"), (os, "scandir"), (os, "rename"), (os, "replace"),
++            (shutil, "rmtree"), (sqlite3, "connect"), (os, "open"), (os, "close"))
++
++
++@contextlib.contextmanager
++def _production_io():
++    """Measure production cost, not the suite's HomeIOGuard: its Python checks on every stat/open/connect
++    doubled the measured row (0.55-0.62% vs 0.30% of a core for the base cell). Setup and the warm-up run
++    guarded, and they exercise the same code paths against the same temporary home; only the measured
++    window runs on the originals (the precedent is tests/gateway/test_status_pid_memo.py)."""
++    saved = [(module, name, getattr(module, name)) for module, name in _GUARDED]
++    for module, name, fn in saved:
++        setattr(module, name, getattr(fn, "__wrapped__", fn))
++    try:
++        yield
++    finally:
++        for module, name, fn in saved:
++            setattr(module, name, fn)
++
++
++class RecordingTransport:
++    def __init__(self):
++        self.frames = []
++
++    def write(self, frame):
++        self.frames.append(frame)
++
++
++def _pad_wal(path, holders):
++    """Real committed WAL frames (not a sparse file) past 400 MiB, with checkpoints off. The padding
++    connection stays open for the cell (``holders``), holding a read transaction: SQLite checkpoints and
++    deletes the WAL when the last connection closes, and resets it once no reader needs its frames."""
++    conn = sqlite3.connect(path)
++    holders.append(conn)
++    conn.execute("PRAGMA journal_mode=WAL")
++    conn.execute("PRAGMA wal_autocheckpoint=0")
++    conn.execute("CREATE TABLE IF NOT EXISTS replay_padding (payload BLOB)")
++    conn.commit()
++    for _ in range(101):
++        conn.execute("INSERT INTO replay_padding VALUES (zeroblob(4194304))")
++        conn.commit()
++    # A live WAL stays this large only while a long reader starves the checkpointer; without one the
++    # production connections' autocheckpoint plus journal_size_limit cut it to 8-64 MiB within seconds.
++    conn.execute("BEGIN")
++    conn.execute("SELECT count(*) FROM replay_padding").fetchone()
++    assert os.path.getsize(f"{path}-wal") >= WAL_BYTES
++
++
++def _checkpoint(path):
++    with contextlib.closing(sqlite3.connect(path)) as conn:
++        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
++
++
++def _filler_task(n):
++    return {"id": f"t_fill{n:06d}", "status": "done", "title": f"filler {n}", "board": "default",
++            "assignee": "default", "created_at": 1_700_000_000, "completed_at": 1_700_000_000 + n,
++            "body": "x" * 4400, "comments": [], "last_comments": [], "parents": [], "children": [],
++            "run": {"ended_at": 1_700_000_000 + n, "summary": "filler"},
++            "sessions": [{"gw": "elsewhere", "profile": "default", "session": f"other_{n % 700}",
++                          "rel": "shepherd"}]}
++
++
++def _done_card(tid, chat, at):
++    task = {"id": tid, "status": "done", "title": tid, "board": "default", "assignee": "default",
++            "completed_at": at, "sessions": [{"gw": "macbook", "profile": "default", "session": chat,
++                                              "rel": "shepherd"}],
++            "completion_notice": {"event_id": 9000 + int(tid[-3:]) + (500 if "warm" in tid else 0),
++                                  "payload": {"summary": f"done {tid}"}}}
++    return f"default/default/{tid}", task
++
++
++def _build_replica(path, rows):
++    with contextlib.closing(sqlite3.connect(path)) as conn:
++        conn.execute("PRAGMA journal_mode=WAL")
++        conn.execute("CREATE TABLE meta(k TEXT PRIMARY KEY, v TEXT)")
++        conn.executemany("INSERT INTO meta VALUES (?, ?)",
++                         [("gateway", "macbook"), ("cursor", "100"), ("head", "100")])
++        conn.execute("CREATE TABLE replica (gw TEXT, coll TEXT, key TEXT, version INTEGER, seq INTEGER, "
++                     "data TEXT, updated_at INTEGER, PRIMARY KEY (gw, coll, key))")
++        conn.execute("CREATE INDEX replica_coll ON replica(coll)")
++        conn.execute("CREATE INDEX replica_poll_metadata ON replica(coll, gw, seq)")
++        conn.execute("CREATE INDEX replica_owner_seen ON replica(gw, updated_at)")
++        conn.executemany("INSERT INTO replica VALUES ('hub', 'tasks', ?, 1, ?, ?, 0)",
++                         ((f"default/default/t_fill{n:06d}", n + 1, json.dumps(_filler_task(n)))
++                          for n in range(rows)))
++        conn.commit()
++    return rows + 1
++
++
++def _build_board(tasks):
++    """``tasks`` real board rows: one created by the API, the rest copies of it with fresh ids."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++
++    with contextlib.closing(kbc.connect()) as conn:
++        seed = kb.create_task(conn, title="filler", assignee="default")
++        kb.complete_task(conn, seed, summary="filler")
++        cols = [row[1] for row in conn.execute("PRAGMA table_info(tasks)")]
++        picked = ", ".join("?" if c == "id" else c for c in cols)
++        with kb.write_txn(conn):
++            conn.executemany(f"INSERT INTO tasks ({', '.join(cols)}) SELECT {picked} FROM tasks WHERE id = ?",
++                             ((f"t_board{n:06d}", seed) for n in range(tasks - 1)))
++        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == tasks
++    return kb.kanban_db_path(board=kb.DEFAULT_BOARD)
++
++
++def _rf2_windows():
++    """600 s of rf2 doubled: 80 task change windows, 568 row changes, 12 new done cards for the chats."""
++    windows = [w for w in range(SECONDS // 2) if (w + 1) * 80 // 300 != w * 80 // 300]
++    assert len(windows) == 80
++    plan = {}
++    for i, w in enumerate(windows):
++        changes = (i + 1) * 568 // 80 - i * 568 // 80
++        new = (i + 1) * 12 // 80 - i * 12 // 80
++        plan[w] = (changes - new, new)
++    assert sum(c + n for c, n in plan.values()) == 568 and sum(n for _, n in plan.values()) == 12
++    return plan
++
++
++def _lease_beat(lease_path):
++    lease_path.write_text(json.dumps({"name": "kanban-remote-index", "held": True, "pid": os.getpid(),
++                                      "start": None, "role": "gateway", "priority": 2, "interval": 5.0,
++                                      "heartbeat_at": time.time()}))
++
++
++def _skill_tree(root, skills, walked, dirs, files):
++    """A skill root with the hub's live shape (``find -L``: SKILL.md count, directories the catalog walks,
++    all directories, files), so ``skills.changed`` walks what the hub serve walks. ``walked`` excludes the
++    support and cache directories the signature prunes (references/, scripts/, templates/, __pycache__/ under
++    a skill: most of the hub's directories). Names are synthetic; the counts and the pruned names are the hub's."""
++    from tools.skills_tool import _dir_tree_signature
++    root.mkdir(parents=True)
++    categories = min(max(1, skills // 9), walked - 1 - skills)
++    skill_dirs = []
++    for n in range(skills):
++        skill = root / f"cat{n % categories:02d}" / f"skill{n:03d}"
++        skill.mkdir(parents=True)
++        (skill / "SKILL.md").write_text(f"---\nname: skill{n:03d}\ndescription: replay skill {n}\n---\nbody\n")
++        skill_dirs.append(skill)
++    for n in range(walked - 1 - categories - skills):  # walked non-support dirs inside skills (tests/, v/)
++        (skill_dirs[n % skills] / f"tests{n}").mkdir()
++    pruned = []
++    for n in range(dirs - walked):  # one per support name per skill, then nested inside them
++        slot, name = divmod(n, 4)
++        if slot < skills:
++            pruned.append(skill_dirs[slot] / ("references", "scripts", "templates", "__pycache__")[name])
++            pruned[-1].mkdir()
++        else:
++            (pruned[n % len(pruned)] / f"sub{n}").mkdir()
++    for n in range(files - skills):  # half beside SKILL.md, half in the pruned support dirs
++        parent = skill_dirs[n % skills] if n % 2 or not pruned else pruned[n % len(pruned)]
++        (parent / f"ref{n}.md").write_text("x\n")
++    assert 1 + sum(1 for p in root.rglob("*") if p.is_dir()) == dirs
++    assert sum(1 for p in root.rglob("*") if p.is_file()) == files
++    rows = []
++    _dir_tree_signature(str(root), rows)
++    assert len(rows) == walked, (root, len(rows), walked)
++
++
++@pytest.fixture
++def row_home(tmp_path, monkeypatch):
++    home = tmp_path / "home"
++    home.mkdir()
++    # The hub's three skill roots (its own plus two external_dirs), counted with find -L on 2026-11-14:
++    # SKILL.md files, directories outside pruned support/cache dirs, all directories, files.
++    _skill_tree(home / "skills", 4, 18, 22, 119)
++    _skill_tree(tmp_path / "mods-skills", 27, 49, 100, 315)
++    _skill_tree(tmp_path / "state-skills", 187, 229, 468, 1487)
++    (home / "config.yaml").write_text(
++        f"display: {{}}\nskills:\n  external_dirs:\n    - {tmp_path / 'mods-skills'}\n"
++        f"    - {tmp_path / 'state-skills'}\n")
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(home / "kanban"))
++    monkeypatch.setenv("HERMES_HUB_STATE", str(tmp_path / "hub"))
++    (tmp_path / "hub").mkdir()
++    token = set_hermes_home_override(str(home))
++    monkeypatch.setattr(server, "_hermes_home", str(home))
++    monkeypatch.setattr(server, "_served_profile_homes", ())
++    monkeypatch.setattr(server, "_cfg_cache", None)
++    for name in ("_change_sigs", "_change_checked_at", "_change_broadcast_at",
++                 "_sessions_db_sig_cache", "_sessions_digest_at", "_sessions_db_identity",
++                 "_room_store_sig_cache", "_groups_woken_heads", "_skin_sig_by_home"):
++        monkeypatch.setattr(server, name, {})
++    peers = [RecordingTransport() for _ in range(10)]
++    monkeypatch.setattr(server, "_live_transports", set(peers))
++    watch_store.reset()
++    from tui_gateway import kanban_remote_notices as krn
++    krn._reset_for_tests()
++    try:
++        yield home, peers
++    finally:
++        krn._reset_for_tests()
++        watch_store.reset()
++        reset_hermes_home_override(token)
++
++
++def _seed(home, cell, wal_holders):
++    """The cell's stores: sessions, the two chats, the board, the replica and the holder's first copy."""
++    from hermes_cli.host_loop_lease import lease_dir
++    from tui_gateway import kanban_remote_index as kri
++    from tui_gateway import kanban_remote_notices as krn
++
++    state = home / "state.db"
++    owner = SessionDB(state)
++    with contextlib.closing(sqlite3.connect(state)) as writer:
++        writer.executemany("INSERT INTO sessions(id, source, started_at) VALUES (?, 'cli', 1)",
++                           [(f"s{n}",) for n in range(cell["sessions"])])
++        writer.commit()
++    for chat in CHATS:
++        owner.create_session(session_id=chat, source="cli")
++    board = _build_board(cell["tasks"])
++    replica = krn.hub_db_path()
++    seq = _build_replica(replica, cell["replicas"])
++    ledger = krn.ledger_path()
++    ledger.parent.mkdir(parents=True, exist_ok=True)
++    for path in (state, board, replica):
++        _pad_wal(path, wal_holders) if cell["large_wal"] else _checkpoint(path)
++    lease = lease_dir() / f"{kri.LEASE}.lock"
++    lease.parent.mkdir(parents=True, exist_ok=True)
++    _lease_beat(lease)
++    assert kri.refresh(replica, ledger)  # the holder's copy of the starting state
++    return SimpleNamespace(state=state, owner=owner, board=board, replica=replica, ledger=ledger, lease=lease,
++                           seq=seq)
++
++
++def _instrument(monkeypatch, home, clock, reader_defers):
++    """Virtual clock at the waits, the model turn replaced by a recorder, and CPU attribution wrappers."""
++    from hermes_cli import loop_accounting
++    from tui_gateway import kanban_remote_index as kri
++
++    monkeypatch.setattr(server, "time", SimpleNamespace(monotonic=lambda: clock[0], time=time.time))
++    monkeypatch.setattr(kri, "_clock", lambda: clock[0])
++    monkeypatch.setattr(server, "_launch_home", home)
++    ins = SimpleNamespace(errors=[], delivered=[], computes=Counter(), calls=Counter(), cpu_by_name=Counter())
++    monkeypatch.setattr(server, "_notif_log_failure", lambda *args: ins.errors.append(repr(args)))
++
++    def model_turn(rid, sid, session, text, **kwargs):  # the only replaced boundary: the agent turn
++        ins.delivered.append((clock[0], sid, text))
++        server._notif_release_turn(session)
++        return True
++
++    monkeypatch.setattr(server, "_notif_run_submit", model_turn)
++    real_compute = kri.compute
++
++    def compute(*args, **kwargs):
++        ins.computes["reader" if threading.current_thread().name.startswith("replay-") else "holder"] += 1
++        return real_compute(*args, **kwargs)
++
++    monkeypatch.setattr(kri, "compute", compute)
++    if not reader_defers:
++        monkeypatch.setattr(kri, "defer", lambda *a, **k: False)  # RED control: the pre-fix reader
++    real_timed = loop_accounting.timed
++
++    def timed(name, fn, *args, **kwargs):
++        ins.calls[name] += 1
++        started = time.thread_time()
++        try:
++            return real_timed(name, fn, *args, **kwargs)
++        finally:
++            ins.cpu_by_name[name] += time.thread_time() - started
++
++    monkeypatch.setattr(loop_accounting, "timed", timed)
++    real_remote = server._collect_remote_kanban_notifications
++
++    def remote(*args, **kwargs):  # attribution only: the remote half of poll_kanban
++        started = time.thread_time()
++        try:
++            return real_remote(*args, **kwargs)
++        finally:
++            ins.cpu_by_name["poll_kanban.remote_collect"] += time.thread_time() - started
++
++    monkeypatch.setattr(server, "_collect_remote_kanban_notifications", remote)
++    return ins
++
++
++def _complete_local(chat, title, summary):
++    """A real local card with a TUI notify subscription for ``chat``, completed."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_db_notify as kbn
++
++    with contextlib.closing(kbc.connect()) as conn:
++        tid = kb.create_task(conn, title=title, assignee="default")
++        kbn.add_notify_sub(conn, task_id=tid, platform="tui", chat_id=chat)
++        kb.complete_task(conn, tid, summary=summary)
++    return tid
++
++
++def _holder_pass(cx, now, measure):
++    """The holder's 1 s pass: beat, and republish once at least 1 s after the first unpublished commit."""
++    from tui_gateway import kanban_remote_index as kri
++
++    _lease_beat(cx.seed.lease)
++    if cx.stale_since is not None and now - cx.stale_since >= 1.0:
++        started = time.thread_time()
++        assert kri.refresh(cx.seed.replica, cx.seed.ledger)
++        if measure:
++            cx.holder_cpu += time.thread_time() - started
++        cx.stale_since = None
++
++
++def _replica_commit(cx, window, now, replicas):
++    """One rf2 change window: ``restamps`` filler rows re-stamped plus ``new`` done cards for the chats."""
++    restamps, new = cx.plan[window]
++    for r in range(restamps):
++        n = (window * 37 + r * 101) % replicas
++        task = _filler_task(n)
++        task["run"]["ended_at"] = now
++        cx.seed.seq += 1
++        cx.rwriter.execute("UPDATE replica SET seq = ?, data = ? WHERE coll = 'tasks' AND key = ?",
++                           (cx.seed.seq, json.dumps(task), f"default/default/t_fill{n:06d}"))
++    for _ in range(new):
++        tid = f"t_remote{cx.counts['remote']:03d}"
++        key, task = _done_card(tid, CHATS[cx.counts["remote"] % POLLERS], time.time() - 30)
++        cx.seed.seq += 1
++        cx.rwriter.execute("INSERT INTO replica VALUES ('hub', 'tasks', ?, 1, ?, ?, 0)",
++                           (key, cx.seed.seq, json.dumps(task)))
++        cx.commits[tid] = now
++        cx.counts["remote"] += 1
++    cx.rwriter.commit()
++    cx.counts["replica_rows"] += restamps + new
++    cx.stale_since = cx.stale_since if cx.stale_since is not None else now
++
++
++def _warm_tick(cx, tick, warm_local):
++    """Warm-up (not measured): a live serve is minutes old when P1 samples it, so one remote and one local
++    notice per chat are delivered first; that builds the per-process replica projections the delivery path
++    reads (a one-off ~1.8 s at 10k rows), as they were long built in the live process."""
++    now = 1000.0 + (tick + 1) * TICK
++    if tick == 1:
++        for n, chat in enumerate(CHATS[:POLLERS]):
++            key, task = _done_card(f"t_warmr{n:03d}", chat, time.time() - 30)
++            cx.seed.seq += 1
++            cx.rwriter.execute("INSERT INTO replica VALUES ('hub', 'tasks', ?, 1, ?, ?, 0)",
++                               (key, cx.seed.seq, json.dumps(task)))
++        cx.rwriter.commit()
++        cx.stale_since = now
++    if tick == 3:
++        for n, chat in enumerate(CHATS[:POLLERS]):
++            warm_local.append(_complete_local(chat, f"warm {n}", f"warm done {n}"))
++    cx.clock[0] = now
++    if now == int(now):
++        _holder_pass(cx, now, measure=False)
++    _watch_pass(now)
++    cx.scheduler.advance(now)
++
++
++def _measured_tick(cx, tick, start, replicas):
++    now = start + (tick + 1) * TICK
++    if tick % 4 == 0 and _state_stream(cx.swriter, tick // 4):
++        cx.counts["state"] += 1
++    if tick % 4 == 1 and tick // 4 in cx.plan:  # replica commit inside the 2 s window
++        _replica_commit(cx, tick // 4, now, replicas)
++    if tick in cx.local_due:
++        n = cx.local_due[tick]
++        cx.commits[_complete_local(CHATS[n % POLLERS], f"local {n}", f"local done {n}")] = now
++        cx.counts["local"] += 1
++    cx.clock[0] = now
++    if now == int(now):  # the holder's 1 s pass
++        _holder_pass(cx, now, measure=True)
++    started = time.thread_time()
++    _watch_pass(now)
++    cx.watcher_cpu += time.thread_time() - started
++    cx.scheduler.advance(now)
++
++
++def _span_delta(before, after):
++    """The production loop accounting over the window: the span names P1 reports, with their fallbacks."""
++    spans = {}
++    for name, end in after.items():
++        begin = before.get(name, {})
++        delta = {k: round(end[k] - begin.get(k, 0), 6) for k in ("runs", "skips", "changes", "fallbacks", "cpu_s")}
++        if delta["runs"]:
++            spans[name] = delta
++    return spans
++
++
++def _run_cell(home, peers, monkeypatch, cell, reader_defers=True):
++    from hermes_cli import loop_accounting
++    from tests.tui_gateway.j_nonrpc_scheduler import PollerScheduler
++    from tools import process_registry, process_registry_awaiting
++    from tools.skills_tool import skill_search_dirs
++    from tui_gateway import kanban_remote_index as kri
++    from tui_gateway.notification_wait import PollerStop
++
++    wal_holders = []
++    skill_roots = sorted(str(d) for _tier, d in skill_search_dirs()[0])
++    assert {"mods-skills", "state-skills", "skills"} <= {os.path.basename(d) for d in skill_roots}, skill_roots
++    seed = _seed(home, cell, wal_holders)
++    clock = [1000.0]
++    ins = _instrument(monkeypatch, home, clock, reader_defers)
++    registry = process_registry.ProcessRegistry()
++    monkeypatch.setattr(process_registry, "process_registry", registry)
++    scheduler = PollerScheduler(clock, process_registry_awaiting.take_ready)
++    monkeypatch.setattr(process_registry_awaiting, "take_ready", scheduler.take)
++    cx = SimpleNamespace(seed=seed, clock=clock, scheduler=scheduler, plan=_rf2_windows(), commits={},
++                         local_due={int((n + 0.5) * SECONDS / 12 / TICK): n for n in range(12)},  # evenly spaced
++                         watcher_cpu=0.0, holder_cpu=0.0, stale_since=None, counts=Counter())
++    sessions = []
++    unguarded = contextlib.ExitStack()
++    try:
++        _watch_pass(clock[0])  # startup pass: first signatures, not part of the window
++        for chat in CHATS[:POLLERS]:
++            session = {"session_key": chat, "history_lock": threading.RLock(), "profile_home": str(home)}
++            sessions.append(session)
++            scheduler.start(server._notification_poller_scoped_loop, PollerStop(registry.completion_queue),
++                            chat, session)
++        with contextlib.closing(sqlite3.connect(seed.state)) as cx.swriter, \
++                contextlib.closing(sqlite3.connect(seed.replica)) as cx.rwriter:
++            warm_local = []
++            for tick in range(WARM_TICKS):
++                _warm_tick(cx, tick, warm_local)
++            warm = [f"t_warmr{n:03d}" for n in range(POLLERS)] + warm_local
++            missing = [tid for tid in warm if not any(tid in text for _at, _sid, text in ins.delivered)]
++            assert not missing, (missing, ins.delivered)  # every warm-up notice reached its chat
++            assert ins.computes.get("reader", 0) == 0, ins.computes
++            for bucket in (ins.delivered, ins.calls, ins.cpu_by_name, ins.computes):
++                bucket.clear()
++            kri.stats["deferred"] = 0
++            warm_samples = {ident: len(values) for ident, values in scheduler.samples.items()}
++            for peer in peers:
++                peer.frames.clear()
++            start = clock[0]
++            unguarded.enter_context(_production_io())  # the measured window only
++            spans_before, load_before = loop_accounting.counters(), os.getloadavg()
++            for tick in range(int(SECONDS / TICK)):
++                _measured_tick(cx, tick, start, cell["replicas"])
++            spans_after, load_after = loop_accounting.counters(), os.getloadavg()
++    finally:
++        unguarded.close()
++        scheduler.close()
++        seed.owner.close()
++        wal_bytes = {p.name: os.path.getsize(f"{p}-wal") if os.path.exists(f"{p}-wal") else 0
++                     for p in (seed.state, seed.board, seed.replica)}
++        for conn in wal_holders:
++            conn.close()
++    # Each sample is one pass's CPU, recorded when the poller next blocks; the warm-up's are excluded.
++    poller_cpu = sum(sum(values[warm_samples[ident]:]) for ident, values in scheduler.samples.items())
++    latency = {}
++    for at, _sid, text in ins.delivered:
++        for tid, committed in cx.commits.items():
++            if tid in text:
++                latency.setdefault(tid, at - committed)
++    spans = _span_delta(spans_before, spans_after)
++    evidence = {"cell": cell, "reader_defers": reader_defers, "seconds": SECONDS, "pollers": POLLERS,
++                "spans": spans, "loadavg_1m": [load_before[0], load_after[0]],
++                "counts": dict(cx.counts), "calls": dict(ins.calls), "cpu_by_name_s": dict(ins.cpu_by_name),
++                "computes": dict(ins.computes),
++                "deferred": kri.stats.get("deferred"), "watcher_cpu_s": cx.watcher_cpu, "poller_cpu_s": poller_cpu,
++                "holder_cpu_s": cx.holder_cpu, "row_core": (cx.watcher_cpu + poller_cpu) / SECONDS,
++                "holder_core": cx.holder_cpu / SECONDS, "latency_s": latency,
++                "max_latency_s": max(latency.values()) if latency else None,
++                "frames_per_peer": len(peers[0].frames), "wal_bytes": wal_bytes,
++                "skill_roots": len(skill_roots)}
++    _write_evidence(evidence)
++    assert not ins.errors, (ins.errors, evidence)
++    assert not scheduler.errors
++    if cell["large_wal"]:  # the WAL stayed past 400 MiB through the measured window
++        assert all(size >= WAL_BYTES for size in wal_bytes.values()), evidence
++    assert cx.counts["state"] == 140 and cx.counts["replica_rows"] == 568
++    assert cx.counts["remote"] == 12 and cx.counts["local"] == 12
++    assert set(latency) == set(cx.commits), (sorted(set(cx.commits) - set(latency)), evidence)
++    assert all(not s.get("_kanban_claims") and not s.get("_kanban_pending") for s in sessions), evidence
++    # P1 fallback ceiling: run11 (cardJ/run11/p1-r11.json) records 0 fallbacks on every change_watcher/*,
++    # notifications.* and remote_index.* span in serve and gateway, so the replay allows none either.
++    assert {name: s["fallbacks"] for name, s in spans.items() if s["fallbacks"]} == {}, evidence
++    return evidence
++
++
++def _write_evidence(evidence):
++    """Raw per-cell evidence, appended before any assertion so a failing cell still leaves its numbers:
++    the runner rewrites the junit file when it reruns failed ids. Set J_ROWS_EVIDENCE to a .jsonl path."""
++    path = os.environ.get("J_ROWS_EVIDENCE")
++    if path:  # an operator-chosen path outside the isolated home: the guard's original open
++        with getattr(builtins.open, "__wrapped__", builtins.open)(path, "a", encoding="utf-8") as out:
++            out.write(json.dumps(evidence, sort_keys=True) + "\n")
++
++
++def _watch_pass(now):
++    server._broadcast_skin_if_changed()
++    server._broadcast_watched_changes(now=now)
++    server._wake_room_drivers()
++
++
++def _state_stream(writer, window):
++    """chg1, count-preserving: 140 state commits spread over 300 windows (83 message, 2 title, 55 activity)."""
++    ordinal = (window + 1) * 140 // 300
++    if ordinal == window * 140 // 300:
++        return None
++    kind = "message" if ordinal <= 83 else "title" if ordinal <= 85 else "activity"
++    column = {"message": "message_count", "title": "title", "activity": "last_activity_at"}[kind]
++    writer.execute(f"UPDATE sessions SET {column}=? WHERE id='s0'", (ordinal,))
++    writer.commit()
++    return kind
++
++
++@pytest.mark.parametrize("name", list(CELLS))
++def test_complete_serve_and_gateway_rows(row_home, monkeypatch, record_property, name):
++    home, peers = row_home
++    evidence = _run_cell(home, peers, monkeypatch, CELLS[name])
++    _RESULTS[name] = evidence
++    record_property("j_row", json.dumps(evidence, sort_keys=True))
++    # Every notice arrives; a deferral costs at most one 5 s poll after the holder's ~1-2 s publish.
++    assert evidence["max_latency_s"] <= 2 * 5.0 + 2.0, evidence
++    assert evidence["computes"].get("reader", 0) == 0, evidence  # the holder publishes within the bound
++    assert evidence["row_core"] <= 0.007, evidence  # serve row; the gateway row (0.008) is looser
++    if name != "base":
++        base = _RESULTS.get("base")
++        assert base is not None, "run the whole parametrization: growth compares with the base cell"
++        assert evidence["row_core"] / base["row_core"] <= 1.5, (evidence, base)
++
++
++def test_red_control_pre_fix_reader_rebuilds_on_misses(row_home, monkeypatch, record_property):
++    """The same base replay with the reader's deferral removed: polls between a commit and the holder's
++    publish rebuild the index in the poller (P1's residual)."""
++    home, peers = row_home
++    evidence = _run_cell(home, peers, monkeypatch, BASE, reader_defers=False)
++    record_property("j_row_red", json.dumps(evidence, sort_keys=True))
++    assert evidence["computes"].get("reader", 0) > 0, evidence
++    if "base" in _RESULTS:
++        assert evidence["poller_cpu_s"] > _RESULTS["base"]["poller_cpu_s"], (evidence, _RESULTS["base"])
+diff --git a/tests/tui_gateway/test_kanban_remote_index_defer.py b/tests/tui_gateway/test_kanban_remote_index_defer.py
+index d1c2926a22..d78c33504a 100644
+--- a/tests/tui_gateway/test_kanban_remote_index_defer.py
++++ b/tests/tui_gateway/test_kanban_remote_index_defer.py
+@@ -119,6 +119,23 @@ def test_deferral_is_bounded_by_one_poll_while_the_holder_never_publishes(own, m
+     assert _refs(_poll()) == {"hub/default/default/t_new", "hub/default/default/t_newer"} and len(computes) == 1
+ 
+ 
++def test_the_chat_poll_after_a_deferred_miss_computes(own, monkeypatch):
++    """Absolute bound, not relative to DEFER_MAX_S: the notice poller polls every 5 s, so a deferral costs
++    the notice at most one poll even if the holder beats and never publishes."""
++    replica, ledger = own
++    _lease()
++    assert kri.refresh(replica, ledger, now=NOW)
++    _poll()
++    clock = [100.0]
++    monkeypatch.setattr(kri, "_clock", lambda: clock[0])
++    monkeypatch.setattr(kri, "publish", lambda *a, **k: False)
++    _add(replica, _done("t_new"), 50)
++    computes = _count_computes(monkeypatch)
++    assert _poll() == []  # deferred
++    clock[0] += 5.0  # the chat's next notice poll
++    assert _refs(_poll()) == {"hub/default/default/t_new"} and len(computes) == 1
++
++
+ def test_a_beating_holder_that_never_publishes_does_not_defer_again_after_the_bound(own, monkeypatch):
+     """A holder beats after a failed build too: once a chat's bound expired, its misses compute until a hit."""
+     replica, ledger = own
+@@ -182,17 +199,15 @@ def test_a_replica_with_no_change_key_never_defers(own, monkeypatch):
+     assert kri.stats["deferred"] == 0
+ 
+ 
+-@pytest.mark.parametrize("holder", ["absent", "released", "dead_pid", "stale_beat", "corrupt"])
++_NO_LIVE_HOLDER = {"absent": None, "released": {"held": False}, "dead_pid": {"pid": 2 ** 22 + 12345},
++                   "stale_beat": {"age": 3 * 5.0 + 1, "interval": 5.0}, "corrupt": {"raw": "{not json"}}
++
++
++@pytest.mark.parametrize("holder", list(_NO_LIVE_HOLDER))
+ def test_no_live_beating_holder_computes_the_miss_at_once(own, monkeypatch, holder):
+     replica, ledger = own
+-    if holder == "released":
+-        _lease(held=False)
+-    elif holder == "dead_pid":
+-        _lease(pid=2 ** 22 + 12345)
+-    elif holder == "stale_beat":
+-        _lease(age=3 * 5.0 + 1, interval=5.0)
+-    elif holder == "corrupt":
+-        _lease(raw="{not json")
++    if _NO_LIVE_HOLDER[holder] is not None:
++        _lease(**_NO_LIVE_HOLDER[holder])
+     assert kri.refresh(replica, ledger, now=NOW)
+     _poll()
+     _add(replica, _done("t_new"), 50)
+diff --git a/tests/tui_gateway/test_notify_subs_gate.py b/tests/tui_gateway/test_notify_subs_gate.py
+index e961191298..f7434cd18e 100644
+--- a/tests/tui_gateway/test_notify_subs_gate.py
++++ b/tests/tui_gateway/test_notify_subs_gate.py
+@@ -177,22 +177,20 @@ def test_replay_budget_board_signature(board):
+     for chat in chats:
+         idle.board_signature(path, chat)
+     commits = 40
+-    reread = warm = float("inf")
+-    for _ in range(3):
+-        first = rest = 0.0
+-        for n in range(commits):
+-            if n % REVISION_EVERY == 0:
+-                _write("UPDATE kanban_notify_subs SET last_event_id = ? WHERE task_id = 't_bench_0'", n + 1)
+-            else:
+-                _bookkeeping(tasks[1], n)
+-            t0 = time.thread_time()
+-            idle.board_signature(path, chats[0])  # the first probe after a commit reads it
+-            t1 = time.thread_time()
+-            for chat in chats[1:]:
+-                idle.board_signature(path, chat)
+-            first, rest = first + t1 - t0, rest + time.thread_time() - t1
+-        reread = min(reread, first / commits)
+-        warm = min(warm, rest / commits / (LIVE_CHATS - 1))
++    first = rest = 0.0
++    for n in range(commits):
++        if n % REVISION_EVERY == 0:
++            _write("UPDATE kanban_notify_subs SET last_event_id = ? WHERE task_id = 't_bench_0'", n + 1)
++        else:
++            _bookkeeping(tasks[1], n)
++        t0 = time.thread_time()
++        idle.board_signature(path, chats[0])  # the first probe after a commit reads it
++        t1 = time.thread_time()
++        for chat in chats[1:]:
++            idle.board_signature(path, chat)
++        first, rest = first + t1 - t0, rest + time.thread_time() - t1
++    reread = first / commits
++    warm = rest / commits / (LIVE_CHATS - 1)
+     per_s = reread * min(COMMITS_PER_S, LIVE_CHATS / POLL_S) + warm * LIVE_CHATS / POLL_S
+     assert per_s <= BUDGET_CORE, (f"{reread * 1000:.2f} ms per commit, {warm * 1000:.3f} ms per probe = "
+                                   f"{per_s:.3%} of a core")
+diff --git a/tests/tui_gateway/test_producer_admission_gate.py b/tests/tui_gateway/test_producer_admission_gate.py
+index 9042e697f3..0a48802636 100644
+--- a/tests/tui_gateway/test_producer_admission_gate.py
++++ b/tests/tui_gateway/test_producer_admission_gate.py
+@@ -288,17 +288,16 @@ def test_replay_budget_every_store_committing_every_pass():
+         for n, db in enumerate(stores):
+             db.create_session(f"s{n}", "desktop")
+         delivery.sweep_once()  # cold: opens observers
+-        best = float("inf")
+-        for _ in range(3):
+-            spent = 0.0
+-            for i in range(10):
+-                for db in stores:
+-                    _commit(db, i)
+-                t0 = time.thread_time()
+-                assert delivery.sweep_once() == []
+-                spent += time.thread_time() - t0
+-            best = min(best, spent / 10)
+-        assert best / INTERVAL_S <= BUDGET_CORE, f"{best * 1000:.2f} ms per pass = {best / INTERVAL_S:.4%} of a core"
++        spent = 0.0
++        for i in range(10):
++            for db in stores:
++                _commit(db, i)
++            t0 = time.thread_time()
++            assert delivery.sweep_once() == []
++            spent += time.thread_time() - t0
++        per_pass = spent / 10
++        assert per_pass / INTERVAL_S <= BUDGET_CORE, (
++            f"{per_pass * 1000:.2f} ms per pass = {per_pass / INTERVAL_S:.4%} of a core")
+     finally:
+         for db in stores:
+             db.close()
+diff --git a/tests/tui_gateway/test_watch_store_gate.py b/tests/tui_gateway/test_watch_store_gate.py
+index 25751b4771..ff5cc20926 100644
+--- a/tests/tui_gateway/test_watch_store_gate.py
++++ b/tests/tui_gateway/test_watch_store_gate.py
+@@ -271,16 +271,14 @@ def test_replay_budget_store_signatures(store):
+         return tuple(conn.execute("SELECT COUNT(*) FROM sessions").fetchone()), False
+ 
+     passes = 60
+-    best = float("inf")
+-    for _ in range(3):
+-        spent = 0.0
+-        for n in range(passes):
+-            if n / passes < COMMIT_SHARE:
+-                db.set_session_title(f"bench-{n}", f"t{time.time_ns()}")
+-            t0 = time.thread_time()
+-            server._session_db_content_sig(path)
+-            server._db_content_sig(path, cache, read)
+-            spent += time.thread_time() - t0
+-        best = min(best, spent / passes)
+-    per_s = best * PASSES_PER_S
+-    assert per_s <= BUDGET_CORE, f"{best * 1000:.3f} ms per pass = {per_s:.3%} of a core"
++    spent = 0.0
++    for n in range(passes):
++        if n / passes < COMMIT_SHARE:
++            db.set_session_title(f"bench-{n}", f"tick-{n}")
++        t0 = time.thread_time()
++        server._session_db_content_sig(path)
++        server._db_content_sig(path, cache, read)
++        spent += time.thread_time() - t0
++    per_pass = spent / passes
++    per_s = per_pass * PASSES_PER_S
++    assert per_s <= BUDGET_CORE, f"{per_pass * 1000:.3f} ms per pass = {per_s:.3%} of a core"
+-- 
+2.43.0
+

@@ -1,0 +1,166 @@
+From 936c0207972afb918e9a568ffa973cff2065b31d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 19:56:33 +0000
+Subject: [PATCH] [daveey] kanban CI wait: a PR ref with no @sha uses a hint
+ sha only when it is the only one
+
+Follow-up to PR #2572 (review 5896901825, card t_01a1d671b97eca49): a narrow fail-open.
+
+Why: pr_target() took the first 40-hex string in ref + hint (the park's wake-check command, then
+its reason) as the head a PR-ref wait names. When that string was another sha (an old head, the
+base sha, an unrelated commit), head.startswith(sha) was False, so pr_progress() answered "ok"
+("head moved") on every sweep. The card then lost conflict and no-run detection and silently fell
+back to the pre-#2572 untracked behaviour.
+
+Fix: without an @<sha> in the ref, the sha is the ref's own 40-hex when the ref holds exactly one,
+else the hint's when the ref holds none and the hint exactly one (case-insensitive, repeats counted
+once). Several distinct shas give None, so pr_progress() reads the PR's current head, and a
+conflict or a missing run there still wakes the card. A single hint sha keeps the "head moved"
+reading, so a card whose PR moved off its named head is still left to its own probe.
+
+Tests (tests/hermes_cli/test_kanban_ci_progress_pr.py):
+- test_pr_target: two distinct shas in the hint, or in the ref, give None; the same sha repeated
+  in another case counts once; a ref's own sha wins over the hint's; @sha wins over everything.
+- test_a_hint_with_two_shas_still_wakes_on_a_conflict: park on a PR ref with no sha, the wake
+  check names an old head and the reason the base and current head; the PR turns dirty; one sweep
+  wakes the card with the "conflicts with state" comment and no runner blocker.
+- test_a_hint_with_one_old_head_sha_reads_the_moved_head_as_ok: one sha in the hint, the PR head
+  moves off it and turns dirty; no wake, no comment.
+RED on the parent head fcd5141834 (impl reverted): 3 failed (both new pr_target cases and the
+two-sha sweep). GREEN: 26/26 in the file; 790 passed across the 21 test files importing
+kanban_ci_progress/kanban_awaiting; scripts/check --base origin/main ok.
+---
+ hermes_cli/kanban_ci_progress.py              | 21 ++++++--
+ .../hermes_cli/test_kanban_ci_progress_pr.py  | 50 +++++++++++++++++--
+ 2 files changed, 62 insertions(+), 9 deletions(-)
+
+diff --git a/hermes_cli/kanban_ci_progress.py b/hermes_cli/kanban_ci_progress.py
+index 65f4054d4c..e63935645d 100644
+--- a/hermes_cli/kanban_ci_progress.py
++++ b/hermes_cli/kanban_ci_progress.py
+@@ -140,14 +140,27 @@ class Progress:
+ 
+ def pr_target(ref: str, hint: str = "") -> Optional[tuple[str, int, Optional[str]]]:
+     """``(owner/repo, PR number, head sha or None)`` for a ref naming ``<owner>/<repo>/pull/<n>``, else None. The
+-    sha is ``@<7-40 hex>`` in the ref, else a 40-hex sha in the ref or ``hint`` (the park's wake check and reason).
+-    A ref that names a run is a run (:func:`run_target`), not a PR."""
++    sha is ``@<7-40 hex>`` in the ref, else the one 40-hex sha the ref holds, else the one 40-hex sha in ``hint``
++    (the park's wake check and reason). Several distinct shas there give None, so the PR's current head is read:
++    a guess could pick an old head or a base sha, which never matches the head, and every sweep would then read
++    the PR as "head moved" (``ok``) and miss its conflict or missing run. A ref that names a run is a run
++    (:func:`run_target`), not a PR."""
+     ref = (ref or "").strip()
+     m = _PR_PATH.search(ref)
+     if m is None or run_target(ref, hint) is not None:
+         return None
+-    sha = _AT_SHA.search(ref) or _FULL_SHA.search(f"{ref} {hint or ''}")
+-    return m.group(1), int(m.group(2)), sha.group(1).lower() if sha else None
++    at = _AT_SHA.search(ref)
++    return m.group(1), int(m.group(2)), at.group(1).lower() if at else _only_sha(ref, hint or "")
++
++
++def _only_sha(ref: str, hint: str) -> Optional[str]:
++    """The 40-hex sha a PR ref without ``@<sha>`` names: the ref's own when it holds exactly one, else the hint's
++    when the ref holds none and the hint exactly one (case-insensitive, repeats counted once), else None."""
++    for text in (ref, hint):
++        found = {s.lower() for s in _FULL_SHA.findall(text)}
++        if found:
++            return found.pop() if len(found) == 1 else None
++    return None
+ 
+ 
+ def run_target(ref: str, hint: str = "") -> Optional[tuple[str, str]]:
+diff --git a/tests/hermes_cli/test_kanban_ci_progress_pr.py b/tests/hermes_cli/test_kanban_ci_progress_pr.py
+index e0e9506734..bf068c9bf4 100644
+--- a/tests/hermes_cli/test_kanban_ci_progress_pr.py
++++ b/tests/hermes_cli/test_kanban_ci_progress_pr.py
+@@ -26,6 +26,7 @@ REPO = "example-org/hermes"
+ PR = 2495
+ HEAD = "7072089bad288a86dc638ba386e6d12fc5d32e7d"
+ OTHER = "6c627f9f0e0000000000000000000000000000ab"
++BASE = "aaaf75adb60000000000000000000000000000cd"
+ REF = f"https://github.com/{REPO}/pull/{PR} checks @{HEAD}"  # verbatim from the incident's park
+ RUN_ID = "43400000001"
+ LABELS = ["self-hosted", "ci-fast"]
+@@ -109,23 +110,23 @@ def _running(conn) -> str:
+     return tid
+ 
+ 
+-def _park(monkeypatch, conn, tid, ref: str = REF) -> dict:
++def _park(monkeypatch, conn, tid, ref: str = REF, *, reason: str = f"Waiting for CI on PR #{PR} head {HEAD[:10]}.",
++          wake_check: str = f"false gh pr checks {PR} -R {REPO}") -> dict:
+     from tools import kanban_tools as kt
+     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(kb.get_task(conn, tid).current_run_id))
+     try:
+         return json.loads(kt._handle_schedule({
+-            "reason": f"Waiting for CI on PR #{PR} head {HEAD[:10]}.",
+-            "wake_check": f"false gh pr checks {PR} -R {REPO}",
++            "reason": reason, "wake_check": wake_check,
+             "awaiting": {"kind": "ci", "ref": ref, "why": "state CI on the fix"}}))
+     finally:
+         monkeypatch.delenv("HERMES_KANBAN_TASK")
+ 
+ 
+-def _parked(conn, monkeypatch, *, ago: int = 0) -> str:
++def _parked(conn, monkeypatch, *, ago: int = 0, **park) -> str:
+     """A card parked on the PR while it read clean (accepted), its park ``ago`` seconds back."""
+     tid = _running(conn)
+-    out = _park(monkeypatch, conn, tid)
++    out = _park(monkeypatch, conn, tid, **park)
+     assert out.get("status") == "scheduled", out
+     if ago:
+         with kb.write_txn(conn):
+@@ -149,6 +150,13 @@ def _runner_blockers(conn) -> list[str]:
+     (f"{REPO}/pull/{PR}", "", (REPO, PR, None)),
+     (f"https://github.com/{REPO}/pull/{PR}@7072089", "", (REPO, PR, "7072089")),
+     (f"https://github.com/{REPO}/pull/{PR}", f"head is {HEAD}", (REPO, PR, HEAD)),
++    (f"https://github.com/{REPO}/pull/{PR}", f"head {HEAD.upper()} (was {HEAD})", (REPO, PR, HEAD)),
++    # several distinct shas: no guess (it could be an old head or the base), so the current head is read
++    (f"https://github.com/{REPO}/pull/{PR}", f"head {HEAD} onto base {BASE}", (REPO, PR, None)),
++    (f"https://github.com/{REPO}/pull/{PR} {OTHER} {HEAD}", "", (REPO, PR, None)),
++    # the ref's own sha wins over others in the hint; an @sha wins over everything
++    (f"https://github.com/{REPO}/pull/{PR} checks {HEAD}", f"rebased from {OTHER}", (REPO, PR, HEAD)),
++    (f"https://github.com/{REPO}/pull/{PR}@{HEAD} (was {OTHER})", f"base {BASE}", (REPO, PR, HEAD)),
+     (f"https://github.com/{REPO}/actions/runs/{RUN_ID}", "", None),  # a run keeps the run path
+     ("t_01a1d5dae3fe181b", "", None),
+ ])
+@@ -297,3 +305,35 @@ def test_github_error_allows_the_park_and_wakes_nothing(kanban_home, api, monkey
+         assert kb.get_task(conn, tid).status == "scheduled"
+         warned = [r for r in caplog.records if r.levelname == "WARNING" and "ci run progress" in r.getMessage()]
+         assert len(warned) == 1, caplog.text
++
++
++# --- the ref names no sha: the hint's shas ------------------------------------------------------------------------
++
++NO_SHA_REF = f"https://github.com/{REPO}/pull/{PR}"
++
++
++def test_a_hint_with_two_shas_still_wakes_on_a_conflict(kanban_home, api, monkeypatch) -> None:
++    """Neither sha is taken as the head (the first one, an old head, would read as "head moved" on every sweep):
++    the current head is read, and its conflict wakes the card."""
++    api.run("in_progress", age=60, runner="ci-fast-1")
++    with kbc.connect_closing() as conn:
++        tid = _parked(conn, monkeypatch, ref=NO_SHA_REF, reason=f"Rebased onto {BASE} as {HEAD}; waiting for CI.",
++                      wake_check=f"false gh pr checks {PR} -R {REPO} # was {OTHER}")
++        api.dirty()
++        assert kcp.sweep(conn) == [tid]
++        notes = _notes(conn, tid)
++        assert len(notes) == 1 and f"PR #{PR} conflicts with state" in notes[0], notes
++        assert _runner_blockers(conn) == []
++
++
++def test_a_hint_with_one_old_head_sha_reads_the_moved_head_as_ok(kanban_home, api, monkeypatch) -> None:
++    """One sha in the hint is still the head the wait names: once the PR moves off it, the owner's probe answers,
++    even when the new head conflicts."""
++    with kbc.connect_closing() as conn:
++        tid = _parked(conn, monkeypatch, ago=30 * 60, ref=NO_SHA_REF,
++                      reason=f"Waiting for CI on PR #{PR} head {HEAD}.")
++        api.dirty()
++        api.pr["head"]["sha"] = OTHER
++        assert kcp.sweep(conn) == []
++        assert kb.get_task(conn, tid).status == "scheduled"
++        assert _notes(conn, tid) == []
+-- 
+2.43.0
+

@@ -1,0 +1,1000 @@
+From 1b2eb076a5269a688b53a24280c32b530f9024d4 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 23:59:24 +0000
+Subject: [PATCH] [daveey] WIP incremental dashboard P2 reads and bookkeeping
+ overlay
+
+Card E checkpoint, not ready for landing. Seven endpoint regression tests fail on base and pass on candidate; focused 39 tests pass. Remaining: align superseded snapshot tests, scale/replay benchmarks, exact-head review, CI and deployed P1 proof.
+---
+ plugins/kanban/dashboard/board_counts.py      |   2 +-
+ plugins/kanban/dashboard/board_incremental.py | 214 +++++++++++
+ plugins/kanban/dashboard/board_read.py        |  43 ++-
+ plugins/kanban/dashboard/board_rows.py        |  56 +++
+ plugins/kanban/dashboard/plugin_api.py        |  52 ++-
+ tests/plugins/test_kanban_board_delta.py      | 348 ++++++++++++++++++
+ tests/plugins/test_kanban_board_p2.py         | 126 +++++++
+ 7 files changed, 801 insertions(+), 40 deletions(-)
+ create mode 100644 plugins/kanban/dashboard/board_incremental.py
+ create mode 100644 tests/plugins/test_kanban_board_delta.py
+ create mode 100644 tests/plugins/test_kanban_board_p2.py
+
+diff --git a/plugins/kanban/dashboard/board_counts.py b/plugins/kanban/dashboard/board_counts.py
+index 1224140d15..2210df46c8 100644
+--- a/plugins/kanban/dashboard/board_counts.py
++++ b/plugins/kanban/dashboard/board_counts.py
+@@ -40,7 +40,7 @@ def board_counts(slug: str) -> dict[str, int]:
+     try:
+         path = kanban_db.kanban_db_path(board=slug)
+         key = str(path)
+-        ver = board_rows.version(key)
++        ver = board_rows.content_version(key)
+         if ver is not None:
+             with _lock:
+                 hit = _cached.get(key)
+diff --git a/plugins/kanban/dashboard/board_incremental.py b/plugins/kanban/dashboard/board_incremental.py
+new file mode 100644
+index 0000000000..0a77eaba9b
+--- /dev/null
++++ b/plugins/kanban/dashboard/board_incremental.py
+@@ -0,0 +1,214 @@
++"""Exact delta refresh of board rows (P2). [daveey]
++
++Read displayed task IDs union marked IDs by primary key on every refresh: bookkeeping
++can change on *any* lane without an activity mark. Only changed raw tuples are parsed.
++Diagnostics check event marks/runs for every displayed row, retaining unchanged events.
++Hidden done history stays a narrow ranked window; uncertainty falls back to a full read.
++The caller holds one read snapshot around the change cursor and this materialization.
++"""
++
++from __future__ import annotations
++
++import functools
++import sqlite3
++from dataclasses import asdict
++from typing import Callable, Optional
++
++from hermes_cli import kanban_db
++
++MAX_CHANGED = 400
++
++
++def _ph(ids) -> str:
++    return ",".join(["?"] * len(ids))
++
++
++def filters_key(filters: dict) -> tuple:
++    return tuple(sorted((k, filters[k]) for k in filters))
++
++
++def _cmp(a: tuple, b: tuple) -> int:
++    """completed_at DESC NULLS LAST, id DESC, on parsed epoch values."""
++    ka, kb = (a[1] is None, -(a[1] or 0)), (b[1] is None, -(b[1] or 0))
++    if ka != kb:
++        return -1 if ka < kb else 1
++    return -1 if a[0] > b[0] else (1 if a[0] < b[0] else 0)
++
++
++rank_key = functools.cmp_to_key(_cmp)
++
++
++def done_epoch(row) -> Optional[int]:
++    return kanban_db._to_epoch(kanban_db._lossy_text(row["completed_at"]))
++
++
++def _fetch(conn, filters: dict, ids: list) -> dict:
++    if not ids:
++        return {}
++    rows = kanban_db.list_task_rows(conn, extra_where=f"id IN ({_ph(ids)})", extra_params=tuple(ids), **filters)
++    return {kanban_db._lossy_text(r["id"]): r for r in rows}
++
++
++def _extras(conn, cards: dict, board_read) -> dict[str, dict]:
++    """Full-path aggregates, restricted to displayed IDs (including unmarked run changes)."""
++    ids = list(cards)
++    if not ids:
++        return {}
++    ph, params = _ph(ids), tuple(ids)
++    counts = {tid: {"parents": 0, "children": 0} for tid in ids}
++    for pid, n in conn.execute(
++            f"SELECT parent_id, COUNT(*) FROM task_links WHERE parent_id IN ({ph}) GROUP BY parent_id", params):
++        counts[pid]["children"] = n
++    for cid, n in conn.execute(
++            f"SELECT child_id, COUNT(*) FROM task_links WHERE child_id IN ({ph}) GROUP BY child_id", params):
++        counts[cid]["parents"] = n
++    comments = dict(conn.execute(
++        f"SELECT task_id, COUNT(*) FROM task_comments WHERE task_id IN ({ph}) GROUP BY task_id", params))
++    progress: dict[str, dict] = {}
++    for pid, status in conn.execute(
++            "SELECT l.parent_id, t.status FROM task_links l JOIN tasks t ON t.id = l.child_id "
++            f"WHERE l.parent_id IN ({ph})", params):
++        p = progress.setdefault(pid, {"done": 0, "total": 0})
++        p["total"] += 1
++        p["done"] += status == "done"
++    summaries = kanban_db.latest_summaries(conn, ids)
++    starts = kanban_db.current_run_started_ats(conn, ids)
++    try:
++        managers = {str(r[0]): str(r[1]) for r in conn.execute(
++            "SELECT task_id, chat_id FROM kanban_notify_subs WHERE platform = 'tui' AND chat_id != '' "
++            f"AND task_id IN ({ph}) ORDER BY created_at, rowid", params)}
++    except sqlite3.Error:  # board predates notify subscriptions
++        managers = {}
++    cap = board_read._CARD_SUMMARY_PREVIEW_CHARS
++    return {tid: {
++        "latest_summary": summaries[tid][:cap] if summaries.get(tid) else None,
++        "current_run_started_at": starts.get(tid),
++        "link_counts": counts[tid], "comment_count": comments.get(tid, 0), "progress": progress.get(tid),
++        "managing_session_id": managers.get(tid) or cards[tid][0].session_id or None} for tid in ids}
++
++
++def _done_window(inc, by_id, changed, cap):
++    """Update the retained ranking; decline whenever an unseen card might enter the window."""
++    done_ids = set(inc["done_ids"])
++    entries = dict(inc["window"])
++    truncated = len(done_ids) > cap
++    cutoff = inc["window"][-1] if inc["window"] else ("", None)
++    for tid in changed:
++        row = by_id.get(tid)
++        if row is None or row["status"] != "done":
++            if tid in entries and truncated:
++                return None
++            entries.pop(tid, None)
++            done_ids.discard(tid)
++            continue
++        item = (tid, done_epoch(row))
++        if tid in entries and truncated and _cmp(item, cutoff) > 0:
++            return None
++        if tid not in entries and not truncated and tid in done_ids:
++            return None
++        if tid in entries or not truncated or _cmp(item, cutoff) < 0:
++            entries[tid] = item[1]
++        done_ids.add(tid)
++    window = tuple(sorted(entries.items(), key=rank_key)[:cap])
++    if any(tid not in by_id or by_id[tid]["status"] != "done" for tid, _ep in window):
++        return None
++    return frozenset(done_ids), window
++
++
++def _card_order(conn, filters, by_id, pcards, changed, window):
++    # Even a hidden/out-of-filter waiter can change an ancestor's inherited
++    # priority transitively. Re-read narrow dispatch IDs on every activity delta.
++    # This also covers deleted links: P2 marks both endpoints, even after cascade.
++    if changed:
++        nondone = sorted(s for s in kanban_db.VALID_STATUSES if s != "done")
++        nd_ids = [kanban_db._lossy_text(r["id"]) for r in kanban_db.list_task_rows(
++            conn, columns="id", extra_where=f"status IN ({_ph(nondone)})", extra_params=tuple(nondone), **filters)]
++        expect = {tid for tid, row in by_id.items() if row["status"] != "done"}
++        if set(nd_ids) != expect or len(nd_ids) != len(expect):
++            return None
++    else:
++        nd_ids = [tid for tid, old in pcards.items() if old[0].status != "done"]
++    return nd_ids + [w[0] for w in window]
++
++
++def _parse_cards(by_id, order, memo):
++    """Only parse changed tuples, and retain no hidden history in the parse memo."""
++    old_tasks = memo["tasks"]
++    parsed, raws, cards = {}, {}, {}
++    for tid in order:
++        row = by_id[tid]
++        raw = (tuple(row.keys()), tuple(row))
++        hit = old_tasks.get(raw)
++        if hit is None:
++            task = kanban_db.Task.from_row(row)
++            hit = (task, asdict(task))
++        if hit[0].id != tid:
++            return None
++        parsed[raw], raws[tid], cards[tid] = hit, raw, hit
++    return cards, parsed, raws
++
++
++def _diagnostics(conn, cards, by_id, old_memo, diagnostic_inputs, br):
++    """Use the freshly read task rows even for unmarked ready/done bookkeeping."""
++    diag_rows = [by_id[tid] for tid, (task, _fields) in cards.items() if task.status != "archived"]
++    if not diag_rows:
++        return None, {}
++    # All displayed marks/runs and graph contexts are bounded by open rows plus
++    # the done cap. Event histories alone are selectively re-read.
++    return br._incremental_diag_inputs(conn, diag_rows, old_memo, diagnostic_inputs)
++
++
++def _pickers(conn, prev, changed):
++    tenants, assignees = prev["tenants"], prev["task_assignees"]
++    if not changed:
++        return tenants, assignees
++    seen = conn.execute(
++        f"SELECT tenant, assignee, status FROM tasks WHERE id IN ({_ph(changed)})", tuple(changed)).fetchall()
++    tset = set(tenants) | {r[0] for r in seen if r[0] is not None}
++    aset = set(assignees) | {r[1] for r in seen if r[1] is not None and r[2] != "archived"}
++    tset = {t for t in tset if conn.execute("SELECT 1 FROM tasks WHERE tenant = ? LIMIT 1", (t,)).fetchone()}
++    aset = {a for a in aset if conn.execute(
++        "SELECT 1 FROM tasks WHERE assignee = ? AND status != 'archived' LIMIT 1", (a,)).fetchone()}
++    return tuple(sorted(tset)), frozenset(aset)
++
++
++def delta(conn, filters: dict, done_limit, diagnostic_inputs: Callable, prev: dict, changed) -> Optional[dict]:
++    from plugins.kanban.dashboard import board_read as br
++
++    if not isinstance(changed, (set, frozenset)):
++        return None
++    memo = prev.get("_memo") or {}
++    inc = memo.get("inc")
++    cap = int(done_limit or 0)
++    if inc is None or cap <= 0 or inc["filters"] != filters_key(filters) or inc["cap"] != cap:
++        return None
++    changed = sorted(str(c) for c in changed if c)
++    if len(changed) > MAX_CHANGED:
++        return None
++    pcards = {t.id: (t, f, e) for t, f, e in prev["cards"]}
++    by_id = _fetch(conn, filters, sorted(set(changed) | set(pcards)))
++    if set(pcards) - set(changed) - set(by_id):
++        return None
++    done = _done_window(inc, by_id, changed, cap)
++    if done is None:
++        return None
++    done_ids, window = done
++    order = _card_order(conn, filters, by_id, pcards, changed, window)
++    if order is None:
++        return None
++    parsed_cards = _parse_cards(by_id, order, memo)
++    if parsed_cards is None:
++        return None
++    cards, parsed, raws = parsed_cards
++    extras = _extras(conn, cards, br)
++    diag_inputs, memo_diag = _diagnostics(conn, cards, by_id, memo["diag"], diagnostic_inputs, br)
++    latest = conn.execute("SELECT COALESCE(MAX(id), 0) AS m FROM task_events").fetchone()["m"]
++    tenants, assignees = _pickers(conn, prev, changed)
++    return {
++        "cards": tuple((t, fields, extras[tid]) for tid, (t, fields) in cards.items()),
++        "diag_inputs": diag_inputs, "done_total": len(done_ids),
++        "latest_event_id": int(latest), "tenants": tenants, "task_assignees": assignees,
++        "_memo": {"delta": True, "tasks": parsed, "diag": memo_diag, "inc": {
++            "filters": inc["filters"], "cap": cap, "done_ids": done_ids,
++            "window": window, "raw": raws}},
++    }
+diff --git a/plugins/kanban/dashboard/board_read.py b/plugins/kanban/dashboard/board_read.py
+index 9329211d02..e7f318e258 100644
+--- a/plugins/kanban/dashboard/board_read.py
++++ b/plugins/kanban/dashboard/board_read.py
+@@ -131,19 +131,30 @@ def preview_list_body(task: dict) -> None:
+ 
+ 
+ def _done_trim(conn, filters: dict, done_limit) -> tuple[str, list, int]:
++    return _done_state(conn, filters, done_limit)[:3]
++
++
++def _done_state(conn, filters: dict, done_limit) -> tuple[str, list, int, frozenset, tuple]:
+     """``(extra_where, params, done total)`` for list_tasks. Done cards past ``done_limit`` never reach
+     the payload, so they are ranked on a narrow read and never fetched whole (4.2k of the hub's 4.4k
+     rows: parsing them was half of every board read). Same order as the done column below:
+     completed_at DESC NULLS LAST, id DESC, on the values Task.from_row parses."""
+     done = kanban_db.list_task_rows(conn, status="done", columns="rowid AS _rowid, id, completed_at", **filters)
+     done_cap = int(done_limit or 0)
++    done_ids = frozenset(kanban_db._lossy_text(r["id"]) for r in done)
+     if not 0 < done_cap < len(done):
+-        return "", [], len(done)
++        window = ()
++        if done_cap > 0:  # the delta path's ranked window: every done card, newest first
++            from plugins.kanban.dashboard.board_incremental import rank_key
++            window = tuple(sorted(((kanban_db._lossy_text(r["id"]), kanban_db._to_epoch(
++                kanban_db._lossy_text(r["completed_at"]))) for r in done), key=rank_key))
++        return "", [], len(done), done_ids, window
+     epoch = {r["_rowid"]: kanban_db._to_epoch(kanban_db._lossy_text(r["completed_at"])) for r in done}
+     ranked = sorted(sorted(done, key=lambda r: kanban_db._lossy_text(r["id"]), reverse=True),
+                     key=lambda r: (epoch[r["_rowid"]] is None, -(epoch[r["_rowid"]] or 0)))
+     keep = [r["_rowid"] for r in ranked[:done_cap]]
+-    return f"status != 'done' OR rowid IN ({_placeholders(keep)})", keep, len(done)
++    window = tuple((kanban_db._lossy_text(r["id"]), epoch[r["_rowid"]]) for r in ranked[:done_cap])
++    return f"status != 'done' OR rowid IN ({_placeholders(keep)})", keep, len(done), done_ids, window
+ 
+ 
+ def _diag_memo(rows, events_by_task, runs_by_task, marks) -> dict:
+@@ -179,20 +190,30 @@ def _incremental_diag_inputs(conn, diag_rows: list, prev: dict, diagnostic_input
+ 
+ 
+ def materialize(conn, tenant, include_archived, workflow_template_id, current_step_key, done_limit, *,
+-                diagnostic_inputs: Callable = diagnostic_inputs, prev: Optional[dict] = None) -> dict:
++                diagnostic_inputs: Callable = diagnostic_inputs, prev: Optional[dict] = None,
++                changed=None) -> dict:
+     """Everything the board payload reads from SQL, and nothing that depends on the clock,
+     config, profiles on disk or the replica. Retained across refreshes: never mutate it.
+ 
+     ``prev`` (the last rows for the same query) makes it incremental: a task whose row values are
+     unchanged keeps its parsed Task, and only tasks whose row, runs or events moved re-read their
+-    events. Every row is still read, so a committed write is never missed; only parsing is saved."""
++    events. Every displayed row is still read, so unmarked bookkeeping writes are never missed.
++    ``prev`` with ``changed`` (a frozenset of task ids from ``kanban_task_change.changed_since``, taken in the
++    same snapshot as this read) takes ``board_incremental.delta``: displayed IDs union marked IDs are
++    read by primary key, with bounded done history. ``changed`` omitted, ``FULL`` or a set the delta cannot vouch for reads in
++    full, exactly as before."""
+     filters = dict(tenant=tenant, include_archived=include_archived,
+                    workflow_template_id=workflow_template_id, current_step_key=current_step_key)
+-    extra_where, extra_params, done_total = _done_trim(conn, filters, done_limit)
++    if prev is not None and isinstance(changed, (set, frozenset)):
++        from plugins.kanban.dashboard import board_incremental
++        rows = board_incremental.delta(conn, filters, done_limit, diagnostic_inputs, prev, changed)
++        if rows is not None:
++            return rows
++    extra_where, extra_params, done_total, done_ids, done_window = _done_state(conn, filters, done_limit)
+     old = (prev or {}).get("_memo")
+     old_tasks = old["tasks"] if old is not None else {}
+     parsed: dict[tuple, tuple] = {}
+-    task_rows, fields = [], []
++    task_rows, fields, raw_keys = [], [], []
+ 
+     def parse(r):
+         raw = (tuple(r.keys()), tuple(r))  # column names too: a migration re-parses every row
+@@ -203,11 +224,12 @@ def materialize(conn, tenant, include_archived, workflow_template_id, current_st
+         parsed[raw] = hit
+         task_rows.append(r)
+         fields.append(hit[1])
++        raw_keys.append(raw)
+         return hit[0]
+ 
+     tasks = kanban_db.list_tasks(conn, extra_where=extra_where, extra_params=extra_params, parse=parse, **filters)
+     if len(task_rows) != len(tasks):  # a list_tasks that bypassed ``parse``: nothing to reuse
+-        task_rows, fields, parsed, old = [], [asdict(t) for t in tasks], {}, None
++        task_rows, fields, raw_keys, parsed, old = [], [asdict(t) for t in tasks], [], {}, None
+     # Link / comment / progress rollups are each one aggregate query rather than N per-task lookups.
+     link_counts: dict[str, dict[str, int]] = {}
+     for row in conn.execute("SELECT parent_id, child_id FROM task_links").fetchall():
+@@ -253,13 +275,18 @@ def materialize(conn, tenant, include_archived, workflow_template_id, current_st
+             "managing_session_id": managers.get(t.id) or (t.session_id or None),
+         }))
+     tenants = [r["tenant"] for r in conn.execute("SELECT DISTINCT tenant FROM tasks WHERE tenant IS NOT NULL ORDER BY tenant")]
++    from plugins.kanban.dashboard.board_incremental import filters_key
++    inc = None
++    if raw_keys and int(done_limit or 0) > 0:  # what a later ``changed`` read starts from
++        inc = {"filters": filters_key(filters), "cap": int(done_limit), "done_ids": done_ids, "window": done_window,
++               "raw": {t.id: k for t, k in zip(tasks, raw_keys)}}
+     return {
+         "cards": tuple(cards), "diag_inputs": diag_inputs, "done_total": done_total,
+         "latest_event_id": int(latest_event_id), "tenants": tuple(tenants),
+         # The SQL half of kanban_db.known_assignees; profiles on disk are added per projection.
+         "task_assignees": frozenset(kanban_db._counts_by_assignee(conn)),
+         # What the next read of the same query diffs against (``prev``); never part of the payload.
+-        "_memo": {"tasks": parsed, "diag": diag_memo},
++        "_memo": {"tasks": parsed, "diag": diag_memo, "inc": inc},
+     }
+ 
+ 
+diff --git a/plugins/kanban/dashboard/board_rows.py b/plugins/kanban/dashboard/board_rows.py
+index 4e75a27d9f..8e8bfb173c 100644
+--- a/plugins/kanban/dashboard/board_rows.py
++++ b/plugins/kanban/dashboard/board_rows.py
+@@ -249,6 +249,62 @@ def materialized(key: tuple, path: str, build: Callable[[], T],
+     return rows
+ 
+ 
++def content_version(path: str) -> Optional[tuple]:
++    """Content-only revision for switcher counts, with commit-key fallback on legacy boards."""
++    from hermes_cli import kanban_task_change
++
++    ver = version(path)
++    if ver is None:
++        return None
++    with _lock:
++        obs = _observers.get(str(path))
++    if obs is None:
++        return None
++    with obs.lock:
++        _, cursor = kanban_task_change.changed_since(obs.conn, None)
++    return (ver[0], cursor) if cursor is not None else ver
++
++
++def incremental(key: tuple, path: str, build: Callable, fallback: Callable) -> dict:
++    """Read cursor, delta and volatile overlay in ONE snapshot on the guarded observer.
++
++    Serialize a board's refreshes through its observer lock, so concurrent readers cannot
++    publish an older result over a newer cursor. No transaction survives a call.
++    """
++    from hermes_cli import kanban_task_change
++
++    ver = version(path)
++    with _lock:
++        obs = _observers.get(str(path)) if ver is not None else None
++    if obs is None:
++        return fallback()
++    cache_key = (*key, "p2")
++    with obs.lock:
++        with _lock:
++            current = _observers.get(str(path)) is obs
++            hit = _entries.get(cache_key)
++        if not current:
++            return fallback()
++        conn = obs.conn
++        factory = conn.row_factory
++        conn.row_factory = sqlite3.Row
++        try:
++            conn.execute("BEGIN")
++            changed, cursor = kanban_task_change.changed_since(conn, hit[0] if hit else None)
++            rows = build(conn, hit[1] if hit else None, changed)
++        finally:
++            if conn.in_transaction:
++                conn.rollback()
++            conn.row_factory = factory
++        with _lock:
++            if _observers.get(str(path)) is obs:
++                _entries[cache_key] = (cursor, rows)
++                _entries.move_to_end(cache_key)
++                while len(_entries) > MAX_ENTRIES:
++                    _entries.popitem(last=False)
++        return rows
++
++
+ def clear() -> None:
+     """Close every observer and drop all rows (tests, shutdown)."""
+     with _lock:
+diff --git a/plugins/kanban/dashboard/plugin_api.py b/plugins/kanban/dashboard/plugin_api.py
+index 0b127beff0..520fdb2ed1 100644
+--- a/plugins/kanban/dashboard/plugin_api.py
++++ b/plugins/kanban/dashboard/plugin_api.py
+@@ -256,32 +256,13 @@ def get_board(
+     current_step_key: Optional[str] = Query(None, description="Restrict to tasks at this workflow step key"),
+     done_limit: int = Query(_BOARD_DONE_LIMIT, ge=0, le=10000, description="Newest done cards to include. 0 returns the whole column."),
+ ):
+-    """Full board grouped by status column; omitting ``board`` uses the active board
+-    (``HERMES_KANBAN_BOARD`` env → on-disk ``current`` pointer → ``default``).
++    """Exact board grouped by status: P2 deltas plus fresh bookkeeping on every GET.
+ 
+-    A signature hit is reused. A miss that already has a snapshot returns it and
+-    refreshes off this request so a slow read cannot time out the Desktop poll.
++    Do not serve the former stale snapshot here: it hides heartbeats and own writes.
++    The coalesced endpoint still joins simultaneous polls for the same board.
+     """
+-    from plugins.kanban.dashboard import board_rows
+-    from plugins.kanban.dashboard.board_snapshot import file_sig, serve
+-
+-    resolved = _resolve_board(board)
+-    sig = key = None
+-    try:
+-        path = str(kanban_db.kanban_db_path(board=resolved))
+-        key = (path, tenant, include_archived, workflow_template_id, current_step_key, int(done_limit))
+-        # Open the row observer first: on a board without a -wal it creates one, which
+-        # would move the signature taken before this read.
+-        board_rows.version(path)
+-        sig = file_sig(path)  # before the read: a commit during it is read again next time
+-    except Exception:
+-        pass
+-
+-    def read():
+-        return _get_board_uncached(
+-            tenant, include_archived, resolved, workflow_template_id, current_step_key, int(done_limit))
+-
+-    return serve(key, sig, read, now=time.monotonic())
++    return _get_board_uncached(
++        tenant, include_archived, board, workflow_template_id, current_step_key, int(done_limit))
+ 
+ 
+ def _get_board_uncached(tenant, include_archived, board, workflow_template_id, current_step_key, done_limit=_BOARD_DONE_LIMIT):
+@@ -292,19 +273,27 @@ def _get_board_uncached(tenant, include_archived, board, workflow_template_id, c
+     board = _resolve_board(board)
+     done_limit = int(done_limit or 0)
+ 
+-    def build(prev=None):
++    def build(conn, prev=None, changed=None):
++        with _la.pass_("kanban.board.rows") as span:
++            rows = board_read.materialize(conn, tenant, include_archived, workflow_template_id, current_step_key,
++                                          done_limit, diagnostic_inputs=_diagnostic_inputs, prev=prev, changed=changed)
++            span.fallback(not rows["_memo"].get("delta", False))
++            span.change(bool(changed))
++            span.rows(len(changed) if isinstance(changed, (set, frozenset)) else len(rows["cards"]))
++            return rows
++
++    def fallback():
+         with closing(_conn(board=board)) as conn:
+-            return board_read.materialize(conn, tenant, include_archived, workflow_template_id, current_step_key,
+-                                          done_limit, diagnostic_inputs=_diagnostic_inputs, prev=prev)
++            return build(conn)
+ 
+     try:
+         path = str(kanban_db.kanban_db_path(board=board))
+     except Exception:  # health: allow BLE001 -- no path to observe: read uncached, as before
+-        rows = build()
++        rows = fallback()
+     else:
+-        rows = board_rows.materialized(
+-            (path, tenant, bool(include_archived), workflow_template_id, current_step_key, done_limit), path, build,
+-            update=build)
++        rows = board_rows.incremental(
++            (path, tenant, bool(include_archived), workflow_template_id, current_step_key, done_limit),
++            path, build, fallback)
+     return board_read.project(rows, include_archived, _diagnostics_from_inputs)
+ 
+ 
+@@ -1546,6 +1535,7 @@ def list_kanban_projects():
+ 
+ 
+ @router.get("/boards")
++@_la.accounted("route/kanban.boards")
+ def list_boards(include_archived: bool = Query(False)):
+     """Every board on disk with task counts and the active slug."""
+     boards = kanban_db.list_boards(include_archived=include_archived)
+diff --git a/tests/plugins/test_kanban_board_delta.py b/tests/plugins/test_kanban_board_delta.py
+new file mode 100644
+index 0000000000..52e43c9a15
+--- /dev/null
++++ b/tests/plugins/test_kanban_board_delta.py
+@@ -0,0 +1,348 @@
++"""``board_read.materialize(prev=, changed=)``: the delta refresh of the board rows (P2). [daveey]
++
++Every case reads a board in full, writes, then asks ``kanban_task_change.changed_since`` what moved and refreshes
++with that set; the projected payload must equal a cold full read's. All displayed raw rows are refreshed by
++indexed IDs for unmarked bookkeeping, but unchanged rows must not be parsed again; hidden done history
++must not be parsed. Counters, never timing, verify the work retained across refreshes.
++"""
++
++from __future__ import annotations
++
++from pathlib import Path
++from unittest import mock
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_task_change as ktc
++from plugins.kanban.dashboard import board_read
++
++DONE_LIMIT = 3
++
++
++@pytest.fixture
++def conn(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    kb.init_db()
++    c = kbc.connect()
++    yield c
++    c.close()
++
++
++class Board:
++    def __init__(self, conn, done_limit=DONE_LIMIT, include_archived=False, tenant=None):
++        self.conn, self.args = conn, (tenant, include_archived, None, None, done_limit)
++        self.rows = self.cursor = None
++
++    def full(self):
++        _changed, self.cursor = ktc.changed_since(self.conn, None)
++        self.rows = board_read.materialize(self.conn, *self.args)
++        return self.rows
++
++    def refresh(self, full_ok=False, **kw):
++        changed, cursor = ktc.changed_since(self.conn, self.cursor)
++        assert changed is not ktc.FULL
++        self.cursor = cursor
++        with mock.patch.object(board_read, "_done_state", wraps=board_read._done_state) as full:
++            self.rows = board_read.materialize(self.conn, *self.args, prev=self.rows, changed=changed, **kw)
++        assert full_ok or not full.called, "the delta declined: read in full"
++        return self.rows, changed
++
++    def cold(self):
++        return board_read.materialize(self.conn, *self.args)
++
++
++def _payload(rows, include_archived=False):
++    body = board_read.project(rows, include_archived)
++    body.pop("now")
++    for col in body["columns"]:
++        for t in col["tasks"]:
++            t.pop("age", None)
++    return body
++
++
++def _same(board: Board):
++    assert _payload(board.rows) == _payload(board.cold())
++    return board.rows
++
++
++def _seed(conn, n_done=6):
++    ids = [kb.create_task(conn, title=f"card-{i}", assignee="worker", tenant="t1" if i % 2 else None)
++           for i in range(6)]
++    kb.link_tasks(conn, ids[0], ids[1])
++    kb.add_comment(conn, ids[2], "me", "note")
++    for i in range(n_done):
++        tid = kb.create_task(conn, title=f"old-{i}", assignee="other")
++        conn.execute("UPDATE tasks SET status='done', completed_at=? WHERE id=?", (100 + i, tid))
++    conn.commit()
++    return ids
++
++
++def _spy_parse(monkeypatch):
++    parsed = []
++    real = kb.Task.from_row.__func__
++    monkeypatch.setattr(kb.Task, "from_row", classmethod(lambda cls, r: parsed.append(r["id"]) or real(cls, r)))
++    return parsed
++
++
++def test_nothing_changed_is_a_cheap_refresh_equal_to_a_cold_read(conn, monkeypatch):
++    _seed(conn)
++    board = Board(conn)
++    board.full()
++    parsed = _spy_parse(monkeypatch)
++    rows, changed = board.refresh()
++    assert changed == frozenset() and parsed == []
++    assert rows["_memo"]["inc"] is not None
++    _same(board)
++
++
++def test_heartbeat_overlay_keeps_diagnostics_and_event_id_without_a_change_mark(conn, monkeypatch):
++    ids = _seed(conn)
++    kb.claim_task(conn, ids[0])
++    run_id = kb.latest_run(conn, ids[0]).id
++    board = Board(conn)
++    board.full()
++    reread = []
++    real = board_read.diagnostic_inputs
++    def spy(c, task_ids=None):
++        reread.append(task_ids)
++        return real(c, task_ids)
++    before = board.rows["latest_event_id"]
++    assert kbd.heartbeat_worker(conn, ids[0], note="still going", expected_run_id=run_id)
++    rows, changed = board.refresh(diagnostic_inputs=spy)
++    assert changed == frozenset()  # heartbeats are excluded from the change set ...
++    assert rows["latest_event_id"] > before  # ... yet the overlay sees the event
++    assert reread == [[ids[0]]]
++    held = {r["id"]: r for r in rows["diag_inputs"][0]}[ids[0]]
++    assert held["last_heartbeat_at"] is not None
++    _same(board)
++
++
++def test_wake_state_probe_without_a_mark_reaches_the_diagnostics(conn):
++    ids = _seed(conn)
++    board = Board(conn)
++    board.full()
++    from hermes_cli import kanban_wake_check as kwc
++    conn.execute("INSERT INTO task_wake_checks (task_id, cmd, every, next_at) VALUES (?, 'true', 60, 1)", (ids[3],))
++    conn.commit()
++    rows, changed = board.refresh()
++    assert changed == frozenset()
++    assert rows["diag_inputs"][4] == kwc.load_states(conn, [t.id for t, _f, _e in rows["cards"]
++                                                            if t.status != "archived"])
++    assert ids[3] in rows["diag_inputs"][4]
++    _same(board)
++
++
++def test_mixed_writes_match_a_cold_read_and_touch_only_neighbours(conn, monkeypatch):
++    ids = _seed(conn)
++    board = Board(conn)
++    board.full()
++    parsed = _spy_parse(monkeypatch)
++    kb.add_comment(conn, ids[1], "me", "another")        # comment count
++    kb.link_tasks(conn, ids[2], ids[3])                  # links both ends
++    kb.block_task(conn, ids[4], reason="waiting")        # status moves lanes
++    rows, changed = board.refresh()
++    assert changed == {ids[1], ids[2], ids[3], ids[4]}
++    assert set(parsed) <= changed
++    _same(board)
++    by_id = {t.id: e for t, _f, e in rows["cards"]}
++    assert by_id[ids[1]]["comment_count"] == 1 and by_id[ids[2]]["progress"] == {"done": 0, "total": 1}
++    assert by_id[ids[3]]["link_counts"] == {"parents": 1, "children": 0}
++
++
++def test_child_completion_updates_the_parent_progress_and_graph(conn):
++    ids = _seed(conn)
++    board = Board(conn)
++    board.full()
++    conn.execute("UPDATE tasks SET status='done', completed_at=500 WHERE id=?", (ids[1],))
++    conn.commit()
++    rows, changed = board.refresh()
++    assert ids[1] in changed
++    _same(board)
++    parent_graph = rows["diag_inputs"][3][ids[0]]
++    assert [c["status"] for c in parent_graph["children"]] == ["done"]
++
++
++def test_new_task_priority_and_creation_reorder_the_lanes(conn):
++    ids = _seed(conn)
++    board = Board(conn)
++    board.full()
++    new = kb.create_task(conn, title="late", assignee="worker", priority=5)
++    conn.execute("UPDATE tasks SET priority = 3 WHERE id = ?", (ids[5],))
++    conn.commit()
++    board.refresh()
++    _same(board)
++    ready = [t.id for t, _f, _e in board.rows["cards"] if t.status == "ready"]
++    assert ready[0] == new and ready[1] == ids[5]
++
++
++def test_done_window_follows_completions_and_leaves_the_rest_unread(conn, monkeypatch):
++    ids = _seed(conn)
++    board = Board(conn)
++    board.full()
++    parsed = _spy_parse(monkeypatch)
++    kb.claim_task(conn, ids[0])
++    kb.complete_task(conn, ids[0], summary="ok", fire_lifecycle_hook=False)  # newest done: enters the window
++    board.refresh()
++    body = _payload(board.rows)
++    done = next(c for c in body["columns"] if c["name"] == "done")
++    assert done["total"] == 7 and done["omitted"] == 4 and done["tasks"][0]["id"] == ids[0]
++    _same(board)
++    # an old, hidden done task changing is never read as a card
++    hidden = next(i for i in board.rows["_memo"]["inc"]["done_ids"] if i not in {w[0] for w in board.rows["_memo"]["inc"]["window"]})
++    parsed.clear()
++    kb.add_comment(conn, hidden, "me", "late note")
++    board.refresh()
++    assert hidden not in parsed
++    _same(board)
++
++
++def test_a_window_card_leaving_done_reads_in_full(conn):
++    ids = _seed(conn)
++    board = Board(conn)
++    board.full()
++    top = board.rows["_memo"]["inc"]["window"][0][0]
++    conn.execute("UPDATE tasks SET status='ready', completed_at=NULL WHERE id=?", (top,))
++    conn.commit()
++    assert top  # window underflow: the delta declines, the result is still exact
++    rows, _ = board.refresh(full_ok=True)
++    assert rows["done_total"] == 5
++    _same(board)
++    assert ids
++
++
++def test_archive_delete_and_tenant_changes(conn):
++    ids = _seed(conn)
++    board = Board(conn)
++    board.full()
++    assert board.rows["tenants"] == ("t1",)
++    kb.archive_task(conn, ids[1])
++    conn.execute("DELETE FROM tasks WHERE id = ?", (ids[3],))
++    conn.execute("DELETE FROM task_links WHERE parent_id = ?", (ids[3],))
++    conn.execute("UPDATE tasks SET tenant='t2' WHERE id = ?", (ids[5],))
++    conn.commit()
++    board.refresh()
++    _same(board)
++    assert board.rows["tenants"] == ("t2",) or board.rows["tenants"] == ("t1", "t2")
++
++
++def test_full_marker_or_missing_prev_reads_in_full(conn, monkeypatch):
++    _seed(conn)
++    board = Board(conn)
++    board.full()
++    parsed = _spy_parse(monkeypatch)
++    rows = board_read.materialize(conn, *board.args, prev=board.rows, changed=ktc.FULL)
++    assert rows is not board.rows and _payload(rows) == _payload(board.cold())
++    rows = board_read.materialize(conn, *board.args, prev=None, changed=frozenset({"x"}))
++    assert _payload(rows) == _payload(board.cold())
++    assert parsed  # both parsed (the first reuses prev's memo, the second is cold)
++
++
++def test_include_archived_matches_a_cold_read(conn):
++    ids = _seed(conn)
++    board = Board(conn, include_archived=True)
++    board.full()
++    kb.archive_task(conn, ids[2])
++    board.refresh()
++    assert _payload(board.rows, True) == _payload(board.cold(), True)
++
++
++def test_manager_falls_back_to_creator_after_a_delta(conn):
++    tid = kb.create_task(conn, title="managed", session_id="creator-session")
++    board = Board(conn)
++    board.full()
++    kb.add_comment(conn, tid, "me", "refresh extras")
++    board.refresh()
++    extra = next(e for t, _f, e in board.rows["cards"] if t.id == tid)
++    assert extra["managing_session_id"] == "creator-session"
++    _same(board)
++
++
++@pytest.mark.parametrize("column,value", [("claim_expires", 999), ("worker_started_at", 123)])
++def test_ready_lease_only_update_without_a_mark_is_visible(conn, column, value):
++    tid = kb.create_task(conn, title="ready lease")
++    board = Board(conn)
++    board.full()
++    conn.execute(f"UPDATE tasks SET {column}=? WHERE id=?", (value, tid))
++    conn.commit()
++    rows, changed = board.refresh()
++    assert changed == frozenset()
++    held = next(r for r in rows["diag_inputs"][0] if r["id"] == tid)
++    assert held[column] == value
++    _same(board)
++
++
++def test_done_heartbeat_without_a_mark_refreshes_rows_events_and_runs(conn):
++    tid = kb.create_task(conn, title="completed worker")
++    kb.claim_task(conn, tid)
++    kb.complete_task(conn, tid, summary="finished", fire_lifecycle_hook=False)
++    board = Board(conn)
++    board.full()
++    before = board.rows["latest_event_id"]
++    conn.execute("UPDATE tasks SET last_heartbeat_at=999 WHERE id=?", (tid,))
++    conn.execute("UPDATE task_runs SET last_heartbeat_at=999 WHERE task_id=?", (tid,))
++    conn.execute("INSERT INTO task_events (task_id, kind, created_at) VALUES (?, 'heartbeat', 999)", (tid,))
++    conn.commit()
++    rows, changed = board.refresh()
++    assert changed == frozenset()
++    assert rows["latest_event_id"] > before
++    held = next(r for r in rows["diag_inputs"][0] if r["id"] == tid)
++    assert held["last_heartbeat_at"] == 999
++    assert rows["diag_inputs"][1][tid][-1]["kind"] == "heartbeat"
++    assert rows["diag_inputs"][2][tid][-1]["last_heartbeat_at"] == 999
++    _same(board)
++
++
++@pytest.mark.parametrize("delete_task", [False, True])
++def test_deleted_links_refresh_surviving_neighbour_graphs(conn, delete_task):
++    ids = _seed(conn)
++    board = Board(conn)
++    board.full()
++    if delete_task:
++        conn.execute("DELETE FROM tasks WHERE id=?", (ids[1],))
++    conn.execute("DELETE FROM task_links WHERE parent_id=? AND child_id=?", (ids[0], ids[1]))
++    conn.commit()
++    rows, changed = board.refresh()
++    assert ids[0] in changed
++    assert rows["diag_inputs"][3][ids[0]]["children"] == []
++    extra = next(e for t, _f, e in rows["cards"] if t.id == ids[0])
++    assert extra["link_counts"]["children"] == 0
++    assert extra["progress"] is None
++    _same(board)
++
++
++def test_out_of_filter_waiter_priority_reorders_displayed_ancestors(conn):
++    parent = kb.create_task(conn, title="prerequisite", tenant="shown", priority=1)
++    rival = kb.create_task(conn, title="rival", tenant="shown", priority=2)
++    child = kb.create_task(conn, title="foreign waiter", tenant="hidden", priority=0)
++    kb.link_tasks(conn, parent, child)
++    board = Board(conn, tenant="shown")
++    board.full()
++    assert [t.id for t, _f, _e in board.rows["cards"]] == [rival, parent]
++    conn.execute("UPDATE tasks SET priority=5 WHERE id=?", (child,))
++    conn.commit()
++    board.refresh()
++    _same(board)
++    assert [t.id for t, _f, _e in board.rows["cards"]] == [parent, rival]
++
++
++def test_a_delta_chain_stays_exact(conn):
++    ids = _seed(conn)
++    board = Board(conn)
++    board.full()
++    for i in range(4):
++        kb.add_comment(conn, ids[i], "me", f"n{i}")
++        board.refresh()
++        _same(board)
++    kb.claim_task(conn, ids[4])
++    board.refresh()
++    kbd.heartbeat_worker(conn, ids[4], note="x")
++    board.refresh()
++    kb.complete_task(conn, ids[4], summary="s", fire_lifecycle_hook=False)
++    board.refresh()
++    _same(board)
+diff --git a/tests/plugins/test_kanban_board_p2.py b/tests/plugins/test_kanban_board_p2.py
+new file mode 100644
+index 0000000000..1b283103e0
+--- /dev/null
++++ b/tests/plugins/test_kanban_board_p2.py
+@@ -0,0 +1,126 @@
++"""Exact endpoint reads: P2 invalidation, volatile overlay and legacy FULL fallback."""
++from contextlib import closing
++from unittest import mock
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_task_change as changes
++from plugins.kanban.dashboard import board_counts, board_rows
++from tests.plugins import test_kanban_board_read_cache as helpers
++
++board = helpers.board
++
++
++@pytest.fixture(autouse=True)
++def reset():
++    board_rows.clear()
++    board_counts.clear()
++    yield
++    board_rows.clear()
++    board_counts.clear()
++
++
++def get(client):
++    response = client.get('/api/plugins/kanban/board?done_limit=2')
++    assert response.status_code == 200
++    body = response.json()
++    return body, {t['id']: t for col in body['columns'] for t in col['tasks']}
++
++
++def seed():
++    with closing(kbc.connect()) as conn:
++        parent = kb.create_task(conn, title='parent', assignee='w')
++        child = kb.create_task(conn, title='child', assignee='w')
++        return parent, child
++
++
++@pytest.mark.parametrize('mutation', ['heartbeat', 'child', 'link', 'done'])
++def test_next_get_is_exact_without_a_whole_board_read(board, mutation):
++    _mod, client, _reads = board
++    parent, child = seed()
++    with closing(kbc.connect()) as conn:
++        if mutation == 'child':
++            kb.link_tasks(conn, parent, child)
++        if mutation == 'done':
++            for i in range(4):
++                tid = kb.create_task(conn, title=f'done-{i}', assignee='w')
++                conn.execute("UPDATE tasks SET status='done',completed_at=? WHERE id=?", (100+i, tid))
++            conn.commit()
++    get(client)
++    with mock.patch.object(kb, 'list_tasks', wraps=kb.list_tasks) as full:
++        with closing(kbc.connect()) as conn:
++            if mutation == 'heartbeat':
++                conn.execute('UPDATE tasks SET last_heartbeat_at=123,claim_expires=456,worker_pid=789 WHERE id=?', (child,))
++            elif mutation == 'link':
++                kb.link_tasks(conn, parent, child)
++            else:
++                conn.execute("UPDATE tasks SET status='done',completed_at=1000 WHERE id=?", (child,))
++            conn.commit()
++        body, cards = get(client)
++        assert not full.called
++    if mutation == 'heartbeat':
++        assert (cards[child]['last_heartbeat_at'], cards[child]['claim_expires'], cards[child]['worker_pid']) == (123, 456, 789)
++    elif mutation == 'child':
++        assert cards[parent]['progress'] == {'done': 1, 'total': 1}
++    elif mutation == 'link':
++        assert cards[parent]['link_counts']['children'] == cards[child]['link_counts']['parents'] == 1
++    else:
++        done = next(c for c in body['columns'] if c['name'] == 'done')
++        assert (done['total'], done['omitted']) == (5, 3)
++        assert [t['title'] for t in done['tasks']] == ['child', 'done-3']
++
++
++def test_untrusted_cursor_falls_back_and_rearms(board):
++    _mod, client, _reads = board
++    _, child = seed()
++    get(client)
++    with closing(kbc.connect()) as conn:
++        conn.execute('DROP TRIGGER kanban_activity_rev_tasks_update')
++        conn.execute("UPDATE tasks SET title='unmarked' WHERE id=?", (child,))
++        conn.commit()
++    with mock.patch.object(kb, 'list_tasks', wraps=kb.list_tasks) as full:
++        assert get(client)[1][child]['title'] == 'unmarked'
++        assert full.call_count == 1
++
++
++def test_cursor_and_rows_share_a_snapshot(board, monkeypatch):
++    _mod, client, _reads = board
++    _, child = seed()
++    get(client)
++    real = changes.changed_since
++    committed = False
++
++    def racing(conn, cursor, **kwargs):
++        nonlocal committed
++        result = real(conn, cursor, **kwargs)
++        assert conn.in_transaction
++        if not committed:
++            committed = True
++            with closing(kbc.connect()) as writer:
++                writer.execute("UPDATE tasks SET title='raced' WHERE id=?", (child,))
++                writer.commit()
++        return result
++
++    monkeypatch.setattr(changes, 'changed_since', racing)
++    assert get(client)[1][child]['title'] == 'child'
++    assert get(client)[1][child]['title'] == 'raced'
++
++
++def test_switcher_ignores_heartbeat_but_not_status(board):
++    mod, _client, _reads = board
++    _, child = seed()
++    mod.list_boards(include_archived=False)
++    with mock.patch.object(board_counts, '_query', wraps=board_counts._query) as query:
++        with closing(kbc.connect()) as conn:
++            conn.execute('UPDATE tasks SET last_heartbeat_at=321 WHERE id=?', (child,))
++            conn.commit()
++        mod.list_boards(include_archived=False)
++        assert not query.called
++        with closing(kbc.connect()) as conn:
++            conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (child,))
++            conn.commit()
++        result = mod.list_boards(include_archived=False)
++        assert query.call_count == 1
++        assert result['boards'][0]['counts']['blocked'] == 1
+-- 
+2.43.0
+

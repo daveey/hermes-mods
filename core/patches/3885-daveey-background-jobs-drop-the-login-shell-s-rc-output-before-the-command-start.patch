@@ -1,0 +1,459 @@
+From 8bf08e5f9d3cf6424c11db077c8d17d1b62fe93d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 21:32:54 +0000
+Subject: [PATCH] [daveey] background jobs: drop the login shell's rc output
+ before the command (start marker)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+spawn_local runs every background job as `$SHELL -lic '... exec bash -c "$HERMES_BG_COMMAND"'`,
+so whatever the host's startup files print became the job's first output. Ubuntu's
+/etc/bash.bashrc prints its sudo hint for any account without ~/.sudo_as_admin_successful
+(a fresh VM, a faked HOME), and the CLI dock painted an idle job as
+`⚙ sleep 30 · 0s · last: See "man sudo_root" for details.` instead of `starting`.
+The readers stripped only bash's job-control warnings.
+
+Fix: just before the `exec`, the login shell prints a per-job start marker on its own line
+(`printf '\n%s\n' __hermes_bg_start_<uuid>__`; the leading newline ends an unterminated rc
+line). `_ingest_output` holds everything until that line and drops it with the marker, so
+poll/log/the dock/watch patterns/notify output see only the command's own output; motd,
+locale and cloud-init banners go too. It covers the pipe, log (persisted/worker) and PTY
+readers, since all three ingest through `_ingest_output`.
+
+- Armed only when the argv actually carries the marker (`arm_start_gate`): Windows argv is
+  unchanged and prints none, an adopted foreground Popen has none, a replaced argv has none.
+- `start_marker` is checkpointed, so a re-adopted persisted job re-reading its log from the
+  start is gated too; old checkpoints default to "" (ungated, as before).
+- No marker by end of output (an rc file that exits, a shell that fails): the held text is
+  released as is (`_finish_reader`, and the log reader's adopter path).
+- Hold bounded at 64 KiB: past it, everything but a possible marker-prefix tail is released.
+- notify_on_complete and watch-pattern semantics unchanged (they scan ingested text only).
+- `clean_shell_noise` moved to process_registry_bg_shell (offsets process_registry.py growth).
+
+Proof:
+- RED at origin/main: tests/tools/test_process_registry_start_banner.py, 5 failed; the
+  pipe/log/pty cases fail on `'To run a command as administrator ...\nno-newline-bannerfirst-line\n'
+  == 'first-line\n'` (a temp rc prints Ubuntu's banner plus an unterminated line).
+- GREEN: that file 7 passed; 230 test files referencing process_registry/ProcessSession/
+  spawn_local: 3905 passed, 3 failed, all 3 in tests/gateway/test_persist_job_survives_gateway_restart.py
+  with RestartSafeScopeUnavailable, which fails identically at origin/main on this Kanban worker.
+- Mutants (sdlc-review mutants.py, 10/10 killed): e.g. M1 `_ingest_output` never gates ->
+  test_rc_banner_never_reaches_output_or_dock[pipe|log|pty] fail; M10 marker printed without
+  its leading newline -> same three fail (the unterminated banner line swallows it); others:
+  no marker in argv, armed without marker, no release in _finish_reader / log reader, no
+  __post_init__ arming, marker not checkpointed, no \r tolerance (PTY), no hold bound.
+
+Card: t_01a1d69d460bc977 (found by t_01a1d6822cd87a47; PR #2643 made the dock test hermetic).
+---
+ tests/hermes_cli/test_process_dock.py         |   2 +-
+ tests/tools/process_registry_fixtures.py      |  12 +-
+ tests/tools/test_process_registry.py          |   2 +-
+ .../test_process_registry_start_banner.py     | 130 ++++++++++++++++++
+ tools/process_registry.py                     |  30 ++--
+ tools/process_registry_bg_shell.py            |  67 ++++++++-
+ tools/process_registry_output_log.py          |   3 +
+ 7 files changed, 225 insertions(+), 21 deletions(-)
+ create mode 100644 tests/tools/test_process_registry_start_banner.py
+
+diff --git a/tests/hermes_cli/test_process_dock.py b/tests/hermes_cli/test_process_dock.py
+index d96d640f79..d500f6ee8a 100644
+--- a/tests/hermes_cli/test_process_dock.py
++++ b/tests/hermes_cli/test_process_dock.py
+@@ -23,7 +23,7 @@ def _quiet_shell(monkeypatch):
+     from tools.environments.local import _find_bash
+ 
+     monkeypatch.setattr(process_registry_module, 'bg_login_argv',
+-                        lambda command: [_find_bash(), '--noprofile', '--norc', '-c', command])
++                        lambda command, *_: [_find_bash(), '--noprofile', '--norc', '-c', command])
+ 
+ 
+ def test_dock_paints_processes_under_agents_and_retires_finished_rows(monkeypatch):
+diff --git a/tests/tools/process_registry_fixtures.py b/tests/tools/process_registry_fixtures.py
+index c242404fa8..08b793c3bf 100644
+--- a/tests/tools/process_registry_fixtures.py
++++ b/tests/tools/process_registry_fixtures.py
+@@ -48,11 +48,21 @@ os._exit(0)
+         proc.stdout.close()
+ 
+ 
++START_MARKER = "__hermes_bg_start_fixture__"
++
++
++@pytest.fixture(autouse=True)
++def fixed_start_marker(monkeypatch):
++    """A known start marker, so the login argv is comparable to ``bg_script()`` (autouse where imported)."""
++    monkeypatch.setattr("tools.process_registry.new_start_marker", lambda: START_MARKER)
++
++
+ def bg_script():
+-    """Login-shell script spawn_local passes: init, then exec the foreground bash."""
++    """Login-shell script spawn_local passes: init, print the start marker, then exec the foreground bash."""
+     import shlex
+ 
+     from tools.process_registry_bg_shell import _find_bash
+ 
+     return ('set +m; _hc=$HERMES_BG_COMMAND; unset HERMES_BG_COMMAND; '
++            f"printf '\\n%s\\n' {START_MARKER}; "
+             f'exec {shlex.quote(_find_bash())} -c "$_hc"')
+diff --git a/tests/tools/test_process_registry.py b/tests/tools/test_process_registry.py
+index 740355268c..8851df417d 100644
+--- a/tests/tools/test_process_registry.py
++++ b/tests/tools/test_process_registry.py
+@@ -22,7 +22,7 @@ from tools.process_registry import (
+ )
+ 
+ 
+-orphan_pipe = process_registry_fixtures.orphan_pipe
++orphan_pipe, fixed_start_marker = process_registry_fixtures.orphan_pipe, process_registry_fixtures.fixed_start_marker
+ 
+ 
+ @pytest.fixture()
+diff --git a/tests/tools/test_process_registry_start_banner.py b/tests/tools/test_process_registry_start_banner.py
+new file mode 100644
+index 0000000000..4fd6784634
+--- /dev/null
++++ b/tests/tools/test_process_registry_start_banner.py
+@@ -0,0 +1,130 @@
++"""What the login shell's rc files print before the command is not the command's output.
++
++``spawn_local`` runs ``$SHELL -lic``, so a host whose startup files print something (Ubuntu's
++/etc/bash.bashrc sudo hint for an account without ``~/.sudo_as_admin_successful``, motd, locale
++warnings) used to start every background job with those lines, and the CLI dock painted an idle job
++as ``last: See "man sudo_root" for details.`` instead of ``starting`` (t_01a1d69d460bc977).
++"""
++
++import shlex
++import shutil
++
++import pytest
++
++from tests.waiting import wait_until
++from tools.process_registry import ProcessRegistry, ProcessSession
++
++pytestmark = pytest.mark.skipif(not shutil.which("bash"), reason="needs bash")
++
++BANNER = 'To run a command as administrator (user "root"), use "sudo <command>".\nSee "man sudo_root" for details.'
++
++
++def _banner_shell(tmp_path, monkeypatch, rc_text):
++    """A ``$SHELL`` named bash whose login startup runs ``rc_text`` and nothing from the host
++    (/etc/profile may reset HOME or print its own banner)."""
++    rc = tmp_path / "banner.rc"
++    rc.write_text(rc_text)
++    login = tmp_path / "bash"
++    login.write_text('#!/bin/sh\n[ "$1" = "-lic" ] || exit 97\n'
++                     f'exec {shlex.quote(shutil.which("bash"))} --noprofile -lic '
++                     f'{shlex.quote(". " + shlex.quote(str(rc)) + "; ")}"$2"\n')
++    login.chmod(0o700)
++    monkeypatch.setenv("SHELL", str(login))
++
++
++@pytest.mark.parametrize("mode", ["pipe", "log", "pty"])
++def test_rc_banner_never_reaches_output_or_dock(tmp_path, monkeypatch, mode):
++    from hermes_cli import cli_process_dock
++    from agent.i18n import t
++    import tools.process_registry as process_registry_module
++
++    if mode == "pty":
++        pytest.importorskip("ptyprocess")
++    # The unterminated last line must not swallow the command's first line.
++    _banner_shell(tmp_path, monkeypatch, f"printf '%s\\n%s' {shlex.quote(BANNER)} 'no-newline-banner'\n")
++    reg = ProcessRegistry()
++    monkeypatch.setattr(process_registry_module, "process_registry", reg)
++    kwargs = {"persist_on_release": True} if mode == "log" else {"use_pty": True} if mode == "pty" else {}
++    try:
++        talker = reg.spawn_local("echo first-line; sleep 30", task_id="t-banner", **kwargs)
++        quiet = reg.spawn_local("echo; sleep 30", task_id="t-banner", **kwargs)
++        assert bool(talker.output_log) == (mode == "log") and (talker._pty is not None) == (mode == "pty")
++        wait_until(lambda: "first-line" in talker.output_buffer, what="the command's first line")
++        # The quiet job's only output is one newline, written after anything its rc printed.
++        wait_until(lambda: "\n" in quiet.output_buffer, what="the quiet job's newline")
++        assert talker.output_buffer.replace("\r\n", "\n") == "first-line\n"
++        assert quiet.output_buffer.strip() == ""
++        rows = {row["id"]: row for row in cli_process_dock.process_rows()}
++        assert cli_process_dock.process_activity(rows[talker.id]).endswith(
++            t("cli.dock.last_output", detail="first-line"))
++        assert cli_process_dock.process_activity(rows[quiet.id]).endswith(t("cli.dock.starting"))
++    finally:
++        reg.kill_all()
++
++
++def test_output_is_kept_when_the_shell_never_reaches_the_command(tmp_path, monkeypatch):
++    """An rc file that exits never runs the command: what it printed is all the job's output."""
++    _banner_shell(tmp_path, monkeypatch, "echo rc-gave-up; exit 5\n")
++    reg = ProcessRegistry()
++    try:
++        s = reg.spawn_local("echo never-runs", task_id="t-banner")
++        wait_until(lambda: s.exited, what="job exit")
++        assert s.output_buffer.strip() == "rc-gave-up" and s.exit_code == 5
++    finally:
++        reg.kill_all()
++
++
++def test_readopted_log_strips_the_banner(tmp_path, monkeypatch):
++    """A re-adopted persisted job re-reads its log from the start: the checkpointed marker still gates it."""
++    import tools.process_registry as process_registry_module
++
++    assert "start_marker" in process_registry_module._CHECKPOINT_FIELDS
++    marker = "__hermes_bg_start_test__"
++    log = tmp_path / "proc_readopt.log"
++    log.write_text(f"{BANNER}\n{marker}\nreal-output\n")
++    (tmp_path / "proc_readopt.exit").write_text("0\n")
++    session = ProcessSession(id="proc_readopt", command="x", output_log=str(log), detached=True,
++                             start_marker=marker)
++    reg = ProcessRegistry()
++    monkeypatch.setattr(reg, "_detached_host_fate", lambda *_: "gone")
++    reg._log_reader_loop(session)
++    assert session.output_buffer == "real-output\n" and session.exit_code == 0
++    # An adopted log whose shell never printed the marker keeps everything it wrote.
++    log.write_text("rc-gave-up\n")
++    (tmp_path / "proc_readopt.exit").write_text("5\n")
++    gave_up = ProcessSession(id="proc_readopt2", command="x", output_log=str(log), detached=True,
++                             start_marker=marker)
++    reg._log_reader_loop(gave_up)
++    assert gave_up.output_buffer == "rc-gave-up\n" and gave_up.exit_code == 5
++
++
++def test_replaced_argv_without_the_marker_is_never_held(monkeypatch):
++    """A login argv that prints no marker (Windows, a test's rc-free shell) must not hold the output."""
++    import tools.process_registry as process_registry_module
++    from tools.environments.local import _find_bash
++
++    monkeypatch.setattr(process_registry_module, "bg_login_argv",
++                        lambda command, *_: [_find_bash(), "--noprofile", "--norc", "-c", command])
++    reg = ProcessRegistry()
++    try:
++        s = reg.spawn_local("echo unheld; sleep 30", task_id="t-banner")
++        assert s.start_marker == ""
++        wait_until(lambda: "unheld" in s.output_buffer, what="output of a running job")
++    finally:
++        reg.kill_all()
++
++
++def test_gate_holds_split_marker_and_bounds_the_hold():
++    from tools.process_registry_bg_shell import START_HOLD_MAX_CHARS, gate_start_output, release_start_output
++
++    s = ProcessSession(id="proc_gate", command="x", start_marker="__m__")
++    assert gate_start_output(s, "banner\n__") == ""
++    assert gate_start_output(s, "m__\r") == ""  # a PTY line end split across reads
++    assert gate_start_output(s, "\nout\n") == "out\n"
++    assert gate_start_output(s, "__m__\n") == "__m__\n"  # after the marker, nothing is filtered
++    flood = ProcessSession(id="proc_flood", command="x", start_marker="__m__")
++    released = gate_start_output(flood, "x" * (START_HOLD_MAX_CHARS + 100))
++    assert released and len(released) < START_HOLD_MAX_CHARS + 100
++    assert gate_start_output(flood, "\n__m__\nafter") == "after"
++    plain = ProcessSession(id="proc_plain", command="x")  # no marker: adopted foreground, Windows, old checkpoint
++    assert gate_start_output(plain, "anything") == "anything" and release_start_output(plain) == ""
+diff --git a/tools/process_registry.py b/tools/process_registry.py
+index 18816a3606..e3e5292201 100644
+--- a/tools/process_registry.py
++++ b/tools/process_registry.py
+@@ -25,7 +25,7 @@ _IS_WINDOWS = platform.system() == "Windows"
+ # (not merely "not Windows") so macOS and other POSIX platforms never touch systemd.
+ # See #70716.
+ _IS_LINUX = platform.system() == "Linux"
+-from tools.process_registry_bg_shell import bg_command_env, bg_login_argv
++from tools.process_registry_bg_shell import arm_start_gate, bg_command_env, bg_login_argv, clean_shell_noise, gate_start_output, new_start_marker, release_start_output
+ from tools.environments.sandbox_scope import hosted_scope, producer_fields
+ from tools.environments.local import _append_dropped_path_entries, _resolve_safe_cwd, _sanitize_subprocess_env, _terminal_env, process_cwd, routed_terminal_base
+ from hermes_cli._subprocess_compat import windows_hide_flags
+@@ -572,6 +572,7 @@ class ProcessSession:
+     output_log: str = ""                        # file the process writes to (worker spawns; no pipe to lose)
+     pty_fallback: str = ""                      # why a pty=true local spawn runs in pipe mode instead
+     shell_markers: list = field(default_factory=list)  # foreground wrapper trailer markers its log carries [daveey]
++    start_marker: str = ""  # the login shell prints it after its rc files; output before it is dropped [daveey]
+     # Sandbox spawns: how a later process re-opens the sandbox (``env.reattach_handle()``) and where the
+     # wrapper's hermes_bg_<id>.{log,pid,exit} files live, so a restart can re-attach the watcher. [daveey]
+     sandbox_handle: dict = field(default_factory=dict)
+@@ -625,12 +626,15 @@ class ProcessSession:
+     # sink (park + wake the chat), since the chat may not be open in this backend. [daveey]
+     _completion_via_readopt_sink: bool = field(default=False, repr=False)
+     _owned_pgid: Optional[int] = field(default=None, repr=False)  # see ProcessOwnershipMixin
++    _start_held: Optional[str] = field(default=None, repr=False)  # output held until start_marker; None = passing
+ 
+     def __post_init__(self):
+         # A session built without an explicit owner is owned by its own task, so ownership checks compare
+         # ``owner_task_id`` alone instead of repeating an ``or task_id`` fallback at every call site.
+         if not self.owner_task_id:
+             self.owner_task_id = self.task_id
++        if self.start_marker and self._start_held is None:  # re-adopted: its log is re-read from the start
++            self._start_held = ""
+ 
+     def append_output(self, text: str) -> None:
+         """Append to the rolling output buffer under the session lock, keeping the tail."""
+@@ -672,7 +676,8 @@ _CHECKPOINT_FIELDS = (
+     "started_at", "task_id", "owner_task_id", "session_key",
+     *(f"watcher_{k}" for k in _WATCHER_ROUTE_KEYS), "watcher_interval",
+     "parent_session_id", "notify_on_complete", "completion_output_chars", "watch_patterns",
+-    "heartbeat_seconds", "persist_on_release", "output_log", "sandbox_handle", "sandbox_temp_dir", "shell_markers")
++    "heartbeat_seconds", "persist_on_release", "output_log", "sandbox_handle", "sandbox_temp_dir", "shell_markers",
++    "start_marker")
+ _CHECKPOINT_DEFAULTS = {
+     f.name: (f.default if f.default is not MISSING
+              else f.default_factory() if f.default_factory is not MISSING else MISSING)  # type: ignore[misc]
+@@ -693,10 +698,7 @@ class ProcessRegistry(ProcessObligationMixin, ProcessTerminationMixin, ProcessCh
+     Thread-safe: accessed from executor threads (terminal_tool, process handlers),
+     the gateway asyncio loop (watchers, reset checks) and the cleanup thread."""
+ 
+-    _SHELL_NOISE_SUBSTRINGS = (
+-        "no job control in this shell", "cannot set terminal process group",
+-        "tcsetattr: Inappropriate ioctl for device")
+-
++    _clean_shell_noise = staticmethod(clean_shell_noise)
+     # Class default so registries built via __new__ (tests) still restore on first drain.
+     _completions_restored = False
+ 
+@@ -799,14 +801,6 @@ class ProcessRegistry(ProcessObligationMixin, ProcessTerminationMixin, ProcessCh
+         _redact_process_result(notification)
+         self.completion_queue.put(notification)
+ 
+-    @staticmethod
+-    def _clean_shell_noise(text: str) -> str:
+-        """Strip shell startup warnings from the beginning of output."""
+-        lines = text.split("\n")
+-        while lines and any(noise in lines[0] for noise in ProcessRegistry._SHELL_NOISE_SUBSTRINGS):
+-            lines.pop(0)
+-        return "\n".join(lines)
+-
+     def _emit_output(self, session: ProcessSession, chunk: str) -> None:
+         """Forward a chunk to the live-output sink; called from reader threads, never raises."""
+         sink = self.on_output
+@@ -1122,7 +1116,9 @@ class ProcessRegistry(ProcessObligationMixin, ProcessTerminationMixin, ProcessCh
+         """Login-shell argv (rc files sourced, user tools on PATH, then the foreground's bash runs
+         the command), wrapped in a transient systemd scope when we are the supervised gateway
+         (own cgroup: an OOM kills only the worker, not the gateway and its messaging control plane)."""
+-        argv = bg_login_argv(safe_command)
++        marker = new_start_marker()
++        argv = bg_login_argv(safe_command, marker)
++        arm_start_gate(session, argv, marker)
+         # This applies to both pipe mode and the PTY path above. See #70716.
+         in_supervised_gateway = _IS_LINUX and _is_supervised_gateway_process()
+         if in_supervised_gateway and _systemd_run_user_scope_available():
+@@ -1421,6 +1417,8 @@ class ProcessRegistry(ProcessObligationMixin, ProcessTerminationMixin, ProcessCh
+             tail = decoder.decode(b"", final=True)
+             if tail:
+                 append(tail)
++            if held := release_start_output(session):  # the shell never reached the command
++                append(held)
+         try:
+             wait()
+         except Exception as e:
+@@ -1495,6 +1493,8 @@ class ProcessRegistry(ProcessObligationMixin, ProcessTerminationMixin, ProcessCh
+     def _ingest_output(self, session: ProcessSession, text: str, *, unless_exited: bool = False) -> None:
+         """Buffer a freshly-read chunk, then scan watch patterns and stream it live.
+         ``unless_exited`` drops the chunk once the session has exited (atomically with a kill)."""
++        if session._start_held is not None and not (text := gate_start_output(session, text)):
++            return  # the login shell's rc output, before the command
+         if not unless_exited:
+             session.append_output(text)
+         elif not session.append_output_if_running(text):
+diff --git a/tools/process_registry_bg_shell.py b/tools/process_registry_bg_shell.py
+index d87259ec41..4790c27a21 100644
+--- a/tools/process_registry_bg_shell.py
++++ b/tools/process_registry_bg_shell.py
+@@ -3,19 +3,48 @@
+ The user's login shell loads the rc files (#42203), then ``exec``s the same bash the foreground
+ terminal uses, so word splitting, ``PIPESTATUS`` etc. match between foreground and background.
+ The command text rides in ``HERMES_BG_COMMAND`` (set on the spawn env), never re-quoted into argv.
++
++Whatever the rc files print (Ubuntu's sudo hint, motd, locale warnings) is not the command's
++output. Just before the ``exec`` the login shell prints a per-job start marker on its own line;
++the readers hold everything until that line and drop it with the marker (``gate_start_output``),
++so poll/log/the dock/watch patterns see only the command's own output. [daveey]
+ """
+ 
++import re
+ import shlex
++import uuid
+ 
+ from tools.environments.local import _IS_WINDOWS, _find_bash, _find_shell
+ 
++# Pre-marker text held before giving up on the marker (an rc file that floods): release all but a
++# tail that could still begin the marker line, and keep looking.
++START_HOLD_MAX_CHARS = 1 << 16
++# bash's job-control warnings under ``-lic`` without a tty (jobs whose argv prints no start marker).
++SHELL_NOISE_SUBSTRINGS = (
++    "no job control in this shell", "cannot set terminal process group",
++    "tcsetattr: Inappropriate ioctl for device")
++
++
++def clean_shell_noise(text: str) -> str:
++    """Strip shell startup warnings from the beginning of output."""
++    lines = text.split("\n")
++    while lines and any(noise in lines[0] for noise in SHELL_NOISE_SUBSTRINGS):
++        lines.pop(0)
++    return "\n".join(lines)
++
++
++def new_start_marker() -> str:
++    return f"__hermes_bg_start_{uuid.uuid4().hex}__"
++
+ 
+-def bg_login_argv(command: str) -> list[str]:
+-    if _IS_WINDOWS:  # unchanged: Windows keeps the command in argv
++def bg_login_argv(command: str, start_marker: str = "") -> list[str]:
++    if _IS_WINDOWS:  # unchanged: Windows keeps the command in argv (and prints no start marker)
+         return [_find_shell(), "-lic", f"set +m; {command}"]
++    # The leading newline ends an unterminated rc line, so the marker always starts its own line.
++    start = f"printf '\\n%s\\n' {shlex.quote(start_marker)}; " if start_marker else ""
+     return [_find_shell(), "-lic",
+             'set +m; _hc=$HERMES_BG_COMMAND; unset HERMES_BG_COMMAND; '
+-            f'exec {shlex.quote(_find_bash())} -c "$_hc"']
++            f'{start}exec {shlex.quote(_find_bash())} -c "$_hc"']
+ 
+ 
+ def bg_command_env(env: dict, command: str) -> dict:
+@@ -23,3 +52,35 @@ def bg_command_env(env: dict, command: str) -> dict:
+     if not _IS_WINDOWS:
+         env["HERMES_BG_COMMAND"] = command
+     return env
++
++
++def arm_start_gate(session, argv: list, marker: str) -> None:
++    """Hold the job's output until ``marker``, only when ``argv`` actually prints it (not on Windows,
++    nor for a replaced argv), so a job is never held for a marker that cannot come."""
++    session.start_marker = marker if marker and any(marker in str(a) for a in argv) else ""
++    session._start_held = "" if session.start_marker else None
++
++
++def gate_start_output(session, text: str) -> str:
++    """The part of ``text`` to ingest: nothing before the marker line (held), what follows it after."""
++    held = session._start_held
++    if held is None:
++        return text
++    buf = held + text
++    found = re.search(rf"\r?\n{re.escape(session.start_marker)}\r?\n", buf)
++    if found:
++        session._start_held = None
++        return buf[found.end():]
++    if len(buf) <= START_HOLD_MAX_CHARS:
++        session._start_held = buf
++        return ""
++    keep = len(session.start_marker) + 3  # "\r\n" + marker + "\r": a marker line not yet complete
++    session._start_held = buf[-keep:]
++    return buf[:-keep]
++
++
++def release_start_output(session) -> str:
++    """At the end of the output with no marker seen (an rc file exited, the shell failed): the held
++    text is all the job printed, so it is shown as is."""
++    held, session._start_held = session._start_held, None
++    return held or ""
+diff --git a/tools/process_registry_output_log.py b/tools/process_registry_output_log.py
+index d625e9f1a3..2562de2761 100644
+--- a/tools/process_registry_output_log.py
++++ b/tools/process_registry_output_log.py
+@@ -213,6 +213,9 @@ class ProcessOutputLogMixin:
+         except OSError as exc:
+             logger.warning("Process output log %s unreadable: %s", session.output_log, exc)
+         ingest(decoder.decode(b"", final=True), final=True)
++        from tools.process_registry_bg_shell import release_start_output
++        if held := release_start_output(session):  # the shell never reached the command
++            ingest(held, final=True)
+         if killed_by := recorded_kill_source(session.output_log):
+             # Another Hermes process's process_manage kill ended it (process_registry_foreign): report
+             # the kill, as a local kill_process does, not the signal's "status unknown". [daveey]
+-- 
+2.43.0
+

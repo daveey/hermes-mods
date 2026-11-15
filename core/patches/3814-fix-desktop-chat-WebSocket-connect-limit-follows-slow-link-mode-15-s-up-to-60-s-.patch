@@ -1,0 +1,793 @@
+From 7ff64f0b56ef5bfae15c6010c10636d6dae2ca0c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 12:10:41 -0800
+Subject: [PATCH] fix(desktop): chat WebSocket connect limit follows slow-link
+ mode (15 s -> up to 60 s) [daveey]
+
+Over a slow link the chat WebSocket still gave up after a fixed 15 s, so chat
+showed "Reconnecting to Hermes" while slow-link mode (#1928,
+apps/desktop/electron/slow-link.ts) kept the HTTP side of the same SSH tunnel
+alive.
+
+- shared JsonRpcGatewayClient.connect(wsUrl, { connectTimeoutMs }) takes a
+  per-dial limit (the constructor default stays 15 s); a dial that hits its
+  limit rejects with code GATEWAY_CONNECT_TIMEOUT.
+- Desktop main (slow-link.ts): RemoteTransports maps an SSH-forwarded
+  backend's origin to its scope and SSH-master check (registered by
+  noteRemoteConnect). gatewayConnectLimitMs(wsUrl) = 15 s, or
+  SlowLinkTracker.scaleTimeout(15 s) (x4, capped 60 s) while that link is slow.
+  A socket that opened is an answer for the tracker; a dial that timed out
+  with the SSH master alive is a strike, like a dispatch-probe timeout.
+  Exposed as hermes:gateway:connect-limit (sync) and
+  hermes:gateway:connect-outcome via preload; registered with
+  registerGatewayConnectIpc. main.ts is net 0 lines.
+- Renderer: HermesGateway.connect dials through dialWithLinkLimit
+  (src/api/gateway-link-dial.ts), which reads the limit before the dial and
+  reports the outcome. No bridge, or a non-positive answer, = client default.
+- Local and cloud backends (any URL main does not know as SSH-forwarded) keep
+  15 s.
+
+Known cost: when WebSocket strikes alone reach SLOW_LINK_STRIKE_LIMIT, the link
+leaves slow mode (logged "giving up on slow mode"); retiring the backend stays
+with the dispatch probe, which runs again before the renderer's next dial.
+
+Tests (executed, fake timers):
+- src/api/gateway-link-dial-slow-link.test.ts drives the real tracker, the
+  main-side limit/outcome functions, dialWithLinkLimit and the shared client
+  against a socket that opens at 20 s: it connects in slow mode (60 s limit)
+  and times out at 15 s in normal mode and for a local backend; a timeout with
+  the master alive enters slow mode, a dead master does not; an open clears
+  strikes; IPC registration answers the sync limit.
+- src/api/gateway-link-dial.test.ts: HermesGateway.connect passes the limit,
+  reports opened / timed-out, ignores other failures, falls back to the default.
+- RED: with json-rpc-gateway.ts and client.ts reverted, 11 of the 21 new tests
+  fail; GREEN: 21/21.
+---
+ apps/desktop/electron/main.ts                 |   9 +-
+ apps/desktop/electron/preload.ts              |   3 +
+ apps/desktop/electron/slow-link.ts            | 152 ++++++++++-
+ apps/desktop/src/api/client.ts                |   3 +-
+ .../api/gateway-link-dial-slow-link.test.ts   | 245 ++++++++++++++++++
+ .../desktop/src/api/gateway-link-dial.test.ts |  76 ++++++
+ apps/desktop/src/api/gateway-link-dial.ts     |  62 +++++
+ apps/desktop/src/global.d.ts                  |   7 +
+ apps/shared/src/index.ts                      |   2 +
+ apps/shared/src/json-rpc-gateway.ts           |  22 +-
+ 10 files changed, 569 insertions(+), 12 deletions(-)
+ create mode 100644 apps/desktop/src/api/gateway-link-dial-slow-link.test.ts
+ create mode 100644 apps/desktop/src/api/gateway-link-dial.test.ts
+ create mode 100644 apps/desktop/src/api/gateway-link-dial.ts
+
+diff --git a/apps/desktop/electron/main.ts b/apps/desktop/electron/main.ts
+index 45c6363662..76cf61f573 100644
+--- a/apps/desktop/electron/main.ts
++++ b/apps/desktop/electron/main.ts
+@@ -586,7 +586,7 @@ import {
+ import { ensureLoginShellPath } from './shell-path'
+ import { installSidebarBootSnapshot } from './sidebar-boot-snapshot'
+ import { removeStaleSingletonLock } from './singleton-lock'
+-import { dispatchSlowLink, noteRemoteAnswer, noteRemoteConnect, slowLinkTracker, thinnedPoll } from './slow-link'
++import { dispatchSlowLink, noteRemoteAnswer, noteRemoteConnect, registerGatewayConnectIpc, slowLinkTracker, thinnedPoll } from './slow-link'
+ import { createSourcePythonBackend, resolveSourceInstallationBackend, type SourceBackend } from './source-backend'
+ import { resolveSourcePython } from './source-python'
+ import { registerSpellcheckDictionaryIpc } from './spellcheck-dictionary-ipc'
+@@ -9408,7 +9408,7 @@ async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, sourc
+     `[remote-timing] ${scope} ${result.alwaysOn ? 'reuse always-on' : result.reused ? 'reuse owned' : 'spawn'} ` +
+       `pid=${result.pid} ssh=${created ? 'dialed' : 'master reused'} +${Date.now() - timingStartedAt} ms`
+   )
+-  noteRemoteConnect(result.baseUrl, scope, timingStartedAt)
++  noteRemoteConnect(result.baseUrl, scope, timingStartedAt, () => sshConnections.get(scope)?.ssh?.isAlive())
+   sshRememberLog(
+     `[ssh] connection ${result.reused ? 'REUSED' : 'spawned'} dashboard: ` +
+       `${result.hermesVersion || 'hermes (version unknown)'} at ${result.hermesPath || '?'}`
+@@ -13825,9 +13825,8 @@ function revalidateSuspectPoolAfterResume() {
+   )
+ }
+ 
+-ipcMain.handle('hermes:gateway:ws-url', async (_event, profile) => {
+-  return gatewayWsUrlIpcResult(() => freshGatewayWsUrl(profile, _event.sender.id))
+-})
++ipcMain.handle('hermes:gateway:ws-url', (e, p) => gatewayWsUrlIpcResult(() => freshGatewayWsUrl(p, e.sender.id)))
++registerGatewayConnectIpc(ipcMain, rememberLog) // [daveey] the chat WebSocket's connect limit follows slow-link mode
+ ipcMain.handle('hermes:window:openSession', async (_event, sessionId, opts) => {
+   if (typeof sessionId !== 'string' || !sessionId.trim()) {
+     return { ok: false, error: 'invalid-session-id' }
+diff --git a/apps/desktop/electron/preload.ts b/apps/desktop/electron/preload.ts
+index 04b811e2d2..b714806100 100644
+--- a/apps/desktop/electron/preload.ts
++++ b/apps/desktop/electron/preload.ts
+@@ -82,6 +82,9 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
+   // Registry-scoped fresh WS URL: { connectionId, profile } → result shape of
+   // getGatewayWsUrl, minted against that connection's backend.
+   getGatewayWsUrlFor: payload => ipcRenderer.invoke('hermes:gateway:ws-url-for', payload),
++  // [daveey] The chat WebSocket's connect limit for one ws URL (slow-link mode, electron/slow-link.ts) and its outcome.
++  gatewayConnectLimit: wsUrl => ipcRenderer.sendSync('hermes:gateway:connect-limit', wsUrl),
++  noteGatewayConnect: (wsUrl, outcome) => ipcRenderer.send('hermes:gateway:connect-outcome', wsUrl, outcome),
+   // { connectionId, profile, pluginId, path } → one-use local plugin socket URL, null, or { refused: 'permission' }.
+   getPluginWsUrl: payload => ipcRenderer.invoke('hermes:plugin:ws-url', payload),
+   // Union agent roster across every registered connection.
+diff --git a/apps/desktop/electron/slow-link.ts b/apps/desktop/electron/slow-link.ts
+index 9538693a9a..85daee2300 100644
+--- a/apps/desktop/electron/slow-link.ts
++++ b/apps/desktop/electron/slow-link.ts
+@@ -260,6 +260,7 @@ export class SlowLinkTracker {
+   }
+ 
+   forgetScope(scope: string): void {
++    remoteTransports.forgetScope(scope)
+     this.forget(this.#scopes.get(scope))
+     this.#scopes.delete(scope)
+     deltaBodyStore.unbindScope(scope) // the tunnel is going away: its port must stop being asked for deltas
+@@ -355,8 +356,19 @@ export function thinnedPoll(
+ // new descriptor serves, per scope, as `[remote-timing]` lines in desktop.log.
+ const remoteFirstRequestPending = new Map<string, { scope: string; startedAt: number }>()
+ 
+-export function noteRemoteConnect(baseUrl: string, scope: string, startedAt: number): void {
++export function noteRemoteConnect(
++  baseUrl: string,
++  scope: string,
++  startedAt: number,
++  masterAlive?: () => Promise<boolean> | undefined
++): void {
+   remoteFirstRequestPending.set(baseUrl, { scope, startedAt })
++  slowLinkTracker.bind(scope, baseUrl)
++
++  if (masterAlive) {
++    remoteTransports.remember(baseUrl, scope, masterAlive)
++  }
++
+   deltaBodyStore.bindRemote(baseUrl, scope) // delta-reads.ts: this tunnel's reads may come back as deltas
+ }
+ 
+@@ -372,3 +384,141 @@ export function noteRemoteAnswer(baseUrl: string, path: string, elapsedMs: numbe
+     log(`[remote-timing] ${pending.scope} first-request ${path} served +${Date.now() - pending.startedAt} ms`)
+   }
+ }
++
++// --- Chat WebSocket connect limit (the renderer's JsonRpcGatewayClient dial) ---
++//
++// The chat socket gave up after a fixed 15 s while slow-link mode kept the HTTP side of the same tunnel alive, so a
++// slow link showed "Reconnecting to Hermes" in chat. The renderer asks main for the limit right before each dial
++// (hermes:gateway:connect-limit, sync) and reports how the dial ended (hermes:gateway:connect-outcome):
++// - a dial to an SSH-forwarded backend gets 15 s, stretched x4 (capped 60 s) while that link is in slow mode;
++// - a socket that opened counts as an answer for the tracker (as a request answer does);
++// - a dial that hit its limit while the SSH master is alive counts as a strike, the same way a dispatch probe does.
++//   When those strikes reach SLOW_LINK_STRIKE_LIMIT the link leaves slow mode (logged as down); retiring the backend
++//   stays with the dispatch probe, which runs again before the renderer's next dial (hermes:gateway:ws-url-for).
++// Every other backend (local, cloud, a URL main does not know) keeps the 15 s default.
++
++export const GATEWAY_CONNECT_LIMIT_MS = 15_000
++export const GATEWAY_CONNECT_LIMIT_CHANNEL = 'hermes:gateway:connect-limit'
++export const GATEWAY_CONNECT_OUTCOME_CHANNEL = 'hermes:gateway:connect-outcome'
++
++export type GatewayConnectOutcome = { elapsedMs: number; kind: 'opened' } | { kind: 'timed-out' }
++
++interface RemoteTransport {
++  baseUrl: string
++  masterAlive: () => Promise<boolean> | undefined
++  scope: string
++}
++
++const originOf = (url: string, wsToHttp = false): null | string => {
++  try {
++    const parsed = new URL(url)
++    const protocol = wsToHttp ? parsed.protocol.replace(/^ws(s?):$/, 'http$1:') : parsed.protocol
++
++    return `${protocol}//${parsed.host}`
++  } catch {
++    return null
++  }
++}
++
++/** SSH-forwarded backends by origin, so a chat ws:// URL can be traced to its tunnel and its slow-link state. */
++export class RemoteTransports {
++  readonly #byOrigin = new Map<string, RemoteTransport>()
++
++  remember(baseUrl: string, scope: string, masterAlive: () => Promise<boolean> | undefined): void {
++    const origin = originOf(baseUrl)
++
++    if (origin) {
++      this.#byOrigin.set(origin, { baseUrl, masterAlive, scope })
++    }
++  }
++
++  forgetScope(scope: string): void {
++    for (const [origin, transport] of this.#byOrigin) {
++      if (transport.scope === scope) {
++        this.#byOrigin.delete(origin)
++      }
++    }
++  }
++
++  forWsUrl(wsUrl: unknown): RemoteTransport | undefined {
++    const origin = typeof wsUrl === 'string' ? originOf(wsUrl, true) : null
++
++    return origin ? this.#byOrigin.get(origin) : undefined
++  }
++}
++
++export const remoteTransports = new RemoteTransports()
++
++/** The connect limit for one chat WebSocket dial: stretched only for an SSH-forwarded backend in slow mode. */
++export function gatewayConnectLimitMs(
++  wsUrl: unknown,
++  tracker: SlowLinkTracker = slowLinkTracker,
++  transports: RemoteTransports = remoteTransports
++): number {
++  const transport = transports.forWsUrl(wsUrl)
++
++  return transport ? tracker.scaleTimeout(transport.baseUrl, GATEWAY_CONNECT_LIMIT_MS) : GATEWAY_CONNECT_LIMIT_MS
++}
++
++/** How a chat WebSocket dial ended: an open is an answer, a timeout with the SSH master alive is a strike. */
++export async function noteGatewayConnectOutcome(
++  wsUrl: unknown,
++  outcome: GatewayConnectOutcome | null | undefined,
++  log: (line: string) => void,
++  tracker: SlowLinkTracker = slowLinkTracker,
++  transports: RemoteTransports = remoteTransports
++): Promise<void> {
++  const transport = transports.forWsUrl(wsUrl)
++
++  if (!transport || !outcome) {
++    return
++  }
++
++  if (outcome.kind === 'opened') {
++    if (Number.isFinite(outcome.elapsedMs) && outcome.elapsedMs >= 0) {
++      remoteAnswerLedger.recordAnswer(transport.baseUrl)
++      tracker.noteAnswer(transport.baseUrl, outcome.elapsedMs)
++    }
++
++    return
++  }
++
++  if (outcome.kind !== 'timed-out') {
++    return
++  }
++
++  let alive = false
++
++  try {
++    alive = (await transport.masterAlive()) === true
++  } catch {
++    alive = false
++  }
++
++  if (!alive) {
++    return // a dead transport is never slow; the dispatch probe retires it
++  }
++
++  tracker.setLog(log)
++  tracker.bind(transport.scope, transport.baseUrl)
++  const { giveUp, strikes } = tracker.noteTimeoutWhileAlive(transport.baseUrl)
++
++  log(
++    `[slow-link] ${transport.scope} chat WebSocket did not open within its limit with the SSH connection alive ` +
++      `(strike ${strikes}${giveUp ? ', giving up on slow mode' : ''})`
++  )
++}
++
++interface IpcMainLike {
++  on(channel: string, listener: (event: { returnValue?: unknown }, ...args: any[]) => void): unknown
++}
++
++/** main.ts calls this once: the renderer's chat dial reads its limit and reports its outcome over these channels. */
++export function registerGatewayConnectIpc(ipcMain: IpcMainLike, log: (line: string) => void): void {
++  ipcMain.on(GATEWAY_CONNECT_LIMIT_CHANNEL, (event, wsUrl) => {
++    event.returnValue = gatewayConnectLimitMs(wsUrl)
++  })
++  ipcMain.on(GATEWAY_CONNECT_OUTCOME_CHANNEL, (_event, wsUrl, outcome) => {
++    void noteGatewayConnectOutcome(wsUrl, outcome, log)
++  })
++}
+diff --git a/apps/desktop/src/api/client.ts b/apps/desktop/src/api/client.ts
+index bca97e4ecc..00209c2531 100644
+--- a/apps/desktop/src/api/client.ts
++++ b/apps/desktop/src/api/client.ts
+@@ -12,6 +12,7 @@ import type { HermesApiRequest } from '@/global'
+ 
+ import { CanonicalDesktopProtocol, canonicalProfile, canonicalPromptParams, canonicalSessionKey, openGatewaySocket, recordCanonicalOwner, splitRewindSubmit } from './canonical-protocol'
+ import { DialReadiness, GATEWAY_NOT_CONNECTED_MESSAGE, remainingRequestBudget } from './dial-readiness'
++import { dialWithLinkLimit } from './gateway-link-dial'
+ 
+ // Desktop startup fires a burst of read-only data calls (config, profiles,
+ // model info/options, cron) the moment the backend passes readiness. On a
+@@ -370,7 +371,7 @@ export class HermesGateway extends JsonRpcGatewayClient {
+     try {
+       // The transport's own rejection names a dial that never opened (#41566); readiness only
+       // speaks for a socket that did.
+-      await super.connect(wsUrl)
++      await dialWithLinkLimit(wsUrl, dial => super.connect(wsUrl, dial)) // [daveey] slow-link connect limit
+       await ready
+     } catch (error) {
+       this.readiness.failDial(ready, error instanceof Error ? error : new Error(GATEWAY_NOT_CONNECTED_MESSAGE))
+diff --git a/apps/desktop/src/api/gateway-link-dial-slow-link.test.ts b/apps/desktop/src/api/gateway-link-dial-slow-link.test.ts
+new file mode 100644
+index 0000000000..f0d685ee72
+--- /dev/null
++++ b/apps/desktop/src/api/gateway-link-dial-slow-link.test.ts
+@@ -0,0 +1,245 @@
++// [daveey] The chat WebSocket's connect limit follows slow-link mode. These tests run the real tracker, the real
++// main-side limit/outcome functions, the renderer's dial wrapper and the shared JsonRpcGatewayClient against a fake
++// socket on fake timers: no source pins.
++
++import { JsonRpcGatewayClient } from '@hermes/shared'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++import {
++  GATEWAY_CONNECT_LIMIT_CHANNEL,
++  GATEWAY_CONNECT_LIMIT_MS,
++  GATEWAY_CONNECT_OUTCOME_CHANNEL,
++  gatewayConnectLimitMs,
++  noteGatewayConnectOutcome,
++  registerGatewayConnectIpc,
++  RemoteTransports,
++  SLOW_LINK_STRIKE_LIMIT,
++  SLOW_LINK_TIMEOUT_CAP_MS,
++  SlowLinkTracker
++} from '../../electron/slow-link'
++
++import { dialWithLinkLimit, type GatewayLinkBridge } from './gateway-link-dial'
++
++const REMOTE_BASE = 'http://127.0.0.1:41001'
++const REMOTE_WS = 'ws://127.0.0.1:41001/api/ws?ticket=t1'
++const LOCAL_WS = 'ws://127.0.0.1:52002/api/ws?token=local'
++const SCOPE = 'conn:hub::default'
++
++/** A WebSocket stand-in that opens `openAfterMs` after it is constructed (on the fake clock). */
++class LateSocket extends EventTarget {
++  readyState = 0
++
++  constructor(openAfterMs: number) {
++    super()
++    setTimeout(() => {
++      if (this.readyState === 0) {
++        this.readyState = 1
++        this.dispatchEvent(new Event('open'))
++      }
++    }, openAfterMs)
++  }
++
++  send(): void {}
++
++  close(): void {
++    this.readyState = 3
++  }
++}
++
++function setup(masterAlive: () => Promise<boolean> | undefined = async () => true) {
++  const tracker = new SlowLinkTracker()
++  const transports = new RemoteTransports()
++  const log = vi.fn()
++
++  transports.remember(REMOTE_BASE, SCOPE, masterAlive)
++
++  const outcomes: Array<Promise<void>> = []
++
++  // What preload + main do over IPC, without Electron: the limit comes from main, the outcome goes back to it.
++  const bridge: GatewayLinkBridge = {
++    gatewayConnectLimit: wsUrl => gatewayConnectLimitMs(wsUrl, tracker, transports),
++    noteGatewayConnect: (wsUrl, outcome) => {
++      outcomes.push(noteGatewayConnectOutcome(wsUrl, outcome, log, tracker, transports))
++    }
++  }
++
++  const enterSlowMode = () => tracker.noteTimeoutWhileAlive(REMOTE_BASE) // what a dispatch probe timeout does
++
++  return { bridge, enterSlowMode, log, outcomes, tracker, transports }
++}
++
++function dialAt(bridge: GatewayLinkBridge, wsUrl: string, openAfterMs: number) {
++  const client = new JsonRpcGatewayClient({
++    heartbeatDeadlineMs: 0,
++    heartbeatIntervalMs: 0,
++    replay: false,
++    socketFactory: () => new LateSocket(openAfterMs) as unknown as WebSocket
++  })
++
++  const result = dialWithLinkLimit(wsUrl, dial => client.connect(wsUrl, dial), bridge).then(
++    () => 'opened' as const,
++    (error: Error) => error
++  )
++
++  return { client, result }
++}
++
++beforeEach(() => {
++  vi.useFakeTimers()
++})
++
++afterEach(() => {
++  vi.useRealTimers()
++})
++
++describe('chat WebSocket connect limit', () => {
++  it('is 15 s for a remote backend on a normal link and 60 s while its link is slow', () => {
++    const { bridge, enterSlowMode } = setup()
++
++    expect(bridge.gatewayConnectLimit!(REMOTE_WS)).toBe(GATEWAY_CONNECT_LIMIT_MS)
++    expect(GATEWAY_CONNECT_LIMIT_MS).toBe(15_000)
++
++    enterSlowMode()
++
++    expect(bridge.gatewayConnectLimit!(REMOTE_WS)).toBe(SLOW_LINK_TIMEOUT_CAP_MS)
++    expect(SLOW_LINK_TIMEOUT_CAP_MS).toBe(60_000)
++  })
++
++  it('stays 15 s for a local backend and a URL main does not know, even while a remote link is slow', () => {
++    const { bridge, enterSlowMode } = setup()
++
++    enterSlowMode()
++
++    expect(bridge.gatewayConnectLimit!(LOCAL_WS)).toBe(15_000)
++    expect(bridge.gatewayConnectLimit!('not a url')).toBe(15_000)
++    expect(bridge.gatewayConnectLimit!(undefined as unknown as string)).toBe(15_000)
++  })
++
++  it('a socket that opens at 20 s connects in slow mode', async () => {
++    const { bridge, enterSlowMode } = setup()
++    enterSlowMode()
++    const { client, result } = dialAt(bridge, REMOTE_WS, 20_000)
++
++    await vi.advanceTimersByTimeAsync(20_000)
++
++    await expect(result).resolves.toBe('opened')
++    expect(client.connectionState).toBe('open')
++  })
++
++  it('the same socket times out at 15 s in normal mode', async () => {
++    const { bridge } = setup()
++    const { client, result } = dialAt(bridge, REMOTE_WS, 20_000)
++
++    await vi.advanceTimersByTimeAsync(15_000)
++
++    const error = await result
++    expect(error).toBeInstanceOf(Error)
++    expect((error as Error).message).toContain('no WebSocket open within 15000 ms')
++    expect(client.connectionState).toBe('error')
++  })
++
++  it('a local backend times out at 15 s even while the remote link is slow', async () => {
++    const { bridge, enterSlowMode } = setup()
++    enterSlowMode()
++    const { result } = dialAt(bridge, LOCAL_WS, 20_000)
++
++    await vi.advanceTimersByTimeAsync(15_000)
++
++    expect(String(await result)).toContain('no WebSocket open within 15000 ms')
++  })
++})
++
++describe('chat WebSocket outcomes feed the slow-link tracker', () => {
++  it('a timeout with the SSH master alive is a strike: it enters slow mode, so the next dial gets 60 s', async () => {
++    const { bridge, log, outcomes, tracker } = setup(async () => true)
++    const first = dialAt(bridge, REMOTE_WS, 20_000)
++
++    await vi.advanceTimersByTimeAsync(15_000)
++    await first.result
++    await Promise.all(outcomes)
++
++    expect(tracker.isSlow(REMOTE_BASE)).toBe(true)
++    expect(tracker.isScopeSlow(SCOPE)).toBe(true)
++    expect(log.mock.calls.flat().join('\n')).toContain('chat WebSocket did not open within its limit')
++
++    const second = dialAt(bridge, REMOTE_WS, 20_000)
++    await vi.advanceTimersByTimeAsync(20_000)
++    await expect(second.result).resolves.toBe('opened')
++  })
++
++  it('a timeout with the SSH master dead is not a strike (a dead transport is never slow)', async () => {
++    const { bridge, outcomes, tracker } = setup(async () => false)
++    const dial = dialAt(bridge, REMOTE_WS, 20_000)
++
++    await vi.advanceTimersByTimeAsync(15_000)
++    await dial.result
++    await Promise.all(outcomes)
++
++    expect(tracker.isSlow(REMOTE_BASE)).toBe(false)
++  })
++
++  it('a socket that opens is an answer: it clears the strikes a dispatch probe left', async () => {
++    const { bridge, enterSlowMode, outcomes } = setup()
++
++    for (let strike = 1; strike < SLOW_LINK_STRIKE_LIMIT; strike++) {
++      enterSlowMode()
++    }
++
++    const dial = dialAt(bridge, REMOTE_WS, 20_000)
++    await vi.advanceTimersByTimeAsync(20_000)
++    await expect(dial.result).resolves.toBe('opened')
++    await Promise.all(outcomes)
++
++    // Strikes were reset by the open, so one more probe timeout does not give up on the link.
++    expect(enterSlowMode()).toEqual({ giveUp: false, strikes: 1 })
++  })
++
++  it('an open records an answer sample that can take the link out of slow mode', async () => {
++    const { tracker, transports } = setup()
++    tracker.noteTimeoutWhileAlive(REMOTE_BASE)
++
++    for (let i = 0; i < 5; i++) {
++      await noteGatewayConnectOutcome(
++        REMOTE_WS,
++        { elapsedMs: 50, kind: 'opened' },
++        () => undefined,
++        tracker,
++        transports
++      )
++    }
++
++    expect(tracker.isSlow(REMOTE_BASE)).toBe(false)
++  })
++
++  it('outcomes for unknown URLs and malformed payloads are ignored', async () => {
++    const { tracker, transports } = setup()
++
++    await noteGatewayConnectOutcome(LOCAL_WS, { kind: 'timed-out' }, () => undefined, tracker, transports)
++    await noteGatewayConnectOutcome(REMOTE_WS, null, () => undefined, tracker, transports)
++    await noteGatewayConnectOutcome(REMOTE_WS, { kind: 'bogus' } as never, () => undefined, tracker, transports)
++
++    expect(tracker.isSlow(REMOTE_BASE)).toBe(false)
++  })
++
++  it('a dropped scope no longer maps its ws URL to a remote transport', () => {
++    const { enterSlowMode, tracker, transports } = setup()
++    enterSlowMode()
++
++    transports.forgetScope(SCOPE)
++
++    expect(gatewayConnectLimitMs(REMOTE_WS, tracker, transports)).toBe(15_000)
++  })
++})
++
++describe('registerGatewayConnectIpc', () => {
++  it('answers the sync limit request and accepts outcome reports', () => {
++    const listeners = new Map<string, (event: { returnValue?: unknown }, ...args: unknown[]) => void>()
++    registerGatewayConnectIpc({ on: (channel, listener) => listeners.set(channel, listener) }, () => undefined)
++
++    const event: { returnValue?: unknown } = {}
++    listeners.get(GATEWAY_CONNECT_LIMIT_CHANNEL)!(event, LOCAL_WS)
++
++    expect(event.returnValue).toBe(15_000)
++    expect(() => listeners.get(GATEWAY_CONNECT_OUTCOME_CHANNEL)!({}, LOCAL_WS, { kind: 'timed-out' })).not.toThrow()
++  })
++})
+diff --git a/apps/desktop/src/api/gateway-link-dial.test.ts b/apps/desktop/src/api/gateway-link-dial.test.ts
+new file mode 100644
+index 0000000000..9d8e547a93
+--- /dev/null
++++ b/apps/desktop/src/api/gateway-link-dial.test.ts
+@@ -0,0 +1,76 @@
++import { GATEWAY_CONNECT_TIMEOUT_CODE, JsonRpcGatewayClient } from '@hermes/shared'
++import { afterEach, describe, expect, it, vi } from 'vitest'
++
++import { HermesGateway } from './client'
++
++const WS = 'ws://127.0.0.1:41001/api/ws?native_dial=fixture&ticket=fixture'
++
++afterEach(() => {
++  vi.restoreAllMocks()
++  delete (window as { hermesDesktop?: unknown }).hermesDesktop
++})
++
++function bridge(limit: unknown) {
++  const desktop = { gatewayConnectLimit: vi.fn(() => limit), noteGatewayConnect: vi.fn() }
++
++  ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
++
++  return desktop
++}
++
++describe('HermesGateway.connect uses the connect limit Desktop main gives its ws URL', () => {
++  it('passes the slow-link limit to the shared dial and reports the open', async () => {
++    const desktop = bridge(60_000)
++    const connect = vi.spyOn(JsonRpcGatewayClient.prototype, 'connect').mockResolvedValue()
++
++    const client = new HermesGateway()
++    await client.connect(WS)
++
++    expect(desktop.gatewayConnectLimit).toHaveBeenCalledWith(WS)
++    expect(connect).toHaveBeenCalledWith(WS, { connectTimeoutMs: 60_000 })
++    expect(desktop.noteGatewayConnect).toHaveBeenCalledWith(WS, expect.objectContaining({ kind: 'opened' }))
++    client.close()
++  })
++
++  it('reports a connect timeout as timed-out and still rejects with it', async () => {
++    const desktop = bridge(15_000)
++
++    const timeout = Object.assign(new Error('no WebSocket open within 15000 ms'), {
++      code: GATEWAY_CONNECT_TIMEOUT_CODE
++    })
++
++    vi.spyOn(JsonRpcGatewayClient.prototype, 'connect').mockRejectedValue(timeout)
++
++    await expect(new HermesGateway().connect(WS)).rejects.toBe(timeout)
++    expect(desktop.noteGatewayConnect).toHaveBeenCalledWith(WS, { kind: 'timed-out' })
++  })
++
++  it('a non-timeout failure is not reported as a strike', async () => {
++    const desktop = bridge(15_000)
++    vi.spyOn(JsonRpcGatewayClient.prototype, 'connect').mockRejectedValue(new Error('WebSocket error before open'))
++
++    await expect(new HermesGateway().connect(WS)).rejects.toThrow('error before open')
++    expect(desktop.noteGatewayConnect).not.toHaveBeenCalled()
++  })
++
++  it.each([undefined, 0, -1, Number.NaN, 'x'])('falls back to the client default when main answers %s', async limit => {
++    bridge(limit)
++    const connect = vi.spyOn(JsonRpcGatewayClient.prototype, 'connect').mockResolvedValue()
++
++    const client = new HermesGateway()
++    await client.connect(WS)
++
++    expect(connect).toHaveBeenCalledWith(WS, {})
++    client.close()
++  })
++
++  it('dials with the client default when there is no Desktop bridge (browser-hosted, tests)', async () => {
++    const connect = vi.spyOn(JsonRpcGatewayClient.prototype, 'connect').mockResolvedValue()
++
++    const client = new HermesGateway()
++    await client.connect(WS)
++
++    expect(connect).toHaveBeenCalledWith(WS, {})
++    client.close()
++  })
++})
+diff --git a/apps/desktop/src/api/gateway-link-dial.ts b/apps/desktop/src/api/gateway-link-dial.ts
+new file mode 100644
+index 0000000000..a7ef23609c
+--- /dev/null
++++ b/apps/desktop/src/api/gateway-link-dial.ts
+@@ -0,0 +1,62 @@
++// [daveey] The chat WebSocket's connect limit follows Desktop main's slow-link mode (electron/slow-link.ts).
++//
++// Before each dial the renderer asks main for the limit of that URL: 15 s, or up to 60 s while the SSH-forwarded
++// backend behind it is on a slow link. After the dial it reports how it ended, so an open counts as an answer and a
++// timeout as a strike for that link. Without a Desktop bridge (browser-hosted, tests) the client default applies.
++
++import { GATEWAY_CONNECT_TIMEOUT_CODE } from '@hermes/shared'
++
++export type GatewayConnectOutcome = { elapsedMs: number; kind: 'opened' } | { kind: 'timed-out' }
++
++export interface GatewayLinkBridge {
++  gatewayConnectLimit?: (wsUrl: string) => number
++  noteGatewayConnect?: (wsUrl: string, outcome: GatewayConnectOutcome) => void
++}
++
++const desktopBridge = (): GatewayLinkBridge | undefined =>
++  (globalThis as { hermesDesktop?: GatewayLinkBridge }).hermesDesktop
++
++/** The limit main gives this dial, or undefined (client default) when main has no answer. */
++function connectLimit(bridge: GatewayLinkBridge | undefined, wsUrl: string): number | undefined {
++  try {
++    const limit = bridge?.gatewayConnectLimit?.(wsUrl)
++
++    return typeof limit === 'number' && Number.isFinite(limit) && limit > 0 ? limit : undefined
++  } catch {
++    return undefined
++  }
++}
++
++function report(bridge: GatewayLinkBridge | undefined, wsUrl: string, outcome: GatewayConnectOutcome): void {
++  try {
++    bridge?.noteGatewayConnect?.(wsUrl, outcome)
++  } catch {
++    // Reporting is advisory: the dial's own result stands.
++  }
++}
++
++/**
++ * Run one WebSocket dial with the connect limit main gives `wsUrl`, then report its outcome. `dial` receives the
++ * per-dial options for `JsonRpcGatewayClient.connect`; its result or rejection is passed through unchanged.
++ */
++export async function dialWithLinkLimit(
++  wsUrl: string,
++  dial: (options: { connectTimeoutMs?: number }) => Promise<void>,
++  bridge: GatewayLinkBridge | undefined = desktopBridge(),
++  now: () => number = Date.now
++): Promise<void> {
++  const connectTimeoutMs = connectLimit(bridge, wsUrl)
++  const startedAt = now()
++
++  try {
++    await dial(connectTimeoutMs === undefined ? {} : { connectTimeoutMs })
++  } catch (error) {
++    if ((error as { code?: unknown } | null)?.code === GATEWAY_CONNECT_TIMEOUT_CODE) {
++      report(bridge, wsUrl, { kind: 'timed-out' })
++    }
++
++    throw error
++  }
++
++  report(bridge, wsUrl, { elapsedMs: now() - startedAt, kind: 'opened' })
++}
+diff --git a/apps/desktop/src/global.d.ts b/apps/desktop/src/global.d.ts
+index b3a30d72eb..8167971040 100644
+--- a/apps/desktop/src/global.d.ts
++++ b/apps/desktop/src/global.d.ts
+@@ -52,6 +52,13 @@ declare global {
+         connectionId?: null | string
+         profile?: null | string
+       }) => Promise<GatewayWsUrlResult>
++      // [daveey] Connect limit (ms) for one chat WebSocket dial: 15 s, up to 60 s while that SSH link is slow.
++      gatewayConnectLimit?: (wsUrl: string) => number
++      // How that dial ended: an open is an answer, a timeout a slow-link strike (electron/slow-link.ts).
++      noteGatewayConnect?: (
++        wsUrl: string,
++        outcome: { elapsedMs: number; kind: 'opened' } | { kind: 'timed-out' }
++      ) => void
+       // One-use plugin socket URL for a local gateway (its native grant rides
+       // a header main attaches to that dial); null for every other backend;
+       // { refused: 'permission' } when main refused the grant mint for a
+diff --git a/apps/shared/src/index.ts b/apps/shared/src/index.ts
+index a87bcfee09..287ea16be0 100644
+--- a/apps/shared/src/index.ts
++++ b/apps/shared/src/index.ts
+@@ -100,6 +100,8 @@ export {
+ export {
+   APPROVAL_RESPOND_TIMEOUT_MS,
+   type ConnectionState,
++  DEFAULT_CONNECT_TIMEOUT_MS,
++  GATEWAY_CONNECT_TIMEOUT_CODE,
+   type GatewayClientOptions,
+   GatewayEventHub,
+   isGatewayWebSocketUrl,
+diff --git a/apps/shared/src/json-rpc-gateway.ts b/apps/shared/src/json-rpc-gateway.ts
+index e1fa54950b..eb0a630e2b 100644
+--- a/apps/shared/src/json-rpc-gateway.ts
++++ b/apps/shared/src/json-rpc-gateway.ts
+@@ -57,7 +57,9 @@ const REPLAY_REQUEST_TIMEOUT_MS = 10_000
+ // A reconnect after sleep/wake must not hang forever in 'connecting' (which
+ // keeps the composer disabled and stuck on "Starting Hermes..."). If the open
+ // handshake doesn't land in this window, fail to 'error' so callers can retry.
+-const DEFAULT_CONNECT_TIMEOUT_MS = 15_000
++export const DEFAULT_CONNECT_TIMEOUT_MS = 15_000
++/** `code` of the error a dial rejects with when no WebSocket opened within its connect limit. */
++export const GATEWAY_CONNECT_TIMEOUT_CODE = 'GATEWAY_CONNECT_TIMEOUT'
+ 
+ /** True for a `ws://` / `wss://` URL string — the only thing `JsonRpcGatewayClient.connect()` will dial. */
+ export function isGatewayWebSocketUrl(value: unknown): value is string {
+@@ -223,7 +225,13 @@ export class JsonRpcGatewayClient {
+     return this.channel.clarifyBatch
+   }
+ 
+-  async connect(wsUrl: string): Promise<void> {
++  /**
++   * `connectTimeoutMs` overrides the constructor's limit for this one dial (Desktop stretches it while a remote
++   * backend's link is slow). A dial that hits the limit rejects with `GATEWAY_CONNECT_TIMEOUT_CODE` as `code`.
++   */
++  async connect(wsUrl: string, dial: { connectTimeoutMs?: number } = {}): Promise<void> {
++    const connectTimeoutMs = dial.connectTimeoutMs ?? this.options.connectTimeoutMs
++
+     // Refuse garbage; WebSocket coerces non-strings into
+     // `ws://<origin>/[object%20Object]` (#68250 stale-emit boot loop).
+     const invalidUrl = () => {
+@@ -356,7 +364,7 @@ export class JsonRpcGatewayClient {
+       socket.addEventListener('error', onError, { once: true })
+       socket.addEventListener('close', onClose, { once: true })
+ 
+-      if (this.options.connectTimeoutMs > 0) {
++      if (connectTimeoutMs > 0) {
+         timer = setTimeout(() => {
+           if (settled) {
+             return
+@@ -378,8 +386,12 @@ export class JsonRpcGatewayClient {
+             this.setState('error')
+           }
+ 
+-          reject(this.connectFailure(`no WebSocket open within ${this.options.connectTimeoutMs} ms`))
+-        }, this.options.connectTimeoutMs)
++          reject(
++            Object.assign(this.connectFailure(`no WebSocket open within ${connectTimeoutMs} ms`), {
++              code: GATEWAY_CONNECT_TIMEOUT_CODE
++            })
++          )
++        }, connectTimeoutMs)
+       }
+     })
+   }
+-- 
+2.43.0
+

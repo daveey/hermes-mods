@@ -1,0 +1,260 @@
+From 23df41d49f08455c0fb5bb376fe3100e1fe2a657 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 21:45:28 +0000
+Subject: [PATCH] [daveey] producer_admission: release kept observers on
+ profile delete/restore, lease loss and stop (review of #2634)
+
+Review 5897803418 (B1): on Windows the sweep's long-held read-only observer on each
+profile's state.db was never released by the serve-side DELETE /api/profiles path, so
+rmtree failed with WinError 32, and since _readopt_wake_profiles keeps listing a home
+whose state.db exists, the observer was never dropped.
+
+- producer_admission.release_under(root): close the observers under a directory (all when
+  None). hermes_state_registry._close_kept_readers calls it next to the kept-reader hook,
+  so close_all_under (profile delete, snapshot restore, run_profile_reconcile) and
+  close_all release the fd. The next pass reopens it.
+- Nit 1: a pass records its key only while the observer that read it is still the kept
+  one (a fresh connection's data_version restarts low, so keys can collide).
+- Nit 3: observers are closed when this process loses the producer-admission lease and
+  when the sweeper loop stops.
+- The pid-memo replay bench measures with the suite's HomeIOGuard os.stat/open wrappers
+  unwrapped: they cost 3-4x a memo hit and made the bench flake at ~1.0-1.5 ms per list
+  on a loaded worker (production cost ~0.3 ms per 11-profile list).
+
+RED (prior head d7d579904f + new tests): 3 of 14 gate tests fail
+(delete release, dropped-observer key, lease loss). GREEN: 201 passed across
+test_producer_admission_gate, test_producer_admission, test_status_pid_memo,
+test_shared_session_db_registry, test_state_kept_reader, test_profiles.
+---
+ hermes_state_registry.py                      |  6 +-
+ tests/gateway/test_status_pid_memo.py         | 13 +++-
+ .../test_producer_admission_gate.py           | 60 +++++++++++++++++++
+ tui_gateway/producer_admission.py             | 45 ++++++++++----
+ 4 files changed, 111 insertions(+), 13 deletions(-)
+
+diff --git a/hermes_state_registry.py b/hermes_state_registry.py
+index 7deea2be1d..63efe97b88 100644
+--- a/hermes_state_registry.py
++++ b/hermes_state_registry.py
+@@ -352,12 +352,16 @@ def close_all() -> int:
+ 
+ 
+ def _close_kept_readers(root: Optional[Path]) -> None:
+-    """Kept read-only handles (``hermes_state_kept_reader``) hold the same files: retire them too."""
++    """Kept read-only handles (``hermes_state_kept_reader``, the producer-admission sweep's observers) hold the
++    same files: retire them too."""
+     import sys
+ 
+     kept = sys.modules.get("hermes_state_kept_reader")
+     if kept is not None:
+         kept.close_all_under(root)
++    observers = sys.modules.get("tui_gateway.producer_admission")
++    if observers is not None:
++        observers.release_under(root)
+ 
+ 
+ def close_all_under(directory: str | Path) -> int:
+diff --git a/tests/gateway/test_status_pid_memo.py b/tests/gateway/test_status_pid_memo.py
+index 4a74603717..b8dd169851 100644
+--- a/tests/gateway/test_status_pid_memo.py
++++ b/tests/gateway/test_status_pid_memo.py
+@@ -154,10 +154,21 @@ def test_profiles_check_gateway_running_uses_the_memo(tmp_path, monkeypatch, ali
+ 
+ # -- replay benchmark: budget 0.05% of one core (design §3: get_running_pid 0.4 -> 0.05) --------------------------
+ 
+-def test_replay_budget_polled_profile_list(files):
++def _unguarded_io(monkeypatch) -> None:
++    """Measure production cost: the suite's HomeIOGuard wraps os.stat/open in Python checks (3-4x a memo hit,
++    which made this bench flake at ~1 ms per list under load). The wrappers keep the originals in __wrapped__."""
++    import builtins
++    import io
++    for module, name in ((os, "stat"), (os, "lstat"), (builtins, "open"), (io, "open")):
++        fn = getattr(module, name)
++        monkeypatch.setattr(module, name, getattr(fn, "__wrapped__", fn))
++
++
++def test_replay_budget_polled_profile_list(files, monkeypatch):
+     """The measured stream: 11 profiles listed every 2 s by an open Desktop, no gateway changing state. A memo
+     hit costs two stats plus one /proc read per profile; budget is per wall second of polling."""
+     import fcntl
++    _unguarded_io(monkeypatch)
+     paths, held = [], []
+     for n in range(11):
+         d = files.parent / f"p{n}"
+diff --git a/tests/tui_gateway/test_producer_admission_gate.py b/tests/tui_gateway/test_producer_admission_gate.py
+index 707322559e..e0a2f70da4 100644
+--- a/tests/tui_gateway/test_producer_admission_gate.py
++++ b/tests/tui_gateway/test_producer_admission_gate.py
+@@ -148,6 +148,66 @@ def test_removed_profile_store_drops_its_observer(monkeypatch):
+     assert not any("work" in p for p in delivery._observers)
+ 
+ 
++def test_profile_delete_release_closes_the_observer_under_that_home(sdb, monkeypatch):
++    """A profile delete (and a snapshot restore) calls ``hermes_state_registry.close_all_under`` before rmtree; on
++    Windows any open handle fails it with WinError 32, and a still-listed store would keep its observer forever."""
++    import hermes_state_registry
++    work = _db("work")
++    work.create_session(SID, "desktop")
++    work.close()
++    delivery.sweep_once()
++    work_home = _root() / "profiles" / "work"
++    assert any("work" in p for p in delivery._observers)
++    hermes_state_registry.close_all_under(work_home)
++    assert not any("work" in p for p in delivery._observers), "the delete path must release the observer fd"
++    assert any(p == str(_root() / "state.db") for p in delivery._observers), "other homes keep theirs"
++    hermes_state_registry.close_all()
++    assert delivery._observers == {} and delivery._last_pass == {}
++
++
++def test_released_observer_is_reopened_and_the_next_admission_still_lands(sdb, turns, monkeypatch):
++    import hermes_state_registry
++    calls, _ = _install_resume(monkeypatch)
++    delivery.sweep_once()
++    hermes_state_registry.close_all_under(_root())
++    _admit()
++    [rec] = delivery.sweep_once()
++    assert rec["verdict"] == "started" and len(calls) == 1
++
++
++def test_key_from_a_dropped_observer_is_not_remembered(sdb, turns, monkeypatch):
++    """A fresh connection's data_version restarts low, so a key read by an observer that was dropped mid-pass
++    could equal a later key and skip commits: it must not be recorded."""
++    _install_resume(monkeypatch, refuse=True)
++    _admit()
++    real = delivery._sweep_profile
++
++    def _reset_mid_pass(*args, **kwargs):
++        delivery.reset_observers()
++        return real(*args, **kwargs)
++
++    monkeypatch.setattr(delivery, "_sweep_profile", _reset_mid_pass)
++    delivery.sweep_once()
++    assert str(_root() / "state.db") not in delivery._last_pass
++
++
++def test_lease_loss_closes_the_observers(sdb):
++    class _Lease:
++        def __init__(self, held):
++            self._held = held
++
++        def held(self):
++            return self._held
++
++        def beat(self):
++            pass
++
++    assert delivery.run_pass(_Lease(True)) is True
++    assert delivery._observers
++    assert delivery.run_pass(_Lease(False)) is False
++    assert delivery._observers == {}, "another process sweeps now: this one must hold no store fds"
++
++
+ def test_unreadable_store_takes_the_full_path(sdb, opens, monkeypatch):
+     def _broken(path):
+         raise OSError("observer unavailable")
+diff --git a/tui_gateway/producer_admission.py b/tui_gateway/producer_admission.py
+index 74ae43242b..b84454a04e 100644
+--- a/tui_gateway/producer_admission.py
++++ b/tui_gateway/producer_admission.py
+@@ -184,11 +184,22 @@ def _drop_observer(path: str) -> None:
+ 
+ 
+ def reset_observers() -> None:
+-    """Close every kept observer connection (tests, shutdown)."""
++    """Close every kept observer connection (tests, sweeper shutdown, lease loss)."""
++    release_under(None)
++
++
++def release_under(root: Optional[Path]) -> int:
++    """Close the kept observers of stores under *root* (all when None); returns how many closed.
++    ``hermes_state_registry.close_all``/``close_all_under`` call this, so a profile delete's rmtree (WinError 32 on
++    Windows while any handle is open) and a snapshot restore never meet an observer fd. The next pass reopens."""
++    from hermes_state_common import path_is_under
+     with _observers_lock:
+-        for path in list(_observers):
++        chosen = [p for p in _observers if root is None or path_is_under(Path(p), root)]
++        for path in chosen:
+             _drop_observer(path)
+-        _last_pass.clear()
++        if root is None:
++            _last_pass.clear()
++    return len(chosen)
+ 
+ 
+ def _observe(path: Path) -> tuple[tuple, sqlite3.Connection]:
+@@ -220,21 +231,30 @@ def _pending_owners_on(conn: sqlite3.Connection) -> list[str]:
+ 
+ 
+ def _gate(path: Path) -> Optional[tuple]:
+-    """None to skip ``path`` this pass; else ``(key, owners)`` where ``owners`` is None when the observer could not
+-    answer (the caller then takes today's full path). Called under ``_observers_lock``."""
++    """None to skip ``path`` this pass; else ``(key, owners, conn)`` where ``owners`` is None when the observer could
++    not answer (the caller then takes today's full path). Called under ``_observers_lock``."""
+     try:
+         key, conn = _observe(path)
+     except (OSError, sqlite3.Error):
+         _drop_observer(str(path))
+-        return (None, None)
++        return (None, None, None)
+     last = _last_pass.get(str(path))
+     if last is not None and last[0] == key and not last[1]:
+         return None
+     try:
+-        return key, _pending_owners_on(conn)
++        return key, _pending_owners_on(conn), conn
+     except sqlite3.Error:
+         _drop_observer(str(path))
+-        return (None, None)
++        return (None, None, None)
++
++
++def _record(path: Path, key: tuple, conn, had_pending: bool) -> None:
++    """Remember this pass's key only while ``conn`` (the observer that read it) is still the kept one: a fresh
++    connection's ``data_version`` restarts low, so a key read by a dropped observer could equal a later one and
++    skip commits nobody saw. Called under ``_observers_lock``."""
++    entry = _observers.get(str(path))
++    if entry is not None and entry[1] is conn:
++        _last_pass[str(path)] = (key, had_pending)
+ 
+ 
+ @_la.accounted("producer_admission.sweep", rows=True)
+@@ -256,16 +276,16 @@ def sweep_once() -> list[dict]:
+             if gate is None:
+                 acct.skip()
+                 continue
+-            key, owners = gate
++            key, owners, conn = gate
+             acct.change(key is not None)
+             if owners is not None and not owners:
+-                _last_pass[str(path)] = (key, False)
++                _record(path, key, conn, False)
+                 continue
+             acct.fallback(owners is None)
+         had_pending = _sweep_profile(server, profile, home, out)
+         if key is not None:
+             with _observers_lock:
+-                _last_pass[str(path)] = (key, had_pending)
++                _record(path, key, conn, had_pending)
+     return out
+ 
+ 
+@@ -336,6 +356,8 @@ def run_pass(lease) -> bool:
+     (design t_01a1d45d75851804 §2b; ``HERMES_HOST_LOOP_LEASE=0`` = every process). The per-chat poller's
+     ``deliver_pending`` is unchanged. True when the sweep ran."""
+     if not lease.held():
++        if _observers:
++            reset_observers()  # another process sweeps now: hold no store fds for it
+         return False
+     try:
+         sweep_once()
+@@ -356,6 +378,7 @@ def _loop(stop: threading.Event) -> None:
+                 logger.warning("producer admission sweep failed", exc_info=True)
+             stop.wait(INTERVAL_S)
+     finally:
++        reset_observers()
+         lease.release()
+ 
+ 
+-- 
+2.43.0
+

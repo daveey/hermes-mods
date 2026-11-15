@@ -1,0 +1,257 @@
+From 2161e67613c148d5da192aecd641b07843e6814c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 17:37:31 +0000
+Subject: [PATCH] [daveey] fix(gateway): wall-replay drops stale plans at boot
+ and keeps its retry budget across restarts
+
+Follow-up of the exact-head review of PR #3047 (review t_01a1db1295693c97, card t_01a1db170ce882d3).
+
+Defect: MAX_DELAY_S was checked only when a redelivery was planned. arm_pending() re-armed every stored
+plan at each gateway boot without comparing its due time with now, and _retry() started its tries budget
+at 0 in each process. So a plan whose adapter never returns (platform removed from config), or whose
+admission raises something other than RuntimeStoreError (that exception escaped fire_replay and left the
+plan stored), was re-armed and retried after every restart and never dropped; after a long outage a plan
+could also be delivered arbitrarily late. Delivery stayed at most once (deterministic identity), so the
+cost was noise and staleness, not duplicates.
+
+Fix (gateway/session_wall_replay.py):
+- STALE_S (1 day): arm_pending() drops, not arms, a plan whose due passed more than STALE_S ago, and
+  fire_replay() drops one that fires that late (a suspended process) instead of delivering it.
+- The spent tries are persisted in the plan ("tries") on every retry; fire_replay() counts from
+  max(timer tries, stored tries) and arm_pending() re-arms with the stored count and drops a plan whose
+  budget (RETRIES_MAX) is spent, so the budget spans restarts.
+- An unexpected exception from _admit is a retry within that budget, not an escaped task error.
+
+Tests (tests/gateway/test_wall_replay_automation_wake.py), RED on the #3047 module, GREEN here (26/26):
+- test_a_stale_planned_redelivery_is_dropped_at_boot_not_delivered: arm_pending re-armed 2, expected 1.
+- test_a_redelivery_whose_adapter_never_returns_is_dropped_across_restarts: 13 simulated boots with no
+  adapter; before, the plan was still stored after all of them; now 10 looks, then boot 11 drops it.
+- test_fire_replay_outcomes[crash-retry-True]: ValueError from admission escaped fire_replay before.
+---
+ gateway/session_wall_replay.py                | 76 ++++++++++++++++---
+ .../test_wall_replay_automation_wake.py       | 66 ++++++++++++++++
+ 2 files changed, 132 insertions(+), 10 deletions(-)
+
+diff --git a/gateway/session_wall_replay.py b/gateway/session_wall_replay.py
+index 46365c5b46..c86edebbe9 100644
+--- a/gateway/session_wall_replay.py
++++ b/gateway/session_wall_replay.py
+@@ -17,7 +17,11 @@ This module is that resend, bounded so it cannot loop:
+ - at ``max(resets_at + SLACK_S, now + MIN_DELAY_S)`` the wake is re-admitted through the same producer entry
+   (``admit_route_wake``) under the deterministic identity ``[producer, route, "wall-replay:<tail>"]``: a second
+   arm or a race re-admits the same row (an exact replay), never a second turn;
+-- a replay that is refused again plans nothing (its identity says it is one) and the reply says so.
++- a replay that is refused again plans nothing (its identity says it is one) and the reply says so;
++- a plan cannot outlive its use: one whose time passed more than :data:`STALE_S` ago (a long outage) is
++  dropped at boot, not delivered, and the admission retry budget (:data:`RETRIES_MAX`) is persisted in the
++  plan, so a route that never comes back (a platform removed from config) or an admission that keeps
++  raising is dropped once the budget is spent, however often the gateway restarts.
+ """
+ from __future__ import annotations
+ 
+@@ -40,7 +44,10 @@ MIN_DELAY_S = 60.0
+ MAX_DELAY_S = 7 * 86400.0
+ # A replay that cannot be admitted yet (no adapter, a draining gateway) looks again this much later, this often.
+ RETRY_S = 120.0
++# The budget spans restarts: the tries spent are stored in the plan (``tries``), not counted per process.
+ RETRIES_MAX = 10
++# A plan whose time passed this long ago (the gateway was down through it) is dropped, not delivered late.
++STALE_S = 86400.0
+ # Descriptor keys a route wake stores (``snapshot_*automation``) and ``admit_route_wake`` accepts back.
+ _CARRIED = ('notification_category', 'display_kind', 'display_text', 'kanban_cards', 'kanban_event_keys')
+ _TRANSIENT = frozenset({'runtime_draining', 'busy', 'database_busy', 'stale_generation'})
+@@ -210,19 +217,51 @@ def _arm(authority, intent: dict, delay: float | None = None, tries: int = 0) ->
+     armed[admission_id] = loop.call_later(max(delay, 0.0), fire)
+ 
+ 
++def _tries(intent: dict) -> int:
++    tries = _number(intent.get('tries'))
++    return int(tries) if tries is not None and tries > 0 else 0
++
++
++def _stale(intent: dict, now: float) -> bool:
++    due = _number(intent.get('due'))
++    return due is None or now - due > STALE_S
++
++
++def _expired(intent: dict, now: float) -> str | None:
++    """Why a stored plan must be dropped rather than armed or delivered, else None."""
++    if _stale(intent, now):
++        return 'stale'
++    if _tries(intent) >= RETRIES_MAX:
++        return 'out of tries'
++    return None
++
++
+ async def arm_pending(authority) -> int:
+     """Boot: re-arm every planned redelivery this authority's store holds (at least ``MIN_DELAY_S`` out, so
+-    the adapters are connected first). Returns how many were armed. Never raises."""
++    the adapters are connected first), dropping the expired ones (:func:`_expired`). Returns how many were
++    armed. Never raises."""
+     try:
+         intents = await asyncio.to_thread(_load, authority.db)
+     except Exception:  # health: allow BLE001 -- an unreadable store loses only the redeliveries
+         logger.warning('wall-replay: could not read the planned redeliveries', exc_info=True)
+         return 0
++    armed = 0
++    now = time.time()
+     for intent in intents:
+-        _arm(authority, intent)
+-    if intents:
+-        logger.info('wall-replay: re-armed %d planned redelivery(ies) at boot', len(intents))
+-    return len(intents)
++        why = _expired(intent, now)
++        if why is not None:
++            logger.warning('wall-replay: dropped the planned redelivery of %s at boot (%s)',
++                           intent['admission_id'], why)
++            try:
++                await asyncio.to_thread(_write, authority.db, PREFIX + intent['admission_id'], None)
++            except Exception:  # health: allow BLE001 -- not armed either way; the next boot drops it again
++                logger.debug('wall-replay: could not drop %s', intent['admission_id'], exc_info=True)
++            continue
++        _arm(authority, intent, tries=_tries(intent))
++        armed += 1
++    if armed:
++        logger.info('wall-replay: re-armed %d planned redelivery(ies) at boot', armed)
++    return armed
+ 
+ 
+ def _serving(authority) -> bool:
+@@ -245,9 +284,18 @@ async def fire_replay(authority, admission_id: str, tries: int = 0) -> str:
+     intent = json.loads(raw)
+     if not _serving(authority):
+         return 'gone'  # a retired authority's store is re-armed by the process that serves it
+-    verdict = await _admit(authority, intent)
++    tries = max(tries, _tries(intent))
++    if _stale(intent, time.time()):
++        logger.warning('wall-replay: the redelivery of %s is stale; dropped', admission_id)
++        await asyncio.to_thread(_write, authority.db, key, None)
++        return 'dropped'
++    try:
++        verdict = await _admit(authority, intent)
++    except Exception:  # health: allow BLE001 -- an unexpected admission error retries within the persisted budget
++        logger.warning('wall-replay: admitting the redelivery of %s failed', admission_id, exc_info=True)
++        verdict = 'retry'
+     if verdict == 'retry':
+-        return await _retry(authority, intent, tries)
++        return await _retry(authority, intent, tries, persist=True)
+     await asyncio.to_thread(_write, authority.db, key, None)
+     return verdict
+ 
+@@ -258,15 +306,23 @@ def _get(db, key: str) -> str | None:
+     return None if row is None else row[0]
+ 
+ 
+-async def _retry(authority, intent: dict, tries: int) -> str:
++async def _retry(authority, intent: dict, tries: int, persist: bool = False) -> str:
++    """Look again in ``RETRY_S``, or drop the plan once ``RETRIES_MAX`` tries are spent. ``persist`` stores
++    the spent tries in the plan (only for a plan read whole from the store), so a restart keeps counting."""
+     if tries >= RETRIES_MAX:
+         logger.warning('wall-replay: gave up admitting the redelivery of %s after %d tries',
+                        intent['admission_id'], tries)
+         try:
+             await asyncio.to_thread(_write, authority.db, PREFIX + intent['admission_id'], None)
+-        except Exception:  # health: allow BLE001 -- the next boot re-arms it, still bounded by the identity
++        except Exception:  # health: allow BLE001 -- the next boot re-arms it under its stored tries, still bounded
+             logger.debug('wall-replay: could not drop %s', intent['admission_id'], exc_info=True)
+         return 'dropped'
++    if persist:
++        try:
++            await asyncio.to_thread(_write, authority.db, PREFIX + intent['admission_id'],
++                                    json.dumps({**intent, 'tries': tries + 1}))
++        except Exception:  # health: allow BLE001 -- this process still counts; a restart may grant a few more
++            logger.debug('wall-replay: could not record the tries of %s', intent['admission_id'], exc_info=True)
+     _arm(authority, intent, RETRY_S, tries + 1)
+     return 'retry'
+ 
+diff --git a/tests/gateway/test_wall_replay_automation_wake.py b/tests/gateway/test_wall_replay_automation_wake.py
+index 6ac6a9ebf4..99d144b3fc 100644
+--- a/tests/gateway/test_wall_replay_automation_wake.py
++++ b/tests/gateway/test_wall_replay_automation_wake.py
+@@ -304,6 +304,7 @@ def _seed(db, admission_id='adm-1'):
+     ('refused', 'dropped', False),        # a permanent refusal: dropped, never retried
+     ('no-route', 'dropped', False),       # the route takes no wakes any more
+     ('exhausted', 'dropped', False),      # the retry budget is spent
++    ('crash', 'retry', True),             # an unexpected admission error: looks again, within the budget
+     ('retired', 'gone', True),            # a retired authority leaves it to the store's next owner
+ ])
+ async def test_fire_replay_outcomes(tmp_path, monkeypatch, case, verdict, kept):
+@@ -320,6 +321,8 @@ async def test_fire_replay_outcomes(tmp_path, monkeypatch, case, verdict, kept):
+                 raise RuntimeStoreError('runtime_draining')
+             if case == 'refused':
+                 raise RuntimeStoreError('permission_denied')
++            if case == 'crash':
++                raise ValueError('adapter blew up')
+             return case != 'no-route'
+ 
+         monkeypatch.setattr(session_automation, 'admit_route_wake', admit)
+@@ -339,3 +342,66 @@ async def test_fire_replay_outcomes(tmp_path, monkeypatch, case, verdict, kept):
+     finally:
+         authority.retiring = False
+         await _stop(authority, db)
++
++
++@pytest.mark.asyncio
++async def test_a_stale_planned_redelivery_is_dropped_at_boot_not_delivered(tmp_path, monkeypatch):
++    """A plan whose time passed more than ``STALE_S`` ago (a long outage) is dropped at boot, not re-armed:
++    the notice would arrive long after it mattered. A plan still in date is re-armed as before."""
++    from gateway import session_automation, session_wall_replay as replay
++    runner, db, authority = await _authority(tmp_path, monkeypatch)
++    calls = []
++
++    async def admit(*args, **kwargs):
++        calls.append(args)
++        return True
++
++    monkeypatch.setattr(session_automation, 'admit_route_wake', admit)
++    monkeypatch.setattr(runner, '_adapter_for_source', lambda source: object())
++    try:
++        stale = _seed(db, 'adm-stale')
++        stale['due'] = time.time() - replay.MAX_DELAY_S - 60  # the gateway was down a week through it
++        replay._write(db, replay.PREFIX + 'adm-stale', json.dumps(stale))
++        _seed(db, 'adm-fresh')
++        assert await replay.arm_pending(authority) == 1
++        assert set(_intents(db)) == {'adm-fresh'}
++        assert 'adm-stale' not in authority._wall_replay_timers
++        assert 'adm-fresh' in authority._wall_replay_timers
++        # A timer an earlier process armed for it finds nothing left to deliver.
++        assert await replay.fire_replay(authority, 'adm-stale') == 'gone'
++        # And a timer that fires that late (a suspended process) drops it rather than delivering it; the
++        # bound is STALE_S (a day), well inside MAX_DELAY_S.
++        assert replay.STALE_S < replay.MAX_DELAY_S
++        stale['due'] = time.time() - replay.STALE_S - 60
++        replay._write(db, replay.PREFIX + 'adm-stale', json.dumps(stale))
++        assert await replay.fire_replay(authority, 'adm-stale') == 'dropped'
++        assert set(_intents(db)) == {'adm-fresh'}
++        assert calls == []
++    finally:
++        await _stop(authority, db)
++
++
++@pytest.mark.asyncio
++async def test_a_redelivery_whose_adapter_never_returns_is_dropped_across_restarts(tmp_path, monkeypatch):
++    """The retry budget is persisted with the plan, so restarts do not reset it: a platform removed from
++    config (no adapter, ever) is dropped once the budget is spent, however often the gateway restarts."""
++    from gateway import session_wall_replay as replay
++    _runner, db, authority = await _authority(tmp_path, monkeypatch)
++    _seed(db, 'adm-orphan')
++    await _stop(authority, db)
++    verdicts, stored, boot = [], {}, -1
++    for boot in range(replay.RETRIES_MAX + 3):
++        runner, db, authority = await _authority(tmp_path, monkeypatch, instance=f'boot-{boot}')
++        monkeypatch.setattr(runner, '_adapter_for_source', lambda source: None)
++        try:
++            stored = _intents(db)
++            if 'adm-orphan' not in getattr(authority, '_wall_replay_timers', {}):
++                break  # this boot found the plan spent, dropped it and armed nothing
++            # The timer this process armed fires once and finds no adapter; then the gateway restarts.
++            verdicts.append(await replay.fire_replay(authority, 'adm-orphan'))
++        finally:
++            await _stop(authority, db)
++    assert 'adm-orphan' not in stored  # read by the last boot, after it dropped the plan
++    # Ten looks in all (one per process here), then the next boot drops the plan instead of arming it.
++    assert verdicts == ['retry'] * replay.RETRIES_MAX
++    assert boot == replay.RETRIES_MAX
+-- 
+2.43.0
+

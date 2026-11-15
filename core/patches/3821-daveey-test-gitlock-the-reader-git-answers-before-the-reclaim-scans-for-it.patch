@@ -1,0 +1,59 @@
+From 6af4055128693d5c4acdd6cbdb1ce156f6d2255b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 20:00:30 +0000
+Subject: [PATCH] [daveey] test(gitlock): the reader git answers before the
+ reclaim scans for it
+
+test_a_killed_updates_lock_stays_while_any_git_works_in_the_checkout[a reader git in the checkout]
+flaked on CI (run 43487859747, `assert release_dead_index_lock(repo) is False` -> True).
+
+Why: the test called the reclaim right after Popen(["git", "cat-file", "--batch"]). Popen returns
+once the child's exec is past its point of no return (vfork release / CLOEXEC errpipe EOF), before
+the kernel has laid out the new argv. In that window /proc/<pid>/cmdline reads empty, and the
+/proc scan rightly skips an argv-less process as "no git" (a zombie or kernel thread). On a starved
+runner the parent reached the child's /proc entry inside that window, saw no git working in the
+checkout, and released the lock. Measured here: cmdline stays empty for p50 26us / p99 4.8ms / max
+13ms after Popen under 32 CPU burners. Production is unaffected: a git still inside exec has taken
+no lock, so dropping a killed update's lock then is safe.
+
+Fix (test only): start `git cat-file --batch-check` with a stdout pipe and wait for its answer to
+`HEAD` before the reclaim. An answered query proves git runs in the checkout; no clock involved.
+
+Proof (16-vCPU worker, each pytest in a fresh pid namespace like a CI container, 32 CPU burners):
+- RED (origin/main test, reader leg x30 per process, 8 processes): 2/240 failed with the CI error
+  `AssertionError: assert True is False`.
+- GREEN (this change, same load): 0/540 across two rounds (8x30 + 10x30).
+- Direct scan probe: `_held_open` right after Popen missed the live reader 1, 2 and 4 times in 200
+  per process (namespace, 32 burners); after the answered query 0 misses (0/1200 on the host).
+- scripts/run_tests.sh tests/hermes_cli/test_gitlock.py: 26 passed.
+
+Kanban: t_01a1d6598aa99ba2
+---
+ tests/hermes_cli/test_gitlock.py | 11 +++++++++--
+ 1 file changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/tests/hermes_cli/test_gitlock.py b/tests/hermes_cli/test_gitlock.py
+index acdb23bb89..4e924c3f9c 100644
+--- a/tests/hermes_cli/test_gitlock.py
++++ b/tests/hermes_cli/test_gitlock.py
+@@ -511,8 +511,15 @@ def test_a_killed_updates_lock_stays_while_any_git_works_in_the_checkout(repo: P
+         assert lock.exists(), "premise: git commit holds index.lock in its editor"
+     else:
+         lock.write_bytes(b"")
+-        proc = subprocess.Popen(["git", "cat-file", "--batch"], cwd=repo, stdin=subprocess.PIPE,
+-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
++        proc = subprocess.Popen(["git", "cat-file", "--batch-check"], cwd=repo, stdin=subprocess.PIPE,
++                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
++        # Popen returns once the exec is past its point of no return, before the kernel has laid out
++        # the new argv: /proc/<pid>/cmdline reads empty there and the scan rightly skips it as no git.
++        # A starved runner reached the scan inside that window. An answered query proves git runs here.
++        assert proc.stdin is not None and proc.stdout is not None
++        proc.stdin.write(b"HEAD\n")
++        proc.stdin.flush()
++        assert b" commit " in proc.stdout.readline(), "premise: the reader git answers in the checkout"
+     try:
+         assert release_dead_index_lock(repo) is False
+         assert lock.exists(), f"{form}: the reclaim deleted a lock a live git may own"
+-- 
+2.43.0
+

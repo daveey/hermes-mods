@@ -1,0 +1,176 @@
+From 9f73d9b9be012af1db920aac52bb0b0c053cc0e9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 20:11:42 +0000
+Subject: [PATCH] perf(cron): memo list_jobs' parsed jobs.json on its
+ (mtime_ns, size, ino) [daveey]
+
+The Desktop cron poll lists every profile's jobs through
+web_server_cron._call_cron_for_profile -> cron.jobs.list_jobs, which re-ran
+ensure_dirs (mkdir + chmod x2) and re-parsed + normalized jobs.json each time.
+On the hub's default store (46 jobs, 193 KB) that is ~1.75 ms of the
+5.1 ms list_jobs (card t_01a1d59ed9eb75fe; design t_01a1d563324d7e8e
+section 6 serve-residue lever, 0.25% of a core in prof10-sv-438019).
+
+list_jobs now keeps the normalized records per jobs file, keyed on the
+same (mtime_ns, size, ino) stamp the shrink-merge fast path trusts (every
+writer renames a new file in). A read is remembered only when no write raced
+it; a hit returns a deep copy. latest/live executions are still read on
+every call, so run state stays exact.
+
+RED->GREEN: tests/cron/test_list_jobs_memo.py
+---
+ cron/jobs.py                      | 29 ++++++++-
+ tests/cron/test_list_jobs_memo.py | 99 +++++++++++++++++++++++++++++++
+ 2 files changed, 127 insertions(+), 1 deletion(-)
+ create mode 100644 tests/cron/test_list_jobs_memo.py
+
+diff --git a/cron/jobs.py b/cron/jobs.py
+index 0088c2ea60..1cd8ec6e60 100644
+--- a/cron/jobs.py
++++ b/cron/jobs.py
+@@ -1996,9 +1996,36 @@ def resolve_job_ref(ref: str) -> Optional[dict[str, Any]]:
+     return _normalize_job_record(name_matches[0])
+ 
+ 
++_LIST_MEMO: dict[Path, tuple[tuple[int, int, int], list[dict[str, Any]]]] = {}
++_LIST_MEMO_LOCK = threading.Lock()
++
++
++def _listed_records() -> list[dict[str, Any]]:
++    """Normalized jobs, memoized on the jobs file's (mtime_ns, size, ino): a Desktop cron poll re-parsed
++    jobs.json (and re-ran ensure_dirs) per profile on every read (t_01a1d59ed9eb75fe). A write renames a new
++    file in (new ino), so it is picked up by the next call. Only a read no write raced is remembered. P1 pass
++    ``cron.list_jobs``: a skip is a memo hit. [daveey]"""
++    from hermes_cli import loop_accounting as la
++    jobs_file = _current_cron_store().jobs_file
++    stamp = _jobs_file_stamp(jobs_file)
++    with _LIST_MEMO_LOCK:
++        hit = _LIST_MEMO.get(jobs_file)
++    with la.pass_("cron.list_jobs") as p:
++        if stamp is not None and hit is not None and hit[0] == stamp:
++            p.skip()
++            _record_load_stamp(stamp)
++            return copy.deepcopy(hit[1])
++        p.change()
++        jobs = [_normalize_job_record(j) for j in load_jobs()]
++        if stamp is not None and _jobs_file_stamp(jobs_file) == stamp:
++            with _LIST_MEMO_LOCK:
++                _LIST_MEMO[jobs_file] = (stamp, copy.deepcopy(jobs))
++        return jobs
++
++
+ def list_jobs(include_disabled: bool = False) -> list[dict[str, Any]]:
+     """List all jobs, optionally including disabled ones."""
+-    jobs = [_normalize_job_record(j) for j in load_jobs()]
++    jobs = _listed_records()
+     if not include_disabled:
+         jobs = [j for j in jobs if j.get("enabled", True)]
+     try:
+diff --git a/tests/cron/test_list_jobs_memo.py b/tests/cron/test_list_jobs_memo.py
+new file mode 100644
+index 0000000000..f70028923e
+--- /dev/null
++++ b/tests/cron/test_list_jobs_memo.py
+@@ -0,0 +1,99 @@
++"""list_jobs memoizes the parsed jobs.json on its (mtime_ns, size, ino) and picks a write up on the next call.
++
++Card t_01a1d59ed9eb75fe (design t_01a1d563324d7e8e §6, serve residue): the Desktop's cron poll re-parsed every
++profile's jobs.json (and re-ran ensure_dirs) on every read. [daveey]
++"""
++import json
++
++import pytest
++
++import cron.jobs as cj
++
++
++@pytest.fixture()
++def store(tmp_path, monkeypatch):
++    monkeypatch.setattr("cron.jobs.CRON_DIR", tmp_path / "cron")
++    monkeypatch.setattr("cron.jobs.JOBS_FILE", tmp_path / "cron" / "jobs.json")
++    monkeypatch.setattr("cron.jobs.OUTPUT_DIR", tmp_path / "cron" / "output")
++    parses = []
++    real = cj._parse_jobs_file
++    monkeypatch.setattr(cj, "_parse_jobs_file", lambda path: parses.append(path) or real(path))
++    return parses
++
++
++def _names():
++    return [j["name"] for j in cj.list_jobs(include_disabled=True)]
++
++
++def test_an_unchanged_jobs_file_is_not_parsed_again(store):
++    cj.create_job(prompt="first", schedule="every 1h", name="one")
++    assert _names() == ["one"]
++    parsed = len(store)
++    assert _names() == ["one"]
++    assert _names() == ["one"]
++    assert len(store) == parsed
++
++
++def test_a_write_is_picked_up_on_the_next_list(store):
++    job = cj.create_job(prompt="first", schedule="every 1h", name="one")
++    assert _names() == ["one"]
++    cj.update_job(job["id"], {"name": "renamed"})
++    assert _names() == ["renamed"]
++    cj.create_job(prompt="second", schedule="every 2h", name="two")
++    assert sorted(_names()) == ["renamed", "two"]
++    cj.remove_job(job["id"])
++    assert _names() == ["two"]
++
++
++def test_a_hand_edit_with_a_new_inode_is_picked_up(store):
++    cj.create_job(prompt="first", schedule="every 1h", name="one")
++    assert _names() == ["one"]
++    path = cj._current_cron_store().jobs_file
++    data = json.loads(path.read_text())
++    data["jobs"][0]["name"] = "two"  # same length: only the inode and mtime tell
++    tmp = path.with_name("jobs.json.edit")
++    tmp.write_text(json.dumps(data))
++    tmp.replace(path)
++    assert _names() == ["two"]
++
++
++def test_a_caller_mutating_the_list_does_not_change_the_next_answer(store):
++    cj.create_job(prompt="first", schedule="every 1h", name="one")
++    first = cj.list_jobs(include_disabled=True)
++    first[0]["name"] = "mutated"
++    first[0]["schedule"]["kind"] = "mutated"
++    again = cj.list_jobs(include_disabled=True)
++    assert again[0]["name"] == "one"
++    assert again[0]["schedule"]["kind"] != "mutated"
++
++
++def test_executions_stay_live_on_a_memo_hit(store, monkeypatch):
++    """The memo covers jobs.json only: latest/live executions are read on every call."""
++    job = cj.create_job(prompt="first", schedule="every 1h", name="one")
++    cj.list_jobs(include_disabled=True)
++    import cron.executions as ce
++    monkeypatch.setattr(ce, "latest_executions", lambda ids: {job["id"]: {"id": "x1", "status": "completed"}})
++    monkeypatch.setattr(ce, "live_executions", lambda ids: {})
++    listed = cj.list_jobs(include_disabled=True)
++    assert listed[0]["latest_execution"] == {"id": "x1", "status": "completed"}
++
++
++def test_each_profile_store_has_its_own_memo(tmp_path):
++    for name in ("a", "b"):
++        with cj.use_cron_store(tmp_path / name):
++            cj.create_job(prompt=f"job {name}", schedule="every 1h", name=f"job-{name}")
++    for _ in range(2):
++        for name in ("a", "b"):
++            with cj.use_cron_store(tmp_path / name):
++                assert _names() == [f"job-{name}"]
++
++
++def test_memo_hits_are_p1_skips(store):
++    from hermes_cli import loop_accounting as la
++    cj.create_job(prompt="first", schedule="every 1h", name="one")
++    before = la.counters().get("cron.list_jobs", {"runs": 0, "skips": 0})
++    for _ in range(3):
++        cj.list_jobs(include_disabled=True)
++    after = la.counters()["cron.list_jobs"]
++    assert after["runs"] - before["runs"] == 3
++    assert after["skips"] - before["skips"] == 2
+-- 
+2.43.0
+

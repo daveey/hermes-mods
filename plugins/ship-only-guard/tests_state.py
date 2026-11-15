@@ -128,7 +128,7 @@ def test_root_and_same_area_overlap_refused(monkeypatch):
     probe(monkeypatch, payload(files=[{"path": "hosts/mini-1/bb-tuner/x.py"}]),
           delta(["hosts/mini-1/bb-tuner/tests/deep/y.py"], [commit("c" * 40, "bb-tuner: y")]))
     assert "cccccccccc" in check()
-    probe(monkeypatch, payload(files=[{"path": "home/bin/tool"}]), delta(["home/bin/other.json"], [commit("c" * 40, "x")]))
+    probe(monkeypatch, payload(files=[{"path": "home/scripts/tool"}]), delta(["home/scripts/other.json"], [commit("c" * 40, "x")]))
     assert check()
     probe(monkeypatch, payload(files=[{"path": "tests/test_a.py"}]), delta(["tests/test_a.py"], [commit("c" * 40, "a")]))
     assert check()

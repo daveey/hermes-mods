@@ -1,0 +1,223 @@
+From c7dade80c865900afb3fbc62a48b48a1cb54b52a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 10:46:41 -0800
+Subject: [PATCH] fix(sidebar): a turn paused for a core update keeps
+ turn_live, so the row does not paint red for the update [daveey]
+
+A core update parks a running turn at a step boundary (gateway update checkpoint, or a Desktop/TUI
+core_update_pause turn marker) and continues it automatically, but the parked turn holds no turn
+lease. turn_live dropped for the length of every update, so a chat with a stored decision outcome or
+blocked asks painted red (stuck) although it was mid-work: the session status auditor filed
+20261026_170127_f07c32 false_red twice (t_01a1d6354e5847dd); all three red episodes that morning
+matched the hermes-sync drain windows exactly.
+
+turn_session_activity now also counts a started admission parked on a gateway update checkpoint
+(checkpointed last message within agent.gateway_auto_continue_freshness, 1 h) and a fresh
+core_update_pause marker with auto_continue and attempts left (15 min / 2, the desktop.auto_continue
+defaults). Stale, settled, exhausted or crash markers do not count.
+---
+ hermes_cli/turn_session_activity.py           | 76 +++++++++++++++--
+ .../hermes_cli/test_turn_session_activity.py  | 82 +++++++++++++++++++
+ 2 files changed, 152 insertions(+), 6 deletions(-)
+
+diff --git a/hermes_cli/turn_session_activity.py b/hermes_cli/turn_session_activity.py
+index 19da87ebfc..f5814eea24 100644
+--- a/hermes_cli/turn_session_activity.py
++++ b/hermes_cli/turn_session_activity.py
+@@ -9,11 +9,15 @@ outcome (red for a decision) or green while the agent was still working in it.
+ Session-list endpoints now stamp ``turn_live: true`` on each row whose compression lineage holds a
+ live durable turn lease (state.db ``session_turn_leases``, held from admission to flush of every turn
+ by any surface, keyed by the lineage root). A lease whose holder pid is provably dead does not count.
++A turn a core update paused at a step boundary (gateway update checkpoint, or a Desktop/TUI
++``core_update_pause`` turn marker) counts too while it can still auto-continue: it holds no lease
++while it waits, and the row painted its stored red decision for the length of every update.
+ Cached for a couple of seconds because the sidebar polls.
+ """
+ 
+ from __future__ import annotations
+ 
++import json
+ import logging
+ import os
+ import re
+@@ -84,6 +88,63 @@ def _holder_dead(holder: str) -> bool:
+     return False
+ 
+ 
++# [daveey] A turn a Hermes core update paused at a step boundary holds no lease while it waits, yet it
++# continues automatically: the row must keep reading as working, not paint its stored outcome (a red
++# decision) for the minute or two the update takes. The freshness bounds match the auto-continue
++# defaults (agent.gateway_auto_continue_freshness 1 h; desktop.auto_continue 15 min, 2 attempts) so a
++# pause nobody will continue stops counting.
++_GATEWAY_CHECKPOINT_PREFIX = "gateway.update_checkpoint.v1."
++_GATEWAY_PAUSE_FRESH_S = 3600.0
++_TUI_PAUSE_REASON = "core_update_pause"
++_TUI_PAUSE_FRESH_S = 15 * 60.0
++_TUI_PAUSE_MAX_ATTEMPTS = 2
++
++
++def _update_paused_gateway_turns(conn: sqlite3.Connection, now: float) -> set[str]:
++    """Sessions whose started gateway admission is parked on an update checkpoint
++    (``hermes_state_update_pause.checkpoint_session_input``), dated by the checkpointed last message."""
++    try:
++        rows = conn.execute(
++            "SELECT a.target_session_id, m.value FROM session_admissions a JOIN state_meta m"
++            " ON m.key = ? || a.admission_id WHERE a.status = 'started'",
++            (_GATEWAY_CHECKPOINT_PREFIX,)).fetchall()
++    except sqlite3.Error:  # no admissions table (older store) or a busy one
++        return set()
++    out: set[str] = set()
++    for sid, value in rows:
++        try:
++            receipt = json.loads(value)
++            stamp = conn.execute("SELECT timestamp FROM messages WHERE id = ?",
++                                 (int(receipt["max_message_id"]),)).fetchone()
++        except (ValueError, TypeError, KeyError, sqlite3.Error):
++            continue
++        if sid and stamp and stamp[0] is not None and now - float(stamp[0]) <= _GATEWAY_PAUSE_FRESH_S:
++            out.add(str(sid))
++    return out
++
++
++def _update_paused_tui_turns(home: Path, now: float) -> set[str]:
++    """Sessions whose Desktop/TUI turn marker (``tui_gateway.turn_marker``) records a core-update pause
++    that may still auto-continue."""
++    try:
++        data = json.loads((home / "desktop" / "interrupted_turns.json").read_text(encoding="utf-8-sig"))
++    except (OSError, ValueError):
++        return set()
++    out: set[str] = set()
++    for key, entry in (data.items() if isinstance(data, dict) else ()):
++        if not (key and isinstance(entry, dict) and entry.get("reason") == _TUI_PAUSE_REASON
++                and entry.get("auto_continue", True)):
++            continue
++        try:
++            since = max(float(entry.get(k) or 0) for k in ("started_at", "parked_at", "paused_at"))
++            attempts = int(entry.get("attempts") or 0)
++        except (TypeError, ValueError):
++            continue
++        if now - since <= _TUI_PAUSE_FRESH_S and attempts < _TUI_PAUSE_MAX_ATTEMPTS:
++            out.add(str(key))
++    return out
++
++
+ def _collect(now: float) -> frozenset[str]:
+     global _leases
+     live: set[str] = set()
+@@ -95,14 +156,17 @@ def _collect(now: float) -> frozenset[str]:
+             _log.debug("turn leases unreadable in %s", path, exc_info=True)
+             continue
+         try:
+-            rows = conn.execute(
+-                "SELECT conversation_id, holder, acquired_at, expires_at FROM session_turn_leases WHERE expires_at > ?",
+-                (now,)
+-            ).fetchall()
+-        except sqlite3.Error:  # no lease table yet (nothing ever ran a turn there) or a busy/odd store
+-            rows = []
++            try:
++                rows = conn.execute(
++                    "SELECT conversation_id, holder, acquired_at, expires_at FROM session_turn_leases"
++                    " WHERE expires_at > ?", (now,)
++                ).fetchall()
++            except sqlite3.Error:  # no lease table yet (nothing ever ran a turn there) or a busy/odd store
++                rows = []
++            live.update(_update_paused_gateway_turns(conn, now))
+         finally:
+             conn.close()
++        live.update(_update_paused_tui_turns(path.parent, now))
+         for cid, holder, acquired_at, expires_at in rows:
+             if cid and not _holder_dead(str(holder or "")):
+                 live.add(cid)
+diff --git a/tests/hermes_cli/test_turn_session_activity.py b/tests/hermes_cli/test_turn_session_activity.py
+index 2ef829029e..19ccd00d80 100644
+--- a/tests/hermes_cli/test_turn_session_activity.py
++++ b/tests/hermes_cli/test_turn_session_activity.py
+@@ -153,3 +153,85 @@ def test_api_profiles_sidebar_rows_carry_turn_live(rest):
+     rows = _by_id(body["recents"]["sessions"])
+     assert rows["busy_chat"].get("turn_live") is True
+     assert "turn_live" not in rows["idle_chat"]
++
++
++# ── a turn a core update paused keeps the row live (t_01a1d6354e5847dd) ─────────────────────────
++
++
++def _checkpointed_db(home, sid, *, status="started", message_age=30.0, receipt_ok=True):
++    """A real state.db with one admission for ``sid`` parked on a gateway update checkpoint."""
++    from hermes_state import SessionDB
++
++    db = SessionDB(db_path=home / "state.db")
++    try:
++        db.create_session(sid, source="desktop")
++        db.append_message(sid, role="user", content="go")
++        db.append_message(sid, role="assistant", content="working")
++    finally:
++        db.close()
++    conn = sqlite3.connect(home / "state.db")
++    mid = conn.execute("SELECT max(id) FROM messages WHERE session_id=?", (sid,)).fetchone()[0]
++    conn.execute("UPDATE messages SET timestamp=? WHERE id=?", (time.time() - message_age, mid))
++    conn.execute(
++        "INSERT INTO session_admissions(admission_id, request_id, principal_id, target_session_id, lineage_json,"
++        " payload_json, payload_digest, intent, status, owner_epoch, generation)"
++        " VALUES ('adm1', 'r1', 'p', ?, '[]', '{}', 'd', 'queue', ?, 1, 1)", (sid, status))
++    receipt = {"max_message_id": mid} if receipt_ok else {"other": 1}
++    import json
++    conn.execute("INSERT INTO state_meta(key, value) VALUES (?, ?)",
++                 ("gateway.update_checkpoint.v1.adm1", json.dumps(receipt)))
++    conn.commit()
++    conn.close()
++
++
++def test_gateway_update_paused_turn_counts_as_live(home):
++    _checkpointed_db(home, "paused_chat")
++    rows = tsa.annotate_turn_activity([{"id": "paused_chat"}, {"id": "tip", "_lineage_root_id": "paused_chat"},
++                                       {"id": "other"}])
++    assert [r.get("turn_live") for r in rows] == [True, True, None]
++
++
++@pytest.mark.parametrize("kwargs", [
++    {"message_age": 2 * 3600.0},   # nobody will auto-continue a pause this old
++    {"status": "terminal"},        # settled: the checkpoint's admission is no longer the started head
++    {"receipt_ok": False},         # unreadable receipt: no proof of the pause
++])
++def test_gateway_checkpoint_that_cannot_continue_does_not_count(home, kwargs):
++    _checkpointed_db(home, "paused_chat", **kwargs)
++    assert "turn_live" not in tsa.annotate_turn_activity([{"id": "paused_chat"}])[0]
++
++
++def _marker(home, key, **entry):
++    import json
++    (home / "desktop").mkdir(parents=True, exist_ok=True)
++    (home / "desktop" / "interrupted_turns.json").write_text(json.dumps({key: entry}), encoding="utf-8")
++
++
++def test_tui_update_pause_marker_counts_as_live(home):
++    now = time.time()
++    _leases(home / "state.db", [])
++    _marker(home, "tui_chat", reason="core_update_pause", auto_continue=True, attempts=0,
++            started_at=now - 7200, paused_at=now - 60)  # a long turn paused a minute ago is fresh
++    assert tsa.annotate_turn_activity([{"id": "tui_chat"}])[0].get("turn_live") is True
++
++
++@pytest.mark.parametrize("entry", [
++    {"reason": "core_update_pause", "auto_continue": True, "attempts": 0, "paused_at": -3600},  # stale
++    {"reason": "core_update_pause", "auto_continue": False, "attempts": 0, "paused_at": -60},
++    {"reason": "core_update_pause", "auto_continue": True, "attempts": 2, "paused_at": -60},  # exhausted
++    {"reason": "backend_exit", "auto_continue": True, "attempts": 0, "paused_at": -60},  # crash marker
++])
++def test_tui_marker_that_is_not_a_live_pause_does_not_count(home, entry):
++    now = time.time()
++    _leases(home / "state.db", [])
++    _marker(home, "tui_chat", **{**entry, "started_at": now - 7200, "paused_at": now + entry["paused_at"]})
++    assert "turn_live" not in tsa.annotate_turn_activity([{"id": "tui_chat"}])[0]
++
++
++def test_profile_tui_marker_is_read(home):
++    now = time.time()
++    _leases(home / "state.db", [])
++    _leases(home / "profiles" / "work" / "state.db", [])
++    _marker(home / "profiles" / "work", "w_chat", reason="core_update_pause", auto_continue=True, attempts=0,
++            started_at=now - 30)
++    assert tsa.annotate_turn_activity([{"id": "w_chat"}])[0].get("turn_live") is True
+-- 
+2.43.0
+

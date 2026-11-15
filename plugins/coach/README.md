@@ -197,6 +197,7 @@ pending at the end of a turn rides the next turn's `pre_llm_call` context. Each 
 | `kanban_db_write` | a `terminal` command or `execute_code` script that names a `kanban*.db` and runs `UPDATE`/`INSERT`/`DELETE` on `tasks`, `task_runs` or `task_events` (reads never count). Once per session, on the same call (also checked in `transform_tool_result`) | use the `kanban_*` tools; a PR contract on a repo with no required checks completes with `kanban_complete` `metadata.contract_waiver`; a damaged board: `hermes kanban recover` |
 | `cleanup_sweeper` | a successful call that schedules a recurring job whose command archives, deletes, removes, kills, prunes, cleans or purges: a crontab or `/etc/cron.*` write with such a cron line, `cronjob_manage` create/update (not a one-shot `in …`/ISO schedule or `repeat=1`; direct or via `tool_call`), `systemd-run --on-*`, a `systemctl enable/start <x>.timer` whose `<x>.service` ExecStart (written this session) cleans up, or a launchd plist with `StartInterval`/`StartCalendarInterval` whose program cleans up. `crontab -l`, removals, one-off cleanups and failed calls stay quiet. Once per session, on the same call (also checked in `transform_tool_result`). agent-a5ac5f1cac | a sweeper hides a leak: load five-whys, find and fix the producer that failed to clean up, remove the job, or say in the reply why the producer can't be fixed |
 | `metric_split` | a `kanban_complete` summary/result, `kanban_comment` body or `kanban_create` title/body (direct or via `tool_call`), or the turn's final reply, with a score (a decimal or a percentage, optionally `± x`) next to BPB, bits-per-byte, perplexity/ppl, accuracy/acc or loss, in a clause (split at sentence stops, `;`, newlines, table pipes) naming no split (val, validation, dev, test, train, held-out, eval). `$2.572`, integers ("0 rows") and labelled numbers stay quiet. Once per number per session; a handoff gets it on the same call (also checked in `transform_tool_result`), a reply with the next turn's context. Hint only, never a refusal. agent-05bb25439d | name the split and metric with every score ("1.787 val BPB"), read from the source table or README, so nobody tables a val score beside test baselines; a closed card gets a kanban_comment with the labelled numbers |
+| `search_cap` | a successful `terminal`/`execute_code` GitHub read (command or code names `gh`, `github` or `graphql`, so a `token-broker exec --scope user/github -- script.sh` counts) whose output prints a count of exactly 1000: `n=1000`, `total: 1000`, `runs 1000`, or a bare `1000`/`1,000` line from `wc -l`/`jq length`. Numbers inside other numbers (`431000`, `1000.5`) and prose about the cap stay quiet. Once per session, attached to the same result (also checked in `transform_tool_result`). Hint only. agent-321e1c0705 | GitHub search and Actions run lists stop at 1000 and `--paginate` ends there silently: select `issueCount`/`total_count`, split the window under 1000 (`merged_since.py` exits 3), before any none/all claim |
 | `hub_ssh_heavy` | a `terminal` command, in a session not on the hub, whose `ssh <hub>` (or `hub-admin`) remote command runs a suite or CI wait: `pytest`, `run_tests.sh`, `wait_for_ci.py`, `vitest`, `npm test`, `test-all`, `unittest`, `hermes-core-wt test`. Hub = `hermes-hub`/`hub`, `COACH_HUB_HOSTS`, or an IPv4 one of those names resolves to. Hub-runtime commands (logs, board, reproductions) never count. Once per session, on the same call (also checked in `transform_tool_result`). agent-24dac018a6 | raw ssh skips the hub's CPU admission gate: a pool-worker card (`runs_on=["pool:worker"]`) or `hermes-core-wt test`, which moves to a worker while the hub is over its gate |
 | `widget_send` | a `write_file` (content) or `patch` (new_string) to an `.html`/`.htm`/`.xhtml` file that calls `hermes.send(` and either has a call whose result is never read (no `await`/`return` just before it, no `.then(` within 400 chars after) or uses `localStorage`/`sessionStorage`. `data-hermes-send` attributes alone never count. Once per file, on the same call (also checked in `transform_tool_result`) | the widget rules: 500 characters and one send per second, await the `{ok}` ack, retry when throttled, show other failures, chunk large data; no browser storage in the sandboxed frame, keep state in the widget's file |
 | `empty_wait` | a finished `terminal` call or `process_manage` job whose command contains `wait`, exit 0, and output empty, `{}`, `[]`, `None` or `null`. Once per job, on the same result (also checked in `transform_tool_result`) | a wait that printed nothing may have matched nothing: check it watched the runs you expect; for dispatched GitHub runs use `wait_for_ci.py --run-id/--expect`, which exits 1 on an empty manifest |
@@ -1515,6 +1516,28 @@ kind per pass, same fingerprint folded into one (`seen Nx`).
   the Macs' `/usr/bin/python3`).
 
 ### Desktop backend timeouts (`backend_timeouts.py`, no agent, no LLM)
+
+Every completed non-dry-run scan also appends an allowlisted diagnostic record to
+`<HERMES_HOME>/coach/backend-timeouts-scans.jsonl`, including healthy, reused and throttled-owner
+scans. Schema `coach.backend-timeouts.scan.v1` records the observed window and retained coverage
+start, raw/awake/fail-fast/residual counts, threshold disposition, top-level owner-action counts,
+and positive-local startup correlation counts (`local`, `primary`, explicit local entries without
+`conn=`) with READY timestamps. This is retained-log correlation only, **not API readiness,
+causality, recovery or continuous availability evidence**. Startup-correlated failures remain in
+residual accounting; filing/admission and quiet healthy stdout are unchanged. Request paths,
+source lines, hostnames, owner IDs and probe payloads are not persisted in this sink.
+
+The sink has one active file and three numbered backups, each at most 64 KiB (256 KiB total),
+mode 0600 (including creation/rotation); a fixed empty `.lock` serializes concurrent writers/rotation
+on supported Unix hosts, with a two-second acquisition deadline before reporting sink failure.
+READY lists retain the first 128 timestamps and report `ready_times_omitted`. Retention is
+size-based, not a promised time window. Sink failures emit a fixed stderr diagnostic and exit 1
+after filing, without retrying filing. `--dry-run`, `--hours` and unresolved-clock scans do not
+append success records. Read retained files to verify production emission; do not trigger a
+production scan or fabricate a natural PASS from a fixture replay. Tests:
+`tests/test_backend_timeout_receipts.py` exercises the normal cron entry with fixture-owned logs,
+state and board adapter, including reused/throttled owners, silent healthy output, unknown-conn
+exclusion, bounded rotation/private modes, READY truncation, failure and dry-run controls.
 
 The Desktop app logs each failed backend call to `~/.hermes/logs/desktop.log` as
 `<local stamp> [hermes] [hermes:api GET /api/...] Error: Timed out connecting to Hermes backend after Nms`. On

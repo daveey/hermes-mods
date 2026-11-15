@@ -1,0 +1,138 @@
+From 8632095832c78b857a1c3aeed79a899e20a27c8f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 23:59:42 +0000
+Subject: [PATCH] fix(shell): inherit arithmetic evaluation through parameter
+ fallbacks [daveey]
+
+Parameter fallback frames previously masked their enclosing arithmetic
+context, so the lifecycle walker missed executable substitution output.
+Carry that context for -, = and + words, including colon forms and nested
+fallbacks, without changing parameter lexical framing or pattern operands.
+
+Proof: predicted and reproduced base RED with real Bash harmless over-cap
+marker scripts (all three colon operators, including nested parameters).
+Expanded regression suite passes 31 cases; seven exact changed-line mutants
+fail behavioral assertions. Ordinary expansion, closed arithmetic, literal
+brackets, pattern operands and date exemption controls stay accepted.
+Initial full lifecycle family passed 1342 tests; final family re-run follows.
+No live Mac changes or synthetic production state.
+
+Task: t_01a1d74ce3012d95
+---
+ .../test_lifecycle_guard_arith_parameter.py   | 69 +++++++++++++++++++
+ tools/shell_arith_sink.py                     |  9 ++-
+ 2 files changed, 76 insertions(+), 2 deletions(-)
+ create mode 100644 tests/cron/test_lifecycle_guard_arith_parameter.py
+
+diff --git a/tests/cron/test_lifecycle_guard_arith_parameter.py b/tests/cron/test_lifecycle_guard_arith_parameter.py
+new file mode 100644
+index 0000000000..67eb41a7ba
+--- /dev/null
++++ b/tests/cron/test_lifecycle_guard_arith_parameter.py
+@@ -0,0 +1,69 @@
++"""Parameter fallback output inherits its surrounding arithmetic evaluation."""
++
++import subprocess
++
++import pytest
++
++from cron.lifecycle_guard import scan_gateway_lifecycle
++from tools.shell_arith_sink import substitution_in_arithmetic
++from tools.shell_heredoc import output_reaches_shell
++
++
++@pytest.mark.parametrize("op,prelude", [
++    (":-", "unset v;"), (":=", "unset v;"), (":+", "v=1;"),
++    ("-", "unset v;"), ("=", "unset v;"), ("+", "v=1;"),
++])
++@pytest.mark.parametrize("nested", [False, True])
++def test_parameter_output_executes_in_arithmetic(tmp_path, op, prelude, nested):
++    marker = tmp_path / "marker"
++    big = tmp_path / "big.sh"
++    big.write_text("# padding\n" * 130000 + f"printf RAN > {marker}\n", encoding="utf-8")
++    value = "$(echo 'a[$(bash " + str(big) + ")]')"
++    if nested:
++        value = "${w:-" + value + "}"
++    command = prelude + "x=$(( 1 + ${v" + op + value + "} ))"
++    result = subprocess.run(
++        ["/bin/bash"], input=command, text=True, encoding="utf-8", capture_output=True,
++        timeout=20, check=False, env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)},
++    )
++    assert result.returncode == 0, result.stderr
++    assert marker.read_text(encoding="utf-8") == "RAN"
++    assert output_reaches_shell(command)
++    unsafe, refusal = scan_gateway_lifecycle(command, cwd=str(tmp_path))
++    assert unsafe
++    assert refusal and "larger than the scan cap" in refusal
++
++
++@pytest.mark.parametrize("command", [
++    "x=${v:-$(echo data)}", "x=${v:=$(echo data)}", "x=${v:+$(echo data)}",
++    "x=${v:-${w:-$(echo data)}}",
++    "x=$(( ${v:-1} )); y=${w:-$(echo data)}",
++    "x=$(( ${v:-${w:-1}} )); y=$(echo data)",
++    "x=$(( ${v:-$(date +%s)} ))",
++    "v=1; x=$(( ${v#[} )); y=$(printf data)",
++    "v=1; x=$(( ${v#$(printf unused)} ))",
++    "v=1; x=$(( ${v/$(printf unused)/0} ))",
++    "v=1; x=$(( ${v:-[} )); y=$(printf data)",
++])
++def test_parameter_data_and_closed_arithmetic_are_not_sinks(command, tmp_path):
++    result = subprocess.run(
++        ["/bin/bash"], input=command, text=True, encoding="utf-8", capture_output=True,
++        timeout=20, check=False, env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)},
++    )
++    assert result.returncode == 0, result.stderr
++    assert not output_reaches_shell(command)
++
++
++def test_parameter_date_exemption_remains_caller_controlled():
++    command = "x=$(( ${v:-${w:-$(date +%s)}} ))"
++    assert not substitution_in_arithmetic(command, date_exempt=True)
++    assert substitution_in_arithmetic(command, date_exempt=False)
++
++
++@pytest.mark.parametrize("shape", [
++    "(( 1 + {value} ))", "x=$[1 + {value}]", "let x=1+{value}",
++    "a[{value}]=1", "echo ${a[{value}]}", "echo ${s:1+{value}}",
++    "[[ 1 -eq {value} ]]",
++])
++def test_other_arithmetic_frames_pass_context_to_parameters(shape):
++    assert output_reaches_shell(shape.replace("{value}", "${v:-$(producer)}"))
+diff --git a/tools/shell_arith_sink.py b/tools/shell_arith_sink.py
+index d916fc251b..d11f2a63fe 100644
+--- a/tools/shell_arith_sink.py
++++ b/tools/shell_arith_sink.py
+@@ -39,6 +39,7 @@ _COMMENT_PRECEDERS = frozenset(" \t\n;&|(")
+ 
+ # Frame kinds. A frame is [kind, closer, depth, in_double_quotes].
+ _CMD, _ARITH, _PARAM = "cmd", "arith", "param"
++_PARAM_ARITH = "param_arith"  # parameter word feeding an arithmetic evaluator
+ 
+ 
+ def substitution_in_arithmetic(command: str, *, date_exempt: bool, _depth: int = 0) -> bool:
+@@ -87,7 +88,7 @@ def substitution_in_arithmetic(command: str, *, date_exempt: bool, _depth: int =
+             stack.append([_ARITH, "))", 0, False])
+             continue
+         if token == "$(":
+-            if kind == _ARITH and not (
++            if kind in (_ARITH, _PARAM_ARITH) and not (
+                     date_exempt and _DATE_PRODUCER_RE.match(command, pos)):
+                 return True
+             stack.append([_CMD, ")", 0, False])
+@@ -184,7 +185,11 @@ def _open_parameter(command: str, pos: int, stack: list[list]) -> int:
+     """Push the frame for a ``${`` opened before *pos*; return where scanning resumes."""
+     name = _PARAM_NAME_RE.match(command, pos)
+     after = name.end() if name else pos
+-    stack.append([_PARAM, "}", 0, False])
++    # Default/alternate/assignment words feed the surrounding evaluator; pattern
++    # operands do not. Preserve parameter lexical rules (not arithmetic brackets).
++    operator = command[after:after + 2].lstrip(":")[:1]
++    inherited = stack[-1][0] in (_ARITH, _PARAM_ARITH) and operator in ("-", "=", "+")
++    stack.append([_PARAM_ARITH if inherited else _PARAM, "}", 0, False])
+     return _after_parameter_name(command, after, stack)
+ 
+ 
+-- 
+2.43.0
+

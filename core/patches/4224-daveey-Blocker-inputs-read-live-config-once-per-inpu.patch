@@ -1,0 +1,200 @@
+From b8bed5dcd4637cdb9d576b8961a411dc75104bfd Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 17:03:30 +0000
+Subject: [PATCH] [daveey] Blocker inputs: read live config once per input
+ read, not twice
+
+kanban_blocker_inputs.read() bracketed every cache-miss compute with two
+_key() calls, each a load_config_readonly(). Profiling blocker_states plus
+one shared_blocker_guard per candidate (t_01a1d87ff4b03f3b) showed _key
+issuing 273 of 312 config loads per round.
+
+The post-compute key no longer re-reads live config. compute sees config
+only through the pass snapshot (config()), so its value is fresh for the
+key's aliases iff the snapshot still carries them afterwards. The check
+compares the snapshot dict's current alias content (an in-place edit
+during compute counts). A live edit during compute is caught by the next
+read's pre-compute key, which still reads live config every time, so an
+alias edit inside a pass still drops memos (0190f3467d's tests unchanged).
+With no snapshot held, the post check still reads live config.
+
+The pre-compute live read stays. The pinned tests detect an in-place edit
+of the loader's dict, which a config-file stat signature cannot see.
+
+RED (new tests/hermes_cli/test_kanban_blocker_input_key.py on the old
+module): a cache-miss plus a hit read loaded config 3 times (now 2). A
+mutant that compared the held alias copy instead of the snapshot's
+content fails test_in_place_edit_during_compute_is_not_cached. GREEN:
+287 tests across 18 blocker/sweep-gate files, scripts/check ok.
+
+Profile on a worker-3 board copy seeded with 3 open walls, 18 cards
+behind them, 38 candidates, 5 rounds, 3 runs (before -> after):
+- _key config loads/round: 273 -> 195 (39 from config() unchanged).
+- load_config_readonly cum: 0.229-0.248 s (8.3%) -> 0.174-0.181 s (6.6%).
+- profiled total: 2.78-3.03 s -> 2.68-2.76 s.
+All config loading stays ~20% (21.8% -> 20.5%). 0.39 s of it (~14%) is
+load_config() with its deepcopy from registered_checks() and
+probe_interval_seconds() in the guard, once each per held candidate. That
+lies outside _key and is left to a follow-up.
+---
+ hermes_cli/kanban_blocker_inputs.py           | 32 +++++--
+ .../test_kanban_blocker_input_key.py          | 84 +++++++++++++++++++
+ 2 files changed, 108 insertions(+), 8 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_blocker_input_key.py
+
+diff --git a/hermes_cli/kanban_blocker_inputs.py b/hermes_cli/kanban_blocker_inputs.py
+index 60e8654397..4052a51e99 100644
+--- a/hermes_cli/kanban_blocker_inputs.py
++++ b/hermes_cli/kanban_blocker_inputs.py
+@@ -84,7 +84,16 @@ def _aliases(cfg):
+     return section.get('shared_blocker_aliases', {}) if isinstance(section, dict) else {}
+ 
+ 
+-def _key(conn, now):
++def _snapshot_aliases(scope):
++    """The aliases the held snapshot carries now (its live content, so an in-place
++    edit counts), or None when no snapshot is held."""
++    held = scope.get(('config', get_ident()))
++    return None if held is None else _aliases(held)
++
++
++def _key(conn, now, aliases=None):
++    """Commit/config identity. ``aliases`` given: the caller vouches for them and
++    the live config is not re-read (``read``'s post-compute check)."""
+     if conn.in_transaction:
+         return None
+     from hermes_cli.config import load_config_readonly
+@@ -102,12 +111,13 @@ def _key(conn, now):
+                     files.append(None)
+         version = conn.execute('PRAGMA data_version').fetchone()[0]
+         schema = conn.execute('PRAGMA schema_version').fetchone()[0]
+-        live = load_config_readonly()
+-        aliases = _aliases(live)
+-        scope = _SCOPE.get() or {}
+-        held = scope.get(('aliases', get_ident()))
+-        if ('config', get_ident()) in scope and held != aliases:
+-            _hold_config(scope, live)
++        if aliases is None:
++            live = load_config_readonly()
++            aliases = _aliases(live)
++            scope = _SCOPE.get() or {}
++            held = scope.get(('aliases', get_ident()))
++            if ('config', get_ident()) in scope and held != aliases:
++                _hold_config(scope, live)
+         return (conn, conn.total_changes, version, schema, tuple(files), now, deepcopy(aliases))
+     except (sqlite3.Error, OSError, ConfigBackendUnavailable):
+         return None
+@@ -119,6 +129,12 @@ def read(name, conn, now, compute):
+     Transactions (including savepoints) always bypass. total_changes catches
+     same-connection writes even after rollback; data_version catches peers.
+     Scope exit drops all retained handles and observations.
++
++    Only the pre-compute key reads the live config: ``compute`` sees config
++    solely through the pass snapshot (``config``), so the value is fresh for
++    the key's aliases iff the snapshot still carries them afterwards. A live
++    edit during ``compute`` is caught by the next read's key. With no snapshot
++    held the post-compute key falls back to a live read.
+     """
+     scope = _SCOPE.get()
+     if scope is None:
+@@ -133,6 +149,6 @@ def read(name, conn, now, compute):
+         return deepcopy(held[1])
+     scope.pop(slot, None)
+     value = compute()
+-    if _key(conn, now) == key:
++    if _key(conn, now, _snapshot_aliases(scope)) == key:
+         scope[slot] = (key, deepcopy(value))
+     return value
+diff --git a/tests/hermes_cli/test_kanban_blocker_input_key.py b/tests/hermes_cli/test_kanban_blocker_input_key.py
+new file mode 100644
+index 0000000000..32d0b95411
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_blocker_input_key.py
+@@ -0,0 +1,84 @@
++"""G2b follow-up: one live config read per validated input read, same alias freshness."""
++from hermes_cli import kanban_blocker_inputs as inputs
++from hermes_cli import kanban_db_connect as kbc
++from tests.hermes_cli import test_kanban_shared_blockers as helpers
++
++kanban_home = helpers.kanban_home
++
++
++def _loader(monkeypatch, cfg):
++    calls = []
++
++    def load():
++        calls.append(1)
++        return cfg[0]
++    monkeypatch.setattr('hermes_cli.config.load_config_readonly', load)
++    return calls
++
++
++def test_cache_miss_reads_live_config_once(kanban_home, monkeypatch):
++    """The post-compute check trusts the pass snapshot: compute only sees config through it."""
++    calls = _loader(monkeypatch, [{'kanban': {'shared_blocker_aliases': {}}}])
++    with kbc.connect_closing() as conn:
++        @inputs.input_pass
++        def exercise():
++            inputs.config()
++            before = len(calls)
++            assert inputs.read('probe', conn, 10, lambda: 1) == 1   # miss
++            assert inputs.read('probe', conn, 10, lambda: 2) == 1   # hit
++            return len(calls) - before
++        assert exercise() == 2
++
++
++def test_in_place_edit_during_compute_is_not_cached(kanban_home, monkeypatch):
++    """A value computed after the snapshot's aliases changed must not be stored under the old
++    aliases, or reverting them would replay it."""
++    cfg = {'kanban': {'shared_blocker_aliases': {}}}
++    _loader(monkeypatch, [cfg])
++    aliases = cfg['kanban']['shared_blocker_aliases']
++    with kbc.connect_closing() as conn:
++        @inputs.input_pass
++        def exercise():
++            inputs.config()
++
++            def edit():
++                aliases['old-wall'] = 'new-wall'
++                return 'under-new'
++            assert inputs.read('probe', conn, 10, edit) == 'under-new'
++            del aliases['old-wall']
++            return inputs.read('probe', conn, 10, lambda: 'under-old')
++        assert exercise() == 'under-old'
++
++
++def test_replaced_config_during_compute_reaches_the_next_read(kanban_home, monkeypatch):
++    held = [{'kanban': {'shared_blocker_aliases': {}}}]
++    _loader(monkeypatch, held)
++    with kbc.connect_closing() as conn:
++        @inputs.input_pass
++        def exercise():
++            inputs.config()
++
++            def swap():
++                held[0] = {'kanban': {'shared_blocker_aliases': {'old-wall': 'new-wall'}}}
++                return 'first'
++            assert inputs.read('probe', conn, 10, swap) == 'first'
++            value = inputs.read('probe', conn, 10, lambda: 'second')
++            return value, inputs.config() is held[0]
++        assert exercise() == ('second', True)
++
++
++def test_no_snapshot_post_check_reads_live(kanban_home, monkeypatch):
++    """Without a held snapshot the compute may have taken one from a newer live config."""
++    held = [{'kanban': {'shared_blocker_aliases': {}}}]
++    _loader(monkeypatch, held)
++    with kbc.connect_closing() as conn:
++        @inputs.input_pass
++        def exercise():
++            def swap_then_snapshot():
++                held[0] = {'kanban': {'shared_blocker_aliases': {'old-wall': 'new-wall'}}}
++                inputs.config()
++                return 'under-new'
++            assert inputs.read('probe', conn, 10, swap_then_snapshot) == 'under-new'
++            held[0] = {'kanban': {'shared_blocker_aliases': {}}}
++            return inputs.read('probe', conn, 10, lambda: 'under-old')
++        assert exercise() == 'under-old'
+-- 
+2.43.0
+

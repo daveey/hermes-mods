@@ -1,0 +1,184 @@
+From 9a3903556de3b034760ab1bb488ab880f1c56b62 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 09:43:00 +0000
+Subject: [PATCH] Walk stdin files redirected into su/runuser/doas/sudo/ssh
+ login shells
+
+Review 5903452583 B1: `su -l bob < f`, `runuser -l bob < f`, `doas -s < f`,
+`sudo -i < f` and `ssh host < f` hand f to a shell with its own startup
+files, but _redirected_shell_inputs only put the path into nested_scripts,
+and the walk only visits paths _walk_candidates names. Walk nested scripts
+first as executed candidates (both scopes), and collect them (plus -c
+payloads and here-strings, minus payloads the session walk already reads)
+even under unknown session aliases, where the abbreviated su/runuser
+forms were otherwise never walked.
+
+Nit: runuser's no-value -f counts in the direct-user cluster (-fu bob).
+
+Tests: 14 new must-refuse stdin-file shapes (now also asserted under
+session_aliases=None) and 8 controls; 15 failed before the fix.
+tests/cron/test_lifecycle_guard*.py: 26 files, 2176 passed.
+---
+ cron/lifecycle_guard.py                       | 12 ++++++--
+ cron/lifecycle_guard_nested_shells.py         | 29 ++++++++++++-------
+ .../test_lifecycle_guard_session_aliases.py   | 26 ++++++++++++++++-
+ 3 files changed, 52 insertions(+), 15 deletions(-)
+
+diff --git a/cron/lifecycle_guard.py b/cron/lifecycle_guard.py
+index a5f3ed6aff..669980c9f1 100644
+--- a/cron/lifecycle_guard.py
++++ b/cron/lifecycle_guard.py
+@@ -1731,8 +1731,10 @@ def _contains_unsafe_gateway_action(
+     from cron.lifecycle_guard_nested_shells import (
+         collect_nested_shell_inputs, shell_scope, unvisited_scopes)
+ 
++    session_payloads = list(itertools.chain(_iter_shell_command_payloads(walk_command),
++                                            _iter_printed_shell_payloads(walk_command)))
+     nested_texts, nested_scripts = collect_nested_shell_inputs(
+-        command, walk_command, cwd=cwd, budget=budget)
++        command, walk_command, cwd=cwd, budget=budget, session_payloads=session_payloads)
+     from cron.lifecycle_guard_output import iter_recursive_payloads
+ 
+     for payload, nested, covered in iter_recursive_payloads(
+@@ -1741,8 +1743,12 @@ def _contains_unsafe_gateway_action(
+         if recurse(payload, cwd, executed, source, nested=nested, covered_quotes=covered):
+             return True
+ 
+-    for script_path, candidate_executed, python_source in _walk_candidates(
+-            command, walk_command, cwd=cwd, executed=executed, budget=budget):
++    # A nested shell's script may be a path the ordinary candidates never name: a stdin file
++    # redirected into `su -l bob`, `doas -s`, `sudo -i` or `ssh host` (review 5903452583 B1). It
++    # comes from the executed view, so it is executed, and is walked first in both scopes.
++    nested_only = ((path, executed, False) for path in sorted(nested_scripts))
++    for script_path, candidate_executed, python_source in itertools.chain(nested_only, _walk_candidates(
++            command, walk_command, cwd=cwd, executed=executed, budget=budget)):
+         # Do not touch a FileProvider path even to discover whether the file is hydrated.
+         if _on_cloud_path(script_path):
+             if candidate_executed:
+diff --git a/cron/lifecycle_guard_nested_shells.py b/cron/lifecycle_guard_nested_shells.py
+index 79d52f252b..321fd10022 100644
+--- a/cron/lifecycle_guard_nested_shells.py
++++ b/cron/lifecycle_guard_nested_shells.py
+@@ -9,7 +9,7 @@ from __future__ import annotations
+ import contextlib
+ import itertools
+ import re
+-from collections.abc import Iterator
++from collections.abc import Iterator, Sequence
+ from pathlib import Path
+ from typing import TYPE_CHECKING, Optional
+ 
+@@ -78,17 +78,23 @@ def unvisited_scopes(
+ 
+ def collect_nested_shell_inputs(
+     command: str, walk_command: str, *, cwd: Optional[str], budget: _LifecycleScanBudget,
++    session_payloads: Sequence[str] = (),
+ ) -> tuple[list[str], set[Path]]:
+     """``(texts, resolved scripts)`` a nested shell holding its own aliases parses in *command*
+-    (see ``_iter_nested_shell_inputs``). Already unknown alias names need no second walk."""
++    (see ``_iter_nested_shell_inputs``). Under already unknown alias names a heredoc body needs
++    no second walk (the session walk reads it in the same scope), but ``-c`` payloads, here-strings
++    and scripts are still returned: `su -lc T`, `runuser --comm=T`, `su -l bob < f` hand the
++    shell text or a path no ordinary walk names (review 5903452583 B1). There the session scope is
++    at least as strict as the nested one (it may also unmask heredoc bodies), so a text among
++    *session_payloads* (walked in the session scope anyway) is left out: walked and charged once."""
+     texts: list[str] = []
+     scripts: set[Path] = set()
+-    if budget.alias_names is None:
+-        return texts, scripts
+-    for text, script in _iter_nested_shell_inputs(command, walk_command, cwd=cwd):
++    unknown_names = budget.alias_names is None
++    for text, script in _iter_nested_shell_inputs(command, walk_command, cwd=cwd,
++                                                  heredocs=not unknown_names):
+         if script is not None:
+             scripts.add(_resolve_lenient(script))
+-        elif text:
++        elif text and not (unknown_names and text in session_payloads):
+             texts.append(text)
+     return texts, scripts
+ 
+@@ -225,7 +231,7 @@ def _nested_shell_input(view: list[str]) -> Optional[tuple[str, Optional[str]]]:
+         options = [_su_long_option(word) for word in view[index + 1:]]
+         direct_user = name == "runuser" and any(
+             word == "--user" or word.startswith("--user=")
+-            or re.fullmatch(r"-[mpPl]*u.*", word)
++            or re.fullmatch(r"-[fmpPl]*u.*", word)
+             for word in _option_words(options, frozenset("ucsgGw"), frozenset({
+                 "--user", "--command", "--session-command", "--shell", "--group",
+                 "--supp-group", "--whitelist-environment",
+@@ -285,16 +291,17 @@ def _feeds_nested_shell(owner: Optional[str]) -> bool:
+ 
+ 
+ def _iter_nested_shell_inputs(
+-    command: str, walk_command: str, *, cwd: Optional[str],
++    command: str, walk_command: str, *, cwd: Optional[str], heredocs: bool = True,
+ ) -> Iterator[tuple[Optional[str], Optional[Path]]]:
+     """``(text, None)`` or ``(None, script)``: what a nested shell holding its own aliases parses
+-    from *command*: heredoc bodies fed to it (at any depth, read from the unmasked *command*),
+-    its ``-c`` payload and its script (from *walk_command*, as the ordinary walk reads them)."""
++    from *command*: heredoc bodies fed to it (at any depth, read from the unmasked *command*;
++    skipped unless *heredocs*), its ``-c`` payload and its script (from *walk_command*, as the
++    ordinary walk reads them)."""
+     if not _NESTED_SHELL_HINT_RE.search(command):
+         return
+     from tools.shell_heredoc import iter_heredoc_bodies
+ 
+-    for owner, body in iter_heredoc_bodies(command):
++    for owner, body in (iter_heredoc_bodies(command) if heredocs else ()):
+         if _feeds_nested_shell(owner):
+             yield body, None
+     for view in _iter_command_segment_views(walk_command):
+diff --git a/tests/cron/test_lifecycle_guard_session_aliases.py b/tests/cron/test_lifecycle_guard_session_aliases.py
+index f189518890..bb36720448 100644
+--- a/tests/cron/test_lifecycle_guard_session_aliases.py
++++ b/tests/cron/test_lifecycle_guard_session_aliases.py
+@@ -276,6 +276,21 @@ _NESTED_FOREIGN_SHELLS = [
+     "runuser --com 't ( bash {db} )' bob",
+     "su --sess='t ( bash {db} )' bob",
+     "doas -a style -s <<< 't ( bash {db} )'",
++    # A stdin file fed to a login-shell launcher is that shell's script (review 5903452583 B1).
++    "su -l bob < {script}",
++    "su - bob < {script}",
++    "su bob < {script}",
++    "su -l bob 0< {script}",
++    "su -l bob <> {script}",
++    "runuser -l bob < {script}",
++    "runuser - bob < {script}",
++    "doas -s < {script}",
++    "doas -u bob -s < {script}",
++    "sudo -i < {script}",
++    "sudo -s < {script}",
++    "sudo -u bob -i < {script}",
++    "ssh host < {script}",
++    "ssh -p 22 host bash -s < {script}",
+ ]
+ 
+ 
+@@ -287,7 +302,7 @@ def test_nested_login_shell_body_treats_names_as_unknown(tmp_path, live_kanban_d
+     script = tmp_path / "inner.sh"
+     script.write_text(f"t ( bash {live_kanban_db} )\n")
+     text = shape.format(db=live_kanban_db, script=script)
+-    for names in (frozenset({"zz"}), frozenset()):
++    for names in (frozenset({"zz"}), frozenset(), None):
+         unsafe, refusal = scan_gateway_lifecycle(text, cwd=str(tmp_path), session_aliases=names)
+         assert unsafe is True and refusal is not None and "SQLite" in refusal, (shape, names)
+ 
+@@ -315,6 +330,15 @@ def test_nested_login_shell_body_treats_names_as_unknown(tmp_path, live_kanban_d
+     "runuser --u=bob -- printf '%s\\\\n' -c 't ( bash {db} )'",
+     "runuser --white HOME -u bob -- cat <<< 't ( bash {db} )'",
+     "runuser --supp=root --us=bob -- cat <<< 't ( bash {db} )'",
++    # Direct-user runuser and non-shell commands read a stdin file as data.
++    "runuser -fu bob -- cat <<< 't ( bash {db} )'",
++    "runuser -f -u bob -- cat <<< 't ( bash {db} )'",
++    "runuser -u bob -- cat < {script}",
++    "runuser -fu bob -- cat < {script}",
++    "cat < {script}",
++    "sudo cat < {script}",
++    "doas cat < {script}",
++    "ssh host cat < {script}",
+ ])
+ def test_plain_child_shell_keeps_session_names(tmp_path, live_kanban_db, shape):
+     """Controls: no login/interactive shell, so the session's names still decide (#2358)."""
+-- 
+2.43.0
+

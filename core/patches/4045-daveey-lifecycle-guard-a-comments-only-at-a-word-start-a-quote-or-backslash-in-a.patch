@@ -1,0 +1,373 @@
+From 9725ac50794b7028165a6b2e3dd4cd1a22f2b908 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 21:59:14 +0000
+Subject: [PATCH] [daveey] lifecycle guard: a `#` comments only at a word
+ start; a quote or backslash in a comment opens nothing
+
+bash reads `a#b` as one word, but `_shlex_tokens` let shlex treat every unquoted `#` as a
+comment and dropped the rest of the line, so `echo a#b; bash ./r.sh` ran a lifecycle script the
+guard never opened. `_split_logical_lines` ignored comments, so the apostrophe in
+`echo hi # it's` opened a "quote" that swallowed the next lines, which the tokenizer then cut at
+that comment: `echo hi # it's<newline>bash ./r.sh` was allowed. Found reviewing PR #2523
+(t_01a1d6db4b966c37); main gives the same verdicts (card t_01a1d6e0355ac8cc).
+
+Two more shapes of the same root cause, found while fixing it:
+- A comment's trailing backslash continues nothing in bash, but the continuation collapse
+  (`_SHELL_LINE_CONTINUATION`, and `.replace("\\\n", "")` before the line split) joined the
+  next line into the comment: `grep x /dev/null # x \<newline><restart>` was allowed.
+- The line splitter honoured a backslash inside single quotes, so `echo 'a\'<newline>bash ./r.sh`
+  stayed "quoted" across the newline.
+
+Fix (cron/lifecycle_guard_lines.py): one quote/escape/comment scanner where `#` is a comment only
+after the line start, unquoted whitespace or `;&|()<>`, and a backslash escapes nothing in single
+quotes. `strip_shell_comments` feeds `_shlex_tokens` (commenters now empty) and the logical-line
+split; `join_line_continuations` replaces `_SHELL_LINE_CONTINUATION.sub(" ", ...)` at its three
+callers, keeping a comment's newline and joining `a\<newline>#b` into `a#b` as bash does.
+
+Tests: tests/cron/test_lifecycle_guard_comment_words.py. Each RUN row first runs in real bash
+with a fake `hermes` that writes a marker. On origin/main 147a9e9d51, 24 of 26 RUN rows and 3 of
+8 split rows fail (the other 2 RUN rows already pass through shlex's per-physical-line fallback
+and stay as pins); all 59 pass here, as do the clean twins (`echo a#b; python3 ./clean.py`) and
+real comments (`echo a#b # bash ./r.sh`). The 30 test files importing the guard pass (1956 tests).
+The `{fd}>` shapes from the card (`x=1#2 {fd}>/dev/null bash r.sh`) also need PR #2523.
+---
+ cron/lifecycle_guard.py                       |  24 +--
+ cron/lifecycle_guard_lines.py                 |  73 ++++++++-
+ .../test_lifecycle_guard_comment_words.py     | 141 ++++++++++++++++++
+ 3 files changed, 220 insertions(+), 18 deletions(-)
+ create mode 100644 tests/cron/test_lifecycle_guard_comment_words.py
+
+diff --git a/cron/lifecycle_guard.py b/cron/lifecycle_guard.py
+index a0430cfb80..e72feddcf6 100644
+--- a/cron/lifecycle_guard.py
++++ b/cron/lifecycle_guard.py
+@@ -22,12 +22,13 @@ from typing import Callable, Iterator, Optional
+ from cron.lifecycle_guard_aliases import _may_define_alias, _session_aliases_shadow_consumers
+ from cron.lifecycle_guard_groups import CONTROL_CHARS as _CONTROL_CHARS
+ from cron.lifecycle_guard_groups import iter_line_segment_contexts, split_glued_redirections
+-from cron.lifecycle_guard_lines import _split_logical_lines  # newlines outside quotes
++from cron.lifecycle_guard_lines import (  # newlines outside quotes, word-start `#` comments
++    _split_logical_lines, join_line_continuations, strip_shell_comments,
++)
+ 
+ # Lines a printer may print, walked as the sink's command (moved out for FILE_LINES).
+ from cron.lifecycle_guard_printf import printed_argument_lines as _printed_argument_lines
+ from cron.lifecycle_guard_printf import with_escapes_decoded as _with_escapes_decoded
+-
+ # How `uv [global options] run [options] <command>` reads its argv.
+ from cron.lifecycle_guard_uv import _uv_run_command_indices
+ 
+@@ -217,7 +218,7 @@ def contains_host_interpreter_kill(text: str) -> bool:
+     name-derived PID feed into one (`pgrep python | xargs kill`, `kill $(pidof python3)`,
+     `Get-Process python | Stop-Process`). Segment-tokenized, so quoted/spliced spellings and Python
+     argv lists resolve the same way the shell resolves them."""
+-    normalized = _SHELL_LINE_CONTINUATION.sub(" ", text)
++    normalized = join_line_continuations(text)
+     kill_verb_present = bool(_KILL_VERB_RE.search(normalized))
+     for segment in _iter_command_segments(normalized):
+         joined = " ".join(segment)
+@@ -239,8 +240,8 @@ def contains_host_interpreter_kill(text: str) -> bool:
+ # split across continuation lines (e.g. `launchctl submit \` / `  -l ai.hermes.gateway-... \` / `  -- ...`,
+ # the exact reported shape in #62891) would otherwise slip past. Collapse continuations to a single space
+ # before matching, mirroring what the shell itself does, rather than loosening `[^\n]*` and risking false
+-# positives across genuinely separate lines.
+-_SHELL_LINE_CONTINUATION = re.compile(r"\\\r?\n[ \t]*")
++# positives across genuinely separate lines. `join_line_continuations` (cron/lifecycle_guard_lines.py)
++# does the collapse; a comment's trailing backslash continues nothing there, as in bash.
+ 
+ # Python argv-list punctuation (`subprocess.run(["launchctl", "bootout", ...])`) separates exec'd
+ # words with brackets/commas. Stripped only for the token-join re-scan, never from raw text.
+@@ -448,7 +449,7 @@ def contains_gateway_lifecycle_command(text: str, *, mask_heredocs: bool = True)
+ 
+     if mask_heredocs:
+         text = strip_inert_heredoc_bodies(text)
+-    normalized = _SHELL_LINE_CONTINUATION.sub(" ", text)
++    normalized = join_line_continuations(text)
+     if _GATEWAY_LIFECYCLE_PATTERN.search(normalized):
+         return True
+     # Profile-flag form: blocked only when the named profile IS the one running the guard.
+@@ -708,10 +709,11 @@ def _refuse_unreadable(budget: _LifecycleScanBudget, path: Path, reason: str) ->
+ # --- shell tokenization -----------------------------------------------------------------------
+ 
+ def _shlex_tokens(line: str) -> list[str]:
+-    """POSIX-tokenize one shell line, honoring quotes and `#` comments; raises ValueError."""
+-    lexer = shlex.shlex(line, posix=True, punctuation_chars=";&|()")
++    """POSIX-tokenize one shell line, honoring quotes and `#` comments; raises ValueError. Only a
++    word-start `#` comments (shlex's own commenters would also cut `a#b`, which bash keeps)."""
++    lexer = shlex.shlex(strip_shell_comments(line), posix=True, punctuation_chars=";&|()")
+     lexer.whitespace_split = True
+-    lexer.commenters = "#"
++    lexer.commenters = ""
+     return list(lexer)
+ 
+ 
+@@ -736,7 +738,7 @@ def _iter_command_token_lists(command: str) -> Iterator[list[str]]:
+     """Yield the shell tokens of each logical line; a line shlex rejects (unbalanced quotes) falls
+     back to per-physical-line tokenization. An unquoted ``<``/``>`` glued to a word starts a word
+     of its own (``python3 -<f.py``), as in the shell."""
+-    for line in _split_logical_lines(command.replace("\\\n", "")):
++    for line in _split_logical_lines(strip_shell_comments(command).replace("\\\n", "")):
+         try:
+             tokens = _shlex_tokens(split_glued_redirections(line))
+         except ValueError:
+@@ -1204,7 +1206,7 @@ def _lifecycle_command_scan_with_data_exemption(text: str, *, mask_heredocs: boo
+     nothing), then re-scan with data-sink arguments masked; only a surviving match blocks."""
+     if not contains_gateway_lifecycle_command(text, mask_heredocs=mask_heredocs):
+         return False
+-    normalized = _SHELL_LINE_CONTINUATION.sub(" ", text)
++    normalized = join_line_continuations(text)
+     return contains_gateway_lifecycle_command(
+         _mask_data_sink_arguments(normalized), mask_heredocs=mask_heredocs)
+ 
+diff --git a/cron/lifecycle_guard_lines.py b/cron/lifecycle_guard_lines.py
+index 06b87836b7..bfc1c11cb4 100644
+--- a/cron/lifecycle_guard_lines.py
++++ b/cron/lifecycle_guard_lines.py
+@@ -1,31 +1,90 @@
+ """How the lifecycle guard's command scan splits a command into logical shell lines.
+ 
+ Moved out of ``cron/lifecycle_guard.py`` to keep that module under its FILE_LINES cap.
++
++A ``#`` starts a comment only where bash starts a word: at the line's start or after unquoted,
++unescaped whitespace or an operator character (``;&|()<>``). Inside a word (``a#b``, ``x=1#2``,
++``$#``, ``${#x}``) it is text, and a quote inside a comment is text too (``echo hi # it's``). A
++comment ends at its newline even after a backslash (``# x \\`` does not continue the line).
+ """
+ 
+ from __future__ import annotations
+ 
++import re
+ 
+-def _split_logical_lines(text: str) -> list[str]:
+-    """Split on newlines outside quotes (a quoted newline is data, not a separator); honors
+-    escapes."""
++# Characters after which an unquoted `#` starts a word, so a comment (bash's metacharacters).
++_WORD_BREAKS = frozenset(" \t\r\n;&|()<>")
++# A backslash-newline continuation and the indentation after it (what the regex scans collapse).
++_CONTINUATION = re.compile(r"\\\r?\n[ \t]*")
++
++
++def _scan(text: str, *, split: bool, keep_comments: bool) -> list[str]:
++    """*text* as one string or (*split*) as logical lines: newlines outside quotes separate them
++    (a quoted newline is data). Honors quotes and escapes. Comments are dropped, or with
++    *keep_comments* kept without the backslashes they end with (no continuation)."""
+     lines: list[str] = []
+     current: list[str] = []
+-    in_single = in_double = escape = False
++    comment: list[str] = []
++    in_single = in_double = escape = in_comment = False
++    previous = "\n"
+     for ch in text:
++        if in_comment:
++            if ch != "\n":
++                comment.append(ch)
++                continue
++            in_comment = False
++            if keep_comments:
++                current.append("".join(comment).rstrip("\r").rstrip("\\"))
++            comment = []
+         if escape:
+             escape = False
+-        elif ch == "\\":
++            if ch == "\n":  # a continuation joins the word: `a\<newline>#b` is `a#b`
++                current.append(ch)
++                continue
++        elif ch == "\\" and not in_single:
+             escape = True
+         elif ch == "'" and not in_double:
+             in_single = not in_single
+         elif ch == '"' and not in_single:
+             in_double = not in_double
+-        elif ch == "\n" and not in_single and not in_double:
++        elif ch == "#" and not in_single and not in_double and previous in _WORD_BREAKS:
++            in_comment = True
++            comment = [ch]
++            continue
++        elif split and ch == "\n" and not in_single and not in_double:
+             lines.append("".join(current))
+             current = []
++            previous = ch
+             continue
+         current.append(ch)
+-    if current:
++        if not escape:
++            previous = ch
++    if in_comment and keep_comments:
++        current.append("".join(comment))
++    if current or not split:
+         lines.append("".join(current))
+     return lines
++
++
++def strip_shell_comments(text: str) -> str:
++    """*text* with each shell comment removed (its newline kept)."""
++    return _scan(text, split=False, keep_comments=False)[0]
++
++
++def join_line_continuations(text: str) -> str:
++    """*text* with each backslash-newline continuation (and the indentation after it) collapsed
++    to a space, as the regex scans read it. A comment's trailing backslash continues nothing, and
++    a continuation glued to a ``#`` joins the word (``a\\<newline>#b`` is ``a#b``, no comment)."""
++    kept = _scan(text, split=False, keep_comments=True)[0]
++
++    def join(match: re.Match[str]) -> str:
++        glued = match.group().endswith("\n") and kept.startswith("#", match.end())
++        return "" if glued else " "
++
++    return _CONTINUATION.sub(join, kept)
++
++
++def _split_logical_lines(text: str) -> list[str]:
++    """Split on newlines outside quotes (a quoted newline is data, not a separator); honors
++    escapes and drops comments, so a quote in a comment opens nothing."""
++    return _scan(text, split=True, keep_comments=False)
+diff --git a/tests/cron/test_lifecycle_guard_comment_words.py b/tests/cron/test_lifecycle_guard_comment_words.py
+new file mode 100644
+index 0000000000..aefb0bc43e
+--- /dev/null
++++ b/tests/cron/test_lifecycle_guard_comment_words.py
+@@ -0,0 +1,141 @@
++"""A ``#`` starts a comment only at the start of a word (card t_01a1d6e0355ac8cc).
++
++bash reads ``a#b`` as one word, but the guard's shlex tokenizer treated every unquoted ``#`` as a
++comment and dropped the rest of the line: ``echo a#b; bash ./r.sh`` ran the script unread. And
++the logical-line splitter ignored comments, so an apostrophe in one (``echo hi # it's``) opened
++a "quote" that swallowed the next lines into one line, which the tokenizer then cut at that
++comment. Real bash runs each RUN row with a fake ``hermes`` that writes a marker.
++"""
++
++from __future__ import annotations
++
++import subprocess
++
++import pytest
++
++from cron.lifecycle_guard import scan_gateway_lifecycle
++from cron.lifecycle_guard_lines import (
++    _split_logical_lines, join_line_continuations, strip_shell_comments,
++)
++
++RUN = [
++    # A `#` inside a word is text.
++    "echo a#b; bash ./r.sh",
++    "echo a#b && bash ./r.sh",
++    "echo a#b | bash ./r.sh",
++    "x=1#2 bash ./r.sh",
++    "echo a#b c#d; bash -s < ./r.sh",
++    "echo $#; bash ./r.sh",
++    "echo a#b; cat ./r.sh | bash",
++    "echo a#b; hermes gateway \"restart\"",
++    "echo a#b; hermes gateway re\"start\"",
++    "echo a#b 2>/dev/null; bash ./r.sh",
++    # A quote inside a comment is text: the next line is its own command.
++    "echo hi # it's\nbash -s -<./r.sh",
++    "echo # it's\nbash<./r.sh",
++    "true # it's\nbash ./r.sh 2>&1",
++    "echo hi # it's\nbash ./r.sh",
++    "echo hi #it's\nbash ./r.sh",
++    "echo hi;# it's\nbash ./r.sh",
++    "# it's\nbash ./r.sh",
++    "echo hi # say \"x\nbash ./r.sh",
++    "echo hi # it's\necho ok\nbash ./r.sh",
++    "echo a#b # it's\nbash ./r.sh",
++    # A single-quoted backslash escapes nothing: the quote closes and the next line runs.
++    "echo 'a\\'\nbash ./r.sh",
++    # A comment ends at its newline even after a backslash; a continuation glued to `#` joins
++    # the word (`a\<newline>#b` is `a#b`).
++    "echo hi # x \\\nbash ./r.sh",
++    "true # x \\\nhermes gateway \"restart\"",
++    "grep x /dev/null # x \\\nhermes gateway \"restart\"",
++    "echo a\\\n#b; bash ./r.sh",
++    "grep x /dev/null a\\\n#b; hermes gateway \"restart\"",
++]
++ALLOWED = [
++    "echo a#b; python3 ./clean.py",
++    "x=1#2 python3 ./clean.py",
++    "echo hi # it's\npython3 ./clean.py",
++    "echo # it's\npython3<./clean.py",
++    # A word-start `#` still comments out the rest of its line.
++    "echo a#b # bash ./r.sh",
++    "echo hi # it's bash ./r.sh",
++    "echo hi;# bash ./r.sh",
++    "echo hi # x\n# bash ./r.sh",
++    # A quoted or escaped `#` is text, and so is what follows it.
++    "echo 'a # b'; python3 ./clean.py",
++    "echo \\#a; python3 ./clean.py",
++    "echo a \\\n#b; bash ./r.sh",
++]
++
++
++def _tree(tmp_path):
++    (tmp_path / "r.sh").write_text('hermes gateway "restart"\n')
++    (tmp_path / "clean.py").write_text("print(1)\n")
++    (tmp_path / "bin").mkdir()
++    tool = tmp_path / "bin" / "hermes"
++    tool.write_text('#!/bin/sh\nprintf called > "$MARKER"\n')
++    tool.chmod(0o755)
++
++
++def _bash_runs(tmp_path, command: str) -> bool:
++    marker = tmp_path / "marker"
++    marker.unlink(missing_ok=True)
++    subprocess.run(["/bin/bash"], input=command + "\n", text=True, capture_output=True,
++                   timeout=20, check=False, cwd=tmp_path,
++                   env={"PATH": f"{tmp_path / 'bin'}:/usr/bin:/bin", "MARKER": str(marker),
++                        "HOME": str(tmp_path)})
++    return marker.exists()
++
++
++@pytest.mark.parametrize("command", RUN)
++def test_command_after_a_mid_word_hash_or_quoted_comment_is_refused(tmp_path, command):
++    _tree(tmp_path)
++    assert _bash_runs(tmp_path, command), "bash must run the restart, or the row proves nothing"
++    assert scan_gateway_lifecycle(command, cwd=str(tmp_path))[0] is True
++
++
++@pytest.mark.parametrize("command", ALLOWED)
++def test_clean_twins_and_real_comments_stay_allowed(tmp_path, command):
++    _tree(tmp_path)
++    assert not _bash_runs(tmp_path, command)
++    assert scan_gateway_lifecycle(command, cwd=str(tmp_path)) == (False, None)
++
++
++@pytest.mark.parametrize(("text", "lines"), [
++    ("echo hi # it's\nbash x", ["echo hi ", "bash x"]),
++    ("echo a#b; c", ["echo a#b; c"]),
++    ("echo 'a\n#b'\nc", ["echo 'a\n#b'", "c"]),
++    ("echo \"it's # x\"\nc", ["echo \"it's # x\"", "c"]),
++    ("echo \\#'\nc'", ["echo \\#'\nc'"]),
++    ("a;#'\nb", ["a;", "b"]),
++    ("a|#'\nb", ["a|", "b"]),
++    ("x=#'\nb'", ["x=#'\nb'"]),
++])
++def test_split_logical_lines_skips_comments(text, lines):
++    assert _split_logical_lines(text) == lines
++
++
++@pytest.mark.parametrize(("line", "stripped"), [
++    ("echo a#b; c", "echo a#b; c"),
++    ("echo a # b; c", "echo a "),
++    ("echo a;#b\nc", "echo a;\nc"),
++    ("echo >#x", "echo >"),
++    ("echo '#' \"#\" \\# ${#x} $# x#", "echo '#' \"#\" \\# ${#x} $# x#"),
++    ("#all", ""),
++    ("  # x 'y\nz", "  \nz"),
++])
++def test_strip_shell_comments_only_at_word_start(line, stripped):
++    assert strip_shell_comments(line) == stripped
++
++
++@pytest.mark.parametrize(("text", "joined"), [
++    ("a \\\n  b", "a  b"),
++    ("a # x \\\nb", "a # x \nb"),
++    ("a # x \\\\\nb", "a # x \nb"),
++    ("a\\\n#b", "a#b"),
++    ("a \\\n#b", "a #b"),
++    ("a\\\n  #b", "a #b"),
++    ("echo '#' \\\nb", "echo '#'  b"),
++])
++def test_join_line_continuations_ends_comments_at_their_newline(text, joined):
++    assert join_line_continuations(text) == joined
+-- 
+2.43.0
+

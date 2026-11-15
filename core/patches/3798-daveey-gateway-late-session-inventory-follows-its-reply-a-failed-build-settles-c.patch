@@ -1,0 +1,528 @@
+From 3fde9a904610ee3cbb332568a30aa19a840da12c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 18:50:04 +0000
+Subject: [PATCH] [daveey] gateway: late session inventory follows its reply, a
+ failed build settles, classic CLI prints its notices
+
+Follow-up to PR #2198 (review 5891116059, three non-blocking points).
+
+1. Ordering. A build finishing while a pending create/resume reply was still being assembled
+   (the transcript read) published session.info before the reply: Ink dropped it on create (sid
+   unknown yet) and a resume reply's pending shape overwrote the merged inventory (banner stuck at
+   "..."). AuthorityConnection.dispatch now runs handlers under reply_scoped(): a reply that
+   carried inventory_pending takes a hold on the shared build, released with loop.call_soon after
+   the handler returns. The transport queues the reply in that same pass (write_async takes its
+   send lock at once or waits in its FIFO), so the late session.info is always behind it.
+2. Failure. A build failing inside the budget answered pending with nothing ever published; one
+   failing after it only logged. Now the in-budget reply carries the settled empty shape
+   (inventory_pending: false, empty sections), and a failure after a pending reply publishes that
+   shape as session.info.
+3. Classic CLI. While pending, unknown_toolsets and tool_availability_warnings never printed (only
+   from the startup reply). SessionState gains info_listeners; _adopt_gateway_toolsets waits for
+   the settled session.info, prints them once and keeps it as the snapshot's banner info.
+   /reload-mcp counts tools from the full session.info RPC, not a resume reply that can be the
+   pending shape (0 tools).
+
+Proof:
+- RED on base 82d31e6c5d: test_late_inventory_reaches_the_viewer_only_after_the_reply (info
+  before 'reply'), test_a_build_failing_after_the_budget_publishes_a_settled_empty_inventory
+  (no frame), test_a_build_failing_inside_the_budget_answers_settled_not_pending (pending True),
+  test_late_inventory_prints_the_startup_notices_once (nothing printed),
+  test_reload_mcp_runs_on_the_gateway (session.resume, 0 tools).
+- GREEN: those plus 255 test files / 2022 tests importing the touched modules
+  (session_local_inventory, session_controls/AuthorityConnection, gateway_connection,
+  cli_init_mixin); scripts/check ruff ok.
+---
+ gateway/session_controls.py                   |  4 +-
+ gateway/session_local_inventory.py            | 93 +++++++++++++++----
+ hermes_cli/cli_info_mixin.py                  |  8 +-
+ hermes_cli/cli_init_mixin.py                  | 36 ++++++-
+ hermes_cli/gateway_connection.py              |  6 ++
+ .../test_session_create_inventory_budget.py   | 79 ++++++++++++++++
+ .../test_cli_gateway_inventory_pending.py     | 81 ++++++++++++++++
+ tests/hermes_cli/test_gateway_reload_mcp.py   | 10 +-
+ 8 files changed, 291 insertions(+), 26 deletions(-)
+ create mode 100644 tests/hermes_cli/test_cli_gateway_inventory_pending.py
+
+diff --git a/gateway/session_controls.py b/gateway/session_controls.py
+index b95c30a4d8..eb5423423b 100644
+--- a/gateway/session_controls.py
++++ b/gateway/session_controls.py
+@@ -369,6 +369,7 @@ class AuthorityConnection:
+             from gateway.session_authorities import async_owner_scope
+             from gateway.session_connections import METHODS as CONNECTION_METHODS, session_owned
+             from gateway.session_plugin_rpc import call_plugin_rpc, resolve_plugin_rpc
++            from gateway.session_local_inventory import reply_scoped
+             async with async_owner_scope(self.authority):
+                 if method in GROUP_METHODS or method == 'profiles.list':
+                     with _method_work_scope(method):
+@@ -385,8 +386,9 @@ class AuthorityConnection:
+                         'code': -32601, 'message': unknown_method_message(method),
+                         'data': {'reason': 'unknown_method'}}}
+                 else:
++                    # A late banner inventory this reply promised publishes after it (``reply_scoped``).
+                     with _method_work_scope(method):
+-                        result = await handlers[method](ref, params)
++                        result = await reply_scoped(handlers[method](ref, params))
+                     if isinstance(result, DeferredReply):  # answered off the serial dispatch
+                         check_params_accepted(contract, original_params)
+                         return result.start(self, rid, partial(check_result, contract))
+diff --git a/gateway/session_local_inventory.py b/gateway/session_local_inventory.py
+index 72a9d30ce3..41d0175ad3 100644
+--- a/gateway/session_local_inventory.py
++++ b/gateway/session_local_inventory.py
+@@ -13,6 +13,7 @@ from __future__ import annotations
+ 
+ import asyncio
+ import contextlib
++import contextvars
+ import logging
+ from types import SimpleNamespace
+ 
+@@ -227,11 +228,42 @@ REPLY_INVENTORY_BUDGET_S = 2.0
+ # tool``): their reply skips the inventory outright, so a loaded gateway spends nothing on it.
+ NO_BANNER_SOURCES = frozenset({'oneshot', 'tool'})
+ _pending: dict = {}  # (authority id, session id) -> in-flight inventory task, shared by concurrent opens
++# The RPC reply being built on this task (:func:`reply_scoped`): the pending inventories it promised.
++_REPLY_HOLDS: contextvars.ContextVar = contextvars.ContextVar('session_inventory_reply_holds', default=None)
++
++
++def _empty_inventory():
++    return {'tools': {}, 'skills': {}, 'mcp_servers': []}
+ 
+ 
+ def _pending_shape(info):
+     """The reply before the inventory is known: main's lazy create shape (``tools: {}``)."""
+-    return {'tools': {}, 'skills': {}, 'mcp_servers': [], **info, 'inventory_pending': True}
++    return {**_empty_inventory(), **info, 'inventory_pending': True}
++
++
++def _failed_shape(info):
++    """A build that failed: the empty sections, settled (``inventory_pending: false``), so no viewer
++    waits on a ``session.info`` that will never come (the banner shows main's empty inventory)."""
++    return {**_compose(info, _empty_inventory(), None), 'inventory_pending': False}
++
++
++async def reply_scoped(call):
++    """Await one RPC handler (*call*); a late inventory its reply promised (``inventory_pending``)
++    publishes only after that reply. The release runs on a later loop pass than the handler's
++    return, and the transport queues the reply in the same pass it gets it (``WSTransport.write_async``
++    takes its send lock at once or waits in its FIFO), so the ``session.info`` can never reach the
++    client first: on create it would name a session the client does not know yet, and on resume the
++    reply's pending shape would overwrite the merged inventory (the banner stuck at "…")."""
++    holds: list = []
++    token = _REPLY_HOLDS.set(holds)
++    try:
++        return await call
++    finally:
++        _REPLY_HOLDS.reset(token)
++        if holds:
++            loop = asyncio.get_running_loop()
++            for hold in holds:
++                loop.call_soon(_release, *hold)
+ 
+ 
+ async def reply_info(authority, ref, *, budget=None):
+@@ -239,9 +271,10 @@ async def reply_info(authority, ref, *, budget=None):
+ 
+     A no-banner source gets the pending shape at once and nothing is computed. Otherwise, when the
+     inventory is not ready within the budget, the reply gets the pending shape and the inventory
+-    keeps building; when it finishes, the session publishes the full info as ``session.info``
+-    (fresh ``local_session_info`` merged at publish time, so a turn started meanwhile is not
+-    reported idle). Concurrent opens of one session share one build."""
++    keeps building; when it finishes (and the pending reply is out, :func:`reply_scoped`), the
++    session publishes the full info as ``session.info`` (fresh ``local_session_info`` merged at
++    publish time, so a turn started meanwhile is not reported idle), or the empty settled shape when
++    the build failed. Concurrent opens of one session share one build."""
+     from gateway.session_local import local_session_info
+     from gateway.session_policy import policy_for_source
+     info = local_session_info(authority, ref)
+@@ -252,38 +285,62 @@ async def reply_info(authority, ref, *, budget=None):
+     entry = _pending.get(key)
+     if entry is None:
+         entry = _pending[key] = SimpleNamespace(
+-            task=asyncio.ensure_future(_inventory_parts(authority, ref, info.get("cwd"))), deferred=False)
++            task=asyncio.ensure_future(_inventory_parts(authority, ref, info.get("cwd"))), deferred=False,
++            holds=0, published=False)
+         entry.task.add_done_callback(lambda task: _settle(authority, ref, key, entry))
+-    task, carried = entry.task, False
++    task, answered = entry.task, False
+     try:
+         await asyncio.wait({task}, timeout=REPLY_INVENTORY_BUDGET_S if budget is None else budget)
+         # ``done()``, not the wait's done set: a build that finished in the timeout's own loop pass
+         # has not run ``_settle`` yet (done callbacks run on a later pass), so this reply carries it.
+-        if task.done() and not task.cancelled() and task.exception() is None:
+-            carried = True
+-            return _compose(info, *task.result())
++        if task.done():
++            answered = True
++            if not task.cancelled() and task.exception() is None:
++                return _compose(info, *task.result())
++            logger.warning("session inventory failed for %s", ref.session_id,
++                           exc_info=None if task.cancelled() else task.exception())
++            return _failed_shape(info)
++        if (holds := _REPLY_HOLDS.get()) is not None:
++            entry.holds += 1
++            holds.append((authority, ref, key, entry))
+     finally:
+-        if not carried and not task.done():
++        if not answered:
+             entry.deferred = True  # some viewer got the pending shape: publish when it finishes
+-    if task.done() and not task.cancelled():
+-        logger.warning("session inventory failed for %s", ref.session_id, exc_info=task.exception())
+     return _pending_shape(info)
+ 
+ 
+ def _settle(authority, ref, key, entry):
+-    """Publish a late inventory to the session's viewers when some reply went out without it."""
++    """The build finished: publish it now unless a pending reply is still on its way out."""
++    if not entry.holds:
++        _publish(authority, ref, key, entry)
++
++
++def _release(authority, ref, key, entry):
++    """A pending reply is out (:func:`reply_scoped`): publish a build that finished meanwhile."""
++    entry.holds -= 1
++    if not entry.holds and entry.task.done():
++        _publish(authority, ref, key, entry)
++
++
++def _publish(authority, ref, key, entry):
++    """Publish a late inventory to the session's viewers when some reply went out without it; a
++    failed build publishes the settled empty shape, so no viewer stays pending."""
++    if entry.published:
++        return
++    entry.published = True
+     if _pending.get(key) is entry:
+         del _pending[key]
+     task = entry.task
+-    if task.cancelled() or not entry.deferred:
+-        return
+-    if (error := task.exception()) is not None:
+-        logger.warning("session inventory failed for %s", ref.session_id, exc_info=error)
++    if not entry.deferred:
+         return
++    failed = task.cancelled() or task.exception() is not None
++    if failed and not task.cancelled():
++        logger.warning("session inventory failed for %s", ref.session_id, exc_info=task.exception())
+     try:
+         from gateway.session_local import local_session_info
+         live = authority.sessions[ref.session_id]
+-        payload = {**_compose(local_session_info(authority, ref), *task.result()), 'inventory_pending': False}
++        info = local_session_info(authority, ref)
++        payload = _failed_shape(info) if failed else {**_compose(info, *task.result()), 'inventory_pending': False}
+         live.event_stream.publish(ref.session_id, payload, event_type='session.info')
+     except Exception:  # health: allow BLE001 -- a closed session or a failed publish leaves the lazy banner
+         logger.debug("late session inventory publish failed for %s", ref.session_id, exc_info=True)
+diff --git a/hermes_cli/cli_info_mixin.py b/hermes_cli/cli_info_mixin.py
+index 13782aa871..697bd6833a 100644
+--- a/hermes_cli/cli_info_mixin.py
++++ b/hermes_cli/cli_info_mixin.py
+@@ -932,19 +932,19 @@ class CLIInfoMixin:
+     def _reload_gateway_mcp(self, connection):
+         """``/reload-mcp`` on the shared gateway: the gateway owns the MCP servers and the session's
+         agent, so it reconciles them with config and refreshes its agents (``reload.mcp``); main's
+-        "Agent updated" line then counts the tools the gateway session now loads."""
++        "Agent updated" line then counts the tools the gateway session now loads, read with the full
++        ``session.info`` (a resume reply on a loaded gateway can be the pending shape: 0 tools)."""
+         from hermes_cli.gateway_client import GatewayClientError
+         if not self._command_running:
+             print(t("cli.reload_mcp.reloading"))
+         try:
+             result = connection.call("reload.mcp", session_id=self.session_id, confirm=True)
+-            snapshot = connection.call("session.resume", session_id=self.session_id) or {}
++            info = connection.call("session.info", session_id=self.session_id) or {}
+         except GatewayClientError as e:
+             print(f"  {t('gateway.reload_mcp.failed', error=str(e))}")
+             return
+         print(f"  {result.get('message') or ''}".rstrip())
+-        connection.state(self.session_id).adopt_snapshot(snapshot)
+-        info = snapshot.get("info") or {}
++        connection.state(self.session_id).apply_event("session.info", info)
+         count = info.get("tool_count")
+         if not isinstance(count, int):
+             count = sum(len(names or []) for names in (info.get("tools") or {}).values())
+diff --git a/hermes_cli/cli_init_mixin.py b/hermes_cli/cli_init_mixin.py
+index e5a98a4eba..341284b3f1 100644
+--- a/hermes_cli/cli_init_mixin.py
++++ b/hermes_cli/cli_init_mixin.py
+@@ -28,14 +28,46 @@ _ROUTE_FLAGS = ("model", "provider", "api_key", "base_url")
+ def _adopt_gateway_toolsets(cli, store):
+     """The profile default the gateway resolved for the opened session, when this process has no list to
+     show (display only), and main's "Unknown toolsets" warning as the gateway judged it against its own
+-    plugins."""
+-    info = (store.current or {}).get("info") or {}
++    plugins. A loaded gateway may answer before its inventory is built (``inventory_pending``): these,
++    and the tool availability warnings the banner had no inventory for, then print when it arrives."""
++    snapshot = store.current or {}
++    info = snapshot.get("info") or {}
++    if info.get("inventory_pending"):
++        _await_gateway_inventory(cli, store, snapshot)
++        return
++    _adopt_inventory(cli, info)
++
++
++def _adopt_inventory(cli, info, *, warnings=False):
+     if getattr(cli, "enabled_toolsets", None) is None and isinstance(info.get("enabled_toolsets"), list):
+         cli.enabled_toolsets = list(info["enabled_toolsets"])
+     if info.get("unknown_toolsets"):
+         from agent.i18n import t as _t
+         names = ", ".join(info["unknown_toolsets"])
+         cli._console_print(f"[bold red]{_t('cli.startup.unknown_toolsets', names=names)}[/]")
++    lines = info.get("tool_availability_warnings") if warnings else None
++    if isinstance(lines, list) and lines:  # main's ``_show_tool_availability_warnings`` (the banner's own path)
++        cli._console_print("")
++        for line in lines:
++            cli._console_print(line)
++
++
++def _await_gateway_inventory(cli, store, snapshot):
++    """Print the startup notices once the late ``session.info`` (``inventory_pending: false``) settles the
++    pending reply, and keep it as the snapshot's banner info. Registered before the check, so a frame the
++    pump applied before this runs is not missed; printed once."""
++    state = store.connection.state(snapshot["stored_session_id"])
++    printed = threading.Lock()
++
++    def settled(payload):
++        if payload.get("inventory_pending") is not False or not printed.acquire(blocking=False):
++            return
++        state.info_listeners.remove(settled)  # appended before the first call; the lock runs this once
++        if store.current is snapshot:
++            snapshot["info"] = {**(snapshot.get("info") or {}), **payload}
++        _adopt_inventory(cli, payload, warnings=True)
++    state.info_listeners.append(settled)
++    settled(dict(state.info))
+ 
+ 
+ def _gateway_launch(cli):
+diff --git a/hermes_cli/gateway_connection.py b/hermes_cli/gateway_connection.py
+index fe3a5c1cf1..54817d7134 100644
+--- a/hermes_cli/gateway_connection.py
++++ b/hermes_cli/gateway_connection.py
+@@ -74,6 +74,9 @@ class SessionState:
+         # Called (loop thread) with each ``session.usage`` payload; GatewayAgent maps it onto main's
+         # agent attributes, so a frame landing between turns is never dropped with the turn queue.
+         self.usage_listeners: list = []
++        # Called (loop thread) with each ``session.info`` payload after it is merged into ``info``: the
++        # classic CLI prints the gateway's startup notices when a late inventory settles a pending reply.
++        self.info_listeners: list = []
+         # Called (loop thread) with each ``request.cancel`` payload: the agent thread may be parked in a
+         # modal answering that very request (another viewer settled it), so it cannot read the queue.
+         self.request_listeners: list = []
+@@ -130,6 +133,9 @@ class SessionState:
+                 self.pending_seq += 1
+             if payload.get("title"):
+                 self.title = payload["title"]
++            if kind == "session.info":
++                for listener in list(self.info_listeners):
++                    listener(payload)
+         elif kind == "todo.updated" and isinstance(payload, dict):
+             self.todo_state = {"todos": list(payload.get("todos") or []), "revision": payload.get("revision")}
+         elif kind == "session.usage" and isinstance(payload, dict):
+diff --git a/tests/gateway/test_session_create_inventory_budget.py b/tests/gateway/test_session_create_inventory_budget.py
+index 0bdf40d4bf..4d61a28d5a 100644
+--- a/tests/gateway/test_session_create_inventory_budget.py
++++ b/tests/gateway/test_session_create_inventory_budget.py
+@@ -140,3 +140,82 @@ async def test_concurrent_opens_of_one_session_share_one_build(tmp_path, monkeyp
+     await async_wait_until(lambda: frames, what='late session.info published')
+     assert len(frames) == 1 and frames[0]['tools'] == {'terminal': ['terminal']}
+     assert session_local_inventory._pending == {}
++
++
++def _failing_inventory(monkeypatch):
++    """``session_inventory`` that raises once released (a builder bug, a closed profile)."""
++    from gateway import session_local_inventory
++    release = threading.Event()
++
++    def failing(authority, policy, agent, cwd):
++        release.wait(60)
++        raise RuntimeError('inventory builder crashed')
++
++    monkeypatch.setattr(session_local_inventory, 'session_inventory', failing)
++    return release
++
++
++@pytest.mark.asyncio
++async def test_late_inventory_reaches_the_viewer_only_after_the_reply(tmp_path, monkeypatch):
++    """The build can finish while the pending reply is still being assembled (a long chat's
++    transcript read): its ``session.info`` must follow the reply, never precede it. Before it, Ink
++    drops it on create (the session id is not known yet) and a resume reply's pending shape
++    overwrites the merged inventory, so the banner stays at "…"."""
++    gateway = await _gateway(tmp_path, monkeypatch)
++    from gateway import session_controls, session_local_inventory
++    release, calls = _slow_inventory(monkeypatch, hold_s=60)
++    monkeypatch.setattr(session_local_inventory, 'REPLY_INVENTORY_BUDGET_S', 0.05)
++    order, real_transcript = [], session_controls._resume_transcript
++
++    async def transcript_after_the_build(authority, ref, *rest):
++        authority.sessions[ref.session_id].event_stream.observers.add(
++            lambda frame: order.append(frame['params']['payload']) if frame['params']['type'] == 'session.info' else None)
++        release.set()
++        await async_wait_until(lambda: calls and all(entry.task.done() for entry in session_local_inventory._pending.values()),
++                               what='inventory built')
++        for _ in range(5):
++            await asyncio.sleep(0)  # the build's done callbacks run before the reply is returned
++        return await real_transcript(authority, ref, *rest)
++
++    monkeypatch.setattr(session_controls, '_resume_transcript', transcript_after_the_build)
++    created = await gateway.call('session.create', request_id='race', source='tui', cwd=gateway.cwd)
++    order.append('reply')
++    assert created['info']['inventory_pending'] is True
++    await async_wait_until(lambda: len(order) == 2, what='late session.info published')
++    assert order[0] == 'reply', order
++    assert order[1]['inventory_pending'] is False and order[1]['tools'] == {'terminal': ['terminal']}
++    assert session_local_inventory._pending == {}
++
++
++@pytest.mark.asyncio
++async def test_a_build_failing_after_the_budget_publishes_a_settled_empty_inventory(tmp_path, monkeypatch):
++    gateway = await _gateway(tmp_path, monkeypatch)
++    from gateway import session_local_inventory
++    monkeypatch.setattr(session_local_inventory, 'REPLY_INVENTORY_BUDGET_S', 0.05)
++    release = _failing_inventory(monkeypatch)
++    try:
++        created = await gateway.call('session.create', request_id='fails-late', source='tui', cwd=gateway.cwd)
++        assert created['info']['inventory_pending'] is True
++        frames = _info_frames(gateway.authority, created['session_id'])
++    finally:
++        release.set()
++    await async_wait_until(lambda: frames, what='terminal session.info published')
++    assert len(frames) == 1, frames
++    assert frames[0]['inventory_pending'] is False, frames[0]
++    assert frames[0]['tools'] == {} and frames[0]['skills'] == {} and frames[0]['mcp_servers'] == []
++    assert frames[0]['tool_count'] == 0 and frames[0]['source'] == 'tui'
++    assert session_local_inventory._pending == {}
++
++
++@pytest.mark.asyncio
++async def test_a_build_failing_inside_the_budget_answers_settled_not_pending(tmp_path, monkeypatch):
++    gateway = await _gateway(tmp_path, monkeypatch)
++    from gateway import session_local_inventory
++    _failing_inventory(monkeypatch).set()  # fails at once
++    created = await gateway.call('session.create', request_id='fails-fast', source='tui', cwd=gateway.cwd)
++    info = created['info']
++    assert info['inventory_pending'] is False and info['tools'] == {} and info['skills'] == {}, info
++    frames = _info_frames(gateway.authority, created['session_id'])
++    for _ in range(5):
++        await asyncio.sleep(0)
++    assert frames == [] and session_local_inventory._pending == {}
+diff --git a/tests/hermes_cli/test_cli_gateway_inventory_pending.py b/tests/hermes_cli/test_cli_gateway_inventory_pending.py
+new file mode 100644
+index 0000000000..e553e2bc50
+--- /dev/null
++++ b/tests/hermes_cli/test_cli_gateway_inventory_pending.py
+@@ -0,0 +1,81 @@
++"""A loaded gateway answers ``session.create`` before its banner inventory is built
++(``inventory_pending``, gateway/session_local_inventory.reply_info). The classic CLI printed the
++gateway-judged startup lines (``unknown_toolsets``, ``tool_availability_warnings``) only from that
++reply, so under load they never showed: they now print when the late ``session.info`` settles it."""
++from contextlib import asynccontextmanager
++
++import pytest
++
++from hermes_cli.gateway_connection import GatewayConnection
++from hermes_cli.gateway_session_store import GatewaySessionStore
++from tests.hermes_cli.test_cli_profile_toolsets import _launch
++from tests.hermes_cli.test_gateway_session_store import FakeClient
++from tests.waiting import wait_until
++
++LATE = {"inventory_pending": False, "enabled_toolsets": ["terminal"], "unknown_toolsets": ["gone_plugin"],
++        "tool_availability_warnings": ["⚠ web: set FIRECRAWL_API_KEY"], "tools": {"terminal": ["terminal"]},
++        "skills": {}, "mcp_servers": [], "tool_count": 1}
++
++
++@pytest.fixture
++def pending_store():
++    client = FakeClient()
++    real_rpc = client.rpc
++
++    async def rpc(method, *, _timeout=None, **params):
++        reply = await real_rpc(method, **params)
++        if method == "session.create":
++            info = reply["info"]
++            for key in ("enabled_toolsets", "tool_availability"):
++                info.pop(key, None)
++            info.update(tools={}, skills={}, mcp_servers=[], inventory_pending=True)
++        return reply
++    client.rpc = rpc
++
++    @asynccontextmanager
++    async def connect():
++        yield client
++    conn = GatewayConnection(connect=connect)
++    conn.start(5)
++    yield GatewaySessionStore(conn), client
++    conn.close()
++
++
++def _publish(store, client, payload):
++    frame = {"jsonrpc": "2.0", "method": "event",
++             "params": {"type": "session.info", "session_id": "local-new", "payload": payload}}
++    store.connection.loop.call_soon_threadsafe(client.events.put_nowait, frame)
++
++
++def test_late_inventory_prints_the_startup_notices_once(pending_store, monkeypatch):
++    db, client = pending_store
++    host, printed = _launch(monkeypatch, db)
++    assert printed == []  # pending: nothing judged yet, and no full banner of zero tools
++    assert db.banner_inventory() is None
++    _publish(db, client, {"running": True})  # an unrelated session.info (a turn) settles nothing
++    _publish(db, client, dict(LATE))
++    wait_until(lambda: len(printed) >= 3, what="late startup notices printed")
++    assert "gone_plugin" in printed[0], printed
++    assert printed[1:] == ["", "⚠ web: set FIRECRAWL_API_KEY"], printed
++    assert host.enabled_toolsets == ["terminal"]
++    inventory = db.banner_inventory()  # the snapshot now carries the settled inventory
++    assert inventory is not None and inventory["tool_availability_warnings"] == LATE["tool_availability_warnings"]
++    _publish(db, client, dict(LATE))  # a later settled frame (another viewer's open) prints nothing again
++    wait_until(lambda: db.connection.state("local-new").info.get("running") is True, what="frames applied")
++    assert db.connection.state("local-new").info_listeners == []
++    assert len(printed) == 3, printed
++
++
++def test_a_settled_reply_prints_at_once_and_waits_on_nothing(pending_store, monkeypatch):
++    db, client = pending_store
++    real_rpc = client.rpc
++
++    async def settled(method, **params):
++        reply = await real_rpc(method, **params)
++        if method == "session.create":
++            reply["info"].update(LATE)
++        return reply
++    client.rpc = settled
++    _host, printed = _launch(monkeypatch, db)
++    assert len(printed) == 1 and "gone_plugin" in printed[0], printed  # the banner prints the warnings
++    assert db.connection.state("local-new").info_listeners == []
+diff --git a/tests/hermes_cli/test_gateway_reload_mcp.py b/tests/hermes_cli/test_gateway_reload_mcp.py
+index b7d3e17468..b46323f40d 100644
+--- a/tests/hermes_cli/test_gateway_reload_mcp.py
++++ b/tests/hermes_cli/test_gateway_reload_mcp.py
+@@ -16,7 +16,11 @@ class _Client:
+         self.calls.append((method, params))
+         if method == "reload.mcp":
+             return {"status": "reloaded", "message": "MCP servers reconciled (no server changes)"}
+-        return {"revision": 2, "execution_generation": 1, "messages": [], "info": {"tool_count": 20}}
++        if method == "session.info":
++            return {"tool_count": 20, "tools": {"mcp-docs": ["docs_search"]}}
++        # A loaded gateway's resume reply: the pending shape (gateway/session_local_inventory.reply_info).
++        return {"revision": 2, "execution_generation": 1, "messages": [],
++                "info": {"tool_count": 0, "tools": {}, "inventory_pending": True}}
+ 
+ 
+ def test_reload_mcp_runs_on_the_gateway(capsys):
+@@ -32,8 +36,12 @@ def test_reload_mcp_runs_on_the_gateway(capsys):
+     cli._command_running = False
+     try:
+         cli._reload_gateway_mcp(conn)
++        state = conn.state("local-mcp").info
+     finally:
+         conn.close()
+     assert client.calls[0] == ("reload.mcp", {"session_id": "local-mcp", "confirm": True})
++    # The count comes from the full session.info, never a resume reply that can be the pending shape.
++    assert [method for method, _ in client.calls[1:]] == ["session.info"]
+     out = capsys.readouterr().out
+     assert "20 tool(s) available" in out and "MCP reload failed" not in out, out
++    assert state["tools"] == {"mcp-docs": ["docs_search"]}
+-- 
+2.43.0
+

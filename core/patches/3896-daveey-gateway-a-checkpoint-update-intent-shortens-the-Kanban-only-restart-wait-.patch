@@ -1,0 +1,109 @@
+From b433d6c553f96058bf6866ae0f27d952c7ea8593 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 13:23:41 -0800
+Subject: [PATCH] [daveey] gateway: a checkpoint update intent shortens the
+ Kanban-only restart wait from 15 s to 2 s
+
+hermes-hub 2026-11-13: every instant swap sat the full CORE_UPDATE_KANBAN_WAIT_S on a managed card after
+hermes-sync's drainer had already spent its own wait and published a checkpoint intent to apply over it
+(journal 21:06:18 -> 21:06:33 'Kanban-only wait capped at 15s with 1 managed card(s)'), then restarted anyway.
+Under an intent with "checkpoint": true the wait is CORE_UPDATE_CHECKPOINT_KANBAN_WAIT_S (2 s). Any other
+intent (cron_cut only, unreadable, missing, non-boolean) keeps 15 s; human or unknown work beside the card is
+under neither cap. The 75 s drain bound and CHECKPOINT_DRAIN_S are unchanged.
+
+Tests: tests/gateway/test_core_update_kanban_wait.py (7 parametrized cases). Not tested live.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ gateway/run_shutdown_restart_wait.py          | 21 ++++++++++++++++--
+ tests/gateway/test_core_update_kanban_wait.py | 22 +++++++++++++++++++
+ 2 files changed, 41 insertions(+), 2 deletions(-)
+
+diff --git a/gateway/run_shutdown_restart_wait.py b/gateway/run_shutdown_restart_wait.py
+index a715420481..b8a0c8989e 100644
+--- a/gateway/run_shutdown_restart_wait.py
++++ b/gateway/run_shutdown_restart_wait.py
+@@ -22,6 +22,11 @@ from gateway.session_runtime_workers import cron_turn_count, kanban_managed_coun
+ # Only the update's post-grace Kanban wait: human turns retain their normal budget.
+ CORE_UPDATE_KANBAN_WAIT_S = 15.0
+ CORE_UPDATE_KANBAN_STOP_LEASH_S = 40.0  # 15 wait + 40 stop + 5 poll allowance = 60s admission
++# Under a checkpoint intent (``"checkpoint": true``) hermes-sync's instant drainer has already spent its own wait
++# on this work and decided to apply over it: the cards are preserved by the checkpoint and the cron runs are cut.
++# hermes-hub 2026-11-13: every instant swap sat the full 15 s here on a managed card that then restarted anyway
++# (journal 21:06:18 -> 21:06:33). A short settle only; the bounds above stay the upper limit.
++CORE_UPDATE_CHECKPOINT_KANBAN_WAIT_S = 2.0
+ 
+ logger = logging.getLogger("gateway.run")
+ 
+@@ -56,14 +61,15 @@ class GatewayRestartWaitMixin:
+         if kanban + cron <= 0 or self._awaitable_work_count() != kanban + cron:
+             return None, False
+         since = now if since is None else since
+-        expired = now - since >= CORE_UPDATE_KANBAN_WAIT_S
++        wait_s = CORE_UPDATE_CHECKPOINT_KANBAN_WAIT_S if self._intent_is_checkpoint(intent) else CORE_UPDATE_KANBAN_WAIT_S
++        expired = now - since >= wait_s
+         if expired:
+             # The after-turn grace is spent. Do not start another full graceful drain in stop().
+             self._core_update_kanban_cap_spent = True
+             logger.warning(
+                 "Core update %s wait capped at %.0fs with %d managed card(s) and %d cron run(s); "
+                 "proceeding to restart drain (interrupted attempts requeued uncounted)",
+-                "Kanban/cron-only" if cron else "Kanban-only", CORE_UPDATE_KANBAN_WAIT_S, kanban, cron,
++                "Kanban/cron-only" if cron else "Kanban-only", wait_s, kanban, cron,
+             )
+             if cron:
+                 self._log_cut_cron_runs()
+@@ -106,6 +112,17 @@ class GatewayRestartWaitMixin:
+             return isinstance(data, dict) and data.get("cron_cut") is True
+         return False
+ 
++    def _intent_is_checkpoint(self, intent: Optional[Path]) -> bool:
++        """The update intent is a negotiated checkpoint (``"checkpoint": true``): the drainer already waited and
++        applies over the work left. Re-read each poll like ``_intent_cuts_cron``; missing or unreadable is False,
++        which keeps the full wait."""
++        if intent is None:
++            return False
++        with suppress(Exception):
++            data = json.loads(Path(intent).read_text(encoding="utf-8-sig"))
++            return isinstance(data, dict) and data.get("checkpoint") is True
++        return False
++
+     def _log_cut_cron_runs(self) -> None:
+         """One line per cron run the update's restart cuts: job id and start time."""
+         with suppress(Exception):
+diff --git a/tests/gateway/test_core_update_kanban_wait.py b/tests/gateway/test_core_update_kanban_wait.py
+index 23f2f37ed5..cbdaa4337d 100644
+--- a/tests/gateway/test_core_update_kanban_wait.py
++++ b/tests/gateway/test_core_update_kanban_wait.py
+@@ -51,6 +51,28 @@ def test_real_managed_counts_reach_the_short_wait(tmp_path):
+     assert runner._kanban_restart_wait_state(tmp_path / 'intent', 16.0, since) == (None, False)
+ 
+ 
++@pytest.mark.parametrize('body, expires_at', [
++    ('{"checkpoint": true, "cron_cut": true}', 2.0),   # the drainer already waited: short settle
++    ('{"checkpoint": false}', 15.0), ('{"cron_cut": true}', 15.0), ('{"checkpoint": "true"}', 15.0),
++    ('[]', 15.0), ('not json', 15.0), (None, 15.0)])   # anything else keeps the full wait
++def test_checkpoint_intent_shortens_only_the_kanban_wait(tmp_path, body, expires_at):
++    from gateway.session_managed_worker import ManagedWorker
++    runner, _ = make_restart_runner()
++    card = ManagedWorker(SimpleNamespace())
++    card.kanban_card = True
++    runner.session_authority = SimpleNamespace(_managed_workers={'s': card}, sessions={})
++    intent = tmp_path / 'intent'
++    if body is not None:
++        intent.write_text(body)
++    since, expired = runner._kanban_restart_wait_state(intent, 0.0, None)
++    assert (since, expired) == (0.0, False)
++    assert runner._kanban_restart_wait_state(intent, expires_at - 0.1, since) == (0.0, False)
++    assert runner._kanban_restart_wait_state(intent, expires_at, since) == (0.0, True)
++    # Human work beside the card is never under either cap, checkpoint or not.
++    runner.session_authority._managed_workers['human'] = ManagedWorker(SimpleNamespace())
++    assert runner._kanban_restart_wait_state(intent, 60.0, since) == (None, False)
++
++
+ @pytest.mark.asyncio
+ @pytest.mark.parametrize('other', [None, 'chat', 'cron', 'api', 'mutation', 'unclassified'])
+ async def test_core_update_caps_only_kanban_wait(monkeypatch, tmp_path, other):
+-- 
+2.43.0
+

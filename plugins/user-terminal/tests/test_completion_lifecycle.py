@@ -8,6 +8,16 @@ from test_closed_asks import ut
 
 @pytest.mark.requires_core  # tests/conftest.py: hermes_cli.plugins injectors
 def test_reconciler_waits_for_host_then_sweeps_and_stops(monkeypatch):
+    # Unload is terminal for a module scope; do not retire the shared test loader.
+    import importlib.util
+    from pathlib import Path
+    spec = importlib.util.spec_from_file_location('lifecycle_scope', Path(ut.__file__))
+    scope = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(scope)
+    _check_reconciler(monkeypatch, scope)
+
+
+def _check_reconciler(monkeypatch, ut):
     from hermes_cli import plugins
     for key in ('HERMES_KANBAN_TASK', 'HERMES_KANBAN_WORKER_TASK', 'HERMES_MANAGED_WORKER'):
         monkeypatch.delenv(key, raising=False)

@@ -1,0 +1,439 @@
+From 71989984eb5381aed84a41004e88bc402533d115 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 05:13:00 +0000
+Subject: [PATCH] [daveey] Reuse validated shared-blocker inputs within a
+ derivation
+
+Reduce repeated cohort and check-event scans without caching mutable blocker decisions. Scope reuse to synchronous calls; invalidate for writes, aliases, clock and physical identity; bypass transactions and retain fresh post-command fences. RED: real due pass scanned cohort five times rather than once. GREEN: 158 focused blocker tests before two added commit/race regressions; final input file 15 passed. Synthetic input-only replay at 100/1000/5000 rows: 6.67/54.64/282.42ms baseline vs4.18/34.11/168.77ms scoped. Config mocked equally; not whole-reclaim/live proof. G2b remains incomplete pending mutation/scale review, CI, canonical ship and <=0.4% live P1.
+---
+ hermes_cli/kanban_blocker_inputs.py           |  78 ++++++
+ hermes_cli/kanban_shared_blocker_checks.py    |  26 +-
+ hermes_cli/kanban_shared_blocker_fence.py     |   9 +-
+ hermes_cli/kanban_shared_blockers.py          |   2 +
+ .../hermes_cli/test_kanban_blocker_inputs.py  | 223 ++++++++++++++++++
+ 5 files changed, 328 insertions(+), 10 deletions(-)
+ create mode 100644 hermes_cli/kanban_blocker_inputs.py
+ create mode 100644 tests/hermes_cli/test_kanban_blocker_inputs.py
+
+diff --git a/hermes_cli/kanban_blocker_inputs.py b/hermes_cli/kanban_blocker_inputs.py
+new file mode 100644
+index 0000000000..7cbfbed267
+--- /dev/null
++++ b/hermes_cli/kanban_blocker_inputs.py
+@@ -0,0 +1,78 @@
++"""Call-scoped, validated input reuse for shared-blocker derivation.
++
++Never retain derived BlockerState or a transaction across a shell probe. Values
++are privately copied; a caller cannot mutate a later consumer's observations.
++"""
++from __future__ import annotations
++
++from contextvars import ContextVar
++from copy import deepcopy
++from functools import wraps
++from pathlib import Path
++import sqlite3
++from threading import get_ident
++
++_SCOPE: ContextVar[dict | None] = ContextVar('blocker_input_scope', default=None)
++
++
++def input_pass(fn):
++    """Reuse only inside a synchronous derivation, including nested consumers."""
++    @wraps(fn)
++    def scoped(*args, **kwargs):
++        if _SCOPE.get() is not None:
++            return fn(*args, **kwargs)
++        token = _SCOPE.set({})
++        try:
++            return fn(*args, **kwargs)
++        finally:
++            _SCOPE.reset(token)
++    return scoped
++
++
++def _key(conn, now):
++    if conn.in_transaction:
++        return None
++    from hermes_cli.config import load_config_readonly
++    from hermes_cli.config_backend import ConfigBackendUnavailable
++
++    try:
++        path = next((r[2] for r in conn.execute('PRAGMA database_list') if r[1] == 'main'), '')
++        files = []
++        if path:
++            for name in (path, path + '-shm'):
++                try:
++                    st = Path(name).stat()
++                    files.append((st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size))
++                except FileNotFoundError:
++                    files.append(None)
++        version = conn.execute('PRAGMA data_version').fetchone()[0]
++        schema = conn.execute('PRAGMA schema_version').fetchone()[0]
++        aliases = (load_config_readonly().get('kanban') or {}).get('shared_blocker_aliases', {})
++        return (conn, conn.total_changes, version, schema, tuple(files), now, deepcopy(aliases))
++    except (sqlite3.Error, OSError, ConfigBackendUnavailable):
++        return None
++
++
++def read(name, conn, now, compute):
++    """Bracket inputs with their commit/config identity; unknown means uncached.
++
++    Transactions (including savepoints) always bypass. total_changes catches
++    same-connection writes even after rollback; data_version catches peers.
++    Scope exit drops all retained handles and observations.
++    """
++    scope = _SCOPE.get()
++    if scope is None:
++        return compute()
++    key = _key(conn, now)
++    if key is None:
++        scope.clear()
++        return compute()
++    slot = (get_ident(), conn, name)
++    held = scope.get(slot)
++    if held is not None and held[0] == key:
++        return deepcopy(held[1])
++    scope.pop(slot, None)
++    value = compute()
++    if _key(conn, now) == key:
++        scope[slot] = (key, deepcopy(value))
++    return value
+diff --git a/hermes_cli/kanban_shared_blocker_checks.py b/hermes_cli/kanban_shared_blocker_checks.py
+index 29923df0a6..fd9b9ab439 100644
+--- a/hermes_cli/kanban_shared_blocker_checks.py
++++ b/hermes_cli/kanban_shared_blocker_checks.py
+@@ -12,6 +12,8 @@ import shlex
+ import subprocess
+ import time
+ 
++from hermes_cli.kanban_blocker_inputs import input_pass, read
++
+ logger = logging.getLogger(__name__)
+ CHECK_EVENT = "shared_blocker_check"
+ # Raced/discarded runs: cadence only, never evidence (not read by apply_check_clears or the fence).
+@@ -55,6 +57,11 @@ def _lookback(now) -> int:
+ 
+ 
+ def _assertion_tokens(conn, now=None) -> dict[str, str]:
++    ts = int(time.time()) if now is None else int(now)
++    return read('tokens', conn, ts, lambda: _read_assertion_tokens(conn, ts))
++
++
++def _read_assertion_tokens(conn, now=None) -> dict[str, str]:
+     """Portable fingerprint of the latest assertion timestamp's complete cohort.
+ 
+     Synced run UIDs survive integer-id remapping and same-second runs. Sorting
+@@ -130,15 +137,25 @@ def _result_key(payload, token) -> tuple:
+             json.dumps(payload, sort_keys=True, ensure_ascii=True))
+ 
+ 
+-def _latest_results(conn, now=None) -> dict[str, dict]:
++def _check_payloads(conn, now):
+     from hermes_cli import kanban_db as kb
++
++    now = int(time.time()) if now is None else int(now)
++
++    def load():
++        return [kb._json_dict(row['payload']) for row in conn.execute(
++            'SELECT payload FROM task_events WHERE kind=? AND created_at >= ? ORDER BY id',
++            (CHECK_EVENT, _lookback(now)))]
++
++    return read('checks', conn, now, load)
++
++
++def _latest_results(conn, now=None) -> dict[str, dict]:
+     from hermes_cli.kanban_shared_blockers import normalize_blocker_id
+ 
+     results = {}
+     tokens = _assertion_tokens(conn, now)
+-    for row in conn.execute("SELECT payload FROM task_events WHERE kind=? AND created_at >= ? ORDER BY id",
+-                            (CHECK_EVENT, _lookback(now))):
+-        payload = kb._json_dict(row["payload"])
++    for payload in _check_payloads(conn, now):
+         bid = normalize_blocker_id(payload.get("blocker_id"))
+         token = tokens.get(bid)
+         if bid and (bid not in results or _result_key(payload, token) > _result_key(results[bid], token)):
+@@ -186,6 +203,7 @@ def _run_check(command: str) -> tuple[object, str]:
+         return "timeout", output[-OUTPUT_TAIL_CHARS:].strip()
+ 
+ 
++@input_pass
+ def run_due_checks(conn, *, cfg=None, now=None, due_out=None) -> list[str]:
+     """Check each open registered wall on its home, even with a worker probe in flight.
+ 
+diff --git a/hermes_cli/kanban_shared_blocker_fence.py b/hermes_cli/kanban_shared_blocker_fence.py
+index a1b3f527dc..f97a1473d9 100644
+--- a/hermes_cli/kanban_shared_blocker_fence.py
++++ b/hermes_cli/kanban_shared_blocker_fence.py
+@@ -6,15 +6,12 @@ import uuid
+ 
+ def _winning_checks(conn, bid, now):
+     """Historical recovery survives new cohorts, but losing tied results do not."""
+-    from hermes_cli import kanban_db as kb
+-    from hermes_cli.kanban_shared_blockers import _LOOKBACK_SECONDS, normalize_blocker_id
+-    from hermes_cli.kanban_shared_blocker_checks import CHECK_EVENT, _assertion_tokens, _checked, _result_key
++    from hermes_cli.kanban_shared_blockers import normalize_blocker_id
++    from hermes_cli.kanban_shared_blocker_checks import _check_payloads, _assertion_tokens, _checked, _result_key
+ 
+     token = _assertion_tokens(conn, now).get(bid)
+     winners = {}
+-    for row in conn.execute('SELECT payload FROM task_events WHERE kind=? AND created_at>=?',
+-                            (CHECK_EVENT, now - _LOOKBACK_SECONDS)):
+-        payload = kb._json_dict(row['payload'])
++    for payload in _check_payloads(conn, now):
+         checked = _checked(payload)
+         if normalize_blocker_id(payload.get('blocker_id')) != bid or checked > now:
+             continue
+diff --git a/hermes_cli/kanban_shared_blockers.py b/hermes_cli/kanban_shared_blockers.py
+index 1f2b2106c1..9820dfd2ed 100644
+--- a/hermes_cli/kanban_shared_blockers.py
++++ b/hermes_cli/kanban_shared_blockers.py
+@@ -63,6 +63,7 @@ import re
+ import sqlite3
+ import time
+ from dataclasses import dataclass, field
++from hermes_cli.kanban_blocker_inputs import input_pass
+ from typing import Optional
+ 
+ logger = logging.getLogger(__name__)
+@@ -316,6 +317,7 @@ def _note_window_exit(out: Optional[list], asserting) -> None:
+         out.append(min(kb._to_epoch(r["ended_at"]) or 0 for r in asserting) + _LOOKBACK_SECONDS + 1)
+ 
+ 
++@input_pass
+ def blocker_states(conn: sqlite3.Connection, *, now: Optional[int] = None,
+                    oldest_out: Optional[list] = None) -> dict[str, BlockerState]:
+     """Derive every recently asserted blocker's state from ``task_runs`` (read-only).
+diff --git a/tests/hermes_cli/test_kanban_blocker_inputs.py b/tests/hermes_cli/test_kanban_blocker_inputs.py
+new file mode 100644
+index 0000000000..32e09f2404
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_blocker_inputs.py
+@@ -0,0 +1,223 @@
++"""Scoped shared-blocker inputs preserve fresh observations and avoid repeats."""
++import pytest
++
++from hermes_cli import kanban_blocker_inputs as inputs
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_shared_blocker_fence as fence
++from hermes_cli import kanban_shared_blocker_checks as checks
++from hermes_cli import kanban_shared_blockers as blockers
++from tests.hermes_cli import test_kanban_shared_blockers as helpers
++
++kanban_home = helpers.kanban_home
++
++
++def test_real_due_pass_reads_assertion_cohort_once(kanban_home):
++    with kbc.connect_closing() as conn:
++        helpers._blocked_behind(conn, 'quota', blocker_id='github-rest-quota')
++        now = blockers.blocker_states(conn)['github-rest-quota'].asserted_at + 1
++        queries = []
++        conn.set_trace_callback(queries.append)
++        checks.run_due_checks(conn, cfg={'kanban': {'shared_blocker_checks': {'github-rest-quota': ''}}}, now=now)
++        cohort = [q for q in queries if 'ORDER BY ended_at, id' in q]
++        assert len(cohort) == 1
++        events = [q for q in queries if "SELECT payload FROM task_events WHERE kind='shared_blocker_check'" in q]
++        assert len(events) == 1
++
++
++@pytest.mark.parametrize('mutation', ['commit', 'rollback', 'savepoint', 'external', 'aliases', 'clock'])
++def test_scope_invalidates_changes(kanban_home, monkeypatch, mutation):
++    from hermes_cli import config
++    with kbc.connect_closing() as conn:
++        conn.execute('CREATE TABLE memo_probe (value INTEGER)')
++        conn.execute('INSERT INTO memo_probe VALUES (1)')
++        conn.commit()
++        cfg = {'kanban': {'shared_blocker_aliases': {}}}
++        monkeypatch.setattr(config, 'load_config_readonly', lambda: cfg)
++        calls = []
++
++        def compute():
++            calls.append(1)
++            return {'rows': [r[0] for r in conn.execute('SELECT value FROM memo_probe')]}
++
++        @inputs.input_pass
++        def exercise():
++            first = inputs.read('probe', conn, 10, compute)
++            first['rows'].append(99)
++            assert inputs.read('probe', conn, 10, compute) == {'rows': [1]}
++            assert len(calls) == 1
++            expected, now = [1], 10
++            if mutation == 'external':
++                with kbc.connect_closing() as peer:
++                    peer.execute('UPDATE memo_probe SET value=2')
++                    peer.commit()
++                expected = [2]
++            elif mutation == 'aliases':
++                cfg['kanban']['shared_blocker_aliases']['old'] = 'new'
++            elif mutation == 'clock':
++                now = 11
++            else:
++                conn.execute('SAVEPOINT sample' if mutation == 'savepoint' else 'BEGIN')
++                conn.execute('UPDATE memo_probe SET value=2')
++                assert inputs.read('probe', conn, 10, compute) == {'rows': [2]}
++                if mutation == 'commit':
++                    conn.commit()
++                    expected = [2]
++                else:
++                    conn.rollback()
++            assert inputs.read('probe', conn, now, compute) == {'rows': expected}
++            assert len(calls) >= 2
++        exercise()
++        before = len(calls)
++        inputs.read('probe', conn, 10, compute)
++        assert len(calls) == before + 1
++
++
++def test_clock_boundary_and_payload_mutation(kanban_home, monkeypatch):
++    clock = [1800000000]
++    monkeypatch.setattr(checks.time, 'time', lambda: clock[0])
++    with kbc.connect_closing() as conn:
++        tid = helpers._blocked_behind(conn, 'wall', blocker_id='github-rest-quota')
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, checks.CHECK_EVENT, {'blocker_id': 'github-rest-quota', 'active_runs': ['a']})
++            conn.execute('UPDATE task_events SET created_at=? WHERE kind=?',
++                         (clock[0] - blockers._LOOKBACK_SECONDS, checks.CHECK_EVENT))
++
++        @inputs.input_pass
++        def exercise():
++            payloads = checks._check_payloads(conn, None)
++            assert len(payloads) == 1
++            payloads[0]['active_runs'].append('mutated')
++            assert checks._check_payloads(conn, None)[0]['active_runs'] == ['a']
++            clock[0] += 1
++            assert checks._check_payloads(conn, None) == []
++        exercise()
++
++
++def test_latest_and_historical_winners_stay_distinct(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid = helpers._blocked_behind(conn, 'wall', blocker_id='github-rest-quota')
++        now = blockers.blocker_states(conn)['github-rest-quota'].asserted_at + 10
++        token = checks._assertion_tokens(conn, now)['github-rest-quota']
++        with kb.write_txn(conn):
++            for checked, rc in [(now - 2, 0), (now - 1, 0), (now - 1, 1), (now + 1, 0)]:
++                kb._append_event(conn, tid, checks.CHECK_EVENT, {
++                    'blocker_id': 'github-rest-quota', 'checked_at': checked, 'rc': rc, 'assertion_id': token})
++
++        def observe():
++            return (checks._latest_results(conn, now), fence._winning_checks(conn, 'github-rest-quota', now))
++        expected = observe()
++        assert expected[0]['github-rest-quota']['checked_at'] == now + 1
++        assert expected[1][now - 1]['rc'] == 1
++        assert expected[1][now - 2]['rc'] == 0
++        assert now + 1 not in expected[1]
++        assert inputs.input_pass(observe)() == expected
++
++
++@pytest.mark.parametrize('peer_write', [False, True])
++def test_probe_reassertion_is_fresh(kanban_home, monkeypatch, peer_write):
++    with kbc.connect_closing() as conn:
++        tid = helpers._blocked_behind(conn, 'wall', blocker_id='test-wall')
++        now = blockers.blocker_states(conn)['test-wall'].asserted_at + 10
++
++        def mutate(target):
++            target.execute('UPDATE task_runs SET ended_at=? WHERE task_id=?', (now, tid))
++            target.commit()
++
++        def command(_):
++            if peer_write:
++                with kbc.connect_closing() as peer:
++                    mutate(peer)
++            else:
++                mutate(conn)
++            return 0, 'recovered'
++
++        monkeypatch.setattr(checks, '_run_check', command)
++        assert checks.run_due_checks(conn, cfg={'kanban': {'shared_blocker_checks': {'test-wall': 'unused'}}}, now=now) == []
++        assert conn.execute('SELECT COUNT(*) FROM task_events WHERE kind=?', (checks.CHECK_EVENT,)).fetchone()[0] == 0
++        assert conn.execute('SELECT COUNT(*) FROM task_events WHERE kind=?', (checks.ATTEMPT_EVENT,)).fetchone()[0] == 1
++
++
++def test_aliases_change_actual_tokens(kanban_home, monkeypatch):
++    from hermes_cli import config
++    cfg = {'kanban': {'shared_blocker_aliases': {}}}
++    monkeypatch.setattr(config, 'load_config_readonly', lambda: cfg)
++    with kbc.connect_closing() as conn:
++        helpers._blocked_behind(conn, 'wall', blocker_id='test-wall')
++
++        @inputs.input_pass
++        def exercise():
++            assert 'test-wall' in checks._assertion_tokens(conn, 2000000000)
++            cfg['kanban']['shared_blocker_aliases']['test-wall'] = 'other-wall'
++            tokens = checks._assertion_tokens(conn, 2000000000)
++            assert 'other-wall' in tokens and 'test-wall' not in tokens
++        # Fix the observation clock to the assertion window, not wall-clock age.
++        conn.execute('UPDATE task_runs SET ended_at=2000000000')
++        conn.commit()
++        exercise()
++
++
++def test_scope_exit_exception_and_nested_reuse(kanban_home):
++    calls = []
++    with kbc.connect_closing() as conn:
++        def compute():
++            calls.append(1)
++            return ['value']
++
++        @inputs.input_pass
++        def nested():
++            return inputs.read('sample', conn, 10, compute)
++
++        @inputs.input_pass
++        def outer():
++            nested()
++            nested()
++            assert len(calls) == 1
++            raise ValueError('stop')
++
++        with pytest.raises(ValueError, match='stop'):
++            outer()
++        nested()
++        assert len(calls) == 2
++
++
++def test_same_connection_commit_without_intermediate_read(kanban_home):
++    with kbc.connect_closing() as conn:
++        conn.execute('CREATE TABLE values_probe (value INTEGER)')
++        conn.execute('INSERT INTO values_probe VALUES (1)')
++        conn.commit()
++        # WAL keeps main/shm stat stable: total_changes must carry this write.
++        def compute():
++            return conn.execute('SELECT value FROM values_probe').fetchone()[0]
++
++        @inputs.input_pass
++        def exercise():
++            assert inputs.read('v', conn, 10, compute) == 1
++            conn.execute('UPDATE values_probe SET value=2')
++            conn.commit()
++            assert inputs.read('v', conn, 10, compute) == 2
++        exercise()
++
++
++def test_mid_read_write_refuses_publication(kanban_home):
++    with kbc.connect_closing() as conn:
++        conn.execute('CREATE TABLE race_probe (value INTEGER)')
++        conn.execute('INSERT INTO race_probe VALUES (1)')
++        conn.commit()
++        calls = []
++
++        def compute():
++            result = conn.execute('SELECT value FROM race_probe').fetchone()[0]
++            if not calls:
++                with kbc.connect_closing() as peer:
++                    peer.execute('UPDATE race_probe SET value=2')
++                    peer.commit()
++            calls.append(1)
++            return result
++
++        @inputs.input_pass
++        def exercise():
++            assert inputs.read('v', conn, 10, compute) == 1
++            assert inputs.read('v', conn, 10, compute) == 2
++            assert len(calls) == 2
++        exercise()
+-- 
+2.43.0
+

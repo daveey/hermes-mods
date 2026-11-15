@@ -1,0 +1,252 @@
+From 96038469ce6e4a42470a68ff9d0809946438dc16 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 17:57:14 +0000
+Subject: [PATCH] [daveey] worker placement: a refused pool repin no longer
+ suppresses the origin repin
+
+Review t_01a1d5dba1ad82b9 of PR #2362 (t_01a1d560c6d3bc3c), follow-up card t_01a1d5edeefa8430.
+
+`kanban_worker_placement` kept one `_selfcheck_refused` entry per card for Board refusals of the stranded-card
+self-check pool repin, and `_repin_target` passed that same entry to
+`kanban_worker_pickup_gate.origin_target` as `refused_at`. A gate-refused enrolled ready card whose pool repin the
+Board refused was then never asked to go home (`--runs-on machine:<origin>`) at that revision: no reserve, one
+capability_mismatch comment, stranded until its revision moved.
+
+Fix: origin-repin refusals get their own map, `_origin_refused`. `_repin_target` returns which map a Board refusal
+of the repin it chose is recorded in (`_remember_refusal(refusals, ...)`), so a refused pool repin still lets the
+origin repin be asked once at that revision, and a refused origin repin still suppresses only origin retries at
+that revision. The persistent/transient status rule is unchanged.
+
+Five whys:
+1. Why did the card stay stranded? origin_target returned "nothing to ask" at its revision.
+2. Why? refused_at matched the revision.
+3. Why? refused_at was the pool self-check's refusal, not an origin refusal.
+4. Why? both repins shared one per-card refusal map.
+5. Why? the origin repin (PR #2362) reused the self-check's map instead of keying its own.
+
+Proof: tests/hermes_cli/test_kanban_worker_origin_repin_refusal.py (stranded card whose wire row has a
+malformed `requires`, so the self-check targets the pool and every pickup gate refuses it).
+RED on main: "the origin repin was never asked at revision 4" (repins after the refused pool repin: []), and the
+refused-origin case asks [pool] only. GREEN: the second tick repins to machine:hub at revision 4, no reserves,
+exactly one capability_mismatch event and gate comment; a refused origin repin is not re-asked at that revision
+(4 ticks: [pool, origin]) and a new revision asks pool then origin once more.
+---
+ hermes_cli/kanban_worker_placement.py         | 46 ++++++----
+ .../test_kanban_pool_deny_runs_on.py          |  2 +
+ ...test_kanban_worker_origin_repin_refusal.py | 88 +++++++++++++++++++
+ 3 files changed, 117 insertions(+), 19 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_worker_origin_repin_refusal.py
+
+diff --git a/hermes_cli/kanban_worker_placement.py b/hermes_cli/kanban_worker_placement.py
+index b1c494b5dd..2e5c3558c1 100644
+--- a/hermes_cli/kanban_worker_placement.py
++++ b/hermes_cli/kanban_worker_placement.py
+@@ -24,6 +24,9 @@ _refused: dict[tuple[str, str], tuple[int, float]] = {}  # (board, task) -> (ref
+ # than re-asking a repin the Board already refused; a new revision asks again. Explicit kanban_move repins never
+ # fall back: a reserve would hand the run's move straight back to the pool.
+ _selfcheck_refused: dict[tuple[str, str], int] = {}
++# Same rule for the pickup gate's origin repin (machine:<origin>), keyed apart: a refused pool repin must still let
++# the origin repin be asked once at that revision (review of PR #2362, t_01a1d5edeefa8430).
++_origin_refused: dict[tuple[str, str], int] = {}
+ _RETRYABLE_4XX = frozenset({408, 425, 429})  # request timeout, too early, rate limited: not the Board's answer
+ # No assigned keepalive exists here. Sixty seconds bounds queue probes while still discovering
+ # registry-only capacity changes without waiting for a task revision. Assigned renewals are unchanged.
+@@ -407,7 +410,7 @@ def reevaluate(conn, hub, board, gateway, *, cfg=None, may_pull=True):
+             key = (board, row["id"])
+             if _backed_off(key, row["sync_version"], now):
+                 continue  # refused not_claimable at this revision: wait for the feed, don't re-ask every tick
+-            labels, why, skip = _repin_target(conn, row, key, gateway, cfg, mode, candidates)
++            labels, why, skip, refusals = _repin_target(conn, row, key, gateway, cfg, mode, candidates)
+             if skip:
+                 continue  # no candidate's pickup gate takes it and no repin may be asked: never reserve
+             stage = "recover" if mode else ("reserve" if labels is None else "repin")
+@@ -448,7 +451,7 @@ def reevaluate(conn, hub, board, gateway, *, cfg=None, may_pull=True):
+                     logger.info("Board recovery endpoint unavailable; backing off for %ss", recovery.RECOVERY_RETRY_S)
+                     continue
+                 fence = None
+-                _remember_selfcheck_refusal(key, row["sync_version"], why, exc)
++                _remember_refusal(refusals, key, row["sync_version"], exc)
+                 if rejection_code(exc) == "not_claimable":
+                     # The Board already has it leased or not ready: our copy is behind. Back off at this revision.
+                     _refused[key] = (row["sync_version"], now + NOT_CLAIMABLE_BACKOFF_S)
+@@ -567,44 +570,49 @@ def _backed_off(key, revision, now):
+ 
+ 
+ def _repin_target(conn, row, key, gateway, cfg, mode, candidates):
+-    """``(labels, why, skip)`` for one selected row: a recovery reserves (``mode`` set); else the self-check's
+-    pool repin, else the origin repin when no candidate's pickup gate takes the card
++    """``(labels, why, skip, refusals)`` for one selected row: a recovery reserves (``mode`` set); else the
++    self-check's pool repin, else the origin repin when no candidate's pickup gate takes the card
+     (:func:`kanban_worker_pickup_gate.origin_target`, t_01a1d560c6d3bc3c), else the reserve ``(None, None)``.
+-    ``skip``: such a card has no repin to ask now; it must not be reserved either."""
++    ``skip``: such a card has no repin to ask now; it must not be reserved either. ``refusals``: the map a Board
++    refusal of this repin is recorded in (:data:`_selfcheck_refused` or :data:`_origin_refused`), None for a run's
++    ``kanban_move`` or a reserve."""
+     from hermes_cli import kanban_worker_pickup_gate as pickup_gate
+ 
+     if mode:
+-        return None, None, False
+-    labels, why = _selfcheck_unrefused(key, row, *_move_target(conn, row, gateway, cfg))
++        return None, None, False, None
++    labels, why = _unrefused(_selfcheck_refused, key, row, *_move_target(conn, row, gateway, cfg))
+     if labels is None and (home := pickup_gate.origin_target(
+-            conn, row, gateway, candidates, refused_at=_selfcheck_refused.get(key))) is not None:
+-        return home[0], home[1], home[0] is None
+-    return labels, why, False
++            conn, row, gateway, candidates, refused_at=_origin_refused.get(key))) is not None:
++        if home[0] is not None:
++            _origin_refused.pop(key, None)  # asked at a new revision: the old refusal no longer holds
++        return home[0], home[1], home[0] is None, _origin_refused
++    return labels, why, False, _selfcheck_refused if why is not None else None
+ 
+ 
+-def _selfcheck_unrefused(key, row, labels, why):
++def _unrefused(refusals, key, row, labels, why):
+     """``(labels, why)``, except a self-check repin (``why`` set) the Board refused at this revision becomes the
+     reserve ``(None, None)``. A new revision clears the refusal so the repin is asked again."""
+     if why is None:
+         return labels, why
+-    if _selfcheck_refused.get(key) == row["sync_version"]:
++    if refusals.get(key) == row["sync_version"]:
+         return None, None
+-    _selfcheck_refused.pop(key, None)
++    refusals.pop(key, None)
+     return labels, why
+ 
+ 
+-def _remember_selfcheck_refusal(key, revision, why, exc):
+-    """Record a Board refusal of a self-check repin (``not_claimable`` is :data:`_refused`'s backoff instead).
++def _remember_refusal(refusals, key, revision, exc):
++    """Record a Board refusal of a self-check or origin repin in ``refusals`` (``not_claimable`` is
++    :data:`_refused`'s backoff instead; None records nothing).
+ 
+     Any 4xx but 408/425/429, coded or not (a Board or proxy without the repin route answers an uncoded 404/405 HTML
+     body every tick), and a 501 are persistent. Other 5xx and 408/425/429 are outages, retried on the next tick."""
+     status = getattr(exc, "status", None)
+     persistent = type(status) is int and (400 <= status <= 499 or status == 501) and status not in _RETRYABLE_4XX
+-    if why is None or not persistent or rejection_code(exc) == "not_claimable":
++    if refusals is None or not persistent or rejection_code(exc) == "not_claimable":
+         return
+-    _selfcheck_refused[key] = revision  # popped by _selfcheck_unrefused first, so this is the newest entry
+-    if len(_selfcheck_refused) > 1024:  # cards that left the query never come back to clear theirs
+-        del _selfcheck_refused[next(iter(_selfcheck_refused))]
++    refusals[key] = revision  # popped before every new ask, so this is the newest entry
++    if len(refusals) > 1024:  # cards that left the query never come back to clear theirs
++        del refusals[next(iter(refusals))]
+ 
+ 
+ def _record_repin(conn, task_id, gateway, labels, reply, *, reason=None):
+diff --git a/tests/hermes_cli/test_kanban_pool_deny_runs_on.py b/tests/hermes_cli/test_kanban_pool_deny_runs_on.py
+index 7dcb693965..78dfd1e541 100644
+--- a/tests/hermes_cli/test_kanban_pool_deny_runs_on.py
++++ b/tests/hermes_cli/test_kanban_pool_deny_runs_on.py
+@@ -165,10 +165,12 @@ def no_pull(monkeypatch):
+     wp._refused.clear()
+     wp._queued.clear()
+     wp._selfcheck_refused.clear()
++    wp._origin_refused.clear()
+     yield
+     wp._refused.clear()
+     wp._queued.clear()
+     wp._selfcheck_refused.clear()
++    wp._origin_refused.clear()
+ 
+ 
+ def _stranded(conn, *, age, requires=("terminal", "file", "git", "hub:write")):
+diff --git a/tests/hermes_cli/test_kanban_worker_origin_repin_refusal.py b/tests/hermes_cli/test_kanban_worker_origin_repin_refusal.py
+new file mode 100644
+index 0000000000..bb30aa7f7a
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_worker_origin_repin_refusal.py
+@@ -0,0 +1,88 @@
++"""A Board-refused self-check pool repin must not suppress the origin repin at that revision. [daveey]
++
++Review t_01a1d5dba1ad82b9 of PR #2362 (t_01a1d560c6d3bc3c): ``kanban_worker_placement`` kept one
++``_selfcheck_refused`` entry per card and passed it to ``kanban_worker_pickup_gate.origin_target`` as ``refused_at``.
++A stranded worker-first card whose self-check pool repin the Board refused, and that every pool worker's pickup gate
++refuses, was then never asked to go home (``--runs-on machine:<origin>``) at that revision: no reserve, one
++``capability_mismatch`` comment, stranded until the revision moved. Entry path: the origin's placement tick
++(``kanban_worker_placement.reevaluate``) on a stranded card whose wire row carries a malformed ``requires`` (the
++self-check reads its access labels; every pickup gate refuses it as invalid).
++"""
++from __future__ import annotations
++
++import json
++
++from hermes_cli import kanban_placement_coordination as coord
++from hermes_cli import kanban_queue_reason as queue
++from hermes_cli import kanban_worker_placement as wp
++from tests.hermes_cli import test_kanban_pool_deny_runs_on as deny
++
++hub = deny.hub
++hub_judge = deny.hub_judge
++no_pull = deny.no_pull
++ORIGIN = [f"machine:{deny.ME}"]
++
++
++class PoolRefusingHub(deny.RecordingHub):
++    """Refuses the self-check's pool repin (403); the origin repin is refused only when ``refuse_origin``."""
++
++    def __init__(self, *, refuse_origin=False):
++        super().__init__()
++        self.refuse_origin = refuse_origin
++
++    def repin(self, board, **body):
++        self.refuse_repin = "forbidden" if body["runs_on"] != ORIGIN or self.refuse_origin else None
++        return super().repin(board, **body)
++
++
++def _gate_refused(conn):
++    """A stranded card (36 min, no runs_on) whose wire row has a malformed ``requires``: the self-check still targets
++    the pool (``hub:write`` -> ``capability:hub-write``), but every pickup gate refuses it as invalid."""
++    tid = deny._stranded(conn, age=36 * 60)
++    conn.execute("UPDATE kanban_sync_state SET applying=1")
++    conn.execute("UPDATE tasks SET requires=? WHERE id=?", (json.dumps(["hub:write", 1]), tid))
++    conn.execute("UPDATE kanban_sync_state SET applying=0")
++    conn.commit()
++    row = dict(conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone())
++    assert coord.claim_refusal(row, deny.WORKER["name"]) == coord.INVALID_REQUIRES
++    return tid
++
++
++def _mismatch_comments(conn, tid):
++    """``(capability_mismatch events, pickup-gate comments)``. Each Board refusal also notes "Board observation
++    failed"; only the gate's comment must stay single."""
++    events = [json.loads(p) for (p,) in conn.execute(
++        "SELECT payload FROM task_events WHERE task_id=? AND kind=?", (tid, queue.EVENT))]
++    comments = conn.execute(
++        "SELECT body FROM task_comments WHERE task_id=? AND author='worker-placement'", (tid,)).fetchall()
++    return (len([e for e in events if e.get("code") == "capability_mismatch"]),
++            len([c for (c,) in comments if c.startswith("No pool worker can claim this card")]))
++
++
++def test_a_refused_pool_repin_still_sends_a_gate_refused_card_to_its_origin(hub, no_pull):
++    _home, conn = hub
++    tid = _gate_refused(conn)
++    board = PoolRefusingHub()
++    for _ in range(2):
++        wp.reevaluate(conn, board, deny.BOARD, deny.ME, cfg=deny.CFG)
++    assert board.repins[0]["runs_on"][0] == "pool:worker"
++    assert [r["runs_on"] for r in board.repins[1:]] == [ORIGIN], "the origin repin was never asked at revision 4"
++    assert all(r["expected_revision"] == 4 for r in board.repins)
++    assert board.reserves == []
++    assert _mismatch_comments(conn, tid) == (1, 1)
++
++
++def test_a_refused_origin_repin_is_not_asked_again_at_that_revision(hub, no_pull):
++    _home, conn = hub
++    tid = _gate_refused(conn)
++    board = PoolRefusingHub(refuse_origin=True)
++    for _ in range(4):
++        wp.reevaluate(conn, board, deny.BOARD, deny.ME, cfg=deny.CFG)
++    assert [r["runs_on"] == ORIGIN for r in board.repins] == [False, True]
++    assert board.reserves == [] and _mismatch_comments(conn, tid) == (1, 1)
++    # A new revision asks the pool repin again, then the origin repin once more.
++    deny._bump(conn, tid, 5)
++    for _ in range(3):
++        wp.reevaluate(conn, board, deny.BOARD, deny.ME, cfg=deny.CFG)
++    assert [(r["runs_on"] == ORIGIN, r["expected_revision"]) for r in board.repins[2:]] == [(False, 5), (True, 5)]
++    assert board.reserves == []
+-- 
+2.43.0
+

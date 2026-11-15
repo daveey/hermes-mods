@@ -1,0 +1,698 @@
+From c308f7b17a721c31e88b8c245562b94ee9e2491b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 04:58:37 +0000
+Subject: [PATCH] [daveey] Retain pure dashboard history reductions with exact
+ run overlays
+
+---
+ hermes_cli/kanban_diagnostic_history.py       |  65 +++++++++
+ hermes_cli/kanban_diagnostics.py              |  39 +++--
+ plugins/kanban/dashboard/board_incremental.py |  14 +-
+ plugins/kanban/dashboard/board_read.py        |  20 +--
+ plugins/kanban/dashboard/board_run_history.py |  47 ++++++
+ tests/plugins/test_kanban_board_history.py    |  35 +++++
+ .../plugins/test_kanban_history_reductions.py | 138 ++++++++++++++++++
+ tests/plugins/test_kanban_run_history.py      | 123 ++++++++++++++++
+ 8 files changed, 451 insertions(+), 30 deletions(-)
+ create mode 100644 hermes_cli/kanban_diagnostic_history.py
+ create mode 100644 plugins/kanban/dashboard/board_run_history.py
+ create mode 100644 tests/plugins/test_kanban_history_reductions.py
+ create mode 100644 tests/plugins/test_kanban_run_history.py
+
+diff --git a/hermes_cli/kanban_diagnostic_history.py b/hermes_cli/kanban_diagnostic_history.py
+new file mode 100644
+index 0000000000..04693d1963
+--- /dev/null
++++ b/hermes_cli/kanban_diagnostic_history.py
+@@ -0,0 +1,65 @@
++"""Pure reductions owned by one immutable, arrival-ordered event snapshot.
++
++No global cache: replacing a dashboard's retained history drops its reductions.
++Build lazily inside each rule's exception boundary. Clock, config, replica and task
++predicates are deliberately absent; callers must evaluate those on every read.
++"""
++from functools import cached_property
++from types import MappingProxyType
++
++
++class EventHistory(tuple):
++    """SQLite scalar event values, plus six lazily built historical reductions."""
++
++    def __new__(cls, rows):
++        return super().__new__(cls, (MappingProxyType(dict(row)) for row in rows))
++
++    def __setattr__(self, name, value):
++        raise AttributeError("event snapshots cannot be reassigned")
++
++    def __delattr__(self, name):
++        raise AttributeError("event snapshots cannot be reassigned")
++
++    @cached_property
++    def active_cards(self):
++        from hermes_cli.kanban_diagnostics import _active_hallucination_events
++        return tuple(_active_hallucination_events(tuple(self), "completion_blocked_hallucination"))
++
++    @cached_property
++    def active_refs(self):
++        from hermes_cli.kanban_diagnostics import _active_hallucination_events
++        return tuple(_active_hallucination_events(tuple(self), "suspected_hallucinated_references"))
++
++    @cached_property
++    def ready_latest(self):
++        from hermes_cli.kanban_diagnostics import _event_kind, _event_ts, _task_field
++        events = [ev for ev in self if _event_kind(ev) != "dispatch_skipped"]
++        return max(events, key=lambda ev: (_event_ts(ev), _task_field(ev, "id", 0) or 0)) if events else None
++
++    @cached_property
++    def quota_candidates(self):
++        from hermes_cli.kanban_diagnostics import _event_kind, _event_ts, _task_field
++        from hermes_cli.kanban_dispatch_skip import EVENT, _episode_kinds
++        bounds = _episode_kinds() | {EVENT}
++        # Sort before filtering: malformed timestamps on irrelevant kinds must
++        # retain the original per-rule failure semantics. Stable ties win first.
++        ordered = sorted(self, key=lambda ev: (_event_ts(ev), _task_field(ev, "id", 0) or 0), reverse=True)
++        return next(((ev,) for ev in ordered if _event_kind(ev) in bounds), ())
++
++    @cached_property
++    def latest_parking(self):
++        from hermes_cli.kanban_diagnostics import _latest_parking_event
++        return _latest_parking_event(tuple(self))
++
++    @cached_property
++    def cycle_inputs(self):
++        from hermes_cli.kanban_diagnostics import _event_kind, _event_ts
++        result = []
++        for ev in self:
++            # Parse ALL timestamps, including irrelevant kinds, just as the old
++            # rule did. A malformed heartbeat must still suppress only this rule.
++            ts = _event_ts(ev)
++            kind = _event_kind(ev)
++            if kind in {"blocked", "unblocked"}:
++                result.append((ts, kind))
++        return tuple(result)
+diff --git a/hermes_cli/kanban_diagnostics.py b/hermes_cli/kanban_diagnostics.py
+index 302a7f46ae..1e950beee9 100644
+--- a/hermes_cli/kanban_diagnostics.py
++++ b/hermes_cli/kanban_diagnostics.py
+@@ -14,6 +14,7 @@ from dataclasses import asdict, dataclass, field
+ from typing import Any, Callable, Iterable, Optional
+ import json
+ import time
++from hermes_cli.kanban_diagnostic_history import EventHistory
+ 
+ 
+ # Least → most urgent; sorted outputs put critical first.
+@@ -156,6 +157,11 @@ def _error_snippet(last_err) -> str:
+ def _active_hallucination_events(events: Iterable[Any], kind: str) -> list[Any]:
+     """Events of ``kind`` with no ``completed``/``edited`` event strictly after
+     them. Requires id-sorted (arrival-order) input, which the DB provides."""
++    if isinstance(events, EventHistory):
++        if kind == "completion_blocked_hallucination":
++            return list(events.active_cards)
++        if kind == "suspected_hallucinated_references":
++            return list(events.active_refs)
+     active: list[Any] = []
+     for ev in events:
+         k = _event_kind(ev)
+@@ -202,7 +208,7 @@ def _runs_newest_first(runs) -> list[Any]:
+ # Each rule: (task, events, runs, now_ts, config) -> list[Diagnostic].
+ # ``events``/``runs`` are kanban_db rows/dataclasses or same-shaped dicts.
+ 
+-RuleFn = Callable[[Any, list[Any], list[Any], int, dict], list[Diagnostic]]
++RuleFn = Callable[[Any, list[Any] | tuple, list[Any], int, dict], list[Diagnostic]]
+ 
+ 
+ def _aux_slot_explicit(slot: Any) -> bool:
+@@ -663,11 +669,11 @@ def _rule_block_unblock_cycling(task, events, runs, now, cfg) -> list[Diagnostic
+     seen_unblock_since_last_cycle = False
+     initial_blocked_ts = 0
+     last_cycle_blocked_ts = 0
+-    for ev in events:
+-        ts = _event_ts(ev)
++    cycle_inputs = (events.cycle_inputs if isinstance(events, EventHistory)
++                    else ((_event_ts(ev), _event_kind(ev)) for ev in events))
++    for ts, kind in cycle_inputs:
+         if ts < cycle_cutoff:
+             continue
+-        kind = _event_kind(ev)
+         if kind == "blocked":
+             if initial_blocked_ts == 0:
+                 initial_blocked_ts = ts
+@@ -782,7 +788,9 @@ def _pinned_quota_hold_until(events, now) -> Optional[int]:
+     hold still in the future (``kanban_dispatch_skip``); else None. Same episode bounds as its reader."""
+     from hermes_cli.kanban_dispatch_skip import EVENT, PINNED_QUOTA_WALL, _episode_kinds
+     bounds = _episode_kinds() | {EVENT}
+-    for ev in sorted(events or [], key=lambda ev: (_event_ts(ev), _task_field(ev, "id", 0) or 0), reverse=True):
++    ordered = (events.quota_candidates if isinstance(events, EventHistory) else
++               sorted(events or [], key=lambda ev: (_event_ts(ev), _task_field(ev, "id", 0) or 0), reverse=True))
++    for ev in ordered:
+         if _event_kind(ev) not in bounds:
+             continue
+         payload = _parse_payload(ev) if _event_kind(ev) == EVENT else {}
+@@ -799,8 +807,11 @@ def _ready_hold_reason(task, events, cfg, now=None) -> Optional[str]:
+     Capacity checks can precede pickup/guard evaluation, leaving old guard history on a
+     replica-only card. A same-second clear must outrank the guard it retired.
+     """
+-    evs = [ev for ev in (events or []) if _event_kind(ev) != "dispatch_skipped"]  # skip records end no guard
+-    latest = max(evs, key=lambda ev: (_event_ts(ev), _task_field(ev, "id", 0) or 0)) if evs else None
++    if isinstance(events, EventHistory):
++        latest = events.ready_latest
++    else:
++        evs = [ev for ev in (events or []) if _event_kind(ev) != "dispatch_skipped"]  # skip records end no guard
++        latest = max(evs, key=lambda ev: (_event_ts(ev), _task_field(ev, "id", 0) or 0)) if evs else None
+     if latest is not None and _event_kind(latest) == "respawn_guarded":
+         return "respawn_guarded"
+     if _foreign_machines(task, cfg):
+@@ -957,16 +968,10 @@ def _rule_overdue_wake(task, events, runs, now, cfg) -> list[Diagnostic]:
+     if _task_field(task, "status") != "scheduled":
+         return []
+     grace = float(cfg.get("overdue_wake_grace_seconds", kc.OVERDUE_WAKE_GRACE_SECONDS))
+-    parking = None
+-    for idx, ev in enumerate(events or []):
+-        if _event_kind(ev) not in kc.SCHEDULED_ENTRY_EVENTS:
+-            continue
+-        key = (_event_ts(ev), int(_task_field(ev, "id", default=0) or 0), idx)
+-        if parking is None or key >= parking[0]:
+-            parking = (key, ev)
++    parking = _latest_parking_event(events)
+     if parking is None:
+         return []
+-    payload = kc.pending_wake_payload(_event_kind(parking[1]), _parse_payload(parking[1]))
++    payload = kc.pending_wake_payload(_event_kind(parking), _parse_payload(parking))
+     if payload is None:
+         return []
+     wake_at = int(payload["wake_at"])
+@@ -990,6 +995,8 @@ def _rule_overdue_wake(task, events, runs, now, cfg) -> list[Diagnostic]:
+ def _latest_parking_event(events):
+     from hermes_cli import kanban_continuation as kc
+ 
++    if isinstance(events, EventHistory):
++        return events.latest_parking
+     parking = None
+     for idx, ev in enumerate(events or []):
+         if _event_kind(ev) not in kc.SCHEDULED_ENTRY_EVENTS:
+@@ -1307,7 +1314,7 @@ def config_from_runtime_config(raw_config: Optional[dict]) -> dict:
+ 
+ def compute_task_diagnostics(
+     task,
+-    events: list,
++    events: list | tuple,
+     runs: list,
+     *,
+     now: Optional[int] = None,
+diff --git a/plugins/kanban/dashboard/board_incremental.py b/plugins/kanban/dashboard/board_incremental.py
+index caefe30140..57532f8c64 100644
+--- a/plugins/kanban/dashboard/board_incremental.py
++++ b/plugins/kanban/dashboard/board_incremental.py
+@@ -87,13 +87,17 @@ def _affected(conn, cards, pcards, changed):
+ 
+ 
+ def _extras(conn, cards, pcards, affected, board_read):
+-    ids = list(cards)
++    # current_run_id can point at another task's run; keep this cheap PK join exact
++    # even when the changed run's owning task is outside the displayed graph.
++    starts = kanban_db.current_run_started_ats(conn, list(cards))
++    retained = {tid: {**pcards[tid][2], "current_run_started_at": starts.get(tid)}
++                for tid in cards if tid not in affected}
++    ids = sorted(affected)
+     if not ids:
+-        return {}
++        return retained
+     rollups = _rollups(conn, sorted(affected)) if affected else {}
+     ph, params = _ph(ids), tuple(ids)
+     summaries = kanban_db.latest_summaries(conn, ids)
+-    starts = kanban_db.current_run_started_ats(conn, ids)
+     try:
+         managers = {str(r[0]): str(r[1]) for r in conn.execute(
+             "SELECT task_id, chat_id FROM kanban_notify_subs WHERE platform = 'tui' AND chat_id != '' "
+@@ -101,11 +105,11 @@ def _extras(conn, cards, pcards, affected, board_read):
+     except sqlite3.Error:  # board predates notify subscriptions
+         managers = {}
+     cap = board_read._CARD_SUMMARY_PREVIEW_CHARS
+-    return {tid: {
++    return {**retained, **{tid: {
+         **(rollups[tid] if tid in rollups else pcards[tid][2]),
+         "latest_summary": summaries[tid][:cap] if summaries.get(tid) else None,
+         "current_run_started_at": starts.get(tid),
+-        "managing_session_id": managers.get(tid) or cards[tid][0].session_id or None} for tid in ids}
++        "managing_session_id": managers.get(tid) or cards[tid][0].session_id or None} for tid in ids}}
+ 
+ 
+ def _done_window(inc, by_id, changed, cap):
+diff --git a/plugins/kanban/dashboard/board_read.py b/plugins/kanban/dashboard/board_read.py
+index b612c671f1..06ae85eecd 100644
+--- a/plugins/kanban/dashboard/board_read.py
++++ b/plugins/kanban/dashboard/board_read.py
+@@ -14,6 +14,7 @@ from hermes_cli import kanban_db
+ from hermes_cli import kanban_diagnostics as kd
+ from hermes_cli import kanban_workflow
+ from plugins.kanban.dashboard.board_diagnostics import _attach_diagnostics
++from plugins.kanban.dashboard.board_run_history import retained_runs
+ 
+ # Dashboard columns, left-to-right ("archived" is a filter toggle, not a column), from the
+ # one workflow definition. A status missing here gets mis-bucketed into ``todo``.
+@@ -31,8 +32,9 @@ def _rows_by_task(conn: sqlite3.Connection, table: str, row_ids: list) -> dict[s
+     if row_ids:
+         for row in conn.execute(
+                 f"SELECT * FROM {table} WHERE task_id IN ({_placeholders(row_ids)}) ORDER BY id", tuple(row_ids)):
+-            by_task.setdefault(row["task_id"], []).append(MappingProxyType(dict(row)))
+-    return {tid: tuple(v) for tid, v in by_task.items()}  # immutable, O(1) field lookup
++            by_task.setdefault(row["task_id"], []).append(row)
++    return {tid: (kd.EventHistory(v) if table == "task_events"
++                  else tuple(MappingProxyType(dict(row)) for row in v)) for tid, v in by_task.items()}
+ 
+ 
+ def _raw(rows) -> tuple:
+@@ -91,8 +93,8 @@ def diagnostic_inputs(conn: sqlite3.Connection, task_ids: Optional[list[str]] =
+ 
+ def diagnostics_from_inputs(inputs: Optional[tuple]) -> dict[str, list[dict]]:
+     """Run the rules over ``diagnostic_inputs``. Reads config, the clock and the hub replica
+-    now, so a retained input set still yields current diagnostics. Rules get fresh lists and
+-    copies of the graph/wake dicts, never the retained objects."""
++    now, so a retained input set still yields current diagnostics. Event histories are immutable;
++    rules get fresh run lists and copies of graph/wake dicts."""
+     from hermes_cli.config import load_config
+ 
+     if inputs is None:
+@@ -103,7 +105,7 @@ def diagnostics_from_inputs(inputs: Optional[tuple]) -> dict[str, list[dict]]:
+     for r in rows:
+         tid = r["id"]
+         diags = kd.compute_task_diagnostics(
+-            r, list(events_by_task[tid]), list(runs_by_task[tid]), config=diag_config,
++            r, events_by_task[tid], list(runs_by_task[tid]), config=diag_config,
+             graph=fresh(graph_by_task.get(tid)), wake_check=fresh(wake_by_task.get(tid)))
+         if diags:
+             out[tid] = [d.to_dict() for d in diags]
+@@ -161,7 +163,7 @@ def _done_state(conn, filters: dict, done_limit) -> tuple[str, list, int, frozen
+ def _diag_memo(rows, events_by_task, runs_by_task, marks) -> dict:
+     """Per task: what its diagnostics inputs were read from, to tell a changed task next time."""
+     return {r["id"]: (tuple(r), _raw(runs_by_task.get(r["id"], ())), marks.get(r["id"], _NO_EVENTS),
+-                      events_by_task.get(r["id"], ())) for r in rows}
++                      events_by_task.get(r["id"], ()), runs_by_task.get(r["id"], ())) for r in rows}
+ 
+ 
+ def _incremental_diag_inputs(conn, diag_rows: list, prev: dict, diagnostic_inputs: Callable, *,
+@@ -173,7 +175,7 @@ def _incremental_diag_inputs(conn, diag_rows: list, prev: dict, diagnostic_input
+     """
+     ids = [r["id"] for r in diag_rows]
+     marks = _event_marks(conn, ids)
+-    runs = _rows_by_task(conn, "task_runs", ids)
++    runs = retained_runs(conn, ids, prev, event_changed, _rows_by_task)
+     raw_runs = {tid: _raw(runs[tid]) for tid in ids}
+     changed = {tid for r, tid in zip(diag_rows, ids)
+                if (old := prev.get(tid)) is None or old[2] is None
+@@ -187,10 +189,10 @@ def _incremental_diag_inputs(conn, diag_rows: list, prev: dict, diagnostic_input
+     for r, tid in zip(diag_rows, ids):
+         if tid in fresh_events or tid not in changed:
+             events[tid] = fresh_events[tid] if tid in fresh_events else prev[tid][3]
+-            memo[tid] = (tuple(r), raw_runs[tid], marks.get(tid, _NO_EVENTS), events[tid])
++            memo[tid] = (tuple(r), raw_runs[tid], marks.get(tid, _NO_EVENTS), events[tid], runs[tid])
+         else:  # vanished between reads: no events held, so never vouch for a mark
+             events[tid] = ()
+-            memo[tid] = (tuple(r), raw_runs[tid], None, ())
++            memo[tid] = (tuple(r), raw_runs[tid], None, (), runs[tid])
+     if graphs is None:
+         graphs = kanban_db.task_graph_contexts(conn, ids)
+     inputs = (tuple(diag_rows), events, runs, graphs, _wake_states(conn, ids))
+diff --git a/plugins/kanban/dashboard/board_run_history.py b/plugins/kanban/dashboard/board_run_history.py
+new file mode 100644
+index 0000000000..f80c492220
+--- /dev/null
++++ b/plugins/kanban/dashboard/board_run_history.py
+@@ -0,0 +1,47 @@
++"""P2-retained run snapshots with an exact per-read bookkeeping overlay."""
++from types import MappingProxyType
++
++# P2 excludes these run columns. Even historical terminal runs need the overlay:
++# unused-grant classification reads NULL-ness of four of them at projection time.
++_BOOKKEEPING = ("claim_lock", "claim_expires", "last_heartbeat_at", "worker_pid",
++                "worker_started_at", "sync_version")
++
++
++def retained_runs(conn, ids, prev, changed, load):
++    """Return all run fields without decoding unchanged historical metadata again.
++
++    ``changed=None`` is the legacy/untrusted path. The caller owns the same-snapshot
++    cursor contract and replaces the memo on schema or connection generation change.
++    """
++    if changed is None:
++        return load(conn, "task_runs", ids)
++    dirty = [tid for tid in ids if tid in changed or tid not in prev or len(prev[tid]) < 5]
++    result = load(conn, "task_runs", dirty) if dirty else {}
++    clean = [tid for tid in ids if tid not in result]
++    if not clean:
++        return result
++    old = {tid: prev[tid][4] for tid in clean}
++    # Old schemas can lack a newer bookkeeping column. Schema changes force FULL,
++    # so retained rows describe the selected columns for this snapshot generation.
++    keys = next((row.keys() for rows in old.values() for row in rows), ())
++    columns = [key for key in _BOOKKEEPING if key in keys]
++    selected = ", ".join(("id", "task_id", *columns))
++    fresh = {tid: [] for tid in clean}
++    for row in conn.execute(
++            f"SELECT {selected} FROM task_runs WHERE task_id IN ({','.join('?' for _ in clean)}) ORDER BY id",
++            tuple(clean)):
++        fresh[row["task_id"]].append(row)
++    reload = []
++    for tid in clean:
++        before, overlay = old[tid], fresh[tid]
++        if len(before) != len(overlay) or any(a["id"] != b["id"] for a, b in zip(before, overlay)):
++            reload.append(tid)  # fail exact if a caller supplied an incomplete invalidation set
++            continue
++        rows = []
++        for original, row in zip(before, overlay):
++            updates = {key: row[key] for key in columns if row[key] != original[key]}
++            rows.append(MappingProxyType({**original, **updates}) if updates else original)
++        result[tid] = tuple(rows)
++    if reload:
++        result.update(load(conn, "task_runs", reload))
++    return result
+diff --git a/tests/plugins/test_kanban_board_history.py b/tests/plugins/test_kanban_board_history.py
+index 7e54bcc72a..d02aee74f4 100644
+--- a/tests/plugins/test_kanban_board_history.py
++++ b/tests/plugins/test_kanban_board_history.py
+@@ -32,6 +32,18 @@ def test_history_rows_are_immutable_keyed_snapshots():
+     conn.close()
+ 
+ 
++def test_unchanged_extras_do_not_read_summary_history(monkeypatch):
++    from plugins.kanban.dashboard import board_incremental as bi
++    from hermes_cli import kanban_db as kb
++    extra = {"latest_summary": "retained", "current_run_started_at": None}
++    def unexpected(*_args):
++        pytest.fail("unchanged P2 task must retain summaries/start/subscriber extras")
++    monkeypatch.setattr(kb, 'latest_summaries', unexpected)
++    monkeypatch.setattr(kb, 'current_run_started_ats', lambda *_: {})
++    got = bi._extras(None, {'t': (None, None)}, {'t': (None, None, extra)}, set(), br)
++    assert got == {'t': extra}
++
++
+ def test_task_only_changes_do_not_reload_event_history(monkeypatch):
+     conn = sqlite3.connect(":memory:")
+     conn.row_factory = sqlite3.Row
+@@ -55,6 +67,29 @@ def test_task_only_changes_do_not_reload_event_history(monkeypatch):
+     conn.close()
+ 
+ 
++@pytest.mark.parametrize('mutation', ['summary', 'run_start', 'subscriber', 'foreign_run_start', 'run_delete'])
++def test_retained_extras_match_cold_payload(board, mutation):
++    ids, run_id = helpers._seed()
++    conn = kbc.connect()
++    try:
++        if mutation == 'foreign_run_start':
++            conn.execute('UPDATE tasks SET current_run_id = ? WHERE id = ?', (run_id, ids[1]))
++            conn.commit()
++        helpers._read(board)
++        queries = {
++            'summary': ("UPDATE task_runs SET summary = 'new summary' WHERE id = ?", (run_id,)),
++            'run_start': ('UPDATE task_runs SET started_at = 555 WHERE id = ?', (run_id,)),
++            'foreign_run_start': ('UPDATE task_runs SET started_at = 666 WHERE id = ?', (run_id,)),
++            'run_delete': ('DELETE FROM task_runs WHERE id = ?', (run_id,)),
++            'subscriber': ("INSERT INTO kanban_notify_subs (task_id,platform,chat_id,created_at) VALUES (?,'tui','new-chat',9999999999)", (ids[0],)),
++        }
++        conn.execute(*queries[mutation])
++        conn.commit()
++        assert helpers._stable(helpers._read(board)) == helpers._cold(board)
++    finally:
++        conn.close()
++
++
+ @pytest.mark.parametrize("mutation", ["event_update", "event_delete", "event_replace", "run_update", "heartbeat"])
+ def test_history_mutations_match_cold_projection(board, monkeypatch, mutation):
+     from hermes_cli import kanban_db as kb
+diff --git a/tests/plugins/test_kanban_history_reductions.py b/tests/plugins/test_kanban_history_reductions.py
+new file mode 100644
+index 0000000000..12a98d8884
+--- /dev/null
++++ b/tests/plugins/test_kanban_history_reductions.py
+@@ -0,0 +1,138 @@
++"""Retained event reductions must not retain live diagnostic decisions."""
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_diagnostics as kd
++from plugins.kanban.dashboard import board_read as br
++
++
++def history(events):
++    with sqlite3.connect(":memory:") as conn:
++        conn.row_factory = sqlite3.Row
++        conn.execute("CREATE TABLE task_events (id INTEGER, task_id TEXT, kind TEXT, payload TEXT, created_at)")
++        conn.executemany("INSERT INTO task_events VALUES (?, 't', ?, ?, ?)",
++                         [(i, *event) for i, event in enumerate(events)])
++        return br._rows_by_task(conn, "task_events", ["t"])["t"]
++
++
++def test_unchanged_projection_does_not_rescan_historical_events(monkeypatch):
++    events = history([("heartbeat", "{}", 100)] * 10000)
++    inputs = (({"id": "t", "status": "done"},), {"t": events}, {"t": ()}, {}, {})
++    br.diagnostics_from_inputs(inputs)
++    calls = []
++    real = kd._event_ts
++    def spy(ev):
++        calls.append(ev)
++        return real(ev)
++    monkeypatch.setattr(kd, "_event_ts", spy)
++    kinds = []
++    real_kind = kd._event_kind
++    def kind_spy(ev):
++        kinds.append(ev)
++        return real_kind(ev)
++    monkeypatch.setattr(kd, "_event_kind", kind_spy)
++    br.diagnostics_from_inputs(inputs)
++    assert calls == [], "unchanged event history must reuse pure reductions"
++    assert kinds == [], "unchanged history must reuse both active hallucination subsets"
++
++
++@pytest.mark.parametrize("status", ["done", "running", "ready", "blocked", "triage", "todo", "scheduled"])
++def test_reductions_preserve_clock_config_replica_and_arrival_order(monkeypatch, status):
++    from hermes_cli import kanban_db as kb
++    unresolved = ["t_phantom"]
++    monkeypatch.setattr(kb, "unresolved_after_replica", lambda ids: [v for v in ids if v in unresolved])
++    events = history([
++        ("completion_blocked_hallucination", '{"phantom_cards":["old"]}', 900),
++        ("edited", "{}", 1),  # reset is arrival-ordered, not timestamp-ordered
++        ("completion_blocked_hallucination", '{"phantom_cards":["new","new"]}', 200),
++        ("suspected_hallucinated_references", '{"phantom_refs":["t_phantom"]}', 201),
++        ("unblocked", "{}", 220), ("blocked", "{}", 220),
++        ("heartbeat", "{}", 1),
++        ("unblocked", "{}", 210), ("blocked", "{}", 210),
++        ("unblocked", "{}", 230), ("blocked", "{}", 230),
++    ])
++    task = {"id": "t", "status": status, "created_at": 1}
++    for now in (231, 400, 220, 231):  # forward and backward time, no DB write
++        for window in (30, 10, 300):
++            config = {"block_cycle_window_seconds": window, "block_cycle_threshold": 1}
++            expected = kd.compute_task_diagnostics(task, list(events), [], now=now, config=config)
++            assert kd.compute_task_diagnostics(task, events, [], now=now, config=config) == expected
++        unresolved.clear()  # live replica resolution must not be retained
++
++
++def test_ready_hold_reuses_history_but_not_deadline(monkeypatch):
++    events = history([('heartbeat', '{}', 1)] * 10000 + [
++        ('dispatch_skipped', '{"reason":"pinned_quota_wall","until":500}', 100)])
++    task = {'id': 't', 'status': 'ready'}
++    assert kd._ready_hold_reason(task, events, {}, 499) == 'pinned_quota_wall'
++    real = kd._event_ts
++    calls = []
++    def spy(ev):
++        calls.append(ev)
++        return real(ev)
++    monkeypatch.setattr(kd, '_event_ts', spy)
++    assert kd._ready_hold_reason(task, events, {}, 500) is None
++    assert kd._ready_hold_reason(task, events, {}, 499) == 'pinned_quota_wall'
++    assert not calls
++
++
++def test_scheduled_projection_reuses_latest_parking_event(monkeypatch):
++    from hermes_cli import kanban_continuation as kc
++    events = history([("heartbeat", "{}", 100)] * 10000 + [
++        (next(iter(kc.SCHEDULED_ENTRY_EVENTS)), '{"wake_at": 100}', 101)])
++    task = {"id": "t", "status": "scheduled", "created_at": 1}
++    original = kd.compute_task_diagnostics(task, list(events), [], now=1000)
++    assert kd.compute_task_diagnostics(task, events, [], now=1000) == original
++    real = kd._event_kind
++    calls = []
++    def spy(ev):
++        calls.append(ev)
++        return real(ev)
++    monkeypatch.setattr(kd, "_event_kind", spy)
++    kd._latest_parking_event(events)
++    assert calls == [], "parking rules must not rescan the full history"
++    assert kd.compute_task_diagnostics(task, events, [], now=1000) == original
++
++
++def test_projection_rechecks_live_inputs_and_isolates_returned_values(monkeypatch):
++    from hermes_cli import config as hc, kanban_db as kb
++    clock = [110]
++    settings = {"block_cycle_threshold": 1, "block_cycle_window_seconds": 30}
++    config = {"kanban": {"diagnostics": settings}}
++    replica = ["t_phantom"]
++    monkeypatch.setattr(hc, "load_config", lambda: config)
++    monkeypatch.setattr(kd.time, "time", lambda: clock[0])
++    monkeypatch.setattr(kb, "unresolved_after_replica", lambda ids: list(replica))
++    events = history([("unblocked", "{}", 100), ("blocked", "{}", 101),
++                      ("suspected_hallucinated_references", '{"phantom_refs":["t_phantom"]}', 102)])
++    inputs = (({"id": "t", "status": "done"},), {"t": events}, {"t": ()}, {}, {})
++    original = br.diagnostics_from_inputs(inputs)
++    assert {d["kind"] for d in original["t"]} == {"prose_phantom_refs", "block_unblock_cycling"}
++    original["t"][0]["data"].clear()
++    assert all(d["data"] for d in br.diagnostics_from_inputs(inputs)["t"])
++    settings["block_cycle_threshold"] = 2
++    assert [d["kind"] for d in br.diagnostics_from_inputs(inputs)["t"]] == ["prose_phantom_refs"]
++    settings["block_cycle_threshold"] = 1
++    clock[0] = 200
++    assert [d["kind"] for d in br.diagnostics_from_inputs(inputs)["t"]] == ["prose_phantom_refs"]
++    replica.clear()
++    assert br.diagnostics_from_inputs(inputs) == {}
++    clock[0] = 110
++    assert [d["kind"] for d in br.diagnostics_from_inputs(inputs)["t"]] == ["block_unblock_cycling"]
++    with pytest.raises(AttributeError):
++        events.cycle_inputs = ()
++    with pytest.raises(AttributeError):
++        del events.active_refs
++
++
++@pytest.mark.parametrize("bad", ["invalid-time", None, 0])
++def test_bad_timestamp_keeps_per_rule_exception_isolation(bad):
++    events = history([("heartbeat", "{}", bad), ("unblocked", "{}", 100), ("blocked", "{}", 101),
++                      ("completion_blocked_hallucination", '{"phantom_cards":["x"]}', 102)])
++    task = {"id": "t", "status": "done"}
++    for _ in range(2):
++        expected = kd.compute_task_diagnostics(task, list(events), [], now=110, config={"block_cycle_threshold": 1})
++        actual = kd.compute_task_diagnostics(task, events, [], now=110, config={"block_cycle_threshold": 1})
++        assert actual == expected
++        assert any(d.kind == "hallucinated_cards" for d in actual)
+diff --git a/tests/plugins/test_kanban_run_history.py b/tests/plugins/test_kanban_run_history.py
+new file mode 100644
+index 0000000000..9634dadc29
+--- /dev/null
++++ b/tests/plugins/test_kanban_run_history.py
+@@ -0,0 +1,123 @@
++"""Run-history retention keeps excluded bookkeeping exact, even for old grants."""
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_diagnostics as kd
++from plugins.kanban.dashboard import board_read as br
++from tests.plugins import test_kanban_board_incremental as helpers
++
++board = helpers.board
++
++
++@pytest.mark.parametrize('column', ['claim_lock', 'worker_pid', 'worker_started_at', 'last_heartbeat_at'])
++def test_bookkeeping_only_run_update_matches_exact_board(board, monkeypatch, column):
++    from hermes_cli import kanban_db as kb, kanban_db_connect as kbc, kanban_task_change as ktc
++    monkeypatch.setattr(kd.time, 'time', lambda: 9100.0)
++    conn = kbc.connect()
++    try:
++        tid = kb.create_task(conn, title='old grant', assignee='worker')
++        conn.execute("UPDATE tasks SET status='ready', created_at=1 WHERE id=?", (tid,))
++        conn.execute('DELETE FROM task_events WHERE task_id=?', (tid,))
++        rid = conn.execute("INSERT INTO task_runs (task_id,profile,status,outcome,started_at,ended_at,metadata) "
++                           "VALUES (?,'worker','released','released',9000,9001,?)", (tid, '{"unused_grant":true}')).lastrowid
++        conn.executemany('INSERT INTO task_events (task_id,run_id,kind,payload,created_at) VALUES (?,?,?,?,?)', [
++            (tid, None, 'created', '{}', 1), (tid, rid, 'claimed', '{}', 9000),
++            (tid, rid, 'released', '{"unused_grant":true}', 9001)])
++        conn.commit()
++        baseline = helpers._stable(helpers._read(board))
++        _, cursor = ktc.changed_since(conn, None)
++        assert cursor is not None
++        for value in (0, None):
++            conn.execute(f'UPDATE task_runs SET {column}=? WHERE id=?', (value, rid))
++            conn.commit()
++            changed, cursor = ktc.changed_since(conn, cursor)
++            assert changed == frozenset(), 'fixture must exercise excluded bookkeeping'
++            actual = helpers._stable(helpers._read(board))
++            assert actual == helpers._cold(board)
++            assert (actual == baseline) == (value is None)
++    finally:
++        conn.close()
++
++
++
++@pytest.fixture
++def source(monkeypatch):
++    conn = sqlite3.connect(":memory:")
++    conn.row_factory = sqlite3.Row
++    conn.executescript('''
++        CREATE TABLE tasks (id TEXT, status TEXT, created_at INTEGER, assignee TEXT);
++        INSERT INTO tasks VALUES ('t', 'ready', 1, 'worker');
++        CREATE TABLE task_events (id INTEGER, task_id TEXT, run_id INTEGER, kind TEXT, payload TEXT, created_at INTEGER);
++        INSERT INTO task_events VALUES (1,'t',NULL,'created','{}',1);
++        INSERT INTO task_events VALUES (2,'t',7,'claimed','{}',9000);
++        INSERT INTO task_events VALUES (3,'t',7,'released','{"unused_grant":true}',9001);
++        CREATE TABLE task_runs (id INTEGER, task_id TEXT, status TEXT, outcome TEXT, ended_at INTEGER,
++          metadata TEXT, summary TEXT, error TEXT, claim_lock, claim_expires, last_heartbeat_at,
++          worker_pid, worker_started_at, sync_version);
++        INSERT INTO task_runs (id,task_id,status,outcome,ended_at,metadata)
++          VALUES (7,'t','released','released',9001,'{"unused_grant":true}');
++    ''')
++    monkeypatch.setattr(br, '_wake_states', lambda *_: {})
++    yield conn
++    conn.close()
++
++
++def inputs(conn):
++    rows = conn.execute('SELECT * FROM tasks').fetchall()
++    events = br._rows_by_task(conn, 'task_events', ['t'])
++    runs = br._rows_by_task(conn, 'task_runs', ['t'])
++    return rows, events, runs
++
++
++def memo(conn):
++    rows, events, runs = inputs(conn)
++    return br._diag_memo(rows, events, runs, br._event_marks(conn, ['t']))
++
++
++def refresh(conn, old):
++    return br._incremental_diag_inputs(conn, conn.execute('SELECT * FROM tasks').fetchall(), old,
++                                      lambda *_args, **_kwargs: pytest.fail('unchanged events reloaded'),
++                                      graphs={}, event_changed=frozenset())
++
++
++def test_unchanged_run_histories_are_not_loaded_again(source, monkeypatch):
++    old = memo(source)
++    def unexpected(*_):
++        pytest.fail('full run histories must not be loaded for an empty trusted delta')
++    monkeypatch.setattr(br, '_rows_by_task', unexpected)
++    got, new = refresh(source, old)
++    assert got[2]['t'][0] is old['t'][4][0]
++    assert new['t'][4][0] is old['t'][4][0]
++
++
++@pytest.mark.parametrize('column', ['claim_lock', 'worker_pid', 'worker_started_at', 'last_heartbeat_at'])
++@pytest.mark.parametrize('value', [0, '', 99])
++def test_old_grant_bookkeeping_is_fresh_and_changes_visible_diagnostics(source, column, value):
++    old = memo(source)
++    task = dict(source.execute('SELECT * FROM tasks').fetchone())
++    _rows, events, runs = inputs(source)
++    baseline = kd.compute_task_diagnostics(task, events['t'], list(runs['t']), now=9100)
++    assert kd._last_ready_entry_ts(events['t'], runs['t']) == 1
++    for updated in (value, None):
++        source.execute(f'UPDATE task_runs SET {column} = ?', (updated,))
++        got, old = refresh(source, old)
++        _, fresh_events, fresh_runs = inputs(source)
++        actual = kd.compute_task_diagnostics(task, got[1]['t'], list(got[2]['t']), now=9100)
++        expected = kd.compute_task_diagnostics(task, fresh_events['t'], list(fresh_runs['t']), now=9100)
++        assert actual == expected
++        assert (actual == baseline) == (updated is None)
++        assert br._raw(got[2]['t']) == br._raw(fresh_runs['t'])
++
++
++def test_untrusted_run_path_reloads(source, monkeypatch):
++    old = memo(source)
++    loaded = []
++    real = br._rows_by_task
++    def load(conn, table, ids):
++        loaded.append(table)
++        return real(conn, table, ids)
++    monkeypatch.setattr(br, '_rows_by_task', load)
++    rows = source.execute('SELECT * FROM tasks').fetchall()
++    br._incremental_diag_inputs(source, rows, old, lambda *_args, **_kwargs: None, graphs={})
++    assert 'task_runs' in loaded
+-- 
+2.43.0
+

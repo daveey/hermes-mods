@@ -1,0 +1,552 @@
+From 36a2504ca961b99b4852688c9e1771263aa72613 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 16:22:29 +0000
+Subject: [PATCH] [daveey] subagent.roster: read the observation scope once per
+ request, and the gateway name without scanning replicas
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The 0.9 Hz Desktop sidebar poll `subagent.roster` cost 5-12 ms thread-CPU per call on the hub while K=6 conversations
+had live children or background processes (0.59% of a core during the startup burst seen on serve 2785815: 476 calls,
+3.6 s over 609 s, which alone failed the 1.0% whole-RPC P1 bucket for card J residual RPC t_01a1d86283da489b).
+
+Five whys
+1. Why is roster expensive only with live owners? With none it returns before projecting observations; with K owners
+   it projects one execution observation per owner (child or process).
+2. Why is each projection ~0.7-1 ms? Every one calls `local_scope()`, which re-reads `kanban_db_sync.sync_config()`
+   (YAML config) and the hub's own gateway name. Attribution on the hub, K=6: `_roster_observations` 5.19 ms, of which
+   `local_scope` 4.27 ms (`sync_config` 2.84, `gateway_names` 1.03).
+3. Why does the gateway name cost so much? `_gateway_name` used `kanban_origin.gateway_names()[0]`. Its memo keys on
+   hub.db and hub.db-wal stat signatures, and hermes-hub writes its WAL continuously, so the memo misses about once a
+   second; each miss runs `SELECT DISTINCT gw FROM replica` (a covering-index scan of every replica row: 2.3 ms at the
+   hub's row count) and then discards the known-gateway set.
+4. Why per owner? The scope is process-wide within one request (config, hub.db, launch profile), but it was read
+   inside the per-record helper `_subagent_observation` and inside `process_observations`.
+5. Why not caught? The read-budget tests pin gateway/dispatcher ticks, not Desktop poll RPCs, and the roster tests
+   used one owner, so neither the per-owner multiplier nor the replica scan was visible.
+
+Fix (design doc + independent review deleg_e2143a25, changes adopted)
+- `kanban_origin.gateway_name()`: exactly `gateway_names()[0]` without the replica scan. A still-valid
+  `gateway_names` memo answers; otherwise it reads only the `meta` primary-key row and the mail config. Not memoized
+  itself (a WAL-keyed memo would almost never hold). `_read_gateway_names(..., names=False)` shares the one reader, so
+  every branch (meta, empty/absent meta, sqlite error, no hub.db, mail fallback) stays identical.
+- `_gateway_name` uses it; `kanban.sync.gateway` still wins first.
+- `subagent.roster` and `subagent.list` read `_observation_scope()` (local_scope) once per request and pass it down to
+  `_subagent_observation` and `process_observations(scope=...)`; no request with zero rows reads it; every request
+  still re-reads it (no cross-request cache), so a config/hub.db change is visible on the next poll. A scope failure
+  still yields unscoped observations (gateway None), not dropped rows. Other callers keep the old default path.
+
+Proof
+- RED (production reverted, new tests only): 8 of the 10 new tests fail (local_scope read once per row;
+  `gateway_name` missing / replica statement executed); the other 2 are preservation tests that pass on both. GREEN: all pass.
+- 202 consumer test files importing the changed modules: 1783 passed, 0 failed. scripts/check --base origin/main OK.
+- §5 scales, K=6, N=150, isolated fixtures with a hub.db write before every call (memo cannot hide the read),
+  thread-CPU per roster call, median base -> fix:
+    replicas 10k / sessions 5k   14.77 -> 3.89 ms
+    replicas 40k / sessions 5k   19.33 -> 3.36 ms
+    replicas 10k / sessions 23k  11.54 -> 3.34 ms
+    replicas 40k / sessions 23k  18.91 -> 3.00 ms
+    + 447 MB WAL on hub.db and state.db  20.44 -> 2.86 ms
+  Base grows 1.64x from 10k->40k replicas; the fix is flat (<=1.0x, growth bound 1.5 met). Tasks are not an input
+  of this path (no kanban.db read), so the tasks1k/5.8k/20k dimension does not apply.
+---
+ hermes_cli/kanban_execution_observations.py   |   6 +-
+ hermes_cli/kanban_origin.py                   |  27 +++-
+ hermes_cli/process_session_activity.py        |  10 +-
+ ...est_execution_observation_source_safety.py |   8 +-
+ .../test_kanban_capacity_integration.py       |   1 +
+ .../test_kanban_card_owner_profile.py         |   1 +
+ .../test_kanban_execution_receipt.py          |   1 +
+ .../test_kanban_gateway_name_read.py          | 128 ++++++++++++++++++
+ .../test_subagent_roster_scope_once.py        |  83 ++++++++++++
+ tui_gateway/methods_subagents.py              |  37 +++--
+ 10 files changed, 279 insertions(+), 23 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_gateway_name_read.py
+ create mode 100644 tests/tui_gateway/test_subagent_roster_scope_once.py
+
+diff --git a/hermes_cli/kanban_execution_observations.py b/hermes_cli/kanban_execution_observations.py
+index 9b17e67cdf..7d204588d7 100644
+--- a/hermes_cli/kanban_execution_observations.py
++++ b/hermes_cli/kanban_execution_observations.py
+@@ -31,7 +31,7 @@ _STATE_EVENTS = {"blocked": {"blocked"}, "scheduled": {"scheduled"}, "review": {
+ def _gateway_name():
+     """Configured gateway name from non-secret metadata only; never the hub key file.
+ 
+-    ``kanban.sync.gateway`` first, then the hub's own gateway metadata (``kanban_origin.gateway_names``:
++    ``kanban.sync.gateway`` first, then the hub's own gateway name (``kanban_origin.gateway_name``:
+     hub.db meta, else the hermes-mail config name). Any failure or absence is None (unknown).
+     """
+     try:
+@@ -43,9 +43,9 @@ def _gateway_name():
+     except ADAPTER_ERRORS:
+         _log.debug("kanban.sync gateway name unavailable", exc_info=True)
+     try:
+-        from hermes_cli.kanban_origin import gateway_names
++        from hermes_cli.kanban_origin import gateway_name
+ 
+-        name = gateway_names()[0]
++        name = gateway_name()
+         return name.strip() if isinstance(name, str) and name.strip() else None
+     except ADAPTER_ERRORS:
+         _log.debug("hub gateway name unavailable", exc_info=True)
+diff --git a/hermes_cli/kanban_origin.py b/hermes_cli/kanban_origin.py
+index 1c0716bb18..3cad516119 100644
+--- a/hermes_cli/kanban_origin.py
++++ b/hermes_cli/kanban_origin.py
+@@ -122,8 +122,7 @@ def gateway_names() -> tuple[str, set[str]]:
+     and each uncached answer opens hub.db (4% of hub gateway CPU, 2026-11-12). [daveey]"""
+     global _names_memo
+     path, cfg = _hub_db(), _mail_config()
+-    key = (str(path), _stat_sig(path) if path else None, _stat_sig(Path(f"{path}-wal")) if path else None,
+-           str(cfg), _stat_sig(cfg))
++    key = _names_key(path, cfg)
+     memo, now = _names_memo, time.monotonic()
+     if memo is not None and memo[0] == key and now - memo[1] < _NAMES_MAX_AGE_S:
+         return memo[2], set(memo[3])
+@@ -137,8 +136,27 @@ def gateway_names() -> tuple[str, set[str]]:
+     return me, known
+ 
+ 
++def gateway_name() -> str:
++    """This gateway's own name: exactly ``gateway_names()[0]``, without the known-gateway set.
++
++    A still-valid ``gateway_names`` memo answers; otherwise only the hub.db ``meta`` row (a primary-key lookup) and
++    the mail config are read, never the ``replica`` scan whose cost grows with replica rows. Not memoized itself:
++    the hub writes hub.db's WAL continuously, so a memo keyed on it would almost never be kept. [daveey]"""
++    path, cfg = _hub_db(), _mail_config()
++    memo = _names_memo
++    if memo is not None and time.monotonic() - memo[1] < _NAMES_MAX_AGE_S and memo[0] == _names_key(path, cfg):
++        return memo[2]
++    return _read_gateway_names(path, cfg, names=False)[0]
++
++
++def _names_key(path: Optional[Path], cfg: Path) -> tuple:
++    """Identity of the gateway-name inputs: hub.db, its WAL and the mail config."""
++    return (str(path), _stat_sig(path) if path else None, _stat_sig(Path(f"{path}-wal")) if path else None,
++            str(cfg), _stat_sig(cfg))
++
++
+ def _read_gateway_names(path: Optional[Path], cfg: Path,
+-                        failed: Optional[list[sqlite3.Error]] = None) -> tuple[str, set[str]]:
++                        failed: Optional[list[sqlite3.Error]] = None, *, names: bool = True) -> tuple[str, set[str]]:
+     me, known = "", set()
+     if path is not None:
+         try:
+@@ -146,7 +164,8 @@ def _read_gateway_names(path: Optional[Path], cfg: Path,
+             try:
+                 row = conn.execute("SELECT v FROM meta WHERE k = 'gateway'").fetchone()
+                 me = str(row[0]) if row and row[0] else ""
+-                known = {str(r[0]) for r in conn.execute("SELECT DISTINCT gw FROM replica") if r[0]}
++                if names:
++                    known = {str(r[0]) for r in conn.execute("SELECT DISTINCT gw FROM replica") if r[0]}
+             finally:
+                 conn.close()
+         except sqlite3.Error as exc:
+diff --git a/hermes_cli/process_session_activity.py b/hermes_cli/process_session_activity.py
+index 0406045696..659779dec0 100644
+--- a/hermes_cli/process_session_activity.py
++++ b/hermes_cli/process_session_activity.py
+@@ -242,7 +242,8 @@ def annotate_background_activity(rows: list[dict[str, Any]]) -> list[dict[str, A
+ 
+ 
+ def process_observations(proc_ids: Iterable[Any], *, owner: str | None, profile: str | None = None,
+-                         exited: Iterable[Any] = (), owner_resolved: bool = False) -> dict[str, dict[str, Any]]:
++                         exited: Iterable[Any] = (), owner_resolved: bool = False,
++                         scope: tuple[str | None, str | None] | None = None) -> dict[str, dict[str, Any]]:
+     """``{registry process id: v1 observation}`` for exact registry processes an owning stored session names.
+ 
+     Reuses the sidebar's bounded, three-second-cached collection, so the probe time is the original
+@@ -261,8 +262,11 @@ def process_observations(proc_ids: Iterable[Any], *, owner: str | None, profile:
+         _log.debug("process evidence unavailable", exc_info=True)
+         evidence = {}
+     try:
+-        from hermes_cli.kanban_execution_observations import local_scope
+-        gateway, local_profile = local_scope()
++        if scope is not None:  # the caller's per-request local_scope(), read once for all its owners
++            gateway, local_profile = scope
++        else:
++            from hermes_cli.kanban_execution_observations import local_scope
++            gateway, local_profile = local_scope()
+     except ADAPTER_ERRORS:
+         _log.debug("process gateway identity unavailable", exc_info=True)
+         gateway = local_profile = None
+diff --git a/tests/hermes_cli/test_execution_observation_source_safety.py b/tests/hermes_cli/test_execution_observation_source_safety.py
+index ccd847a7e2..caa1aa29bd 100644
+--- a/tests/hermes_cli/test_execution_observation_source_safety.py
++++ b/tests/hermes_cli/test_execution_observation_source_safety.py
+@@ -82,21 +82,21 @@ def test_local_scope_reads_no_key_and_survives_every_lookup_failure(monkeypatch)
+ 
+     monkeypatch.setattr(client, "load_identity", forbidden)
+     monkeypatch.setattr(client.sync, "sync_config", lambda: {"gateway": "cfg-gw"})
+-    monkeypatch.setattr(kanban_origin, "gateway_names", lambda: ("", set()))
++    monkeypatch.setattr(kanban_origin, "gateway_name", lambda: "")
+     assert keo.local_scope()[0] == "cfg-gw"
+ 
+     monkeypatch.setattr(client.sync, "sync_config", dict)
+-    monkeypatch.setattr(kanban_origin, "gateway_names", lambda: ("hub-gw", {"hub-gw"}))
++    monkeypatch.setattr(kanban_origin, "gateway_name", lambda: "hub-gw")
+     assert keo.local_scope()[0] == "hub-gw"
+ 
+     def boom(*a, **k):
+         raise RuntimeError("lookup failed")
+ 
+     monkeypatch.setattr(client.sync, "sync_config", boom)
+-    monkeypatch.setattr(kanban_origin, "gateway_names", boom)
++    monkeypatch.setattr(kanban_origin, "gateway_name", boom)
+     assert keo.local_scope()[0] is None  # unknown, not an exception
+ 
+-    monkeypatch.setattr(kanban_origin, "gateway_names", lambda: ("", set()))
++    monkeypatch.setattr(kanban_origin, "gateway_name", lambda: "")
+     monkeypatch.setattr(client.sync, "sync_config", dict)
+     assert keo.local_scope()[0] is None
+ 
+diff --git a/tests/hermes_cli/test_kanban_capacity_integration.py b/tests/hermes_cli/test_kanban_capacity_integration.py
+index e6b4051d03..be88d8fa9d 100644
+--- a/tests/hermes_cli/test_kanban_capacity_integration.py
++++ b/tests/hermes_cli/test_kanban_capacity_integration.py
+@@ -72,6 +72,7 @@ def test_tool_cli_rest_read_actual_persisted_evidence(capacity_board, monkeypatc
+     # Hermetic gateway identity: never inherit the host's hub.db / hermes-mail name (a CI runner has none).
+     monkeypatch.setattr(kanban_db_sync, "sync_config", lambda: {"gateway": "fixture-gw"})
+     monkeypatch.setattr(kanban_origin, "gateway_names", lambda: ("", set()))
++    monkeypatch.setattr(kanban_origin, "gateway_name", lambda: "")
+     monkeypatch.setattr(queue, "_running_and_limit", lambda *a: (0, 4))
+     evidence.record(conn, dispatch.DispatchResult(memory_pressure="critical"), board="default", machine="m")
+     app = FastAPI()
+diff --git a/tests/hermes_cli/test_kanban_card_owner_profile.py b/tests/hermes_cli/test_kanban_card_owner_profile.py
+index 065505c743..ee9a7aae23 100644
+--- a/tests/hermes_cli/test_kanban_card_owner_profile.py
++++ b/tests/hermes_cli/test_kanban_card_owner_profile.py
+@@ -25,6 +25,7 @@ def root(tmp_path, monkeypatch):
+     monkeypatch.setenv("HERMES_HUB_STATE", str(tmp_path / "hub-state"))
+     monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+     monkeypatch.setattr(kanban_origin, "gateway_names", lambda: (GATEWAY, {GATEWAY}))
++    monkeypatch.setattr(kanban_origin, "gateway_name", lambda: GATEWAY)
+     monkeypatch.setattr(observations, "_gateway_name", lambda: GATEWAY)
+     return tmp_path
+ 
+diff --git a/tests/hermes_cli/test_kanban_execution_receipt.py b/tests/hermes_cli/test_kanban_execution_receipt.py
+index d7d13220b6..a30df414e2 100644
+--- a/tests/hermes_cli/test_kanban_execution_receipt.py
++++ b/tests/hermes_cli/test_kanban_execution_receipt.py
+@@ -34,6 +34,7 @@ def board(tmp_path, monkeypatch):
+     monkeypatch.setenv("HERMES_HUB_STATE", str(tmp_path / "hub-state"))
+     monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+     monkeypatch.setattr(kanban_origin, "gateway_names", lambda: (GATEWAY, {GATEWAY, "away"}))
++    monkeypatch.setattr(kanban_origin, "gateway_name", lambda: GATEWAY)
+     monkeypatch.setattr(observations, "local_scope", lambda: (GATEWAY, PROFILE))
+     activity._reset_cache_for_tests()
+     path = kb.kanban_db_path(board="default")
+diff --git a/tests/hermes_cli/test_kanban_gateway_name_read.py b/tests/hermes_cli/test_kanban_gateway_name_read.py
+new file mode 100644
+index 0000000000..79336d780e
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_gateway_name_read.py
+@@ -0,0 +1,128 @@
++"""``_gateway_name`` / ``kanban_origin.gateway_name``: this gateway's own name without the replica scan.
++
++``subagent.roster`` (a 0.9 Hz Desktop poll) projects one observation per owner, each asking the gateway's own
++name. On the hub the ``gateway_names`` memo misses about once a second (hermes-hub writes hub.db's WAL
++continuously), and each miss scanned every replica row (``SELECT DISTINCT gw FROM replica``: 2.3 ms at 46k
++rows) only to throw the known-gateway set away. [daveey]
++"""
++import json
++import os
++import sqlite3
++import time
++
++import pytest
++
++from hermes_cli import kanban_db_sync, kanban_origin
++from hermes_cli import kanban_execution_observations as keo
++
++
++@pytest.fixture
++def hub(tmp_path, monkeypatch):
++    state = tmp_path / "hub-state"
++    state.mkdir()
++    monkeypatch.setenv("HERMES_HUB_STATE", str(state))
++    monkeypatch.setenv("HERMES_MAIL_CONFIG", str(tmp_path / "mail.json"))
++    monkeypatch.setattr(kanban_origin, "_names_memo", None)
++    monkeypatch.setattr(kanban_db_sync, "sync_config", dict)  # no kanban.sync.gateway: the hub path is live
++    db = sqlite3.connect(state / "hub.db")
++    db.execute("CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT)")
++    db.execute("CREATE TABLE replica (gw TEXT, coll TEXT, key TEXT, PRIMARY KEY (gw, coll, key))")
++    db.execute("INSERT INTO meta VALUES ('gateway', 'hub')")
++    db.executemany("INSERT INTO replica VALUES (?, 'tasks', ?)", [("macbook", str(i)) for i in range(50)])
++    db.commit()
++    _settle(state / "hub.db")
++    yield db, state, tmp_path / "mail.json"
++    db.close()
++
++
++def _settle(*paths):
++    old = time.time() - 60
++    for p in paths:
++        if os.path.exists(p):
++            os.utime(p, (old, old))  # a settled file, as on a running host (never inside the racy window)
++
++
++def _statements(monkeypatch):
++    """Every SQL statement run on a hub.db connection opened by kanban_origin."""
++    real, seen = kanban_origin._ro, []
++
++    def traced(path):
++        conn = real(path)
++        conn.set_trace_callback(seen.append)
++        return conn
++
++    monkeypatch.setattr(kanban_origin, "_ro", traced)
++    return seen
++
++
++def test_gateway_name_never_scans_the_replica_table(hub, monkeypatch):
++    seen = _statements(monkeypatch)
++    assert keo._gateway_name() == "hub"
++    assert seen, "hub.db was not read at all"
++    assert not [s for s in seen if "replica" in s.lower()], seen
++
++
++def test_gateway_name_matches_gateway_names_in_every_branch(hub, monkeypatch):
++    db, state, mail = hub
++
++    def both():
++        monkeypatch.setattr(kanban_origin, "_names_memo", None)
++        name = kanban_origin.gateway_name()
++        monkeypatch.setattr(kanban_origin, "_names_memo", None)
++        return name, kanban_origin.gateway_names()[0]
++
++    assert both() == ("hub", "hub")
++    db.execute("UPDATE meta SET v = '  spaced  ' WHERE k = 'gateway'")  # truthy: no fallback, unstripped
++    db.commit()
++    assert both() == ("  spaced  ", "  spaced  ")
++    assert keo._gateway_name() == "spaced"
++    mail.write_text(json.dumps({"gateway": "mail-gw"}), encoding="utf-8")
++    db.execute("DELETE FROM meta")  # no meta row: the mail config names the gateway
++    db.commit()
++    assert both() == ("mail-gw", "mail-gw")
++    db.execute("DROP TABLE meta")  # unreadable meta (sqlite error): still the mail config
++    db.commit()
++    assert both() == ("mail-gw", "mail-gw")
++    mail.write_text("not json", encoding="utf-8")
++    assert both() == ("", "")
++    db.close()
++    (state / "hub.db").unlink()  # no hub.db at all
++    mail.write_text(json.dumps({"gateway": "solo"}), encoding="utf-8")
++    assert both() == ("solo", "solo")
++
++
++def test_kanban_sync_gateway_still_wins(hub, monkeypatch):
++    seen = _statements(monkeypatch)
++    monkeypatch.setattr(kanban_db_sync, "sync_config", lambda: {"gateway": " cfg-gw "})
++    assert keo._gateway_name() == "cfg-gw"
++    assert seen == []
++
++
++def test_a_valid_gateway_names_memo_answers_without_a_read(hub, monkeypatch):
++    kanban_origin.gateway_names()  # settled inputs: remembered
++    seen = _statements(monkeypatch)
++    assert kanban_origin.gateway_name() == "hub"
++    assert seen == []
++
++
++def test_a_meta_change_is_seen_on_the_next_call(hub, monkeypatch):
++    db, state, _ = hub
++    kanban_origin.gateway_names()  # a remembered answer for the old inputs
++    assert kanban_origin.gateway_name() == "hub"
++    db.execute("UPDATE meta SET v = 'renamed' WHERE k = 'gateway'")
++    db.commit()
++    _settle(state / "hub.db", state / "hub.db-wal")  # even a settled write changes the size/identity key
++    assert kanban_origin.gateway_name() == "renamed"
++
++
++def test_unchanged_inputs_are_reread_once_the_age_bound_passes(hub, monkeypatch):
++    clock = [1000.0]
++    monkeypatch.setattr(kanban_origin.time, "monotonic", lambda: clock[0])
++    kanban_origin.gateway_names()
++    seen = _statements(monkeypatch)
++    clock[0] += kanban_origin._NAMES_MAX_AGE_S - 0.1
++    kanban_origin.gateway_name()
++    assert seen == [], "re-read before the age bound"
++    clock[0] += 0.2  # time alone, no input change
++    kanban_origin.gateway_name()
++    assert seen, "not re-read after the age bound"
+diff --git a/tests/tui_gateway/test_subagent_roster_scope_once.py b/tests/tui_gateway/test_subagent_roster_scope_once.py
+new file mode 100644
+index 0000000000..301fcd72c4
+--- /dev/null
++++ b/tests/tui_gateway/test_subagent_roster_scope_once.py
+@@ -0,0 +1,83 @@
++"""``subagent.roster`` / ``subagent.list`` read the observation scope once per request, not once per owner.
++
++The roster is a 0.9 Hz Desktop poll. With live children or background processes it projected one observation per
++owner, each re-reading ``local_scope()`` (kanban config, hub.db gateway name, active profile): about 0.7 ms per
++owner on the hub, 0.59% of a core during a six-owner burst. The scope is process-wide within one request, so one
++read serves every row; it is still read on every request (no cross-request cache). [daveey]
++"""
++import time
++
++from hermes_cli import kanban_execution_observations as keo
++from tests.tui_gateway import test_process_subagent_observation_rpc as rpc
++
++runtime, sleeper = rpc.runtime, rpc.sleeper
++_child, _register, _roster, _subagents = rpc._child, rpc._register, rpc._roster, rpc._subagents
++
++
++def _count_scope(monkeypatch, answer=("gw-1", "default")):
++    calls = []
++
++    def scope():
++        calls.append(1)
++        if isinstance(answer, Exception):
++            raise answer
++        return answer
++
++    monkeypatch.setattr(keo, "local_scope", scope)
++    return calls
++
++
++def test_roster_reads_scope_once_for_many_owners(runtime, sleeper, monkeypatch):
++    from tui_gateway import server
++
++    db = server._get_db()
++    for i in range(4):
++        db.create_session(f"conv-{i}", source="tui")
++        _child(runtime, f"c{i}", owner=f"conv-{i}", activity=time.time())
++    route = "agent:main:local:dm:desktop-chat-9"
++    db.create_session("local-bg", source="local", session_key=route)
++    for i in range(2):
++        _register(runtime, f"proc_{i}", sleeper().pid, session_key=route)
++    calls = _count_scope(monkeypatch)
++
++    rows = _roster(runtime)
++    assert set(rows) == {"conv-0", "conv-1", "conv-2", "conv-3", "local-bg"}
++    observed = [o for r in rows.values() for o in r["execution_observations"]]
++    assert len(observed) == 6 and all(o["identity"].get("gateway") == "gw-1" for o in observed)
++    assert len(calls) == 1, f"local_scope read {len(calls)} times for one roster request"
++    _roster(runtime)
++    assert len(calls) == 2, "the next request must read the scope again (no cross-request cache)"
++
++
++def test_subagent_list_reads_scope_once_for_many_children(runtime, monkeypatch):
++    for i in range(3):
++        _child(runtime, f"c{i}", activity=time.time())
++    calls = _count_scope(monkeypatch)
++    rows = _subagents(runtime)
++    assert set(rows) == {"c0", "c1", "c2"}
++    assert all(r["execution_observations"][0]["identity"].get("gateway") == "gw-1" for r in rows.values())
++    assert len(calls) == 1
++
++
++def test_roster_without_rows_in_this_profile_reads_no_scope(runtime, monkeypatch):
++    _child(runtime, owner="someone-elses-session", activity=time.time())
++    calls = _count_scope(monkeypatch)
++    assert _roster(runtime) == {}
++    assert calls == []
++
++
++def test_scope_failure_leaves_observations_unscoped_not_dropped(runtime, sleeper, monkeypatch):
++    from tui_gateway import server
++
++    route = "agent:main:local:dm:desktop-chat-2"
++    server._get_db().create_session("local-x", source="local", session_key=route)
++    _register(runtime, "proc_x", sleeper().pid, session_key=route)
++    _child(runtime, "c1", activity=time.time())
++    calls = _count_scope(monkeypatch, RuntimeError("scope read failed"))
++    rows = _roster(runtime)
++    assert len(calls) == 1
++    for sid in ("parent-a", "local-x"):
++        (obs,) = rows[sid]["execution_observations"]
++        assert obs["identity"].get("gateway") is None
++    (row,) = _subagents(runtime).values()
++    assert row["execution_observations"][0]["identity"].get("gateway") is None
+diff --git a/tui_gateway/methods_subagents.py b/tui_gateway/methods_subagents.py
+index ff61ed7cd7..5aa42c0634 100644
+--- a/tui_gateway/methods_subagents.py
++++ b/tui_gateway/methods_subagents.py
+@@ -50,19 +50,36 @@ def _visible_subagent_records(session_id, transport, owner):
+             or _owns_subagent_record(r, agent)]
+ 
+ 
+-def _subagent_observation(record, profile):
+-    """One v1 observation for a registry record (own activity clock, else spawn time); None on adapter failure."""
+-    from hermes_cli.kanban_execution_observations import ADAPTER_ERRORS, local_scope
++def _subagent_observation(record, profile, scope=None):
++    """One v1 observation for a registry record (own activity clock, else spawn time); None on adapter failure.
++
++    ``scope``: the RPC's ``_observation_scope()``, read once per request instead of once per record."""
++    from hermes_cli.kanban_execution_observations import ADAPTER_ERRORS
+     from hermes_cli.turn_process_execution_observations import registry_subagent as subagent
+ 
+     try:
+-        gateway, local_profile = local_scope()
++        gateway, local_profile = _observation_scope() if scope is None else scope
+         return subagent(record, gateway=gateway, profile=profile or local_profile, now=time.time())
+     except ADAPTER_ERRORS:
+         logger.debug("subagent execution observation unavailable", exc_info=True)
+         return None
+ 
+ 
++def _observation_scope():
++    """``(gateway, local profile)`` for this request's observations; ``(None, None)`` when unavailable.
++
++    Call-invariant within one RPC (process-wide config, hub.db and the launch profile, never a per-row
++    home), so a handler reads it once rather than once per child or process: per owner it cost about
++    0.7 ms of a 0.9 Hz sidebar poll."""
++    from hermes_cli.kanban_execution_observations import ADAPTER_ERRORS, local_scope
++
++    try:
++        return local_scope()
++    except ADAPTER_ERRORS:
++        logger.debug("execution observation scope unavailable", exc_info=True)
++        return None, None
++
++
+ def _profile_label(home):
+     if not home:
+         return None
+@@ -78,10 +95,11 @@ def _(rid, params):
+         return _err(rid, 4001, "session not found or not owned by this transport")
+     live = _visible_subagent_records(session_id, transport, owner)
+     profile = _profile_label(owner.get("profile_home"))
++    scope = _observation_scope() if live else None
+     rows = []
+     for r in live:
+         row = {**{key: r.get(key) for key in _SUBAGENT_SNAPSHOT_FIELDS}, "child_session_id": _child_session_id(r)}
+-        if (obs := _subagent_observation(r, profile)) is not None:
++        if (obs := _subagent_observation(r, profile, scope)) is not None:
+             row["execution_observations"] = [obs]
+         rows.append(row)
+     return _ok(rid, {
+@@ -172,23 +190,24 @@ def _(rid, params):
+                 counts.setdefault(sid, {"subagents": 0, "background": 0})[kind] += 1
+                 work.setdefault(sid, []).append((kind, item))
+     profile = _profile_label(profile_home)
++    scope = _observation_scope() if counts else None
+     sessions = []
+     for sid, c in counts.items():
+         row = {"session_id": sid, **c}
+-        if observations := _roster_observations(sid, work[sid], profile):
++        if observations := _roster_observations(sid, work[sid], profile, scope):
+             row["execution_observations"] = observations
+         sessions.append(row)
+     return _ok(rid, {"sessions": sessions})
+ 
+ 
+-def _roster_observations(sid, items, profile):
++def _roster_observations(sid, items, profile, scope=None):
+     """Observations for one conversation's counted children and processes (same projector as ``subagent.list``)."""
+     from hermes_cli.process_session_activity import process_observations
+ 
+     observations = [o for kind, item in items if kind == "subagents"
+-                    if (o := _subagent_observation(item, profile)) is not None]
++                    if (o := _subagent_observation(item, profile, scope)) is not None]
+     procs = [item for kind, item in items if kind == "background"]
+-    observations += process_observations(procs, owner=sid, profile=profile, owner_resolved=True).values()
++    observations += process_observations(procs, owner=sid, profile=profile, owner_resolved=True, scope=scope).values()
+     return observations
+ 
+ 
+-- 
+2.43.0
+

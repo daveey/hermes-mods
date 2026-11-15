@@ -198,6 +198,18 @@ class PinnedOwner(Base):
         (proc / str(pid) / "cgroup").write_text(f"0::/{slice_}/{unit}\n")
         (proc / str(pid) / "status").write_text(f"Name:\tx\nPPid:\t{ppid}\n")
         self.g.PROC = proc
+        # Fixed fixture pids are not this host's processes. The owner-card lookup reads the real ps table and
+        # /proc/<pid>/{cwd,environ}, so a live same-user process holding pid 4243 or 4244 (a Hermes worker with
+        # HERMES_OWNER_CARD, or a cwd with OWNER.md) would refuse a kill these tests expect allowed.
+        self.host_lookups = []
+        self.g._lookup_pids = lambda act: self.host_lookups.append(act) or {"status": "none"}
+
+    def test_fixed_pid_fixture_never_reads_the_host_process_table(self):
+        self._fake_proc(4243, PLAIN + ".service")
+        with mock.patch.object(subprocess, "run", side_effect=AssertionError("host ps read")) as run:
+            self.assertIsNone(self.verdict("kill 4243"))
+        run.assert_not_called()
+        self.assertEqual([a.get("pid") for a in self.host_lookups], [4243])
 
     def test_kill_of_a_child_the_pinned_gateway_spawned_allowed(self):
         """An agent inside the pinned gateway kills its own dev server: same cgroup, not the unit's main process."""

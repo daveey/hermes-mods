@@ -1,0 +1,167 @@
+From 1d739b90e91f028baf2ec0515f46c37b63f92585 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 05:29:19 +0000
+Subject: [PATCH] Scan su-mode operands past -- and resolve abbreviated
+ su/runuser long options
+
+su and su-mode runuser hand the operands after the user (even past --) to
+the shell, so a -c there is shell code. getopt_long accepts unique long
+option prefixes (--whitelist, --comm=...), which hid direct-user mode and
+-c payloads. Also treat doas -a as value-taking. Addresses review 5901861180.
+---
+ cron/lifecycle_guard_nested_shells.py         | 72 +++++++++++++++----
+ .../test_lifecycle_guard_session_aliases.py   | 26 ++++++-
+ 2 files changed, 81 insertions(+), 17 deletions(-)
+
+diff --git a/cron/lifecycle_guard_nested_shells.py b/cron/lifecycle_guard_nested_shells.py
+index 07345662f7..79d52f252b 100644
+--- a/cron/lifecycle_guard_nested_shells.py
++++ b/cron/lifecycle_guard_nested_shells.py
+@@ -130,6 +130,55 @@ def _option_words(
+     return options, index
+ 
+ 
++# util-linux su/runuser long options; getopt_long accepts any unique prefix of these.
++_SU_LONG_OPTIONS = (
++    "--command", "--session-command", "--fast", "--group", "--supp-group", "--login",
++    "--preserve-environment", "--pty", "--no-pty", "--shell", "--whitelist-environment",
++    "--user", "--help", "--version",
++)
++
++
++def _su_long_option(word: str) -> str:
++    """*word* with an abbreviated su/runuser long option spelled out (``--whitelist`` ->
++    ``--whitelist-environment``, ``--comm=x`` -> ``--command=x``); other words unchanged."""
++    if not word.startswith("--") or word == "--":
++        return word
++    name, equals, value = word.partition("=")
++    if name in _SU_LONG_OPTIONS:
++        return word
++    matches = [option for option in _SU_LONG_OPTIONS if option.startswith(name)]
++    return matches[0] + equals + value if len(matches) == 1 else word
++
++
++def _su_payload(words: list[str]) -> Optional[str]:
++    """The first ``-c``/``--command``/``--session-command`` value anywhere in su-mode *words*
++    (long options already spelled out), including clustered and glued short forms. Operands
++    after the user, even past ``--``, reach the shell, so nothing stops the scan."""
++    for position, word in enumerate(words):
++        following = words[position + 1] if position + 1 < len(words) else None
++        if word.startswith("--"):
++            name, equals, value = word.partition("=")
++            if name in ("--command", "--session-command"):
++                if equals:
++                    return value
++                if following is not None:
++                    return following
++            continue
++        if not word.startswith("-") or word == "-":
++            continue
++        for letter_index, letter in enumerate(word[1:], 1):
++            if letter in "sgGuw":
++                break  # takes a value: the rest of the word (or the next one) is not flags
++            if letter == "c":
++                glued = word[letter_index + 1:]
++                if glued:
++                    return glued
++                if following is not None:
++                    return following
++                break
++    return None
++
++
+ def _shell_inputs(arguments: list[str], shell: str) -> tuple[str, Optional[str]]:
+     """What a POSIX *shell* given *arguments* parses as code: ``("payload", text)`` for ``-c``,
+     ``("script", path)`` for a script operand, else ``("stdin", None)``."""
+@@ -173,8 +222,8 @@ def _nested_shell_input(view: list[str]) -> Optional[tuple[str, Optional[str]]]:
+         return None
+     name = _executable_name(view[index])
+     if name in ("su", "runuser"):
+-        options = view[index + 1:]
+-        direct_user = any(
++        options = [_su_long_option(word) for word in view[index + 1:]]
++        direct_user = name == "runuser" and any(
+             word == "--user" or word.startswith("--user=")
+             or re.fullmatch(r"-[mpPl]*u.*", word)
+             for word in _option_words(options, frozenset("ucsgGw"), frozenset({
+@@ -182,19 +231,14 @@ def _nested_shell_input(view: list[str]) -> Optional[tuple[str, Optional[str]]]:
+                 "--supp-group", "--whitelist-environment",
+             }))[0]
+         )
+-        if name == "su" or not direct_user:
+-            # Direct-user runuser executes argv, not a shell command string.
+-            # Even in shell mode, -- ends the wrapper's option namespace.
+-            for position, word in enumerate(options):
+-                if word == "--":
+-                    break
+-                if word.startswith("--command="):
+-                    return "payload", word.partition("=")[2]
+-                if word in ("-c", "--command") and position + 1 < len(options):
+-                    return "payload", options[position + 1]
+-            return "stdin", None
++        if not direct_user:
++            # Direct-user runuser executes argv, not a shell command string. In su mode the
++            # operands after the user (even after `--`) are handed to the shell, so a `-c`
++            # anywhere is shell code: scan every word and fail closed.
++            payload = _su_payload(options)
++            return ("payload", payload) if payload is not None else ("stdin", None)
+     if name == "doas":
+-        options, _operand = _option_words(view[index + 1:], frozenset("uC"))
++        options, _operand = _option_words(view[index + 1:], frozenset("auC"))
+         if any(re.fullmatch(r"-[A-Za-z]*s[A-Za-z]*", word) for word in options):
+             return "stdin", None
+     if name == "sudo":
+diff --git a/tests/cron/test_lifecycle_guard_session_aliases.py b/tests/cron/test_lifecycle_guard_session_aliases.py
+index c07c60f9e5..f189518890 100644
+--- a/tests/cron/test_lifecycle_guard_session_aliases.py
++++ b/tests/cron/test_lifecycle_guard_session_aliases.py
+@@ -261,6 +261,21 @@ _NESTED_FOREIGN_SHELLS = [
+     "BASH_ENV=x bash <<< 't ( bash {db} )'",
+     "BASH_ENV=x bash < {script}",
+     "ENV=x sh -i -c 't ( bash {db} )'",
++    # su-mode operands after the user, even past `--`, reach the shell (`bash -c CMD`).
++    "su -- bob -c 't ( bash {db} )'",
++    "runuser -- bob -c 't ( bash {db} )'",
++    "su bob -c 't ( bash {db} )'",
++    "su -lc 't ( bash {db} )' bob",
++    "su -c't ( bash {db} )' bob",
++    # getopt_long accepts unique long-option prefixes.
++    "runuser --whitelist -u bob <<< 't ( bash {db} )'",
++    "runuser --white -u bob <<< 't ( bash {db} )'",
++    "runuser --supp -u bob <<< 't ( bash {db} )'",
++    "runuser --gro -u bob <<< 't ( bash {db} )'",
++    "runuser --comm='t ( bash {db} )' bob",
++    "runuser --com 't ( bash {db} )' bob",
++    "su --sess='t ( bash {db} )' bob",
++    "doas -a style -s <<< 't ( bash {db} )'",
+ ]
+ 
+ 
+@@ -296,8 +311,10 @@ def test_nested_login_shell_body_treats_names_as_unknown(tmp_path, live_kanban_d
+     "runuser -u bob -- printf '%s\\n' -c 't ( bash {db} )'",
+     "runuser -u bob printf '%s\\n' --command='t ( bash {db} )'",
+     "runuser --user=bob printf '%s\\n' -c 't ( bash {db} )'",
+-    "su -- bob --command='t ( bash {db} )'",
+-    "runuser -- bob -c 't ( bash {db} )'",
++    "runuser --us bob -- cat <<< 't ( bash {db} )'",
++    "runuser --u=bob -- printf '%s\\\\n' -c 't ( bash {db} )'",
++    "runuser --white HOME -u bob -- cat <<< 't ( bash {db} )'",
++    "runuser --supp=root --us=bob -- cat <<< 't ( bash {db} )'",
+ ])
+ def test_plain_child_shell_keeps_session_names(tmp_path, live_kanban_db, shape):
+     """Controls: no login/interactive shell, so the session's names still decide (#2358)."""
+@@ -324,7 +341,10 @@ def test_runuser_value_options_preserve_direct_stdin(tmp_path, live_kanban_db, o
+         False, None)
+ 
+ 
+-@pytest.mark.parametrize("option", ["--group", "--supp-group", "--whitelist-environment", "-g", "-G", "-w"])
++@pytest.mark.parametrize("option", [
++    "--group", "--supp-group", "--whitelist-environment", "-g", "-G", "-w",
++    "--gr", "--supp", "--whitelist", "--w",
++])
+ def test_runuser_option_value_is_not_user_switch(tmp_path, live_kanban_db, option):
+     """A flag-looking value cannot prove direct-user mode and suppress the shell walk."""
+     text = f"runuser {option} -u bob <<< 't ( bash {live_kanban_db} )'"
+-- 
+2.43.0
+

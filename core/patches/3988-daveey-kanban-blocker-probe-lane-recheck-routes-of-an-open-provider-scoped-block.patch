@@ -1,0 +1,163 @@
+From 04808b222ec7d6d4b3f4c226e7fd32370b0b330e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 22:07:55 +0000
+Subject: [PATCH] [daveey] kanban blocker probe lane: recheck routes of an open
+ provider-scoped blocker on a 300 s cadence (G2 follow-up)
+
+Follow-up to PR #2677 (G2), exact-head review 5898596145 (card t_01a1d6ea60f68015).
+
+Defect: the G2 gate on `dispatch.shared_blocker_probed` keys on the board content revision, this gateway's id and
+the main config signature. For a provider-scoped blocker, `probe_stranded_blockers` decides which cards behind it
+count through `task_applies -> task_route`, which also reads inputs outside that key: the assignee profile's
+config.yaml (`_assignee_config`), the effective user/managed config (`class_unroutable_reason`), provider walls and
+quota episodes that end with time. When a blocked card's route moved into the blocker's scope with no board write,
+`ids` was empty, nothing was appended to `due_out`, and the lane stayed skipped until the next content write or the
+14-day lookback exit: unbounded on a quiet board.
+
+Fix: while a provider-scoped blocker is open with cards behind it, the probe lane appends
+`now + ROUTE_RECHECK_SECONDS` (300 s) to its due times. A bounded cadence instead of a fingerprint because the
+route's inputs include clocks (wall/episode expiry) that no file signature captures. Unscoped blockers are
+unchanged (their scope never reads routes).
+
+Proof:
+- RED -> GREEN: test_scoped_blocker_probe_reruns_when_a_route_enters_its_scope_with_no_board_write fails on
+  62dd71093e (`assert [] == ['t_...']`: the lane stays gated after the assignee route flips with the revision
+  unchanged) and passes here; the same test shows the lane is still skipped one tick later with nothing moved.
+- test_unscoped_blocker_adds_no_route_recheck pins the scope condition.
+- Mutants killed: drop `st.blocker_provider` (2 sweep_gate tests fail); drop `due_out is not None`
+  (test_stranded_probe_ignores_other_provider_running fails); drop the append (the RED above).
+- test_kanban_sweep_gate, test_kanban_shared_blockers, test_kanban_ci_progress: 160 passed.
+- scripts/check --only health: ok.
+
+Budget (hub `default` board copy, 2026-11-13 22:05 UTC; scripts/kanban_reclaim_replay_bench.py, 120 ticks):
+- replay 1800 s (100 write ticks): 62dd71093e 48.0 ms/tick (0.32% of a core) vs this head 50.8 ms (0.34%);
+  write-free: 24.5 vs 24.7 ms (0.16%). The board has no blocked card now, so the probe lane does not run in either;
+  the difference is run noise.
+- Cadence cost, upper bound measured on the same copy: blocker_states 11.6 ms + task_route for 50 cards 110.5 ms
+  = 122 ms per recheck; at one recheck per 300 s that is 0.04% of a core, only while a provider-scoped blocker is
+  open with cards behind it.
+---
+ hermes_cli/kanban_idle_candidates.py       |  4 +-
+ hermes_cli/kanban_shared_blockers.py       |  7 +++
+ tests/hermes_cli/test_kanban_sweep_gate.py | 68 ++++++++++++++++++++++
+ 3 files changed, 78 insertions(+), 1 deletion(-)
+
+diff --git a/hermes_cli/kanban_idle_candidates.py b/hermes_cli/kanban_idle_candidates.py
+index 403d7541ad..f05d65de0e 100644
+--- a/hermes_cli/kanban_idle_candidates.py
++++ b/hermes_cli/kanban_idle_candidates.py
+@@ -64,7 +64,9 @@ def sweep_shared_blockers(conn, result) -> None:
+     [daveey] G2: each lane also skips while the board's content revision, this gateway's id and the config hold
+     and none of its clocks ran out (``kanban_sweep_gate``). Both lanes read only content rows (``task_runs``
+     outcomes and metadata, statuses, events). Their clocks: the probe interval of a blocker the probe lane deferred,
+-    and the 14-day lookback, whose oldest assertion leaving the window reruns both lanes."""
++    the 14-day lookback, whose oldest assertion leaving the window reruns both lanes, and the route recheck of an
++    open provider-scoped blocker (``ROUTE_RECHECK_SECONDS``): the probe lane's scope test reads routes, whose
++    config/wall inputs are not in the key."""
+     from hermes_cli import kanban_db as kb
+     from hermes_cli.kanban_shared_blockers import probe_stranded_blockers, release_cleared_blockers
+     from hermes_cli.kanban_sweep_gate import config_key, gated
+diff --git a/hermes_cli/kanban_shared_blockers.py b/hermes_cli/kanban_shared_blockers.py
+index 08fb8e029d..0d0fcb5a5e 100644
+--- a/hermes_cli/kanban_shared_blockers.py
++++ b/hermes_cli/kanban_shared_blockers.py
+@@ -70,6 +70,11 @@ GUARD_REASON = "shared_blocker"
+ CLEARED_EVENT = "shared_blocker_cleared"
+ PROBE_RELEASED_EVENT = "shared_blocker_probe_released"
+ DEFAULT_PROBE_SECONDS = 1800
++# [daveey] G2 follow-up: which cards a provider-scoped blocker holds comes from ``task_route``, whose inputs sit
++# outside the probe lane's gate key: the assignee profile's config, the effective user/managed config, provider
++# walls and quota episodes that end with time. A route can enter the scope with no board write, so while a scoped
++# blocker is open the lane rechecks on this cadence instead of waiting for the next content write.
++ROUTE_RECHECK_SECONDS = 300
+ MAX_BLOCKER_ID_CHARS = 64
+ # Outcomes that prove nothing about an external condition.
+ NEUTRAL_OUTCOMES = frozenset({
+@@ -597,6 +602,8 @@ def probe_stranded_blockers(conn: sqlite3.Connection, *, now: Optional[int] = No
+     for st in blocker_states(conn, now=now, oldest_out=due_out).values():
+         if not st.is_open or not st.behind:
+             continue
++        if st.blocker_provider and due_out is not None:
++            due_out.append(now + ROUTE_RECHECK_SECONDS)
+         ids = sorted(t for t in st.behind if task_applies(conn, st, t))
+         if not ids:
+             continue
+diff --git a/tests/hermes_cli/test_kanban_sweep_gate.py b/tests/hermes_cli/test_kanban_sweep_gate.py
+index 579069a55d..732eadfcbe 100644
+--- a/tests/hermes_cli/test_kanban_sweep_gate.py
++++ b/tests/hermes_cli/test_kanban_sweep_gate.py
+@@ -348,3 +348,71 @@ def test_stranded_blocker_probe_runs_when_its_interval_ends_with_no_other_change
+         sweep_shared_blockers(conn, r)
+         assert r.shared_blocker_probed == [tid]
+         assert kb.get_task(conn, tid).status != "blocked"
++
++
++def test_scoped_blocker_probe_reruns_when_a_route_enters_its_scope_with_no_board_write(home, monkeypatch):
++    """G2 follow-up (review 5898596145): ``task_applies`` reads the assignee's config, outside the gate key. A
++    blocked card whose route moves into a provider-scoped blocker's scope with no board write is probed within
++    ``ROUTE_RECHECK_SECONDS``, not at the next content write or the 14-day lookback exit."""
++    from unittest import mock
++
++    from hermes_cli import kanban_model_assignment as assignment
++    from hermes_cli import kanban_model_tier as tier
++    from hermes_cli import kanban_shared_blockers as ksb
++    from hermes_cli import kanban_timed_park as ktp
++    from hermes_cli.kanban_idle_candidates import sweep_shared_blockers
++
++    profile = {"model": {"default": "gpt-5", "provider": "openai-codex"}}  # the assignee's config.yaml
++    monkeypatch.setattr(tier, "load_tier_config", dict)
++    monkeypatch.setattr(assignment, "_assignee_config", lambda _a: profile)
++    monkeypatch.setattr(ksb, "probe_interval_seconds", lambda cfg=None: 1800)
++    t0 = int(time.time())
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="behind", assignee="default")
++        assert kb.claim_task(conn, tid)
++        with mock.patch.object(ktp, "park_mode", lambda *a, **k: None):  # a plain ``blocked`` card, no wake
++            assert kb.block_task(conn, tid, reason="wall", kind="capability", blocker_id="wall-a",
++                                 blocker_provider="anthropic")
++        st = ksb.blocker_states(conn)["wall-a"]
++        assert st.is_open and st.blocker_provider == "anthropic"
++        assert not ksb.task_applies(conn, st, tid)  # routed to openai-codex: outside the scope
++
++        class R:
++            shared_blocker_released = shared_blocker_probed = None
++
++        clock = {"t": t0 + 1801}  # the probe interval is over: only the scope keeps the card unprobed
++        monkeypatch.setattr(kb.time, "time", lambda: clock["t"])
++        r = R()
++        sweep_shared_blockers(conn, r)
++        assert r.shared_blocker_probed == []
++        revision = _revision(conn)
++        _, skips0 = _runs("dispatch.shared_blocker_probed")
++        clock["t"] += 15  # one more tick, nothing moved: still gated (the cadence keeps the budget)
++        sweep_shared_blockers(conn, r)
++        assert _runs("dispatch.shared_blocker_probed")[1] == skips0 + 1
++
++        profile["model"] = {"default": "claude-opus-4", "provider": "anthropic"}  # no board write
++        assert ksb.task_applies(conn, st, tid)
++        assert _revision(conn) == revision
++        clock["t"] = t0 + 1801 + 300  # the stated cadence (ksb.ROUTE_RECHECK_SECONDS)
++        sweep_shared_blockers(conn, r)
++        assert r.shared_blocker_probed == [tid]
++        assert kb.get_task(conn, tid).status != "blocked"
++
++
++def test_unscoped_blocker_adds_no_route_recheck(home, monkeypatch):
++    """The cadence is only for provider-scoped blockers: an unscoped one holds every card whatever its route."""
++    from unittest import mock
++
++    from hermes_cli import kanban_shared_blockers as ksb
++    from hermes_cli import kanban_timed_park as ktp
++
++    t0 = int(time.time())
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="behind", assignee="default")
++        assert kb.claim_task(conn, tid)
++        with mock.patch.object(ktp, "park_mode", lambda *a, **k: None):
++            assert kb.block_task(conn, tid, reason="wall", kind="capability", blocker_id="wall-x")
++        due: list = []
++        assert ksb.probe_stranded_blockers(conn, now=t0 + 10, interval=1800, due_out=due) == []
++        assert due and min(due) > t0 + 10 + 300  # the probe interval's end, not a route recheck
+-- 
+2.43.0
+

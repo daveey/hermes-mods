@@ -17,6 +17,15 @@ Every launched child and every created card is recorded per parent session in `<
 or `Kanban card <id> on board <b>`), so don't offer or redo them. Later plans for that session (and its compressed
 continuations) skip them too. Each child's brief already ends with an `@session` pointer back to the parent.
 
+## A child takes over the parent's cards
+
+A brief often hands over a card ("Drive kanban card t_… to completion"). On the child's first turn the agent hook
+links every card that the brief names, that the parent chat is linked to (an unreleased `task_chat_links` row or a
+`tui` subscription), and that is still open to the child chat. It uses core's `adopt_next_step`: `hermes kanban
+notify-subscribe … --platform tui` for a card on this gateway, `hermes-hub adopt-task` for another gateway's card.
+The child gets a `[spin-out]` note listing what it now owns. If a link fails, the note gives the exact command to
+run. Without this, the child's task list stayed empty while it waited on the card (kanban-abb8d6e8a7).
+
 ## When it appears
 
 - **Automatically, when a turn finishes** in the focused session and its last reply mentions follow-up work

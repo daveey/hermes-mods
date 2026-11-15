@@ -30,6 +30,12 @@ def _no_land_turn(monkeypatch):
     # fixtures below explicitly restore the helper; never contact GitHub in tests.
     if hasattr(g, "_git_merge_tree_refusal"):
         monkeypatch.setattr(g, "_git_merge_tree_refusal", lambda *a: "")
+    # The carry starts its head fetch with the ancestry walk (t_01a1dadbf711c31c): without the verifier no
+    # fetch is read, so the prefilter reads its fakes below through gh, as with the lazy fetch before.
+    monkeypatch.setattr(g._CarryObjects, "_fetch", lambda self: "git fetch is not run in these tests")
+
+
+REAL_FETCH = g._CarryObjects._fetch
 
 R = "example/protected"
 H0 = "1fd079c68f8cc4aa5f887df5e6d3668945b68149"     # #2438's approved head
@@ -173,11 +179,13 @@ def test_patch_identical_update_branch_head_admitted(monkeypatch):
     calls = fake(monkeypatch)
     assert check() is None
     paths = [c[-1] for c in calls[1:]]
-    assert paths[:4] == [f"repos/{R}/compare/{H0}...{H}", f"repos/{R}/compare/{BASE_TIP}...state",
-                         f"repos/{R}/compare/state...{H0}", f"repos/{R}/compare/state...{H}"]
-    # then the merge's tree against the clean merge of its parents (trees read in parallel)
-    assert paths[4] == f"repos/{R}/compare/{H0}...{BASE_TIP}"
-    assert sorted(paths[5:9]) == sorted(tree_path(s) for s in (STATE_OLD, H0, BASE_TIP, H))
+    assert paths[0] == f"repos/{R}/compare/{H0}...{H}"
+    # Independent identity and immutable merge proofs overlap, but none is omitted.
+    assert sorted(paths[1:9]) == sorted([
+        f"repos/{R}/compare/{BASE_TIP}...state", f"repos/{R}/compare/state...{H0}",
+        f"repos/{R}/compare/state...{H}", f"repos/{R}/compare/{H0}...{BASE_TIP}",
+        *(tree_path(s) for s in (STATE_OLD, H0, BASE_TIP, H)),
+    ])
     assert paths[9:] == [f"repos/{R}/compare/{STATE_OLD}...state"]   # then the base-drift gate still runs
 
 
@@ -262,6 +270,61 @@ def test_more_merges_than_the_cap_refused(monkeypatch):
     fake(monkeypatch, answers={f"repos/{R}/compare/{H0}...{H}": {"status": "ahead", "behind_by": 0,
                                                                   "commits": commits}})
     assert f"more than {g._CARRY_MERGES} commits" in check()
+
+
+def test_two_base_merges_with_forty_newer_commits_fit_full_budget(monkeypatch):
+    import time
+    mid, tip2 = "c" * 40, "d" * 40
+    cmp = {"status": "ahead", "behind_by": 0, "commits": [node(mid, H0, BASE_TIP), node(H, mid, tip2)]}
+    notes3 = "b3" * 20
+    drift = {"status": "ahead", "behind_by": 0, "total_commits": 40,
+             "commits": [{"sha": f"{i:040x}", "commit": {"message": "sync: fixture"}} for i in range(40)],
+             "files": [{"filename": "docs/unrelated.md"}]}
+    trees = {mid: tree(FILES[H]), tip2: tree({**FILES[BASE_TIP], "docs/notes.md": notes3}),
+             H: tree({**FILES[H], "docs/notes.md": notes3})}
+    calls = fake(monkeypatch, answers={
+        f"repos/{R}/compare/{H0}...{H}": cmp, f"repos/{R}/compare/{tip2}...state": ON_STATE,
+        f"repos/{R}/compare/{STATE_OLD}...state": drift,
+        f"repos/{R}/compare/{mid}...{tip2}": merge_base(BASE_TIP),
+        **{tree_path(sha): t for sha, t in trees.items()}})
+    trees.update({sha: tree(files) for sha, files in FILES.items() if sha not in trees})
+    run = g.subprocess.run
+    def latent(argv, **kwargs):
+        if argv[0] == 'gh':
+            time.sleep(1.8)  # measured per-call transport latency, not a zero-cost API fake
+        return run(argv, **kwargs)
+    verified, fetched = [], []
+    # The authoritative check's one fetch of the chain (t_01a1da82db1127a5) takes 3 s; the prefilter reads
+    # its trees and merge bases from that fetch, as `git ls-tree -r -l -z` and `git merge-base --all` answer
+    # them, instead of through gh.
+    def fetch(objects):
+        time.sleep(3)
+        fetched.append(list(objects.shas))
+        objects.path = "fetched"
+        return ''
+    def local_git(objects, *args, binary=False):
+        if args[:2] == ("merge-base", "--all"):       # the prefilter's merge bases come from the fetch too
+            return {(H0, BASE_TIP): STATE_OLD, (mid, tip2): BASE_TIP}[args[2:4]]
+        assert args[:4] == ("ls-tree", "-r", "-l", "-z"), args
+        return b"".join(f"{e['mode']} {e['type']} {e['sha']} {e.get('size', '-'):>7}\t{e['path']}\0".encode()
+                        for e in trees[args[4]]["tree"] if e["type"] != "tree")
+    monkeypatch.setattr(g.subprocess, 'run', latent)
+    monkeypatch.setattr(g, '_git_merge_tree_refusal', GIT_VERIFY)
+    monkeypatch.setattr(g._CarryObjects, '_fetch', fetch)
+    monkeypatch.setattr(g._CarryObjects, 'git', local_git)
+    monkeypatch.setattr(g._CarryObjects, 'verify', lambda objects, merge, *a: verified.append(merge) or '')
+    start = time.monotonic()
+    result = g.bounded_preflight(g.check_tool, 'terminal', {'command': ' '.join(CMD)},
+                                 repos={R}, env={'GH_REPO': R})
+    elapsed = time.monotonic() - start
+    assert result is None, result
+    assert elapsed < 12, elapsed
+    assert sorted(verified) == sorted([mid, H])
+    assert fetched == [[H]]          # one fetch of the head serves the whole chain (t_01a1dadbf711c31c)
+    assert not [c for c in calls if "/git/trees/" in c[-1] or "/git/blobs/" in c[-1]]
+    gh_bases = (f"repos/{R}/compare/{H0}...{BASE_TIP}", f"repos/{R}/compare/{mid}...{tip2}")
+    assert not [c for c in calls if c[-1] in gh_bases]       # merge bases came from the fetch as well
+    assert calls[-1][-1] == f"repos/{R}/compare/{STATE_OLD}...state"
 
 
 def test_two_base_merges_admitted(monkeypatch):
@@ -656,6 +719,54 @@ def test_unreadable_blob_refused(monkeypatch, which, answer, reason):
     assert why and reason in why and "a clean merge cannot be shown" in why
 
 
+@pytest.mark.parametrize("tampered", [False, True], ids=["valid", "wrong-content"])
+def test_carry_blob_checks_local_object_hash_without_fallback(monkeypatch, tampered):
+    data = b"fetched blob\n"
+    sha = blob_sha(data)
+    reads = []
+
+    def local_blob(requested):
+        reads.append(requested)
+        # Same length: rejection must depend on the content-addressed hash, not size.
+        return b"altered blob\n" if tampered else data
+
+    def no_fallback(*args):
+        pytest.fail("a local blob must be verified without an API fallback")
+
+    monkeypatch.setattr(g, "_blob", no_fallback)
+    objects = SimpleNamespace(blob=local_blob)
+    if tampered:
+        with pytest.raises(g._Unreadable, match=f"blob {sha[:10]} does not hash to its id"):
+            g._carry_blob(sha, len(data), R, None, {}, objects)
+    else:
+        assert g._carry_blob(sha, len(data), R, None, {}, objects) == data
+    assert reads == [sha]
+
+
+@pytest.mark.parametrize("has_objects", [False, True], ids=["no-objects", "local-miss"])
+@pytest.mark.parametrize("tampered", [False, True], ids=["valid", "wrong-content"])
+def test_carry_blob_fallback_keeps_hash_verification(monkeypatch, has_objects, tampered):
+    data = b"fallback blob\n"
+    sha = blob_sha(data)
+    calls = fake(monkeypatch, answers={
+        f"repos/{R}/git/blobs/{sha}": blob_answer(b"tampered blob\n" if tampered else data),
+    })
+    reads = []
+
+    def local_miss(requested):
+        reads.append(requested)
+        return None
+
+    objects = SimpleNamespace(blob=local_miss) if has_objects else None
+    if tampered:
+        with pytest.raises(g._Unreadable, match=f"blob {sha[:10]} does not hash to its id"):
+            g._carry_blob(sha, len(data), R, None, {}, objects)
+    else:
+        assert g._carry_blob(sha, len(data), R, None, {}, objects) == data
+    assert reads == ([sha] if has_objects else [])
+    assert len(calls) == 1 and calls[0][-1] == f"repos/{R}/git/blobs/{sha}"
+
+
 def test_oversized_blob_is_never_read(monkeypatch):
     big = g._MERGE_BLOB_BYTES + 1
     calls = shared(monkeypatch, ours=("100644", blob_sha(SHARED["ours"]), big))
@@ -684,6 +795,9 @@ RELOC_MOVED = RELOC_STATE[:RELOC_STATE.rindex("    c = 3\n")] + "    c = 3\n" + 
     RELOC_STATE.rindex("    c = 3\n") + len("    c = 3\n"):]
 
 
+REAL_REPO = {}
+
+
 @pytest.fixture(scope="module")
 def real_merges(tmp_path_factory):
     """(h0, {name: merge head}, answers) from a real repository: the PR adds `log(a)` to first() and changes line 1
@@ -705,6 +819,7 @@ def real_merges(tmp_path_factory):
         git("add", "-A")
 
     git("init", "-q", "-b", "state")
+    REAL_REPO["path"] = repo
     write(build_py=RELOC_STATE, notes_txt="one\n", shared_txt=SHARED["base"])
     git("commit", "-q", "-m", "base")
     git("checkout", "-q", "-b", "pr")
@@ -778,6 +893,61 @@ def test_real_edited_merge_refused(monkeypatch, real_merges):
     assert not ok and ("patch changed" in why or "at build.py" in why)
 
 
+def carry_local(monkeypatch, tmp_path, real_merges, name, fetch_failure=False):
+    """The carry with the real authoritative check fetching from the fixture repository (t_01a1da82db1127a5):
+    gh answers compares and diffs; trees and blobs are answered by gh only when `fetch_failure`."""
+    h0, heads, answers = real_merges
+    if not fetch_failure:
+        answers = {k: v for k, v in answers.items() if "/git/trees/" not in k and "/git/blobs/" not in k}
+    calls = fake(monkeypatch, answers=answers)
+    gh, fetches, url = g.subprocess.run, [], f"https://github.com/{R}.git"
+
+    def run(argv, **kwargs):
+        if argv[0] != "git" or argv[:2] in (["git", "patch-id"], ["git", "merge-file"]):
+            return gh(argv, **kwargs)
+        if "fetch" in argv:
+            fetches.append(argv[argv.index(url) + 1:])
+            if fetch_failure:
+                return SimpleNamespace(returncode=128, stdout="", stderr="unreadable remote")
+            argv = [str(REAL_REPO["path"]) if a == url else a for a in argv]
+        return REAL_RUN(argv, **kwargs)
+    monkeypatch.setattr(g.subprocess, "run", run)
+    monkeypatch.setattr(g, "_git_merge_tree_refusal", GIT_VERIFY)
+    monkeypatch.setattr(g._CarryObjects, "_fetch", REAL_FETCH)
+    data = payload([review(f"Independent exact-head review at {h0}. **Verdict: approve**", commit=h0)])
+    env = {"HERMES_HOME": str(tmp_path / "home")}
+    result = g._carried_approval(heads[name], data, R, None, env)
+    assert not list((tmp_path / "home" / "cache").iterdir())       # the shared fetch is removed
+    return result, calls, fetches
+
+
+def test_prefilter_reads_trees_and_blobs_from_the_authoritative_fetch(monkeypatch, tmp_path, real_merges):
+    (ok, h0), calls, fetches = carry_local(monkeypatch, tmp_path, real_merges, "clean")
+    assert ok and h0 == real_merges[0]
+    assert len(fetches) == 1                       # one fetch serves both checks
+    # The content merge of shared.txt ran on blobs from the fetch: no gh tree or blob read at all.
+    assert not [c for c in calls if "/git/trees/" in c[-1] or "/git/blobs/" in c[-1]]
+
+
+def test_local_prefilter_keeps_its_refusal_and_priority(monkeypatch, tmp_path, real_merges):
+    (ok, why), calls, _ = carry_local(monkeypatch, tmp_path, real_merges, "relocated")
+    # Both checks refuse; the prefilter's reason (the path) still wins over git merge-tree's.
+    assert not ok and "its tree differs from the clean merge" in why and "at build.py" in why
+    assert "computed by git merge-tree" not in why
+    assert not [c for c in calls if "/git/trees/" in c[-1] or "/git/blobs/" in c[-1]]
+
+
+@pytest.mark.parametrize("name", ["clean", "relocated"])
+def test_refused_fetch_falls_back_to_gh_reads(monkeypatch, tmp_path, real_merges, name):
+    (ok, why), calls, fetches = carry_local(monkeypatch, tmp_path, real_merges, name, fetch_failure=True)
+    assert not ok and len(fetches) == 1
+    assert [c for c in calls if "/git/trees/" in c[-1]]       # the prefilter read through gh as before
+    if name == "clean":
+        assert "git fetch exited 128" in why
+    else:
+        assert "at build.py" in why and "git fetch" not in why
+
+
 # Authoritative Git verifier: real fetch/merge-tree, only the remote URL is local.
 GIT_VERIFY = g._git_merge_tree_refusal
 
@@ -845,8 +1015,141 @@ def local_git_verifier(monkeypatch, tmp_path, repo, failure=None):
         return REAL_RUN(argv, **kw)
 
     monkeypatch.setattr(g.subprocess, "run", run)
+    monkeypatch.setattr(g._CarryObjects, "_fetch", REAL_FETCH)
     assert GIT_VERIFY is not None, "real merge-tree verifier missing"
     return calls
+
+
+def test_head_only_fetch_preserves_depth_for_oldest_carried_merge(monkeypatch, tmp_path, git_history):
+    """Real shallow history: three carry merges must not consume the tips' depth budget."""
+    import os
+    repo, heads = git_history
+    _, approved, theirs = heads["clean"]
+
+    def git(*args):
+        return REAL_RUN(["git", "-c", "user.name=test", "-c", "user.email=test@example.com",
+                         "-c", "core.hooksPath=/dev/null", *args], cwd=repo,
+                        env={**os.environ, "GIT_AUTHOR_DATE": "2026-11-13T17:00:00Z",
+                             "GIT_COMMITTER_DATE": "2026-11-13T17:00:00Z"},
+                        capture_output=True, text=True, check=True).stdout.strip()
+
+    tree = git("rev-parse", approved + "^{tree}")
+    ours = approved
+    # Fixed boundary, not derived from the production depth (a changed budget must fail).
+    for i in range(125):
+        ours = git("commit-tree", tree, "-p", ours, "-m", f"reviewed history {i}")
+    oldest = None
+    head = ours
+    for i in range(3):
+        merged_tree = git("merge-tree", "--write-tree", head, theirs)
+        merge = git("commit-tree", merged_tree, "-p", head, "-p", theirs, "-m", f"carry {i}")
+        if oldest is None:
+            oldest = (merge, head, theirs)
+        head = merge
+    assert oldest is not None
+    local_git_verifier(monkeypatch, tmp_path, repo)
+    env = {"HERMES_HOME": str(tmp_path / "home")}
+    # Control: the previous per-merge fetch can prove this oldest merge.
+    assert GIT_VERIFY(*oldest, R, None, env) == ""
+    objects = g._CarryObjects(R, env, (head,), chain=True)
+    try:
+        assert objects.fetch() == ""
+        # No stubbed verify or depth-argv assertion: merge-base and merge-tree run on fetched objects.
+        assert objects.verify(*oldest) == ""
+        assert objects.merge_base(oldest[1], oldest[2]) == git("merge-base", oldest[1], oldest[2])
+    finally:
+        objects.close()
+
+
+@pytest.mark.parametrize("owner", ["shared", "per-call", "git-verifier"])
+@pytest.mark.parametrize("outcome", ["success", "refusal", "exception"])
+def test_owned_carry_store_explicitly_closes_before_return(
+        monkeypatch, tmp_path, git_history, owner, outcome):
+    repo, heads = git_history
+    merge, ours, theirs = heads["clean"]
+    local_git_verifier(monkeypatch, tmp_path, repo)
+    retained = []
+    original_init = g._CarryObjects.__init__
+
+    def retain(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        retained.append(self)  # Prevent TemporaryDirectory's finalizer masking a missing close().
+    monkeypatch.setattr(g._CarryObjects, "__init__", retain)
+
+    def result():
+        if outcome == "exception":
+            raise g._Unreadable("injected proof error")
+        return "" if outcome == "success" else "injected proof refusal"
+
+    def chain(head, h0, repo, cwd, env, objects):
+        assert objects.fetch() == ""
+        assert Path(objects.path).is_dir()
+        why = result()
+        return (not why, why or h0)
+
+    if owner == "git-verifier":
+        def verify(self, *args):
+            assert Path(self.path).is_dir()
+            return result()
+        monkeypatch.setattr(g._CarryObjects, "verify", verify)
+    else:
+        monkeypatch.setattr(g, "_carry_chain", chain)
+    env = {"HERMES_HOME": str(tmp_path / "home")}
+
+    def call():
+        if owner == "shared":
+            data = payload([review(f"Independent exact-head review at {ours}. **Verdict: approve**", commit=ours)])
+            return g._carried_approval(merge, data, R, None, env)
+        if owner == "per-call":
+            return g._carry_one(merge, ours, False, R, None, env)
+        return GIT_VERIFY(merge, ours, theirs, R, None, env)
+
+    try:
+        if outcome == "exception":
+            with pytest.raises(g._Unreadable, match="injected proof error"):
+                call()
+        else:
+            answer = call()
+            if owner == "git-verifier":
+                assert answer == ("" if outcome == "success" else "injected proof refusal")
+            else:
+                assert answer == ((True, ours) if outcome == "success" else (False, "injected proof refusal"))
+        assert len(retained) == 1
+        assert retained[0]._settled.is_set()
+        assert retained[0].path is not None
+        assert not Path(retained[0].path).exists(), "owned store leaked before finalization"
+    finally:
+        # Test cleanup even on a mutant's failed assertion; never rely on GC here either.
+        for objects in retained:
+            objects.close()
+
+
+@pytest.mark.parametrize("local_result", ["valid", "multiple", "cut", "unreadable", "not-ready"])
+def test_local_merge_base_refusal_uses_api_fallback(monkeypatch, local_result):
+    objects = g._CarryObjects(R, {}, (H,), chain=True)
+    objects._why = "fetch refused" if local_result == "not-ready" else ""
+    objects.settle()
+    api_calls = []
+
+    def base(ours, theirs):
+        assert (ours, theirs) == (H0, BASE_TIP)
+        if local_result == "unreadable":
+            raise g._Unreadable("git merge-base exited 1")
+        if local_result == "valid":
+            return STATE_OLD, ""
+        return "", ("merge base is unreadable or multiple (cannot prove bounded history)"
+                    if local_result == "multiple" else "fetch depth cuts history before the merge base")
+
+    def api(path, cwd, env):
+        api_calls.append(path)
+        return merge_base(STATE_OLD)
+    monkeypatch.setattr(objects, "_base", base)
+    monkeypatch.setattr(g, "_gh_json", api)
+    try:
+        assert g._carry_merge_base(H0, BASE_TIP, R, None, {}, objects) == STATE_OLD
+        assert api_calls == ([] if local_result == "valid" else [f"repos/{R}/compare/{H0}...{BASE_TIP}"])
+    finally:
+        objects.close()
 
 
 def test_git_verifier_rejects_rename_delete_conflict(monkeypatch, tmp_path, git_history):
@@ -923,7 +1226,8 @@ def test_git_verifier_checks_each_merge_in_chain(monkeypatch):
     calls = []
     monkeypatch.setattr(g, "_git_merge_tree_refusal", lambda *a: calls.append(a[:3]) or "")
     assert check() is None
-    assert calls == [(mid, H0, BASE_TIP), (H, mid, tip2)]
+    # The carry proofs run concurrently (tests_carry_parallel.py): each merge is checked once, in any order.
+    assert sorted(calls) == sorted([(mid, H0, BASE_TIP), (H, mid, tip2)])
 
 
 @pytest.mark.parametrize("step,output,reason", [

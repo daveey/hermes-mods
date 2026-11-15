@@ -77,6 +77,38 @@ test('withdraw: goes to THIS Mac\'s /start as origin.withdraw (empty command), g
   assert.deepEqual(calls[0].body.origin, { gateway: 'nous-1', request_id: 'e2aafe9a2ec443a3a651405b8f90c8ac', job_id: '', withdraw: 'superseded' })
 })
 
+// agent-c92065f334: the gateway asks this Mac to raise a pending job's buried window.
+test('focus: goes to THIS Mac\'s /start as origin.focus (empty command), never as a status poll', async () => {
+  const calls = []
+  const m = await load({ state, connections: async () => conns }, async req => {
+    calls.push(req)
+    return { ok: true, status: 'pending', job_id: 'j1', focused: 'iTerm', focus: true }
+  })
+  const res = await m.performRequest({ action: 'user_terminal', args: { job_id: 'j1', focus: true, wait_s: 0 }, sender: { ...sender, gateway: 'forged' } }, 'cloud-1', conns)
+  assert.equal(res.focused, 'iTerm')
+  assert.equal(res.device, 'macbook')
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].connectionId, 'local')
+  assert.equal(calls[0].path, '/api/plugins/user-terminal/start')
+  assert.equal(calls[0].body.command, '') // a Mac module from before focus refuses it: no window, no run
+  assert.deepEqual(calls[0].body.origin, { gateway: 'nous-1', job_id: 'j1', focus: true })
+})
+
+// agent-7e5ac22ea5: the gateway asks this Mac to press Return in a job's window the user confirmed in chat.
+test('enter: goes to THIS Mac\'s /start as origin.enter (empty command), never as a status poll', async () => {
+  const calls = []
+  const m = await load({ state, connections: async () => conns }, async req => {
+    calls.push(req)
+    return { ok: true, status: 'running', job_id: 'j1', pressed: 'iTerm', enter: true }
+  })
+  const res = await m.performRequest({ action: 'user_terminal', args: { job_id: 'j1', enter: true, wait_s: 0 }, sender: { ...sender, gateway: 'forged' } }, 'cloud-1', conns)
+  assert.equal(res.pressed, 'iTerm')
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].path, '/api/plugins/user-terminal/start')
+  assert.equal(calls[0].body.command, '') // a Mac module from before enter refuses it: nothing pressed, no run
+  assert.deepEqual(calls[0].body.origin, { gateway: 'nous-1', job_id: 'j1', enter: true })
+})
+
 test('withdraw: a non-owner session is refused without touching the Mac backend', async () => {
   const calls = []
   const m = await load({ state, connections: async () => conns }, async req => calls.push(req))

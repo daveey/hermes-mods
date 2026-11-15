@@ -1,0 +1,586 @@
+From 0d10252520278b52e0e6964b911cc7257a5c63c5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 21:38:56 +0000
+Subject: [PATCH] [daveey] Desktop read sharing: key on the native grant;
+ WS-RPC session writes start a new generation
+
+Follow-up to #2498 (shared in-flight backend reads, 9deeb8c84e), from review t_01a1d61a3a3363f1's
+non-blocking behaviour notes (card t_01a1d621b1af9854).
+
+1. The read key named only whether a descriptor had a native grant (Boolean(gatewayEndpoint)). A
+   multiplexer serves several profiles behind one api_origin, each with its own grant, and an
+   unscoped read answers for the grant's profile: two such descriptors would share one wire request
+   and both get the first profile's answer. The key now carries the grant's identity
+   (profile_id, instance_id, authority_epoch).
+2. Only REST writes through fetchJsonForBackend started a new generation. Session mutations the
+   renderer sends over the gateway WebSocket (session.title / archive / compress / rewind / model /
+   branch, policy edits, session.create) never pass that sink, so a list refetch right after a
+   rename could join a list GET sent before it and show the old title. HermesGateway.request now
+   announces each such write to main (preload noteBackendWrite -> ipc hermes:backend:note-write ->
+   ReadCoalescer.noteWriteEverywhere) as it leaves and again once it settles (refusals included).
+   The renderer does not know which backend origin main resolves for a WS connection, so the notice
+   starts a new generation on every backend; writes are rare user actions, so the cost is a few
+   unshared reads right after one.
+3. A REST write now also starts a new generation when it settles, not only when it is sent: a read
+   sent while the write was in flight may hold the old state, and a read issued after the write's
+   answer must not join it (same read-after-write gap as 2).
+
+Tests
+- electron/read-coalescing.test.ts: multiplexed grants differing in profile_id / instance_id /
+  authority_epoch (and grant vs none) never share, an equal grant still does; a read after a write
+  settles does not join one sent during it; noteWriteEverywhere separates reads on every backend
+  while reads after it still share; main/preload wiring of the notice.
+- src/api/backend-write-notice.test.ts: a real ws fixture: session.title / session.archive notify
+  before the session.mutate frame and after its answer, session.resume does not; a refused
+  mutation still notifies after it settles; the write-method set.
+- RED on origin/main: 4 of the new electron tests and both ws-fixture tests fail; GREEN with the fix.
+  Hand mutants (14: each grant field, the settle bump, the everywhere generation, each notice, the
+  method set, the ipc and preload lines) are all killed.
+- main.ts stays under its FILE_LINES cap: the profile-name extraction of the native all-profiles
+  path moved to profile-session-routing.ts as profileNamesOf (same filter; unit-tested).
+- src/api (42 files, 265 tests) and electron (413 files) pass; the one electron failure under the
+  scratch config (updater/checkout-source) needs the project's Python globalSetup and passes under
+  --project electron. tsc (tsconfig.json, tsconfig.electron.json) and eslint clean.
+---
+ apps/desktop/electron/main.ts                 |  11 +-
+ apps/desktop/electron/preload.ts              |   1 +
+ .../electron/profile-session-routing.test.ts  |  11 ++
+ .../electron/profile-session-routing.ts       |   9 ++
+ apps/desktop/electron/read-coalescing.test.ts | 112 +++++++++++++++
+ apps/desktop/electron/read-coalescing.ts      |  35 ++++-
+ .../src/api/backend-write-notice.test.ts      | 135 ++++++++++++++++++
+ apps/desktop/src/api/canonical-protocol.ts    |   7 +
+ apps/desktop/src/api/client.ts                |  21 ++-
+ apps/desktop/src/global.d.ts                  |   2 +
+ 10 files changed, 332 insertions(+), 12 deletions(-)
+ create mode 100644 apps/desktop/src/api/backend-write-notice.test.ts
+
+diff --git a/apps/desktop/electron/main.ts b/apps/desktop/electron/main.ts
+index 76cf61f573..9628a23a00 100644
+--- a/apps/desktop/electron/main.ts
++++ b/apps/desktop/electron/main.ts
+@@ -485,6 +485,7 @@ import {
+   isRemoteSessionRequestPath,
+   mergeRegistrySessionRows,
+   primaryRowsOwnerTag,
++  profileNamesOf,
+   type RegistrySessionSource,
+   remoteOwnerRoutePath,
+   remoteProfileQueryScope,
+@@ -14816,7 +14817,7 @@ async function getJsonForBackend(descriptor, path, opts: any = {}) {
+ // Any-method REST call against a resolved backend descriptor, the one sink for renderer-routed paths (so the
+ // join refuses any path that would move the credentials off the backend origin). OAuth backends prefer a native
+ // bearer (cookieless RFC 8252) and fall back to the cookie partition; token/local use the session-token header.
+-// [daveey] read-coalescing.ts: an identical read already in flight is shared, not sent again.
++// [daveey] read-coalescing.ts: an identical read in flight is shared; WS-RPC writes announce themselves (below).
+ function fetchJsonForBackend(descriptor: any, path: string, opts: BackendReadOpts = {}): Promise<any> {
+   return coalescedBackendRead(backendReadCoalescer, descriptor, path, opts, fetchJsonForBackendOnce)
+ }
+@@ -14831,11 +14832,8 @@ async function fetchJsonForBackendOnce(descriptor: any, path: string, opts: Back
+     const sessions = isAllProfilesSessionListRequest(opts.method, path)
+ 
+     if (sessions || isAllProfilesAggregateRequest(opts.method, path)) {
+-      const listing = (await fetchJsonForBackend(descriptor, '/api/profiles', { timeoutMs: opts.timeoutMs })) as any
+-
+-      const profiles = (Array.isArray(listing?.profiles) ? listing.profiles : [])
+-        .map(profile => profile?.name)
+-        .filter(name => typeof name === 'string' && name)
++      const listing = await fetchJsonForBackend(descriptor, '/api/profiles', { timeoutMs: opts.timeoutMs })
++      const profiles = profileNamesOf(listing)
+ 
+       const readProfile = (_profile, scoped) =>
+         fetchJsonForBackend(descriptor, scoped, { method: opts.method, body: opts.body, timeoutMs: opts.timeoutMs, profileScoped: true })
+@@ -14890,6 +14888,7 @@ async function fetchJsonForBackendOnce(descriptor: any, path: string, opts: Back
+   return answer
+ }
+ 
++ipcMain.on('hermes:backend:note-write', () => backendReadCoalescer.noteWriteEverywhere())
+ ipcMain.handle('hermes:connection-config:probe', async (_event, rawUrl) => probeRemoteAuthMode(rawUrl))
+ ipcMain.handle('hermes:connection-config:oauth-login', async (_event, rawUrl, rawOpts) => {
+   // Capability-gated login (RFC 8252). Probe the gateway's public /api/status
+diff --git a/apps/desktop/electron/preload.ts b/apps/desktop/electron/preload.ts
+index b714806100..76922809c3 100644
+--- a/apps/desktop/electron/preload.ts
++++ b/apps/desktop/electron/preload.ts
+@@ -382,6 +382,7 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
+   // (Electron logs a stack for every rejected invoke). Turn it back into the
+   // rejection the renderer expects — see electron/api-expected-404.ts.
+   api: request => ipcRenderer.invoke('hermes:api', request).then(unwrapExpectedNotFound),
++  noteBackendWrite: () => ipcRenderer.send('hermes:backend:note-write'),
+   notify: payload => ipcRenderer.invoke('hermes:notify', payload),
+   claimStartupLatency: () => ipcRenderer.invoke('hermes:startup-latency:claim'),
+   requestMicrophoneAccess: () => ipcRenderer.invoke('hermes:requestMicrophoneAccess'),
+diff --git a/apps/desktop/electron/profile-session-routing.test.ts b/apps/desktop/electron/profile-session-routing.test.ts
+index 3cb60146a0..79c57bf761 100644
+--- a/apps/desktop/electron/profile-session-routing.test.ts
++++ b/apps/desktop/electron/profile-session-routing.test.ts
+@@ -22,6 +22,7 @@ import {
+   pathWithRemoteOwnerScope,
+   primaryAggregateConnectionId,
+   primaryRowsOwnerTag,
++  profileNamesOf,
+   remoteOwnerRoutePath,
+   remoteProfileQueryScope,
+   settleRemoteProfileSessions,
+@@ -1881,3 +1882,13 @@ test('the primary aggregate names this device only for a local backend', async (
+     null
+   )
+ })
++
++test('profileNamesOf: the named profiles of a /api/profiles listing, in order; anything else yields none', () => {
++  assert.deepEqual(
++    profileNamesOf({ profiles: [{ name: 'default' }, { name: '' }, {}, null, { name: 7 }, { name: 'coder' }] }),
++    ['default', 'coder']
++  )
++  assert.deepEqual(profileNamesOf({ profiles: 'default' }), [])
++  assert.deepEqual(profileNamesOf(null), [])
++  assert.deepEqual(profileNamesOf(undefined), [])
++})
+diff --git a/apps/desktop/electron/profile-session-routing.ts b/apps/desktop/electron/profile-session-routing.ts
+index ca4c2359c6..a871fb51e7 100644
+--- a/apps/desktop/electron/profile-session-routing.ts
++++ b/apps/desktop/electron/profile-session-routing.ts
+@@ -1606,6 +1606,15 @@ async function allProfilesSidebar(url: URL, profiles: readonly string[], fetchPa
+   return body
+ }
+ 
++/** The profile names a `/api/profiles` listing names, in order (anything unnamed is skipped). */
++export function profileNamesOf(listing: unknown): string[] {
++  const profiles = (listing as { profiles?: unknown } | null)?.profiles
++
++  return (Array.isArray(profiles) ? profiles : [])
++    .map(profile => profile?.name)
++    .filter((name): name is string => typeof name === 'string' && Boolean(name))
++}
++
+ /** An all-profiles session list (`/api/profiles/sessions` or the batched sidebar) assembled
+  *  from one read per profile.
+  *
+diff --git a/apps/desktop/electron/read-coalescing.test.ts b/apps/desktop/electron/read-coalescing.test.ts
+index 5ce0c52883..ae28824472 100644
+--- a/apps/desktop/electron/read-coalescing.test.ts
++++ b/apps/desktop/electron/read-coalescing.test.ts
+@@ -103,6 +103,111 @@ describe('coalescedBackendRead', () => {
+     expect(once).toHaveBeenCalledTimes(4)
+   })
+ 
++  it('keeps reads apart for multiplexed native grants of different profiles on one api_origin', async () => {
++    const coalescer = new ReadCoalescer()
++
++    const once = vi.fn(
++      async (descriptor: { gatewayEndpoint?: Record<string, unknown> }) =>
++        descriptor.gatewayEndpoint?.profile_id ?? 'none'
++    )
++
++    const grant = {
++      profile_id: '/h/.hermes',
++      instance_id: 'i-1',
++      authority_epoch: 3,
++      api_origin: 'http://127.0.0.1:9147'
++    }
++
++    const native = { ...hub, authMode: 'native', gatewayEndpoint: grant }
++
++    const reads = [
++      coalescedBackendRead(coalescer, native, '/api/sessions', {}, once),
++      coalescedBackendRead(
++        coalescer,
++        { ...native, gatewayEndpoint: { ...grant, profile_id: '/h/.hermes/profiles/b' } },
++        '/api/sessions',
++        {},
++        once
++      ),
++      coalescedBackendRead(
++        coalescer,
++        { ...native, gatewayEndpoint: { ...grant, instance_id: 'i-2' } },
++        '/api/sessions',
++        {},
++        once
++      ),
++      coalescedBackendRead(
++        coalescer,
++        { ...native, gatewayEndpoint: { ...grant, authority_epoch: 4 } },
++        '/api/sessions',
++        {},
++        once
++      ),
++      coalescedBackendRead(coalescer, { ...native, gatewayEndpoint: undefined }, '/api/sessions', {}, once),
++      // The same grant (a fresh descriptor object for it) still shares.
++      coalescedBackendRead(coalescer, { ...native, gatewayEndpoint: { ...grant } }, '/api/sessions', {}, once)
++    ]
++
++    expect(await Promise.all(reads)).toEqual([
++      '/h/.hermes',
++      '/h/.hermes/profiles/b',
++      '/h/.hermes',
++      '/h/.hermes',
++      'none',
++      '/h/.hermes'
++    ])
++    expect(once).toHaveBeenCalledTimes(5)
++  })
++
++  it('a read issued after a write settles never joins one sent while the write was in flight', async () => {
++    const coalescer = new ReadCoalescer()
++    const write = deferred<string>()
++    const during = deferred<string>()
++    const after = deferred<string>()
++    const reads = [during, after]
++
++    const once = vi.fn((_d: unknown, _p: string, opts: { method?: string; body?: unknown }) =>
++      opts.method === 'POST' ? write.promise : (reads.shift() as ReturnType<typeof deferred<string>>).promise
++    )
++
++    const writing = coalescedBackendRead(coalescer, hub, '/api/sessions/x/archive', { method: 'POST', body: {} }, once)
++    const racing = coalescedBackendRead(coalescer, hub, LIST, {}, once) // may be answered before the write lands
++
++    write.resolve('wrote')
++    await writing
++    const fresh = coalescedBackendRead(coalescer, hub, LIST, {}, once)
++
++    during.resolve('while writing')
++    after.resolve('after the write')
++    expect(await racing).toBe('while writing')
++    expect(await fresh).toBe('after the write')
++    expect(once).toHaveBeenCalledTimes(3)
++  })
++
++  it('a write announced from elsewhere (a WS-RPC session mutation) starts a new generation on every backend', async () => {
++    const coalescer = new ReadCoalescer()
++    const gates = [deferred<string>(), deferred<string>(), deferred<string>()]
++    const queue = [...gates]
++    const once = vi.fn(() => (queue.shift() as ReturnType<typeof deferred<string>>).promise)
++    const other = { ...hub, baseUrl: 'http://127.0.0.1:60000' }
++
++    const stale = coalescedBackendRead(coalescer, hub, LIST, {}, once)
++    const staleOther = coalescedBackendRead(coalescer, other, LIST, {}, once)
++    coalescer.noteWriteEverywhere()
++    const fresh = coalescedBackendRead(coalescer, hub, LIST, {}, once)
++    // Unchanged by the notice: reads issued after it still share with each other.
++    const freshJoin = coalescedBackendRead(coalescer, hub, LIST, {}, once)
++
++    gates.forEach((gate, n) => gate.resolve(`answer ${n}`))
++    expect(await Promise.all([stale, staleOther, fresh, freshJoin])).toEqual([
++      'answer 0',
++      'answer 1',
++      'answer 2',
++      'answer 2'
++    ])
++    expect(once).toHaveBeenCalledTimes(3)
++  })
++
+   it('shares a failure with every caller and then lets the next read try again', async () => {
+     const coalescer = new ReadCoalescer()
+     const answer = deferred<unknown>()
+@@ -150,4 +255,11 @@ describe('main.ts wiring', () => {
+     // Nothing else calls the uncoalesced transport, so no read can bypass the sharing.
+     expect(main.match(/\bfetchJsonForBackendOnce\b/g)).toHaveLength(2)
+   })
++
++  it('a renderer WS-RPC write notice reaches the shared coalescer', () => {
++    const preload = readFileSync(join(__dirname, 'preload.ts'), 'utf8')
++
++    expect(preload).toContain("noteBackendWrite: () => ipcRenderer.send('hermes:backend:note-write')")
++    expect(main).toContain("ipcMain.on('hermes:backend:note-write', () => backendReadCoalescer.noteWriteEverywhere())")
++  })
+ })
+diff --git a/apps/desktop/electron/read-coalescing.ts b/apps/desktop/electron/read-coalescing.ts
+index a88a1a757d..b8fa1530e4 100644
+--- a/apps/desktop/electron/read-coalescing.ts
++++ b/apps/desktop/electron/read-coalescing.ts
+@@ -8,8 +8,10 @@
+ //
+ // A GET that is identical to one still in flight (same backend, credential, headers, path, deadline, pool) now
+ // waits for that one's answer instead of sending its own. Each caller gets its own copy of the answer, so a caller
+-// that edits its result cannot change another's. A write to a backend starts a new generation: a read issued after
+-// it never joins a read that left before it, so read-after-write still sees the write.
++// that edits its result cannot change another's. A write to a backend starts a new generation when it is sent and
++// again when it settles: a read issued after it never joins a read that left before it, so read-after-write still
++// sees the write. Session mutations the renderer sends over the gateway WebSocket announce themselves the same way
++// (preload `noteBackendWrite`), since they never pass through this REST sink.
+ 
+ export interface CoalescibleRead {
+   method?: string
+@@ -28,6 +30,7 @@ const copyOf = <T>(value: T): T => {
+ export class ReadCoalescer {
+   readonly #inflight = new Map<string, { joined: number; promise: Promise<unknown> }>()
+   readonly #generations = new Map<string, number>()
++  #everywhere = 0
+ 
+   /** True for a plain read: a GET (or no method) with no body and no upload. */
+   static isRead(opts: CoalescibleRead = {}): boolean {
+@@ -39,9 +42,15 @@ export class ReadCoalescer {
+     this.#generations.set(origin, (this.#generations.get(origin) ?? 0) + 1)
+   }
+ 
++  /** A write this sink never saw (a renderer's WS-RPC session mutation) on an unnamed backend: new generation
++   *  everywhere. Writes are rare user actions, so the only cost is a few unshared reads right after one. */
++  noteWriteEverywhere(): void {
++    this.#everywhere += 1
++  }
++
+   /** The key identical reads share; `parts` must already name the credential, headers, path and deadline. */
+   keyFor(origin: string, parts: unknown[]): string {
+-    return JSON.stringify([origin, this.#generations.get(origin) ?? 0, ...parts])
++    return JSON.stringify([origin, this.#everywhere, this.#generations.get(origin) ?? 0, ...parts])
+   }
+ 
+   /** Run `start` unless a read with this key is in flight; then share its answer (each caller gets a copy). */
+@@ -113,14 +122,16 @@ export function coalescedBackendRead<D extends BackendReadDescriptor, O extends
+   if (!ReadCoalescer.isRead(opts)) {
+     coalescer.noteWrite(origin)
+ 
+-    return once(descriptor, path, opts)
++    // And again once it has settled: a read sent while the write was in flight may hold the old state, so a
++    // read issued after the write's answer must not join it.
++    return Promise.resolve(once(descriptor, path, opts)).finally(() => coalescer.noteWrite(origin))
+   }
+ 
+   const key = coalescer.keyFor(origin, [
+     descriptor?.authMode ?? '',
+     descriptor?.token ?? '',
+     descriptor?.headers ?? null,
+-    Boolean(descriptor?.gatewayEndpoint),
++    nativeGrantIdentity(descriptor?.gatewayEndpoint),
+     path,
+     opts.timeoutMs ?? null,
+     opts.pool ?? '',
+@@ -129,3 +140,17 @@ export function coalescedBackendRead<D extends BackendReadDescriptor, O extends
+ 
+   return coalescer.run(key, () => once(descriptor, path, opts))
+ }
++
++/**
++ * Which native grant a read rides on: a multiplexer serves several profiles behind one api_origin, each with its own
++ * grant, and an unscoped read answers for the grant's profile. Two grants never share an answer.
++ */
++function nativeGrantIdentity(endpoint: unknown): null | unknown[] {
++  if (!endpoint || typeof endpoint !== 'object') {
++    return null
++  }
++
++  const { authority_epoch, instance_id, profile_id } = endpoint as Record<string, unknown>
++
++  return [profile_id ?? null, instance_id ?? null, authority_epoch ?? null]
++}
+diff --git a/apps/desktop/src/api/backend-write-notice.test.ts b/apps/desktop/src/api/backend-write-notice.test.ts
+new file mode 100644
+index 0000000000..33268c472c
+--- /dev/null
++++ b/apps/desktop/src/api/backend-write-notice.test.ts
+@@ -0,0 +1,135 @@
++// @vitest-environment node
++import { afterEach, expect, test, vi } from 'vitest'
++
++import { isBackendWriteMethod } from './canonical-protocol'
++import { HermesGateway } from './client'
++
++// Main's read coalescer (electron/read-coalescing.ts) shares an identical in-flight REST GET. A session
++// mutation that travels over the gateway WebSocket never passes through that REST sink, so without a notice
++// a list refetch right after `session.title` could join a list GET sent before the rename and show the old
++// title. Every WS-RPC write tells main before it leaves and again once it has settled.
++afterEach(() => {
++  vi.unstubAllGlobals()
++})
++
++test('session mutations, policy edits and session.create are writes; reads, turns and controls are not', () => {
++  const writes = [
++    'session.title',
++    'session.archive',
++    'session.compress',
++    'session.rewind',
++    'session.model',
++    'session.branch',
++    'session.branch_stored',
++    'session.branch_whole',
++    'slash.exec',
++    'config.set',
++    'session.workspace.move',
++    'session.cwd.set',
++    'session.create'
++  ]
++
++  const others = [
++    'session.resume',
++    'session.activate',
++    'session.list',
++    'session.usage',
++    'session.control.read',
++    'prompt.submit',
++    'session.interrupt',
++    'config.get',
++    'client.capabilities'
++  ]
++
++  expect(writes.filter(method => !isBackendWriteMethod(method))).toEqual([])
++  expect(others.filter(isBackendWriteMethod)).toEqual([])
++})
++
++async function fixtureGateway(answer: (frame: any) => { result?: unknown; error?: unknown }) {
++  const wsPackage = 'ws'
++  const { WebSocketServer } = await import(wsPackage)
++  const server = new WebSocketServer({ host: '127.0.0.1', port: 0 })
++  await new Promise<void>(resolve => server.once('listening', resolve))
++  const log: string[] = []
++  server.on('connection', (socket: any) => {
++    socket.on('message', (bytes: Buffer) => {
++      const frame = JSON.parse(bytes.toString())
++
++      // The dial's own capability handshake is not part of what these tests order.
++      if (!frame.method.startsWith('client.')) {
++        log.push(`wire ${frame.method}`)
++      }
++
++      socket.send(JSON.stringify({ jsonrpc: '2.0', id: frame.id, ...answer(frame) }))
++    })
++  })
++  vi.stubGlobal('window', { hermesDesktop: { noteBackendWrite: () => log.push('notice') } })
++  const client = new HermesGateway()
++  const address = server.address() as { port: number }
++  await client.connect(`ws://127.0.0.1:${address.port}/api/ws?native_dial=fixture&ticket=one-use`)
++
++  const close = async () => {
++    client.close()
++
++    for (const socket of server.clients) {
++      socket.terminate()
++    }
++
++    await new Promise<void>(resolve => server.close(() => resolve()))
++  }
++
++  return { client, close, log }
++}
++
++const resume = { session_id: 's', revision: 4, execution_generation: 2, running: false, messages: [], prompts: [] }
++
++test('a WS-RPC session mutation notifies main before it is sent and after it settles; reads do not', async () => {
++  const { client, close, log } = await fixtureGateway(frame =>
++    frame.method === 'session.resume'
++      ? { result: resume }
++      : {
++          result: {
++            session_id: 's',
++            operation: frame.params.operation,
++            revision: 5,
++            execution_generation: 2,
++            title: 'New'
++          }
++        }
++  )
++
++  try {
++    await client.request('session.resume', { session_id: 's' })
++    expect(log).toEqual(['wire session.resume'])
++
++    await client.request('session.title', { session_id: 's', title: 'New' })
++    await client.request('session.archive', { session_id: 's', archived: true })
++    expect(log).toEqual([
++      'wire session.resume',
++      'notice',
++      'wire session.mutate',
++      'notice',
++      'notice',
++      'wire session.mutate',
++      'notice'
++    ])
++  } finally {
++    await close()
++  }
++})
++
++test('a refused mutation still notifies main once it has settled', async () => {
++  const { client, close, log } = await fixtureGateway(frame =>
++    frame.method === 'session.resume'
++      ? { result: resume }
++      : { error: { code: 4001, message: 'session_busy', data: { reason: 'session_busy' } } }
++  )
++
++  try {
++    await client.request('session.resume', { session_id: 's' })
++    await expect(client.request('session.title', { session_id: 's', title: 'New' })).rejects.toThrow()
++    expect(log).toEqual(['wire session.resume', 'notice', 'wire session.mutate', 'notice'])
++  } finally {
++    await close()
++  }
++})
+diff --git a/apps/desktop/src/api/canonical-protocol.ts b/apps/desktop/src/api/canonical-protocol.ts
+index ce8a842c50..5f35b542ef 100644
+--- a/apps/desktop/src/api/canonical-protocol.ts
++++ b/apps/desktop/src/api/canonical-protocol.ts
+@@ -251,6 +251,13 @@ const VALUE_OPERATIONS = new Set(['rename', 'archive', 'model', 'reasoning', 'wo
+ // token, as the owner asked it (a deferred pick's confirmation): the same request the TUI resends.
+ const MUTATION_METHODS = new Set(['session.title', 'session.archive', 'session.compress', 'session.rewind', 'session.model', ...BRANCH_METHODS])
+ 
++/** [daveey] An RPC that can change what the backend's REST reads answer (a session's title, archive state, model,
++ *  a new session). Main shares identical in-flight REST reads (electron/read-coalescing.ts) and must hear of these
++ *  writes, which never pass through its REST sink. A policy edit counts even when it turns out not to mutate. */
++export function isBackendWriteMethod(method: string): boolean {
++  return MUTATION_METHODS.has(method) || POLICY_EDIT_METHODS.has(method) || method === 'session.create'
++}
++
+ export class CanonicalDesktopProtocol {
+   private creates = new Map<string, string>()
+   private revisions = new Map<string, number>()
+diff --git a/apps/desktop/src/api/client.ts b/apps/desktop/src/api/client.ts
+index 00209c2531..53dcf5c2a9 100644
+--- a/apps/desktop/src/api/client.ts
++++ b/apps/desktop/src/api/client.ts
+@@ -10,7 +10,7 @@ import { map, type MapStore } from 'nanostores'
+ 
+ import type { HermesApiRequest } from '@/global'
+ 
+-import { CanonicalDesktopProtocol, canonicalProfile, canonicalPromptParams, canonicalSessionKey, openGatewaySocket, recordCanonicalOwner, splitRewindSubmit } from './canonical-protocol'
++import { CanonicalDesktopProtocol, canonicalProfile, canonicalPromptParams, canonicalSessionKey, isBackendWriteMethod, openGatewaySocket, recordCanonicalOwner, splitRewindSubmit } from './canonical-protocol'
+ import { DialReadiness, GATEWAY_NOT_CONNECTED_MESSAGE, remainingRequestBudget } from './dial-readiness'
+ import { dialWithLinkLimit } from './gateway-link-dial'
+ 
+@@ -93,6 +93,11 @@ function requestDeadline(timeoutMs: number | undefined): number {
+ 
+ export type GatewaySessionWire = 'canonical' | 'legacy'
+ 
++// [daveey] Main's REST read sharing hears of a WS-RPC write as it leaves and once it settles (no bridge: no-op).
++function noteBackendWrite(): void {
++  if (typeof window !== 'undefined') { window.hermesDesktop?.noteBackendWrite?.() }
++}
++
+ export class HermesGateway extends JsonRpcGatewayClient {
+   private canonical = false
+   private nativeDial = false
+@@ -423,6 +428,20 @@ export class HermesGateway extends JsonRpcGatewayClient {
+   }
+ 
+   override async request<T>(method: string, params: Record<string, unknown> = {}, timeoutMs?: number, signal?: AbortSignal): Promise<T> {
++    if (!isBackendWriteMethod(method)) { return this.requestOnWire<T>(method, params, timeoutMs, signal) }
++
++    // [daveey] Main shares identical in-flight REST reads; a write it cannot see is announced as it leaves and
++    // again once it settles, so a list refetch after a rename never joins a list read sent before it.
++    noteBackendWrite()
++
++    try {
++      return await this.requestOnWire<T>(method, params, timeoutMs, signal)
++    } finally {
++      noteBackendWrite()
++    }
++  }
++
++  private async requestOnWire<T>(method: string, params: Record<string, unknown>, timeoutMs?: number, signal?: AbortSignal): Promise<T> {
+     const generation = this.connectionGeneration
+     const deadline = requestDeadline(timeoutMs)
+ 
+diff --git a/apps/desktop/src/global.d.ts b/apps/desktop/src/global.d.ts
+index 8167971040..d50fc96d42 100644
+--- a/apps/desktop/src/global.d.ts
++++ b/apps/desktop/src/global.d.ts
+@@ -345,6 +345,8 @@ declare global {
+         set: (name: string | null) => Promise<DesktopActiveProfile>
+       }
+       api: <T>(request: HermesApiRequest) => Promise<T>
++      /** A WS-RPC session write is starting or has settled: main's REST read sharing starts a new generation. */
++      noteBackendWrite?: () => void
+       notify: (payload: HermesNotification) => Promise<boolean>
+       /** Launch -> ready ms for the first caller per app launch, null afterwards. Absent on older shells. */
+       claimStartupLatency?: () => Promise<null | number>
+-- 
+2.43.0
+

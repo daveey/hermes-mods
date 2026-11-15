@@ -54,7 +54,7 @@ class GitHubActions:
                  max_job_requests=10, max_repositories=10, max_runs=10,
                  enrichment_interval=60, backoff_base=2, backoff_cap=300,
                  max_cycle_requests=32, pace_requests=False, pacing_window=0,
-                 quota_reserve=0, max_hourly_requests=None):
+                 quota_reserve=0, max_hourly_requests=None, precharge_pacing=False):
         for value in (timeout, max_pages, max_job_requests, max_repositories,
                       max_runs, enrichment_interval, backoff_base, backoff_cap):
             if not isinstance(value, (float, int)) or not math.isfinite(value) or value <= 0:
@@ -85,6 +85,7 @@ class GitHubActions:
             raise ValueError('invalid_provider_options')
         self.quota_reserve, self.max_hourly_requests = quota_reserve, max_hourly_requests
         self.max_cycle_requests, self.pace_requests = max_cycle_requests, pace_requests
+        self.precharge_pacing = precharge_pacing
         self._cycle_remaining = None
         self._budgets, self._cache, self._enriched = {}, {}, {}
         # Advisory scheduling only; never evidence or an authorization cache.
@@ -171,6 +172,13 @@ class GitHubActions:
                 delay = max(delay, seconds)
         budget.until = max(budget.until, now + delay)
 
+    def _request_spacing(self, budget, now):
+        spacing = 3600 / self.max_hourly_requests if self.max_hourly_requests else 0
+        if budget.remaining is not None and budget.remaining > self.quota_reserve:
+            spacing = max(spacing, max(0, budget.reset - now) /
+                          max(1, budget.remaining - self.quota_reserve))
+        return spacing
+
     def _get(self, credential, path, *, metadata=False):
         try:
             result = self._request(credential, path, metadata=metadata)
@@ -188,7 +196,8 @@ class GitHubActions:
         if self._cycle_remaining is not None:
             if self._cycle_remaining <= 0:
                 raise _Failure('cycle_budget')
-            self._cycle_remaining -= 1
+            if not self.precharge_pacing:
+                self._cycle_remaining -= 1
         budget = self._budgets.setdefault(credential.key, _Budget())
         # Permissions are resource-local; quota belongs to the credential.
         if '/actions/' in path:
@@ -220,6 +229,10 @@ class GitHubActions:
         # Reserve before I/O. SIGKILL cannot erase consumed budget or immediately
         # repeat an unknown-outcome request. A completed response replaces this
         # conservative crash fence with its actual rate and Retry-After headers.
+        if self.precharge_pacing:
+            if self._cycle_remaining is not None:
+                self._cycle_remaining -= 1
+            budget.next_at = max(now, budget.next_at) + self._request_spacing(budget, now)
         reservation = self.export_state()
         reservation[credential.key]['until'] = max(
             budget.until, now + self.timeout + self.backoff_cap)
@@ -243,7 +256,7 @@ class GitHubActions:
                 budget.reset = reset
         except (ValueError, TypeError, OverflowError):
             raise _Failure('invalid_rate_headers') from None
-        if self.pace_requests and budget.remaining is not None and budget.remaining > 0:
+        if self.pace_requests and not self.precharge_pacing and budget.remaining is not None and budget.remaining > 0:
             spacing = max(0, budget.reset-now)/max(1, budget.remaining - self.quota_reserve)
             if self.max_hourly_requests:
                 spacing = max(spacing, 3600 / self.max_hourly_requests)

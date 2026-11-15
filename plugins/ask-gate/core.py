@@ -11,8 +11,10 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
+import types
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
@@ -1281,23 +1283,54 @@ _NON_EVIDENCE = {"kanban_create", "kanban_block", "kanban_complete", "kanban_com
                  "send_message"}
 
 
-class TurnLog:
-    """Per-session record of this turn's tool calls, fed by post_tool_call and reset at pre_llm_call."""
+_SHARED_KEY = "_ask_gate_turn_log"
 
-    def __init__(self) -> None:
-        self._d: dict[str, list[dict]] = {}
-        self._users: dict[str, list[str]] = {}
-        self._lock = threading.Lock()
+
+def shared_turn_state(key: str) -> dict:
+    """This process's turn-log state for ``key`` (the resolved Hermes home), shared by every load of the plugin.
+
+    hermes-sync's mods-reload force-reloads every plugin of a running gateway/serve when any linked plugin changes,
+    often mid-turn: the manager purges this package and re-executes it. A module-level log started empty, and
+    pre_llm_call (which resets it) does not run again until the next turn, so every human_request for the rest of
+    the turn was refused as matching no tool call (self-heal agent-85e085f99e). The state lives under a
+    sys.modules key outside the plugin namespace (the purge leaves it); plain dicts + a lock, so a TurnLog class
+    from a newer load works on state an older load created."""
+    reg = sys.modules.get(_SHARED_KEY)
+    if reg is None or not isinstance(getattr(reg, "homes", None), dict):
+        reg = types.ModuleType(_SHARED_KEY)
+        reg.__dict__["homes"] = {}
+        sys.modules[_SHARED_KEY] = reg
+    state = reg.__dict__["homes"].setdefault(key, {})  # dict.setdefault: atomic under the GIL
+    state.setdefault("lock", threading.Lock())
+    state.setdefault("d", {})
+    state.setdefault("users", {})
+    return state
+
+
+class TurnLog:
+    """Per-session record of this turn's tool calls, fed by post_tool_call and reset at pre_llm_call.
+
+    ``state`` (see shared_turn_state) lets a reloaded plugin keep the turn's log; without it the log is private."""
+
+    def __init__(self, state: dict | None = None) -> None:
+        state = state if state is not None else {}
+        state.setdefault("lock", threading.Lock())
+        self._d: dict[str, list[dict]] = state.setdefault("d", {})
+        self._users: dict[str, list[str]] = state.setdefault("users", {})
+        self._lock = state["lock"]
 
     def reset(self, session: str) -> None:
         with self._lock:
             self._d[session] = []
 
     def add(self, session: str, tool: str, args: Any, result: Any) -> None:
+        a, r = _short(args, MATCH_CHARS), _short(result, MATCH_CHARS)
         with self._lock:
             lst = self._d.setdefault(session, [])
-            lst.append({"tool": tool, "args": _short(args, STORE_CHARS), "result": _short(result, STORE_CHARS),
-                        "t": time.time()})
+            # args/result are the bounded display copies (judge prompts); "hay" is what evidence matching reads, so
+            # a sentence quoted from the middle of a long result is not clipped away (self-heal agent-85e085f99e).
+            lst.append({"tool": tool, "args": clip(a, STORE_CHARS), "result": clip(r, STORE_CHARS),
+                        "hay": (a + " " + r).lower(), "t": time.time()})
             del lst[:-60]
 
     def get(self, session: str) -> list[dict]:
@@ -1327,6 +1360,8 @@ def _short(v: Any, n: int) -> str:
 # Tool results put the verdict last (an HTTP 422 after the request echo, an exit code after the output), so a
 # head-only cut hid exactly the failure a human_request cites. Keep both ends.
 STORE_CHARS = 1600
+# How much of each call's args/result evidence matching reads (``hay``); the display copy stays STORE_CHARS.
+MATCH_CHARS = 16000
 
 
 def clip(s: str, n: int) -> str:
@@ -1422,7 +1457,7 @@ def _names_call(claim: str, t: dict) -> bool:
     if t["tool"].lower() in low:
         return True
     toks = {w for w in re.findall(r"[a-z0-9_@./:-]{4,}", low) if w not in _STOP}
-    hay = (t["args"] + " " + t["result"]).lower()
+    hay = t.get("hay") or (t["args"] + " " + t["result"]).lower()
     return sum(1 for tok in toks if tok in hay) >= 2
 
 

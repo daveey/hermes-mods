@@ -1713,6 +1713,47 @@ def test_each_e0a5909348_guard_warning_files_a_signal(tmp_path):
     assert len([s for s in sg.collect(h, {}, "macbook", _ts("2026-10-28 13:25:00")) if s["kind"] == "errors"]) == 3
 
 
+LEFT_POOL = ("2026-10-28 13:19:40,500 WARNING [20261028_130956_a12ab0] agent.client_lifecycle: Anthropic pool entry "
+             "acct-b left the pool; re-resolving the session's credential")
+
+
+def test_moved_off_entry_after_entry_left_pool_is_designed_recovery_not_filed(tmp_path):
+    """agent-47adfc1ed2: a hub-disabled/expired entry leaves the pool mid-session; core logs "left the pool" and then
+    "moved the session off pool entry X (now Y)". That is the designed recovery, not the e0a5909348 drift loop."""
+    moved = GUARD_LINES["moved-off-entry"]
+    assert sg.parse_errors([LEFT_POOL, moved]) == []
+    # moved to nowhere (unattributed) still files: the session lost its account attribution
+    assert len(sg.parse_errors([LEFT_POOL, moved.replace("(now acct-a)", "(now unattributed)")])) == 1
+    # another entry left, or the same entry left in another session: real drift, still files
+    assert len(sg.parse_errors([LEFT_POOL.replace("acct-b", "acct-q"), moved])) == 1
+    assert len(sg.parse_errors([LEFT_POOL.replace("a12ab0]", "ffffff]"), moved])) == 1
+    # a "left the pool" from a request long before does not excuse a later move
+    assert len(sg.parse_errors([LEFT_POOL.replace("13:19:40,500", "13:09:40,500"), moved])) == 1
+    # no left-the-pool line: unchanged, files
+    assert len(sg.parse_errors([moved])) == 1
+    # and through the real collector: only the unexcused guard lines file
+    h = _auth_home(tmp_path, [LEFT_POOL] + list(GUARD_LINES.values()))
+    got = [s for s in sg.collect(h, {}, "macbook", _ts("2026-10-28 13:25:00")) if s["kind"] == "errors"]
+    assert len(got) == 2 and not any("moved-off-entry" in s["symptom"] for s in got)
+
+
+def test_moved_off_entry_before_left_pool_timestamp_still_files_drift(tmp_path):
+    """Input order is not timestamp order: a future departure cannot excuse an earlier move."""
+    moved = GUARD_LINES["moved-off-entry"].replace("13:19:41,001", "13:19:39,001")
+    # Keep the departure first in input so parse_errors has already recorded it;
+    # only the nonnegative delta guard prevents this false recovery pairing.
+    lines = [LEFT_POOL, moved]
+    rows = sg.parse_errors(lines)
+    assert len(rows) == 1
+    assert rows[0]["session_id"] == "20261028_130956_a12ab0"
+    assert "moved-off-entry" in rows[0]["symptom"]
+    assert "moved the session off pool entry acct-b (now acct-a)" in rows[0]["details"]
+    h = _auth_home(tmp_path, lines)
+    got = [s for s in sg.collect(h, {}, "macbook", _ts("2026-10-28 13:25:00")) if s["kind"] == "errors"]
+    assert len(got) == 1
+    assert "moved-off-entry" in got[0]["symptom"]
+
+
 def test_kanban_sibling_cards_with_same_stem_and_error_are_one_signal(tmp_path):
     h = tmp_path / "h"
     err = "worker exited cleanly (rc=0) without kanban_complete — protocol violation"

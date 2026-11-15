@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import re
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parents[1]
@@ -393,6 +394,47 @@ def test_parse_confirm_reads_the_strong_models_label():
         r = rc.parse_confirm(o)
         assert r is None or r[0] == 0.1
     assert "kanban_create" in rc.CONFIRM_SYS and "report_only" in rc.CONFIRM_SYS
+
+
+# agent-fdfab26745: asked "are you done" (a repeat ask, relay_repeat forced the second opinion), the Desktop reply said
+# two things "remain unverified", "I'm responsible for finishing the end-to-end verification; you don't need to do
+# anything. I can run a deeper live check next." and stopped with zero tool calls. Screen p 0.99; the second opinion
+# labelled it outcome "offered" (problem true, agent_fixable true: 3/3 replays), which parse_confirm scored 0.1, so no
+# nudge; two days later the user had to type "resume". The screen rule itself says a vague offer is not a proposal.
+FDFAB_REPLY = (
+    "**No.** The receipt implementation is merged, but **two things remain unverified: live receipt display and keeping "
+    "this unfinished chat out of green.** The last check still showed the Desktop using the old `done` state after I "
+    "changed the canonical state to `waiting`.\n\nThat is the last verified state, **not re-checked this turn**. "
+    "I\u2019m responsible for finishing the end-to-end verification; you don\u2019t need to do anything.\n\n"
+    "I can run a deeper live check next.")
+FDFAB_CONFIRM_RAW = ('{"problem": true, "agent_fixable": true, "outcome": "offered", "user_wanted_action": false, '
+                     '"quote": "two things remain unverified: live receipt display and keeping this unfinished chat out '
+                     'of green."}')
+
+
+def test_parse_confirm_counts_a_vague_offer_on_a_fixable_problem():
+    assert rc.parse_confirm(FDFAB_CONFIRM_RAW)[0] == 0.9
+    # an offer about something only the user can do stays below
+    assert rc.parse_confirm('{"outcome": "offered", "agent_fixable": false}')[0] == 0.1
+    # a concrete proposal asking for a go is the confirm rule's, not report_only's
+    assert rc.parse_confirm('{"outcome": "proposed", "agent_fixable": true}')[0] == 0.1
+
+
+def test_every_confirm_outcome_label_is_classified():
+    """A label CONFIRM_SYS offers the model must be classified on purpose: one that falls through to 0.1 by default is
+    how "offered" silently vetoed every vague-offer stall (agent-fdfab26745)."""
+    labels = set(re.findall(r'^  "(\w+)": ', rc.CONFIRM_SYS, re.M))
+    assert {"fixed", "started", "proposed", "offered", "report_only", "na"} <= labels
+    assert labels == set(rc.CONFIRM_POSITIVE) | set(rc.CONFIRM_NEGATIVE)
+    assert not set(rc.CONFIRM_POSITIVE) & set(rc.CONFIRM_NEGATIVE)
+
+
+def test_vague_offer_stall_on_a_repeat_status_ask_is_nudged():
+    llm, _ = _judge(_ro_verdict(0.99))
+    hit = rc.check(FDFAB_REPLY, "are you done", [], llm, only=["report_only"], thresholds=rc.settings()["thresholds"],
+                   confirm=lambda: rc.parse_confirm(FDFAB_CONFIRM_RAW), confirm_floor=rc.CONFIRM_FLOOR,
+                   relay_repeat=True)
+    assert hit and hit["rule"] == "report_only" and hit["verdict"]["report_only_src"] == "confirm"
 
 
 def test_pre_verify_hook_runs_the_confirm_with_real_args_and_honours_the_daily_cap(tmp_path, monkeypatch):

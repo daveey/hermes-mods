@@ -1,0 +1,342 @@
+From c56fd250376a3344ece809824d2e9f22d8737c69 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 22:43:39 +0000
+Subject: [PATCH] [daveey] relay scratch preservation reasons on GC stdout
+
+Why: GC wrappers capture child stdout/stderr, but core subcommands log to files only. Retention warnings therefore disappeared at the CLI boundary, and archive refusals only had INFO diagnostics. Synthetic-string relay tests never exercised that boundary.
+
+Add a scoped hermes_cli handler for bare Scratch preserved records, preserving file logging and removing the handler in finally. Add bounded sanitized archive_refused (fresh and backoff) and detach_refused diagnostics. No cleanup policy or owned-job veto changes.
+
+Proof: required capsys tests fail on base 3f93310ecf26c2031453f4e615de8b98dbf87acd with no stdout lines; fixed stdout and archive suites pass 103 tests. State real-child fixture fails on base (0 lines) and passes fixed (retention plus archive refusal on both passes). scripts/check: 20 checks pass.
+---
+ hermes_cli/kanban_ops.py                      |  44 ++++-
+ hermes_cli/kanban_scratch_backoff.py          |  25 +++
+ hermes_cli/kanban_worktree_gc.py              |   6 +
+ .../test_kanban_gc_keep_lines_stdout.py       | 171 ++++++++++++++++++
+ 4 files changed, 242 insertions(+), 4 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_gc_keep_lines_stdout.py
+
+diff --git a/hermes_cli/kanban_ops.py b/hermes_cli/kanban_ops.py
+index fdde911e4d..d77008af33 100644
+--- a/hermes_cli/kanban_ops.py
++++ b/hermes_cli/kanban_ops.py
+@@ -6,7 +6,9 @@
+ from __future__ import annotations
+ 
+ import argparse
++import contextlib
+ import json
++import logging
+ import os
+ import sys
+ import time
+@@ -337,6 +339,39 @@ def _cmd_watch(args: argparse.Namespace) -> int:
+     return _poll_loop(args.interval, tick)
+ 
+ 
++_KEEP_PREFIX = "Scratch preserved: "
++
++
++class _KeepLines(logging.Handler):
++    """Print each ``Scratch preserved: `` record on stdout as one bare line (no logger prefix)."""
++
++    def emit(self, record: logging.LogRecord) -> None:
++        try:
++            message = record.getMessage()
++            if message.startswith(_KEEP_PREFIX):
++                # One record is one line: a path may hold a line break, and a wrapper relays by line.
++                print("?".join(message.splitlines()))
++        except Exception:  # health: allow BLE001 -- logging.Handler contract: emit never raises into the caller
++            self.handleError(record)
++
++
++@contextlib.contextmanager
++def _keep_lines_on_stdout():
++    """While open, every kept scratch tree's reason is also a stdout line. [daveey]
++
++    Subcommands log to files only, so a caller that captures this command's output (the Mac and
++    worker GC wrappers) never saw why a tree was kept, and agent.log rotates within a day. File
++    logging is untouched: this only adds a handler on ``hermes_cli`` for the workspace pass.
++    """
++    handler = _KeepLines()
++    package = logging.getLogger("hermes_cli")
++    package.addHandler(handler)
++    try:
++        yield
++    finally:
++        package.removeHandler(handler)
++
++
+ def _cmd_gc(args: argparse.Namespace) -> int:
+     """Retry terminal workspace cleanup and remove old events and worker logs."""
+     event_days = getattr(args, "event_retention_days", 30)
+@@ -352,10 +387,11 @@ def _cmd_gc(args: argparse.Namespace) -> int:
+     budget_s = getattr(args, "scratch_budget_seconds", None)
+     # One budget for the whole workspace pass: the wrapper's kill covers it all.
+     budget = Budget(DEFAULT_BUDGET_S if budget_s is None else budget_s)
+-    with kbc.connect_closing() as conn:
+-        removed_ws = gc_task_worktrees(conn, older_than_days=wt_days)
+-    with kbc.connect_closing() as conn:
+-        removed_ws += gc_task_scratch(conn, older_than_days=wt_days, budget=budget)
++    with _keep_lines_on_stdout():
++        with kbc.connect_closing() as conn:
++            removed_ws = gc_task_worktrees(conn, older_than_days=wt_days)
++        with kbc.connect_closing() as conn:
++            removed_ws += gc_task_scratch(conn, older_than_days=wt_days, budget=budget)
+ 
+     removed_events = 0
+     if event_days:
+diff --git a/hermes_cli/kanban_scratch_backoff.py b/hermes_cli/kanban_scratch_backoff.py
+index a2b63ce578..b752f3abde 100644
+--- a/hermes_cli/kanban_scratch_backoff.py
++++ b/hermes_cli/kanban_scratch_backoff.py
+@@ -26,6 +26,7 @@ import json
+ import logging
+ import math
+ import os
++import re
+ import time
+ from pathlib import Path
+ from typing import Optional
+@@ -160,6 +161,29 @@ class Refusals:
+                         self.file, exc_info=True)
+ 
+ 
++# ``hermes kanban gc`` prints every ``Scratch preserved: `` record on stdout (kanban_ops._cmd_gc)
++# and the Mac/worker GC wrappers relay those lines into their own log, so a kept tree's reason
++# outlives agent.log's rotation. The detail is cut to this alphabet: the relay full-matches it.
++_DETAIL_UNSAFE = re.compile(r"[^A-Za-z0-9_./:=,()' -]")
++DETAIL_MAX = 200
++
++
++def keep_detail(reason) -> str:
++    """*reason* as one relay-safe line: any character outside the alphabet becomes ``?``, cut to 200."""
++    return _DETAIL_UNSAFE.sub("?", str(reason))[:DETAIL_MAX]
++
++
++def report_archive_refused(path: Path, task_id: str, entry: Optional[dict], reason) -> None:
++    """One ``Scratch preserved: reason=archive_refused`` line for a tree kept by an archive refusal.
++
++    *entry* is the tree's backoff entry (attempt count and next retry); ``None`` when the caller
++    keeps no backoff state, which reads as a first attempt with no retry time.
++    """
++    attempts, retry_at = (entry["count"], int(entry["retry_at"])) if entry else (1, None)
++    log.warning("Scratch preserved: reason=archive_refused path=%s task=%s attempts=%s retry_at=%s; %s",
++                path, task_id, attempts, retry_at, keep_detail(reason))
++
++
+ def skip_logged(refusals: Refusals, key: str, path: Path, completed_at, task_id: str) -> bool:
+     """True (and one INFO line) when *key* is inside its backoff window: the tree is kept untouched."""
+     entry = refusals.backing_off(key, path, completed_at)
+@@ -168,4 +192,5 @@ def skip_logged(refusals: Refusals, key: str, path: Path, completed_at, task_id:
+     log.info("Keeping aged scratch workspace for task %s: %s (archive refused %d time(s), "
+              "next retry after %s; last: %s)", task_id, path, entry["count"],
+              _utc(entry["retry_at"]), entry.get("reason"))
++    report_archive_refused(path, task_id, entry, entry.get("reason"))
+     return True
+diff --git a/hermes_cli/kanban_worktree_gc.py b/hermes_cli/kanban_worktree_gc.py
+index 3bc73338ff..3c347f3406 100644
+--- a/hermes_cli/kanban_worktree_gc.py
++++ b/hermes_cli/kanban_worktree_gc.py
+@@ -302,8 +302,12 @@ def _archive_and_remove_scratch(conn: sqlite3.Connection, task_id: str, path: Pa
+         final = sa.archive_workspace(path, archive_dir, task_id=task_id, completed_at=completed_at)
+     except (sa.ArchiveRefused, OSError, subprocess.SubprocessError, ValueError) as exc:
+         log.info("Keeping aged scratch workspace for task %s: %s (%s)", task_id, path, exc)
++        entry = None
+         if refusals is not None:
+             refusals.record(task_id, path, completed_at, str(exc))
++            entry = refusals.entries.get(task_id)
++        from hermes_cli.kanban_scratch_backoff import report_archive_refused
++        report_archive_refused(path, task_id, entry, exc)
+         return 0
+     if refusals is not None:
+         refusals.clear(task_id)
+@@ -332,6 +336,8 @@ def _archive_and_remove_scratch(conn: sqlite3.Connection, task_id: str, path: Pa
+     except (sa.ArchiveRefused, OSError) as exc:
+         log.info("Keeping archived scratch workspace for task %s (or detached recovery tree): %s (%s)",
+                  task_id, path, exc)
++        from hermes_cli.kanban_scratch_backoff import keep_detail
++        log.warning("Scratch preserved: reason=detach_refused path=%s task=%s; %s", path, task_id, keep_detail(exc))
+         return 0
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_gc_keep_lines_stdout.py b/tests/hermes_cli/test_kanban_gc_keep_lines_stdout.py
+new file mode 100644
+index 0000000000..80b529618f
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_gc_keep_lines_stdout.py
+@@ -0,0 +1,171 @@
++"""`hermes kanban gc` says on stdout why each scratch tree was kept. [daveey]
++
++mini, 2026-11-14: the daily pass kept four aged trees whose archive was refused and removed 0
++workspaces, and `mac-worktree-gc.log` said nothing about any of them in 4028 lines. Subcommands
++log to files only, so the `Scratch preserved: ...` records never reached the stdout the GC
++wrapper captures and relays, and the refusals were INFO lines in an agent.log that had rotated.
++"""
++import logging
++import re
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_ops
++from hermes_cli import kanban_scratch_archive as sa
++from hermes_cli import kanban_scratch_backoff as bo
++from hermes_cli import kanban_worktree_gc as gc
++from tests.hermes_cli import test_kanban_scratch_gc_archive as helpers
++from tests.hermes_cli.test_kanban_scratch_gc_archive import OLD, _task
++
++board = helpers.board
++remote = helpers.remote
++
++pytestmark = pytest.mark.usefixtures("board")
++
++# The relay in mac-worktree-gc.py full-matches the detail against this alphabet (plus the `?`
++# that stands in for anything else).
++DETAIL = re.compile(r"[A-Za-z0-9_./:=,()' ?-]{1,200}")
++
++
++def _refused(remote):
++    tid, path = _task(remote=remote)
++    helpers.refuse_forever(path)
++    return tid, path
++
++
++def _keep_lines(capsys):
++    """This pass's stdout: the kept-tree lines, after checking nothing else was printed with them."""
++    lines = capsys.readouterr().out.splitlines()
++    assert lines[-1].startswith("GC complete: "), lines
++    kept = lines[:-1]
++    assert all(line.startswith("Scratch preserved: ") for line in kept), kept
++    return kept
++
++
++def test_tree_inside_retention_is_named_on_stdout(remote, capsys):
++    finished = int(time.time()) - 3600
++    tid, path = _task(remote=remote, completed_at=finished)
++    assert helpers._gc() == 0
++    assert _keep_lines(capsys) == [
++        f"Scratch preserved: reason=retention_pending path={path} task={tid} "
++        f"eligible_at={finished + 7 * 86400}; deadline is archival eligibility only, "
++        "all safety guards still apply"]
++    assert path.exists()
++
++
++def test_fresh_archive_refusal_then_backoff_skip_are_named_on_stdout(remote, capsys, caplog):
++    tid, path = _refused(remote)
++    caplog.set_level(logging.INFO, logger="hermes_cli")
++    assert helpers._gc() == 0
++    entry = bo.Refusals("default").entries[tid]
++    head = (f"Scratch preserved: reason=archive_refused path={path} task={tid} "
++            f"attempts=1 retry_at={int(entry['retry_at'])}; ")
++    (fresh,) = _keep_lines(capsys)
++    assert fresh.startswith(head)
++    detail = fresh[len(head):]
++    assert DETAIL.fullmatch(detail) and "linked worktree or submodule" in detail
++    assert detail == bo.keep_detail(entry["reason"])
++    # The file log keeps its INFO line: the stdout line is added next to it, not instead of it.
++    assert f"Keeping aged scratch workspace for task {tid}: {path} (" in caplog.text
++
++    caplog.clear()
++    assert helpers._gc() == 0  # inside the backoff window: not re-archived, still named
++    assert _keep_lines(capsys) == [fresh]
++    assert "archive refused 1 time(s)" in caplog.text
++    assert path.exists()
++
++
++def test_refused_detach_is_named_on_stdout(remote, capsys, monkeypatch, caplog):
++    tid, path = _task(remote=remote)
++
++    def refuse(*_args, **_kwargs):
++        raise sa.ArchiveRefused("owner changed\nwhile archiving \u2603 {x}")
++
++    monkeypatch.setattr(sa, "remove_archived", refuse)
++    caplog.set_level(logging.INFO, logger="hermes_cli")
++    assert helpers._gc() == 0
++    assert _keep_lines(capsys) == [
++        f"Scratch preserved: reason=detach_refused path={path} task={tid}; "
++        "owner changed?while archiving ? ?x?"]
++    assert f"Keeping archived scratch workspace for task {tid} (or detached recovery tree)" in caplog.text
++    assert path.exists()
++
++
++def test_refusal_without_backoff_state_reads_as_a_first_attempt(remote, caplog):
++    tid, path = _refused(remote)
++    with kbc.connect_closing() as conn:
++        assert gc._archive_and_remove_scratch(conn, tid, path, OLD) == 0
++    (line,) = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Scratch preserved: ")]
++    assert line.startswith(f"Scratch preserved: reason=archive_refused path={path} task={tid} "
++                           "attempts=1 retry_at=None; ")
++
++
++def test_keep_detail_is_one_line_in_the_relay_alphabet_cut_to_200():
++    safe = "aZ09_./:=,()' -"
++    assert bo.keep_detail(safe) == safe
++    assert bo.keep_detail("a\nb\tc;d\"e[f]g{h}i\u2603j?k\\l") == "a?b?c?d?e?f?g?h?i?j?k?l"
++    assert bo.keep_detail("x" * 500) == "x" * 200
++    assert bo.keep_detail(OSError(13, "Permission denied")) == "?Errno 13? Permission denied"
++
++
++def test_a_line_break_in_a_kept_path_cannot_forge_a_second_stdout_line(capsys):
++    root = kb.workspaces_root()
++    forged = "Scratch preserved: reason=owner_unverified path=forged"
++    odd = root / f"odd\n{forged}"
++    try:
++        odd.mkdir(parents=True)
++    except OSError:
++        pytest.skip("this filesystem cannot hold a line break in a name")
++    assert helpers._gc() == 0
++    assert _keep_lines(capsys) == [
++        f"Scratch preserved: reason=owner_unverified path={root}/odd?{forged}; "
++        "no local task workspace record; moved or unknown ownership; no deletion deadline"]
++
++
++def test_other_warnings_of_the_pass_stay_off_stdout(remote, capsys):
++    """Only the kept-tree family is printed: a wrapper reads the last stdout line as the result."""
++    _task(remote=remote)
++    _task(remote=remote, completed_at=OLD - 3600)
++    ticks = iter([0.0, 0.0, 5.0])  # started, first check (in budget), second check (spent)
++    budget = bo.Budget(1, clock=lambda: next(ticks, 9.0))
++    seen = []
++    watch = logging.Handler()
++    watch.emit = lambda record: seen.append(record.getMessage())
++    package = logging.getLogger("hermes_cli")
++    package.addHandler(watch)
++    try:
++        with kanban_ops._keep_lines_on_stdout(), kbc.connect_closing() as conn:
++            assert gc.gc_task_scratch(conn, older_than_days=7, budget=budget) == 1
++    finally:
++        package.removeHandler(watch)
++    assert any("Scratch GC budget reached" in message for message in seen)
++    assert capsys.readouterr().out == ""
++
++
++@pytest.mark.parametrize("fails", [False, True])
++def test_stdout_handler_lasts_only_for_the_workspace_pass(monkeypatch, capsys, fails):
++    package = logging.getLogger("hermes_cli")
++    before = list(package.handlers)
++    during = []
++
++    def scratch(conn, **_kwargs):
++        during.append([h for h in package.handlers if h not in before])
++        if fails:
++            raise RuntimeError("pass died")
++        return 0
++
++    monkeypatch.setattr(gc, "gc_task_scratch", scratch)
++    if fails:
++        with pytest.raises(RuntimeError):
++            helpers._gc()
++    else:
++        assert helpers._gc() == 0
++    (added,) = during
++    assert [type(h) for h in added] == [kanban_ops._KeepLines]
++    assert package.handlers == before
++    logging.getLogger("hermes_cli.kanban_worktree_gc").warning("Scratch preserved: reason=after_the_pass")
++    assert "after_the_pass" not in capsys.readouterr().out
++
+-- 
+2.43.0
+
