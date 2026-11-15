@@ -136,14 +136,21 @@ def _tests_dir_runs(code):
     # A literal step-local working-directory makes `pytest tests` plugin-local.
     # Preserve offsets while masking those steps; this is only the repository's text shape,
     # not general YAML job/defaults or shell-cd analysis.
-    steps = list(re.finditer(r"(?m)^ +-(?: name| run| uses):", code))
+    steps = list(re.finditer(r"(?m)^ +- [\w-]+:", code))
     direct_code = code
     for index, step in reversed(list(enumerate(steps))):
         end = steps[index + 1].start() if index + 1 < len(steps) else len(code)
+        # Stop at a dedent out of the step list, including the next job's defaults.
+        indent = len(step.group()) - len(step.group().lstrip())
+        dedent = re.compile(r"(?m)^ {0," + str(indent - 1) + r"}\S").search(code, step.end(), end)
+        if dedent:
+            end = dedent.start()
         block = code[step.start():end]
         cwd = re.search(r"(?m)^\s+working-directory:\s*([^\n]+)", block)
         if cwd and cwd.group(1).strip().strip("\"'") not in (".", "./", "${{ github.workspace }}"):
             direct_code = direct_code[:step.start()] + " " * len(block) + direct_code[end:]
+    # Join shell continuation lines without changing offsets used by provisioning checks.
+    direct_code = direct_code.replace("\\\n", "  ")
     return ([match.start() for match in re.finditer(r"scripts/test-all\b", code)] +
             [match.start() for match in re.finditer(
                 r"\b(?:unittest[ \t]+discover|pytest)[ \t]+[^\n]*?"
@@ -313,6 +320,36 @@ class GitleaksProvisionTripwireMutants(unittest.TestCase):
             with self.subTest(cwd=cwd):
                 offsets = _tests_dir_runs(local + root)
                 self.assertEqual(offsets, [(local + root).index("unittest discover")])
+
+    def check_root_step_after_local(self, first_key):
+        local = ('      - name: Plugin tests\n'
+                 '        working-directory: plugins/example\n'
+                 '        run: python -m pytest tests\n')
+        code = local + first_key + '        run: python -m unittest discover -s tests\n'
+        self.assertEqual(_tests_dir_runs(code), [code.index('unittest discover')])
+
+    def test_id_first_root_step(self):
+        self.check_root_step_after_local('      - id: root\n')
+
+    def test_if_first_root_step(self):
+        self.check_root_step_after_local('      - if: always()\n')
+
+    def test_env_first_root_step(self):
+        self.check_root_step_after_local('      - env:\n          EXAMPLE: value\n')
+
+    def test_later_job_defaults_do_not_mask_final_root_step(self):
+        code = ('jobs:\n  root:\n    steps:\n'
+                '      - run: python -m unittest discover -s tests\n'
+                '  plugin:\n    defaults:\n      run:\n'
+                '        working-directory: plugins/example\n'
+                '    steps:\n      - run: echo example\n')
+        self.assertEqual(_tests_dir_runs(code), [code.index('unittest discover')])
+
+    def test_continued_pytest_command_is_root_consumer(self):
+        code = ('      - run: |\n'
+                '          pytest -q ' + '\\\n' +
+                '            tests\n')
+        self.assertEqual(_tests_dir_runs(code), [code.index('pytest')])
 
     def test_comments_and_other_test_directories_are_not_consumers(self):
         with tempfile.TemporaryDirectory() as directory:
