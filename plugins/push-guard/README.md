@@ -6,9 +6,32 @@ The built-in policy covers `daveey/hermes-mods`. Add other repositories with a h
 `$HERMES_HOME/ship-only-guard.json` with a separate `"pr_landing_repos": ["example/service"]`
 key. Preserve the existing `repos` list: it selects the core-only ship path and is not
 extended by this policy. Existing fleet delivery of this file also delivers the new key.
-Profiles without their own file inherit the host file. Invalid/unreadable policy refuses
-merge admission, not an empty allowlist. Keep this file in private host configuration;
-it does not change `ship-only-guard` or select the core/state shipping path.
+Profiles without their own file inherit the host file. A profile file is an explicit
+**whole-file override**, not a per-key merge: a core-only `repos` file, an omitted
+`pr_landing_repos` key, or an empty list removes inherited PR-only coverage (the
+built-in repo remains). Preserve all required `pr_landing_repos` entries in each
+profile override; never add them to core `repos` instead. Invalid/unreadable policy,
+including dangling or looping symlinks, refuses merge admission rather than falling
+back to the host or an empty allowlist. Valid symlinks remain supported.
+Keep this file in private host configuration; it does not change `ship-only-guard`
+or select the core/state shipping path.
+
+Before and after fleet policy delivery, run this read-only check on **each host**, using
+an explicit required repository inventory independent of that host's policy:
+
+```sh
+python3 plugins/push-guard/check_policy.py --home ~/.hermes \
+  --require example/service --require daveey/hermes-mods
+```
+
+It checks the root and every entry under `profiles/` (including dormant directories),
+prints JSON with effective coverage, missing repositories or read errors, and exits
+nonzero on any gap. A core-only profile override must fail this check even though its
+runtime override is valid and intentional. Fix accidental gaps in the private policy
+source and redeploy; intentionally narrower profiles require an explicitly scoped
+fleet inventory, not silent unioning or a waived audit. This checks policy only:
+separately verify push-guard enablement/discovery in every active profile and fresh
+process activation. Offline hosts remain unverified, not passed.
 
 For configured repos use `python3 plugins/push-guard/land.py --repo example/service --pr N --head SHA`.
 The helper refuses unconfigured repositories before any GitHub I/O; the default remains
