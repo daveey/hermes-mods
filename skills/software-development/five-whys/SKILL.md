@@ -236,7 +236,7 @@ For a chain going into a new card's body, check the draft before `kanban_create`
 - [ ] The write-up has both `Root (happened)` and `Root (not caught)`, and neither is "human error", "flaky" or "transient"?
 - [ ] A `Recurrence:` line names the earlier occurrence it searched for (or says first time)?
 - [ ] Every countermeasure has a `proof:` (test fails before/passes after, command output) or a card/issue link, and each live check ran at once, never as an N-hour soak?
-- [ ] Each log-line probe (wake or live check) matched a real line of its logger copied from the live log (session tag and rotated files included) and missed a line that only quotes its phrase?
+- [ ] Each log-line probe (wake or live check) wakes on the precondition's own line, not only the outcomes you expect, matched a real line of its logger copied from the live log (session tag and rotated files included) and missed a line that only quotes its phrase?
 - [ ] The chain is posted where the fix lives (PR body, issue, card comment), not only in chat?
 
 ## Blameless
