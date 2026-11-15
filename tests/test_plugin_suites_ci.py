@@ -131,6 +131,25 @@ def _workflow_code(text):
     return "\n".join(re.sub(r"(^|\s)#.*$", "", line) for line in text.splitlines())
 
 
+def _tests_dir_runs(code):
+    """Offsets for the supported runner spellings; deliberately not a YAML/shell parser."""
+    # A literal step-local working-directory makes `pytest tests` plugin-local.
+    # Preserve offsets while masking those steps; this is only the repository's text shape,
+    # not general YAML job/defaults or shell-cd analysis.
+    steps = list(re.finditer(r"(?m)^ +-(?: name| run| uses):", code))
+    direct_code = code
+    for index, step in reversed(list(enumerate(steps))):
+        end = steps[index + 1].start() if index + 1 < len(steps) else len(code)
+        block = code[step.start():end]
+        cwd = re.search(r"(?m)^\s+working-directory:\s*([^\n]+)", block)
+        if cwd and cwd.group(1).strip().strip("\"'") not in (".", "./", "${{ github.workspace }}"):
+            direct_code = direct_code[:step.start()] + " " * len(block) + direct_code[end:]
+    return ([match.start() for match in re.finditer(r"scripts/test-all\b", code)] +
+            [match.start() for match in re.finditer(
+                r"\b(?:unittest[ \t]+discover|pytest)[ \t]+[^\n]*?"
+                r"(?<!\S)(?:\./)?tests/?(?=\s|$|[\"'])", direct_code, re.M)])
+
+
 class GitleaksHistoryScope(unittest.TestCase):
     def test_missing_binary_fails_in_ci(self):
         with patch.dict(os.environ, {"CI": "true"}), patch.object(shutil, "which", return_value=None):
@@ -153,8 +172,8 @@ class GitleaksHistoryScope(unittest.TestCase):
         version = re.search(r"/download/v([0-9.]+)/", scan)
         digest = re.search(r"\b([0-9a-f]{64})  gitleaks\.tar\.gz", scan)
         assert version and digest, scan
-        runners = {"repo-guards.yml"} | {path.name for path in WORKFLOWS.glob("*.yml")
-                                         if "scripts/test-all" in _workflow_code(path.read_text())}
+        runners = {path.name for pattern in ("*.yml", "*.yaml") for path in WORKFLOWS.glob(pattern)
+                   if _tests_dir_runs(_workflow_code(path.read_text()))}
         self.assertLessEqual({"plugin-suites.yml", "repo-guards.yml", "skill-tests.yml"}, runners)
         for name in sorted(runners):
             with self.subTest(workflow=name):
@@ -166,9 +185,17 @@ class GitleaksHistoryScope(unittest.TestCase):
                 self.assertIn(f"/gitleaks/gitleaks/releases/download/v{version.group(1)}/", expanded)
                 self.assertIn("sha256sum -c -", code)
                 self.assertIn('>> "$GITHUB_PATH"', code)
-                runs = [i for i in (code.find("scripts/test-all"), code.find("unittest discover")) if i >= 0]
+                runs = _tests_dir_runs(code)
                 self.assertTrue(runs, f"{name} runs no tests")
-                self.assertLess(pinned, min(runs), f"{name} provisions gitleaks after its tests start")
+                # Match the gitleaks tools directory, not browser-harness's earlier PATH export.
+                extraction = re.search(r'tar -xzf [^\n]+ -C "\$\{RUNNER_TEMP\}/tools" gitleaks', code)
+                path_export = re.search(r'echo "\$\{RUNNER_TEMP\}/tools" >> "\$GITHUB_PATH"', code)
+                self.assertIsNotNone(extraction, f"{name} does not extract gitleaks into the tools directory")
+                self.assertIsNotNone(path_export, f"{name} does not export the gitleaks tools directory")
+                assert extraction and path_export
+                for label, offset in (("pin", pinned), ("digest check", code.find("sha256sum -c -")),
+                                      ("extraction", extraction.start()), ("PATH export", path_export.start())):
+                    self.assertLess(offset, min(runs), f"{name} {label} after its tests start")
 
     def test_checked_out_history_and_unignored_branch_controls(self):
         binary = shutil.which("gitleaks")
@@ -228,6 +255,76 @@ class GitleaksHistoryScope(unittest.TestCase):
             scan(1)  # push-shaped HEAD must still detect a real branch finding.
             git("merge", "--no-ff", "-qm", "pull request merge", "main")
             scan(1)  # merge-shaped PR HEAD must detect it too.
+
+
+class GitleaksProvisionTripwireMutants(unittest.TestCase):
+    """Exercise the text tripwire against isolated workflow mutations, not the live tree."""
+
+    def check_workflows(self, workflows):
+        case = GitleaksHistoryScope(
+            "test_every_workflow_running_tests_dir_provisions_the_verified_archive")
+        result = unittest.TestResult()
+        with patch.dict(globals(), WORKFLOWS=workflows):
+            case.run(result)
+        self.assertFalse(result.errors, result.errors)
+        return result
+
+    def test_unprovisioned_consumers_fail(self):
+        for filename, command in (
+            ("future.yaml", "scripts/test-all"),
+            ("future.yml", "python -m unittest discover -s tests"),
+            ("future.yml", "pytest -q tests/"),
+            ("future.yaml", "python -m pytest ./tests"),
+        ):
+            with self.subTest(filename=filename, command=command), tempfile.TemporaryDirectory() as directory:
+                workflows = Path(directory) / "workflows"
+                shutil.copytree(WORKFLOWS, workflows)
+                (workflows / filename).write_text(
+                    "name: future\non: push\njobs:\n  tests:\n    runs-on: ubuntu-latest\n"
+                    f"    steps:\n      - run: {command}\n")
+                result = self.check_workflows(workflows)
+                self.assertEqual(len(result.failures), 1, result.failures)
+                self.assertIn(filename, result.failures[0][1])
+                self.assertIn("does not pin", result.failures[0][1])
+
+    def test_late_provisioning_fails(self):
+        for fragment in ('tar -xzf', 'echo "${RUNNER_TEMP}/tools" >> "$GITHUB_PATH"', 'sha256sum -c -'):
+            with self.subTest(fragment=fragment), tempfile.TemporaryDirectory() as directory:
+                workflows = Path(directory) / "workflows"
+                shutil.copytree(WORKFLOWS, workflows)
+                path = workflows / "skill-tests.yml"
+                lines = path.read_text().splitlines()
+                moved = next(line for line in lines if fragment in line)
+                lines.remove(moved)
+                lines.extend(['      - name: Too late', '        run: |', moved])
+                path.write_text("\n".join(lines) + "\n")
+                result = self.check_workflows(workflows)
+                self.assertEqual(len(result.failures), 1, result.failures)
+                self.assertIn("after its tests start", result.failures[0][1])
+
+    def test_step_local_directory_does_not_hide_later_root_consumer(self):
+        local = ('      - name: Plugin tests\n'
+                 '        working-directory: plugins/example\n'
+                 '        run: python -m pytest tests\n')
+        self.assertEqual(_tests_dir_runs(local), [])
+        for cwd in (".", "./", "${{ github.workspace }}"):
+            root = (f'      - name: Root tests\n        working-directory: "{cwd}"\n'
+                    '        run: python -m unittest discover -s tests\n')
+            with self.subTest(cwd=cwd):
+                offsets = _tests_dir_runs(local + root)
+                self.assertEqual(offsets, [(local + root).index("unittest discover")])
+
+    def test_comments_and_other_test_directories_are_not_consumers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workflows = Path(directory) / "workflows"
+            shutil.copytree(WORKFLOWS, workflows)
+            (workflows / "not-a-consumer.yaml").write_text(
+                "# scripts/test-all\n# python -m unittest discover -s tests\n"
+                "# pytest tests\n"
+                "      - run: pytest plugins/example/tests # pytest tests\n"
+                "      - run: python -m unittest discover -s tests_other\n")
+            result = self.check_workflows(workflows)
+            self.assertTrue(result.wasSuccessful(), result.failures)
 
 
 class SuiteSelection(unittest.TestCase):
