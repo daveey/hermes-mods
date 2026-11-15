@@ -50,6 +50,8 @@ never one account's reset as the ETA. A `held` provider waits for its `until`.
 
 Paced is not stopped. While each worker's `limit` is 1 or more, freed slots keep going out in `DISPATCH_ORDER`: effective priority, then cards with waiters, then oldest first. A p0 card can sit behind dozens of higher-priority cards while the fleet claims every few minutes. Report its position among the ready cards a worker can take: evaluate `hermes_cli.kanban_db_dispatch_queries.DISPATCH_ORDER` against the replica with `~/.hermes/hermes-agent/.venv/bin/python` (the `hermes` launcher is a shell script, so its interpreter is not Python). Don't write "nothing claims". A low-urgency card that is waiting its turn needs no change. Bump it only under the lane-median rule.
 
+**Move a waited-on card to a provider that has room.** Pacing is per provider: when its card is paced on one provider and another provider's `llm_pacing.json` state is neither `paced` nor `held`, switch the card's model on its home board with `hermes kanban set-model <id> <model> --provider <p> --no-mandatory`. Without `--no-mandatory`, a later wall on that provider holds the card instead of moving it. Read back a `claimed` event a few minutes later. Once that provider is `held` too, clear the pin (`hermes kanban set-model <id> none`) so the default route can choose any provider with room. Priority and re-placement do not lift a pacing hold.
+
 A paced fleet keeps many free slots, so the worker autoscaler (`free_slots` in its tick log) correctly launches
 nothing. More machines can't raise LLM throughput, so say that instead of re-placing cards or asking for scale-up.
 The capacity question already has owners: the `Model capacity: <provider> pool projected exhaustion (paced)` cards.
