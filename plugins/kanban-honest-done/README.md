@@ -167,6 +167,16 @@ unverified", scoping notes like "the other test files were not run").
 
 ## Tests
 
+Shell write classification is command-position based: assignments and the explicit
+`env`, `command`, `exec`, `nohup`, `timeout` and `time` wrappers do not hide a call,
+but arguments of `echo`, `printf`, `grep`, and `git commit -m` are data. Quoted
+punctuation and data heredocs cannot manufacture commands. Explicit shell `-c`,
+substitutions, shell-input heredocs, reserved words, and Python `-m hermes_cli.main`
+retain executable classification. Consent shell checks share this parser too.
+`tests/test_command_position.py` covers those boundaries, all shared consumers,
+and the real comment hook. This is static classification, not shell evaluation:
+aliases, dynamically constructed command names, and sourced scripts are not resolved.
+
 `tests/test_acceptance_provenance_real_shapes.py` replays real state.db shapes (msg 931890 notice, peer-mail, exact steer, relays, stale and wrong-chat rows); `tests/test_acceptance_authority.py` (gate F) replays the t_7e2ee45c 2026-11-10 shape: a prepared waiver body applied with `f=…; hermes kanban edit <id> --body "$(cat $f)"` from a chat with no user turn, quoting a real user message of another chat, is refused; so are uncited waivers, notices, assistant text, worker prompts, missing ids, a quote older than the current body, a delegated parent's turn, dropping the DONE sentence and an unknown session. A fresh user turn in the same chat or its compression ancestor passes, as do restoring the original over a waiver and edits that keep acceptance. Paths: terminal (quoted and unquoted substitution), `mcp__terminal`, execute_code, tool_call, and the registered `pre_tool_call` hook with the `session_id` kwarg.
 
 `tests/test_title_context.py` covers the exact deferred-cleanup defect title: completed handoffs pass,

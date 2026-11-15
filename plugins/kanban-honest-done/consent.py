@@ -188,11 +188,40 @@ def write_texts(tool_name: str, args: Any) -> list[str]:
         return [] if str(args.get("action") or "spawn").lower() in ("list", "stop") else [json.dumps(args, default=str)]
     if name in SHELL_TOOLS:
         cmd = " ; ".join(str(args.get(k) or "") for k in ("command", "input", "data"))
-        return [cmd] if _SHELL_WRITE_RE.search(cmd) else []
+        return shell_write_texts(cmd)
     if name == "execute_code":
         code = str(args.get("code") or "")
         return [code] if _SHELL_WRITE_RE.search(code) or "kanban_" in code else []
     return []
+
+
+def shell_write_texts(command: str) -> list[str]:
+    # Use the same executable-position classifier as comment/acceptance gates.
+    try:
+        from . import core
+    except ImportError:
+        import importlib.util
+        import sys
+        key = "kanban_honest_done_core"
+        core = sys.modules.get(key)
+        if core is None:
+            spec = importlib.util.spec_from_file_location(key, Path(__file__).with_name("core.py"))
+            assert spec is not None and spec.loader is not None
+            core = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(core)
+            core = sys.modules.setdefault(key, core)
+    writes = []
+    for seg in core._segments(command):
+        parsed = core._kanban_verb(seg)
+        if parsed and _SHELL_WRITE_RE.search('kanban ' + parsed[0]):
+            writes.append(' '.join(parsed[1]))
+            continue
+        start = core._shell_commands().command_start(seg)
+        if start < len(seg) and os.path.basename(seg[start]) == 'hermes-hub':
+            text = ' '.join(seg[start:])
+            if _SHELL_WRITE_RE.search(text):
+                writes.append(text)
+    return writes
 
 
 def check_relay(tool_name: str, args: Any, sessions: Iterable[str], env=None,
