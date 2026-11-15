@@ -104,7 +104,8 @@ For each answer:
 **For a slow agent, read the execution log before explaining the delay.** Resolve the active worker session from its task/run, read timestamped tool calls and results, then inspect the output paths those calls actually used and query live publication state. Heartbeats prove liveness, not progress; an unchanged data directory says nothing about a separate build directory. Show the user a compact timeline of concrete operations/errors rather than another supervision promise. Separate dependency waits, productive execution, tool timeouts, recovery, rework and deployment; run counts alone do not measure wasted work. Tie resource failures to the operation stopped: a per-worker OOM does not establish global concurrency pressure. Preserve useful work before taking over. On a laptop host, rule out sleep before
 blaming software for a wall-clock gap: minutes with no lines at all in the agent log, plus `pmset -g log`
 Sleep/DarkWake entries, mean the machine was asleep, and timers on the monotonic clock (pause, resume and
-replacement watchers) don't advance during sleep. A gap that spans a sleep is not a software delay.
+replacement watchers) don't advance during sleep. A gap that spans a sleep is not a software delay. DarkWakes do
+advance it: a laptop alarm with no pmset `Wake from` between its start and filing is a detector misfire.
 
 **When state changed and no code path explains it** (a counter reset, a row rewritten, a file swapped), look for
 another actor before filesystem or log forensics: open cards on that subsystem on every board and host, their latest
