@@ -314,13 +314,13 @@ export function classify(chips, { nowMs = Date.now(), silence = new Map(), isAsk
     // Keep the independent execution verdict below (including unknown progress); never
     // turn a recent list read into a heartbeat or claim a running worker is alive.
     const board = c.boardStatus
-    if (ev?.state === 'unknown' && board && board.state === c.state && ['scheduled', 'blocked', 'triage', 'review', 'ready', 'todo'].includes(c.state) &&
+    if ((!ev || ev.state === 'unknown') && board && board.state === c.state && ['scheduled', 'blocked', 'triage', 'review', 'ready', 'todo'].includes(c.state) &&
         Number.isFinite(board.readAt) && nowMs >= board.readAt && nowMs - board.readAt <= 60_000) {
       out.waiting.push({ ...item(c), detail: `${c.state} · ${board.source === 'replica' ? 'reported board status' : 'board status'}${on ? ` · ${on}` : ''}` })
       continue
     }
-    if (ev?.sourced && ev.state === 'unknown' || legacyLive(c, ev)) {
-      out.waiting.push({ ...item(c), detail: `status unknown${ev.reason ? ` (${ev.reason.replace(/_/g, ' ')})` : ''} · last known: ${ev.lastKnown || c.state || 'unknown'}${ev.ageSec != null ? ` (observed ${span(ev.ageSec)} ago)` : ''}` })
+    if (board && (!ev || ev.state === 'unknown') || ev?.sourced && ev.state === 'unknown' || legacyLive(c, ev)) {
+      out.waiting.push({ ...item(c), detail: `status unknown${ev?.reason ? ` (${ev.reason.replace(/_/g, ' ')})` : ''} · last known: ${ev?.lastKnown || c.state || 'unknown'}${ev?.ageSec != null ? ` (observed ${span(ev.ageSec)} ago)` : ''}` })
       continue
     }
     if (c.look === 'stalled') { out.stuck.push({ ...item(c), reason: 'stalled', detail: `stalled: ${on || 'agent-owned wait over 2 h'}` }); continue }
