@@ -417,7 +417,8 @@ def main(argv=None):
 def _run(args, source, config, runtime, github, discovery):
     resolver = github
     adapter = MaintenanceGitHub(transport=github.transport, credential_resolver=resolver,
-        clock=lambda: time.time(), hourly_request_cap=runtime.get('hourly_request_cap'))
+        clock=lambda: time.time(), hourly_request_cap=runtime.get('hourly_request_cap'),
+        inventory_credentials=runtime.get('inventory_credentials'))
     identity = tuple(config[k] for k in ('owner_gateway_id', 'owner_profile', 'owner_epoch'))
     state = Path(args.state_dir)
     with OwnerLock(state / 'collector.lock', config, identity), Store(state / 'state.sqlite') as store:

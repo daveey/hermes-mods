@@ -68,7 +68,7 @@ def load_runtime(path):
         if len(raw) > 1024 * 1024:
             raise ValueError()
         data = json.loads(raw, object_pairs_hook=_pairs)
-        if not {'credentials', 'probes'} <= set(data) or set(data) - {'credentials', 'probes', 'broker_executable', 'job_repositories', 'hourly_request_cap'}:
+        if not {'credentials', 'probes'} <= set(data) or set(data) - {'credentials', 'probes', 'broker_executable', 'job_repositories', 'hourly_request_cap', 'inventory_credentials'}:
             raise ValueError()
         cap = data.get('hourly_request_cap')
         if cap is not None and (type(cap) is not int or cap < 1):
@@ -78,6 +78,17 @@ def load_runtime(path):
             raise ValueError()
         credentials = {k: BrokerCredential.from_mapping(v) for k, v in data['credentials'].items()}
         BrokerVendGitHub(credentials)  # Validate without vending anything.
+        routes = data.get('inventory_credentials', {})
+        if type(routes) is not dict:
+            raise ValueError()
+        for route, ref in routes.items():
+            kind, name = route.split(':', 1)
+            if kind not in ('repository', 'organization') or name != name.lower():
+                raise ValueError()
+            app = credentials[ref].app
+            prefix = 'repos' if kind == 'repository' else 'orgs'
+            if app is None or not app.permits(f'https://api.github.com/{prefix}/{name}/actions/runners'):
+                raise ValueError()
         jobs = data.get('job_repositories', {})
         if type(jobs) is not dict or any(type(v) is not list or len(v) > 10 or
                 any(not GitHubActions._name(repo, 2) for repo in v) for v in jobs.values()):
@@ -174,7 +185,8 @@ def run(config_path, runtime_path, identity, state_dir, *, stop=None, once=False
         adapter = GitHubActions(transport=github.transport,
                                 credential_resolver=github, pace_requests=True, pacing_window=30,
                                 quota_reserve=QUOTA_RESERVE, max_hourly_requests=MAX_HOURLY_REQUESTS,
-                                hourly_request_cap=private.get('hourly_request_cap'))
+                                hourly_request_cap=private.get('hourly_request_cap'),
+                                inventory_credentials=private.get('inventory_credentials'))
         scopes = {s['id']: s for s in config['scopes']}
         jobs = private.get('job_repositories', {})
         for sid, repositories in jobs.items():

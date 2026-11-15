@@ -56,7 +56,7 @@ class GitHubActions:
                  enrichment_interval=60, backoff_base=2, backoff_cap=300,
                  max_cycle_requests=32, pace_requests=False, pacing_window=0,
                  quota_reserve=0, max_hourly_requests=None, precharge_pacing=False,
-                 hourly_request_cap=None):
+                 hourly_request_cap=None, inventory_credentials=None):
         for value in (timeout, max_pages, max_job_requests, max_repositories,
                       max_runs, enrichment_interval, backoff_base, backoff_cap):
             if not isinstance(value, (float, int)) or not math.isfinite(value) or value <= 0:
@@ -91,6 +91,12 @@ class GitHubActions:
         if hourly_request_cap is not None and (type(hourly_request_cap) is not int or hourly_request_cap < 1):
             raise ValueError('invalid_provider_options')
         self.hourly_request_cap = hourly_request_cap
+        if inventory_credentials is not None and (
+                type(inventory_credentials) is not dict or any(
+                    type(k) is not str or type(v) is not str or not v
+                    for k, v in inventory_credentials.items())):
+            raise ValueError('invalid_provider_options')
+        self.inventory_credentials = dict(inventory_credentials or {})
         self._hourly_attempts = []
         self._cycle_remaining = None
         self._budgets, self._cache, self._enriched = {}, {}, {}
@@ -418,7 +424,9 @@ class GitHubActions:
             rows, total, seen = [], None, set()
             try:
                 s = self._scope(scope)
-                c = self._credential(s)
+                # Observe-only enumeration routing, not metadata or dispatch.
+                ref = self.inventory_credentials.get(s['kind'] + ':' + s['name'].lower())
+                c = self._credential(dict(s, credential_ref=ref) if ref else s)
                 budget = self._budgets.get(c.key)
                 if self.pace_requests and budget and self.clock() + self.pacing_window < budget.next_at:
                     raise _Failure('budget_deferred')
