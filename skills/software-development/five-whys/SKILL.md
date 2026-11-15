@@ -271,6 +271,8 @@ When fixtures depend on event chronology or expiry, read `references/clock-fixtu
 
 - Before exercising fork/timeout cleanup, validate exact integer PID ownership at the signal boundary and mock destructive signal/exit calls locally in unit tests. A bare fork mock can coerce to PID 1 and turn killpg into a broad user-process signal; a systemd scope alone does not contain that syscall. Use module-local process-control aliases rather than patching shared os functions, refuse external SIGCHLD reapers, and preserve unreaped-child identity through signalling. Test invalid/coercible IDs and lost-child ownership without real signals; real timeout integration must restrict signals to its own child.
 
+- Inject receipt stalls at the exact append, not metadata POSTs; assert call return/raise, not renamed logs. Synchronize profiler sampling with RPC.
+
 - Writing the chain after the fix is chosen, so the chain is built to justify it. Do the chain first; let it pick
   the fix.
 - Answers that restate the question ("it failed because it errored"). Each why must add new information.
