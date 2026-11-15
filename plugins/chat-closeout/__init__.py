@@ -1666,6 +1666,7 @@ def _wi_reset() -> None:
     with _waiting_lock:
         _state.pop("waiting_cache", None)
         _state.pop("waiting_memo", None)
+        _state.pop("waiting_rows", None)
         _state.pop("inputs_hit", None)
     _state.pop("host_memo", None)
 
@@ -1892,6 +1893,23 @@ def waiting_inputs() -> Any:
     return key
 
 
+def _waiting_scope() -> Any:
+    from hermes_cli import kanban_session_activity as ksa
+    return tuple(ksa._origin_scope()) if hasattr(ksa, "_origin_scope") else None
+
+
+def _waiting_slots(name: str, scope: Any) -> dict:
+    """Bound each scope partition to 32 LRU entries; caller holds _waiting_lock."""
+    slots = _state.setdefault(name, {})
+    if scope in slots:
+        slots[scope] = slots.pop(scope)
+    else:
+        if len(slots) >= 32:
+            del slots[next(iter(slots))]
+        slots[scope] = None
+    return slots
+
+
 def _own_inputs_hit(pop: bool) -> Optional[tuple]:
     """This thread's fresh ``inputs_hit`` (``(rows, parts)``), else None; ``pop`` consumes it."""
     hit = getattr(_inputs_local, "hit", None)
@@ -1899,7 +1917,10 @@ def _own_inputs_hit(pop: bool) -> Optional[tuple]:
         return None
     if pop:
         _inputs_local.hit = None
-    return (hit[1], hit[2]) if time.monotonic() - hit[0] <= INPUTS_REUSE_S else None
+    scope = _waiting_scope()
+    expected = list(scope) if scope is not None else None
+    return (hit[1], hit[2]) if (hit[2].get("scope") == expected
+                              and time.monotonic() - hit[0] <= INPUTS_REUSE_S) else None
 
 
 def _waiting_row_key(lineages: Optional[dict[str, list]], floor: Any) -> Callable[[dict, Any], Optional[str]]:
@@ -1921,9 +1942,15 @@ def waiting_source() -> dict[str, list[str]]:
     if _off():
         return {}
     with _waiting_lock:
-        hit = _state.get("waiting_cache")
+        scope = _waiting_scope()
+        answers = _waiting_slots("waiting_cache", scope)
+        memos = _waiting_slots("waiting_memo", scope)
+        row_caches = _waiting_slots("waiting_rows", scope)
+        if row_caches[scope] is None:
+            row_caches[scope] = wi.RowCache()
+        hit = answers[scope]
         raw = getattr(_inputs_local, "hit", None)
-        memo = _state.get("waiting_memo")
+        memo = memos[scope]
         # Age limits read reuse, never invalidation: core's counts read or this lock can take longer than
         # INPUTS_REUSE_S. An expired newer fingerprint still forbids returning an older cached answer.
         moved = raw is not None and (memo is None or memo[0] != raw[2])
@@ -1943,10 +1970,10 @@ def waiting_source() -> dict[str, list[str]]:
                 logger.debug("chat-closeout: waiting inputs unavailable; full pass", exc_info=True)
                 rows, parts = None, None
                 acct.fallback()
-            memo = _state.get("waiting_memo")
+            memo = memos[scope]
             if parts is not None and memo is not None and memo[0] == parts:
                 acct.skip()
-                _state["waiting_cache"] = (time.monotonic(), memo[1])
+                answers[scope] = (time.monotonic(), memo[1])
                 return memo[1]
             input_moved = parts is not None
             acct.change(input_moved)
@@ -1963,7 +1990,7 @@ def waiting_source() -> dict[str, list[str]]:
                         lineages = dict(parts["lineage"])
                         out = core.pending_closeouts(ledger(), reader, proof=session_proof, rows=rows,
                                                      row_key=_waiting_row_key(lineages, parts["floor"]),
-                                                     cache=_wi_get("waiting_rows", wi.RowCache), stats=stats,
+                                                     cache=row_caches[scope], stats=stats,
                                                      fields=core.SETTLE_ROW_FIELDS)
                 except Exception:
                     logger.debug("chat-closeout waiting source failed", exc_info=True)
@@ -1975,8 +2002,8 @@ def waiting_source() -> dict[str, list[str]]:
                 if not input_moved:
                     detail.fallback()
                 detail.rows(stats.get("recomputed", 0))
-            _state["waiting_memo"] = (parts, out) if parts is not None else None
-        _state["waiting_cache"] = (time.monotonic(), out)
+            memos[scope] = (parts, out) if parts is not None else None
+        answers[scope] = (time.monotonic(), out)
         return out
 
 

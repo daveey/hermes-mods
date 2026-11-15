@@ -69,6 +69,65 @@ def reset(work):
     work['read_cards'] = 0
 
 
+def test_interleaved_scope_memos_skip_card_reads(world, monkeypatch):
+    scope = ['a']
+    monkeypatch.setattr(ksa, '_origin_scope', lambda: ('example', scope[0]))
+    for name in ('a', 'b'):
+        scope[0] = name
+        plugin.waiting_inputs()
+        assert poll() == {'c1': ['t_1'], 'c2': ['t_2']}
+    reset(world['work'])
+    for name in ('a', 'b'):
+        scope[0] = name
+        plugin.waiting_inputs()
+        assert poll() == {'c1': ['t_1'], 'c2': ['t_2']}
+    assert world['work'] == {'reconcile_done': [], 'read_cards': 0}
+
+
+def test_other_scope_does_not_adopt_three_second_answer(world, monkeypatch):
+    scope = ['a']
+    monkeypatch.setattr(ksa, '_origin_scope', lambda: ('example', scope[0]))
+    plugin.waiting_inputs()
+    assert plugin.waiting_source() == {'c1': ['t_1'], 'c2': ['t_2']}
+    with sqlite3.connect(world['board']) as conn:
+        conn.execute("UPDATE tasks SET status = 'running' WHERE id = 't_2'")
+    scope[0] = 'b'
+    plugin._inputs_local.hit = None
+    assert plugin.waiting_source() == {'c1': ['t_1']}
+
+
+def test_scope_switch_discards_same_thread_inputs(world, monkeypatch):
+    scope = ['a']
+    monkeypatch.setattr(ksa, '_origin_scope', lambda: ('example', scope[0]))
+    plugin.waiting_inputs()
+    scope[0] = 'b'
+    hit = plugin._own_inputs_hit(pop=True)
+    assert hit is None
+
+
+def test_waiting_partitions_are_bounded_lru_and_reset(world, monkeypatch):
+    scope = ['0']
+    monkeypatch.setattr(ksa, '_origin_scope', lambda: ('example', scope[0]))
+    for index in range(33):
+        scope[0] = str(index)
+        plugin.waiting_inputs()
+        plugin.waiting_source()
+    for name in ('waiting_cache', 'waiting_memo', 'waiting_rows'):
+        assert len(plugin._state[name]) == 32
+        assert ('example', '0') not in plugin._state[name]
+    scope[0] = '1'
+    plugin.waiting_inputs()
+    plugin.waiting_source()
+    scope[0] = '33'
+    plugin.waiting_inputs()
+    plugin.waiting_source()
+    for name in ('waiting_cache', 'waiting_memo', 'waiting_rows'):
+        assert ('example', '1') in plugin._state[name]
+        assert ('example', '2') not in plugin._state[name]
+    plugin._wi_reset()
+    assert all(name not in plugin._state for name in ('waiting_cache', 'waiting_memo', 'waiting_rows'))
+
+
 def test_inputs_are_declared_and_portable(world):
     key = plugin.waiting_inputs()
     assert plugin.waiting_inputs() == key

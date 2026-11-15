@@ -303,6 +303,8 @@ def _run(args, clock: ReplayClock) -> int:
             plugin.waiting_source()
             cpu["waiting"] += time.process_time() - c0
             cache = plugin._state.get("waiting_cache")
+            if isinstance(cache, dict):
+                cache = cache.get(plugin._waiting_scope())
             if cache is not None and abs(cache[0] - clock.mono) >= 1e-6:
                 raise RuntimeError("waiting freshness stamp is not on the replay clock")
             passes["waiting"] += 1
