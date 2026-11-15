@@ -2060,6 +2060,110 @@ def pr_state_claim(reply: str, tool_log: Optional[list] = None) -> Optional[str]
     return hit.strip(" -*\t")
 
 
+# ---- deploy_claim: the reply says a change runs on named hosts, but this turn read nothing that shows it -------------
+# (self-heal agent-56a1fd1512: at 01:26Z a chat told David "The fix, core PR #3115, is merged as b7523ba7aa and running
+# on the hub and all eight workers." The turn had only counted dispatch skips and claims per host, which were zero
+# because the governor was disabled fleet-wide; its own `merge-base --is-ancestor` read five minutes later showed the
+# hub and workers 2, 5, 7 and 8 without the fix. Merged is not deployed: hosts pull on their own schedule and the hub
+# batches core updates.) Deterministic, before the judge: a sentence (outside code and quotes, not a question, not a
+# condition, negation, forecast or past tense) whose subject is a fix/change/commit/PR and which says it is
+# running/installed/deployed/live on or across named hosts (hub, workers, machines, Macs, mini, fleet), live
+# everywhere, or that hosts now have/run it, while the turn's tool log has no deployment read (ancestry, `--contains`,
+# `hermes version`, `rev-parse`/`describe`/`log -1` of a checkout, the hermes-sync log, or agent_rules' `<- DEPLOY
+# read:` line for a read past the `->` cut; agent_rules.DEPLOY_READ_RE is kept equal by a test).
+_DC_HOST = (r"(?:hub|worker-\d+|workers?|machines?|hosts?|gateways?|Macs?|MacBooks?|minis?|fleet|boxes|nodes|"
+            r"servers?|instances?)")
+_DC_DET = (r"(?:(?:the|all|every|each|both|other|remaining|our|these|those|pool|\d+|one|two|three|four|five|six|seven|"
+           r"eight|nine|ten|of)\s+){0,4}")
+_DC_CLAIM_RE = re.compile(
+    r"\b(?:live|running|installed|deployed|rolled\s+out|active|loaded)\s+(?:now\s+)?(?:on|to|across|in)\s+"
+    + _DC_DET + _DC_HOST + r"\b"
+    r"|\b(?:live|running|installed|deployed|rolled\s+out)\s+(?:now\s+)?everywhere\b"
+    r"|\b" + _DC_DET + _DC_HOST + r"\s+(?:[\w-]+\s+){0,3}?(?:now\s+|already\s+|all\s+)?(?:has|have|runs?|"
+    r"(?:is|are)\s+running|picked\s+up|loaded)\s+(?:it|the\s+(?:fix|change|new\s+code|update|commit|patch|guard))\b",
+    re.I)
+# The sentence's subject must be a change, nearer the claim than any card/run noun ("Card t_… is running on worker-3"
+# and "the review is running on worker-2" are about work, not code).
+_DC_FIX_RE = re.compile(r"\b(?:fix(?:es)?|changes?|commits?|PRs?|patch(?:es)?|version|update|code|release|guard|"
+                        r"rule|plugin|revision)\b|\B#\d{2,}\b|\b[0-9a-f]{7,40}\b", re.I)
+_DC_WORK_RE = re.compile(r"\b(?:cards?|t_[0-9a-f]{8,}|tasks?|jobs?|(?:re-?)?reviews?|rework|process(?:es)?|sessions?|"
+                         r"chats?|subagents?|lanes?|daemons?|services?|timers?|crons?|probes?|tests?|suites?|builds?|"
+                         r"land(?:ing)?\s+steps?|landing|merges?|watch(?:es)?|re-?measure|apply|status)\b", re.I)
+# "running on worker-3" alone is where a card runs, not what code a host has: a single-worker "running"/"active" claim
+# is skipped; "installed/live/deployed on worker-4" still counts.
+_DC_ONE_WORKER_RUN_RE = re.compile(r"^(?:running|active|loaded)\s+(?:now\s+)?(?:on|in)\s+(?:the\s+)?worker-\d+$", re.I)
+_DC_NEG_RE = re.compile(r"(?:\b(?:not|never|no\s+longer|yet\s+to|neither|nor)\b|n[\u2019']t\b)[^.;:!?]{0,40}$"
+                        r"|\b(?:will|would|should|could|might|may|can|must|to|was|were|had\s+been|be|"
+                        r"I[\u2019']ll|it[\u2019']ll|we[\u2019']ll|they[\u2019']ll)\s+(?:(?:now|already|also|then|"
+                        r"soon)\s+)?(?:be\s+)?$"
+                        r"|\b(?:get|gets|getting|make|makes|making|have|having)\s+(?:[\w#()-]+\s+){0,5}$"
+                        r"|\b(?:go|goes|going|went|come|comes|coming)\s+$"
+                        r"|\b(?:checks?|checking|verif(?:y|ies|ying)|watch(?:es|ing)?|ensures?|expects?|expected|"
+                        r"confirm(?:s|ed|ing)?|until|whether)\b[^.;:!?]{0,80}$", re.I)
+_DC_READ_RE = re.compile(
+    r"\bmerge-base\s+--is-ancestor\b|\b(?:branch|tag)\s+(?:-[\w-]+\s+)*--contains\b|\bhermes\s+(?:--)?version\b"
+    r"|\bgit\b[^\n;|&]*?\b(?:rev-parse|describe)\b|\bgit\b[^\n;|&]*?\blog\s+(?:--\S+\s+)*(?:-1|-n\s*1)\b"
+    r"|hermes-sync\.log\b|\bcmp\s+\S|\bsha256sum\b|<- DEPLOY read:", re.I)
+_DC_META_RE = re.compile(r"\bdeploy_claim\b", re.I)
+# Fleet scope only: several hosts ("the hub and all eight workers", "workers 1-8", "both Macs"), every/each/all of them,
+# the fleet, or everywhere. Hosts pull on their own schedules, so one card's readback never covers a fleet claim; a
+# single-host claim ("live on the hub") usually relays that host's card readback, and holding those too was ~46
+# no-read holds a day in a 4-day hub backtest (2026-11-11..15) against ~6 fleet ones.
+_DC_PLURAL_HOST_RE = re.compile(r"\b(?:workers|machines|hosts|gateways|Macs|MacBooks|minis|nodes|boxes|servers|"
+                                r"instances|fleet|everywhere)\b|\b(?:every|each|all|both)\s+(?:the\s+|of\s+the\s+)?"
+                                + _DC_HOST + r"\b", re.I)
+_DC_ONE_HOST = r"(?:hub|worker-\d+|mini|Mac(?:Book)?(?:[\u2019']s\s+core)?)"
+_DC_TWO_HOSTS_RE = re.compile(r"\b" + _DC_ONE_HOST + r"\s+and\s+(?:(?:on|in|to)\s+)?(?:(?:the|your)\s+)?"
+                              + _DC_ONE_HOST + r"\b", re.I)
+
+
+def _dc_fleet_scope(window: str) -> bool:
+    """True when `window` (the claim plus the rest of its clause) names more than one host or a fleet."""
+    window = re.split(r"\s(?:but|except|while|though|although)\s", window, maxsplit=1)[0]
+    return bool(_DC_PLURAL_HOST_RE.search(window) or _DC_TWO_HOSTS_RE.search(window))
+DEPLOY_CLAIM_NUDGE = (
+    "[coach] deploy_claim: your reply says a change is running on named hosts (\"{evidence}\"), but this turn read "
+    "nothing that shows what those hosts run. Merged is not deployed: each host pulls on its own schedule (the hub "
+    "batches core updates), and an outcome metric (zero skips, cards moving) can have another cause. Read it per host "
+    "now (`git -C <checkout> merge-base --is-ancestor <sha> HEAD` on the hub and on each worker, e.g. through "
+    "`hub-worker-exec all --`) and report which hosts have it and which do not yet, with the time of the read.")
+
+
+def deploy_claim(reply: str, tool_log: Optional[list] = None) -> Optional[str]:
+    """The sentence claiming a fix/change is running, installed, deployed or live on named hosts when this turn's
+    tool log shows no deployment read, else None (code spans, quotes, `>` lines, questions, conditions, negations,
+    forecasts, past tense, sentences about cards/runs and replies naming deploy_claim are ignored)."""
+    text = _CODE_QUOTE.sub(" ", reply or "")
+    text = _QUOTED_RE.sub(" ", text)
+    if _DC_META_RE.search(text):
+        return None
+    hit = None
+    for s in _SENTENCE_END.split(text):
+        if s.rstrip(" *_").endswith("?"):
+            continue
+        for m in _DC_CLAIM_RE.finditer(s):
+            pre = s[:m.start()]
+            if _PSC_HEDGE_RE.search(pre) or _DC_NEG_RE.search(pre) or _DC_ONE_WORKER_RUN_RE.match(m.group(0)):
+                continue
+            fixes = [f.end() for f in _DC_FIX_RE.finditer(pre)] or [f.end() for f in _DC_FIX_RE.finditer(m.group(0))]
+            if not fixes:
+                continue
+            works = [w.end() for w in _DC_WORK_RE.finditer(pre)]
+            if works and max(works) > max(fixes) and not _DC_FIX_RE.search(m.group(0)):
+                continue
+            if not _dc_fleet_scope(s[m.start():m.end() + 80].split(";", 1)[0].split(":", 1)[0]):
+                continue
+            hit = s
+            break
+        if hit:
+            break
+    if not hit:
+        return None
+    if any(_DC_READ_RE.search(l or "") for l in (tool_log or [])):
+        return None
+    return hit.strip(" -*\t")
+
+
 # ---- future_clock: a past-tense Pacific time stamp that has not happened yet -------------------------------------------
 # (self-heal agent-748d257889: at 20:59 PST a red-sweep report said "(Checked 21:05–21:40 PT.)" and card comments said
 # "Red sweep ~21:15 PST". The model subtracted 7 h from UTC tool stamps after DST had ended (UTC-8) and never read the
@@ -2453,17 +2557,18 @@ def restart_scope_claim_nudge(evidence: str, skew: Optional[tuple]) -> str:
 
 RULES = ("handoff", "confirm", "unverified", "unwatched", "report_only", "status_only", "denied_ask", "credit_ask",
          "laptop_job", "skipped_live", "merge_forecast", "pr_state_claim", "future_clock", "claimed_mutation",
-         "restart_scope_claim")
+         "restart_scope_claim", "deploy_claim")
 # Every rule is classified by whether its check reads the user turn (agent-372c9408b8). A reply-only rule judges the
 # reply (and tool log or board) alone, so many holds under one user-turn opening say nothing about the rule firing on
 # a template: close-out turns are where chats report PR state. signals.template_holds skips these rules.
 # tests/test_signals.py fails CI for a rule in neither set, or a "reply-only" check that takes the ask.
 REPLY_ONLY_RULES = frozenset({"denied_ask", "credit_ask", "laptop_job", "skipped_live", "merge_forecast",
-                              "pr_state_claim", "future_clock", "claimed_mutation", "restart_scope_claim"})
+                              "pr_state_claim", "future_clock", "claimed_mutation", "restart_scope_claim",
+                              "deploy_claim"})
 USER_TURN_RULES = frozenset({"handoff", "confirm", "unverified", "unwatched", "report_only", "status_only"})
 DEFAULT_RULES = ("handoff", "confirm", "unwatched", "report_only", "status_only", "denied_ask", "credit_ask",
                  "laptop_job", "skipped_live", "merge_forecast", "pr_state_claim", "future_clock", "claimed_mutation",
-                 "restart_scope_claim")
+                 "restart_scope_claim", "deploy_claim")
 # Per-rule judge thresholds (COACH_REPLY_THRESHOLDS overrides; other rules use COACH_REPLY_THRESHOLD).
 # report_only: tuned on the training split of the 2026-10-27 labeled set (README, "report_only").
 # report_only_capped: the screen alone when a second opinion was due but unavailable (daily cap hit, error); confirms
@@ -4032,7 +4137,7 @@ def handoff_outcome(reply: str, user_ask: str, tool_log: list[str], llm: Callabl
 STRONG_REPORT_ONLY_SRC = ("confirm", "closed_owner", "unverified_owner")
 
 
-NEW_CLAIM_RULES = ("merge_forecast", "pr_state_claim")
+NEW_CLAIM_RULES = ("merge_forecast", "pr_state_claim", "deploy_claim")
 
 
 def outcome_error(exc: BaseException, judge_error: bool, judged: bool) -> dict:
@@ -4073,7 +4178,7 @@ def nudge_outcome(rule: str, reply: str, user_ask: str, tool_log: list[str], llm
                         kanban_down=kanban_down, human_asks=human_asks, prev_turn=prev_turn, confirm=confirm,
                         confirm_floor=confirm_floor, human_confirm_floor=human_confirm_floor,
                         report_only_fallback=report_only_fallback)
-    fns = {"merge_forecast": merge_forecast, "pr_state_claim": pr_state_claim}
+    fns = {"merge_forecast": merge_forecast, "pr_state_claim": pr_state_claim, "deploy_claim": deploy_claim}
     for r in (NEW_CLAIM_RULES if extra_rules is None else extra_rules):
         if r == rule or r not in fns:
             continue
@@ -4295,6 +4400,12 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
             return {"rule": "pr_state_claim", "p": 1.0, "evidence": phrase, "reason": "pr_state_claim",
                     "verdict": {"pr_state_claim": 1.0, "evidence": phrase},
                     "nudge": PR_STATE_CLAIM_NUDGE.format(evidence=phrase[:160])}
+    if not only or "deploy_claim" in only:
+        phrase = deploy_claim(reply, tool_log)
+        if phrase:  # deterministic: a fix claimed running on named hosts with no deployment read (agent-56a1fd1512)
+            return {"rule": "deploy_claim", "p": 1.0, "evidence": phrase, "reason": "deploy_claim",
+                    "verdict": {"deploy_claim": 1.0, "evidence": phrase},
+                    "nudge": DEPLOY_CLAIM_NUDGE.format(evidence=phrase[:160])}
     if not only or "future_clock" in only:
         phrase = future_clock(reply, now=now)
         if phrase:  # deterministic: a past-tense Pacific stamp later than the real clock (agent-748d257889)
@@ -4597,6 +4708,7 @@ BACKTEST_RULES: dict = {"credit_ask": lambda r: credit_ask(r, []), "laptop_job":
                         "skipped_live": lambda r: skipped_live(r, []),
                         "merge_forecast": lambda r: merge_forecast(r, []),
                         "pr_state_claim": lambda r: pr_state_claim(r, []),
+                        "deploy_claim": lambda r: deploy_claim(r, []),
                         "future_clock": lambda r, at=None: future_clock(r, now=at),
                         "claimed_mutation": lambda r: (claimed_mutation(r, []) or {}).get("evidence"),
                         # wording only (an upper bound): a backtest can't know each reply's backend skew

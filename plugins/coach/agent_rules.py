@@ -2601,6 +2601,30 @@ PR_READ_RE = re.compile(
 PR_READ_HELP_RE = re.compile(r"(?:^|\s)(?:--help|-h)(?:\s|\)|$)")
 TURN_LOG_ARG_CAP = 140
 PR_READ_LINES_MAX = 3
+# agent-56a1fd1512: a deployment read (`merge-base --is-ancestor <sha> HEAD` per host) usually sits behind a `cd ~;
+# date; C=$(readlink -f ...)` preamble, past the 140-char `->` cut, so reply_check.deploy_claim would not see it. Each
+# such read past the cut gets its own `   <- DEPLOY read: ...` line. Same pattern as reply_check._DC_READ_RE (a test
+# keeps them equal).
+DEPLOY_READ_RE = re.compile(
+    r"\bmerge-base\s+--is-ancestor\b|\b(?:branch|tag)\s+(?:-[\w-]+\s+)*--contains\b|\bhermes\s+(?:--)?version\b"
+    r"|\bgit\b[^\n;|&]*?\b(?:rev-parse|describe)\b|\bgit\b[^\n;|&]*?\blog\s+(?:--\S+\s+)*(?:-1|-n\s*1)\b"
+    r"|hermes-sync\.log\b|\bcmp\s+\S|\bsha256sum\b|<- DEPLOY read:", re.I)
+
+
+def deploy_read_lines(arg: str, cap: int = TURN_LOG_ARG_CAP) -> list[str]:
+    """`   <- DEPLOY read: <the read>` for each deployment read in `arg` that ends past the `->` line's `cap` chars."""
+    out: list[str] = []
+    if not isinstance(arg, str) or len(arg) <= cap:
+        return out
+    for m in DEPLOY_READ_RE.finditer(arg):
+        if m.end() <= cap:
+            continue
+        line = f"   <- DEPLOY read: {arg[m.start():m.start() + 160].split(chr(10), 1)[0]}"
+        if line not in out:
+            out.append(line)
+        if len(out) >= PR_READ_LINES_MAX:
+            break
+    return out
 
 # agent-521fd3b5d4: core resumes a turn the backend cut (planned update pause, crash) with a user-role note, so the
 # coach starts a new turn and, in a gateway that booted after the cut, has none of its calls in memory. turn_start then
@@ -4531,7 +4555,7 @@ class AgentCoach:
         s["turn_log"].append(f"-> {tool}({arg[:TURN_LOG_ARG_CAP]})")
         s.setdefault("turn_rich", deque(maxlen=60)).append(rich_tool_line(tool, args, arg))
         if tool in ("terminal", "execute_code"):
-            for line in pr_read_lines(arg):
+            for line in pr_read_lines(arg) + deploy_read_lines(arg):
                 s["turn_log"].append(line)
                 s["turn_rich"].append(line)
         if tool == "terminal" and "commit" in arg and "git" in arg:
