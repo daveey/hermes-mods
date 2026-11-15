@@ -47,3 +47,10 @@ stops new claims on a provider while its pooled accounts burn faster than their 
 A paced provider has no start time. Claims resume when the pool's burn falls below what the accounts with headroom
 sustain; an account's weekly reset adds headroom but doesn't set a time. Quote that condition and the next resets,
 never one account's reset as the ETA. A `held` provider waits for its `until`.
+
+A paced fleet keeps many free slots, so the worker autoscaler (`free_slots` in its tick log) correctly launches
+nothing. More machines can't raise LLM throughput, so say that instead of re-placing cards or asking for scale-up.
+The capacity question already has owners: the `Model capacity: <provider> pool projected exhaustion (paced)` cards.
+There is one per reset window, with idempotency key `model-capacity-pace:<provider>:<reset epoch>`. Their bodies forbid
+buying capacity, enabling paid overflow, or asking David unless an authorization boundary is reached. Point to
+those cards. Never turn a stall notice into a capacity-purchase ask.
