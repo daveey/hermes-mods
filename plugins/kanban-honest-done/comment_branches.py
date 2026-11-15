@@ -1,44 +1,16 @@
 """Early feedback for branch-looking comments; Gate G still reads only bodies."""
-import argparse
-import functools
 import os
 import re
 from pathlib import Path
 
 # `hermes kanban [--board B] comment TASK_ID TEXT...` options as core defines them (hermes_cli/kanban_parser.py).
-# argparse accepts any unique prefix (`--max 5` is `--max-len 5`), so the no-core reader resolves prefixes too.
-# tests/test_comment_branches_cli_options.py checks these lists against core's parser whenever core imports.
+# argparse accepts any unique prefix (`--max 5` is `--max-len 5`), so the reader resolves prefixes too.
+# The hook never builds core's parser: the first build in a process costs 63-107 ms (t_01a1dee4d010c1ba).
+# tests/test_comment_branches_cli_options.py checks these lists, and what the reader returns, against core's
+# parser whenever core imports.
 COMMENT_VALUE_OPTIONS = ("--author", "--max-len", "--origin-gateway")
 COMMENT_FLAG_OPTIONS = ("--help",)
 KANBAN_VALUE_OPTIONS = ("--board",)
-
-
-class _NoWrite(Exception):
-    """hermes would print help or a usage error for these arguments, so it posts nothing."""
-
-
-class _QuietParser(argparse.ArgumentParser):
-    # Subparsers inherit the root's class: help and usage errors raise here instead of printing and exiting.
-    def _print_message(self, message, file=None):
-        pass
-
-    def exit(self, status=0, message=None):
-        raise _NoWrite()
-
-    def error(self, message):
-        raise _NoWrite()
-
-
-@functools.lru_cache(maxsize=1)
-def core_parser():
-    """Core's own `hermes kanban` parser, built once per process; None when core isn't importable."""
-    try:
-        from hermes_cli.kanban_parser import build_parser
-        root = _QuietParser(prog="hermes", add_help=False)
-        build_parser(root.add_subparsers(dest="command"))
-        return root
-    except Exception:
-        return None
 
 
 def _resolve(token, options):
@@ -63,8 +35,8 @@ def _kanban_options(seg, rest):
     return []
 
 
-def _static_comment(kanban_opts, rest):
-    """No-core reader of the same grammar: unique prefixes, `--opt=value`, options before or after the text."""
+def _read_comment(kanban_opts, rest):
+    """Static reader of core's grammar: unique prefixes, `--opt=value`, options before or after the text."""
     board, i = None, 0
     while i < len(kanban_opts):
         token = kanban_opts[i]
@@ -105,15 +77,7 @@ def _static_comment(kanban_opts, rest):
 
 def comment_args(seg, rest):
     """(task id, text, board) as hermes reads `... kanban [OPTS] comment REST`, or None when it posts nothing."""
-    kanban_opts = _kanban_options(seg, rest)
-    parser = core_parser()
-    if parser is None:
-        return _static_comment(kanban_opts, rest)
-    try:
-        ns = parser.parse_args(["kanban", *kanban_opts, "comment", *rest])
-    except _NoWrite:
-        return None  # help or a usage error: hermes refuses the command too
-    return str(ns.task_id), " ".join(ns.text).strip(), ns.board
+    return _read_comment(_kanban_options(seg, rest), rest)
 
 
 def hint(task_id):
