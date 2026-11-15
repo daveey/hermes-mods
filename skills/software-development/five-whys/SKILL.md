@@ -190,8 +190,13 @@ the update). Write that precondition into the live-check acceptance and confirm 
 it was absent, report "no regression; prevention not yet observed live". The reverse holds for a check that the old
 symptom stopped: count only hits from processes started after the fix landed (a worker spawned before the update keeps
 the old code until it exits; date each line by its session-id stamp or the run's `spawned` time), and anchor the
-match at line start (timestamp, level, emitting logger, then the message), never the bare phrase: card titles,
-comments and your own grep commands (desktop.log echoes tool-call arguments) quote it in the same logs. Dry-run the probe on the live log and on one synthetic hit right after filing it, before parking. A guard that "works"
+match at line start (timestamp, level, the optional `[<session>] ` tag that lines logged inside a session carry,
+emitting logger, then the message: `WARNING (\[[^]]*\] )?agent\.conversation_loop: <message>`), never the bare phrase:
+card titles, comments and your own grep commands (desktop.log echoes tool-call arguments) quote it in the same logs.
+Dry-run the probe on the live log (current and rotated files) and on one synthetic hit right after filing it, before
+parking. Copy that hit from a real line of the same logger in the live log and swap only the message: a hit typed from
+the format you assumed passes a probe that shares the wrong assumption (an anchor without the session tag kept a
+verify card asleep 29 h past its real hit, and a sweep that re-ran the probe trusted it). A guard that "works"
 often moves the failure somewhere quieter: a loud error that falls back to a slow path, an estimate that drifted from
 the real count, an urgent route parked by an unrelated hold. Each of those is a new why-chain.
 
@@ -234,6 +239,7 @@ For a chain going into a new card's body, check the draft before `kanban_create`
 - [ ] The write-up has both `Root (happened)` and `Root (not caught)`, and neither is "human error", "flaky" or "transient"?
 - [ ] A `Recurrence:` line names the earlier occurrence it searched for (or says first time)?
 - [ ] Every countermeasure has a `proof:` (test fails before/passes after, command output) or a card/issue link, and each live check ran at once, never as an N-hour soak?
+- [ ] Each log-line probe (wake or live check) matched a real line of its logger copied from the live log (session tag and rotated files included) and missed a line that only quotes its phrase?
 - [ ] The chain is posted where the fix lives (PR body, issue, card comment), not only in chat?
 
 ## Blameless
