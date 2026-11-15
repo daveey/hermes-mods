@@ -1,0 +1,319 @@
+From 14e67f11acf4e2d2ee2083e323cfc42a3fc5036a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 22:08:23 +0000
+Subject: [PATCH] [daveey] ci: recover flaky intake overlap and stale cache
+ liveness
+
+Reconcile unrelated overlap refusals after key-absence readback even after an ambiguous create. Preserve attempted pages when match readback fails. Deduplicate journal-mode legacy body receipts and re-resolve missing local cached owners only after authoritative listing absence; document foreign-owner recovery.
+
+Proof: three targeted regressions failed on the base; 199 focused tests across 10 files pass with file retries disabled, including real Board/CLI coverage. Seven condition mutants killed. scripts/check: 20 checks pass. No cadence, thresholds, self-heal or autoscaling changes; no savings claim.
+---
+ docs/ci-flaky-intake.md                |  26 ++++-
+ scripts/ci/flaky_kanban.py             |  36 ++++--
+ tests/ci/test_flaky_intake.py          |   6 +
+ tests/ci/test_flaky_intake_liveness.py | 148 +++++++++++++++++++++++++
+ 4 files changed, 204 insertions(+), 12 deletions(-)
+ create mode 100644 tests/ci/test_flaky_intake_liveness.py
+
+diff --git a/docs/ci-flaky-intake.md b/docs/ci-flaky-intake.md
+index e74f94dc2b..d8cd2db00a 100644
+--- a/docs/ci-flaky-intake.md
++++ b/docs/ci-flaky-intake.md
+@@ -79,9 +79,11 @@ Unattempted pages are rechecked against exact owners before each drain. Once cre
+ comment delivery has been attempted, the page remains immutable so an ambiguous response
+ cannot change its replay identity. A definitive `create_overlap` refusal is different:
+ read back every named match, route exact-test owners through the existing owner path, and
+-retry unrelated matches only with supported `distinct_from` evidence. A refusal after an
+-earlier ambiguous attempt cannot dissolve that earlier page. Unreadable overlap matches
+-remain retryable, never an excuse to declare unknown work distinct. The shared polling budget also stops starting new owner
++retry unrelated matches only with supported `distinct_from` evidence. After an earlier
++ambiguous attempt, successful complete board listing must first establish that the intake
++key is absent. A subsequent definitive refusal can then be reconciled; unreadable overlap
++matches retain the immutable attempted page and remain pending, never an excuse to declare
++unknown work distinct. The shared polling budget also stops starting new owner
+ resolutions and page deliveries; deferred rows remain durable and the poll reports failure.
+ Board/courier operations already started may still consume their existing transport timeout.
+ Before GitHub discovery, a drain gets half the invocation budget and checkpoints the JSON
+@@ -138,6 +140,24 @@ backup, but never replace an actively held lock inode.
+ 
+ ## Recovery and rollback
+ 
++At cutover the journal may replay legacy cursor runs. Journal-mode owner delivery recognizes
++an exact test/job citation in the owner's body as well as its comments, so initial legacy
++filings do not receive redundant "Flaked again" comments. Different jobs still get comments;
++the legacy non-journal helper retains its original comment behavior.
++
++An unreadable cached local owner is evicted only when a successful complete local board
++listing (including archived cards) proves its ID absent. Normal owner discovery then runs
++again before intake admission. An inventory error, a listed but unreadable owner, or a stale
++foreign scope never proves absence. No retry count silently abandons a known OPEN owner.
++For a permanently gone cross-board/foreign cached owner, stop the producer, back up the JSON
++cursor, and verify deletion on the owning gateway/profile/board through its authoritative
++Board surface (not absence in the hub replica). Remove only that exact test's entry from
++`state['cards']` in the JSON cursor and resume the producer. This is the manual escape hatch
++for scopes the local listing cannot prove absent. Do not remove entries for merely offline
++or unreadable owners; restore read access/freshness instead. Retain the deletion evidence.
++Never edit the journal or its identity/lock files for this recovery. Rediscovery still holds
++stale/unreadable matching OPEN replica owners pending even after cache eviction.
++
+ Loss of only the JSON cursor is replay-safe while the journal remains intact. Missing or
+ corrupt journal state must not be treated as an empty queue. Missing queue or anchor and a
+ mismatched database UUID fail closed before polling or delivery. This detects replacement by
+diff --git a/scripts/ci/flaky_kanban.py b/scripts/ci/flaky_kanban.py
+index 78b4c0b96f..5395516148 100644
+--- a/scripts/ci/flaky_kanban.py
++++ b/scripts/ci/flaky_kanban.py
+@@ -378,8 +378,10 @@ def file_cards(entries: Iterable[dict[str, str]], *, run_url: str, branch: str,
+         recorded_generation = (known or {}).get("generation", 0)
+         owner = ctx.resolve(known) if known else None
+         if on_unowned is not None and known and (owner is None or owner.get("status") is None):
+-            log.append(f"FAILED {test_id}: cached owner unreadable; durable retry pending")
+-            continue
++            if not ctx.cached_owner_absent(known):
++                log.append(f"FAILED {test_id}: cached owner unreadable; durable retry pending")
++                continue
++            del state["cards"][test_id]
+         if owner is not None and owner.get("status") not in CLOSED | {None}:
+             log.append(_append(ctx, owner, recorded_generation))
+             continue
+@@ -429,8 +431,20 @@ class _Flake:
+         self.comment = f"Flaked again: `{test_id}` in {run_url} (branch `{branch}`)." + (
+             f"\n\n```\n{excerpt[-1500:]}\n```" if excerpt else "")
+ 
++    def cached_owner_absent(self, ref: dict[str, Any]) -> bool:
++        """Only a complete local inventory proves a cached owner is gone.
++
++        Replica absence or repeated read failures are not deletion receipts.
++        Other boards require operator reconciliation on their owning scope.
++        """
++        if ref.get("gateway") not in (None, "", "local", self.self_gw):
++            return False
++        if ref.get("board") not in (None, "", "default"):
++            return False
++        return not any(c.get("id") == ref.get("card") for c in self.board.list_cards())
++
+     def noted(self, comments: Iterable[str]) -> bool:
+-        return any(self.run_url in c and self.test_id in c for c in comments)
++        return any(_cites_job(c, self.run_url) and _mentions(c, self.test_id) for c in comments)
+ 
+     def resolve(self, ref: dict[str, Any]) -> dict[str, Any] | None:
+         """``ref`` (an overlap match or a state entry) read from its owner: this board, another board here, or
+@@ -455,6 +469,10 @@ class _Flake:
+ 
+     def deliver(self, card: dict[str, Any]) -> tuple[bool | None, str]:
+         """Comment ``card`` and read the comment back. ``(True, how)``, ``(False, why)`` or ``(None, pending)``."""
++        # Legacy owners put the initial job receipt in the body, not a comment.
++        current = self.resolve(card) if self.require_fresh else None
++        if current is not None and self.noted([str(current.get("body") or "")]):
++            return True, "already noted in owner body for this job"
+         if card.get("gateway"):
+             if self.relay is None:
+                 return False, "no hermes-hub relay on this host"
+@@ -608,11 +626,10 @@ def _create_intake(journal, repo, board, state, relay, title, body, key, page, d
+                                 distinct_reason="Daily intake only admits unowned occurrences; "
+                                 "read-back overlap matches do not own any test in this manifest.")
+         except CreateRefused as refused:
+-            # A previous lost create response cannot be disproved by this later refusal.
+-            if page["attempted"] or not contexts:
++            # deliver() proved the key absent before calling us. Keep the old
++            # ambiguity fence until every overlap match has also been read back.
++            if not contexts:
+                 raise
+-            with journal.db:
+-                journal.db.execute("UPDATE pages SET attempted=0 WHERE id=?", (page["id"],))
+             fresh = [m for m in refused.matches if m.get("id") and m["id"] not in distinct]
+             if not fresh:
+                 raise
+@@ -622,8 +639,9 @@ def _create_intake(journal, repo, board, state, relay, title, body, key, page, d
+                     raise RuntimeError("intake_budget")
+                 owner = contexts[0].resolve(match)
+                 if owner is None or owner.get("status") not in OPEN | CLOSED:
+-                    # Definitive refusal, so a later drain may safely recheck this page.
+-                    journal.unplan_page(page["id"])
++                    # Preserve earlier ambiguity when match readback is unavailable.
++                    if not page["attempted"]:
++                        journal.unplan_page(page["id"])
+                     raise RuntimeError("intake overlap owner unreadable") from None
+                 owners.append(owner)
+             exact = [(ctx, owner) for ctx in contexts for owner in owners if _overlap_owns(ctx, owner)]
+diff --git a/tests/ci/test_flaky_intake.py b/tests/ci/test_flaky_intake.py
+index 7a20bf3f9d..a7fb0ca0d4 100644
+--- a/tests/ci/test_flaky_intake.py
++++ b/tests/ci/test_flaky_intake.py
+@@ -189,6 +189,9 @@ def test_unreadable_cached_owner_never_admits_to_intake():
+         def card(self, cid):
+             return None
+ 
++        def list_cards(self):
++            return [{"id": "missing", "status": "running", "title": "Deflake tests/a.py::test_a"}]
++
+     state = {"cards": {"tests/a.py::test_a": {"card": "missing", "generation": 0}}}
+     admitted = []
+     lines = fk.file_cards([{"test_id": "tests/a.py::test_a"}], run_url="https://github.com/o/r/actions/runs/1/job/9",
+@@ -352,6 +355,9 @@ def test_prior_ambiguous_create_followed_by_refusal_never_repartitions(tmp_path)
+         def create(self, *args, **kwargs):
+             raise fk.CreateRefused("overlap", [{"id": "unknown"}])
+ 
++        def card(self, cid):
++            return None
++
+     journal = intake.Journal(tmp_path / "queue.sqlite3")
+     record(journal, count=1)
+     with journal.db:
+diff --git a/tests/ci/test_flaky_intake_liveness.py b/tests/ci/test_flaky_intake_liveness.py
+new file mode 100644
+index 0000000000..dad5609204
+--- /dev/null
++++ b/tests/ci/test_flaky_intake_liveness.py
+@@ -0,0 +1,148 @@
++"""Recovery without duplicate creates or abandoning unreadable owners."""
++import json
++
++import pytest
++
++from scripts.ci import flaky_kanban as fk
++from scripts.ci.flaky_intake import Journal
++from tests.ci.test_flaky_intake import Board, record
++
++
++class ReadableBoard(Board):
++    def card(self, cid, board=None):
++        return self.cards.get(cid)
++
++
++def test_ambiguous_create_then_unrelated_overlap_recovers(tmp_path):
++    class Overlap(ReadableBoard):
++        calls = 0
++
++        def create(self, title, body, key, **kwargs):
++            self.calls += 1
++            if self.calls == 1:
++                raise RuntimeError("lost response")
++            if not kwargs.get("distinct_from"):
++                raise fk.CreateRefused("overlap", [{"id": "old"}])
++            assert kwargs["distinct_from"] == ["old"]
++            assert kwargs["distinct_reason"]
++            return super().create(title, body, key)
++
++    journal = Journal(tmp_path / "queue.sqlite3")
++    try:
++        record(journal, count=1)
++        board = Overlap()
++        board.cards["old"] = dict(id="old", title="Yesterday's intake", body="", status="ready",
++                                  idempotency_key="ci-flaky-intake:o/r:2000-01-01")
++        board.notes["old"] = []
++        assert any(s.startswith("FAILED") for s in fk.drain_intake(journal, "o/r", board, {"cards": {}}, None))
++        fk.drain_intake(journal, "o/r", board, {"cards": {}}, None)
++        assert journal.db.execute("SELECT sum(delivered) FROM occurrences").fetchone()[0] == 1
++        assert board.calls == 3
++        assert len(board.cards) == 2
++    finally:
++        journal.close()
++
++
++@pytest.mark.parametrize("readable", [True, False])
++def test_ambiguous_create_never_repeated_when_key_exists_or_inventory_fails(tmp_path, readable):
++    class Lost(ReadableBoard):
++        calls = 0
++        unavailable = False
++
++        def create(self, *args, **kwargs):
++            self.calls += 1
++            super().create(*args, **kwargs)
++            raise RuntimeError("lost response")
++
++        def list_cards(self):
++            if self.unavailable:
++                raise RuntimeError("inventory unavailable")
++            return super().list_cards()
++
++    journal = Journal(tmp_path / "queue.sqlite3")
++    try:
++        record(journal, count=1)
++        board = Lost()
++        fk.drain_intake(journal, "o/r", board, {"cards": {}}, None)
++        board.unavailable = not readable
++        fk.drain_intake(journal, "o/r", board, {"cards": {}}, None)
++        assert board.calls == 1
++        assert journal.db.execute("SELECT sum(delivered) FROM occurrences").fetchone()[0] == int(readable)
++    finally:
++        journal.close()
++
++
++@pytest.mark.parametrize("cached", [True, False])
++@pytest.mark.parametrize("job", [9, 10])
++def test_legacy_cursor_body_receipt_dedupes_cutover(tmp_path, cached, job):
++    path = tmp_path / "legacy.json"
++    test = "tests/a.py::test_0"
++    url = "https://github.com/o/r/actions/runs/1/job/9"
++    cards = {test: {"card": "card0", "generation": 0}} if cached else {}
++    path.write_text(json.dumps({"runs": ["1/1"], "cards": cards}))
++    board = ReadableBoard()
++    board.create(f"Deflake {test}", f"Flaky test: `{test}`\n\nFailed in {url}", f"deflake:{test}")
++    journal = Journal(tmp_path / "queue.sqlite3")
++    try:
++        journal.record("o/r", [(job, [{"test_id": test}])], {"id": 1, "head_sha": "a" * 40})
++        fk.drain_intake(journal, "o/r", board, fk.load_state(path), None)
++        assert journal.db.execute("SELECT sum(delivered) FROM occurrences").fetchone()[0] == 1
++        assert len(board.notes["card0"]) == int(job != 9)
++    finally:
++        journal.close()
++
++
++@pytest.mark.parametrize("listed", [False, True])
++def test_cached_missing_local_owner_requires_authoritative_absence(listed):
++    class Unreadable(ReadableBoard):
++        def card(self, cid, board=None):
++            return None
++
++    board = Unreadable()
++    test = "tests/a.py::test_0"
++    if listed:
++        board.cards["gone"] = dict(id="gone", title=f"Deflake {test}", body="", status="ready")
++    state = {"cards": {test: {"card": "gone", "generation": 0}}}
++    lines = fk.file_cards([{"test_id": test}], run_url="https://github.com/o/r/actions/runs/1/job/9",
++                          branch="a" * 40, board=board, state=state, on_unowned=lambda: "queued")
++    if listed:
++        assert lines[0].startswith("FAILED")
++        assert state["cards"][test]["card"] == "gone"
++    else:
++        assert lines == ["queued"]
++        assert test not in state["cards"]
++
++
++@pytest.mark.parametrize("scope", [{"gateway": "peer"}, {"board": "other"}])
++def test_foreign_cache_absence_never_uses_local_inventory(scope):
++    test = "tests/a.py::test_0"
++    state = {"cards": {test: {"card": "gone", "generation": 0, **scope}}}
++    lines = fk.file_cards([{"test_id": test}], run_url="https://github.com/o/r/actions/runs/1/job/9",
++                          branch="a" * 40, board=ReadableBoard(), state=state, on_unowned=lambda: "queued")
++    assert lines[0].startswith("FAILED")
++    assert state["cards"][test]["card"] == "gone"
++
++
++def test_cached_owner_inventory_error_preserves_cache():
++    class Unavailable(ReadableBoard):
++        def list_cards(self):
++            raise RuntimeError("unavailable")
++
++    test = "tests/a.py::test_0"
++    state = {"cards": {test: {"card": "gone", "generation": 0}}}
++    with pytest.raises(RuntimeError, match="unavailable"):
++        fk.file_cards([{"test_id": test}], run_url="https://github.com/o/r/actions/runs/1/job/9",
++                      branch="a" * 40, board=Unavailable(), state=state, on_unowned=lambda: "queued")
++    assert state["cards"][test]["card"] == "gone"
++
++
++def test_gone_cached_owner_is_replaced_by_discovered_owner():
++    board = ReadableBoard()
++    test = "tests/a.py::test_0"
++    replacement = board.create(f"Deflake {test}", "", f"deflake:{test}")
++    state = {"cards": {test: {"card": "gone", "generation": 2}}}
++    lines = fk.file_cards([{"test_id": test}], run_url="https://github.com/o/r/actions/runs/1/job/9",
++                          branch="a" * 40, board=board, state=state, on_unowned=lambda: "queued")
++    assert lines == [f"appended {replacement} {test}"]
++    assert state["cards"][test] == {"card": replacement, "generation": 2}
++    assert len(board.notes[replacement]) == 1
+-- 
+2.43.0
+

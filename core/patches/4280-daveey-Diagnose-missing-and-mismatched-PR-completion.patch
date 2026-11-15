@@ -1,0 +1,144 @@
+From dcb3ba5c88c31e40b2fd9123c7930c122f2e999e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 22:57:26 +0000
+Subject: [PATCH] [daveey] Diagnose missing and mismatched PR completion
+ metadata separately
+
+Problem: kanban_complete reports PR acceptance missing even when a real but
+wrong PR was supplied, then recommends CI retries or human blocking.
+Why 1: the contract matcher groups absent publication and mismatched URL.
+Why 2: all early exits retain the default missing classification/recovery.
+Why 3: the error omits both persisted contract and submitted publication,
+so the caller cannot repair its payload from the refusal itself.
+Root (happened): validation failures reuse CI-oriented recovery guidance.
+Root (not caught): existing acceptance tests exercise safety/CI outcomes,
+not actionable expected-versus-submitted diagnostics in persisted errors.
+Instructions: generic retry/block advice points metadata failures at the
+wrong recovery lane; replace it at the producer, not with another reminder.
+Recurrence: source sessions show two omitted publications and one #2325
+publication against a #2300 contract; the latter must remain refused.
+
+Keep the exact existing matching predicate and every CI/landing gate.
+Return the persisted contract and supplied URL, distinguish mismatch from
+missing, and prescribe metadata repair instead of waiting or blocking.
+No alias normalization, inferred publication, or contract weakening.
+Core owns these persisted receipts; plugin interception would duplicate
+the validation boundary and miss CLI callers.
+
+Proof: new tests RED 3 failed/2 passed before fix, GREEN 6/6 including real
+SQLite refusal/event persistence and no-rebind control. Consumer run:
+53 files, 1142 passed, 1 macOS-only skip, 0 failed. scripts/check: 20 checks OK.
+---
+ hermes_cli/kanban_pr_acceptance.py            | 11 ++-
+ .../test_kanban_pr_contract_diagnostics.py    | 77 +++++++++++++++++++
+ 2 files changed, 87 insertions(+), 1 deletion(-)
+ create mode 100644 tests/hermes_cli/test_kanban_pr_contract_diagnostics.py
+
+diff --git a/hermes_cli/kanban_pr_acceptance.py b/hermes_cli/kanban_pr_acceptance.py
+index 1ce25cc05b..773318c733 100644
+--- a/hermes_cli/kanban_pr_acceptance.py
++++ b/hermes_cli/kanban_pr_acceptance.py
+@@ -197,7 +197,16 @@ def collect_acceptance(contract: str, published_pr: str | None,
+         url = contract if declared else published_pr
+         match = _PR.fullmatch(url or "")
+         if not match or (not declared and match[1] != contract) or (declared and published_pr and published_pr != contract):
+-            receipt["detail"] = "Supply metadata.published_pr matching the persisted completion contract."
++            receipt.update(
++                classification="contract_mismatch" if published_pr else "missing",
++                completion_contract=contract,
++                detail=f"Persisted completion contract: {contract}. "
++                       f"metadata.published_pr: {published_pr or 'not supplied'}.",
++                recovery="Retry completion with metadata.published_pr matching that contract "
++                         "(an exact PR URL for a repository-only contract). A different PR belongs "
++                         "in separate evidence, not in place of the bound PR. This is a metadata "
++                         "error, not a CI failure; no acceptance checks have run.",
++            )
+             return receipt
+         repo, number = match[1], int(match[2])
+         receipt["pr_url"] = url
+diff --git a/tests/hermes_cli/test_kanban_pr_contract_diagnostics.py b/tests/hermes_cli/test_kanban_pr_contract_diagnostics.py
+new file mode 100644
+index 0000000000..86a3f871a7
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_pr_contract_diagnostics.py
+@@ -0,0 +1,77 @@
++"""Contract input errors must name the repair, not recommend waiting for CI."""
++import pytest
++
++from hermes_cli import kanban_pr_acceptance as gate
++
++
++@pytest.mark.parametrize(
++    "contract,published,classification",
++    [
++        ("acme/repo", None, "missing"),
++        ("acme/repo", "https://github.com/other/repo/pull/7", "contract_mismatch"),
++        ("https://github.com/acme/repo/pull/7", "https://github.com/acme/repo/pull/8", "contract_mismatch"),
++    ],
++)
++def test_contract_refusal_names_expected_and_supplied_without_ci_advice(monkeypatch, contract, published, classification):
++    def no_api(*args, **kwargs):
++        pytest.fail("invalid contract input must not query GitHub")
++
++    monkeypatch.setattr(gate, "_api", no_api)
++    receipt = gate.collect_acceptance(contract, published)
++    assert receipt["ok"] is False
++    assert receipt["classification"] == classification
++    assert receipt["completion_contract"] == contract
++    assert receipt["pr_url"] == published
++    assert contract in receipt["detail"]
++    assert (published or "not supplied") in receipt["detail"]
++    assert "metadata.published_pr" in receipt["recovery"]
++    assert "wait" not in receipt["recovery"]
++    assert "kanban_block" not in receipt["recovery"]
++    assert "rerun" not in receipt["recovery"]
++
++
++@pytest.mark.parametrize("published", [None, "https://github.com/acme/repo/pull/7"])
++def test_exact_contract_still_reaches_github_checks(monkeypatch, published):
++    calls = []
++
++    def closed_pr(endpoint, **kwargs):
++        calls.append(endpoint)
++        return {"data": {"repository": {"pullRequest": {
++            "headRefOid": "a" * 40, "baseRefName": "main", "state": "CLOSED",
++        }}}}
++
++    monkeypatch.setattr(gate, "_api", closed_pr)
++    receipt = gate.collect_acceptance("https://github.com/acme/repo/pull/7", published)
++    assert receipt["ok"] is True
++    assert receipt["classification"] == "closed"
++    assert calls == ["graphql"]
++
++
++def test_mismatch_persists_actionable_refusal_without_rebinding(tmp_path, monkeypatch):
++    import json
++
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_db_connect import connect
++
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++    kb.init_db()
++    expected = "https://github.com/acme/repo/pull/7"
++    supplied = "https://github.com/other/repo/pull/8"
++    with connect() as conn:
++        tid = kb.create_task(conn, title="Publish", completion_contract=expected)
++        assert not kb.complete_task(conn, tid, result="done", metadata={"published_pr": supplied})
++        task = kb.get_task(conn, tid)
++        assert task is not None
++        assert task.last_failure_error is not None
++        assert task.status != "done"
++        assert task.completion_contract == expected
++        assert "contract_mismatch" in task.last_failure_error
++        assert expected in task.last_failure_error
++        assert supplied in task.last_failure_error
++        row = conn.execute(
++            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,),
++        ).fetchone()
++        receipt = json.loads(row[0])
++        assert receipt["completion_contract"] == expected
++        assert receipt["pr_url"] == supplied
++        assert receipt["ok"] is False
+-- 
+2.43.0
+

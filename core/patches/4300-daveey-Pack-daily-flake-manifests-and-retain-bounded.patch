@@ -1,0 +1,471 @@
+From 9bbcc246488b1d24e13e580a75f935c5e458929c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 22:10:05 +0000
+Subject: [PATCH] [daveey] Pack daily flake manifests and retain bounded
+ terminal history
+
+Proof: 40-row fixture drops comments from 40 to 3; 275 focused tests pass. Eight targeted mutants killed after adding an incomplete-run control. Preserve attempted-page bytes, FIFO retries and pending work. Expand nightly sibling pins and document installed hermes_cli dependency.
+---
+ docs/ci-flaky-intake.md                 |  35 ++++++-
+ scripts/ci/flaky_intake.py              |  56 +++++++++--
+ scripts/ci/flaky_kanban.py              |  48 +++++++--
+ scripts/ci/nightly_e2e.py               |  12 ++-
+ tests/ci/test_flaky_intake_retention.py | 123 ++++++++++++++++++++++++
+ tests/ci/test_nightly_e2e_pin.py        |  14 ++-
+ 6 files changed, 263 insertions(+), 25 deletions(-)
+ create mode 100644 tests/ci/test_flaky_intake_retention.py
+
+diff --git a/docs/ci-flaky-intake.md b/docs/ci-flaky-intake.md
+index d8cd2db00a..c1ff3a0e88 100644
+--- a/docs/ci-flaky-intake.md
++++ b/docs/ci-flaky-intake.md
+@@ -88,8 +88,13 @@ resolutions and page deliveries; deferred rows remain durable and the poll repor
+ Board/courier operations already started may still consume their existing transport timeout.
+ Before GitHub discovery, a drain gets half the invocation budget and checkpoints the JSON
+ cursor; a slow discovery cannot prevent already queued delivery on every invocation.
+-Within a drain, ownership resolution delivers each admitted occurrence immediately in a
+-bounded one-occurrence page. Half the drain window is reserved for prior attempted pages.
++Within a drain, consecutive admissions are packed by `plan_pages` into multi-row pages
++(maximum 6000 bytes), flushed after at most 16 rows, an ownership boundary, or the
++resolution deadline. Occurrences are durable before ownership resolution; each batch's
++pages are committed before immediate delivery in the same drain. Half the drain window is
++reserved for prior attempted pages. If a slow owner exhausts it, the unsent pages remain
++durable and retain their batch boundaries during next-drain ownership rechecks, so that
++unrelated slow owner cannot repeatedly delay the already-admitted prefix.
+ Durable FIFO tickets are assigned transactionally when occurrences, pages and run attempts
+ are enqueued. Replay preserves the original ticket; attempts rotate to the tail before external
+ calls, surviving process death. Older unscheduled rows are backfilled on journal open before
+@@ -118,7 +123,31 @@ successful GitHub listing no longer includes such a run and it has reached the u
+ `FAILED run=<k> code=<c> polls=<n> retired=unlisted` line and marked complete, matching the
+ per-test producer, which dropped runs that left the lookback listing. A failed listing never
+ retires anything, and a still-listed run stays `FAILED` until its data becomes readable.
+-Retired runs remain queryable with `SELECT repo,key FROM runs WHERE complete=1`.
++Retired runs remain queryable with `SELECT repo,key FROM runs WHERE complete=1` until
++terminal-history retention expires.
++
++## Retention and nightly pins
++
++Each production poll prunes terminal history under the journal lock. Complete runs are
++retained for 30 days plus the discovery lookback (currently 6 hours), counted from their
++last listing or completion. Runs with undelivered occurrences are never pruned. Delivered
++occurrences are retained for the same interval after acknowledgement and until their run
++record is gone; delivered pages remain until all their occurrences have aged out. Pending
++runs, undelivered occurrences, and undelivered pages have no age limit. Terminal/orphaned
++FIFO entries are removed without renumbering any pending ticket. Legacy rows receive the
++migration time, not a guessed historical completion date. SQLite reuses freed space; no
++blocking VACUUM is performed. Export before expiry if longer audit history is needed.
++Replaying an artifact outside this retention window is not guaranteed deduplicated; do not
++use old manual reports as a replay shortcut.
++
++The nightly reporter's immutable export includes `nightly_e2e.py`, `flaky_kanban.py`,
++`flaky_intake.py`, `flaky_http.py`, `flaky_artifact.py`, and `flaky_artifact_poll.py` from
++one revision. `PIN_FILES` checks every sibling, including missing exports, and generated
++re-pin instructions name them all. `hermes_cli` is intentionally **not** a partial frozen
++export: the transport deadline and scope-heartbeat modules belong to the installed Hermes
++runtime and its transitive dependencies. The cron launcher must expose that runtime;
++verify those imports and both dispatch/report entry points when re-pinning. The pin check
++certifies sibling script bytes, not hermes_cli deployment or runtime compatibility.
+ 
+ ## Read-only backlog and export
+ 
+diff --git a/scripts/ci/flaky_intake.py b/scripts/ci/flaky_intake.py
+index 634303df6a..59ae718e4c 100644
+--- a/scripts/ci/flaky_intake.py
++++ b/scripts/ci/flaky_intake.py
+@@ -170,6 +170,8 @@ class Journal:
+                 attempted INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE IF NOT EXISTS owner_check_details (
+                 digest TEXT PRIMARY KEY, payload TEXT NOT NULL);
++            CREATE INDEX IF NOT EXISTS occurrences_run ON occurrences(repo,json_extract(metadata,'$.run_id'),delivered);
++            CREATE INDEX IF NOT EXISTS occurrences_page ON occurrences(page);
+         """)
+         columns = {r[1] for r in self.db.execute("PRAGMA table_info(pages)")}
+         if "attempted" not in columns:
+@@ -177,6 +179,13 @@ class Journal:
+             self.db.execute("ALTER TABLE pages ADD COLUMN attempted INTEGER NOT NULL DEFAULT 1")
+             self.db.commit()
+ 
++        with self.db:
++            for table, column in (("runs", "retained_at"), ("occurrences", "retained_at"), ("pages", "retained_at")):
++                if column not in {r[1] for r in self.db.execute(f"PRAGMA table_info({table})")}:
++                    self.db.execute(f"ALTER TABLE {table} ADD COLUMN {column} REAL NOT NULL DEFAULT 0")
++                    # Unknown legacy age starts now, never from an inferred old run date.
++                    self.db.execute(f"UPDATE {table} SET {column}=?", (time.time(),))
++
+         # Backfill older queues before admitting new work. Replay preserves tickets.
+         with self.db:
+             for kind, query in (
+@@ -203,9 +212,10 @@ class Journal:
+             for run in runs:
+                 descriptor = run_metadata(run)
+                 key = f"{run['id']}/{run.get('run_attempt', 1)}"
+-                self.db.execute("INSERT INTO runs(repo,key,descriptor) VALUES(?,?,?) "
+-                                "ON CONFLICT(repo,key) DO UPDATE SET descriptor=excluded.descriptor",
+-                                (repo, key, json.dumps(descriptor)))
++                self.db.execute("INSERT INTO runs(repo,key,descriptor,retained_at) VALUES(?,?,?,?) "
++                                "ON CONFLICT(repo,key) DO UPDATE SET descriptor=excluded.descriptor, "
++                                "retained_at=excluded.retained_at",
++                                (repo, key, json.dumps(descriptor), time.time()))
+                 self.enqueue(repo, "run", key)
+         return [json.loads(r[0]) for r in self.db.execute(
+             "SELECT r.descriptor FROM runs r LEFT JOIN scheduling s ON "
+@@ -221,7 +231,8 @@ class Journal:
+ 
+     def finish_run(self, repo: str, key: str):
+         with self.db:
+-            self.db.execute("UPDATE runs SET complete=1 WHERE repo=? AND key=?", (repo, key))
++            self.db.execute("UPDATE runs SET complete=1,retained_at=? WHERE repo=? AND key=?",
++                            (time.time(), repo, key))
+             self.db.execute("DELETE FROM run_failures WHERE repo=? AND key=?", (repo, key))
+ 
+     def record(self, repo: str, jobs: list[tuple[int, list[dict]]], run: dict):
+@@ -262,7 +273,8 @@ class Journal:
+ 
+     def acknowledge(self, row_id: int, owner: str):
+         with self.db:
+-            self.db.execute("UPDATE occurrences SET delivered=1,owner=? WHERE id=?", (owner, row_id))
++            self.db.execute("UPDATE occurrences SET delivered=1,owner=?,retained_at=? WHERE id=?",
++                            (owner, time.time(), row_id))
+ 
+     def plan_pages(self, repo: str, rows: list, owner_check: dict[int, list] | None = None):
+         """Commit immutable pages before any external write; never shorten a manifest.
+@@ -392,5 +404,35 @@ class Journal:
+ 
+     def acknowledge_page(self, page_id: int, card: str):
+         with self.db:
+-            self.db.execute("UPDATE pages SET delivered=1 WHERE id=?", (page_id,))
+-            self.db.execute("UPDATE occurrences SET delivered=1,owner=? WHERE page=?", (card, page_id))
++            self.db.execute("UPDATE pages SET delivered=1,retained_at=? WHERE id=?", (time.time(), page_id))
++            self.db.execute("UPDATE occurrences SET delivered=1,owner=?,retained_at=? WHERE page=?",
++                            (card, time.time(), page_id))
++
++    def prune(self, repo: str, *, lookback_hours: float = 6.0):
++        """Retain terminal history for 30 days plus discovery lookback; never pending work.
++
++        No VACUUM: SQLite reuses freed pages without a blocking file rewrite.
++        Recently listed runs retain all their occurrence replay receipts.
++        """
++        cutoff = time.time() - 30 * 86400 - max(0, lookback_hours) * 3600
++        with self.db:
++            self.db.execute("DELETE FROM runs WHERE repo=? AND complete=1 AND retained_at<? "
++                            "AND NOT EXISTS (SELECT 1 FROM occurrences o WHERE o.repo=runs.repo "
++                            "AND json_extract(o.metadata,'$.run_id')=json_extract(runs.descriptor,'$.id') "
++                            "AND o.delivered=0)", (repo, cutoff))
++            self.db.execute("DELETE FROM occurrences WHERE repo=? AND delivered=1 AND retained_at<? "
++                            "AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.repo=occurrences.repo "
++                            "AND r.key=json_extract(occurrences.metadata,'$.run_id') || '/' || "
++                            "json_extract(occurrences.metadata,'$.run_attempt')) "
++                            "AND NOT EXISTS (SELECT 1 FROM pages p WHERE p.id=occurrences.page AND p.delivered=0)",
++                            (repo, cutoff))
++            self.db.execute("DELETE FROM pages WHERE repo=? AND delivered=1 AND retained_at<? "
++                            "AND NOT EXISTS (SELECT 1 FROM occurrences o WHERE o.page=pages.id)", (repo, cutoff))
++            for kind, table, key, pending in (
++                ("run", "runs", "key", "complete=0"),
++                ("occurrence", "occurrences", "id", "delivered=0"),
++                ("page", "pages", "id", "delivered=0"),
++            ):
++                self.db.execute(f"DELETE FROM scheduling WHERE repo=? AND kind=? AND NOT EXISTS "
++                                f"(SELECT 1 FROM {table} t WHERE t.repo=scheduling.repo "
++                                f"AND CAST(t.{key} AS TEXT)=scheduling.item AND {pending})", (repo, kind))
+diff --git a/scripts/ci/flaky_kanban.py b/scripts/ci/flaky_kanban.py
+index bed37b7cca..d4e38ad21c 100644
+--- a/scripts/ci/flaky_kanban.py
++++ b/scripts/ci/flaky_kanban.py
+@@ -573,17 +573,43 @@ def _complete_foreign_history(owner: dict[str, Any]) -> bool:
+ def drain_intake(journal: Journal, repo: str, board: Board, state: dict, relay: HubRelay | None,
+                  *, deadline: float | None = None) -> list[str]:
+     log = []
++    # Retain retry batch boundaries when rechecking never-attempted pages. A slow
++    # unrelated owner must not repeatedly consume the budget before this prefix
++    # can be sent. Ticket ordering remains unchanged.
++    retry_groups = dict(journal.db.execute(
++        "SELECT o.id,o.page FROM occurrences o JOIN pages p ON p.id=o.page "
++        "WHERE o.repo=? AND p.attempted=0 AND p.delivered=0", (repo,)))
+     journal.recheck_unattempted(repo)
+-    # Reserve half the remaining drain window for already-attempted pages. Resolve
+-    # and deliver one occurrence at a time: a later slow owner cannot strand a
+-    # whole newly resolved prefix behind the deadline on every invocation.
++    # Reserve half the drain for retry pages. Bound admission batches independently
++    # of the backlog; every flush commits its pages before attempting delivery.
+     now = time.monotonic()
+     resolve_deadline = None if deadline is None else now + max(0, deadline - now) / 2
+     old_pages = {r[0] for r in journal.db.execute(
+         "SELECT id FROM pages WHERE repo=? AND delivered=0", (repo,))}
+     def create(title, body, key, page):
+         return _create_intake(journal, repo, board, state, relay, title, body, key, page, deadline)
++    batch, owner_checks = [], {}
++    def flush():
++        try:
++            journal.plan_pages(repo, batch, owner_check=owner_checks)
++        except ValueError:
++            # An oversized owner inventory must not poison the valid prefix.
++            for row in batch:
++                try:
++                    journal.plan_pages(repo, [row], owner_check=owner_checks)
++                except ValueError:
++                    log.append(f"FAILED intake_page_oversize occurrence={row['id']}; durable retry pending")
++        page_ids = {journal.db.execute("SELECT page FROM occurrences WHERE id=?", (row["id"],)).fetchone()[0]
++                    for row in batch}
++        batch.clear()
++        owner_checks.clear()
++        return journal.deliver(repo, board, deadline=deadline, create=create, page_ids=page_ids)
++    previous_group = None
+     for row in journal.pending(repo):
++        group = retry_groups.get(row["id"])
++        if group != previous_group:
++            log += flush()
++        previous_group = group
+         if resolve_deadline is not None and time.monotonic() >= resolve_deadline:
+             log.append("FAILED intake_budget; durable retry pending")
+             break
+@@ -595,15 +621,20 @@ def drain_intake(journal: Journal, repo: str, board: Board, state: dict, relay:
+             lines = file_cards([meta], run_url=url, branch=meta["head_sha"], board=board, state=state,
+                                relay=relay, on_unowned=lambda: "queued", owner_notes=notes)
+         except (RuntimeError, subprocess.TimeoutExpired):
++            log += flush()
+             log.append(f"FAILED {meta['test_id']}: owner delivery unavailable; durable retry pending")
+             continue
+         if lines == ["queued"]:
+-            journal.plan_pages(repo, [row], owner_check={row["id"]: notes.get(meta["test_id"], [])})
+-            page_id = journal.db.execute("SELECT page FROM occurrences WHERE id=?", (row["id"],)).fetchone()[0]
+-            log += journal.deliver(repo, board, deadline=deadline, create=create, page_ids={page_id})
+-        elif lines and not any(line.startswith("FAILED") for line in lines):
+-            journal.acknowledge(row["id"], json.dumps(state["cards"][meta["test_id"]], sort_keys=True))
++            batch.append(row)
++            owner_checks[row["id"]] = notes.get(meta["test_id"], [])
++            if len(batch) >= 16:
++                log += flush()
++        else:
++            log += flush()
++            if lines and not any(line.startswith("FAILED") for line in lines):
++                journal.acknowledge(row["id"], json.dumps(state["cards"][meta["test_id"]], sort_keys=True))
+         log += lines
++    log += flush()
+     return log + journal.deliver(repo, board, deadline=deadline, create=create, page_ids=old_pages)
+ 
+ 
+@@ -1051,6 +1082,7 @@ def _run_intake(args: argparse.Namespace, board: Board, relay: HubRelay, journal
+         journal.record(args.repo, [(int(match.group(2)), entries)], {"id": run_id, "head_sha": args.branch})
+         log = []
+     log += drain_intake(journal, args.repo, board, state, relay, deadline=deadline)
++    journal.prune(args.repo)
+     save_state(args.state, state)
+     for line in log:  # silent when nothing flaked (no-agent cron delivers stdout)
+         print(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} {line}")
+diff --git a/scripts/ci/nightly_e2e.py b/scripts/ci/nightly_e2e.py
+index 1bc11cb0e6..7cc0c37458 100644
+--- a/scripts/ci/nightly_e2e.py
++++ b/scripts/ci/nightly_e2e.py
+@@ -717,7 +717,8 @@ def _settle_error(
+ 
+ 
+ DEFAULT_CORE = Path.home() / ".hermes" / "hermes-agent"
+-PIN_FILES = ("nightly_e2e.py", "flaky_kanban.py")
++PIN_FILES = ("nightly_e2e.py", "flaky_kanban.py", "flaky_intake.py", "flaky_http.py",
++             "flaky_artifact.py", "flaky_artifact_poll.py")
+ 
+ 
+ def _pin_git(core: Path, *args: str) -> bytes:
+@@ -739,7 +740,8 @@ def check_pin(board: Any, state: dict[str, Any], *, core: Path, now: float) -> s
+         path = f"scripts/ci/{name}"
+         content = _pin_git(core, "show", f"{main}:{path}")
+         blobs.append(_pin_git(core, "rev-parse", f"{main}:{path}").decode().strip())
+-        if hashlib.sha256((running.parent / name).read_bytes()).digest() != hashlib.sha256(content).digest():
++        deployed = running.parent / name
++        if not deployed.is_file() or hashlib.sha256(deployed.read_bytes()).digest() != hashlib.sha256(content).digest():
+             changed = int(_pin_git(core, "log", "-1", "--format=%ct", main, "--", path))
+             if now - changed > 2 * 3600:
+                 stale.append(name)
+@@ -749,11 +751,13 @@ def check_pin(board: Any, state: dict[str, Any], *, core: Path, now: float) -> s
+     body = (
+         f"Nightly reporter pin `{running.parent.name}` lags main `{main}`. "
+         f"Files changed more than 2 h ago: {', '.join(stale)}.\n\n"
+-        f"On hermes-hub, export BOTH scripts/ci/nightly_e2e.py and scripts/ci/flaky_kanban.py "
++        f"On hermes-hub, export ALL sibling scripts ({', '.join(PIN_FILES)}) "
+         f"from `{main}` in `{core}` to `~/.hermes/lib/nightly-e2e/{main[:12]}/` "
+         "using git show <sha>:scripts/ci/<file>. Point SCRIPT in BOTH "
+         "`~/.hermes/scripts/nightly_e2e_dispatch.py` and `~/.hermes/scripts/nightly_e2e_report.py` "
+-        "there. Verify both pinned SHA-256 hashes against main and the real report cron is ok and silent. "
++        "there. Verify every pinned SHA-256 hash against main and the real report cron is ok and silent. "
++        "Use the installed Hermes runtime for hermes_cli (deadline transport and scope heartbeat helpers); "
++        "do not export a partial hermes_cli package. Verify those imports under the cron launcher. "
+         "Do not move the live core checkout."
+     )
+     # Separate from run cards: a green nightly must not imply that the deployment drift is repaired.
+diff --git a/tests/ci/test_flaky_intake_retention.py b/tests/ci/test_flaky_intake_retention.py
+new file mode 100644
+index 0000000000..c96926316b
+--- /dev/null
++++ b/tests/ci/test_flaky_intake_retention.py
+@@ -0,0 +1,123 @@
++"""Bounded terminal history, preserving durable retries and FIFO custody."""
++import json
++import sqlite3
++
++import pytest
++
++from scripts.ci import flaky_intake as intake
++from scripts.ci import flaky_kanban as fk
++from tests.ci.test_flaky_intake import Board
++
++
++def test_drain_packs_consecutive_rows_and_reads_back(tmp_path):
++    journal = intake.Journal(tmp_path / "queue.db")
++    journal.record("o/r", [(9, [{"test_id": f"tests/a.py::test_{i}"} for i in range(40)])],
++                   {"id": 1, "head_sha": "a" * 40})
++    board = Board()
++    fk.drain_intake(journal, "o/r", board, {"cards": {}}, None)
++    comments = board.notes["card0"]
++    print(f"40 occurrences: before=40 comments after={len(comments)}")
++    assert len(comments) == 3
++    assert all(len(c.encode()) <= 6000 for c in comments)
++    assert journal.db.execute("SELECT sum(delivered) FROM occurrences").fetchone()[0] == 40
++    fk.drain_intake(journal, "o/r", board, {"cards": {}}, None)
++    assert board.notes["card0"] == comments
++    journal.close()
++
++
++def test_oversized_inventory_does_not_poison_valid_batch(tmp_path, monkeypatch):
++    def resolve(entries, **kwargs):
++        test_id = entries[0]["test_id"]
++        if test_id.endswith("test_bad"):
++            kwargs["owner_notes"][test_id] = [{"candidate": "x" * 7000}]
++        return ["queued"]
++    monkeypatch.setattr(fk, "file_cards", resolve)
++    journal = intake.Journal(tmp_path / "queue.db")
++    journal.record("o/r", [(9, [{"test_id": f"tests/a.py::test_{s}"} for s in ("good", "bad", "last")])],
++                   {"id": 1, "head_sha": "a" * 40})
++    lines = fk.drain_intake(journal, "o/r", Board(), {"cards": {}}, None)
++    assert any("intake_page_oversize" in line for line in lines)
++    assert [r[0] for r in journal.db.execute("SELECT delivered FROM occurrences ORDER BY id")] == [1, 0, 1]
++    journal.close()
++
++
++def test_slow_later_owner_cannot_starve_admitted_prefix(tmp_path, monkeypatch):
++    clock = [0.0]
++    monkeypatch.setattr(fk.time, "monotonic", lambda: clock[0])
++    original = fk.file_cards
++    def resolve(entries, **kwargs):
++        if entries[0]["test_id"].endswith("test_slow"):
++            clock[0] += 20
++            raise RuntimeError("slow unavailable owner")
++        return original(entries, **kwargs)
++    monkeypatch.setattr(fk, "file_cards", resolve)
++    path = tmp_path / "queue.db"
++    journal = intake.Journal(path)
++    journal.record("o/r", [(9, [{"test_id": f"tests/a.py::test_{s}"} for s in ("good", "slow")])],
++                   {"id": 1, "head_sha": "a" * 40})
++    journal.close()
++    board = Board()
++    for _ in range(3):
++        journal = intake.Journal(path)
++        fk.drain_intake(journal, "o/r", board, {"cards": {}}, None, deadline=clock[0] + 10)
++        journal.close()
++    journal = intake.Journal(path)
++    assert [r[0] for r in journal.db.execute("SELECT delivered FROM occurrences ORDER BY id")] == [1, 0]
++    assert len(board.notes["card0"]) == 1
++    journal.close()
++
++
++@pytest.mark.parametrize("age,remaining", [(30 * 86400, 1), (30 * 86400 + 21600, 1),
++                                          (30 * 86400 + 21601, 0)])
++def test_retention_boundary_and_foreign_repo(tmp_path, monkeypatch, age, remaining):
++    clock = [1000000.0]
++    monkeypatch.setattr(intake.time, "time", lambda: clock[0])
++    journal = intake.Journal(tmp_path / "queue.db")
++    for repo in ("o/r", "other/repo"):
++        journal.remember_runs(repo, [{"id": 1, "head_sha": "a" * 40}])
++        journal.finish_run(repo, "1/1")
++    clock[0] += age
++    journal.prune("o/r")
++    assert journal.db.execute("SELECT count(*) FROM runs WHERE repo='o/r'").fetchone()[0] == remaining
++    assert journal.db.execute("SELECT count(*) FROM runs WHERE repo='other/repo'").fetchone()[0] == 1
++    journal.close()
++
++
++def test_legacy_history_gets_full_retention_window(tmp_path, monkeypatch):
++    path = tmp_path / "queue.db"
++    with sqlite3.connect(path) as db:
++        db.execute("CREATE TABLE runs(repo TEXT,key TEXT,descriptor TEXT,complete INTEGER,PRIMARY KEY(repo,key))")
++        db.execute("INSERT INTO runs VALUES ('o/r','1/1',?,1)", (json.dumps({"id": 1, "head_sha": "a" * 40}),))
++    monkeypatch.setattr(intake.time, "time", lambda: 9999999999.0)
++    journal = intake.Journal(path)
++    journal.prune("o/r")
++    assert journal.db.execute("SELECT count(*) FROM runs").fetchone()[0] == 1
++    journal.close()
++
++
++def test_retention_preserves_pending_and_recent_history(tmp_path, monkeypatch):
++    clock = [1000000.0]
++    monkeypatch.setattr(intake.time, "time", lambda: clock[0])
++    journal = intake.Journal(tmp_path / "queue.db")
++    runs = [{"id": i, "head_sha": "a" * 40} for i in range(1, 5)]
++    journal.remember_runs("o/r", runs + [{"id": 5, "head_sha": "b" * 40}])
++    for run in runs:
++        journal.record("o/r", [(9, [{"test_id": "tests/a.py::test_a"}])], run)
++    rows = journal.pending("o/r")
++    journal.plan_pages("o/r", [rows[0]])
++    journal.deliver("o/r", Board())
++    journal.acknowledge(rows[1]["id"], "owner")
++    journal.plan_pages("o/r", [rows[2]])  # pending page must survive
++    journal.finish_run("o/r", "1/1")
++    journal.finish_run("o/r", "2/1")
++    journal.finish_run("o/r", "3/1")  # discovery complete != delivery complete
++    clock[0] += 32 * 86400
++    journal.remember_runs("o/r", [runs[1]])  # still listed: preserve replay evidence
++    tickets = dict(journal.db.execute("SELECT item,ticket FROM scheduling WHERE kind='occurrence'"))
++    journal.prune("o/r", lookback_hours=6)
++    assert [r[0] for r in journal.db.execute("SELECT key FROM runs ORDER BY key")] == ["2/1", "3/1", "4/1", "5/1"]
++    assert [r[0] for r in journal.db.execute("SELECT id FROM occurrences ORDER BY id")] == [2, 3, 4]
++    assert journal.db.execute("SELECT count(*) FROM pages WHERE delivered=0").fetchone()[0] == 1
++    assert dict(journal.db.execute("SELECT item,ticket FROM scheduling WHERE kind='occurrence'")) == {
++        str(r["id"]): tickets[str(r["id"])] for r in rows[2:]}
++    journal.close()
+diff --git a/tests/ci/test_nightly_e2e_pin.py b/tests/ci/test_nightly_e2e_pin.py
+index 11d4049115..cb2845e284 100644
+--- a/tests/ci/test_nightly_e2e_pin.py
++++ b/tests/ci/test_nightly_e2e_pin.py
+@@ -23,7 +23,7 @@ def pin(tmp_path, monkeypatch):
+     source.mkdir(parents=True)
+     deployed = tmp_path / "lib" / "nightly-e2e" / "abcdef123456"
+     deployed.mkdir(parents=True)
+-    for name in ("nightly_e2e.py", "flaky_kanban.py"):
++    for name in ne.PIN_FILES:
+         (source / name).write_bytes(b"# original\r\n")
+         (deployed / name).write_bytes(b"# original\r\n")
+     git(core, "init")
+@@ -44,13 +44,21 @@ def change(core, source, name, age):
+     git(core, "update-ref", "refs/remotes/origin/main", "HEAD")
+ 
+ 
++def test_missing_dependency_pin_is_reported(pin):
++    _core, _source, deployed, gh, board, state = pin
++    (deployed / "flaky_intake.py").unlink()
++    assert "stale pin:" in ne.report(gh, board, state, now=T0)[0]
++    assert "flaky_intake.py" in next(iter(board.cards.values()))["body"]
++
++
+ def test_identical_pin_is_silent(pin):
+     _core, _source, _deployed, gh, board, state = pin
+     assert ne.report(gh, board, state, now=T0) == []
+     assert board.created == []
+ 
+ 
+-@pytest.mark.parametrize("name", ["nightly_e2e.py", "flaky_kanban.py"])
++@pytest.mark.parametrize("name", ["nightly_e2e.py", "flaky_kanban.py", "flaky_intake.py", "flaky_http.py",
++                                  "flaky_artifact.py", "flaky_artifact_poll.py"])
+ def test_stale_pin_files_exactly_one_card_on_two_reports(pin, name):
+     core, source, deployed, gh, board, state = pin
+     change(core, source, name, 7201)
+@@ -61,7 +69,7 @@ def test_stale_pin_files_exactly_one_card_on_two_reports(pin, name):
+     assert card["comments"] == []
+     assert deployed.name in card["body"]
+     assert git(core, "rev-parse", "origin/main") in card["body"]
+-    for filename in ("nightly_e2e.py", "flaky_kanban.py"):
++    for filename in ne.PIN_FILES:
+         assert git(core, "rev-parse", f"origin/main:scripts/ci/{filename}") in card["key"]
+     assert "nightly_e2e_dispatch.py" in card["body"]
+     assert "nightly_e2e_report.py" in card["body"]
+-- 
+2.43.0
+

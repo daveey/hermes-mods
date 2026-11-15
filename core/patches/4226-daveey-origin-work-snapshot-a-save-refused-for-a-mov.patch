@@ -1,0 +1,150 @@
+From b37701631d9dce09a494fdccb962e47a3cb01c09 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 17:17:47 +0000
+Subject: [PATCH] [daveey] origin-work snapshot: a save refused for a moved
+ kanban home no longer fails the remote-links read
+
+Follow-up to the review nit on #3041 (review 5906022807, card t_01a1db0bed4a833a).
+
+#3041 makes `remote_snapshot(cards)` refuse a save when `kanban_home()` moves while the
+scope is resolved, and refuse a test process writing the live root. Both raised a bare
+RuntimeError. `_legacy_remote_links()` caught only `sqlite3.Error` around the save, so a
+refused save failed the whole read, against its own "must not fail this read" contract:
+cold and strict reads propagated it and the sidebar would mark every row kanban_unknown.
+
+Fix: the race now raises `SnapshotRootMoved(RuntimeError)`, and `_legacy_remote_links`
+catches it alongside `sqlite3.Error`, logs "origin-work snapshot not saved; retrying on
+the next change" and returns its cards. `_snapshot_saved` stays unset, so the next read
+retries the save. The test-isolation tripwire (`ensure_origin_work_test_isolation`) still
+raises a plain RuntimeError through the read: it exists to fail a leaking test loudly.
+
+Proof:
+- RED (on #3041's head 05c3dcede5, new test only):
+  test_a_save_refused_for_a_moved_home_does_not_fail_the_remote_links_read fails with
+  "RuntimeError: kanban home moved while resolving the origin-work scope".
+- GREEN: test_kanban_origin_snapshot_isolation.py 6/6, including the new
+  test_the_test_isolation_tripwire_still_fails_the_remote_links_read; 291 tests across
+  the 17 test files referencing the snapshot or _legacy_remote_links pass;
+  scripts/check --base origin/main ok.
+---
+ hermes_cli/kanban_session_activity.py         |  3 +-
+ ...kanban_session_activity_origin_snapshot.py |  8 +++-
+ .../test_kanban_origin_snapshot_isolation.py  | 48 +++++++++++++++++++
+ 3 files changed, 57 insertions(+), 2 deletions(-)
+
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 63bd8d4a14..384bcd5532 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -28,6 +28,7 @@ from hermes_cli.kanban_execution_source import transaction as _execution_transac
+ from hermes_cli import kanban_session_activity_recent_done as _recent_done
+ from hermes_cli.kanban_session_activity_decode import _decode_replica_task
+ from hermes_cli import kanban_execution_receipt as _receipts
++from hermes_cli.kanban_session_activity_origin_snapshot import SnapshotRootMoved as _RootMoved
+ from hermes_cli.kanban_session_activity_origin_snapshot import remote_snapshot as _remote_snapshot
+ from hermes_cli.kanban_session_activity_hub import _hub_content_signature
+ from hermes_cli import kanban_scope_heartbeat as _scope_hb
+@@ -1112,7 +1113,7 @@ def _legacy_remote_links() -> list[dict[str, Any]]:
+         try:
+             _remote_snapshot(cards)
+             _snapshot_saved = (scope, [dict(c) for c in cards])
+-        except sqlite3.Error as exc:
++        except (sqlite3.Error, _RootMoved) as exc:  # also a mid-save home swap; the test tripwire raises [daveey]
+             _log.warning("origin-work snapshot not saved; retrying on the next change: %s", exc)
+     with _cache_lock:
+         _remote_scope = scope
+diff --git a/hermes_cli/kanban_session_activity_origin_snapshot.py b/hermes_cli/kanban_session_activity_origin_snapshot.py
+index 0b0716b49e..3b38eaaa80 100644
+--- a/hermes_cli/kanban_session_activity_origin_snapshot.py
++++ b/hermes_cli/kanban_session_activity_origin_snapshot.py
+@@ -22,6 +22,12 @@ def _use_wal(conn) -> None:
+         kanban_lockguard.guard(conn)  # a file that only became WAL now gets its OFD lock guard
+ 
+ 
++class SnapshotRootMoved(RuntimeError):
++    """A save refused because ``kanban_home()`` moved while its scope was resolved: a race, not a fault. Callers may
++    skip the save and retry on the next change. The test-isolation tripwire raises a plain RuntimeError instead,
++    so a leaking test still fails loudly. [daveey]"""
++
++
+ def remote_snapshot(cards: list[dict[str, Any]] | None = None) -> list[dict[str, Any]] | None:
+     """Durable last-known origin obligations, separate from the replaceable hub replica.
+ 
+@@ -43,7 +49,7 @@ def remote_snapshot(cards: list[dict[str, Any]] | None = None) -> list[dict[str,
+         # filed one root's scope in another root's file: 20 pytest rows of ~1 MB in the hub's live file. [daveey]
+         scope = json.dumps(_ksa._origin_scope())
+         if kanban_db.kanban_home() != root:
+-            raise RuntimeError("kanban home moved while resolving the origin-work scope; not saving across roots")
++            raise SnapshotRootMoved("kanban home moved while resolving the origin-work scope; not saving across roots")
+         import hermes_state_guard
+ 
+         hermes_state_guard.ensure_origin_work_test_isolation(path)
+diff --git a/tests/hermes_cli/test_kanban_origin_snapshot_isolation.py b/tests/hermes_cli/test_kanban_origin_snapshot_isolation.py
+index 8362d63096..ce4255e5a4 100644
+--- a/tests/hermes_cli/test_kanban_origin_snapshot_isolation.py
++++ b/tests/hermes_cli/test_kanban_origin_snapshot_isolation.py
+@@ -9,6 +9,7 @@ process writing the account's live file either. [daveey]
+ """
+ import json
+ import sqlite3
++import sys
+ 
+ import pytest
+ 
+@@ -54,6 +55,53 @@ def test_save_never_files_one_roots_scope_in_another_roots_file(tmp_path, monkey
+         assert [scope[2] for scope in rows(root)] in ([], [str(root)]), f'foreign scope filed under {root}'
+ 
+ 
++def test_a_save_refused_for_a_moved_home_does_not_fail_the_remote_links_read(tmp_path, monkeypatch):
++    """The refusal above must not fail the caller: a cold or strict read would surface it and the sidebar would
++    mark every row kanban_unknown. Like a lost lock, the read returns its cards and the next changed read retries."""
++    from hermes_cli import kanban_session_activity_origin_snapshot as snapshot_module
++
++    session_root, test_root = tmp_path / 'session', tmp_path / 'test'
++    session_root.mkdir()
++    test_root.mkdir()
++    hub = tmp_path / 'hub.db'
++    hub.touch()
++    home = {'now': session_root}
++    monkeypatch.setattr(kanban_db, 'kanban_home', lambda: home['now'])
++    monkeypatch.setattr(activity, '_hub_db_path', lambda: hub)
++    monkeypatch.setattr(activity, '_read_remote_links', lambda path, **kw: [card()])
++    real_scope = activity._origin_scope
++
++    def scope():
++        # The env swap lands between the save's root read and its scope read, and only during that save.
++        caller = sys._getframe(1)
++        if caller.f_code is snapshot_module.remote_snapshot.__code__ and caller.f_locals.get('cards') is not None:
++            home['now'] = test_root
++        return real_scope()
++
++    monkeypatch.setattr(activity, '_origin_scope', scope)
++    assert activity._legacy_remote_links() == [card()]
++    assert rows(session_root) == [] and rows(test_root) == []
++    home['now'] = session_root
++    monkeypatch.setattr(activity, '_origin_scope', real_scope)
++    assert activity._legacy_remote_links() == [card()]  # the unsaved inventory is retried, not forgotten
++    assert [scope[2] for scope in rows(session_root)] == [str(session_root)]
++
++
++def test_the_test_isolation_tripwire_still_fails_the_remote_links_read(tmp_path, monkeypatch):
++    """Only the race is swallowed. A test resolving the live root is a leak in that test: it must fail loudly."""
++    live = tmp_path / 'live-root'
++    live.mkdir()
++    hub = tmp_path / 'hub.db'
++    hub.touch()
++    monkeypatch.setattr(hermes_state_guard, '_account_hermes_root', lambda: live.resolve())
++    monkeypatch.setattr(kanban_db, 'kanban_home', lambda: live)
++    monkeypatch.setattr(activity, '_hub_db_path', lambda: hub)
++    monkeypatch.setattr(activity, '_read_remote_links', lambda path, **kw: [card()])
++    with pytest.raises(RuntimeError, match='live-system guard'):
++        activity._legacy_remote_links()
++    assert not (live / 'origin-work.db').exists()
++
++
+ def test_test_process_cannot_write_the_live_origin_work_db(tmp_path, monkeypatch):
+     live = tmp_path / 'live-root'
+     live.mkdir()
+-- 
+2.43.0
+

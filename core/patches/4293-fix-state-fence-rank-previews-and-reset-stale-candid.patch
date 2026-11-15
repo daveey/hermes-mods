@@ -1,0 +1,116 @@
+From e72068b6a24d28807bb2c715e6602a6f6d38ca8c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 22:52:28 +0000
+Subject: [PATCH] fix(state): fence rank previews and reset stale candidates
+ [daveey]
+
+Gate preview reads on the captured generation as well as transcript revision. Invalidate D1 message maxima before exact ranking after lowered or untrusted resets. RED: old-snapshot preview leaked a new first message; both timestamp-raise reset cases omitted s0000. GREEN: all 28 rank memo tests pass.
+---
+ hermes_state_rank_memo.py            |  8 +++----
+ hermes_state_recency.py              |  5 ++++-
+ tests/hermes_state/test_rank_memo.py | 32 ++++++++++++++++++++++++++++
+ 3 files changed, 40 insertions(+), 5 deletions(-)
+
+diff --git a/hermes_state_rank_memo.py b/hermes_state_rank_memo.py
+index fc2bfdc634..64941501b3 100644
+--- a/hermes_state_rank_memo.py
++++ b/hermes_state_rank_memo.py
+@@ -272,9 +272,9 @@ class RankMemo:
+             self.entries.popitem(last=False)
+         return entry
+ 
+-    def cached_previews(self, ids: list) -> list:
++    def cached_previews(self, generation: int, ids: list) -> list:
+         with self.lock:
+-            if not self.preview_ok:
++            if generation != self.generation or not self.preview_ok:
+                 return []
+             out = []
+             for sid in ids:
+@@ -329,7 +329,7 @@ def ranked_ids(conn, memo: RankMemo, key: tuple, need: int, exact_ids, restricte
+     reason = memo.advance(conn)
+     entry = memo.entries.get(key) if reason is None else None
+     if entry is None:
+-        rows = exact_ids()
++        rows = exact_ids(invalidate_candidates=reason in ("lowered", "untrusted"))
+         if memo.clock is not None:
+             memo.put(key, rows)
+         _account(f"fallback/{reason or 'no_entry'}")
+@@ -372,7 +372,7 @@ def project(conn, memo: RankMemo, ids_rows: list, select_head: str, prompt_join:
+     # The cached (revision, raw) rides on the page row itself: one PK join per row, no second json_each to
+     # join against (an unindexed CTE join was quadratic on a 2000-row tree page).
+     use_cache = preview_sql in select_head
+-    cached = {c[0]: (c[1], c[2]) for c in memo.cached_previews([r[0] for r in ids_rows])} if use_cache else {}
++    cached = {c[0]: (c[1], c[2]) for c in memo.cached_previews(generation, [r[0] for r in ids_rows])} if use_cache else {}
+     page = json.dumps([[r[0], r[3], *cached.get(r[0], (None, None))] for r in ids_rows])
+     head = select_head
+     if use_cache:
+diff --git a/hermes_state_recency.py b/hermes_state_recency.py
+index c54637df1f..2f46390fa4 100644
+--- a/hermes_state_recency.py
++++ b/hermes_state_recency.py
+@@ -293,7 +293,10 @@ def _memo_rows(db, store, rank_memo, where_sql, where_clauses, params, outer_whe
+         return conn.execute(ranked_query(narrowed, narrowed, seed_from, ids_head, ""),
+                             narrowed_params + narrowed_params + [limit, 0]).fetchall()
+ 
+-    def exact_ids():
++    def exact_ids(*, invalidate_candidates=False):
++        if invalidate_candidates:
++            # An in-place message edit can raise a row outside D1's cached candidates.
++            store.stale = True
+         picked = _candidates(conn, store, where_clauses, params, need)
+         if picked is None:
+             return conn.execute(ranked_query(where_sql, outer_where, seed_from, ids_head, ""),
+diff --git a/tests/hermes_state/test_rank_memo.py b/tests/hermes_state/test_rank_memo.py
+index 8f758ff8d6..7e8c5fe3c0 100644
+--- a/tests/hermes_state/test_rank_memo.py
++++ b/tests/hermes_state/test_rank_memo.py
+@@ -174,6 +174,19 @@ def test_a_message_delete_falls_back(db, monkeypatch):
+     assert rows == _exact(db, monkeypatch)
+ 
+ 
++@pytest.mark.parametrize("untrusted", [False, True])
++def test_timestamp_raise_rebuilds_candidate_cache_after_reset(db, monkeypatch, untrusted):
++    _seed(db, 400)
++    assert "s0000" not in _ids(_page(db))
++    if untrusted:
++        _write(db, f"DROP TRIGGER {memo.PREFIX}messages_move")
++    _write(db, "UPDATE messages SET timestamp = ? WHERE session_id = 's0000'", (_BASE + 90_000,))
++    rows, delta = _outcome(lambda: _page(db))
++    assert set(delta) == {"fallback/untrusted" if untrusted else "fallback/lowered"}
++    assert _ids(rows)[0] == "s0000"
++    assert rows == _exact(db, monkeypatch)
++
++
+ def test_a_message_rewind_falls_back(db, monkeypatch):
+     _seed(db, 40)
+     _page(db)
+@@ -247,6 +260,25 @@ def test_preview_follows_a_hidden_flag_a_redaction_and_a_first_message(db, monke
+     assert rows == _exact(db, monkeypatch)
+ 
+ 
++def test_old_snapshot_does_not_project_a_newer_first_message(db, monkeypatch):
++    _seed(db, 5)
++    _write(db, "DELETE FROM messages WHERE session_id = 's0004'")
++    before = _page(db)
++    assert before[0]["preview"] == ""
++    original = memo.project
++
++    def interleave(conn, rank, *args):
++        monkeypatch.setattr(memo, "project", original)
++        with SessionDB(db_path=db.db_path) as newer:
++            _write(newer, "INSERT INTO messages (session_id, role, content, timestamp)"
++                          " VALUES ('s0004', 'user', 'first!', ?)", (_BASE + 5,))
++            assert _page(newer)[0]["preview"] == "first!"
++        return original(conn, rank, *args)
++
++    monkeypatch.setattr(memo, "project", interleave)
++    assert _page(db) == before
++
++
+ def test_a_stale_snapshot_never_installs_a_preview(db):
+     _seed(db, 5)
+     _page(db)
+-- 
+2.43.0
+

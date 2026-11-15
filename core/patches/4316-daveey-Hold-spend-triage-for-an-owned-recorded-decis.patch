@@ -1,0 +1,766 @@
+From 28218962228dd90458fd9ea4c5533c233a3acd72 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 22:43:50 +0000
+Subject: [PATCH] [daveey] Hold spend triage for an owned recorded decision
+
+The stale triage timer released budget stops because it only saw older generic triage entries. Budget triage also lacked a notified decision owner. Preserve the stop until promoted_manual/archive, and publish one durable chat-notice or supervisor producer receipt per episode, retrying publication without releasing the hold.
+
+Proof: RED stale-sweep regression reproduced before implementation; tests/hermes_cli/test_kanban_spend_budget_hold.py 17 passed; budget suite 20 passed. scripts/check --base origin/main: 20 checks ok. No Inbox delivery; eligibility exemptions remain sibling work.
+---
+ gateway/kanban_wake_fold.py                   |   1 +
+ gateway/kanban_watchers_notifier.py           |  10 +-
+ hermes_cli/kanban_spend_budget.py             |  19 +-
+ hermes_cli/kanban_spend_decision.py           |  96 ++++++++
+ hermes_cli/kanban_triage_sweep.py             |   6 +
+ locales/af.yaml                               |   1 +
+ locales/ar.yaml                               |   1 +
+ locales/de.yaml                               |   1 +
+ locales/en.yaml                               |   1 +
+ locales/es.yaml                               |   1 +
+ locales/fr.yaml                               |   1 +
+ locales/ga.yaml                               |   1 +
+ locales/hu.yaml                               |   1 +
+ locales/it.yaml                               |   1 +
+ locales/ja.yaml                               |   1 +
+ locales/ko.yaml                               |   1 +
+ locales/pt.yaml                               |   1 +
+ locales/ru.yaml                               |   1 +
+ locales/tr.yaml                               |   1 +
+ locales/uk.yaml                               |   1 +
+ locales/zh-hant.yaml                          |   1 +
+ locales/zh.yaml                               |   1 +
+ tests/hermes_cli/test_kanban_spend_budget.py  |   7 +-
+ .../test_kanban_spend_budget_hold.py          | 222 ++++++++++++++++++
+ tui_gateway/session_notifications.py          |   8 +-
+ website/docs/user-guide/features/kanban.md    |  12 +-
+ 26 files changed, 386 insertions(+), 12 deletions(-)
+ create mode 100644 hermes_cli/kanban_spend_decision.py
+ create mode 100644 tests/hermes_cli/test_kanban_spend_budget_hold.py
+
+diff --git a/gateway/kanban_wake_fold.py b/gateway/kanban_wake_fold.py
+index 98b7932205..d508f0b543 100644
+--- a/gateway/kanban_wake_fold.py
++++ b/gateway/kanban_wake_fold.py
+@@ -37,6 +37,7 @@ _FOLD_HEADER = ('[IMPORTANT: {count} Kanban task updates arrived while this sess
+ # The live statuses under which a wake's premise still holds. A kind absent here reports an outcome
+ # (completed, review_requested, ...) and is never relabelled.
+ _PREMISE_HOLDS = {
++    'spend_budget_decision_ready': frozenset({'triage'}),
+     'chat_wait_unclaimed': frozenset({'triage', 'todo', 'ready'}),
+     'blocked': frozenset({'blocked', 'triage'}),
+     'block_loop_detected': frozenset({'blocked', 'triage'}),
+diff --git a/gateway/kanban_watchers_notifier.py b/gateway/kanban_watchers_notifier.py
+index faefac792b..b2b712513e 100644
+--- a/gateway/kanban_watchers_notifier.py
++++ b/gateway/kanban_watchers_notifier.py
+@@ -58,7 +58,8 @@ TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "st
+ # Kinds that hand a decision back to the origin, which must take a turn.
+ # status/archived/unblocked are bookkeeping.
+ _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "review_requested", "changes_requested", "block_loop_detected", "dependency_parent_unclaimed", "chat_wait_unclaimed", "request_withdrawn", "failure_finalized", "resolved_check_broken", "resolved_check_lost")
+-TERMINAL_KINDS = (*TERMINAL_KINDS, "failure_finalized")
++TERMINAL_KINDS = (*TERMINAL_KINDS, "failure_finalized", "spend_budget_decision_ready")
++_WAKE_KINDS = (*_WAKE_KINDS, "spend_budget_decision_ready")
+ 
+ 
+ def diagnostic_event(ev) -> bool:
+@@ -650,6 +651,12 @@ def _fmt_resolved_check_drop(ev, n) -> tuple:
+     return f"⏸ {n.head} {body}", body, None
+ 
+ 
++def _fmt_spend_budget(ev, n):
++    from hermes_cli.kanban_spend_decision import notice
++    body = notice(ev.payload or {})
++    return f"⏸ {n.head} {body}", body, None
++
++
+ def _fmt_request_withdrawn(ev, n):
+     detail = ("the card was archived. No answer is needed for this request; "
+               "this is not approval and not proof of completion.")
+@@ -676,6 +683,7 @@ _EVENT_FORMATTERS: dict[str, Callable[[Any, _KanbanNotification], tuple]] = {
+     "quota_episode_notice": _fmt_quota_episode,
+     "worker_repin_notice": _fmt_repin_notice,
+     "dependency_parent_unclaimed": _fmt_parent_unclaimed,
++    "spend_budget_decision_ready": _fmt_spend_budget,
+     "chat_wait_unclaimed": _fmt_chat_wait,
+ }
+ 
+diff --git a/hermes_cli/kanban_spend_budget.py b/hermes_cli/kanban_spend_budget.py
+index f1eafff8d7..1624642226 100644
+--- a/hermes_cli/kanban_spend_budget.py
++++ b/hermes_cli/kanban_spend_budget.py
+@@ -277,14 +277,22 @@ def hold(conn: sqlite3.Connection, task_id: str, *, now: Optional[int] = None,
+     from hermes_cli import kanban_db as kb
+     from hermes_cli.kanban_wake_check import foreign_copy
+ 
+-    lim = limits() if lim is None else lim
+-    board = lim
+-    lim = card_limits(conn, task_id, board)
+-    if not lim.runs and not lim.cache_read_tokens:
+-        return None
++    from hermes_cli import kanban_spend_decision as decision
++
+     if foreign_copy(conn, task_id):
+         return None  # a worker-node copy: its home board owns the decision
+     now = int(time.time()) if now is None else int(now)
++    if decision.pending(conn, task_id):
++        with kb.write_txn(conn):
++            if decision.pending(conn, task_id):
++                conn.execute("UPDATE tasks SET status='triage' WHERE id=? AND status IN ('ready','review') "
++                             "AND current_run_id IS NULL AND " + _UNCLAIMED, (task_id, now))
++                decision.safe_ensure_producer(conn, task_id)
++                return "triage"
++    board = limits() if lim is None else lim
++    lim = card_limits(conn, task_id, board)
++    if not lim.runs and not lim.cache_read_tokens:
++        return None
+     if over(spend(conn, task_id, as_of=now + 1), lim) is None:
+         return None  # cheap read on every tick; the write lock is taken only for a card over budget
+     with kb.write_txn(conn):
+@@ -309,6 +317,7 @@ def hold(conn: sqlite3.Connection, task_id: str, *, now: Optional[int] = None,
+             "runs_with_usage": spent.reported, "cost_usd": spent.cost_usd, "override": override,
+             "limits": {"runs": lim.runs, "cache_read_tokens": lim.cache_read_tokens}, "reason": note})
+         kb.add_comment(conn, task_id, AUTHOR, _comment(task_id, note), system=True)
++        decision.safe_ensure_producer(conn, task_id)
+     logger.info("kanban: spend budget sent %s to triage (%s: %d runs, %s cache-read)", task_id, which,
+                 spent.runs, _m(spent.tokens["cache_read_tokens"]))
+     return "triage"
+diff --git a/hermes_cli/kanban_spend_decision.py b/hermes_cli/kanban_spend_decision.py
+new file mode 100644
+index 0000000000..94775fb4c8
+--- /dev/null
++++ b/hermes_cli/kanban_spend_decision.py
+@@ -0,0 +1,96 @@
++"""Durable decision hold and producer for a cumulative spend stop. [daveey]"""
++from __future__ import annotations
++
++from hermes_cli import kanban_db as kb
++
++EVENT = "spend_budget_triaged"
++NOTICE = "spend_budget_decision_ready"
++
++
++def ensure_producer(conn, task_id: str) -> None:
++    """Repair pre-notice stops too; one durable producer receipt per spend-stop episode."""
++    import json
++    from hermes_cli.kanban_sync_divergence import _event_order
++    with kb.write_txn(conn, allow_nested=True):
++        if not pending(conn, task_id):
++            return
++        events = [dict(r) for r in conn.execute(
++            "SELECT * FROM task_events WHERE task_id=? AND kind=?", (task_id, EVENT))]
++        stop = max(events, key=_event_order)
++        episode = stop.get("uid") or str(stop["id"])
++        if conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind=? "
++                        "AND json_extract(payload,'$.episode')=?", (task_id, NOTICE, episode)).fetchone():
++            return
++        payload = json.loads(stop["payload"] or "{}")
++        route = producer(conn, task_id, payload.get("reason") or "Spend budget reached")
++        kb._append_event(conn, task_id, NOTICE, {**payload, "episode": episode, "producer": route})
++
++
++
++def safe_ensure_producer(conn, task_id: str) -> None:
++    import logging
++    try:
++        ensure_producer(conn, task_id)
++    except Exception:  # health: allow BLE001 -- retain the spend hold; the next sweep retries producer publication
++        logging.getLogger(__name__).exception("spend decision producer failed for %s; hold retained", task_id)
++
++
++def pending(conn, task_id: str) -> bool:
++    """Only an explicit promotion or archive releases a spend stop, not an automatic status change."""
++    from hermes_cli.kanban_sync_divergence import _event_order
++    rows = conn.execute(
++        "SELECT * FROM task_events WHERE task_id=? "
++        "AND kind IN ('spend_budget_triaged','promoted_manual','archived') "
++        "AND created_at=(SELECT MAX(created_at) FROM task_events WHERE task_id=? "
++        "AND kind IN ('spend_budget_triaged','promoted_manual','archived'))", (task_id, task_id)).fetchall()
++    return bool(rows and max((dict(r) for r in rows), key=_event_order)["kind"] == EVENT)
++
++
++def notice(payload: dict) -> str:
++    return (str(payload.get("reason") or "Spend budget reached") + ". Held in triage until a recorded decision: "
++            "split or re-scope the work, then manually promote it, or archive it. "
++            "Do not requeue unchanged; the stale-triage sweep cannot release this hold.")
++
++
++def producer(conn, task_id: str, note: str) -> dict:
++    """Inside the stop transaction: one chat-notice route OR one supervisor, never both."""
++    from hermes_cli.kanban_db_notify import is_headless_session
++    from hermes_cli.profiles import get_active_profile_name
++
++    def bind(platform, chat_id):
++        conn.execute(
++            "INSERT OR IGNORE INTO kanban_notify_subs "
++            "(task_id,platform,chat_id,thread_id,delivery_mode,delivery_metadata,created_at,last_event_id) "
++            "VALUES (?,?,?,'','notify','{\"reason\":\"origin\"}',unixepoch(),"
++            "(SELECT COALESCE(MAX(id),0) FROM task_events WHERE task_id=?))",
++            (task_id, platform, chat_id, task_id))
++    from hermes_cli.kanban_creator_chats import _chat_links
++    from hermes_cli.kanban_origin import gateway_names
++    from hermes_cli.kanban_triage_sweep import _supervisor_profile
++
++    task = kb.get_task(conn, task_id)
++    assert task is not None
++    # Bind legacy origin sessions before appending the notice so its cursor cannot skip this event.
++    if task.session_id and not is_headless_session(task.session_id):
++        bind("tui", task.session_id)
++    own = gateway_names()[0]
++    links = (_chat_links(conn, task_id) if conn.execute(
++        "SELECT 1 FROM sqlite_master WHERE name='task_chat_links'").fetchone() else [])
++    for link in links:
++        session = link["chat_session"]
++        gw, profile = link["chat_gateway"], link["chat_profile"] or "default"
++        chat_id = f"{gw}/{profile}/{session}"
++        if not is_headless_session(chat_id):
++            local = gw == own and profile == get_active_profile_name()
++            bind("tui" if local else "hub", session if local else chat_id)
++    if conn.execute("SELECT 1 FROM kanban_notify_subs WHERE task_id=? LIMIT 1", (task_id,)).fetchone():
++        return {"kind": "chats"}
++    episode = conn.execute("SELECT COALESCE(MAX(id),0) FROM task_events WHERE task_id=?", (task_id,)).fetchone()[0]
++    sup = kb.create_task(
++        conn, title=f"Spend budget decision: {task.title}"[:200],
++        body=f"Card {task_id} ({task.title}) has stopped. No chat owns its decision.\n\n" + notice({"reason": note})
++             + f"\n\nRecord the decision on {task_id}; use `hermes kanban promote {task_id} --reason '<what changed>'` "
++               "only after re-scoping or justifying further spend, or archive it. Do not run the original work here.",
++        assignee=_supervisor_profile(), created_by="kanban-spend-budget", workspace_kind="scratch",
++        idempotency_key=f"spend-budget-decision:{task_id}:{episode}", tenant=task.tenant)
++    return {"kind": "supervisor", "task_id": sup}
+diff --git a/hermes_cli/kanban_triage_sweep.py b/hermes_cli/kanban_triage_sweep.py
+index 93c1a4cbcd..54a2ad1278 100644
+--- a/hermes_cli/kanban_triage_sweep.py
++++ b/hermes_cli/kanban_triage_sweep.py
+@@ -124,10 +124,14 @@ def sweep_stale_triage(
+ 
+     # Retained executor copies have no triage policy authority. Local cap keys cannot
+     # arbitrate supervisor creation across gateways, even when neither has synced yet.
++    from hermes_cli.kanban_spend_decision import pending as spend_decision_pending, safe_ensure_producer
+     copies = foreign_ids(conn)
+     for row in rows:
+         if row["id"] in copies:
+             continue
++        if spend_decision_pending(conn, row["id"]):
++            safe_ensure_producer(conn, row["id"])
++            continue
+         if row["human_request"] or open_recovery_card(conn, row["id"]) or current_park(conn, row['id']):
+             continue  # a human owns it, or its kernel recovery card is its producer
+         from hermes_cli.kanban_triage_cleanup import archive_requested_fixture
+@@ -148,6 +152,8 @@ def sweep_stale_triage(
+         if _TRIAGE_BRIEF.strip() not in body:
+             body += _TRIAGE_BRIEF
+         with _kb.write_txn(conn):
++            if spend_decision_pending(conn, row["id"]):
++                continue
+             cur = conn.execute(
+                 "UPDATE tasks SET status = 'ready', assignee = ?, body = ? WHERE id = ? AND status = 'triage'",
+                 (assignee, body, row["id"]),
+diff --git a/locales/af.yaml b/locales/af.yaml
+index 5df6452054..73c5cb59c5 100644
+--- a/locales/af.yaml
++++ b/locales/af.yaml
+@@ -241,6 +241,7 @@ gateway:
+       block_loop_detected: "routed to triage after repeated blocks; orchestration attention needed"
+       dependency_parent_unclaimed: "has a parent card waiting with no worker"
+       chat_wait_unclaimed: "is ready with no worker claiming it"
++      spend_budget_decision_ready: "het sy bestedingsbegroting bereik; wag op 'n bevorder- of argiveerbesluit"
+       status_default: "status changed"
+       status_joiner: ", "
+       message: "[kanban] Task {task_id} {status}.\nTitle: {title}\nAssignee: @{assignee}\nBoard: {board}\n\nCheck the result or decide the next step."
+diff --git a/locales/ar.yaml b/locales/ar.yaml
+index 1e28429a2c..ab29b0b81e 100644
+--- a/locales/ar.yaml
++++ b/locales/ar.yaml
+@@ -241,6 +241,7 @@ gateway:
+       block_loop_detected: "أُحيلت إلى الفرز بعد تكرار الحجب؛ تحتاج إلى اهتمام بالتنسيق"
+       dependency_parent_unclaimed: "has a parent card waiting with no worker"
+       chat_wait_unclaimed: "is ready with no worker claiming it"
++      spend_budget_decision_ready: "بلغ ميزانية الإنفاق؛ بانتظار قرار إعادة التشغيل أو الأرشفة"
+       status_default: "تغيّرت الحالة"
+       status_joiner: "، "
+       message: "[kanban] المهمة {task_id} {status}.\nالعنوان: {title}\nالمُكلَّف: @{assignee}\nاللوحة: {board}\n\nراجع النتيجة أو قرّر الخطوة التالية."
+diff --git a/locales/de.yaml b/locales/de.yaml
+index 5689ba7906..70a719953b 100644
+--- a/locales/de.yaml
++++ b/locales/de.yaml
+@@ -241,6 +241,7 @@ gateway:
+       block_loop_detected: "routed to triage after repeated blocks; orchestration attention needed"
+       dependency_parent_unclaimed: "has a parent card waiting with no worker"
+       chat_wait_unclaimed: "is ready with no worker claiming it"
++      spend_budget_decision_ready: "hat das Ausgabenbudget erreicht; wartet auf Freigabe oder Archivierung"
+       status_default: "status changed"
+       status_joiner: ", "
+       message: "[kanban] Task {task_id} {status}.\nTitle: {title}\nAssignee: @{assignee}\nBoard: {board}\n\nCheck the result or decide the next step."
+diff --git a/locales/en.yaml b/locales/en.yaml
+index 85fcf8ba08..2437089832 100644
+--- a/locales/en.yaml
++++ b/locales/en.yaml
+@@ -244,6 +244,7 @@ gateway:
+       block_loop_detected: "routed to triage after repeated blocks; orchestration attention needed"
+       dependency_parent_unclaimed: "has a parent card waiting with no worker"
+       chat_wait_unclaimed: "is ready with no worker claiming it"
++      spend_budget_decision_ready: "reached its spend budget; awaiting a promote or archive decision"
+       status_default: "status changed"
+       status_joiner: ", "
+       message: "[kanban] Task {task_id} {status}.\nTitle: {title}\nAssignee: @{assignee}\nBoard: {board}\n\nCheck the result or decide the next step."
+diff --git a/locales/es.yaml b/locales/es.yaml
+index e8b572f73b..14fd112d29 100644
+--- a/locales/es.yaml
++++ b/locales/es.yaml
+@@ -241,6 +241,7 @@ gateway:
+       block_loop_detected: "routed to triage after repeated blocks; orchestration attention needed"
+       dependency_parent_unclaimed: "has a parent card waiting with no worker"
+       chat_wait_unclaimed: "is ready with no worker claiming it"
++      spend_budget_decision_ready: "alcanzó su presupuesto; espera una decisión de reactivación o archivo"
+       status_default: "status changed"
+       status_joiner: ", "
+       message: "[kanban] Task {task_id} {status}.\nTitle: {title}\nAssignee: @{assignee}\nBoard: {board}\n\nCheck the result or decide the next step."
+diff --git a/locales/fr.yaml b/locales/fr.yaml
+index 478cf0a1db..ed8b022cae 100644
+--- a/locales/fr.yaml
++++ b/locales/fr.yaml
+@@ -267,6 +267,7 @@ gateway:
+       block_loop_detected: "routed to triage after repeated blocks; orchestration attention needed"
+       dependency_parent_unclaimed: "has a parent card waiting with no worker"
+       chat_wait_unclaimed: "is ready with no worker claiming it"
++      spend_budget_decision_ready: "a atteint son budget ; attend une décision de relance ou d’archivage"
+       status_default: "status changed"
+       status_joiner: ", "
+       message: "[kanban] Task {task_id} {status}.\nTitle: {title}\nAssignee: @{assignee}\nBoard: {board}\n\nCheck the result or decide the next step."
+diff --git a/locales/ga.yaml b/locales/ga.yaml
+index c8cfff1739..f8072bfb4a 100644
+--- a/locales/ga.yaml
++++ b/locales/ga.yaml
+@@ -241,6 +241,7 @@ gateway:
+       block_loop_detected: "routed to triage after repeated blocks; orchestration attention needed"
+       dependency_parent_unclaimed: "has a parent card waiting with no worker"
+       chat_wait_unclaimed: "is ready with no worker claiming it"
++      spend_budget_decision_ready: "shroich sé a bhuiséad; ag fanacht le cinneadh athsheolta nó cartlannaithe"
+       status_default: "status changed"
+       status_joiner: ", "
+       message: "[kanban] Task {task_id} {status}.\nTitle: {title}\nAssignee: @{assignee}\nBoard: {board}\n\nCheck the result or decide the next step."
+diff --git a/locales/hu.yaml b/locales/hu.yaml
+index 1c7c1305a8..e81f8c9864 100644
+--- a/locales/hu.yaml
++++ b/locales/hu.yaml
+@@ -244,6 +244,7 @@ gateway:
+       block_loop_detected: "ismételt blokkolások után triázsra irányítva; orkesztrációs figyelmet igényel"
+       dependency_parent_unclaimed: "has a parent card waiting with no worker"
+       chat_wait_unclaimed: "is ready with no worker claiming it"
++      spend_budget_decision_ready: "elérte a költségkeretét; újraindítási vagy archiválási döntésre vár"
+       status_default: "állapota megváltozott"
+       status_joiner: ", "
+       message: "[kanban] A(z) {task_id} feladat {status}.\nCím: {title}\nFelelős: @{assignee}\nTábla: {board}\n\nNézd meg az eredményt, vagy dönts a következő lépésről."
+diff --git a/locales/it.yaml b/locales/it.yaml
+index d010e83db6..42463ddf3d 100644
+--- a/locales/it.yaml
++++ b/locales/it.yaml
+@@ -241,6 +241,7 @@ gateway:
+       block_loop_detected: "routed to triage after repeated blocks; orchestration attention needed"
+       dependency_parent_unclaimed: "has a parent card waiting with no worker"
+       chat_wait_unclaimed: "is ready with no worker claiming it"
++      spend_budget_decision_ready: "ha raggiunto il budget; attende una decisione di riavvio o archiviazione"
+       status_default: "status changed"
+       status_joiner: ", "
+       message: "[kanban] Task {task_id} {status}.\nTitle: {title}\nAssignee: @{assignee}\nBoard: {board}\n\nCheck the result or decide the next step."
+diff --git a/locales/ja.yaml b/locales/ja.yaml
+index edccca0ce0..a7f92dc9fb 100644
+--- a/locales/ja.yaml
++++ b/locales/ja.yaml
+@@ -241,6 +241,7 @@ gateway:
+       block_loop_detected: "routed to triage after repeated blocks; orchestration attention needed"
+       dependency_parent_unclaimed: "has a parent card waiting with no worker"
+       chat_wait_unclaimed: "is ready with no worker claiming it"
++      spend_budget_decision_ready: "支出予算に達しました。再開またはアーカイブの判断を待っています"
+       status_default: "status changed"
+       status_joiner: ", "
+       message: "[kanban] Task {task_id} {status}.\nTitle: {title}\nAssignee: @{assignee}\nBoard: {board}\n\nCheck the result or decide the next step."
+diff --git a/locales/ko.yaml b/locales/ko.yaml
+index 618f20dc6a..268be94676 100644
+--- a/locales/ko.yaml
++++ b/locales/ko.yaml
+@@ -241,6 +241,7 @@ gateway:
+       block_loop_detected: "routed to triage after repeated blocks; orchestration attention needed"
+       dependency_parent_unclaimed: "has a parent card waiting with no worker"
+       chat_wait_unclaimed: "is ready with no worker claiming it"
++      spend_budget_decision_ready: "지출 예산에 도달했습니다. 재개 또는 보관 결정을 기다립니다"
+       status_default: "status changed"
+       status_joiner: ", "
+       message: "[kanban] Task {task_id} {status}.\nTitle: {title}\nAssignee: @{assignee}\nBoard: {board}\n\nCheck the result or decide the next step."
+diff --git a/locales/pt.yaml b/locales/pt.yaml
+index adbff133cf..65a5c22a70 100644
+--- a/locales/pt.yaml
++++ b/locales/pt.yaml
+@@ -241,6 +241,7 @@ gateway:
+       block_loop_detected: "routed to triage after repeated blocks; orchestration attention needed"
+       dependency_parent_unclaimed: "has a parent card waiting with no worker"
+       chat_wait_unclaimed: "is ready with no worker claiming it"
++      spend_budget_decision_ready: "atingiu o orçamento; aguarda uma decisão de retomar ou arquivar"
+       status_default: "status changed"
+       status_joiner: ", "
+       message: "[kanban] Task {task_id} {status}.\nTitle: {title}\nAssignee: @{assignee}\nBoard: {board}\n\nCheck the result or decide the next step."
+diff --git a/locales/ru.yaml b/locales/ru.yaml
+index b4d1c076c8..2e9eea8ab9 100644
+--- a/locales/ru.yaml
++++ b/locales/ru.yaml
+@@ -241,6 +241,7 @@ gateway:
+       block_loop_detected: "routed to triage after repeated blocks; orchestration attention needed"
+       dependency_parent_unclaimed: "has a parent card waiting with no worker"
+       chat_wait_unclaimed: "is ready with no worker claiming it"
++      spend_budget_decision_ready: "достигла бюджета; ожидает решения о возобновлении или архивировании"
+       status_default: "status changed"
+       status_joiner: ", "
+       message: "[kanban] Task {task_id} {status}.\nTitle: {title}\nAssignee: @{assignee}\nBoard: {board}\n\nCheck the result or decide the next step."
+diff --git a/locales/tr.yaml b/locales/tr.yaml
+index 6597553dcd..890def6499 100644
+--- a/locales/tr.yaml
++++ b/locales/tr.yaml
+@@ -241,6 +241,7 @@ gateway:
+       block_loop_detected: "routed to triage after repeated blocks; orchestration attention needed"
+       dependency_parent_unclaimed: "has a parent card waiting with no worker"
+       chat_wait_unclaimed: "is ready with no worker claiming it"
++      spend_budget_decision_ready: "harcama bütçesine ulaştı; yeniden başlatma veya arşivleme kararı bekliyor"
+       status_default: "status changed"
+       status_joiner: ", "
+       message: "[kanban] Task {task_id} {status}.\nTitle: {title}\nAssignee: @{assignee}\nBoard: {board}\n\nCheck the result or decide the next step."
+diff --git a/locales/uk.yaml b/locales/uk.yaml
+index fbc1005b3b..35a06753ba 100644
+--- a/locales/uk.yaml
++++ b/locales/uk.yaml
+@@ -241,6 +241,7 @@ gateway:
+       block_loop_detected: "routed to triage after repeated blocks; orchestration attention needed"
+       dependency_parent_unclaimed: "has a parent card waiting with no worker"
+       chat_wait_unclaimed: "is ready with no worker claiming it"
++      spend_budget_decision_ready: "досягла бюджету; очікує рішення про відновлення або архівування"
+       status_default: "status changed"
+       status_joiner: ", "
+       message: "[kanban] Task {task_id} {status}.\nTitle: {title}\nAssignee: @{assignee}\nBoard: {board}\n\nCheck the result or decide the next step."
+diff --git a/locales/zh-hant.yaml b/locales/zh-hant.yaml
+index 397631ae4d..405c3e409b 100644
+--- a/locales/zh-hant.yaml
++++ b/locales/zh-hant.yaml
+@@ -241,6 +241,7 @@ gateway:
+       block_loop_detected: "routed to triage after repeated blocks; orchestration attention needed"
+       dependency_parent_unclaimed: "has a parent card waiting with no worker"
+       chat_wait_unclaimed: "is ready with no worker claiming it"
++      spend_budget_decision_ready: "已達到支出預算，等待重新啟動或封存的決定"
+       status_default: "status changed"
+       status_joiner: ", "
+       message: "[kanban] Task {task_id} {status}.\nTitle: {title}\nAssignee: @{assignee}\nBoard: {board}\n\nCheck the result or decide the next step."
+diff --git a/locales/zh.yaml b/locales/zh.yaml
+index 3b98cbf4ed..fa0334bc28 100644
+--- a/locales/zh.yaml
++++ b/locales/zh.yaml
+@@ -241,6 +241,7 @@ gateway:
+       block_loop_detected: "反复阻塞后被转入待分诊，需要编排关注"
+       dependency_parent_unclaimed: "has a parent card waiting with no worker"
+       chat_wait_unclaimed: "is ready with no worker claiming it"
++      spend_budget_decision_ready: "已达到支出预算，等待重新启动或归档的决定"
+       status_default: "状态变化"
+       status_joiner: "，"
+       message: "[kanban] 任务 {task_id} {status}。\n标题: {title}\n执行者: @{assignee}\n看板: {board}\n\n请检查结果或决定下一步动作。"
+diff --git a/tests/hermes_cli/test_kanban_spend_budget.py b/tests/hermes_cli/test_kanban_spend_budget.py
+index 9bebd5c784..17244509d1 100644
+--- a/tests/hermes_cli/test_kanban_spend_budget.py
++++ b/tests/hermes_cli/test_kanban_spend_budget.py
+@@ -98,7 +98,9 @@ def test_long_tail_card_goes_to_triage_with_its_spend(kanban_home):
+         assert comment.author == ksb.AUTHOR
+         assert "15 runs since" in comment.body and "18.0M cache-read" in comment.body and "~$7.50" in comment.body
+         # Triage is a hold: the next tick spawns nothing and writes nothing.
+-        assert kbd.dispatch_once(conn, spawn_fn=spawns).no_progress_held == [] and spawns.ids == []
++        assert kbd.dispatch_once(conn, spawn_fn=spawns).no_progress_held == [] and tid not in spawns.ids
++        producer = _events(conn, tid, "spend_budget_decision_ready")[0].payload["producer"]
++        assert spawns.ids == [producer["task_id"]]  # only the decision owner may run
+         assert len(_events(conn, tid, ksb.EVENT)) == 1
+ 
+ 
+@@ -185,7 +187,8 @@ def test_promote_from_triage_starts_a_new_window(kanban_home):
+         assert ksb.spend(conn, tid).runs == 0
+         spawns = Spawns()
+         kbd.dispatch_once(conn, spawn_fn=spawns)
+-        assert spawns.ids == [tid]
++        assert tid in spawns.ids
++        assert set(spawns.ids) <= {tid, _events(conn, tid, "spend_budget_decision_ready")[0].payload["producer"]["task_id"]}
+ 
+ 
+ def test_live_claim_is_never_taken_off_the_lane(kanban_home):
+diff --git a/tests/hermes_cli/test_kanban_spend_budget_hold.py b/tests/hermes_cli/test_kanban_spend_budget_hold.py
+new file mode 100644
+index 0000000000..04e40c61aa
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_spend_budget_hold.py
+@@ -0,0 +1,222 @@
++"""A spend stop needs a decision, never a timer, and exactly one producer."""
++from __future__ import annotations
++
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_notify as notify
++from hermes_cli import kanban_spend_budget as budget
++from hermes_cli import kanban_spend_decision as decision
++from hermes_cli import kanban_triage_sweep as sweep
++from tests.hermes_cli import test_kanban_spend_budget as helpers
++
++kanban_home = helpers.kanban_home
++
++
++def stopped(conn):
++    tid = kb.create_task(conn, title="Bounded work", assignee="default")
++    with kb.write_txn(conn):
++        kb._append_event(conn, tid, "blocked", {"reason": "old wait"})
++    helpers._runs(conn, tid, budget.DEFAULT_RUNS, usage={"cache_read_tokens": 1_200_000})
++    return tid
++
++
++def test_stale_sweep_cannot_release_spend_stop(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid = stopped(conn)
++        assert budget.hold(conn, tid) == "triage"
++        future = int(time.time()) + 7200
++        assert tid not in sweep.sweep_stale_triage(conn, now=future)
++        assert kb.get_task(conn, tid).status == "triage"
++        assert not helpers._events(conn, tid, "triage_swept")
++
++
++@pytest.mark.parametrize("origin", [False, True])
++def test_owned_stop_has_one_chat_notice_and_no_supervisor(kanban_home, origin):
++    from gateway import kanban_watchers_notifier as watcher
++    from tui_gateway.session_notifications import _format_kanban_event_text
++
++    with kbc.connect_closing() as conn:
++        tid = stopped(conn)
++        if origin:
++            with kb.write_txn(conn):
++                conn.execute("UPDATE tasks SET session_id='human-chat' WHERE id=?", (tid,))
++        else:
++            notify.add_notify_sub(conn, task_id=tid, platform="tui", chat_id="human-chat")
++        assert budget.hold(conn, tid) == "triage"
++        budget.hold(conn, tid)
++        (event,) = helpers._events(conn, tid, decision.NOTICE)
++        assert event.payload["producer"]["kind"] == "chats"
++        assert decision.NOTICE in watcher.TERMINAL_KINDS
++        assert decision.NOTICE in watcher._WAKE_KINDS
++        text = _format_kanban_event_text({"task_id": tid}, kb.get_task(conn, tid), event, "default")
++        assert "15 runs" in text and "18.0M" in text
++        assert "promote" in text and "archive" in text
++        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
++        _, events = notify.unseen_events_for_sub(conn, task_id=tid, platform="tui", chat_id="human-chat",
++                                              kinds=(decision.NOTICE,))
++        assert len(events) == 1
++
++
++def test_unowned_stop_has_one_supervisor(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid = stopped(conn)
++        assert budget.hold(conn, tid) == "triage"
++        budget.hold(conn, tid)
++        (event,) = helpers._events(conn, tid, decision.NOTICE)
++        producer = event.payload["producer"]
++        assert producer["kind"] == "supervisor"
++        supervisor = kb.get_task(conn, producer["task_id"])
++        assert supervisor.assignee == "default"
++        assert tid in supervisor.body and "15 runs" in supervisor.body
++        assert "promote" in supervisor.body and "archive" in supervisor.body
++        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 2
++        assert conn.execute("SELECT COUNT(*) FROM kanban_notify_subs WHERE task_id=?", (tid,)).fetchone()[0] == 0
++
++
++@pytest.mark.parametrize("status", ["ready", "review"])
++def test_unrecorded_release_cannot_spawn_even_with_limits_disabled(kanban_home, status):
++    with kbc.connect_closing() as conn:
++        tid = stopped(conn)
++        budget.hold(conn, tid)
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status=? WHERE id=?", (status, tid))
++        assert budget.hold(conn, tid, lim=budget.Limits(0, 0)) == "triage"
++        assert kb.get_task(conn, tid).status == "triage"
++        assert len(helpers._events(conn, tid, budget.EVENT)) == 1
++
++
++def test_decomposer_cannot_release_spend_stop(kanban_home):
++    from hermes_cli.kanban_decompose import list_triage_ids
++    with kbc.connect_closing() as conn:
++        tid = stopped(conn)
++        budget.hold(conn, tid)
++        assert tid not in list_triage_ids()
++        assert kb.get_task(conn, tid).status == "triage"
++
++
++def test_sweep_rechecks_spend_stop_inside_write_lock(kanban_home, monkeypatch):
++    from contextlib import contextmanager
++    with kbc.connect_closing() as conn:
++        tid = kb.create_task(conn, title="race", assignee="default", triage=True)
++        real = kb.write_txn
++        @contextmanager
++        def racing(c, **kw):
++            monkeypatch.setattr(kb, "write_txn", real)
++            with real(c):
++                kb._append_event(c, tid, budget.EVENT, {})
++            with real(c, **kw):
++                yield
++        monkeypatch.setattr(kb, "write_txn", racing)
++        assert tid not in sweep.sweep_stale_triage(conn, now=int(time.time()) + 7200)
++        assert kb.get_task(conn, tid).status == "triage"
++
++
++def test_manual_decision_clears_hold_and_later_triage_can_sweep(kanban_home):
++    from hermes_cli.kanban_spend_decision import pending
++    with kbc.connect_closing() as conn:
++        tid = stopped(conn)
++        budget.hold(conn, tid)
++        assert pending(conn, tid)
++        assert kb.promote_task(conn, tid, actor="operator", reason="rescope")[0]
++        assert not pending(conn, tid)
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
++            kb._append_event(conn, tid, "status", {"status": "triage"})
++        assert tid in sweep.sweep_stale_triage(conn, now=int(time.time()) + 7200)
++
++
++def test_gateway_notice_contains_spend_and_decision(kanban_home):
++    from types import SimpleNamespace
++    from gateway.kanban_watchers_notifier import _EVENT_FORMATTERS
++    from hermes_cli.kanban_spend_decision import notice
++    payload = {"reason": "Spend budget: 15 runs, 18.0M cache-read"}
++    text, body, _ = _EVENT_FORMATTERS[decision.NOTICE](SimpleNamespace(payload=payload), SimpleNamespace(head="card"))
++    assert notice(payload) == body
++    assert "15 runs" in text and "promote" in text and "archive" in text
++
++
++def test_producer_failure_keeps_hold_and_sweep_retries_once(kanban_home, monkeypatch):
++    with kbc.connect_closing() as conn:
++        tid = stopped(conn)
++        real = decision.producer
++        def fail(c, task_id, note):
++            real(c, task_id, note)  # even a partial publication must roll back
++            raise RuntimeError("injected publication failure")
++        monkeypatch.setattr(decision, "producer", fail)
++        assert budget.hold(conn, tid) == "triage"
++        assert kb.get_task(conn, tid).status == "triage"
++        assert not helpers._events(conn, tid, decision.NOTICE)
++        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
++        monkeypatch.setattr(decision, "producer", real)
++        for _ in range(2):
++            assert tid not in sweep.sweep_stale_triage(conn, now=int(time.time()) + 7200)
++        assert len(helpers._events(conn, tid, decision.NOTICE)) == 1
++        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 2
++
++
++def test_repair_does_not_create_owner_after_decision(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid = stopped(conn)
++        decision.ensure_producer(conn, tid)
++        assert not helpers._events(conn, tid, decision.NOTICE)
++
++
++@pytest.mark.parametrize("released", [False, True])
++def test_link_only_owner_gets_notice_unless_released(kanban_home, released):
++    with kbc.connect_closing() as conn:
++        tid = stopped(conn)
++        with kb.write_txn(conn):
++            conn.execute("CREATE TABLE task_chat_links (task_id TEXT, chat_gateway TEXT, chat_profile TEXT, "
++                         "chat_session TEXT, released INTEGER, created_at INTEGER)")
++            conn.execute("INSERT INTO task_chat_links VALUES (?, 'remote', 'named', 'human-chat', ?, 0)",
++                         (tid, int(released)))
++        budget.hold(conn, tid)
++        (event,) = helpers._events(conn, tid, decision.NOTICE)
++        assert event.payload["producer"]["kind"] == ("supervisor" if released else "chats")
++        if not released:
++            _, events = notify.unseen_events_for_sub(conn, task_id=tid, platform="hub",
++                                                     chat_id="remote/named/human-chat", kinds=(decision.NOTICE,))
++            assert len(events) == 1
++
++
++def test_pending_rechecks_manual_decision_inside_lock(kanban_home, monkeypatch):
++    from contextlib import contextmanager
++    with kbc.connect_closing() as conn:
++        tid = stopped(conn)
++        budget.hold(conn, tid)
++        real = kb.write_txn
++        @contextmanager
++        def racing(c, **kw):
++            monkeypatch.setattr(kb, "write_txn", real)
++            assert kb.promote_task(c, tid, actor="operator", reason="rescope")[0]
++            with real(c, **kw):
++                yield
++        monkeypatch.setattr(kb, "write_txn", racing)
++        assert budget.hold(conn, tid) is None
++        assert kb.get_task(conn, tid).status == "ready"
++
++
++def test_headless_origin_does_not_own_stop(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid = stopped(conn)
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET session_id=? WHERE id=?", ("local-" + "a" * 64, tid))
++        budget.hold(conn, tid)
++        (event,) = helpers._events(conn, tid, decision.NOTICE)
++        assert event.payload["producer"]["kind"] == "supervisor"
++
++
++def test_archived_stop_needs_no_producer(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid = stopped(conn)
++        with kb.write_txn(conn):
++            kb._append_event(conn, tid, budget.EVENT, {})
++            kb._append_event(conn, tid, "archived", {})
++        assert not decision.pending(conn, tid)
++        decision.ensure_producer(conn, tid)
++        assert not helpers._events(conn, tid, decision.NOTICE)
++
+diff --git a/tui_gateway/session_notifications.py b/tui_gateway/session_notifications.py
+index 7d4fd3b768..6b76149df3 100644
+--- a/tui_gateway/session_notifications.py
++++ b/tui_gateway/session_notifications.py
+@@ -174,7 +174,7 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
+ # past them and they can't wedge a later completed/blocked event behind an unclaimed row.
+ _KANBAN_NOTIFY_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked",
+                         "quota_episode_notice", "worker_repin_notice", "dependency_parent_unclaimed",
+-                        "chat_wait_unclaimed", "request_withdrawn", "failure_finalized", "resolved_check_broken",
++                        "chat_wait_unclaimed", "spend_budget_decision_ready", "request_withdrawn", "failure_finalized", "resolved_check_broken",
+                         "resolved_check_lost")
+ # kanban, /loop + /heartbeat and the bot mailbox share one idle-poll cadence; probing the lease registry on
+ # every 0.5s queue timeout cost ~a core at 11 sessions (#108005).
+@@ -595,7 +595,13 @@ def _kb_completed(task, payload: dict, title: str) -> str:
+ 
+ 
+ # kind -> (glyph, suffix after "Kanban <id>"); silent kinds (archived/unblocked) are absent → None.
++def _kb_spend_budget(task, payload, title):
++    from hermes_cli.kanban_spend_decision import notice
++    return ": " + notice(payload)
++
++
+ _KANBAN_EVENT_FORMATTERS = {
++    "spend_budget_decision_ready": ("⏸", _kb_spend_budget),
+     "request_withdrawn": ("ℹ", lambda t, p, title: " request withdrawn: the card was archived. "
+                          "No answer is needed for this request; this is not approval and not proof of completion."),
+     "resolved_check_broken": ("⏸", lambda t, p, title: " blocked"),  # body rendered by block_notice in the formatter
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index 317d7e31a9..1573619854 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -674,9 +674,15 @@ At `kanban.spend_budget_runs` spending runs (default 15) or
+ the write lock and never under another dispatcher's live claim, moves the card
+ to `triage` with a `spend_budget_triaged` event and a comment showing the spend
+ (`dispatch --json` key `no_progress_held`, action `spend_budget:triage`). The
+-auto-decomposer skips cards that already ran, so triage holds the card until
+-someone splits, re-scopes, archives or promotes it; a promote starts a new
+-budget window.
++auto-decomposer skips cards that already ran, and the stale-triage sweep cannot
++release a spend hold. Only a recorded manual promote (after splitting or
++re-scoping, if needed) or archive releases it; a promote starts a new budget
++window. Changing status or disabling the budget does not clear an existing hold.
++
++Each stop records its producer in `spend_budget_decision_ready.producer`: owning chats
++receive one Kanban notice with spend and decision options, or a card with no
++chat gets one board-supervisor decision card. The supervisor uses
++`kanban.orchestrator_profile`, falling back to `default`. No Inbox post is made.
+ 
+ A card can carry its own limits, so a standing card meant to run indefinitely
+ (an upkeep shepherd) is not sent to triage every 15 runs:
+-- 
+2.43.0
+

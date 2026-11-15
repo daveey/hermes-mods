@@ -1,0 +1,318 @@
+From b70ce0eb96b08e7fab7762d4425d47d2b929b2f3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 22:53:22 +0000
+Subject: [PATCH] [daveey] fix(state): a host wake does not hand a live
+ holder's lapsed turn lease to the first waiter
+
+On laptop-1 (2026-11-14 08:29:34 PST) a TUI turn held chat 20000101_030000_000001's turn lease, the Mac
+slept ~7 min, the 300 s wall-clock TTL ran out during the sleep, and on the DarkWake the gateway's notice
+turn reclaimed the row before the holder's 60 s refresher tick could renew it. The holder's finished reply
+was then refused ('another Hermes process took over this session'); chat 20000101_030000_000002 lost its
+turn the same way in the same second.
+
+Acquisition (SessionDB.try_acquire_session_turn_lease and the runtime worker's turn.acquire) now keeps an
+expired row whose holder is not provably dead for WAKE_GRACE_SECONDS (90) of awake time after this
+process first sees a host suspend (suspend-inclusive clock minus time.monotonic grows). The holder's
+_renew_after_lapse tick lands inside that grace; a holder that never renews is reclaimed after it, a dead
+holder at once. Hosts without a suspend (Linux servers, CI) see no change.
+
+Self-heal t_01a1dae544d34841 (gateway-34796400a6).
+---
+ hermes_state_compression.py                   |   8 +-
+ hermes_state_runtime.py                       |   3 +-
+ hermes_state_wake_grace.py                    |  82 ++++++++++
+ .../test_session_turn_lease_wake_grace.py     | 145 ++++++++++++++++++
+ 4 files changed, 234 insertions(+), 4 deletions(-)
+ create mode 100644 hermes_state_wake_grace.py
+ create mode 100644 tests/hermes_state/test_session_turn_lease_wake_grace.py
+
+diff --git a/hermes_state_compression.py b/hermes_state_compression.py
+index ccfe9da089..41468834b4 100644
+--- a/hermes_state_compression.py
++++ b/hermes_state_compression.py
+@@ -750,8 +750,10 @@ class SessionCompressionMixin:
+     ) -> bool:
+         """Atomically acquire the cross-process turn lease for a conversation (keyed by the
+         lineage root). The walk, the INSERT, and reclaim of expired or dead-local-PID leases
+-        share one write transaction."""
++        share one write transaction. Right after a host suspend an expired row of a holder not
++        provably dead stays held for a short awake grace (``hermes_state_wake_grace``) [daveey]."""
+         from hermes_state import _compression_lock_holder_process_is_dead
++        from hermes_state_wake_grace import lapsed_row_reclaimable
+         if not session_id or not holder:
+             return False
+         now = time.time()
+@@ -767,8 +769,8 @@ class SessionCompressionMixin:
+             conversation_id = self._session_turn_lease_key_on_conn(conn, session_id)
+             return _claim_lease_row(
+                 conn, "session_turn_leases", "conversation_id", conversation_id, holder, now, expires_at,
+-                lambda h, e: (float(e) <= now or _compression_lock_holder_process_is_dead(h)
+-                              or _turn_lease_abandoned(db_path, h)),
++                lambda h, e: (_compression_lock_holder_process_is_dead(h) or _turn_lease_abandoned(db_path, h)
++                              or lapsed_row_reclaimable(h, e, now)),
+             )
+         acquired, reclaimed_holder = self._execute_write(_do, patience_s=patience_s)
+         if reclaimed_holder and _turn_lease_abandoned(db_path, reclaimed_holder):
+diff --git a/hermes_state_runtime.py b/hermes_state_runtime.py
+index 5473a7258b..344617fa5e 100644
+--- a/hermes_state_runtime.py
++++ b/hermes_state_runtime.py
+@@ -925,6 +925,7 @@ def _worker_turn(db, conn, session_id, payload, operation):
+     import time
+     from hermes_state_compression import _claim_lease_row
+     from hermes_state import _compression_lock_holder_process_is_dead
++    from hermes_state_wake_grace import lapsed_row_reclaimable
+     allowed = {'holder'} if operation == 'turn.release' else {'holder', 'ttl_seconds'}
+     if set(payload) != allowed:
+         raise RuntimeStoreError('invalid_params')
+@@ -937,7 +938,7 @@ def _worker_turn(db, conn, session_id, payload, operation):
+     if operation == 'turn.acquire':
+         value = _claim_lease_row(conn, 'session_turn_leases', 'conversation_id', key,
+             holder, now, now + ttl,
+-            lambda h, e: float(e) <= now or _compression_lock_holder_process_is_dead(h))[0]
++            lambda h, e: _compression_lock_holder_process_is_dead(h) or lapsed_row_reclaimable(h, e, now))[0]
+     elif operation == 'turn.renew':
+         value = conn.execute('UPDATE session_turn_leases SET expires_at=? WHERE conversation_id=? AND holder=?',
+                              (now + ttl, key, holder)).rowcount > 0
+diff --git a/hermes_state_wake_grace.py b/hermes_state_wake_grace.py
+new file mode 100644
+index 0000000000..3e294ded8d
+--- /dev/null
++++ b/hermes_state_wake_grace.py
+@@ -0,0 +1,82 @@
++"""[daveey] Post-wake grace for lapsed session turn leases.
++
++A turn lease row expires on the wall clock, but its holder renews on the awake clock (the shared
++scheduler waits on ``time.monotonic``, which stops while macOS sleeps). Across a host suspend longer
++than the TTL every live holder's row is expired at the instant the host wakes, and whichever process
++runs first wins: a waiter polling every second beats the holder's 60 s refresher tick, takes the row,
++and the holder's finished reply is refused ("another Hermes process took over this session").
++
++``recently_woke()`` says whether this host suspended within the last ``WAKE_GRACE_SECONDS`` of awake
++time. Acquisition then treats an expired row whose holder is not provably dead as still held, so the
++holder's post-wake refresher (``DurableTurnLease._renew_after_lapse``) gets its tick. A holder that
++never renews is reclaimed once the grace has passed; a dead holder is reclaimed at once.
++
++Suspend detection: the suspend-inclusive clock (``hermes_platform.quiet_clock``) minus the awake
++clock grows by exactly the suspended time, host-wide. The tracker keeps the last sample per process
++and records the awake instant at which it first saw growth. No suspend clock, no deferral.
++"""
++
++from __future__ import annotations
++
++import threading
++import time
++from typing import Optional
++
++# Longer than the refresher's default 60 s interval plus its write patience, so one post-wake tick lands.
++WAKE_GRACE_SECONDS = 90.0
++# Clock-read jitter between the two clocks is microseconds; growth past this is a suspend.
++_SUSPEND_STEP_SECONDS = 5.0
++
++_lock = threading.Lock()
++_last_total: Optional[float] = None
++_woke_at: Optional[float] = None
++
++
++def suspended_total_s() -> Optional[float]:
++    """Seconds this host has spent suspended since boot, or ``None`` without a suspend-inclusive clock."""
++    try:
++        from hermes_platform.quiet_clock import suspend_inclusive_ns
++    except ImportError:
++        return None
++    inclusive = suspend_inclusive_ns()  # None on hosts without a suspend-inclusive clock; never raises
++    if inclusive is None:
++        return None
++    return (inclusive - time.monotonic_ns()) / 1e9
++
++
++def _awake_now() -> float:
++    return time.monotonic()
++
++
++def recently_woke() -> bool:
++    """True while this host resumed from a suspend less than ``WAKE_GRACE_SECONDS`` awake seconds ago
++    (as first observed by this process)."""
++    global _last_total, _woke_at
++    total = suspended_total_s()
++    if total is None:
++        return False
++    now = _awake_now()
++    with _lock:
++        if _last_total is not None and total - _last_total > _SUSPEND_STEP_SECONDS:
++            _woke_at = now
++        _last_total = total if _last_total is None else max(_last_total, total)
++        woke_at = _woke_at
++    return woke_at is not None and now - woke_at < WAKE_GRACE_SECONDS
++
++
++def lapsed_row_reclaimable(holder: str, expires_at: float, now: float) -> bool:
++    """Expired-row half of the turn-lease stale rule: expired, and not inside a post-wake grace."""
++    if float(expires_at) > now:
++        return False
++    return not recently_woke()
++
++
++def _reset_for_tests() -> None:
++    global _last_total, _woke_at
++    with _lock:
++        _last_total = None
++        _woke_at = None
++
++
++# Baseline at import, so the first acquisition after a sleep in a long-running process sees the growth.
++recently_woke()
+diff --git a/tests/hermes_state/test_session_turn_lease_wake_grace.py b/tests/hermes_state/test_session_turn_lease_wake_grace.py
+new file mode 100644
+index 0000000000..192a762bdc
+--- /dev/null
++++ b/tests/hermes_state/test_session_turn_lease_wake_grace.py
+@@ -0,0 +1,145 @@
++"""A host suspend must not hand a live holder's lapsed turn lease to the first waiter that wakes.
++
++Incident (laptop-1, 2026-11-14 08:29:34 PST): a TUI turn held chat 20000101_030000_000001's lease, the
++Mac slept ~7 min, the 300 s wall-clock TTL ran out during the sleep, and on the DarkWake the gateway's
++notice turn reclaimed the row before the holder's refresher tick could renew it; the holder's finished
++reply was then refused ("another Hermes process took over this session").
++"""
++
++from __future__ import annotations
++
++import os
++import time
++
++import pytest
++
++import hermes_state_wake_grace as wake_grace
++from hermes_state import SessionDB
++
++
++class _FakeClocks:
++    """Drives the tracker's suspended-total and awake clocks."""
++
++    def __init__(self, monkeypatch):
++        self.suspended = 1000.0
++        self.awake = 50_000.0
++        monkeypatch.setattr(wake_grace, "suspended_total_s", lambda: self.suspended)
++        monkeypatch.setattr(wake_grace, "_awake_now", lambda: self.awake)
++        wake_grace._reset_for_tests()
++        wake_grace.recently_woke()  # baseline sample before the "sleep"
++
++    def sleep(self, seconds: float) -> None:
++        self.suspended += seconds
++
++    def run(self, seconds: float) -> None:
++        self.awake += seconds
++
++
++def _expire(db_path, holder):
++    import sqlite3
++
++    conn = sqlite3.connect(db_path)
++    with conn:
++        conn.execute("UPDATE session_turn_leases SET expires_at = ? WHERE holder = ?", (time.time() - 186, holder))
++    conn.close()
++
++
++def _owner(db_path):
++    import sqlite3
++
++    conn = sqlite3.connect(db_path)
++    try:
++        row = conn.execute("SELECT holder FROM session_turn_leases").fetchone()
++    finally:
++        conn.close()
++    return row[0] if row else None
++
++
++def test_waiter_does_not_steal_live_holders_lease_right_after_a_suspend(tmp_path, monkeypatch):
++    clocks = _FakeClocks(monkeypatch)
++    path = tmp_path / "state.db"
++    db = SessionDB(path)
++    db.create_session("chat", source="desktop")
++    holder = f"pid={os.getpid()}:turn=tui:platform=tui"
++    waiter = f"pid={os.getpid()}:turn=gateway:platform=desktop"
++    assert db.try_acquire_session_turn_lease("chat", holder, ttl_seconds=300)
++
++    clocks.sleep(441)  # the Mac slept; the row's wall-clock TTL ran out meanwhile
++    _expire(path, holder)
++
++    assert not db.try_acquire_session_turn_lease("chat", waiter, ttl_seconds=300)
++    assert _owner(path) == holder
++    # The holder's post-wake refresher tick renews its own row (holder-fenced CAS).
++    assert db.refresh_session_turn_lease("chat", holder, ttl_seconds=300)
++    assert not db.try_acquire_session_turn_lease("chat", waiter, ttl_seconds=300)
++    db.release_session_turn_lease("chat", holder)
++    assert db.try_acquire_session_turn_lease("chat", waiter, ttl_seconds=300)
++
++
++def test_live_holder_that_never_renews_is_reclaimed_after_the_wake_grace(tmp_path, monkeypatch):
++    clocks = _FakeClocks(monkeypatch)
++    path = tmp_path / "state.db"
++    db = SessionDB(path)
++    db.create_session("chat", source="desktop")
++    holder = f"pid={os.getpid()}:turn=wedged"
++    waiter = f"pid={os.getpid()}:turn=next"
++    assert db.try_acquire_session_turn_lease("chat", holder, ttl_seconds=300)
++    clocks.sleep(600)
++    _expire(path, holder)
++    assert not db.try_acquire_session_turn_lease("chat", waiter, ttl_seconds=300)
++    clocks.run(wake_grace.WAKE_GRACE_SECONDS + 1)
++    assert db.try_acquire_session_turn_lease("chat", waiter, ttl_seconds=300)
++    assert _owner(path) == waiter
++
++
++def test_without_a_suspend_an_expired_lease_is_reclaimed_at_once(tmp_path, monkeypatch):
++    _FakeClocks(monkeypatch)
++    path = tmp_path / "state.db"
++    db = SessionDB(path)
++    db.create_session("chat", source="desktop")
++    holder = f"pid={os.getpid()}:turn=old"
++    waiter = f"pid={os.getpid()}:turn=new"
++    assert db.try_acquire_session_turn_lease("chat", holder, ttl_seconds=300)
++    _expire(path, holder)
++    assert db.try_acquire_session_turn_lease("chat", waiter, ttl_seconds=300)
++
++
++def test_dead_holder_is_reclaimed_even_right_after_a_suspend(tmp_path, monkeypatch):
++    clocks = _FakeClocks(monkeypatch)
++    path = tmp_path / "state.db"
++    db = SessionDB(path)
++    db.create_session("chat", source="desktop")
++    dead = "pid=999999:turn=gone"
++    monkeypatch.setattr("hermes_state._compression_lock_holder_process_is_dead", lambda h: h == dead)
++    assert db.try_acquire_session_turn_lease("chat", dead, ttl_seconds=300)
++    clocks.sleep(600)
++    _expire(path, dead)
++    assert db.try_acquire_session_turn_lease("chat", f"pid={os.getpid()}:turn=new", ttl_seconds=300)
++
++
++def test_runtime_worker_acquire_honors_the_wake_grace(tmp_path, monkeypatch):
++    from hermes_state_runtime import _worker_turn
++
++    clocks = _FakeClocks(monkeypatch)
++    path = tmp_path / "state.db"
++    db = SessionDB(path)
++    db.create_session("chat", source="desktop")
++    holder = f"pid={os.getpid()}:turn=tui"
++    assert db.try_acquire_session_turn_lease("chat", holder, ttl_seconds=300)
++    clocks.sleep(441)
++    _expire(path, holder)
++
++    def acquire(holder_name):
++        return db._execute_write(lambda conn: _worker_turn(
++            db, conn, "chat", {"holder": holder_name, "ttl_seconds": 300}, "turn.acquire"))["value"]
++
++    assert acquire(f"pid={os.getpid()}:turn=worker") is False
++    assert _owner(path) == holder
++
++
++@pytest.mark.parametrize("value", [None])
++def test_tracker_without_a_suspend_clock_never_defers(monkeypatch, value):
++    monkeypatch.setattr(wake_grace, "suspended_total_s", lambda: value)
++    wake_grace._reset_for_tests()
++    assert wake_grace.recently_woke() is False
++    assert wake_grace.recently_woke() is False
+-- 
+2.43.0
+

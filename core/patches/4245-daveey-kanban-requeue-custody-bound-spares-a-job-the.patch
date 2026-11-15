@@ -1,0 +1,175 @@
+From 58bdb584abb925d4a78b9ab79ef753f4d842f12c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 17:37:27 +0000
+Subject: [PATCH] [daveey] kanban: requeue custody bound spares a job the
+ custody host's running retry holds; liveness on macOS
+
+Review of PR #3050 @478094ef (t_01a1db14e8fb1bff, review 5906095416):
+
+1. Blocking: at `until`, sweep() terminated every live custody process whatever the card's
+   state, including the designed case where the custody host's own retry has re-claimed the
+   card and runs with that persist_on_release job. Killing it there prevents nothing (another
+   host cannot claim a running card) and breaks the persist_on_release contract. sweep() now
+   skips the bound while this host's claim holds the card running (`_held_here`: status
+   running and a local claim_lock); the custody stays open, so once that run ends with the
+   job still alive the bound applies on the next tick.
+   Test: test_bound_spares_the_job_while_the_custody_hosts_retry_runs (RED on 478094ef:
+   sweep released and killed the job under a running card; GREEN now).
+
+2. Nit (behaviour gap): `_start_ticks` read /proc only, so on macOS every process read as
+   dead and core-update requeues there kept the incident class open. Without /proc it now
+   uses the process registry's own fingerprint (gateway.status.get_process_start_time,
+   psutil centiseconds), which is what checkpoint entries record as host_start_time, and
+   reads a zombie as dead. Test: test_liveness_without_proc_uses_the_registry_fingerprint.
+
+Neighbour suites: 8 files / 134 tests pass. scripts/check --base origin/main: 20 checks ok.
+---
+ hermes_cli/kanban_requeue_custody.py          | 35 +++++++++++++++--
+ .../hermes_cli/test_kanban_requeue_custody.py | 39 +++++++++++++++++++
+ 2 files changed, 70 insertions(+), 4 deletions(-)
+
+diff --git a/hermes_cli/kanban_requeue_custody.py b/hermes_cli/kanban_requeue_custody.py
+index 1d33ee8bec..92ef86b867 100644
+--- a/hermes_cli/kanban_requeue_custody.py
++++ b/hermes_cli/kanban_requeue_custody.py
+@@ -22,7 +22,8 @@ While a custody is open, :func:`claim_refusal` (called from ``kanban_db_sync.cla
+ every Board lease) defers another host's claim with a reason naming the host, the pids and the commands; the
+ custody host claims as usual. The custody host's dispatch tick (:func:`sweep`) records
+ ``requeue_custody_released`` once every custody pid has exited, or at ``until`` (the run's
+-``max_runtime_seconds``, 60 min when unset) terminates the jobs as groups (TERM, then KILL) and records it. A
++``max_runtime_seconds``, 60 min when unset) terminates the jobs as groups (TERM, then KILL) and records it,
++unless the custody host's own retry holds the card then (it keeps the job until that run ends). A
+ custody whose host never reports (the host died with its processes) stops holding ``RELEASE_GRACE_SECONDS``
+ after ``until``. A requeue that finds no live persisted job records no custody: today's behaviour.
+ 
+@@ -46,6 +47,7 @@ RELEASE_GRACE_SECONDS = 600
+ TERM_GRACE_SECONDS = 5.0
+ SWEEP_WINDOW_SECONDS = 14 * 86400
+ CMD_CHARS = 160
++_HAS_PROC = os.path.exists("/proc/self/stat")  # Linux; macOS has none (test seam)
+ 
+ 
+ # --- host identity ------------------------------------------------------------------------------
+@@ -66,6 +68,8 @@ def own_host(conn: sqlite3.Connection) -> str:
+ def _start_ticks(pid: int) -> Optional[int]:
+     """Kernel start time of a running pid; None when gone or a zombie (exited, not yet reaped)."""
+     from pathlib import Path
++    if not _HAS_PROC:
++        return _start_fingerprint_without_proc(pid)
+     try:
+         stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8-sig")
+         fields = stat[stat.rindex(")") + 2:].split()
+@@ -74,6 +78,19 @@ def _start_ticks(pid: int) -> Optional[int]:
+         return None
+ 
+ 
++def _start_fingerprint_without_proc(pid: int) -> Optional[int]:
++    """macOS: the process registry's own fingerprint (``gateway.status.get_process_start_time``, psutil
++    centiseconds), so a checkpoint's ``host_start_time`` compares equal; None when gone or a zombie."""
++    try:
++        import psutil  # type: ignore
++        if psutil.Process(pid).status() == psutil.STATUS_ZOMBIE:
++            return None
++        from gateway.status import get_process_start_time
++        return get_process_start_time(pid)
++    except Exception:  # health: allow BLE001 -- psutil NoSuchProcess/AccessDenied/missing all read as not ours
++        return None
++
++
+ def _alive(pid: Any, start: Any) -> bool:
+     """Same process as recorded: pid > 1 and an exact kernel start-time match (never a bare pid)."""
+     return type(pid) is int and pid > 1 and type(start) is int and _start_ticks(pid) == start
+@@ -128,7 +145,7 @@ def _signal(record: dict, sig: int, *, group: bool) -> None:
+         return
+     try:
+         if group and os.getpgid(pid) == pid:
+-            os.killpg(pid, sig)  # windows-footgun: ok -- POSIX only (reads /proc); a job leads its own group
++            os.killpg(pid, sig)  # windows-footgun: ok -- POSIX workers only; a job leads its own group
+         else:
+             os.kill(pid, sig)
+     except OSError:
+@@ -255,6 +272,16 @@ def _release(conn: sqlite3.Connection, task_id: str, custody: dict, outcome: str
+             "outcome": outcome, **extra})
+ 
+ 
++def _held_here(conn: sqlite3.Connection, task_id: str) -> bool:
++    """This host's claim holds the card (the custody host re-claimed the retry): no other host can claim it, so
++    the bound has nothing to prevent and must not kill a ``persist_on_release`` job the running retry relies on.
++    The custody stays open; once that run ends, the sweep resumes (bound included)."""
++    from hermes_cli import kanban_db as kb
++    row = conn.execute("SELECT status, claim_lock FROM tasks WHERE id = ?", (task_id,)).fetchone()
++    return row is not None and row["status"] == "running" and bool(row["claim_lock"]) \
++        and kb._claim_is_local(row["claim_lock"], kb._host_prefix())
++
++
+ def sweep(conn: sqlite3.Connection, *, now: Optional[float] = None,
+           terminate_fn: Optional[Callable[[list[dict]], list[dict]]] = None) -> list[str]:
+     """Dispatch tick on the custody host: release custodies whose processes all exited; at ``until``, terminate
+@@ -268,8 +295,8 @@ def sweep(conn: sqlite3.Connection, *, now: Optional[float] = None,
+                 continue
+             procs = [p for p in custody["processes"] if isinstance(p, dict)]
+             live = [p for p in procs if _alive(p.get("pid"), p.get("start"))]
+-            if live and moment < float(custody.get("until") or 0):
+-                continue
++            if live and (moment < float(custody.get("until") or 0) or _held_here(conn, task_id)):
++                continue  # before the bound, or the retry runs here with the job: persist_on_release holds
+             extra: dict = {}
+             outcome = "exited"
+             if live:
+diff --git a/tests/hermes_cli/test_kanban_requeue_custody.py b/tests/hermes_cli/test_kanban_requeue_custody.py
+index 546f0f2f76..fa72fccca8 100644
+--- a/tests/hermes_cli/test_kanban_requeue_custody.py
++++ b/tests/hermes_cli/test_kanban_requeue_custody.py
+@@ -19,6 +19,7 @@ from hermes_cli import kanban_db_connect as kbc
+ from hermes_cli import kanban_db_sync as sync
+ from hermes_cli import kanban_requeue_custody as custody
+ from hermes_cli.kanban_core_update_requeue import CORE_UPDATE_REQUEUE_REASON
++from tests.waiting import wait_until
+ 
+ SESSION = "local-run-48261-session"
+ HOST, OTHER = "worker-2", "worker-8"
+@@ -225,3 +226,41 @@ def test_custody_of_a_silent_host_stops_holding_after_the_grace(board, procs, mo
+     row = board.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone()
+     assert custody.claim_refusal(board, row, now=until + custody.RELEASE_GRACE_SECONDS - 1)
+     assert custody.claim_refusal(board, row, now=until + custody.RELEASE_GRACE_SECONDS) is None
++
++
++def test_bound_spares_the_job_while_the_custody_hosts_retry_runs(board, procs, monkeypatch):
++    """Review of 478094ef: the bound must not kill a persist_on_release job the same host's re-claimed retry
++    runs with (another host can't claim a running card, so killing prevents nothing). Once that run ends
++    while the job still lives, the bound applies again."""
++    tid = _running_card(board, max_runtime=60)
++    ship = _ready(procs(STUBBORN))
++    start = custody._start_ticks(ship)
++    assert start is not None
++    _checkpoint(board, _entry(ship, persist=True, command="ship"))
++    monkeypatch.setattr(custody, "own_host", lambda conn: HOST)
++    until = _requeue(board, tid)["custody"]["until"]
++    assert not _claim_from(board, monkeypatch, tid, HOST).deferred
++    assert kb.claim_task(board, tid) is not None  # the custody host's own retry runs
++
++    assert custody.sweep(board, now=until + 1) == []
++    task = kb.get_task(board, tid)
++    assert task is not None and task.status == "running" and custody._alive(ship, start)
++
++    assert kb.reclaim_task(board, tid, reason="operator", signal_fn=lambda *_: None)  # that run ends
++    assert custody.sweep(board, now=until + 2) == [tid]
++    assert _wait_dead(ship, start)
++
++
++def test_liveness_without_proc_uses_the_registry_fingerprint(procs, monkeypatch):
++    """Review nit of 478094ef: on macOS (no /proc) every pid read as dead, so no custody was ever recorded.
++    Without /proc the fingerprint is the process registry's own (psutil), matching checkpoint entries."""
++    from gateway.status import get_process_start_time
++    monkeypatch.setattr(custody, "_HAS_PROC", False)
++    proc = procs(SLEEPER)
++    pid = _ready(proc)
++    assert custody._start_ticks(pid) is not None and custody._start_ticks(pid) == get_process_start_time(pid)
++    assert custody._alive(pid, get_process_start_time(pid))
++    proc.kill()
++    wait_until(lambda: custody._start_ticks(pid) is None, timeout=5, what="killed child reads as dead (zombie)")
++    proc.wait(timeout=5)
++    assert custody._start_ticks(pid) is None
+-- 
+2.43.0
+

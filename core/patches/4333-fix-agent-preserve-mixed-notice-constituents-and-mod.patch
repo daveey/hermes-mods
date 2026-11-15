@@ -1,0 +1,421 @@
+From d4f5974c9d56073afae5642c1cbaada5d70b97ad Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:09:58 +0000
+Subject: [PATCH] fix(agent): preserve mixed notice constituents and model
+ sidecars [daveey]
+
+Retain validated display/model spans when ordinary user input shares an alternation-repair run with repeated notices. Rewrite only repair-owned metadata during snapshot-matched persistence, preserve the current notice override, and keep normal compaction retirement. Tests cover both orders, interleaved notices, SQLite reload, three compaction surfaces, stale spans and malformed carriers.
+---
+ agent/agent_runtime_helpers.py                |  33 ++--
+ agent/agent_runtime_helpers_user_rows.py      |  93 ++++++++++-
+ agent/session_persistence.py                  |   6 +
+ agent/transcript_repair.py                    |  25 +++
+ tests/agent/test_mixed_notice_constituents.py | 157 ++++++++++++++++++
+ 5 files changed, 292 insertions(+), 22 deletions(-)
+ create mode 100644 tests/agent/test_mixed_notice_constituents.py
+
+diff --git a/agent/agent_runtime_helpers.py b/agent/agent_runtime_helpers.py
+index 17218875a4..ac38957b13 100644
+--- a/agent/agent_runtime_helpers.py
++++ b/agent/agent_runtime_helpers.py
+@@ -36,7 +36,7 @@ from agent.retry_utils import LIVE_RETRY_WAIT_CAP_S, parse_retry_after_seconds,
+ from agent.message_metadata import MERGED_TURN_PREFIX
+ from agent.turn_context import drop_stale_api_content
+ from agent.agent_runtime_helpers_placeholders import _INTERRUPTED_PLACEHOLDER
+-from agent.agent_runtime_helpers_user_rows import _remember_own_row, keep_one_notice_row
++from agent.agent_runtime_helpers_user_rows import _count_unnamed_row, _remember_own_row, keep_one_notice_row
+ from agent.primary_runtime_snapshot import _build_primary_runtime_snapshot
+ from utils import base_url_host_matches, base_url_hostname, env_var_enabled, atomic_json_write
+ logger = logging.getLogger(__name__)
+@@ -498,26 +498,6 @@ def _remember_absorbed_row(survivor: dict[str, Any], dropped: dict[str, Any], *,
+         record_absorbed_message(survivor, dropped)
+ 
+ 
+-def _count_unnamed_row(survivor: dict[str, Any], retired: dict[str, Any]) -> None:
+-    """On a reload without row ids nothing names *retired*'s durable row once the repair takes the dict
+-    out of the list, so *survivor* counts it. A dict that counts rows was loaded too: a merge may have
+-    popped its marker since. Call before the merge rewrites the survivor: *retired*'s own fields are
+-    recorded so the commit can name its row."""
+-    from agent.context_compressor import _DB_PERSISTED_MARKER
+-    from agent.conversation_compression_archive import (
+-        OWN_ROW, RETIRED_DURABLE_ROWS, UNNAMED_DURABLE_ROWS, retired_row_payload)
+-
+-    def loaded(message: dict[str, Any]) -> bool:
+-        return bool(message.get(_DB_PERSISTED_MARKER) or message.get(UNNAMED_DURABLE_ROWS))
+-
+-    if loaded(survivor) and loaded(retired) and not isinstance(retired.get("_row_id"), int):
+-        survivor[UNNAMED_DURABLE_ROWS] = int(survivor.get(UNNAMED_DURABLE_ROWS) or 0) + 1
+-        # A previously folded dict already records its original row. The transfer in
+-        # _remember_absorbed_row retires that record; its synthetic text/calls never existed in storage.
+-        if not any(row.get(OWN_ROW) for row in retired.get(RETIRED_DURABLE_ROWS) or ()):
+-            survivor.setdefault(RETIRED_DURABLE_ROWS, []).append(retired_row_payload(retired))
+-
+-
+ def _retire_dropped_row(kept: list[dict], dropped: dict[str, Any], leading: list[dict]) -> None:
+     """A durable row the repair drops was still handed to the caller, so the survivor before it stands
+     for it. Left unnamed, an in-place compaction takes it for a row another surface appended and
+@@ -682,6 +662,14 @@ def _merge_consecutive_users(messages: list[dict]) -> tuple[list[dict], int]:
+             merged_content = (
+                 (prev_content + "\n\n" + new_content) if prev_content and new_content else (prev_content or new_content)
+             )
++            from agent.agent_runtime_helpers_user_rows import NOTICE_TURN_OVERRIDE, _notice_id, merge_notice_constituents
++
++            prev.pop(NOTICE_TURN_OVERRIDE, None)
++            notice_merge = merge_notice_constituents(prev, msg)
++            if notice_merge is not None:
++                merged_content = notice_merge[0]
++                if _notice_id(msg) is not None:
++                    prev[NOTICE_TURN_OVERRIDE] = (new_content, merged_content)
+             had_api_sidecar = "api_content" in prev
+             # Read before the marker is popped below. An unpersisted turn folded in ends the claim:
+             # the dict no longer stands for durable rows only.
+@@ -696,6 +684,9 @@ def _merge_consecutive_users(messages: list[dict]) -> tuple[list[dict], int]:
+                 prev[MERGED_TURN_PREFIX] = prev_content
+             # Merged content invalidates the api_content sidecar; drop it so replay cannot use stale bytes.
+             drop_stale_api_content(prev)
++            if notice_merge is not None:
++                prev["api_content"], prev["display_metadata"] = notice_merge[1:]
++                prev.pop(_DB_PERSISTED_MARKER, None)
+             # A display-marker row (e.g. a model-switch marker persisted as role=user on
+             # purpose, #48338) merging with a plain user row must not bury the plain row's
+             # addressable identity: keeping the marker's display_kind hides the merged pair
+diff --git a/agent/agent_runtime_helpers_user_rows.py b/agent/agent_runtime_helpers_user_rows.py
+index d79d8558e3..fe46d8a60b 100644
+--- a/agent/agent_runtime_helpers_user_rows.py
++++ b/agent/agent_runtime_helpers_user_rows.py
+@@ -3,6 +3,7 @@
+ from __future__ import annotations
+ 
+ from typing import Any, Optional
++import hashlib
+ 
+ 
+ def _remember_own_row(survivor: dict[str, Any]) -> None:
+@@ -17,14 +18,104 @@ def _remember_own_row(survivor: dict[str, Any]) -> None:
+         survivor.setdefault(RETIRED_DURABLE_ROWS, []).append({**retired_row_payload(survivor), OWN_ROW: True})
+ 
+ 
++def _count_unnamed_row(survivor: dict[str, Any], retired: dict[str, Any]) -> None:
++    """On a reload without row ids nothing names *retired*'s durable row once the repair takes the dict
++    out of the list, so *survivor* counts it. A dict that counts rows was loaded too: a merge may have
++    popped its marker since. Call before the merge rewrites the survivor: *retired*'s own fields are
++    recorded so the commit can name its row."""
++    from agent.context_compressor import _DB_PERSISTED_MARKER
++    from agent.conversation_compression_archive import (
++        OWN_ROW, RETIRED_DURABLE_ROWS, UNNAMED_DURABLE_ROWS, retired_row_payload)
++
++    def loaded(message: dict[str, Any]) -> bool:
++        return bool(message.get(_DB_PERSISTED_MARKER) or message.get(UNNAMED_DURABLE_ROWS))
++
++    if loaded(survivor) and loaded(retired) and not isinstance(retired.get("_row_id"), int):
++        survivor[UNNAMED_DURABLE_ROWS] = int(survivor.get(UNNAMED_DURABLE_ROWS) or 0) + 1
++        # A previously folded dict already records its original row. The transfer in
++        # _remember_absorbed_row retires that record; its synthetic text/calls never existed in storage.
++        if not any(row.get(OWN_ROW) for row in retired.get(RETIRED_DURABLE_ROWS) or ()):
++            survivor.setdefault(RETIRED_DURABLE_ROWS, []).append(retired_row_payload(retired))
++
++
+ def _notice_id(msg: Any) -> Optional[str]:
+     meta = msg.get("display_metadata") if isinstance(msg, dict) else None
+-    if not isinstance(meta, dict) or msg.get("role") != "user" or msg.get("display_kind") != "kanban_notice":
++    if (not isinstance(meta, dict) or "notice_constituents_v1" in meta
++            or msg.get("role") != "user" or msg.get("display_kind") != "kanban_notice"):
+         return None
+     value = meta.get("notice_id")
+     return value if isinstance(value, str) and value else None
+ 
+ 
++# Only offsets and notice identities live in display metadata. Model-only bytes stay
++# exclusively in api_content, never in a display-facing metadata payload.
++NOTICE_PARTS = "notice_constituents_v1"
++NOTICE_TURN_OVERRIDE = "_merged_notice_turn_override"
++
++
++def _join_parts(parts: list[dict], field: str) -> str:
++    return "\n\n".join(p[field] for p in parts if p[field])
++
++
++def _constituents(row: dict) -> list[dict]:
++    meta = row.get("display_metadata") or {}
++    spans = meta.get(NOTICE_PARTS) if isinstance(meta, dict) else None
++    display, model = row.get("content", ""), row.get("api_content", row.get("content", ""))
++    if isinstance(spans, list) and spans and isinstance(model, str):
++        try:
++            parts = []
++            for span in spans:
++                a, b, c, d = span["offsets"]
++                if not all(type(n) is int for n in (a, b, c, d)) or not (0 <= a <= b <= len(display) and 0 <= c <= d <= len(model)):
++                    break
++                nid = span.get("notice_id")
++                if nid is not None and (not isinstance(nid, str) or not nid):
++                    break
++                if span.get("display_sha256") != hashlib.sha256(display[a:b].encode("utf-8", "surrogatepass")).hexdigest():
++                    break
++                parts.append({"content": display[a:b], "api_content": model[c:d], "notice_id": nid})
++            else:
++                if _join_parts(parts, "content") == display and _join_parts(parts, "api_content") == model:
++                    return parts
++        except (KeyError, TypeError, ValueError):
++            pass
++    # An opaque premerged carrier cannot safely be classified as a single notice.
++    from agent.conversation_compression_archive import MERGED_DURABLE_ROWS
++    from agent.message_metadata import MERGED_TURN_PREFIX
++
++    merged = any(row.get(k) for k in (NOTICE_PARTS, MERGED_TURN_PREFIX, MERGED_DURABLE_ROWS, "_absorbed_row_ids"))
++    nid = None if spans or merged else _notice_id(row)
++    return [{"content": display, "api_content": model if nid and isinstance(model, str) else display, "notice_id": nid}]
++
++
++def merge_notice_constituents(prev: dict, msg: dict) -> Optional[tuple[str, str, dict]]:
++    """Merge identified constituents, never infer notice boundaries from text."""
++    parts = _constituents(prev) + _constituents(msg)
++    if not any(p["notice_id"] for p in parts):
++        return None
++    kept, positions = [], {}
++    for part in parts:
++        nid = part["notice_id"]
++        if nid is not None and nid in positions:
++            index = positions[nid]
++            if kept[index]["api_content"] == kept[index]["content"]:
++                kept[index] = part
++        else:
++            if nid is not None:
++                positions[nid] = len(kept)
++            kept.append(part)
++    display, model = _join_parts(kept, "content"), _join_parts(kept, "api_content")
++    spans, display_end, model_end = [], 0, 0
++    for part in kept:
++        a = display_end + (2 if display_end and part["content"] else 0)
++        c = model_end + (2 if model_end and part["api_content"] else 0)
++        display_end, model_end = a + len(part["content"]), c + len(part["api_content"])
++        spans.append({"offsets": [a, display_end, c, model_end], "notice_id": part["notice_id"],
++                      "display_sha256": hashlib.sha256(part["content"].encode("utf-8", "surrogatepass")).hexdigest()})
++    meta = prev.get("display_metadata")
++    return display, model, {**(meta if isinstance(meta, dict) else {}), NOTICE_PARTS: spans}
++
++
+ def keep_one_notice_row(prev: dict[str, Any], msg: Any) -> Optional[dict[str, Any]]:
+     """Two adjacent user rows of ONE Kanban notice (a passive row, then the turn it woke): the row to keep, else None.
+ 
+diff --git a/agent/session_persistence.py b/agent/session_persistence.py
+index 357b2869da..65e9f724f3 100644
+--- a/agent/session_persistence.py
++++ b/agent/session_persistence.py
+@@ -103,6 +103,12 @@ def _override_replaces_content(msg: dict, content: Any, override: Any) -> bool:
+ def _content_with_turn_override(msg: dict, content: Any, override: Any) -> Any:
+     """Replace only the absorbed current turn, leaving unanswered history intact. The join matches
+     ``_merge_consecutive_users``; a row that no longer holds the prefix takes the plain override."""
++    from agent.agent_runtime_helpers_user_rows import NOTICE_TURN_OVERRIDE
++
++    # An identified notice already has a clean constituent in the composite.
++    # Reappending its identical persist override would resurrect the duplicate.
++    if msg.get(NOTICE_TURN_OVERRIDE) == (override, content):
++        return content
+     prefix = msg.get(MERGED_TURN_PREFIX)
+     if isinstance(content, str) and isinstance(override, str) and isinstance(prefix, str):
+         if content == prefix or content.startswith(prefix + "\n\n"):
+diff --git a/agent/transcript_repair.py b/agent/transcript_repair.py
+index 73e0f842ba..34caa29b85 100644
+--- a/agent/transcript_repair.py
++++ b/agent/transcript_repair.py
+@@ -327,9 +327,34 @@ def _rewrite_row(
+         [*(serialized[column] for column in _OWNED_COLUMNS), serialized["content"], serialized["display_metadata"],
+          int(target_row["id"]), session_id],
+     )
++    _rewrite_notice_constituents(conn, session_id, target_row, serialized)
+     _restore_display_index(conn, session_id, target_row, serialized, old_identity, old_peer_ids)
+ 
+ 
++def _rewrite_notice_constituents(conn, session_id, target_row, serialized) -> None:
++    """A notice fold owns its paired display/model projection, not other metadata writers' keys."""
++    import json
++
++    from agent.agent_runtime_helpers_user_rows import NOTICE_PARTS, _constituents
++
++    metadata = json.loads(serialized["display_metadata"] or "{}")
++    if not isinstance(metadata, dict) or not metadata.get(NOTICE_PARTS):
++        return
++    candidate = {"content": serialized["content"], "display_metadata": metadata}
++    if serialized["api_content"] is not None:
++        candidate["api_content"] = serialized["api_content"]
++    if not any(part["notice_id"] for part in _constituents(candidate)):
++        return
++    # Only this repair-owned key follows the composite. Reactions/backfills remain
++    # outside the ownership digest and must not be overwritten by a stale live copy.
++    conn.execute(
++        "UPDATE messages SET api_content = ?, display_metadata = json_set("
++        "COALESCE(display_metadata, '{}'), ?, json(?)) WHERE id = ? AND session_id = ?",
++        (serialized["api_content"], f"$.{NOTICE_PARTS}", json.dumps(metadata[NOTICE_PARTS]),
++         int(target_row["id"]), session_id),
++    )
++
++
+ def _restore_display_index(
+     conn: sqlite3.Connection,
+     session_id: str,
+diff --git a/tests/agent/test_mixed_notice_constituents.py b/tests/agent/test_mixed_notice_constituents.py
+new file mode 100644
+index 0000000000..abd5fe2164
+--- /dev/null
++++ b/tests/agent/test_mixed_notice_constituents.py
+@@ -0,0 +1,157 @@
++"""Mixed user runs preserve notice identity without sacrificing ordinary input."""
++from copy import deepcopy
++
++import pytest
++
++from agent.agent_runtime_helpers import repair_message_sequence
++from tests.agent import test_in_place_preflight_rewind as _rewind
++
++session = _rewind.session
++
++
++def notice(key, row, *, woken=False):
++    msg = {"role": "user", "content": f"notice {key}", "_row_id": row,
++           "display_kind": "kanban_notice", "display_metadata": {"notice_id": key}}
++    if woken:
++        msg["api_content"] = f"notice {key}\n[ask-gate] live state {key}"
++    return msg
++
++
++@pytest.mark.parametrize("woken_first", [False, True])
++@pytest.mark.parametrize("interleaved", [False, True])
++def test_plain_user_notice_pair(woken_first, interleaved):
++    a, wake = notice("A", 2), notice("A", 4, woken=True)
++    pair = [wake, a] if woken_first else [a, wake]
++    if interleaved:
++        pair.insert(1, notice("B", 3))
++    rows = [{"role": "assistant", "content": "ok"},
++            {"role": "user", "content": "unrelated request", "_row_id": 1}, *pair]
++    original = deepcopy(rows)
++    repair_message_sequence(None, rows)
++    kept = rows[-1]
++    assert kept["content"].count("notice A") == 1
++    assert kept["content"].count("unrelated request") == 1
++    assert "[ask-gate]" not in kept["content"]
++    assert kept["api_content"].count("notice A") == 1
++    assert kept["api_content"].count("[ask-gate] live state A") == 1
++    assert "unrelated request" in kept["api_content"]
++    if interleaved:
++        assert kept["content"].count("notice B") == 1
++        assert kept["api_content"].count("notice B") == 1
++    assert {r["_row_id"] for r in original[1:]} == {kept["_row_id"], *kept["_absorbed_row_ids"]}
++    assert repair_message_sequence(None, rows) == 0
++
++
++def test_current_notice_override_does_not_reappend_deduplicated_turn():
++    from types import SimpleNamespace
++    from agent.session_persistence import _db_flush_row
++
++    rows = [{"role": "assistant", "content": "ok"},
++            {"role": "user", "content": "unrelated request"},
++            notice("A", 1), notice("B", 2), notice("A", 3, woken=True)]
++    repair_message_sequence(None, rows)
++    agent = SimpleNamespace(_persist_user_message_override="notice A")
++    written = _db_flush_row(agent, rows[-1], True)
++    assert written["content"] == "unrelated request\n\nnotice A\n\nnotice B"
++    assert written["api_content"].count("[ask-gate] live state A") == 1
++
++
++def test_edited_constituent_is_not_superseded_by_old_identity():
++    rows = [{"role": "assistant", "content": "ok"},
++            {"role": "user", "content": "unrelated request"}, notice("A", 1)]
++    repair_message_sequence(None, rows)
++    rows[-1]["content"] = rows[-1]["content"].replace("notice A", "my edit!")
++    rows.append(notice("A", 2, woken=True))
++    repair_message_sequence(None, rows)
++    assert "my edit!" in rows[-1]["content"]
++    assert rows[-1]["content"].count("notice A") == 1
++
++
++@pytest.mark.parametrize("bad_spans", [[None], [{"offsets": [-1, 2, 0, 2]}], "bad", []])
++def test_malformed_metadata_never_discards_plain_input(bad_spans):
++    from agent.agent_runtime_helpers_user_rows import NOTICE_PARTS
++
++    rows = [{"role": "assistant", "content": "ok"},
++            {"role": "user", "content": "unrelated request", "display_kind": "kanban_notice",
++             "display_metadata": {"notice_id": "A", NOTICE_PARTS: bad_spans}}, notice("A", 2, woken=True)]
++    repair_message_sequence(None, rows)
++    assert "unrelated request" in rows[-1]["content"]
++    assert "notice A" in rows[-1]["content"]
++
++
++@pytest.mark.parametrize("row_ids", [False, True])
++@pytest.mark.parametrize("woken_first", [False, True])
++def test_durable_mixed_run_flush_and_reload(tmp_path, row_ids, woken_first):
++    from hermes_state import SessionDB
++    from run_agent import AIAgent
++
++    with SessionDB(db_path=tmp_path / "state.db") as db:
++        db.create_session("mixed", source="tui", model="test")
++        db.append_message("mixed", "assistant", "ok")
++        db.append_message("mixed", "user", "unrelated request")
++        for row in ([notice("A", 1, woken=True), notice("B", 2), notice("A", 3)] if woken_first else
++                    [notice("A", 1), notice("B", 2), notice("A", 3, woken=True)]):
++            db.append_message("mixed", "user", row["content"], display_kind=row["display_kind"],
++                              display_metadata=row["display_metadata"], api_content=row.get("api_content"))
++        rows = db.get_messages_as_conversation("mixed", repair_alternation=True, include_row_ids=row_ids)
++        agent = AIAgent.__new__(AIAgent)
++        agent._session_db, agent.session_id = db, "mixed"
++        agent._session_db_created = True
++        agent._last_flushed_db_idx = 0
++        agent._flushed_db_message_ids = set()
++        agent._flushed_db_message_session_id = None
++        agent._persist_disabled = False
++        assert agent._flush_messages_to_session_db(rows)
++        # Flush is append/rewrite, not compaction: originals remain until the
++        # compaction transaction retires them. The supported replay repairs them.
++        raw = db.get_messages_as_conversation("mixed", include_row_ids=row_ids)
++        if not row_ids:  # snapshot/CAS replay rewrites; legacy addressed replay waits for compaction
++            assert raw[1]["api_content"].count("[ask-gate] live state A") == 1
++        loaded = db.get_messages_as_conversation("mixed", repair_alternation=True, include_row_ids=row_ids)
++        assert len(loaded) == 2, (rows, loaded)
++        assert loaded[-1]["content"] == "unrelated request\n\nnotice A\n\nnotice B"
++        assert loaded[-1]["api_content"].count("[ask-gate] live state A") == 1
++        assert "[ask-gate]" not in str(loaded[-1]["display_metadata"])
++        loaded.append(notice("A", 999))
++        repair_message_sequence(None, loaded)
++        assert loaded[-1]["content"].count("notice A") == 1
++        assert loaded[-1]["api_content"].count("[ask-gate] live state A") == 1
++
++
++@pytest.mark.parametrize("surface", ["cli", "resume", "gateway"])
++@pytest.mark.parametrize("woken_first", [False, True])
++def test_mixed_notices_survive_compaction_and_retire_originals(session, surface, woken_first):
++    from types import SimpleNamespace
++
++    db, agent = session
++    cli = SimpleNamespace(conversation_history=[])
++    for n in range(1, 13):
++        _rewind._turn(db, agent, cli, surface, n, 5_000)
++    original_ids = [db.append_message("sid", "user", "unrelated request")]
++    pair = [notice("A", 1), notice("A", 2, woken=True)]
++    if woken_first:
++        pair.reverse()
++    pair.insert(1, notice("B", 3))
++    for row in pair:
++        original_ids.append(db.append_message("sid", "user", row["content"],
++            display_kind=row["display_kind"], display_metadata=row["display_metadata"],
++            api_content=row.get("api_content")))
++    if surface == "cli":
++        cli.conversation_history = db.get_messages_as_conversation("sid", repair_alternation=True)
++    elif surface == "resume":
++        cli.conversation_history = db.get_resume_conversations("sid")[0]
++    _rewind._turn(db, agent, cli, surface, 13, 5_000)
++    _rewind._turn(db, agent, cli, surface, 14, 200_000)
++    _rewind._turn(db, agent, cli, surface, 15, 20_000)
++    assert agent._last_compaction_in_place is True
++    live = db.get_messages_as_conversation("sid")
++    display = "\n".join(str(row.get("content", "")) for row in live)
++    model = "\n".join(str(row.get("api_content", row.get("content", ""))) for row in live)
++    for text in ("unrelated request", "notice A", "notice B"):
++        assert display.count(text) == 1
++        assert model.count(text) == 1
++    assert model.count("[ask-gate] live state A") == 1
++    assert "[ask-gate]" not in display
++    for row_id in original_ids:
++        assert tuple(db._conn.execute("SELECT active, compacted FROM messages WHERE id = ?", (row_id,)).fetchone()) == (0, 0)
++
+-- 
+2.43.0
+

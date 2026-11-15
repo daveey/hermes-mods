@@ -1,0 +1,191 @@
+From b9a66929105c0d64bb73c5a56500605e13c03a19 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 14:26:16 +0000
+Subject: [PATCH] [daveey] test: kill forked_exit_status join and _fork_lock
+ mutants
+
+Post-merge mutation sweep of #2931 (retain forkserver exit status after
+sentinel consumption) left two survivors in scripts/run_tests_launch.py
+forked_exit_status:
+
+- M2931b: drop proc.join() in the cached-status branch. Nothing checked
+  that a returned status removes the finished child from multiprocessing's
+  registry (multiprocessing.process._children), so a leaked Process stayed
+  invisible. The consumed-sentinel fixture now registers its fake child
+  the way Process.start does and asserts it is gone after the first status
+  return (all 6 cases).
+- M2931c: read proc.exitcode outside _fork_lock. New
+  test_forked_status_read_excludes_concurrent_process_start drives the
+  real interleaving deterministically: the status poll stops between
+  wait() and read_signed(), another thread runs start_forked() whose
+  start() calls multiprocessing.process._cleanup(), and an observed
+  _fork_lock records whether that start had to wait. Unlocked, _cleanup
+  reads the 8 status bytes and the poll reads EOF, which multiprocessing
+  reports as 255 (the original flake); locked, the start waits and the
+  real status (0, 1, -9) is returned. No sleeps: progress is decided by
+  Events, with 30 s bounds only for failure.
+
+Not equivalent: the race was argued from CPython 3.14.9
+Popen.poll/_cleanup source; with the writer closed, the losing reader gets
+EOFError and stores 255.
+
+Proof (hermes-worker-8, base 14ad1c5b0f):
+- bash scripts/run_tests.sh tests/scripts/test_pytest_exit_diagnostics.py:
+  23 passed, 0 failed, 0 skipped (20 before + 3 new).
+- sdlc-review mutants.py with that command: baseline ok; M2931a killed
+  (6 consumed-sentinel cases), M2931b killed (6 consumed-sentinel cases),
+  M2931c killed (3 new cases, `assert 255 == <status>`). tally killed 3.
+- 15 repeated runs of the 9 affected cases: all passed.
+- scripts/check --base origin/main: 20 checks ok.
+
+Kanban: t_01a1d97521fe4b19 (sweep t_01a1d88301271ee1).
+---
+ tests/scripts/test_pytest_exit_diagnostics.py | 107 ++++++++++++++++--
+ 1 file changed, 99 insertions(+), 8 deletions(-)
+
+diff --git a/tests/scripts/test_pytest_exit_diagnostics.py b/tests/scripts/test_pytest_exit_diagnostics.py
+index 83caad60fa..0ecde3abef 100644
+--- a/tests/scripts/test_pytest_exit_diagnostics.py
++++ b/tests/scripts/test_pytest_exit_diagnostics.py
+@@ -204,21 +204,15 @@ def test_forked_child_poll_observes_status_without_consuming_output(monkeypatch,
+ @pytest.mark.parametrize("status", [0, 1, -9])
+ @pytest.mark.parametrize("poll_first", [False, True])
+ def test_forked_status_survives_consumed_sentinel(tmp_path, monkeypatch, status, poll_first):
+-    import multiprocessing
+     import os
++    from multiprocessing import process as mp_process
+     from multiprocessing.connection import wait
+     from multiprocessing.forkserver import write_signed
+-    from multiprocessing.popen_forkserver import Popen
+ 
+     # Real multiprocessing status decoding, with the forkserver's writer held
+     # open after its status write. No EOF can mask the consumed-pipe race.
+     read_fd, write_fd = os.pipe()
+-    popen = Popen.__new__(Popen)
+-    popen.sentinel = read_fd
+-    popen.returncode = None
+-    proc = multiprocessing.get_context("forkserver").Process()
+-    proc._popen = popen
+-    proc._sentinel = read_fd
++    proc = _fake_forkserver_child(read_fd)
+     child = launch._ForkedPytest.__new__(launch._ForkedPytest)
+     child._proc = proc
+     child.returncode = None
+@@ -236,6 +230,9 @@ def test_forked_status_survives_consumed_sentinel(tmp_path, monkeypatch, status,
+         if poll_first:
+             assert child.poll() == status
+         assert child.communicate(timeout=0) == ("preserved diagnostics", None)
++        # Every status return joins: the finished child leaves multiprocessing's
++        # registry instead of lingering for the next Process.start to poll.
++        assert proc not in mp_process._children
+         assert wait([read_fd], 0) == []  # consumed bytes, writer not closed
+         assert child.poll() == status
+         assert child.poll() == status
+@@ -244,10 +241,104 @@ def test_forked_status_survives_consumed_sentinel(tmp_path, monkeypatch, status,
+         child.kill()
+         kill.assert_not_called()  # terminal status must not resurrect kill eligibility
+     finally:
++        mp_process._children.discard(proc)
+         os.close(write_fd)
+         os.close(read_fd)
+ 
+ 
++def _fake_forkserver_child(read_fd):
++    """A started-looking forkserver Process whose status pipe the test owns.
++
++    Real Popen.poll/read_signed decoding; registered in multiprocessing's child
++    registry as Process.start does, so Process.start's _cleanup() polls it too.
++    """
++    import multiprocessing
++    from multiprocessing import process as mp_process
++    from multiprocessing.popen_forkserver import Popen
++
++    popen = Popen.__new__(Popen)
++    popen.sentinel = read_fd
++    popen.returncode = None
++    proc = multiprocessing.get_context("forkserver").Process()
++    proc._popen = popen
++    proc._sentinel = read_fd
++    mp_process._children.add(proc)
++    return proc
++
++
++@pytest.mark.platforms("linux")
++@pytest.mark.parametrize("status", [0, 1, -9])
++def test_forked_status_read_excludes_concurrent_process_start(monkeypatch, status):
++    """A Process.start racing the status read must not consume the status bytes.
++
++    Interleaving, made deterministic: the status poll has seen the sentinel
++    readable and is about to read the 8 status bytes when another thread runs
++    start_forked(), whose Process.start() first polls every registered child
++    (multiprocessing.process._cleanup). Unlocked, that poll reads the bytes and
++    the status poll then reads EOF, which multiprocessing reports as 255.
++    """
++    import os
++    from multiprocessing import forkserver
++    from multiprocessing import process as mp_process
++
++    read_fd, write_fd = os.pipe()
++    proc = _fake_forkserver_child(read_fd)
++    forkserver.write_signed(write_fd, status)
++    os.close(write_fd)  # the server has closed its writer: a lost read sees EOF
++
++    decided = threading.Event()  # the racing start either waits on the lock or has polled
++    contended = threading.Event()
++    starter_done = threading.Event()
++
++    class ObservedLock:
++        """_fork_lock that records when a caller has to wait for it."""
++
++        def __init__(self):
++            self._lock = threading.Lock()
++
++        def __enter__(self):
++            if not self._lock.acquire(blocking=False):
++                contended.set()
++                decided.set()
++                self._lock.acquire()
++            return self
++
++        def __exit__(self, *exc):
++            self._lock.release()
++
++    class RacingStart:
++        def start(self):  # what Process.start runs before forking
++            mp_process._cleanup()
++            starter_done.set()
++            decided.set()
++
++    monkeypatch.setattr(launch, "_fork_lock", ObservedLock())
++    real_read = forkserver.read_signed
++    status_reader = threading.get_ident()
++    racer = threading.Thread(target=launch.start_forked, args=(RacingStart(),), daemon=True)
++    raced = []
++
++    def read_signed(fd):
++        if threading.get_ident() == status_reader and not raced:
++            raced.append(True)
++            racer.start()  # the status poll is between wait() and its read
++            assert decided.wait(30), "racing Process.start neither waited nor polled"
++        return real_read(fd)
++
++    monkeypatch.setattr(forkserver, "read_signed", read_signed)
++    try:
++        assert launch.forked_exit_status(proc, 0) == status
++        racer.join(30)
++        assert not racer.is_alive()
++        assert contended.is_set()  # the start waited for the status read to finish
++        assert starter_done.is_set()
++        assert proc.exitcode == status
++        assert proc not in mp_process._children
++    finally:
++        mp_process._children.discard(proc)
++        os.close(read_fd)
++
++
+ @pytest.mark.parametrize("status", [None, 0])
+ def test_runner_records_child_status_before_killing(tmp_path, monkeypatch, status):
+     from scripts import run_tests_parallel as runner
+-- 
+2.43.0
+

@@ -1,0 +1,194 @@
+From abfb1850fbe75c9c97b9cfb8430681709a68981c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 17:27:06 +0000
+Subject: [PATCH] [daveey] Raise ci-red main_health for failed empty post-merge
+ suites
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The no-required-check fallback appends a failed 0-run check suite created
+after mergedAt to post_merge_checks inside fallback_outcomes, but
+merge_evidence had already computed main_health from the earlier rows. A
+failed empty suite on the landed sha (e.g. a main-push workflow with an
+invalid workflow file) therefore never raised the ci-red pointer.
+
+Fix: the main_health computation moves into flag_main_health(), which
+merge_evidence still calls, and collect_acceptance calls it again after
+fallback_outcomes. It only ever adds the pointer, so the second call is
+idempotent; it is a no-op unless the PR merged as this exact head, and the
+required-check path adds no post-merge rows after merge_evidence, so that
+path's evidence and pointer are unchanged.
+
+Red conclusion set (RED_CONCLUSIONS), decided here:
+- red: failure, error, timed_out, action_required, and now startup_failure
+  (the workflow could not start on the landed sha: real breakage, and the
+  usual conclusion of a jobless failed suite).
+- not red: cancelled (concurrency groups routinely cancel a superseded main
+  run; already pinned by test_nonfailure_postmerge_checks_do_not_claim_main_is_red),
+  stale, neutral, skipped, success, unknown/None.
+main_health stays diagnostic only: ci-main-watch owns base health, and
+acceptance classification is unchanged.
+
+Follow-up to independent review t_01a1daf204b0b701 of PR #3036 (review
+5906041934, nit 1). PR #3036 (landed as 95e3d3cf35) introduced the
+post-merge empty-suite rows.
+
+Proof:
+- RED on origin/main 6b75e232c9 (code reverted, new tests kept): 5 failed —
+  test_failed_empty_suite_after_merge_raises_main_health[failure,
+  startup_failure, timed_out, action_required] and
+  test_red_postmerge_conclusions_claim_main_is_red[startup_failure]. On
+  main the empty-suite row is dropped entirely, so these fail there too.
+- GREEN: all 18 test files importing kanban_pr_acceptance/merge_time/
+  fallback: 515 passed, 1 skipped.
+- Mutants killed: dropping the post-fallback flag_main_health call (4
+  fail); dropping startup_failure from RED_CONCLUSIONS (2 fail).
+- Negative controls pass: cancelled/stale/None empty suites and a failed
+  empty suite on an unlanded (rebased) head raise no main_health.
+- scripts/check --base origin/main: 20 checks ok.
+---
+ hermes_cli/kanban_pr_acceptance.py            |  5 +++-
+ hermes_cli/kanban_pr_merge_time.py            | 22 +++++++++++++--
+ tests/hermes_cli/test_kanban_pr_fallback.py   |  1 +
+ .../test_kanban_pr_fallback_merged.py         | 28 +++++++++++++++++++
+ tests/hermes_cli/test_kanban_pr_merge_time.py |  8 ++++++
+ 5 files changed, 60 insertions(+), 4 deletions(-)
+
+diff --git a/hermes_cli/kanban_pr_acceptance.py b/hermes_cli/kanban_pr_acceptance.py
+index 4d5264d1f1..1ce25cc05b 100644
+--- a/hermes_cli/kanban_pr_acceptance.py
++++ b/hermes_cli/kanban_pr_acceptance.py
+@@ -16,7 +16,7 @@ import subprocess
+ from pathlib import Path
+ from urllib.parse import quote
+ 
+-from hermes_cli.kanban_pr_merge_time import check_receipt, merge_evidence, timestamp
++from hermes_cli.kanban_pr_merge_time import check_receipt, flag_main_health, merge_evidence, timestamp
+ 
+ _REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+ _PR = re.compile(r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)")
+@@ -281,6 +281,9 @@ def collect_acceptance(contract: str, published_pr: str | None,
+                 receipt["checks"].append(evidence)
+         outcomes = fallback_outcomes(receipt, required, outcomes, runs, statuses, suites,
+                                      merged=pr["state"] == "MERGED")
++        # Failed empty suites joined post_merge_checks after merge_evidence; a no-op
++        # unless the PR merged as this head, and the required path adds no rows.
++        flag_main_health(receipt, pr, repo)
+         # Re-read after all pages: old-head successes are never transferable.
+         phase = "re-reading the PR head"
+         current = _api(f"repos/{repo}/pulls/{number}", profile_home=profile_home)
+diff --git a/hermes_cli/kanban_pr_merge_time.py b/hermes_cli/kanban_pr_merge_time.py
+index b039a3deb3..ffdd42832b 100644
+--- a/hermes_cli/kanban_pr_merge_time.py
++++ b/hermes_cli/kanban_pr_merge_time.py
+@@ -148,17 +148,33 @@ def merge_evidence(receipt, pr, repo, runs, statuses, *, distinct_suites=False,
+     statuses, post_statuses = partition_at_merge(statuses, merged_at, runs=False)
+     sha = receipt["head_sha"]
+     receipt["post_merge_checks"] = [check_receipt(c, sha) for c in post_runs + post_statuses]
++    flag_main_health(receipt, pr, repo)
++    return runs, statuses
++
++
++# Post-merge conclusions that mean the landed sha's CI is red. startup_failure is
++# a workflow that could not start (e.g. an invalid workflow file): red. cancelled
++# is not: concurrency groups routinely cancel a superseded main run. stale,
++# neutral and skipped never claim red either.
++RED_CONCLUSIONS = frozenset({"failure", "error", "timed_out", "action_required", "startup_failure"})
++
++
++def flag_main_health(receipt, pr, repo):
++    """Point at ci-main-watch when post-merge evidence on the landed sha is red.
++
++    Callers that add post-merge rows later (the fallback's empty suites) call it
++    again; it only ever adds the pointer, so a second call is idempotent.
++    """
++    sha = receipt["head_sha"]
+     landed = pr.get("mergeCommit")
+     if (isinstance(landed, dict) and landed.get("oid") == sha
+-            and any(c["conclusion"] in {"failure", "error", "timed_out", "action_required"}
+-                    for c in receipt["post_merge_checks"])):
++            and any(c.get("conclusion") in RED_CONCLUSIONS for c in receipt["post_merge_checks"])):
+         branch = pr["baseRefName"]
+         label = repo if branch == "main" else f"{repo}@{branch}"
+         receipt["main_health"] = {
+             "idempotency_key": f"ci-red:{label}:{sha}",
+             "detail": f"Base branch {branch} CI is red for {repo}@{sha}; "
+                       "ci-main-watch owns base health, not this PR's acceptance."}
+-    return runs, statuses
+ 
+ 
+ def _health_owner_rows(conn, exact_key):
+diff --git a/tests/hermes_cli/test_kanban_pr_fallback.py b/tests/hermes_cli/test_kanban_pr_fallback.py
+index 28d2c61b44..94818d7c20 100644
+--- a/tests/hermes_cli/test_kanban_pr_fallback.py
++++ b/tests/hermes_cli/test_kanban_pr_fallback.py
+@@ -17,6 +17,7 @@ def evidence(monkeypatch):
+                 "headRefOid": SHA, "baseRefName": "main",
+                 "state": "MERGED" if state["merged"] else "OPEN",
+                 "mergedAt": "2026-11-02T13:00:00Z",
++                "mergeCommit": {"oid": state["landed"]} if state.get("landed") else None,
+                 "baseRef": {"branchProtectionRule": None}}}}}
+         if "/rules/" in endpoint:
+             return [[]]
+diff --git a/tests/hermes_cli/test_kanban_pr_fallback_merged.py b/tests/hermes_cli/test_kanban_pr_fallback_merged.py
+index 295668df30..0b8a714c49 100644
+--- a/tests/hermes_cli/test_kanban_pr_fallback_merged.py
++++ b/tests/hermes_cli/test_kanban_pr_fallback_merged.py
+@@ -48,6 +48,34 @@ def test_failed_empty_suite_after_merge_is_post_merge_evidence(evidence):
+     assert [c["id"] for c in receipt["post_merge_checks"]] == [100]
+ 
+ 
++@pytest.mark.parametrize("conclusion", ["failure", "startup_failure", "timed_out", "action_required"])
++def test_failed_empty_suite_after_merge_raises_main_health(evidence, conclusion):
++    # The row joins post_merge_checks after merge_evidence ran: health must see it.
++    evidence.update(merged=True, landed=SHA, runs=[run("success")],
++                    extra_suites=[failed_suite(conclusion, created=POST_MERGE)])
++    receipt = gate.collect_acceptance(URL, None)
++    assert receipt["classification"] == "success"
++    assert receipt["main_health"]["idempotency_key"] == f"ci-red:acme/repo:{SHA}"
++    assert "ci-main-watch" in receipt["main_health"]["detail"]
++
++
++@pytest.mark.parametrize("conclusion", ["cancelled", "stale", None])
++def test_cancelled_or_unknown_empty_suite_after_merge_is_not_main_health(evidence, conclusion):
++    # Concurrency cancels superseded main runs routinely: not a red base signal.
++    evidence.update(merged=True, landed=SHA, runs=[run("success")],
++                    extra_suites=[failed_suite(conclusion, created=POST_MERGE)])
++    receipt = gate.collect_acceptance(URL, None)
++    assert [c["id"] for c in receipt["post_merge_checks"]] == [100]
++    assert "main_health" not in receipt
++
++
++def test_failed_empty_suite_after_merge_on_unlanded_head_is_not_main_health(evidence):
++    # A rebase landed another sha: red on the PR head is not base CI.
++    evidence.update(merged=True, landed="b" * 40, runs=[run("success")],
++                    extra_suites=[failed_suite(created=POST_MERGE)])
++    assert "main_health" not in gate.collect_acceptance(URL, None)
++
++
+ @pytest.mark.parametrize("created", [None, "not a time", "2026-11-02T13:00:00Z"])
+ def test_failed_empty_suite_unprovable_or_tied_age_fails_closed(evidence, created):
+     evidence.update(merged=True, runs=[run("success")], extra_suites=[failed_suite(created=created)])
+diff --git a/tests/hermes_cli/test_kanban_pr_merge_time.py b/tests/hermes_cli/test_kanban_pr_merge_time.py
+index f842d7f690..8f3d8586d5 100644
+--- a/tests/hermes_cli/test_kanban_pr_merge_time.py
++++ b/tests/hermes_cli/test_kanban_pr_merge_time.py
+@@ -299,6 +299,14 @@ def test_nonfailure_postmerge_checks_do_not_claim_main_is_red(evidence, conclusi
+     assert receipt["post_merge_checks"][0]["conclusion"] == conclusion
+ 
+ 
++@pytest.mark.parametrize("conclusion", ["failure", "startup_failure", "timed_out", "action_required"])
++def test_red_postmerge_conclusions_claim_main_is_red(evidence, conclusion):
++    # startup_failure: the workflow could not start on the landed sha (red, not cancelled).
++    evidence["runs"][0]["conclusion"] = conclusion
++    receipt = collect()
++    assert receipt["ok"] and "ci-main-watch" in receipt["main_health"]["detail"]
++
++
+ def test_completed_landing_proof_survives_github_expiry(evidence, monkeypatch):
+     from hermes_cli import kanban_db as kb
+     from hermes_cli.kanban_db_connect import connect
+-- 
+2.43.0
+

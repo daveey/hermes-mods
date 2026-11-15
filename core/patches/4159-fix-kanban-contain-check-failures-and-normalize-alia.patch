@@ -1,0 +1,213 @@
+From c4e1d331b522aab59436ac20b02e1b546072b6da Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 05:01:41 +0000
+Subject: [PATCH] fix(kanban): contain check failures and normalize alias keys
+ [daveey]
+
+Contain unexpected cheap-check exceptions so independent release, probe and upkeep lanes still execute. Normalize configured keys with input slugging; lexical original-key order resolves collisions deterministically while built-in GitHub identities remain authoritative.
+
+Proof: seven regression cases fail on original production sources; all 13 pass with the fix. All 24 importing-consumer/docs suites pass (475 tests). scripts/check --base origin/main: 20 checks pass. No concrete live exception trigger claimed.
+---
+ docs/shared-blocker-recovery.md               |  4 +
+ hermes_cli/kanban_idle_candidates.py          |  2 +-
+ hermes_cli/kanban_shared_blockers.py          | 25 +++--
+ .../test_kanban_shared_blocker_hardening.py   | 96 +++++++++++++++++++
+ website/docs/user-guide/configuration.md      |  4 +
+ 5 files changed, 124 insertions(+), 7 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_shared_blocker_hardening.py
+
+diff --git a/docs/shared-blocker-recovery.md b/docs/shared-blocker-recovery.md
+index 1d26a28922..722d7f46d5 100644
+--- a/docs/shared-blocker-recovery.md
++++ b/docs/shared-blocker-recovery.md
+@@ -22,6 +22,10 @@ The check scheduler cannot promise a two-minute wall-clock bound if the
+ machine/dispatcher itself is stopped or its maintenance loop is delayed.
+ 
+ `kanban.shared_blocker_aliases` adds one-hop `alias: canonical-id` mappings.
++Keys use the input slug function and length limit. Collisions select the
++lexicographically smallest original string key with a valid nonempty target,
++regardless of mapping order. Non-string keys, invalid/empty targets and empty
++input slugs are ignored.
+ Targets should be canonical slugs, not other aliases. Built-in GitHub REST/core
+ quota spellings always collapse to `github-rest-quota`; config cannot split
+ that family. Historical run and event payloads are normalized on read.
+diff --git a/hermes_cli/kanban_idle_candidates.py b/hermes_cli/kanban_idle_candidates.py
+index b3590a6dee..2e94dcf886 100644
+--- a/hermes_cli/kanban_idle_candidates.py
++++ b/hermes_cli/kanban_idle_candidates.py
+@@ -90,7 +90,7 @@ def sweep_shared_blockers(conn, result) -> None:
+     try:
+         gated("dispatch.shared_blocker_checks", conn, check, conn, skipped=([], None),
+               extra=lambda c: (own_gateway(c), config_key()), run_due=lambda r: r[1])
+-    except (OSError, sqlite3.Error, ValueError):
++    except Exception:  # health: allow BLE001 -- a failed check must not suppress independent maintenance lanes
+         kb._log.warning('kanban: shared blocker checks failed', exc_info=True)
+ 
+     for statuses, handler, field in (
+diff --git a/hermes_cli/kanban_shared_blockers.py b/hermes_cli/kanban_shared_blockers.py
+index fff30c5196..6ce9ebdbb8 100644
+--- a/hermes_cli/kanban_shared_blockers.py
++++ b/hermes_cli/kanban_shared_blockers.py
+@@ -113,11 +113,27 @@ def run_effect(outcome: Optional[str], metadata) -> tuple[str, Optional[str]]:
+ _ID_RE = re.compile(r"[^a-z0-9._-]+")
+ 
+ 
++def _blocker_slug(raw: str) -> str:
++    return _ID_RE.sub("-", raw.strip().lower()).strip("-._")[:MAX_BLOCKER_ID_CHARS]
++
++
++def _configured_alias(slug: str, aliases) -> Optional[str]:
++    """First valid original key in lexical order wins normalized collisions."""
++    if not slug or not isinstance(aliases, dict):
++        return None
++    for key in sorted(key for key in aliases if isinstance(key, str)):
++        if _blocker_slug(key) == slug:
++            target = normalize_blocker_id(aliases[key], cfg={})
++            if target:
++                return target
++    return None
++
++
+ def normalize_blocker_id(raw, *, cfg=None) -> Optional[str]:
+     """Canonical slug; configured aliases augment (never split) built-in families."""
+     if not isinstance(raw, str):
+         return None
+-    slug = _ID_RE.sub("-", raw.strip().lower()).strip("-._")[:MAX_BLOCKER_ID_CHARS]
++    slug = _blocker_slug(raw)
+     if re.fullmatch(r"github(-(shared|rest|core))*-quota(-reserve)?", slug):
+         return "github-rest-quota"
+     if cfg is None:
+@@ -128,11 +144,8 @@ def normalize_blocker_id(raw, *, cfg=None) -> Optional[str]:
+         except ConfigBackendUnavailable:
+             return slug or None
+     aliases = (cfg.get("kanban") or {}).get("shared_blocker_aliases", {})
+-    target = aliases.get(slug) if isinstance(aliases, dict) else None
+-    if isinstance(target, str) and target.strip():
+-        # One hop only: cycles cannot recurse; targets must be canonical ids.
+-        return normalize_blocker_id(target, cfg={})
+-    return slug or None
++    # Resolve one hop only; targets cannot follow configured aliases or recurse.
++    return _configured_alias(slug, aliases) or slug or None
+ 
+ 
+ def probe_interval_seconds(cfg: Optional[dict] = None) -> int:
+diff --git a/tests/hermes_cli/test_kanban_shared_blocker_hardening.py b/tests/hermes_cli/test_kanban_shared_blocker_hardening.py
+new file mode 100644
+index 0000000000..825c65f97f
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_shared_blocker_hardening.py
+@@ -0,0 +1,96 @@
++"""Independent maintenance lanes and deterministic configured alias identities."""
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_shared_blockers as blockers
++from tests.hermes_cli import test_kanban_shared_blockers as helpers
++
++kanban_home = helpers.kanban_home
++
++
++def test_unexpected_check_failure_leaves_reclaim_lanes_alive(kanban_home, monkeypatch, caplog):
++    from hermes_cli import kanban_db_dispatch as dispatch
++    from hermes_cli import kanban_shared_blocker_checks as checks
++    from hermes_cli import kanban_sweep_gate as gate
++
++    calls = []
++
++    def fail_check(conn, **kwargs):
++        calls.append('check')
++        raise RuntimeError('injected check failure')
++
++    def release(conn, **kwargs):
++        calls.append('release')
++        return ['released']
++
++    def probe(conn, **kwargs):
++        calls.append('probe')
++        return ['probed']
++
++    def timed(name, handler, *args, **kwargs):
++        # Exercise real reclaim ordering, isolating unrelated process maintenance.
++        if name == 'dispatch.sweep_shared_blockers':
++            return handler(*args, **kwargs)
++        if name == 'dispatch.tick_upkeep':
++            calls.append('upkeep')
++        return []
++
++    monkeypatch.setattr(checks, 'run_due_checks', fail_check)
++    monkeypatch.setattr(blockers, 'release_cleared_blockers', release)
++    monkeypatch.setattr(blockers, 'probe_stranded_blockers', probe)
++    monkeypatch.setattr(gate, 'gated', lambda name, conn, fn, *args, **kw: fn(*args))
++    monkeypatch.setattr(dispatch._la, 'timed', timed)
++    monkeypatch.setattr(dispatch, '_record_dispatch_pass', lambda *a, **kw: None)
++    with kbc.connect_closing() as conn:
++        helpers._legacy_blocked_behind(conn, 'waiting', blocker_id='test-wall')
++        result = SimpleNamespace()
++        dispatch._run_reclaim_phase(conn, result, stale_timeout_seconds=3600,
++                                    failure_limit=2, reconcile_orphans=False, dry_run=True)
++    assert calls == ['check', 'release', 'probe', 'upkeep']
++    assert result.shared_blocker_released == ['released']
++    assert result.shared_blocker_probed == ['probed']
++    assert 'shared blocker checks failed' in caplog.text
++    assert 'injected check failure' in caplog.text
++
++
++@pytest.mark.parametrize('key', [' Quota Limited! ', 'QUOTA-LIMITED', '.quota-limited_'])
++def test_alias_keys_use_input_slugging(key):
++    cfg = {'kanban': {'shared_blocker_aliases': {key: 'github-quota-reserve'}}}
++    assert blockers.normalize_blocker_id('quota-limited', cfg=cfg) == 'github-rest-quota'
++    assert blockers.normalize_blocker_id(key, cfg=cfg) == 'github-rest-quota'
++
++
++@pytest.mark.parametrize('reverse', [False, True])
++def test_alias_collisions_are_order_independent_and_one_hop(reverse):
++    entries = [('QUOTA LIMITED', 'first-wall'), ('quota-limited', 'second-wall'),
++               ('first-wall', 'third-wall'), (7, 'bad-wall'), ('!!!', 'bad-wall')]
++    cfg = {'kanban': {'shared_blocker_aliases': dict(reversed(entries) if reverse else entries)}}
++    assert blockers.normalize_blocker_id('quota limited', cfg=cfg) == 'first-wall'
++    assert blockers.normalize_blocker_id('!!!', cfg=cfg) is None
++
++
++@pytest.mark.parametrize('key', ['github-rest-quota', ' GITHUB QUOTA RESERVE! '])
++def test_builtin_family_cannot_be_overridden(key):
++    cfg = {'kanban': {'shared_blocker_aliases': {key: 'other-wall'}}}
++    assert blockers.normalize_blocker_id(key, cfg=cfg) == 'github-rest-quota'
++
++
++def test_invalid_aliases_do_not_mask_valid_collisions():
++    cfg = {'kanban': {'shared_blocker_aliases': {
++        'WALL': None, 'Wall': '!!!', 'wall': 'target', 'unused': 7}}}
++    assert blockers.normalize_blocker_id('wall', cfg=cfg) == 'target'
++    assert blockers.normalize_blocker_id('unused', cfg=cfg) == 'unused'
++
++
++@pytest.mark.parametrize('aliases', [None, [], 'wall'])
++def test_non_mapping_aliases_are_ignored(aliases):
++    assert blockers.normalize_blocker_id('wall', cfg={
++        'kanban': {'shared_blocker_aliases': aliases}}) == 'wall'
++
++
++def test_alias_keys_share_input_length_limit():
++    key = 'x' * (blockers.MAX_BLOCKER_ID_CHARS + 10)
++    assert blockers.normalize_blocker_id(key, cfg={
++        'kanban': {'shared_blocker_aliases': {key: 'target'}}}) == 'target'
+diff --git a/website/docs/user-guide/configuration.md b/website/docs/user-guide/configuration.md
+index a96213de2d..1a1bef2875 100644
+--- a/website/docs/user-guide/configuration.md
++++ b/website/docs/user-guide/configuration.md
+@@ -3522,6 +3522,10 @@ after recovery resets the budget. A stopped or delayed dispatcher cannot guarant
+ a two-minute wall-clock recovery bound.
+ 
+ `kanban.shared_blocker_aliases` maps an alias to a canonical blocker ID in one hop.
++Keys use the same slug normalization (including length limit) as blocker inputs.
++On collisions, the lexicographically smallest original string key with a valid
++nonempty target wins, independent of mapping order. Non-string keys and invalid
++or empty targets are ignored; empty input slugs cannot be aliases.
+ Targets must not be other aliases. Built-in GitHub REST/core quota spellings
+ always normalize to `github-rest-quota`; configuration cannot split that family.
+ Historical run and event payloads are normalized on read. Workers are instructed
+-- 
+2.43.0
+

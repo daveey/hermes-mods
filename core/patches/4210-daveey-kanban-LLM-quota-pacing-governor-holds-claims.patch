@@ -1,0 +1,838 @@
+From be9b942274b0e534b1f23072f84fc1847290a582 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 16:11:22 +0000
+Subject: [PATCH] [daveey] kanban: LLM quota pacing governor holds claims when
+ the pool is ahead of pace
+
+Card t_01a1d975f57bb7b8 (follow-up of the 11-13/14 capacity incident t_01a1d96f7aecd229).
+
+Why: on 11-12/13 the fleet (hub + workers 1-8) burned deep-class work at ~2.7x the Claude pool's
+sustainable weekly rate (2.7-3.5B weighted tokens/day vs ~1.25B). One account-week went in under
+21 h, 6 of 7 accounts reached seven_day 100%, Codex was walled for a week, and 301 worker starts
+were refused overnight while nothing finished. Admission was gated on slots and walls only:
+nothing slowed spawning as an account's week ran down.
+
+What: before any claim, `_dispatch_lane_task` asks `kanban_llm_pacing_dispatch.hold`:
+- The card's route comes from the read-only `resolve_dispatch_tier`; a class selector is held
+  only when every subscription provider it may allocate holds it. Mandatory pins, unknown routes
+  and ungoverned providers always start.
+- Each governed pool (anthropic, openai-codex) is read read-only via `/api/oauth/usage` at most
+  every 5 min per Hermes home; samples and this host's running count on the provider persist in
+  `<kanban home>/llm_pacing.json`.
+- Pool math (`kanban_llm_pacing`): per window kind (five_hour and seven_day, account-wide buckets),
+  factor = sum(sustainable rate of headroom accounts) / sum(measured burn). Sustainable reaches
+  95% exactly at that window's reset; burn is the steeper of the oldest/newest slopes over the
+  last hour (fallback: the window's average). Factor < 1 = paced. Projection, not used-vs-elapsed:
+  account-primary at 14:29:52Z on 11-14 was 92% used with 94.3% of the week elapsed ("behind pace")
+  but rising 0.8%/min.
+- Reserve: an account past five_hour 80% / seven_day 85% is left to chats, cron and notices; when
+  every readable account is past it the pool is held until the earliest reset that frees one.
+- Paced: this host keeps floor(factor x its average concurrency over the hour) runs on the
+  provider; review-lane, negative-priority and scheduled-wake cards get half of that. Open but
+  under factor 2: ramp to ceil(factor x avg), at least 1. Held: 0.
+- A held card stays ready and unclaimed: `respawn_guarded` + `clock_held` reason `llm_pacing`
+  (the stuck warning names the deadline), plus one `llm_paced` event per change/hour.
+- Fail open on any read/resolve fault. `kanban.llm_pacing.enabled: false` = old behaviour.
+  Knobs: target_percent, reserve_five_hour_percent, reserve_seven_day_percent, providers,
+  read_interval_seconds, rate_window_seconds, min_rate_span_seconds, deferrable_share.
+- Only the dispatcher imports it: chats, cron and notice delivery never consult the governor.
+
+kanban_db_dispatch.py stays at its line count (two comments folded to offset the 3-line hook).
+
+Proof:
+- RED: with the 3-line hook removed, test_pool_ahead_of_pace_defers_spawns,
+  test_held_pool_names_the_reset_and_repeats_no_event and
+  test_only_kanban_dispatch_consults_the_governor fail; GREEN: 20/20 in
+  tests/hermes_cli/test_kanban_llm_pacing.py.
+- 45 dispatch/tier/walls/quota/review/stuck test files: 718 passed.
+- scripts/check --base origin/main: 20 checks ok.
+- Live read on hermes-worker-8 (16:20Z 11-14): anthropic paced (6 accounts seven_day 100%,
+  account-primary 5h 78%, account-secondary 7d 12% burning ~0.9%/min); openai-codex held until
+  2026-11-20T22:40Z.
+---
+ hermes_cli/kanban_db_dispatch.py           |  12 +-
+ hermes_cli/kanban_llm_pacing.py            | 206 +++++++++++++++
+ hermes_cli/kanban_llm_pacing_dispatch.py   | 276 +++++++++++++++++++++
+ tests/hermes_cli/test_kanban_llm_pacing.py | 232 +++++++++++++++++
+ 4 files changed, 720 insertions(+), 6 deletions(-)
+ create mode 100644 hermes_cli/kanban_llm_pacing.py
+ create mode 100644 hermes_cli/kanban_llm_pacing_dispatch.py
+ create mode 100644 tests/hermes_cli/test_kanban_llm_pacing.py
+
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index 3633794b23..6e281f645d 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -1874,8 +1874,7 @@ def _dispatch_lane_task(
+     if lane_admission_refused(conn, task_id, assignee, result, profile_exists=_profile_exists_fn(),
+                               spawn_fn=spawn_fn, dry_run=dry_run, lane=lane):
+         return False
+-    # Per-profile cap: one profile's local model / API quota / browser pool
+-    # must not be overwhelmed by a fan-out even with global headroom.
++    # Per-profile cap: a fan-out must not swamp one profile's local model / API quota / browser pool.
+     if per_profile_cap is not None:
+         current = per_profile_running.get(assignee, 0)
+         if current >= per_profile_cap:
+@@ -1886,13 +1885,15 @@ def _dispatch_lane_task(
+     if guard_reason is not None:
+         result.respawn_guarded.append((task_id, guard_reason))
+         _record_clock_hold(conn, result, task_id, guard_reason)
+-        # Maintenance is home-owned; foreign executors still record the guard.
+-        if not dry_run:
++        if not dry_run:  # maintenance is home-owned; foreign executors still record the guard
+             if _block_if_guard_hold_capped(conn, task_id, guard_reason):
+                 result.auto_blocked.append(task_id)
+                 return False
+             _guard_notice.record_guard_hold(conn, task_id, guard_reason)
+         return False
++    from hermes_cli.kanban_llm_pacing_dispatch import hold as _pacing_hold  # quota-pace governor [daveey]
++    if _pacing_hold(conn, row, lane, result, dry_run=dry_run):  # pool ahead of pace: wait, unclaimed
++        return False
+ 
+     def _count_spawn(name: str) -> None:
+         # Later rows in this tick respect the per-profile cap; subsequent ticks re-query from the DB.
+@@ -1903,8 +1904,7 @@ def _dispatch_lane_task(
+         result.spawned.append((task_id, assignee, ""))
+         _count_spawn(assignee)
+         return True
+-    # The assignee's own gateway service is failed/masked/disabled: claim nothing, hold the card and
+-    # file the owner-down card (``kanban_owner_down``). Before it, every claim crashed on it. [daveey]
++    # Assignee's gateway service failed/masked/disabled: hold unclaimed, file ``kanban_owner_down``'s card. [daveey]
+     from hermes_cli.kanban_owner_down import preflight as _owner_down_preflight
+     down = _owner_down_preflight(conn, task_id, assignee)
+     if down is not None:
+diff --git a/hermes_cli/kanban_llm_pacing.py b/hermes_cli/kanban_llm_pacing.py
+new file mode 100644
+index 0000000000..b97c227a19
+--- /dev/null
++++ b/hermes_cli/kanban_llm_pacing.py
+@@ -0,0 +1,206 @@
++"""LLM quota pacing for Kanban dispatch: the pool math (pure; IO lives in ``kanban_llm_pacing_dispatch``). [daveey]
++
++2026-11-13/14: the fleet (hub + 8 workers) spawned deep-class work at ~2.7x the Claude pool's sustainable
++weekly rate. One account-week went in under 21 h, 6 of 7 accounts sat at ``seven_day`` 100%, Codex was walled
++for a week, and nothing finished for hours (301 refused starts). Admission was gated on slots and walls only.
++
++The governor judges each governed provider's OAuth pool from its per-account usage windows (``five_hour`` and
++``seven_day``, the account-wide buckets of ``/api/oauth/usage``; Codex ``Session``/``Weekly``):
++
++* **Projection, not elapsed pace.** Each window's burn rate is measured from this host's own samples of that
++  window over the last ``rate_window`` (fallback: the window's average so far). A used-vs-elapsed rule read
++  "behind pace" ten minutes before an account hit 100% (account-primary 11-14 14:29Z: 92% used, 94% elapsed,
++  +0.8%/min). The pool factor is ``sum(sustainable rate of headroom accounts) / sum(measured burn)`` per
++  window kind, where a sustainable rate reaches ``target`` (95%) exactly at that window's reset. Factor < 1
++  means the pool, at today's burn, ends above target: ``paced``.
++* **Reserve floor.** An account past ``reserve`` (five_hour 80% / seven_day 85%) is left to chats, cron and
++  notices. When every readable account is past it, the pool is ``held`` until the earliest reset that frees
++  one, so Kanban never drains the last headroom the human-facing callers need.
++* **Fail open.** No readable account (read failure, empty pool, endpoint down) is ``unknown``: today's behaviour.
++"""
++from __future__ import annotations
++
++import math
++from dataclasses import dataclass, field
++from typing import Any, Iterable, Optional
++
++FIVE_HOUR, SEVEN_DAY = "five_hour", "seven_day"
++WINDOW_SECONDS = {FIVE_HOUR: 5 * 3600, SEVEN_DAY: 7 * 86400}
++OPEN, PACED, HELD, UNKNOWN = "open", "paced", "held", "unknown"
++GUARD_REASON = "llm_pacing"
++# A sample belongs to the same window instance when its reset is within this of the current reading's.
++_SAME_RESET_SECONDS = 300
++# At or above this pool factor an open pool sets no limit at all; between 1 and it the host ramps.
++OPEN_RAMP_FACTOR = 2.0
++
++
++@dataclass(frozen=True)
++class PacingConfig:
++    enabled: bool = True
++    target: float = 95.0
++    reserve: dict = field(default_factory=lambda: {FIVE_HOUR: 80.0, SEVEN_DAY: 85.0})
++    providers: tuple = ("anthropic", "openai-codex")
++    read_interval: int = 300
++    rate_window: int = 3600
++    min_rate_span: int = 600
++    deferrable_share: float = 0.5
++
++
++def _num(value: Any, default: float) -> float:
++    try:
++        number = float(value)
++    except (TypeError, ValueError):
++        return default
++    return number if math.isfinite(number) else default
++
++
++def config_from(section: Any) -> PacingConfig:
++    """``kanban.llm_pacing`` -> :class:`PacingConfig`; anything unreadable keeps the default."""
++    base = PacingConfig()
++    raw = section if isinstance(section, dict) else {}
++    providers = raw.get("providers", base.providers)
++    providers = tuple(str(p).strip().lower() for p in providers) if isinstance(providers, (list, tuple)) else base.providers
++    return PacingConfig(
++        enabled=bool(raw.get("enabled", base.enabled)),
++        target=_num(raw.get("target_percent"), base.target),
++        reserve={FIVE_HOUR: _num(raw.get("reserve_five_hour_percent"), base.reserve[FIVE_HOUR]),
++                 SEVEN_DAY: _num(raw.get("reserve_seven_day_percent"), base.reserve[SEVEN_DAY])},
++        providers=providers,
++        read_interval=int(_num(raw.get("read_interval_seconds"), base.read_interval)),
++        rate_window=int(_num(raw.get("rate_window_seconds"), base.rate_window)),
++        min_rate_span=int(_num(raw.get("min_rate_span_seconds"), base.min_rate_span)),
++        deferrable_share=min(1.0, max(0.0, _num(raw.get("deferrable_share"), base.deferrable_share))),
++    )
++
++
++@dataclass(frozen=True)
++class Reading:
++    """One account's usage window at one moment (``ts``): ``used`` percent, ``reset_at`` epoch seconds."""
++    ts: float
++    account: str
++    kind: str
++    used: float
++    reset_at: Optional[float]
++
++    def as_row(self) -> list:
++        return [self.ts, self.account, self.kind, self.used, self.reset_at]
++
++    @classmethod
++    def from_row(cls, row: Any) -> Optional[Reading]:
++        try:
++            ts, account, kind, used, reset_at = row
++            return cls(float(ts), str(account), str(kind), float(used),
++                       None if reset_at is None else float(reset_at))
++        except (TypeError, ValueError):
++            return None
++
++
++@dataclass(frozen=True)
++class PoolPace:
++    provider: str
++    state: str
++    factor: Optional[float] = None
++    until: Optional[float] = None
++    detail: str = ""
++
++    def as_dict(self) -> dict:
++        return {"provider": self.provider, "state": self.state, "factor": self.factor, "until": self.until,
++                "detail": self.detail}
++
++    @classmethod
++    def from_dict(cls, data: Any) -> Optional[PoolPace]:
++        if not isinstance(data, dict) or data.get("state") not in (OPEN, PACED, HELD, UNKNOWN):
++            return None
++        return cls(str(data.get("provider") or ""), data["state"], data.get("factor"), data.get("until"),
++                   str(data.get("detail") or ""))
++
++
++def window_kind(label: Any) -> str:
++    """``Current week``/``Weekly`` -> seven_day; ``Current session``/``Session`` -> five_hour."""
++    return SEVEN_DAY if "week" in str(label or "").lower() else FIVE_HOUR
++
++
++def burn_rate(reading: Reading, history: Iterable[Reading], cfg: PacingConfig) -> float:
++    """Percent per second this window is burning: the steeper of the slopes from the oldest and the newest
++    same-window sample inside ``rate_window`` (at least ``min_rate_span`` old), so a fresh burst counts at once;
++    else the window's average since it opened. A capped window (100%) burns nothing more."""
++    now = reading.ts
++    same = [h for h in history
++            if h.account == reading.account and h.kind == reading.kind
++            and now - cfg.rate_window <= h.ts <= now - cfg.min_rate_span
++            and (h.reset_at is None) == (reading.reset_at is None)
++            and abs((h.reset_at or 0) - (reading.reset_at or 0)) <= _SAME_RESET_SECONDS]
++    if same:
++        ends = (min(same, key=lambda h: h.ts), max(same, key=lambda h: h.ts))
++        return max(0.0, *((reading.used - h.used) / max(1.0, now - h.ts) for h in ends))
++    if reading.reset_at is None or reading.used >= 100:
++        return 0.0
++    elapsed = WINDOW_SECONDS[reading.kind] - (reading.reset_at - now)
++    return max(0.0, reading.used / max(float(cfg.min_rate_span), elapsed))
++
++
++def _reserved(reading: Reading, cfg: PacingConfig) -> bool:
++    return reading.used >= cfg.reserve.get(reading.kind, 100.0)
++
++
++def _held_until(current: list[Reading], cfg: PacingConfig) -> Optional[float]:
++    """Earliest moment one reserved account frees: per account, the latest reset among its reserved windows."""
++    frees = []
++    for account in {r.account for r in current}:
++        reserved = [r for r in current if r.account == account and _reserved(r, cfg)]
++        resets = [r.reset_at for r in reserved if r.reset_at is not None]
++        if reserved and len(resets) == len(reserved):
++            frees.append(max(resets))
++    return min(frees) if frees else None
++
++
++def _factor(current: list[Reading], history: list[Reading], headroom: set[str], cfg: PacingConfig) -> float:
++    factor = math.inf
++    for kind in (FIVE_HOUR, SEVEN_DAY):
++        readings = [r for r in current if r.kind == kind]
++        burn = sum(burn_rate(r, history, cfg) for r in readings)
++        sustainable = sum(max(0.0, cfg.target - r.used) / max(60.0, r.reset_at - r.ts)
++                          for r in readings if r.account in headroom and r.reset_at is not None)
++        if burn > 0:
++            factor = min(factor, sustainable / burn)
++    return factor
++
++
++def _describe(current: list[Reading], history: list[Reading], cfg: PacingConfig) -> str:
++    parts = []
++    for r in sorted(current, key=lambda r: (r.account, r.kind)):
++        rate = burn_rate(r, history, cfg) * 60
++        parts.append(f"{r.account} {'5h' if r.kind == FIVE_HOUR else '7d'} {r.used:.0f}% +{rate:.2f}%/min")
++    return "; ".join(parts)
++
++
++def pool_pace(provider: str, current: list[Reading], history: list[Reading], cfg: PacingConfig) -> PoolPace:
++    """Judge one provider's pool from this read (``current``) and earlier samples (``history``)."""
++    if not current:
++        return PoolPace(provider, UNKNOWN, detail="no readable account")
++    detail = _describe(current, history, cfg)
++    headroom = {r.account for r in current} - {r.account for r in current if _reserved(r, cfg)}
++    if not headroom:
++        return PoolPace(provider, HELD, 0.0, _held_until(current, cfg), detail)
++    factor = _factor(current, history, headroom, cfg)
++    if factor >= 1.0:
++        return PoolPace(provider, OPEN, None if math.isinf(factor) else round(factor, 4), None, detail)
++    return PoolPace(provider, PACED, round(factor, 4), None, detail)
++
++
++def admit_limit(pace: PoolPace, avg_running: float, *, deferrable: bool, cfg: PacingConfig) -> Optional[int]:
++    """Concurrent runs this host may hold on the provider (None = no limit).
++
++    Burn is proportional to concurrency, so the host keeps ``factor`` of its recent average concurrency: every
++    host does the same, and the fleet's burn lands on the sustainable rate. Deferrable work (review lane,
++    negative priority, scheduled wakes) gets ``deferrable_share`` of that, so it yields first. Just behind pace
++    (factor < ``OPEN_RAMP_FACTOR``) the host may grow to ``factor`` x its recent concurrency (at least one run),
++    so a pool coming off a hold ramps up instead of bursting back into the wall."""
++    if pace.state == UNKNOWN or (pace.state == OPEN and (pace.factor is None or pace.factor >= OPEN_RAMP_FACTOR)):
++        return None
++    if pace.state == HELD:
++        return 0
++    if pace.state == OPEN:
++        return max(1, math.ceil(max(0.0, avg_running) * float(pace.factor or 1.0)))
++    limit = math.floor(max(0.0, avg_running) * float(pace.factor or 0.0))
++    return math.floor(limit * cfg.deferrable_share) if deferrable else limit
+diff --git a/hermes_cli/kanban_llm_pacing_dispatch.py b/hermes_cli/kanban_llm_pacing_dispatch.py
+new file mode 100644
+index 0000000000..08bfd00f9c
+--- /dev/null
++++ b/hermes_cli/kanban_llm_pacing_dispatch.py
+@@ -0,0 +1,276 @@
++"""LLM quota pacing at Kanban claim time: read the pools, hold cards the pool cannot pace. [daveey]
++
++Called by ``kanban_db_dispatch._dispatch_lane_task`` for every ready/review candidate after the respawn guard and
++before any claim (:func:`hold`). Pool math and the incident are in ``kanban_llm_pacing``.
++
++* The card's route comes from the same read-only resolver admission uses (``resolve_dispatch_tier``); a class
++  selector (``class:deep``) may run on any of its subscription routes, so it is held only when every candidate
++  provider holds it. An unknown route, an ungoverned provider or a mandatory pin always starts.
++* Each governed provider's OAuth pool is read (``/api/oauth/usage``, read-only) at most every
++  ``read_interval`` seconds per Hermes home; samples and this host's running count on the provider are kept in
++  ``<kanban home>/llm_pacing.json`` for burn rates and average concurrency.
++* Only Kanban dispatch consults this module: chats, cron and notice delivery never do.
++* Any read or resolve fault starts the card (fail open, warned once per interval).
++* ``kanban.llm_pacing.enabled: false`` restores the ungoverned behaviour.
++"""
++from __future__ import annotations
++
++import json
++import logging
++import os
++import sqlite3
++import time
++from pathlib import Path
++from typing import Any, Optional
++
++from hermes_cli import kanban_llm_pacing as lp
++
++logger = logging.getLogger(__name__)
++
++READ_DEADLINE_SECONDS = 10.0
++EVENT_KIND = "llm_paced"
++EVENT_REPEAT_SECONDS = 3600
++_STATE_FILE = "llm_pacing.json"
++_CACHE: dict[str, tuple[float, lp.PoolPace]] = {}
++_CLASS_CACHE: dict[str, tuple[float, list[str]]] = {}
++_WARNED: dict[str, float] = {}
++
++
++def load_config() -> lp.PacingConfig:
++    from hermes_cli.kanban_model_tier import load_tier_config
++    return lp.config_from(load_tier_config().get("llm_pacing"))
++
++
++def state_path() -> Path:
++    from hermes_cli import kanban_db as kb
++    return kb.kanban_home() / _STATE_FILE
++
++
++def _load_state(path: Path) -> dict:
++    try:
++        data = json.loads(path.read_text(encoding="utf-8-sig"))
++    except (OSError, ValueError):
++        return {}
++    return data if isinstance(data, dict) else {}
++
++
++def _save_state(path: Path, data: dict) -> None:
++    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
++    try:
++        tmp.write_text(json.dumps(data, separators=(",", ":")), encoding="utf-8")
++        os.replace(tmp, path)
++    except OSError:
++        logger.debug("kanban pacing: cannot write %s", path, exc_info=True)
++
++
++def _warn(key: str, message: str, *args: Any) -> None:
++    now = time.monotonic()
++    if now - _WARNED.get(key, -1e9) >= 900:
++        _WARNED[key] = now
++        logger.warning(message, *args)
++
++
++def _snapshots(provider: str) -> list[tuple[str, Any]]:
++    """``(account label, usage snapshot or None)`` for every enabled, live OAuth account (bounded, read-only)."""
++    from concurrent.futures import ThreadPoolExecutor, wait
++
++    from agent.account_usage import fetch_account_usage
++    from agent.credential_pool import STATUS_DEAD
++    from agent.credential_pool_disabled import enabled_entries
++    from hermes_cli.kanban_provider_walls import _home_secret_scope, _oauth_pool
++    with _home_secret_scope():
++        entries = [(entry.label or entry.id[:8], entry.runtime_api_key)
++                   for entry in enabled_entries(provider, _oauth_pool(provider).entries())
++                   if entry.auth_type == "oauth" and entry.last_status != STATUS_DEAD and entry.runtime_api_key]
++    if not entries:
++        return []
++    pool = ThreadPoolExecutor(max_workers=len(entries))
++    try:
++        futures = [pool.submit(fetch_account_usage, provider, api_key=key, read_only=True) for _, key in entries]
++        wait(futures, timeout=READ_DEADLINE_SECONDS)
++        return [(label, f.result() if f.done() and not f.exception() else None)
++                for (label, _), f in zip(entries, futures)]
++    finally:
++        pool.shutdown(wait=False, cancel_futures=True)
++
++
++def read_pool(provider: str, now: float) -> list[lp.Reading]:
++    """This moment's account-wide usage windows for every readable account of ``provider``."""
++    readings = []
++    for label, snapshot in _snapshots(provider):
++        if snapshot is None or not snapshot.available:
++            continue
++        for window in snapshot.windows:
++            if window.scope != "account" or window.used_percent is None:
++                continue
++            reset = window.reset_at.timestamp() if window.reset_at is not None else None
++            readings.append(lp.Reading(now, label, lp.window_kind(window.label), float(window.used_percent), reset))
++    return readings
++
++
++def class_providers(model: str) -> list[str]:
++    """Providers a ``class:<level>`` selector may allocate (the allocator's own billing filter), cached 60 s."""
++    cached = _CLASS_CACHE.get(model)
++    if cached and time.monotonic() - cached[0] < 60:
++        return cached[1]
++    from agent.model_routing import eligible_routes
++    from hermes_cli.config_effective import load_user_config_effective
++    policy = (load_user_config_effective() or {}).get("model_routing") or {}
++    level = model.removeprefix("class:")
++    providers = sorted({str(r["provider"]).lower() for r in eligible_routes(policy, level)}) if policy.get("enabled") else []
++    _CLASS_CACHE[model] = (time.monotonic(), providers)
++    return providers
++
++
++def _route_providers(model: Optional[str], provider: Optional[str]) -> list[str]:
++    from agent.model_routing import is_class_selector
++    from hermes_cli.kanban_model_tier import infer_provider
++    if not model:
++        return []
++    if is_class_selector(model) or str(provider or "").lower() == "auto":
++        return class_providers(model)
++    name = str(provider or infer_provider(model) or "").strip().lower()
++    return [name] if name else []
++
++
++def candidate_providers(conn: sqlite3.Connection, task: Any, lane: str) -> list[str]:
++    """Providers the card's next run may land on; ``[]`` = unknown (the card starts)."""
++    from hermes_cli.kanban_model_tier import profile_route, resolve_dispatch_tier
++    model, provider, _ = resolve_dispatch_tier(conn, task, lane=lane)
++    if not model:
++        model, provider = getattr(task, "model_override", None), getattr(task, "provider_override", None)
++    if not model:
++        model, provider = profile_route(getattr(task, "assignee", None))
++    return _route_providers(model, provider)
++
++
++def local_running(conn: sqlite3.Connection, provider: str) -> int:
++    """This host's running cards whose run routed to ``provider`` (a class run counts for each candidate)."""
++    from hermes_cli import kanban_db as kb
++    prefix = kb._host_prefix()
++    rows = conn.execute(
++        "SELECT e.payload FROM tasks t JOIN task_events e ON e.task_id = t.id AND e.run_id = t.current_run_id "
++        "AND e.kind = 'run_route' WHERE t.status = 'running' AND substr(t.claim_lock, 1, ?) = ?",
++        (len(prefix), prefix)).fetchall()
++    count = 0
++    for (payload,) in rows:
++        route = kb._json_dict(payload)
++        if provider in _route_providers(route.get("model"), route.get("provider")):
++            count += 1
++    return count
++
++
++def _history(entry: dict, now: float, cfg: lp.PacingConfig) -> list[lp.Reading]:
++    rows = (lp.Reading.from_row(row) for row in entry.get("samples") or [])
++    return [r for r in rows if r is not None and now - 2 * cfg.rate_window <= r.ts < now]
++
++
++def _refresh(conn: sqlite3.Connection, provider: str, cfg: lp.PacingConfig, now: float) -> lp.PoolPace:
++    path = state_path()
++    state = _load_state(path)
++    found = state.get(provider)
++    entry: dict = found if isinstance(found, dict) else {}
++    shared = lp.PoolPace.from_dict(entry.get("pace"))
++    if shared is not None and now - float(entry.get("read_at") or 0) < cfg.read_interval:
++        return shared  # another dispatcher on this home read it already
++    try:
++        current = read_pool(provider, now)
++    except Exception as exc:  # health: allow BLE001 -- a usage read fault never stops dispatch (fail open)
++        _warn(f"read:{provider}", "kanban pacing: cannot read the %s usage windows (%s); dispatch is ungoverned "
++              "until it reads again", provider, exc)
++        current = []
++    history = _history(entry, now, cfg)
++    pace = lp.pool_pace(provider, current, history, cfg)
++    running = [row for row in entry.get("running") or [] if now - cfg.rate_window <= float(row[0]) < now]
++    state[provider] = {"read_at": now, "pace": pace.as_dict(), "running": running + [[now, local_running(conn, provider)]],
++                       "samples": [r.as_row() for r in history + current]}
++    _save_state(path, state)
++    if pace.state != (shared.state if shared else None):
++        logger.info("kanban pacing: %s pool %s (factor %s, until %s): %s", provider, pace.state, pace.factor,
++                    pace.until, pace.detail)
++    return pace
++
++
++def pace_for(conn: sqlite3.Connection, provider: str, cfg: lp.PacingConfig, now: float) -> lp.PoolPace:
++    cached = _CACHE.get(provider)
++    if cached is not None and now - cached[0] < cfg.read_interval:
++        return cached[1]
++    pace = _refresh(conn, provider, cfg, now)
++    _CACHE[provider] = (now, pace)
++    return pace
++
++
++def avg_running(provider: str, now: float, cfg: lp.PacingConfig) -> float:
++    """This host's average concurrency on ``provider`` over ``rate_window`` (the samples the burn was measured on)."""
++    entry = _load_state(state_path()).get(provider) or {}
++    counts = [float(n) for ts, n in entry.get("running") or [] if now - cfg.rate_window <= float(ts) <= now]
++    return sum(counts) / len(counts) if counts else 0.0
++
++
++def is_deferrable(conn: sqlite3.Connection, task: Any, lane: str) -> bool:
++    """Review-lane work, negative priority and scheduled wakes yield first when the pool is paced."""
++    if lane == "review" or int(getattr(task, "priority", 0) or 0) < 0:
++        return True
++    from hermes_cli.kanban_continuation import CONTINUATION_WOKEN_EVENT
++    row = conn.execute("SELECT kind FROM task_events WHERE task_id = ? AND kind IN (?, 'claimed', 'spawned') "
++                       "ORDER BY id DESC LIMIT 1", (task.id, CONTINUATION_WOKEN_EVENT)).fetchone()
++    return row is not None and row[0] == CONTINUATION_WOKEN_EVENT
++
++
++def _verdicts(conn, task, providers, lane, cfg) -> Optional[list[dict]]:
++    """One verdict per governed candidate provider, or None as soon as one provider admits the card."""
++    now = time.time()
++    deferrable = is_deferrable(conn, task, lane)
++    verdicts = []
++    for provider in providers:
++        pace = pace_for(conn, provider, cfg, now)
++        limit = lp.admit_limit(pace, avg_running(provider, now, cfg), deferrable=deferrable, cfg=cfg)
++        running = local_running(conn, provider)
++        if limit is None or running < limit:
++            return None
++        verdicts.append({**pace.as_dict(), "limit": limit, "running": running, "deferrable": deferrable})
++    return verdicts
++
++
++def _record(conn: sqlite3.Connection, task_id: str, verdicts: list[dict], result: Any, *, dry_run: bool,
++            cfg: lp.PacingConfig) -> None:
++    from hermes_cli import kanban_db as kb
++    now = time.time()
++    until = min((v["until"] for v in verdicts if v.get("until")), default=None)
++    result.respawn_guarded.append((task_id, lp.GUARD_REASON))
++    result.clock_held[task_id] = (lp.GUARD_REASON, int(until or now + cfg.read_interval))
++    if dry_run:
++        return
++    last = conn.execute("SELECT payload, created_at FROM task_events WHERE task_id = ? AND kind = ? "
++                        "ORDER BY id DESC LIMIT 1", (task_id, EVENT_KIND)).fetchone()
++    key = [(v["provider"], v["state"], v["limit"]) for v in verdicts]
++    if last is not None and now - float(last[1] or 0) < EVENT_REPEAT_SECONDS:
++        prior = kb._json_dict(last[0]).get("providers") or []
++        if [(v.get("provider"), v.get("state"), v.get("limit")) for v in prior] == key:
++            return
++    with kb.write_txn(conn):
++        kb._append_event(conn, task_id, EVENT_KIND, {"providers": verdicts, "until": until})
++
++
++def hold(conn: sqlite3.Connection, row: Any, lane: str, result: Any, *, dry_run: bool = False) -> bool:
++    """True when the card must wait for its provider's pool to come back to pace (recorded on ``result``)."""
++    try:
++        cfg = load_config()
++        if not cfg.enabled:
++            return False
++        from hermes_cli import kanban_db as kb
++        task = kb.get_task(conn, row["id"])
++        if task is None or int(getattr(task, "model_pin_mandatory", 0) or 0):
++            return False
++        providers = candidate_providers(conn, task, lane)
++        if not providers or any(p not in cfg.providers for p in providers):
++            return False
++        verdicts = _verdicts(conn, task, providers, lane, cfg)
++        if verdicts is None:
++            return False
++        _record(conn, task.id, verdicts, result, dry_run=dry_run, cfg=cfg)
++        return True
++    except Exception as exc:  # health: allow BLE001 -- the governor fails open; a fault never holds a card
++        _warn("hold", "kanban pacing: governor check failed (%s: %s); dispatching ungoverned", type(exc).__name__, exc)
++        logger.debug("kanban pacing: governor check failed", exc_info=True)
++        return False
+diff --git a/tests/hermes_cli/test_kanban_llm_pacing.py b/tests/hermes_cli/test_kanban_llm_pacing.py
+new file mode 100644
+index 0000000000..71e8129250
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_llm_pacing.py
+@@ -0,0 +1,232 @@
++"""LLM quota pacing governor: pool math and Kanban dispatch admission (t_01a1d975f57bb7b8). [daveey]"""
++from __future__ import annotations
++
++import pathlib
++import time
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as kbd
++from hermes_cli import kanban_llm_pacing as lp
++from hermes_cli import kanban_llm_pacing_dispatch as pd
++
++from tests.hermes_cli.test_kanban_model_tier import _write_cfg, board as _board_fixture
++
++board = _board_fixture
++
++OPUS = "claude-opus-5-5"
++HOUR, DAY = 3600.0, 86400.0
++CFG = lp.PacingConfig()
++
++
++def _r(account, kind, used, reset_in, ts):
++    return lp.Reading(ts, account, kind, used, ts + reset_in)
++
++
++# --- pool math ---------------------------------------------------------------------------------------------
++
++def test_pool_ahead_of_pace_is_paced():
++    now = 1_800_000_000.0
++    # 60% used, 10 h to reset, burning 6%/h over the last hour: 120% projected at reset.
++    current = [_r("a", lp.SEVEN_DAY, 60, 10 * HOUR, now)]
++    history = [_r("a", lp.SEVEN_DAY, 54, 11 * HOUR, now - HOUR)]
++    pace = lp.pool_pace("anthropic", current, history, CFG)
++    assert pace.state == lp.PACED
++    assert pace.factor == pytest.approx((35 / (10 * HOUR)) / (6 / HOUR), rel=1e-3)
++
++
++def test_pool_behind_pace_is_open():
++    now = 1_800_000_000.0
++    current = [_r("a", lp.SEVEN_DAY, 30, 3 * DAY, now), _r("a", lp.FIVE_HOUR, 10, 4 * HOUR, now)]
++    history = [_r("a", lp.SEVEN_DAY, 29.5, 3 * DAY + HOUR, now - HOUR), _r("a", lp.FIVE_HOUR, 8, 5 * HOUR, now - HOUR)]
++    assert lp.pool_pace("anthropic", current, history, CFG).state == lp.OPEN
++
++
++def test_behind_elapsed_pace_but_projected_over_is_paced():
++    """account-primary 11-14: 87% at 14:23:35Z, 92% at 14:29:52Z, seven_day resets 11-15 00:00Z.
++
++    94.3% of the week had elapsed, so used-vs-elapsed called it behind pace; at +0.8%/min it hit 100% by 14:40Z."""
++    reset = 1794700800.0  # 2026-11-15T00:00:00Z
++    now, before = 1794666592.0, 1794666215.0  # 14:29:52Z, 14:23:35Z
++    elapsed_fraction = 1 - (reset - now) / lp.WINDOW_SECONDS[lp.SEVEN_DAY]
++    assert 92 / 100 < elapsed_fraction  # a used-vs-elapsed rule would not throttle
++    cfg = lp.PacingConfig(reserve={lp.FIVE_HOUR: 101.0, lp.SEVEN_DAY: 101.0}, min_rate_span=300)
++    current = [lp.Reading(now, "account-primary", lp.SEVEN_DAY, 92, reset)]
++    history = [lp.Reading(before, "account-primary", lp.SEVEN_DAY, 87, reset)]
++    pace = lp.pool_pace("anthropic", current, history, cfg)
++    assert pace.state == lp.PACED and pace.factor < 0.01
++
++
++def test_five_hour_bucket_gates_as_well():
++    now = 1_800_000_000.0
++    # Weekly is fine; the five-hour bucket went 0 -> 44% in 10 minutes (14:20-14:30Z on 11-14).
++    current = [_r("a", lp.SEVEN_DAY, 20, 5 * DAY, now), _r("a", lp.FIVE_HOUR, 44, 4.83 * HOUR, now)]
++    history = [_r("a", lp.FIVE_HOUR, 0, 5 * HOUR, now - 600)]
++    assert lp.pool_pace("anthropic", current, history, CFG).state == lp.PACED
++
++
++def test_every_account_past_reserve_holds_until_earliest_reset():
++    now = 1_800_000_000.0
++    current = [_r("a", lp.SEVEN_DAY, 100, 2 * DAY, now),
++               _r("b", lp.SEVEN_DAY, 86, 9 * HOUR, now), _r("b", lp.FIVE_HOUR, 81, 3 * HOUR, now)]
++    pace = lp.pool_pace("anthropic", current, [], CFG)
++    assert pace.state == lp.HELD
++    assert pace.until == now + 9 * HOUR  # b frees once both its reserved windows reset
++    assert lp.admit_limit(pace, 5, deferrable=False, cfg=CFG) == 0
++
++
++def test_one_account_under_reserve_is_not_held():
++    now = 1_800_000_000.0
++    current = [_r("a", lp.SEVEN_DAY, 100, 2 * DAY, now), _r("b", lp.SEVEN_DAY, 40, 6 * DAY, now)]
++    assert lp.pool_pace("anthropic", current, [], CFG).state != lp.HELD
++
++
++def test_no_readable_account_fails_open():
++    pace = lp.pool_pace("anthropic", [], [], CFG)
++    assert pace.state == lp.UNKNOWN
++    assert lp.admit_limit(pace, 5, deferrable=False, cfg=CFG) is None
++
++
++def test_paced_limit_scales_recent_concurrency_and_defers_low_tier_first():
++    pace = lp.PoolPace("anthropic", lp.PACED, 0.5)
++    assert lp.admit_limit(pace, 6, deferrable=False, cfg=CFG) == 3
++    assert lp.admit_limit(pace, 6, deferrable=True, cfg=CFG) == 1
++    assert lp.admit_limit(lp.PoolPace("anthropic", lp.OPEN, 2.0), 6, deferrable=True, cfg=CFG) is None
++
++
++def test_just_behind_pace_ramps_from_recent_concurrency():
++    pace = lp.PoolPace("anthropic", lp.OPEN, 1.5)
++    assert lp.admit_limit(pace, 4, deferrable=False, cfg=CFG) == 6
++    assert lp.admit_limit(pace, 0, deferrable=False, cfg=CFG) == 1  # off a hold: one run, then grow
++
++
++def test_capped_window_burns_nothing_and_a_fresh_burst_counts_at_once():
++    now = 1_800_000_000.0
++    capped = _r("a", lp.SEVEN_DAY, 100, 2 * DAY, now)
++    assert lp.burn_rate(capped, [], CFG) == 0.0
++    current = _r("b", lp.FIVE_HOUR, 40, 4 * HOUR, now)
++    history = [_r("b", lp.FIVE_HOUR, 10, 4 * HOUR + 3600, now - 3600),
++               _r("b", lp.FIVE_HOUR, 20, 4 * HOUR + 600, now - 600)]
++    assert lp.burn_rate(current, history, CFG) == pytest.approx(20 / 600)  # newest slope, not the hour's 30/3600
++
++
++def test_config_from_reads_overrides_and_keeps_defaults():
++    cfg = lp.config_from({"enabled": False, "target_percent": 90, "reserve_seven_day_percent": "x"})
++    assert (cfg.enabled, cfg.target, cfg.reserve[lp.SEVEN_DAY]) == (False, 90.0, 85.0)
++    assert lp.config_from(None) == lp.PacingConfig()
++
++
++def test_window_kind_maps_anthropic_and_codex_labels():
++    assert [lp.window_kind(x) for x in ("Current session", "Current week", "Session", "Weekly")] == [
++        lp.FIVE_HOUR, lp.SEVEN_DAY, lp.FIVE_HOUR, lp.SEVEN_DAY]
++
++
++# --- dispatch admission ------------------------------------------------------------------------------------
++
++@pytest.fixture
++def paced_board(board, monkeypatch):
++    monkeypatch.setattr(pd, "_CACHE", {})
++    return board
++
++
++def _usage(monkeypatch, used, reset_in, *, kind=lp.SEVEN_DAY):
++    """Every governed pool reads one account; with no history the burn is the window's average so far."""
++    def read(provider, now):
++        return [lp.Reading(now, f"{provider}-1", kind, used, now + reset_in)]
++    monkeypatch.setattr(pd, "read_pool", read)
++
++
++def _dispatch(conn):
++    seen = []
++    result = kbd.dispatch_once(conn, dry_run=False, spawn_fn=lambda task, ws: seen.append(task.id))
++    return seen, result
++
++
++def _opus_card(conn, title="work", **kw):
++    return kb.create_task(conn, title=title, assignee="default", model_override=OPUS, provider_override="anthropic", **kw)
++
++
++def test_pool_ahead_of_pace_defers_spawns(paced_board, monkeypatch):
++    _write_cfg(paced_board)
++    _usage(monkeypatch, 70, 6 * DAY)  # 70% in the week's first day: ~490% projected at reset
++    with kbc.connect() as conn:
++        tid = _opus_card(conn)
++        seen, result = _dispatch(conn)
++        events = [e.payload for e in kb.list_events(conn, tid) if e.kind == pd.EVENT_KIND]
++        status = kb.get_task(conn, tid).status
++    assert seen == [] and status == "ready"
++    assert (tid, lp.GUARD_REASON) in result.respawn_guarded
++    assert result.clock_held[tid][0] == lp.GUARD_REASON
++    assert events and events[-1]["providers"][0]["state"] == lp.PACED
++
++
++def test_pool_behind_pace_does_not_defer(paced_board, monkeypatch):
++    _write_cfg(paced_board)
++    _usage(monkeypatch, 5, 6 * DAY)  # 5% after one day: ~35% at reset
++    with kbc.connect() as conn:
++        a, b = _opus_card(conn, "a"), _opus_card(conn, "b")
++        seen, _ = _dispatch(conn)
++    assert sorted(seen) == sorted([a, b])
++
++
++def test_held_pool_names_the_reset_and_repeats_no_event(paced_board, monkeypatch):
++    _write_cfg(paced_board)
++    _usage(monkeypatch, 90, 9 * HOUR)
++    with kbc.connect() as conn:
++        tid = _opus_card(conn)
++        _dispatch(conn)
++        _, result = _dispatch(conn)
++        events = [e.payload for e in kb.list_events(conn, tid) if e.kind == pd.EVENT_KIND]
++    assert len(events) == 1 and events[0]["providers"][0]["state"] == lp.HELD
++    assert abs(result.clock_held[tid][1] - (time.time() + 9 * HOUR)) < 120
++
++
++def test_governor_off_is_todays_behaviour(paced_board, monkeypatch):
++    _write_cfg(paced_board, llm_pacing={"enabled": False})
++    _usage(monkeypatch, 99, 9 * HOUR)
++    with kbc.connect() as conn:
++        tid = _opus_card(conn)
++        seen, _ = _dispatch(conn)
++    assert seen == [tid]
++
++
++def test_mandatory_pin_is_never_throttled(paced_board, monkeypatch):
++    _write_cfg(paced_board)
++    _usage(monkeypatch, 99, 9 * HOUR)
++    with kbc.connect() as conn:
++        tid = _opus_card(conn, pin_mandatory=True)
++        seen, _ = _dispatch(conn)
++    assert seen == [tid]
++
++
++def test_usage_read_failure_starts_the_card(paced_board, monkeypatch):
++    _write_cfg(paced_board)
++
++    def boom(provider, now):
++        raise OSError("usage endpoint down")
++    monkeypatch.setattr(pd, "read_pool", boom)
++    with kbc.connect() as conn:
++        tid = _opus_card(conn)
++        seen, _ = _dispatch(conn)
++    assert seen == [tid]
++
++
++def test_ungoverned_provider_is_not_throttled(paced_board, monkeypatch):
++    _write_cfg(paced_board, llm_pacing={"providers": ["openai-codex"]})
++    _usage(monkeypatch, 99, 9 * HOUR)
++    with kbc.connect() as conn:
++        tid = _opus_card(conn)
++        seen, _ = _dispatch(conn)
++    assert seen == [tid]
++
++
++def test_only_kanban_dispatch_consults_the_governor():
++    """Chats, cron and notice delivery never import it: only the dispatcher's claim path does."""
++    root = pathlib.Path(pd.__file__).resolve().parents[1]
++    users = sorted(str(p.relative_to(root)) for top in ("agent", "gateway", "cron", "hermes_cli", "tui_gateway")
++                   if (root / top).is_dir() for p in (root / top).rglob("*.py")
++                   if "kanban_llm_pacing" in p.read_text(encoding="utf-8", errors="ignore"))
++    assert users == ["hermes_cli/kanban_db_dispatch.py", "hermes_cli/kanban_llm_pacing.py",
++                     "hermes_cli/kanban_llm_pacing_dispatch.py"]
+-- 
+2.43.0
+

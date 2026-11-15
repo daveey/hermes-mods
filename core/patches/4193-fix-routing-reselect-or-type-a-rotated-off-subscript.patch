@@ -1,0 +1,234 @@
+From 41714d589afc402ded558744d8178a94a3c87a21 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 14:31:55 +0000
+Subject: [PATCH] fix(routing): reselect or type a rotated-off subscription
+ pool before the retry [daveey]
+
+Hub 2026-11-14 05:40Z (sessions 20000101_010000_000001, 20000101_010000_000002, both
+anthropic/claude-sonnet-5-5): a 429 benched account-primary for that model only ("other models
+stay available"), the pool had no other entry for it, so `pool.current()` stayed empty and the
+turn waited 600 s. Attempt 2 died in `verify_class_runtime` on the non-retryable
+"Subscription OAuth credential is unavailable; no selected pool entry". The opus sibling
+(20000101_010000_000003) hit the same bench and got the typed SubscriptionQuotaUnavailable,
+so the difference was the pool's state for sonnet after the wait, not the 429 itself.
+
+Five whys:
+1. Why non-retryable? verify_class_runtime only typed the empty selection when
+   quota_unavailable() returned a wall; otherwise it raised the generic ModelRoutingError.
+2. Why no wall? quota_unavailable() returns None when (a) some OAuth row has room for the
+   model again (a sibling's model cooldown lapsed during the 600 s wait), or (b) a live row
+   sits on an auth (401) bench with no cooldown of its own for the model (quota unproven).
+3. Why was room not used? Nothing re-selected the pool between the failed rotation and the
+   retry: the retry reused the benched key with `current` empty.
+4. Why not the auth wall? verify_class_runtime lacked the auth_churned() rung that
+   resolve_class_runtime already has.
+5. Fix both: build_request_payload re-selects a subscription entry for the model when a
+   rotation left none (reselect_class_credential, swaps the agent onto it), and
+   verify_class_runtime raises SubscriptionAuthUnavailable for an auth-churned pool, the same
+   ladder as resolution. The generic error remains only for a pool with neither room nor typed
+   evidence, and for a foreign runtime key.
+
+Tests (tests/agent/test_model_bench_wait_verify.py, real pool/runtime, HTTP mocked):
+- sole model bench -> SubscriptionQuotaUnavailable (guard, green on base)
+- 401-benched sibling w/o this model's cooldown -> SubscriptionAuthUnavailable (RED on base:
+  "no selected pool entry")
+- full agent wire: 200, 429 (13150 s window), 600 s wait during which the sibling's cooldown
+  lapses -> third request goes out on the sibling token and the turn answers "ok" (RED on
+  base with the exact hub sequence: attempt 1 RateLimitError, attempt 2 "no selected pool
+  entry").
+---
+ agent/model_routing_runtime.py              |  27 ++++-
+ agent/turn_api_request.py                   |   2 +
+ tests/agent/test_model_bench_wait_verify.py | 119 ++++++++++++++++++++
+ 3 files changed, 145 insertions(+), 3 deletions(-)
+ create mode 100644 tests/agent/test_model_bench_wait_verify.py
+
+diff --git a/agent/model_routing_runtime.py b/agent/model_routing_runtime.py
+index 770e9f14c7..c9772124bb 100644
+--- a/agent/model_routing_runtime.py
++++ b/agent/model_routing_runtime.py
+@@ -219,6 +219,22 @@ def refresh_class_responses_token(agent):
+                                             reason='class_oauth_refresh')
+ 
+ 
++def reselect_class_credential(agent):
++    """[daveey] Re-adopt a subscription pool entry a rotation left unselected, before the next attempt.
++
++    A 429 that benches the last row for this model leaves ``pool.current()`` empty and the turn waits
++    (up to 600 s). A sibling row whose cooldown lapsed meanwhile is room, yet nothing reselected it, so
++    the pre-send check refused the retry as "no selected pool entry" (hub 2026-11-14 05:50Z)."""
++    metadata = getattr(agent, "model_routing", None)
++    pool = getattr(agent, "_credential_pool", None)
++    if not metadata or metadata.get("billing_group") != "subscription" or pool is None or pool.current():
++        return
++    entry = pool.select(model=agent.model)
++    if entry is not None and agent._swap_credential(entry) is not False:
++        logger.info("Class route re-selected pool entry %s for %s after a rotation left none",
++                    entry.label or entry.id[:8], agent.model)
++
++
+ def verify_agent_class_credentials(agent):
+     """Recheck the actual native credential immediately before client checkout."""
+     metadata = getattr(agent, "model_routing", None)
+@@ -243,12 +259,17 @@ def verify_class_runtime(runtime, metadata):
+     pool = runtime.get("credential_pool")
+     entry = pool.current() if pool else None
+     if entry is None:
+-        from agent.model_routing_unavailable import quota_unavailable
++        from agent.model_routing_unavailable import SubscriptionAuthUnavailable, auth_churned, quota_unavailable
++        model = metadata["selected_model"]
+         if pool is not None and any(
+             candidate.auth_type == "oauth" and candidate.runtime_api_key == runtime["api_key"]
+             for candidate in pool.entries()
+-        ) and (unavailable := quota_unavailable(pool, metadata["selected_model"])):
+-            raise unavailable
++        ):
++            # [daveey] Same ladder as resolution: a rotated-off pool's own state types the refusal.
++            if unavailable := quota_unavailable(pool, model):
++                raise unavailable
++            if auth_churned(pool, model):
++                raise SubscriptionAuthUnavailable(metadata["selected_provider"], model)
+         raise ModelRoutingError("Subscription OAuth credential is unavailable; no selected pool entry")
+     if entry.auth_type != "oauth":
+         raise ModelRoutingError("Subscription routing requires an OAuth credential, never a paid API key")
+diff --git a/agent/turn_api_request.py b/agent/turn_api_request.py
+index ead643a0b3..924e2e878d 100644
+--- a/agent/turn_api_request.py
++++ b/agent/turn_api_request.py
+@@ -124,6 +124,8 @@ def build_request_payload(
+     adopt_managed_policy(agent)
+     from agent.model_routing_request import validate_class_request
+     if getattr(agent, "model_routing", None):
++        from agent.model_routing_runtime import reselect_class_credential
++        reselect_class_credential(agent)
+         validate_class_request(agent, {
+             "model": agent.model, "messages": api_messages, "tools": tools_for_api,
+             "max_tokens": agent.max_tokens,
+diff --git a/tests/agent/test_model_bench_wait_verify.py b/tests/agent/test_model_bench_wait_verify.py
+new file mode 100644
+index 0000000000..114b210fe1
+--- /dev/null
++++ b/tests/agent/test_model_bench_wait_verify.py
+@@ -0,0 +1,119 @@
++"""A model-scoped 429 bench, a long retry wait, then the pre-send credential check.
++
++Hub 2026-11-14 05:40Z (sessions 20000101_010000_000001, 20000101_010000_000002): a 429 benched the last
++Anthropic subscription row for claude-sonnet-5-5 only ("other models stay available"), the turn waited
++600 s with no pool entry selected, and the retry died on the non-retryable "Subscription OAuth credential
++is unavailable; no selected pool entry". Real pool and runtime code; only HTTP is mocked.
++"""
++import json
++import time
++from unittest.mock import patch
++
++import anthropic
++import httpx
++import pytest
++
++from tests.agent import test_managed_subscription as fixtures
++from tests.agent.test_class_failure_wire import completion
++
++managed = fixtures.managed
++routing_home = fixtures.routing_home
++streaming_route = fixtures.streaming_route
++
++MODEL = "anthropic-deep"
++SIBLING_TOKEN = "sk-ant-oat01-sibling"
++
++
++def _add_sibling(tmp_path, **fields):
++    path = tmp_path / "auth.json"
++    data = json.loads(path.read_text(encoding="utf-8"))
++    data["credential_pool"]["anthropic"].append({
++        "id": "sibling", "label": "sibling", "priority": 2, "auth_type": "oauth",
++        "source": "manual", "access_token": SIBLING_TOKEN, **fields})
++    path.write_text(json.dumps(data), encoding="utf-8")
++
++
++def _bench_runtime_for_model():
++    """Resolve the live runtime, then bench its OAuth row for MODEL only, as an Anthropic 429 does."""
++    from hermes_cli.runtime_provider import resolve_runtime_provider
++    runtime = resolve_runtime_provider(requested="anthropic", target_model=MODEL, routing_session_id="bench")
++    pool = runtime["credential_pool"]
++    assert pool.current().id == "subscription"
++    assert pool.mark_exhausted_and_rotate(status_code=429, model=MODEL, credential_id="subscription",
++                                          error_context={"reset_at": time.time() + 13150},
++                                          failure_reason="rate_limit") is None
++    assert pool.current() is None
++    return runtime
++
++
++def test_sole_model_bench_is_typed_quota(managed):
++    from agent.model_routing_runtime import verify_class_runtime
++    from agent.model_routing_unavailable import SubscriptionQuotaUnavailable
++    runtime = _bench_runtime_for_model()
++    with pytest.raises(SubscriptionQuotaUnavailable):
++        verify_class_runtime(runtime, runtime["model_routing"])
++
++
++def test_auth_benched_sibling_is_typed_auth_unavailable(managed, tmp_path):
++    """The other OAuth row sits on a 401 bench with no cooldown of its own for this model: quota is
++    unproven, but the refusal is still the typed, retryable auth wall, never the generic one."""
++    from agent.model_routing_runtime import verify_class_runtime
++    from agent.model_routing_unavailable import SubscriptionAuthUnavailable
++    now = time.time()
++    _add_sibling(tmp_path, last_status="exhausted", last_status_at=now, last_error_code=401,
++                 last_error_reset_at=now + 3600, model_cooldowns={"other-model": now + 7200})
++    runtime = _bench_runtime_for_model()
++    with pytest.raises(SubscriptionAuthUnavailable):
++        verify_class_runtime(runtime, runtime["model_routing"])
++
++
++def test_sibling_freed_during_retry_wait_is_reselected(managed, tmp_path):
++    """The sibling's own cooldown for this model lapses during the 600 s wait: the retry must go out
++    on the sibling, not die on 'no selected pool entry'."""
++    _add_sibling(tmp_path, model_cooldowns={MODEL: time.time() + 300})
++    sent = []
++    clock = {"skew": 0.0}
++    real_time = time.time
++    original = anthropic.Anthropic
++
++    def respond(request):
++        sent.append(request)
++        body = json.loads(request.content)
++        if len(sent) == 2:
++            return httpx.Response(429, json={"type": "error", "error": {
++                "type": "rate_limit_error",
++                "message": "This request would exceed your account's rate limit. Please try again later.",
++                "resets_at": real_time() + 13150}})
++        if body.get("stream"):
++            return completion(body["model"])
++        return httpx.Response(200, json={"id": "message", "type": "message", "role": "assistant",
++            "model": body["model"], "content": [{"type": "text", "text": "ok"}],
++            "stop_reason": "end_turn", "usage": {"input_tokens": 1, "output_tokens": 1}})
++
++    def sdk(**kwargs):
++        kwargs.update(http_client=httpx.Client(transport=httpx.MockTransport(respond)), max_retries=0)
++        return original(**kwargs)
++
++    def wait_out(*_args, **_kwargs):
++        clock["skew"] += 600.0
++
++    from run_agent import AIAgent
++    with patch("anthropic.Anthropic", side_effect=sdk), \
++         patch("time.time", side_effect=lambda: real_time() + clock["skew"]), \
++         patch("model_tools.get_tool_definitions", return_value=[]), \
++         patch("agent.title_generator._auto_title_enabled", return_value=False), \
++         patch("agent.turn_api_error.interruptible_backoff_sleep", side_effect=wait_out), \
++         patch("agent.turn_recovery.interruptible_backoff_sleep", side_effect=wait_out):
++        agent = AIAgent(model=MODEL, provider="anthropic", session_id="bench-wait",
++                        quiet_mode=True, skip_memory=True, skip_context_files=True, max_iterations=2)
++        agent._disable_streaming = True
++        try:
++            assert agent.run_conversation("Say ok")["final_response"] == "ok"
++            result = agent.run_conversation("Say ok again")
++            assert result.get("final_response") == "ok", result
++            assert agent._credential_pool.current().id == "sibling"
++        finally:
++            agent.release_clients()
++    assert len(sent) == 3
++    assert sent[2].headers["authorization"] == f"Bearer {SIBLING_TOKEN}"
++    assert sent[1].headers["authorization"] != sent[2].headers["authorization"]
+-- 
+2.43.0
+

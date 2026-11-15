@@ -1,0 +1,189 @@
+From 392c8383c9ae9121c36ea498ccd787c095e274ed Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 09:33:35 +0000
+Subject: [PATCH] [daveey] repark accounting: blocked and parent-gated
+ shared-clear wakes end the premise streak
+
+Follow-up to PR #2932 (review https://github.com/example-org/hermes/pull/2932#pullrequestreview-5901683733,
+nit 1; card t_01a1d85c5a382f3e). Not a regression: main behaved the same before #2932.
+
+Why-chain
+- Why 1: a card woken by a shared-blocker clear can still escalate on its next re-park.
+- Why 2: `kanban_awaiting.prior_same_premise` ends the same-premise streak at a `shared_blocker_cleared`
+  event only when its payload status is `ready`/`review`, so it can tell a real wake from a hold-retirement
+  annotation (which carries no status).
+- Why 3: two real wakes do not carry such a status. The blocked branch of `release_cleared_blockers`
+  unblocks the card through `unblock_task` and appends the clear event with no status. `kwc._wake` lands
+  `todo` (not `ready`) when parents are still open.
+- Root cause: wake provenance was inferred from a status field that only one wake path wrote, and only
+  for two of its three outcomes.
+
+Fix
+- `release_cleared_blockers` stamps `woke: true` on the clear event of every real wake (blocked branch
+  and `_wake` branch). Annotation-only clears (ready/review cards, cards parked on their own wait) stay
+  unchanged: no `woke`, no `status`.
+- `prior_same_premise` ends the streak on `woke: true`, and also on the legacy `status` values `ready`,
+  `review` and `todo` (events written before this change).
+
+Tests (RED on base production modules 20c99f7a67, GREEN here)
+- tests/hermes_cli/test_kanban_blocker_park_wake.py: +4
+  - test_blocked_clear_wake_ends_repark_streak (RED: 2 == 0)
+  - test_parent_gated_clear_wake_ends_repark_streak (RED: 2 == 0)
+  - test_clear_annotation_keeps_repark_streak[ready|own-wait] (controls: pass before and after)
+- tests/hermes_cli/test_kanban_awaiting.py: +3
+  - test_clear_wake_provenance_resets_repark_budget[woke|woke+status None|status todo]
+- The existing test_clear_annotation_does_not_reset_repark_budget[None|scheduled] stays green.
+---
+ hermes_cli/kanban_awaiting.py                 |  5 +-
+ hermes_cli/kanban_shared_blockers.py          |  3 +
+ tests/hermes_cli/test_kanban_awaiting.py      | 13 +++
+ .../test_kanban_blocker_park_wake.py          | 79 +++++++++++++++++++
+ 4 files changed, 98 insertions(+), 2 deletions(-)
+
+diff --git a/hermes_cli/kanban_awaiting.py b/hermes_cli/kanban_awaiting.py
+index 458893e0d9..4755d0b198 100644
+--- a/hermes_cli/kanban_awaiting.py
++++ b/hermes_cli/kanban_awaiting.py
+@@ -719,8 +719,9 @@ def prior_same_premise(conn: sqlite3.Connection, task_id: str, premise: str, *,
+         except (ValueError, AttributeError):
+             data, got = {}, {}
+         if kind == CLEARED_EVENT:
+-            # Only a real wake interrupts the premise streak; hold-retirement annotations do not.
+-            if data.get("status") in ("ready", "review"):
++            # Only a real wake interrupts the premise streak; hold-retirement annotations do not. ``woke``
++            # covers the blocked branch (no status) and a parent-gated ``todo`` wake; status is the legacy form.
++            if data.get("woke") is True or data.get("status") in ("ready", "review", "todo"):
+                 break
+             continue
+         if kind == CONDITION_MET_EVENT:
+diff --git a/hermes_cli/kanban_shared_blockers.py b/hermes_cli/kanban_shared_blockers.py
+index 92457cf1c0..1f2b2106c1 100644
+--- a/hermes_cli/kanban_shared_blockers.py
++++ b/hermes_cli/kanban_shared_blockers.py
+@@ -639,6 +639,9 @@ def release_cleared_blockers(conn: sqlite3.Connection, *, now: Optional[int] = N
+                 with kb.write_txn(conn):
+                     kb._append_event(conn, tid, CLEARED_EVENT, payload)
+                 continue
++            # ``woke`` marks a real lane change for repark accounting (``kanban_awaiting.prior_same_premise``):
++            # the blocked branch has no status and a parent-gated wake lands ``todo``. [daveey]
++            payload["woke"] = True
+             if row["status"] == "blocked":
+                 if not kb.unblock_task(conn, tid):
+                     continue
+diff --git a/tests/hermes_cli/test_kanban_awaiting.py b/tests/hermes_cli/test_kanban_awaiting.py
+index e434d25894..5b3db207f1 100644
+--- a/tests/hermes_cli/test_kanban_awaiting.py
++++ b/tests/hermes_cli/test_kanban_awaiting.py
+@@ -427,6 +427,19 @@ def test_clear_annotation_does_not_reset_repark_budget(kanban_home, status):
+         assert kaw.prior_same_premise(conn, tid, "same") == 2
+ 
+ 
++@pytest.mark.parametrize("payload", [{"woke": True}, {"woke": True, "status": None}, {"status": "todo"}])
++def test_clear_wake_provenance_resets_repark_budget(kanban_home, payload):
++    """A blocked-branch wake (``woke``, no status) or a parent-gated ``todo`` wake ends the streak."""
++    from hermes_cli import kanban_shared_blockers as ksb
++    with kbc.connect_closing() as conn:
++        tid = _running(conn)
++        with kb.write_txn(conn):
++            for _ in range(2):
++                kb._append_event(conn, tid, "scheduled", {"awaiting": {"premise": "same"}})
++            kb._append_event(conn, tid, ksb.CLEARED_EVENT, payload)
++        assert kaw.prior_same_premise(conn, tid, "same") == 0
++
++
+ def test_escalation_without_any_assignee_uses_default(kanban_home, monkeypatch):
+     monkeypatch.setattr(kaw, "_supervisor_profile", lambda task: None)
+     with kbc.connect_closing() as conn:
+diff --git a/tests/hermes_cli/test_kanban_blocker_park_wake.py b/tests/hermes_cli/test_kanban_blocker_park_wake.py
+index e2556b8175..6d702c4441 100644
+--- a/tests/hermes_cli/test_kanban_blocker_park_wake.py
++++ b/tests/hermes_cli/test_kanban_blocker_park_wake.py
+@@ -401,6 +401,85 @@ def test_newer_clear_after_an_independent_repark_retires_only_the_hold(kanban_ho
+         assert len(_cleared_events(conn, a)) == 2
+ 
+ 
++# --- Repark accounting: every real clear-wake ends the premise streak ---------------------
++# Review of PR #2932: ``prior_same_premise`` ended its run only at a clear whose status was
++# ready/review. The blocked branch wrote no status and a parent-gated wake wrote ``todo``, so
++# both real wakes kept the earlier scheduled streak and the next re-park could escalate.
++
++def _streak(conn, tid: str, premise: str = "same", n: int = 2) -> None:
++    with kb.write_txn(conn):
++        for _ in range(n):
++            kb._append_event(conn, tid, "scheduled", {"awaiting": {"kind": "external", "premise": premise}})
++
++
++def _clear_by_other(monkeypatch, conn) -> str:
++    clearing = _worker_block_behind(monkeypatch, conn, "wall probe")
++    assert kb.unblock_task(conn, clearing)
++    assert kb.claim_task(conn, clearing)
++    assert kb.complete_task(conn, clearing, result="wall gone")
++    return clearing
++
++
++def test_blocked_clear_wake_ends_repark_streak(kanban_home, monkeypatch):
++    from hermes_cli import kanban_awaiting as kaw
++    hr = {"action": "Raise the limit", "why_human": "billing owner only", "interaction": "external",
++          "scope": "github org billing", "evidence": "job annotation"}
++    with kbc.connect_closing() as conn:
++        waiting = kb.create_task(conn, title="blocked waiter", assignee="default")
++        kb.claim_task(conn, waiting)
++        _streak(conn, waiting)
++        assert kb.block_task(conn, waiting, reason="billing", kind="needs_input", blocker_id=BID, human_request=hr)
++        assert kb.get_task(conn, waiting).status == "blocked"
++        assert kaw.prior_same_premise(conn, waiting, "same") == 2
++        _clear_by_other(monkeypatch, conn)
++        assert ksb.release_cleared_blockers(conn) == [waiting]
++        assert kb.get_task(conn, waiting).status == "ready"
++        assert kaw.prior_same_premise(conn, waiting, "same") == 0
++        assert _cleared_events(conn, waiting)[-1].payload.get("woke") is True
++
++
++def test_parent_gated_clear_wake_ends_repark_streak(kanban_home, monkeypatch):
++    from hermes_cli import kanban_awaiting as kaw
++    with kbc.connect_closing() as conn:
++        parent = kb.create_task(conn, title="open parent", assignee="default")
++        waiting = kb.create_task(conn, title="gated waiter", assignee="default")
++        _streak(conn, waiting)
++        _as_worker(monkeypatch, conn, waiting)
++        out = json.loads(kt._handle_block({"reason": "Actions refuses jobs: billing", "kind": "capability",
++                                           "blocker_id": BID}))
++        assert "error" not in out, out
++        _as_parent(monkeypatch)
++        assert kb.get_task(conn, waiting).status == "scheduled"
++        kb.link_tasks(conn, parent, waiting)
++        assert kaw.prior_same_premise(conn, waiting, "same") == 2
++        _clear_by_other(monkeypatch, conn)
++        assert ksb.release_cleared_blockers(conn) == [waiting]
++        assert kb.get_task(conn, waiting).status == "todo"
++        assert kaw.prior_same_premise(conn, waiting, "same") == 0
++        event = _cleared_events(conn, waiting)[-1]
++        assert event.payload.get("woke") is True and event.payload.get("status") == "todo"
++
++
++@pytest.mark.parametrize("status", ["ready", "own-wait"])
++def test_clear_annotation_keeps_repark_streak(kanban_home, monkeypatch, status):
++    """A clear that only retires a hold (no lane change) is not a wake and keeps the streak."""
++    from hermes_cli import kanban_awaiting as kaw
++    with kbc.connect_closing() as conn:
++        waiting = _worker_block_behind(monkeypatch, conn, "annotated waiter")
++    if status == "own-wait":
++        _repark(monkeypatch, "schedule", "parent", waiting)
++    with kbc.connect_closing() as conn:
++        if status == "ready":
++            with kb.write_txn(conn):
++                conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (waiting,))
++        _streak(conn, waiting)
++        _clear_by_other(monkeypatch, conn)
++        assert ksb.release_cleared_blockers(conn) == []
++        event = _cleared_events(conn, waiting)[-1]
++        assert "woke" not in event.payload and "status" not in event.payload
++        assert kaw.prior_same_premise(conn, waiting, "same") == 2
++
++
+ def _age_all(conn, seconds: int) -> None:
+     with kb.write_txn(conn):
+         conn.execute("UPDATE task_runs SET started_at = started_at - ?, "
+-- 
+2.43.0
+

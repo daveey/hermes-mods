@@ -1,0 +1,296 @@
+From bdf2f36df7eedbd1007d98e7272b12a0f29666fa Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 05:10:02 +0000
+Subject: [PATCH] fix(auth): scope singleton quota recovery to proven row and
+ failure [daveey]
+
+HTTP-only singleton tests reproduce both missing-window resurrection and clearing unrelated accounts. Scope evidence to reset/failure, compare row generation before clearing, and log the early lift. Boundary, cache-expiry, explicit-reset resync and all-walled readmission tests pass. Broad consumer run: 272 files, 4838 passed, one performance threshold failure; isolated candidate and parent reruns pass. Mutation validation and final publication remain.
+---
+ agent/credential_pool.py                      |  2 +-
+ agent/credential_pool_bench.py                |  3 +-
+ hermes_cli/auth_codex.py                      | 10 +-
+ hermes_cli/auth_codex_quota_window.py         | 24 +++++
+ tests/agent/test_codex_rotation_window.py     | 34 +++++--
+ .../test_codex_rotation_window_boundaries.py  | 97 +++++++++++++++++++
+ .../hermes_cli/test_auth_codex_quota_probe.py |  4 +-
+ 7 files changed, 161 insertions(+), 13 deletions(-)
+ create mode 100644 tests/agent/test_codex_rotation_window_boundaries.py
+
+diff --git a/agent/credential_pool.py b/agent/credential_pool.py
+index 8c90607edf..31ba79e77f 100644
+--- a/agent/credential_pool.py
++++ b/agent/credential_pool.py
+@@ -1941,7 +1941,7 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
+             from hermes_cli.auth_codex import _codex_pool_route_base_url
+             return bool(auth_mod._probe_codex_quota_restored(
+                 token, base_url=_codex_pool_route_base_url(entry.base_url),
+-                reset_at=entry.last_error_reset_at, failure_at=entry.last_status_at))
++                reset_at=_parse_absolute_timestamp(entry.last_error_reset_at), failure_at=entry.last_status_at))
+         except Exception:
+             logger.debug("Codex quota-restored probe failed", exc_info=True)
+             return False
+diff --git a/agent/credential_pool_bench.py b/agent/credential_pool_bench.py
+index aaa46e0d82..64a3bf9159 100644
+--- a/agent/credential_pool_bench.py
++++ b/agent/credential_pool_bench.py
+@@ -6,7 +6,8 @@ logger = logging.getLogger(__name__)
+ 
+ 
+ def log_early_lift(entry, mechanism):
+-    reset = entry.last_error_reset_at
++    from agent.credential_pool_timestamps import _parse_absolute_timestamp
++    reset = _parse_absolute_timestamp(entry.last_error_reset_at)
+     if entry.last_status == "exhausted" and reset is not None and reset > time.time():
+         logger.info("credential pool: bench lifted early %s mechanism=%s old_reset=%s",
+                     entry.label or entry.id[:8], mechanism, reset)
+diff --git a/hermes_cli/auth_codex.py b/hermes_cli/auth_codex.py
+index 45154c5cda..56254db250 100644
+--- a/hermes_cli/auth_codex.py
++++ b/hermes_cli/auth_codex.py
+@@ -675,8 +675,8 @@ def resolve_codex_runtime_credentials(
+             # days in the future while the account is already usable again. Never from a
+             # read-only caller: the picker fingerprint resolves on every cache-only read.
+             if not read_only and _probe_codex_pool_entry_quota_restored(pool_rate_limit):
+-                logger.info("Codex quota restored upstream — clearing stale pool cooldown(s).")
+-                clear_codex_pool_quota_cooldowns()
++                from hermes_cli.auth_codex_quota_window import clear_proven_cooldown
++                clear_proven_cooldown(pool_rate_limit)
+                 pool_token, pool_base = _pool_codex_credential(skip_disabled=not read_only)
+                 if pool_token:
+                     return _codex_runtime_result(
+@@ -855,13 +855,15 @@ def _probe_codex_pool_entry_quota_restored(entry: dict[str, Any]) -> Optional[bo
+                     if disk_entry.get("id") == entry.get("id"):
+                         disk_entry.update(fresh)
+                         _save_auth_store(auth_store)
++                        entry["access_token"] = token
+                         break
+         except Exception:
+             logger.debug("Failed to persist refreshed Codex pool tokens", exc_info=True)
+     if not token:
+         return None
+     # The row keeps the canonical URL; a gateway key belongs to its route host (#121486).
+-    return _probe_codex_quota_restored(token, base_url=_codex_pool_route_base_url(entry.get("base_url")))
++    return _probe_codex_quota_restored(token, base_url=_codex_pool_route_base_url(entry.get("base_url")),
++                                      reset_at=entry.get("reset_at"), failure_at=entry.get("last_status_at"))
+ 
+ 
+ def clear_codex_pool_quota_cooldowns(access_token: Optional[str] = None) -> int:
+@@ -917,7 +919,7 @@ def _codex_pool_rate_limit_status() -> Optional[dict[str, Any]]:
+             reset_at = _parse_absolute_timestamp(entry.get("last_error_reset_at"))
+             if reset_at is None or reset_at > now:
+                 return {
+-                    "label": entry.get("label"), "last_refresh": entry.get("last_refresh"),
++                    "label": entry.get("label"), "last_refresh": entry.get("last_refresh"), "last_status_at": entry.get("last_status_at"),
+                     "reset_at": reset_at, "reason": entry.get("last_error_reason"),
+                     "message": entry.get("last_error_message"), "access_token": token.strip(),
+                     "refresh_token": entry.get("refresh_token"), "id": entry.get("id"),
+diff --git a/hermes_cli/auth_codex_quota_window.py b/hermes_cli/auth_codex_quota_window.py
+index 291d1809c6..e6c9e8fd36 100644
+--- a/hermes_cli/auth_codex_quota_window.py
++++ b/hermes_cli/auth_codex_quota_window.py
+@@ -29,3 +29,27 @@ def quota_restored(payload, reset_at=None):
+                 if _number(reset_at) and _number(reset) and abs(reset - reset_at) <= 60:
+                     matched = True
+     return bool(usages) and matched and all(0 <= used < 100 for used in usages)
++
++
++def clear_proven_cooldown(proven):
++    """Clear only the observed row/generation, never other accounts or a newer 429."""
++    import logging
++    from agent.credential_pool import _borrowed_single_use_pool_root, _profile_owns_pool_provider, _parse_absolute_timestamp
++    from hermes_cli.auth import _auth_store_lock, _load_auth_store, _save_auth_store
++    from hermes_cli.auth_codex import _codex_pool_dicts, _pool_entries, _entry_is_rate_limit_exhausted, _clear_pool_entry_status
++    target = None if _profile_owns_pool_provider("openai-codex") else _borrowed_single_use_pool_root()
++    with _auth_store_lock(target_path=target):
++        store = _load_auth_store(target)
++        for row in _codex_pool_dicts(_pool_entries(store, "openai-codex")):
++            if (row.get("id") != proven.get("id") or row.get("last_status_at") != proven.get("last_status_at")
++                    or _parse_absolute_timestamp(row.get("last_error_reset_at")) != proven.get("reset_at")
++                    or row.get("access_token") != proven.get("access_token")
++                    or not _entry_is_rate_limit_exhausted(row)):
++                continue
++            logging.getLogger(__name__).info(
++                "credential pool: bench lifted early %s mechanism=singleton_quota_probe old_reset=%s",
++                row.get("label") or row.get("id"), proven.get("reset_at"))
++            _clear_pool_entry_status(row)
++            _save_auth_store(store, target_path=target)
++            return True
++    return False
+diff --git a/tests/agent/test_codex_rotation_window.py b/tests/agent/test_codex_rotation_window.py
+index 6b9c7b0b81..84a7a7ca4e 100644
+--- a/tests/agent/test_codex_rotation_window.py
++++ b/tests/agent/test_codex_rotation_window.py
+@@ -63,7 +63,7 @@ def test_singleton_token_adoption_preserves_weekly_quota(tmp_path, monkeypatch):
+     entry = pool._adopt(pool.entries()[0], source="device_code")
+     pool._mark_exhausted(entry, 429, {"reason": "usage_limit_reached", "reset_at": reset})
+     state = json.loads((tmp_path / "auth.json").read_text())
+-    fresh = _token("replacement")
++    fresh = _token("A") + "-new-generation"
+     state["providers"] = {"openai-codex": {"tokens": {"access_token": fresh, "refresh_token": "new-refresh"}}}
+     (tmp_path / "auth.json").write_text(json.dumps(state))
+     entry = next(e for e in pool.entries() if e.id == "A")
+@@ -88,16 +88,38 @@ def test_short_window_all_walled_is_retryable(tmp_path, monkeypatch):
+         _verify(pool, rows[0]["access_token"])
+ 
+ 
+-def test_proven_weekly_reopen_logs_and_rotation_still_excludes_failure(tmp_path, monkeypatch, caplog):
++@pytest.mark.parametrize("other_walled", [False, True])
++def test_proven_weekly_reopen_logs_and_rotation_still_excludes_failure(tmp_path, monkeypatch, caplog, other_walled):
+     reset = time.time() + 6 * 86400
+     payload = {"rate_limit": {"primary_window": {"used_percent": 0},
+                               "secondary_window": {"used_percent": 0, "reset_at": reset}}}
+-    pool, _, _ = _pool(tmp_path, monkeypatch, payload=payload)
++    pool, rows, _ = _pool(tmp_path, monkeypatch, payload=payload, other_walled=other_walled)
++    transport = httpx.MockTransport(lambda request: httpx.Response(200, json=payload)
++                                    if rows[0]["access_token"] in request.headers["Authorization"]
++                                    else httpx.Response(429))
++    monkeypatch.setattr(auth_codex, "_codex_http_client", lambda **kwargs: httpx.Client(transport=transport))
+     with caplog.at_level(logging.INFO):
+         nxt = _rotate(pool, reset)
+-    assert nxt is not None and nxt.id == "B"
+-    _verify(pool, nxt.runtime_api_key)
++    if other_walled:
++        assert nxt is None
++        with pytest.raises(SubscriptionQuotaUnavailable):
++            _verify(pool, rows[0]["access_token"])
++    else:
++        assert nxt is not None and nxt.id == "B"
++        _verify(pool, nxt.runtime_api_key)
+     assert "bench lifted early" in caplog.text
+     assert "quota_probe" in caplog.text
+-    assert "old_reset=" in caplog.text
+     assert next(e for e in pool.entries() if e.id == "A").last_status == "exhausted"
++
++
++def test_explicit_reset_resync_logs_early_lift(tmp_path, monkeypatch, caplog):
++    pool, _, reset = _pool(tmp_path, monkeypatch)
++    assert _rotate(pool, reset).id == "B"
++    state = json.loads((tmp_path / "auth.json").read_text())
++    row = next(row for row in state["credential_pool"]["openai-codex"] if row["id"] == "A")
++    row["status_cleared_at"] = time.time() + 1
++    (tmp_path / "auth.json").write_text(json.dumps(state))
++    with caplog.at_level(logging.INFO):
++        available, _ = pool._available_entries(clear_expired=True, refresh=False)
++    assert "A" in {entry.id for entry in available}
++    assert "bench lifted early A mechanism=resync old_reset=" in caplog.text
+diff --git a/tests/agent/test_codex_rotation_window_boundaries.py b/tests/agent/test_codex_rotation_window_boundaries.py
+new file mode 100644
+index 0000000000..6b2515ad68
+--- /dev/null
++++ b/tests/agent/test_codex_rotation_window_boundaries.py
+@@ -0,0 +1,97 @@
++"""Window-scoped evidence at the real HTTP probe and singleton resolver."""
++import json
++import logging
++
++import httpx
++import pytest
++
++from hermes_cli import auth_codex
++from hermes_cli.auth_codex_quota_window import quota_restored
++from tests.agent.test_codex_rotation_window import _pool, _rotate
++
++
++@pytest.mark.parametrize("delta, expected", [(0, True), (60, True), (-60, True), (61, False)])
++def test_window_reset_tolerance(delta, expected):
++    assert quota_restored({"rate_limit": {"primary_window": {
++        "used_percent": 0, "reset_at": 1000 + delta}}}, 1000) is expected
++
++
++@pytest.mark.parametrize("used", [True, float("nan"), float("inf"), -1, 100, "0", None])
++def test_invalid_or_exhausted_usage_is_not_evidence(used):
++    assert quota_restored({"rate_limit": {"primary_window": {
++        "used_percent": used, "reset_at": 1000}}}, 1000) is False
++
++
++@pytest.mark.parametrize("denial", [{"allowed": False}, {"limit_reached": True}])
++def test_account_denial_overrides_open_window(denial):
++    assert quota_restored({"rate_limit": {**denial, "primary_window": {
++        "used_percent": 0, "reset_at": 1000}}}, 1000) is False
++
++
++def test_model_window_wall_overrides_account_evidence():
++    assert quota_restored({"rate_limit": {"primary_window": {"used_percent": 0, "reset_at": 1000}},
++                          "additional_rate_limits": [{"rate_limit": {"primary_window": {"used_percent": 100}}}]},
++                         1000) is False
++
++
++def test_cache_cannot_reuse_older_failure_and_expires(tmp_path, monkeypatch):
++    _, rows, reset = _pool(tmp_path, monkeypatch)
++    calls = []
++    payload = {"rate_limit": {"primary_window": {"used_percent": 0, "reset_at": reset}}}
++    def respond(request):
++        calls.append(request.url)
++        return httpx.Response(200, json=payload)
++    transport = httpx.MockTransport(respond)
++    monkeypatch.setattr(auth_codex, "_codex_http_client", lambda **kwargs: httpx.Client(transport=transport))
++    clock = [1000.0]
++    monkeypatch.setattr(auth_codex.time, "monotonic", lambda: clock[0])
++    probe = auth_codex._probe_codex_quota_restored
++    token = rows[0]["access_token"]
++    assert probe(token, reset_at=reset, failure_at=1) is True
++    assert probe(token, reset_at=reset, failure_at=1) is True
++    assert probe(token, reset_at=reset, failure_at=2) is None
++    assert probe(token, reset_at=reset + 100, failure_at=1) is None
++    assert len(calls) == 1
++    clock[0] += 300
++    assert probe(token, reset_at=reset, failure_at=2) is True
++    assert len(calls) == 2
++
++
++def test_singleton_short_window_cannot_clear_weekly_wall(tmp_path, monkeypatch):
++    pool, _, reset = _pool(tmp_path, monkeypatch, other_walled=True)
++    assert _rotate(pool, reset) is None
++    auth_codex._codex_quota_probe_cache.clear()
++    with pytest.raises(auth_codex.AuthError, match="quota exhausted"): 
++        auth_codex.resolve_codex_runtime_credentials()
++    saved = json.loads((tmp_path / "auth.json").read_text())["credential_pool"]["openai-codex"]
++    assert all(row["last_status"] == "exhausted" for row in saved)
++
++
++def test_singleton_positive_probe_only_clears_proven_row(tmp_path, monkeypatch, caplog):
++    pool, rows, reset = _pool(tmp_path, monkeypatch, other_walled=True)
++    assert _rotate(pool, reset) is None
++    auth_codex._codex_quota_probe_cache.clear()
++    payload = {"rate_limit": {"primary_window": {"used_percent": 0, "reset_at": reset}}}
++    transport = httpx.MockTransport(lambda request: httpx.Response(200, json=payload))
++    monkeypatch.setattr(auth_codex, "_codex_http_client", lambda **kwargs: httpx.Client(transport=transport))
++    with caplog.at_level(logging.INFO):
++        result = auth_codex.resolve_codex_runtime_credentials()
++    assert result["api_key"] == rows[0]["access_token"]
++    saved = json.loads((tmp_path / "auth.json").read_text())["credential_pool"]["openai-codex"]
++    assert saved[0]["last_status"] is None
++    assert all(row["last_status"] == "exhausted" for row in saved[1:])
++    assert "mechanism=singleton_quota_probe" in caplog.text
++    assert "old_reset=" in caplog.text
++
++
++@pytest.mark.parametrize("field,value", [("id", "other"), ("last_status_at", "newer"),
++                                        ("reset_at", 1), ("access_token", "different")])
++def test_singleton_clear_rejects_changed_generation(tmp_path, monkeypatch, field, value):
++    from hermes_cli.auth_codex_quota_window import clear_proven_cooldown
++    pool, _, reset = _pool(tmp_path, monkeypatch, other_walled=True)
++    assert _rotate(pool, reset) is None
++    proven = auth_codex._codex_pool_rate_limit_status()
++    proven[field] = value
++    before = (tmp_path / "auth.json").read_bytes()
++    assert clear_proven_cooldown(proven) is False
++    assert (tmp_path / "auth.json").read_bytes() == before
+diff --git a/tests/hermes_cli/test_auth_codex_quota_probe.py b/tests/hermes_cli/test_auth_codex_quota_probe.py
+index 3f82bb3c40..96a78567f4 100644
+--- a/tests/hermes_cli/test_auth_codex_quota_probe.py
++++ b/tests/hermes_cli/test_auth_codex_quota_probe.py
+@@ -370,7 +370,9 @@ def test_resolver_refreshes_expired_token_before_probe(tmp_path, monkeypatch):
+     fresh = _jwt({"exp": now + 3600})
+     refresh_calls: list = []
+     _fake_refresh(monkeypatch, fresh, refresh_calls)
+-    http_calls = _patch_expiry_aware_httpx(monkeypatch, _StubResponse(200, _usage_payload(0.0, 0.0)))
++    payload = _usage_payload(0.0, 0.0)
++    payload["rate_limit"]["secondary_window"]["reset_at"] = now + 3 * 86400
++    http_calls = _patch_expiry_aware_httpx(monkeypatch, _StubResponse(200, payload))
+ 
+     resolved = resolve_codex_runtime_credentials()
+ 
+-- 
+2.43.0
+

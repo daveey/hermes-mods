@@ -1,0 +1,148 @@
+From 2db9fa31ab9979fe887ad45f139dc1aaf9564392 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:04:21 +0000
+Subject: [PATCH] [daveey] Separate registered hub wake probes from ready
+ execution placement
+
+A denied card whose latest park registered its exact probe on this gateway need not execute here: task_wake_checks remains machine-local. Preserve the legacy keep for unknown, mismatched or superseded custody and all independent structural guards. Tests reproduce both ready timer wakes and condition_met history choosing hub before the fix and worker after it; malformed/foreign/superseded custody remains conservative. Focused admission, selfcheck, race and capacity suites pass; scripts/check passes all 20 guards. Alarm capacity fallback is a separate implementation scope.
+---
+ hermes_cli/kanban_hub_admission_claim.py      | 16 ++---
+ hermes_cli/kanban_hub_probe_custody.py        | 25 ++++++++
+ .../test_kanban_hub_probe_custody.py          | 59 +++++++++++++++++++
+ 3 files changed, 93 insertions(+), 7 deletions(-)
+ create mode 100644 hermes_cli/kanban_hub_probe_custody.py
+ create mode 100644 tests/hermes_cli/test_kanban_hub_probe_custody.py
+
+diff --git a/hermes_cli/kanban_hub_admission_claim.py b/hermes_cli/kanban_hub_admission_claim.py
+index 3359e2f309..e9ae7dd475 100644
+--- a/hermes_cli/kanban_hub_admission_claim.py
++++ b/hermes_cli/kanban_hub_admission_claim.py
+@@ -14,10 +14,10 @@ The screen covers ready and review because a scheduled continuation can resume e
+ * admit: claimed as before;
+ * deny: re-placed on the worker queue (the pickup deny route, never ``machine:worker-N``) with a ``moved`` event
+   citing the verdict, so it is not claimed here;
+-* deny of a card that must stay (structural restriction, ``host_repo``, a hub worktree in the brief, a hub-local
+-  wake_check, or no worker queue fits): the verdict carries ``kept: <reason>`` and the card is claimed as before;
+-  a fleet probe under ``~/.hermes/bin`` in :data:`PORTABLE_WAKE_PROBES` (or ``kanban.placement.
+-  portable_wake_probes``) is not hub-local;
++* deny of a card that must stay (structural restriction, ``host_repo``, a hub worktree in the brief, an unlocated
++  hub-local wake_check, or no worker queue fits): the verdict carries ``kept: <reason>``. A probe registered on
++  this gateway stays here independently of the ready card's execution; unknown legacy probe custody stays local.
++  A fleet probe in :data:`PORTABLE_WAKE_PROBES` (or ``kanban.placement.portable_wake_probes``) is also portable;
+ * an earlier deny that left the card here (a ``kept`` that no longer holds, or none) is re-placed on the worker
+   queue once it has waited ready 5 min (``kanban_worker_first_selfcheck.denied_target``), with no new judge call;
+ * judge unavailable: claimed as before, warning logged, nothing recorded (judged at its next ready). Failing open
+@@ -121,9 +121,11 @@ def keep_reason(conn: sqlite3.Connection, card: sqlite3.Row, fields: dict, cfg:
+     if re.search(kp.HOST_WORKTREE_PATH, text, re.IGNORECASE) or re.search(kp.LOCAL_WORKTREE_PATH, text,
+                                                                            re.IGNORECASE):
+         return "hub worktree path in the brief"
+-    probe = _without_portable_probes(_latest_wake_check(conn, card["id"]), cfg)
+-    if probe and any(re.search(p, probe, re.IGNORECASE) for p in (_HUB_PATH, kp.HOST_WORKTREE_PATH,
+-                                                                   kp.LOCAL_WORKTREE_PATH)):
++    from hermes_cli.kanban_hub_probe_custody import registered_here
++    raw_probe = _latest_wake_check(conn, card["id"])
++    probe = _without_portable_probes(raw_probe, cfg)
++    if probe and not registered_here(conn, card["id"], raw_probe) and any(
++            re.search(p, probe, re.IGNORECASE) for p in (_HUB_PATH, kp.HOST_WORKTREE_PATH, kp.LOCAL_WORKTREE_PATH)):
+         return "wake_check reads a hub-local path"
+     return None
+ 
+diff --git a/hermes_cli/kanban_hub_probe_custody.py b/hermes_cli/kanban_hub_probe_custody.py
+new file mode 100644
+index 0000000000..23c428a927
+--- /dev/null
++++ b/hermes_cli/kanban_hub_probe_custody.py
+@@ -0,0 +1,25 @@
++"""Keep probe custody separate from the execution placement of a ready card."""
++from __future__ import annotations
++
++import sqlite3
++
++
++def registered_here(conn: sqlite3.Connection, task_id: str, probe: str) -> bool:
++    """The latest park registers this exact probe on this gateway.
++
++    Wake checks are machine-local and do not move with execution. Unknown legacy
++    custody stays conservative; a later park must never borrow an older host.
++    """
++    from hermes_cli import kanban_continuation as kc
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_wake_check as kwc
++
++    marks = ",".join("?" for _ in kc.SCHEDULED_ENTRY_EVENTS)
++    row = conn.execute(
++        f"SELECT payload FROM task_events WHERE task_id = ? AND kind IN ({marks}) "
++        "ORDER BY id DESC LIMIT 1", (task_id, *kc.SCHEDULED_ENTRY_EVENTS)).fetchone()
++    if row is None:
++        return False
++    payload = kb._json_dict(row[0])
++    own = kwc.own_gateway(conn)
++    return bool(own and payload.get("probe_host") == own and payload.get("wake_check") == probe)
+diff --git a/tests/hermes_cli/test_kanban_hub_probe_custody.py b/tests/hermes_cli/test_kanban_hub_probe_custody.py
+new file mode 100644
+index 0000000000..c1af28f459
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_hub_probe_custody.py
+@@ -0,0 +1,59 @@
++"""A registered probe's host is not the execution host of its ready card."""
++import pytest
++
++from hermes_cli import kanban_db as kb
++from tests.hermes_cli import test_kanban_hub_admission_claim as claim
++
++hub_judge = claim.hub_judge
++gws = claim.gws
++_claim_screen_first = claim._claim_screen_first
++
++
++@pytest.mark.parametrize("wake_event", [False, True])
++def test_registered_hub_probe_does_not_pin_ready_execution(gws, hub_judge, wake_event):
++    hub, worker, svc = gws
++    hub_judge.admit_next = False
++    tid = claim._hub_card(hub)
++    probe = "test -f ~/.hermes/cache/ready.flag"
++    with kb.write_txn(hub.conn):
++        kb._append_event(hub.conn, tid, "scheduled", {"wake_check": probe, "probe_host": claim.HUB})
++        if wake_event:
++            kb._append_event(hub.conn, tid, "condition_met", {"wake_check": probe})
++    claim._tick(hub)
++    assert claim._holder(svc, tid) != claim.HUB
++    [verdict] = claim._events(hub.conn, tid, "hub_admission")
++    assert verdict["admit"] is False and "kept" not in verdict
++    [moved] = claim._events(hub.conn, tid, "moved")
++    assert moved["runs_on"][0] == claim.POOL
++    hub.round()
++    worker.round()
++    worker.tick()
++    assert claim._holder(svc, tid) == claim.WORKER
++
++
++@pytest.mark.parametrize("payload", [
++    {}, {"probe_host": None}, {"probe_host": []}, {"probe_host": "worker-2"},
++    {"probe_host": claim.HUB, "wake_check": "test -f ~/.hermes/cache/different.flag"},
++])
++def test_unknown_or_different_probe_custody_keeps_the_local_guard(gws, payload):
++    from hermes_cli.kanban_hub_probe_custody import registered_here
++    hub, _worker, _svc = gws
++    tid = claim._hub_card(hub)
++    probe = "test -f ~/.hermes/cache/ready.flag"
++    assert not registered_here(hub.conn, tid, probe)
++    with kb.write_txn(hub.conn):
++        kb._append_event(hub.conn, tid, "scheduled", {"wake_check": probe, **payload})
++    assert not registered_here(hub.conn, tid, probe)
++
++
++def test_a_later_park_cannot_borrow_an_older_probe_host(gws):
++    from hermes_cli.kanban_hub_probe_custody import registered_here
++    hub, _worker, _svc = gws
++    tid = claim._hub_card(hub)
++    probe = "test -f ~/.hermes/cache/ready.flag"
++    with kb.write_txn(hub.conn):
++        kb._append_event(hub.conn, tid, "scheduled", {"wake_check": probe, "probe_host": claim.HUB})
++    assert registered_here(hub.conn, tid, probe)
++    with kb.write_txn(hub.conn):
++        kb._append_event(hub.conn, tid, "scheduled", {"wake_check": probe})
++    assert not registered_here(hub.conn, tid, probe)
+-- 
+2.43.0
+

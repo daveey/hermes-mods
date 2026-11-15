@@ -1,0 +1,99 @@
+From a15a67b893f6e8cadf17c67ec7ac0e5389bf1c29 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 23:06:04 +0000
+Subject: [PATCH] [daveey] Record origin custody on automatic pickup-gate
+ repins
+
+Automatic creator repins bypass the manual move event writer. Carry the actual pickup-gate decision with the creator-owned task record/origin coordination authority as host_reason. Do not claim target custody for pool self-checks. Malformed requirements stay an explicit fail-closed return, not an invented worker capability.
+
+Proof: new origin/action and malformed-contract assertions fail on base (2 failures), pass with fix. Focused machine-target/pickup-stall/pickup-gate suites: 133 passed; added pool negative control also passes. Full consumer coverage and mutation/replay proof in progress on t_01a1dc13f719875e; not yet approved for landing.
+---
+ hermes_cli/kanban_worker_placement.py         | 10 ++++++---
+ .../test_kanban_worker_first_pickup_gate.py   | 22 +++++++++++++++++++
+ 2 files changed, 29 insertions(+), 3 deletions(-)
+
+diff --git a/hermes_cli/kanban_worker_placement.py b/hermes_cli/kanban_worker_placement.py
+index 278b32a318..f95c8e5896 100644
+--- a/hermes_cli/kanban_worker_placement.py
++++ b/hermes_cli/kanban_worker_placement.py
+@@ -439,7 +439,10 @@ def reevaluate(conn, hub, board, gateway, *, cfg=None, may_pull=True):
+                     reply = hub.repin(board, task_id=row["id"], expected_revision=row["sync_version"], runs_on=labels)
+                     queue.clear_streak(gateway, row["id"])
+                     try:
+-                        _record_repin(conn, row["id"], gateway, labels, reply, reason=why)
++                        host_reason = (f"machine:{gateway} holds the creator-owned task record and origin-local "
++                                       f"coordination authority for this fail-closed return: {why}"
++                                       if refusals is _origin_refused else None)
++                        _record_repin(conn, row["id"], gateway, labels, reply, reason=why, host_reason=host_reason)
+                     except sqlite3.Error:
+                         logger.warning("repinned %s on the Board but could not record it locally", row["id"],
+                                        exc_info=True)
+@@ -625,7 +628,7 @@ def _remember_refusal(refusals, key, revision, exc):
+         del refusals[next(iter(refusals))]
+ 
+ 
+-def _record_repin(conn, task_id, gateway, labels, reply, *, reason=None):
++def _record_repin(conn, task_id, gateway, labels, reply, *, reason=None, host_reason=None):
+     from hermes_cli import kanban_db as kb
+     from hermes_cli import kanban_move as km
+     from hermes_cli.kanban_worker_repin import REPINNED_EVENT_FLAG
+@@ -638,7 +641,8 @@ def _record_repin(conn, task_id, gateway, labels, reply, *, reason=None):
+         kb._append_event(conn, task_id, km.MOVED_EVENT, {
+             "from_machine": gateway, "runs_on": labels,
+             "reason": reason or "applied the run's kanban_move as the creator repin",
+-            "queued": True, REPINNED_EVENT_FLAG: True, "board_version": version})
++            "queued": True, REPINNED_EVENT_FLAG: True, "board_version": version,
++            **({"host_reason": host_reason} if host_reason else {})})
+ 
+ 
+ def acknowledged_outbox(row, task):
+diff --git a/tests/hermes_cli/test_kanban_worker_first_pickup_gate.py b/tests/hermes_cli/test_kanban_worker_first_pickup_gate.py
+index b9d76dd9d2..bdbd22d573 100644
+--- a/tests/hermes_cli/test_kanban_worker_first_pickup_gate.py
++++ b/tests/hermes_cli/test_kanban_worker_first_pickup_gate.py
+@@ -82,6 +82,11 @@ def test_an_enrolled_card_every_pickup_gate_refuses_is_repinned_to_its_origin_on
+     _ticks(origin, hub)
+     assert hub.reserves == [], f"reserved {len(hub.reserves)} times in {TICKS} ticks; no worker can claim it"
+     assert [r["runs_on"] for r in hub.repins] == [[f"machine:{HUB}"]]
++    [moved] = [json.loads(p) for (p,) in origin.conn.execute(
++        "SELECT payload FROM task_events WHERE task_id=? AND kind='moved'", (tid,))]
++    assert f"machine:{HUB}" in moved["host_reason"]
++    assert "creator-owned" in moved["host_reason"]
++    assert moved["reason"] in moved["host_reason"]
+     local = origin.conn.execute("SELECT placement_policy, runs_on FROM tasks WHERE id=?", (tid,)).fetchone()
+     assert (local["placement_policy"], json.loads(local["runs_on"])) == (None, [f"machine:{HUB}"])
+     [event] = _mismatch_events(origin.conn, tid)
+@@ -116,6 +121,11 @@ def test_an_enrolled_card_with_malformed_requires_is_repinned_to_its_origin_once
+     _ticks(origin, hub)
+     assert hub.reserves == [], f"reserved {len(hub.reserves)} times in {TICKS} ticks; no worker can claim it"
+     assert [r["runs_on"] for r in hub.repins] == [[f"machine:{HUB}"]]
++    [moved] = [json.loads(p) for (p,) in origin.conn.execute(
++        "SELECT payload FROM task_events WHERE task_id=? AND kind='moved'", (tid,))]
++    assert f"machine:{HUB}" in moved["host_reason"]
++    assert "creator-owned" in moved["host_reason"]
++    assert moved["reason"] in moved["host_reason"]
+     local = origin.conn.execute("SELECT placement_policy, runs_on FROM tasks WHERE id=?", (tid,)).fetchone()
+     assert (local["placement_policy"], json.loads(local["runs_on"])) == (None, [f"machine:{HUB}"])
+     [event] = _mismatch_events(origin.conn, tid)
+@@ -124,6 +134,18 @@ def test_an_enrolled_card_with_malformed_requires_is_repinned_to_its_origin_once
+     assert coord.INVALID_REQUIRES in comment and f"`{malformed}`" in comment and f"machine:{HUB}" in comment
+ 
+ 
++def test_pool_selfcheck_does_not_claim_creator_host_state(gws, svc, monkeypatch):
++    origin, _worker = gws
++    tid = _enrolled(origin, "Fix the parser")
++    monkeypatch.setattr(wp, "_move_target", lambda *args: (["pool:worker"], "portable pool recovery"))
++    hub = PlacementHub(svc, HUB)
++    _ticks(origin, hub, 1)
++    [moved] = [json.loads(p) for (p,) in origin.conn.execute(
++        "SELECT payload FROM task_events WHERE task_id=? AND kind='moved'", (tid,))]
++    assert moved["runs_on"] == ["pool:worker"]
++    assert "host_reason" not in moved
++
++
+ def test_a_started_card_every_gate_refuses_is_never_reserved_and_noted_once(gws, svc, monkeypatch):
+     """The origin repin covers only unstarted cards; a started one stays put without reserves or a comment loop."""
+     origin, _worker = gws
+-- 
+2.43.0
+

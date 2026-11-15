@@ -1,0 +1,241 @@
+From 188313dec84087d4a49c05839d12a3e3c36cd421 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 05:36:17 +0000
+Subject: [PATCH] [daveey] Ignore idle app suites and accept skipped/neutral
+ runs in no-required fallback
+
+Review t_01a1d87dd3138fbb (REQUEST_CHANGES @17c3803a) found two blocking
+regressions in the no-required-check all-check fallback:
+
+B1: installed GitHub Apps (amplify, cloud-build, letta, cursor,
+reason-machines on daveey/hermes-mods) leave 0-run check suites queued
+forever, so every OPEN mods PR was 'missing' even with all CI green, and
+the absence waiver became unreachable. A 0-run suite is now idle (ignored,
+recorded in receipt.idle_suites) only when it is still 'queued', its app
+has no runs or non-empty suites on the commit, and it is older than a
+15-minute grace. Unreadable app/age, started suites and same-app suites
+still count as missing. Idle-only evidence keeps the bounded
+no_required_checks waiver; red/pending/missing evidence is never waived.
+
+B2: the fallback graded every run with the required-check classifier,
+which maps skipped and neutral to 'infra'. The fallback now accepts
+completed exact-head skipped/neutral runs as success, matching branch
+protection. The required-check path is unchanged.
+
+RED on 17c3803a: 8 new cases fail; GREEN: 55 passed. Consumers: 25 files,
+618 passed, 0 failed, 1 skipped. Live probe: hermes-mods #183 OPEN ->
+success (5 idle suites), #178 OPEN -> failure (red retained).
+---
+ hermes_cli/kanban_pr_fallback.py            | 67 ++++++++++++++--
+ tests/hermes_cli/test_kanban_pr_fallback.py | 86 ++++++++++++++++++++-
+ 2 files changed, 143 insertions(+), 10 deletions(-)
+
+diff --git a/hermes_cli/kanban_pr_fallback.py b/hermes_cli/kanban_pr_fallback.py
+index edb1369e30..67d6320b99 100644
+--- a/hermes_cli/kanban_pr_fallback.py
++++ b/hermes_cli/kanban_pr_fallback.py
+@@ -1,6 +1,13 @@
+ """All-check acceptance when a repository configures no required contexts."""
++from datetime import UTC, datetime, timedelta
++
+ from hermes_cli.kanban_pr_check_runs import _complete
+-from hermes_cli.kanban_pr_merge_time import check_receipt
++from hermes_cli.kanban_pr_merge_time import check_receipt, timestamp
++
++# A just-created empty suite may be CI that has not started its jobs yet.
++IDLE_SUITE_GRACE = timedelta(minutes=15)
++# GitHub branch protection accepts these completed conclusions as passing.
++_PASSING_CONCLUSIONS = ("neutral", "skipped")
+ 
+ 
+ def complete_statuses(pages, sha):
+@@ -10,7 +17,46 @@ def complete_statuses(pages, sha):
+     return [{**status, "sha": sha} for page in pages for status in page]
+ 
+ 
+-def fallback_outcomes(receipt, required, outcomes, runs, statuses, suites, *, merged):
++def _app_id(row):
++    app = row.get("app")
++    return app.get("id") if isinstance(app, dict) else None
++
++
++def idle_suites(suite_rows, runs, now):
++    """Installed apps that never run CI leave 0-run suites ``queued`` forever.
++
++    Such a suite is idle (ignored) only when nothing suggests real CI: it is
++    still ``queued``, its app has no runs or non-empty suites on this commit,
++    and it is older than the grace period. Anything unreadable stays non-idle.
++    """
++    active = {_app_id(r) for r in runs}
++    active |= {_app_id(s) for s in suite_rows if s.get("latest_check_runs_count") != 0}
++    idle = []
++    for suite in suite_rows:
++        app = _app_id(suite)
++        if suite.get("latest_check_runs_count") != 0 or suite.get("status") != "queued":
++            continue
++        if app is None or app in active:
++            continue
++        try:
++            age = now - timestamp(suite["created_at"].replace("Z", "+00:00"))
++        except (AttributeError, KeyError, TypeError, ValueError):
++            continue
++        if age >= IDLE_SUITE_GRACE:
++            idle.append(suite)
++    return idle
++
++
++def _grade(check, sha):
++    evidence = check_receipt(check, sha)
++    # _classify grades stale/pending before the conclusion map, so an "infra"
++    # row with a passing conclusion is a completed exact-head run.
++    if evidence["classification"] == "infra" and evidence["conclusion"] in _PASSING_CONCLUSIONS:
++        evidence["classification"] = "success"
++    return evidence
++
++
++def fallback_outcomes(receipt, required, outcomes, runs, statuses, suites, *, merged, now=None):
+     """Keep required semantics, otherwise require every current producer's success."""
+     if required:
+         return outcomes
+@@ -19,24 +65,33 @@ def fallback_outcomes(receipt, required, outcomes, runs, statuses, suites, *, me
+     latest = {}
+     for status in sorted(statuses, key=lambda s: s["id"]):
+         latest[(status["context"], (status.get("creator") or {}).get("id"))] = status
+-    receipt["checks"] = [check_receipt(c, sha) for c in runs + list(latest.values())]
++    receipt["checks"] = [_grade(c, sha) for c in runs + list(latest.values())]
++    idle = idle_suites(suite_rows, runs, now or datetime.now(UTC))
++    receipt["idle_suites"] = [{"id": s["id"], "app": (s.get("app") or {}).get("slug"),
++                               "status": s.get("status"), "created_at": s.get("created_at")}
++                              for s in idle]
++    idle_ids = {s["id"] for s in idle}
+     if not merged:
+         for suite in suite_rows:
+             # An empty latest attempt can be queued CI, not absence, even if
+             # other producers already succeeded. Required-context logic is separate.
+-            if suite["latest_check_runs_count"] == 0:
++            if suite["latest_check_runs_count"] == 0 and suite["id"] not in idle_ids:
+                 receipt["checks"].append({"name": f"check suite {suite['id']}",
+                     "classification": "missing", "head_sha": sha})
+     return [c["classification"] for c in receipt["checks"]]
+ 
+ 
+ def mark_absence(receipt, required, outcomes, suites, where):
+-    """Waive only proven absence, never missing/pending or post-merge-only CI."""
++    """Waive only proven absence, never missing/pending or post-merge-only CI.
++
++    Idle third-party suites (see ``idle_suites``) are absence, not evidence.
++    """
+     from hermes_cli.kanban_pr_acceptance import NO_REQUIRED_CHECKS_DETAIL, _REPOINT_HINT
+ 
+     if required or outcomes or receipt["post_merge_checks"]:
+         return
+-    if _complete(suites, "check_suites", "check-suite"):
++    idle_ids = {s["id"] for s in receipt.get("idle_suites", [])}
++    if any(s["id"] not in idle_ids for s in _complete(suites, "check_suites", "check-suite")):
+         return
+     receipt.update(classification="no_required_checks", detail=NO_REQUIRED_CHECKS_DETAIL.format(
+         where=where, repoint=_REPOINT_HINT))
+diff --git a/tests/hermes_cli/test_kanban_pr_fallback.py b/tests/hermes_cli/test_kanban_pr_fallback.py
+index fa05165a97..d81ec0c55d 100644
+--- a/tests/hermes_cli/test_kanban_pr_fallback.py
++++ b/tests/hermes_cli/test_kanban_pr_fallback.py
+@@ -28,10 +28,11 @@ def evidence(monkeypatch):
+         if "/check-suites?" in endpoint:
+             if state.get("missing_suites"):
+                 return [{"total_count": 1, "check_suites": []}]
+-            if not state["runs"] and not state.get("empty_suite"):
+-                return [{"total_count": 0, "check_suites": []}]
+-            return [{"total_count": 1, "check_suites": [{"id": 7, "app": {"id": 1},
+-                     "head_sha": SHA, "latest_check_runs_count": len(state["runs"])}]}]
++            rows = list(state.get("extra_suites", []))
++            if state["runs"] or state.get("empty_suite"):
++                rows.insert(0, {"id": 7, "app": {"id": 1}, "head_sha": SHA,
++                                "latest_check_runs_count": len(state["runs"])})
++            return [{"total_count": len(rows), "check_suites": rows}]
+         if "/statuses?" in endpoint:
+             return state.get("status_pages", [state["statuses"]])
+         if "/pulls/" in endpoint:
+@@ -165,3 +166,80 @@ def test_fallback_statuses_keep_producers_distinct(evidence):
+     assert gate.collect_acceptance(URL, None)["classification"] == "failure"
+     evidence["statuses"].append({"id": 3, "context": "ci", "state": "success", "creator": {"id": 1}})
+     assert gate.collect_acceptance(URL, None)["classification"] == "success"
++
++
++OLD = "2026-01-01T00:00:00Z"
++
++
++def suite(id, app, *, status="queued", created=OLD, count=0):
++    return {"id": id, "app": {"id": app, "slug": f"app-{app}"}, "head_sha": SHA,
++            "status": status, "created_at": created, "latest_check_runs_count": count}
++
++
++@pytest.mark.parametrize("merged", [False, True])
++def test_idle_third_party_suites_do_not_strand_green_ci(evidence, merged):
++    # hermes-mods PRs carry 0-run queued suites from installed apps that never run.
++    evidence.update(merged=merged, runs=[run("success")],
++                    extra_suites=[suite(100 + n, 900 + n) for n in range(5)])
++    receipt = gate.collect_acceptance(URL, None)
++    assert receipt["classification"] == "success"
++    assert receipt["ok"] is True
++    assert [s["id"] for s in receipt["idle_suites"]] == [100, 101, 102, 103, 104]
++
++
++@pytest.mark.parametrize("outcome,expected", [("failure", "failure"), ("pending", "pending"),
++                                             ("cancelled", "infra")])
++def test_idle_suites_never_hide_red_ci(evidence, outcome, expected):
++    evidence.update(runs=[run(outcome)], extra_suites=[suite(100, 900)])
++    assert gate.collect_acceptance(URL, None)["classification"] == expected
++
++
++@pytest.mark.parametrize("merged", [False, True])
++def test_only_idle_suites_is_waivable_absence(evidence, merged):
++    evidence.update(merged=merged, extra_suites=[suite(100, 900), suite(101, 901)])
++    receipt = gate.collect_acceptance(URL, None)
++    assert receipt["classification"] == "no_required_checks"
++    assert receipt["ok"] is False
++
++
++@pytest.mark.parametrize("live", [
++    suite(100, 1),                                    # same app as a producing suite
++    suite(100, 900, status="in_progress"),            # started
++    suite(100, 900, created="2999-01-01T00:00:00Z"),  # inside the grace period
++    {**suite(100, 900), "created_at": None},          # unreadable age
++    {**suite(100, 900), "app": None},                 # unreadable app
++])
++def test_possibly_live_empty_suite_stays_missing(evidence, live):
++    evidence.update(runs=[run("success")], extra_suites=[live])
++    receipt = gate.collect_acceptance(URL, None)
++    assert receipt["classification"] in ("missing", "infra")
++    assert receipt["ok"] is False
++    assert not receipt.get("idle_suites")
++
++
++def test_possibly_live_empty_suite_blocks_absence_waiver(evidence):
++    evidence.update(merged=True, extra_suites=[suite(100, 900, status="in_progress")])
++    assert gate.collect_acceptance(URL, None)["classification"] == "missing"
++
++
++@pytest.mark.parametrize("conclusion", ["skipped", "neutral"])
++@pytest.mark.parametrize("merged", [False, True])
++def test_fallback_accepts_skipped_and_neutral(evidence, conclusion, merged):
++    evidence.update(merged=merged, runs=[run("success"), {**run(conclusion, id=2), "name": "cond"}])
++    receipt = gate.collect_acceptance(URL, None)
++    assert receipt["classification"] == "success"
++    assert [c["conclusion"] for c in receipt["checks"]] == ["success", conclusion]
++
++
++def test_skipped_on_another_head_is_not_success(evidence):
++    evidence["runs"] = [{**run("skipped"), "head_sha": "b" * 40}]
++    assert gate.collect_acceptance(URL, None)["classification"] != "success"
++
++
++def test_required_checks_keep_strict_conclusions():
++    from hermes_cli.kanban_pr_fallback import fallback_outcomes
++
++    receipt = {"head_sha": SHA, "checks": [{"classification": "infra"}]}
++    assert fallback_outcomes(receipt, {("ci", None)}, ["infra"], [run("skipped")], [], [],
++                             merged=False) == ["infra"]
++    assert receipt["checks"] == [{"classification": "infra"}]
+-- 
+2.43.0
+

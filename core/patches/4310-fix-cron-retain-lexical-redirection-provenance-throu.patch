@@ -1,0 +1,235 @@
+From 0376877c9c94a3cae3929318294a02b5c3341637 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 04:08:01 +0000
+Subject: [PATCH] fix(cron): retain lexical redirection provenance through
+ quote removal [daveey]
+
+Quote-stripped argv was misclassified as real descriptor close/rebind syntax, erasing known stdin sources. Carry parsed redirection metadata beside decoded words, protecting literal punctuation and escaping the encoding character itself. Preserve descriptor transfers and target filenames.
+
+Proof: all four reported malicious stdin regressions fail on 9e7dcd953c and pass with repair; harmless real Bash markers and benign scripts pass. Full lifecycle consumer run: 3207 passed before added collision controls; final-head consumers rerun after canonical publication. Adds quote-fragment sentinel collision controls with dangerous/benign files swapped. Review 5901419054 repair; landing owner t_01a1d756e3461c64 retains independent final-head review and merge.
+---
+ cron/lifecycle_guard.py                       | 19 ++---
+ cron/lifecycle_guard_words.py                 | 57 +++++++++++++++
+ ...est_lifecycle_guard_quoted_redirections.py | 69 +++++++++++++++++++
+ 3 files changed, 136 insertions(+), 9 deletions(-)
+ create mode 100644 cron/lifecycle_guard_words.py
+ create mode 100644 tests/cron/test_lifecycle_guard_quoted_redirections.py
+
+diff --git a/cron/lifecycle_guard.py b/cron/lifecycle_guard.py
+index 1b7a5c0281..11584c64e6 100644
+--- a/cron/lifecycle_guard.py
++++ b/cron/lifecycle_guard.py
+@@ -24,6 +24,7 @@ from cron.lifecycle_guard_groups import CONTROL_CHARS as _CONTROL_CHARS
+ from cron.lifecycle_guard_groups import (
+     heredoc_scripts, iter_script_segment_contexts, join_continued_lines,
+     protect_redirection_ampersands, restore_redirection_ampersands, split_glued_redirections)
++from cron.lifecycle_guard_words import redirection_parts, tokenize_redirections
+ from cron.lifecycle_guard_lines import (  # newlines outside quotes, word-start `#` comments
+     _split_logical_lines, join_line_continuations, strip_shell_comments,
+ )
+@@ -743,11 +744,11 @@ def _iter_command_token_lists(command: str) -> Iterator[list[str]]:
+     of its own (``python3 -<f.py``), as in the shell."""
+     for line in _split_logical_lines(strip_shell_comments(command).replace("\\\n", "")):
+         try:
+-            tokens = _shlex_tokens(split_glued_redirections(line))
++            tokens = tokenize_redirections(line, _shlex_tokens, _REDIRECTION)
+         except ValueError:
+             for physical_line in line.splitlines():
+                 try:
+-                    yield _shlex_tokens(split_glued_redirections(physical_line))
++                    yield tokenize_redirections(physical_line, _shlex_tokens, _REDIRECTION)
+                 except ValueError:
+                     continue
+             continue
+@@ -927,12 +928,12 @@ def _split_redirections(arguments: list[str]) -> tuple[list[str], list[str]]:
+     opened: dict[str, str] = {}
+     index = 0
+     while index < len(arguments):
+-        match = _REDIRECTION.match(arguments[index])
++        match = redirection_parts(arguments[index], _REDIRECTION)
+         index += 1
+         if match is None:
+             kept.append(arguments[index - 1])
+             continue
+-        fd, operator, target = match.groups()
++        fd, operator, target = match
+         if not target and index < len(arguments):
+             target = arguments[index]
+             index += 1
+@@ -970,11 +971,11 @@ def _cat_relays_stdin(segment: list[str]) -> bool:
+         if index is not None and (name := _executable_name(view[index])) in ("cat", "tee"):
+             words, arguments = iter(view[index + 1 :]), []
+             for word in words:
+-                match = _REDIRECTION.match(word)
++                match = redirection_parts(word, _REDIRECTION)
+                 if match is None:
+                     arguments.append(word)
+                     continue
+-                fd, operator, target = match.groups()
++                fd, operator, target = match
+                 target = target or next(words, "")
+                 if fd in ("", "0") and operator.startswith("<") and (operator, target) != ("<&", "0"):
+                     return False  # `cat < x`, `cat <<< x`, `cat <&3` read their own stdin
+@@ -1081,10 +1082,10 @@ def _hoist_command_redirections(segment: list[str]) -> list[str]:
+ def _redirection_width(word: str) -> int:
+     """Words a redirection starting at *word* spans: 1 with a glued target (``<f``), 2 when the
+     target is the next word (``< f``), 0 when *word* is not a redirection."""
+-    match = _REDIRECTION.match(word)
++    match = redirection_parts(word, _REDIRECTION)
+     if match is None:
+         return 0
+-    return 1 if match.group(3) else 2
++    return 1 if match[2] else 2
+ 
+ 
+ def _iter_command_segment_views(command: str) -> Iterator[list[str]]:
+@@ -1189,7 +1190,7 @@ def _mask_data_sink_arguments(text: str) -> str:
+             lines_out.append(line)
+             continue
+         try:
+-            tokens = _shlex_tokens(split_glued_redirections(line))
++            tokens = tokenize_redirections(line, _shlex_tokens, _REDIRECTION)
+         except ValueError:
+             lines_out.append(line)
+             continue
+diff --git a/cron/lifecycle_guard_words.py b/cron/lifecycle_guard_words.py
+new file mode 100644
+index 0000000000..0b267c777b
+--- /dev/null
++++ b/cron/lifecycle_guard_words.py
+@@ -0,0 +1,57 @@
++"""Carry redirection syntax through quote removal without changing argv text."""
++from __future__ import annotations
++
++from collections.abc import Callable
++import re
++
++from cron.lifecycle_guard_groups import split_glued_redirections
++
++
++class ShellWord(str):
++    """A decoded word plus the redirection parsed before quoted punctuation is decoded."""
++
++    redirection: tuple[str, str, str] | None
++
++    def __new__(cls, text: str, redirection: tuple[str, str, str] | None):
++        word = super().__new__(cls, text)
++        word.redirection = redirection
++        return word
++
++
++def redirection_parts(word: str, pattern: re.Pattern[str]) -> tuple[str, str, str] | None:
++    if isinstance(word, ShellWord):
++        return word.redirection
++    match = pattern.match(word)  # Legacy callers supply already lexical redirection words.
++    return (match[1], match[2], match[3]) if match else None
++
++
++def tokenize_redirections(line: str, tokenize: Callable[[str], list[str]],
++                          pattern: re.Pattern[str]) -> list[str]:
++    # Encode the escape character itself too, even outside quotes. A one-pass
++    # decode cannot confuse literal fragments joined by quote removal with syntax.
++    marker = "\ue000"
++    alphabet = "<>&|" + marker
++    replacements = {ch: f"{marker}{index}{marker}" for index, ch in enumerate(alphabet)}
++    protected: list[str] = []
++    single = double = escaped = False
++    for ch in line:
++        literal = single or double or escaped
++        if escaped:
++            escaped = False
++        elif ch == "\\" and not single:
++            escaped = True
++        elif ch == "'" and not double:
++            single = not single
++        elif ch == '"' and not single:
++            double = not double
++        protected.append(replacements.get(ch, ch) if literal or ch == marker else ch)
++
++    def restore(text: str) -> str:
++        return re.sub(marker + r"([0-4])" + marker, lambda m: alphabet[int(m[1])], text)
++
++    words: list[str] = []
++    for token in tokenize(split_glued_redirections("".join(protected))):
++        match = pattern.match(token)
++        parts = (restore(match[1]), restore(match[2]), restore(match[3])) if match else None
++        words.append(ShellWord(restore(token), parts))
++    return words
+diff --git a/tests/cron/test_lifecycle_guard_quoted_redirections.py b/tests/cron/test_lifecycle_guard_quoted_redirections.py
+new file mode 100644
+index 0000000000..43702abe3d
+--- /dev/null
++++ b/tests/cron/test_lifecycle_guard_quoted_redirections.py
+@@ -0,0 +1,69 @@
++"""Quoted argv must not overwrite the provenance of real stdin redirections."""
++import subprocess
++
++import pytest
++
++from cron.lifecycle_guard import _iter_command_token_lists, _split_redirections, scan_gateway_lifecycle
++
++
++ARGV = ["'0<&-'", "'0>out'", "'0<clean'", r"0\<\&-"]
++
++
++@pytest.mark.parametrize("argument", ARGV)
++@pytest.mark.parametrize("dangerous", [True, False])
++def test_quoted_redirection_argument_keeps_stdin(tmp_path, argument, dangerous):
++    script = tmp_path / "r.sh"
++    script.write_text(" ".join(["hermes", "gateway", "restart"]) + "\n"
++                      if dangerous else "echo harmless\n", encoding="utf-8")
++    (tmp_path / "clean").write_text("echo clean\n", encoding="utf-8")
++    assert scan_gateway_lifecycle(f"bash -s <{script} {argument}", cwd=str(tmp_path)) == (dangerous, None)
++
++
++@pytest.mark.parametrize("argument", ARGV)
++def test_real_bash_quoted_redirection_argument_executes_stdin(tmp_path, argument):
++    # Only a harmless marker is executed, never a lifecycle command.
++    (tmp_path / "r.sh").write_text("printf 'STDIN_EXECUTED\\n'\n", encoding="utf-8")
++    (tmp_path / "clean").write_text("echo clean\n", encoding="utf-8")
++    result = subprocess.run(["bash", "--noprofile", "--norc", "-c", f"bash -s <r.sh {argument}"],
++                            cwd=tmp_path, capture_output=True, text=True, encoding="utf-8", timeout=5, check=False)
++    assert result.returncode == 0, result.stderr
++    assert result.stdout == "STDIN_EXECUTED\n"
++    assert not (tmp_path / "out").exists()
++
++
++@pytest.mark.parametrize("source, kept, stdin", [
++    ("<bad '0<&-'", ["0<&-"], ["bad"]),
++    ('<bad "0<&-"', ["0<&-"], ["bad"]),
++    (r"<bad 0\<\&-", ["0<&-"], ["bad"]),
++    ("<bad 0'<'\"&-\"", ["0<&-"], ["bad"]),
++    ("<bad 0<&-", [], []),
++    ("<bad 0>out", [], []),
++    ("<bad 0<clean", [], ["clean"]),
++    ("<bad 0<'&-'", [], ["&-"]),
++    (r"<bad 0<\&-", [], ["&-"]),
++    ("3<bad 4>&3- <&4", [], ["bad"]),
++    ("3<bad '4>&3-' <&3", ["4>&3-"], ["bad"]),
++    ("<'0<clean'", [], ["0<clean"]),
++    ("< '\ue0000\ue000'", [], ["\ue0000\ue000"]),
++])
++def test_lexical_redirection_parts(source, kept, stdin):
++    tokens, = _iter_command_token_lists(source)
++    assert _split_redirections(tokens) == (kept, stdin)
++
++
++@pytest.mark.parametrize("name", ["0<clean", "\ue0000\ue000", "\ue000\ue0001\ue000\ue000"])
++@pytest.mark.parametrize("dangerous", [True, False])
++def test_quoted_input_filename_preserved(tmp_path, name, dangerous):
++    (tmp_path / name).write_text(" ".join(["hermes", "gateway", "restart"]) + "\n"
++                                 if dangerous else "echo harmless\n", encoding="utf-8")
++    assert scan_gateway_lifecycle(f"bash <'{name}'", cwd=str(tmp_path)) == (dangerous, None)
++
++
++@pytest.mark.parametrize("spelling", ["\ue0000\ue000", "\ue000''0\ue000", "\ue000''\ue0000\ue000''\ue000"])
++@pytest.mark.parametrize("literal_dangerous", [True, False])
++def test_quote_fragment_marker_collision(tmp_path, spelling, literal_dangerous):
++    literal = spelling.replace("'", "")
++    bad = " ".join(["hermes", "gateway", "restart"]) + "\n"
++    for name, dangerous in [(literal, literal_dangerous), ("<", not literal_dangerous)]:
++        (tmp_path / name).write_text(bad if dangerous else "echo harmless\n", encoding="utf-8")
++    assert scan_gateway_lifecycle(f"bash <{spelling}", cwd=str(tmp_path)) == (literal_dangerous, None)
+-- 
+2.43.0
+

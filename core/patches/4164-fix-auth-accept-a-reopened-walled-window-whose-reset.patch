@@ -1,0 +1,102 @@
+From 49ca774e96f0ad6640ec4030b009db1633a78563 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 05:27:27 +0000
+Subject: [PATCH] fix(auth): accept a reopened walled window whose reset moved
+ later [daveey]
+
+A redeemed banked/upstream reset reopens the weekly window with a later reset than
+the persisted wall (#43747), so exact reset matching would keep a usable account
+benched for days. Evidence now needs an open window resetting no earlier than the
+persisted wall (60 s tolerance); a short window resetting before it still proves
+nothing, so the 03:07Z short-window false positive stays benched.
+
+Proof: boundary params (-61 s false, +7 d true, -6 d false); #43747 pool-selection
+test now uses a moved reset. 6 focused files / 88 tests pass; 279 consumer files /
+4933 passed, 2 failed in tests/e2e/core/providers/test_oauth_device_flow.py poll
+cadence (timing under -j16 load; untouched code; passes isolated).
+---
+ fixture/cache/plugin_hooks.json                      |  2 +-
+ hermes_cli/auth_codex_quota_window.py                | 10 +++++++---
+ tests/agent/test_codex_rotation_window_boundaries.py |  6 +++++-
+ tests/hermes_cli/test_auth_codex_quota_probe.py      |  5 +++--
+ 4 files changed, 16 insertions(+), 7 deletions(-)
+
+diff --git a/fixture/cache/plugin_hooks.json b/fixture/cache/plugin_hooks.json
+index 1c1a56c3e7..fc8e63031c 100644
+--- a/fixture/cache/plugin_hooks.json
++++ b/fixture/cache/plugin_hooks.json
+@@ -1 +1 @@
+-{"version": 1, "fingerprint": "e8b721429371650aa0e8f0aa0194109e861f19dcf00a2c8bc9e69cf2ea5448f5", "hooks": ["on_session_end", "post_tool_call", "pre_tool_call", "transform_tool_result"]}
+\ No newline at end of file
++{"version": 1, "fingerprint": "7af0cf1e9bc92b4cc7c8940b7947dad36625f8d6b4b817a9dcce35661e9ba698", "hooks": ["on_session_end", "post_tool_call", "pre_tool_call", "transform_tool_result"]}
+\ No newline at end of file
+diff --git a/hermes_cli/auth_codex_quota_window.py b/hermes_cli/auth_codex_quota_window.py
+index e6c9e8fd36..430979f80c 100644
+--- a/hermes_cli/auth_codex_quota_window.py
++++ b/hermes_cli/auth_codex_quota_window.py
+@@ -9,14 +9,18 @@ def _number(value):
+ def quota_restored(payload, reset_at=None):
+     """A partial short-window response cannot disprove a named long-window wall.
+ 
+-    Match absolute reset epochs with a minute of provider rounding tolerance.
+-    Unknown/missing evidence keeps the bench; account/model denial always wins.
++    Evidence must include an open window that resets no earlier than the persisted wall
++    (a minute of provider rounding tolerance): the walled window itself, or the same
++    window after a banked/upstream reset moved its reset later (#43747). A shorter
++    window that resets before the wall says nothing about it. Unknown/missing evidence
++    keeps the bench; account/model denial always wins.
+     """
+     limits = [payload.get("rate_limit") or {}] + [
+         extra.get("rate_limit") or {} for extra in (payload.get("additional_rate_limits") or [])
+         if isinstance(extra, dict)]
+     usages = []
+     matched = reset_at is None
++    floor = float(reset_at) - 60 if _number(reset_at) else None
+     for limit in limits:
+         if limit.get("allowed") is False or limit.get("limit_reached") is True:
+             return False
+@@ -26,7 +30,7 @@ def quota_restored(payload, reset_at=None):
+             if _number(used):
+                 usages.append(used)
+                 reset = window.get("reset_at")
+-                if _number(reset_at) and _number(reset) and abs(reset - reset_at) <= 60:
++                if floor is not None and _number(reset) and reset >= floor:
+                     matched = True
+     return bool(usages) and matched and all(0 <= used < 100 for used in usages)
+ 
+diff --git a/tests/agent/test_codex_rotation_window_boundaries.py b/tests/agent/test_codex_rotation_window_boundaries.py
+index 6b2515ad68..1990aea399 100644
+--- a/tests/agent/test_codex_rotation_window_boundaries.py
++++ b/tests/agent/test_codex_rotation_window_boundaries.py
+@@ -10,7 +10,11 @@ from hermes_cli.auth_codex_quota_window import quota_restored
+ from tests.agent.test_codex_rotation_window import _pool, _rotate
+ 
+ 
+-@pytest.mark.parametrize("delta, expected", [(0, True), (60, True), (-60, True), (61, False)])
++@pytest.mark.parametrize("delta, expected", [
++    (0, True), (60, True), (-60, True), (-61, False),
++    (7 * 86400, True),  # banked/upstream reset moved the walled window later (#43747)
++    (-6 * 86400, False),  # a 5h window resetting before a weekly wall is not evidence
++])
+ def test_window_reset_tolerance(delta, expected):
+     assert quota_restored({"rate_limit": {"primary_window": {
+         "used_percent": 0, "reset_at": 1000 + delta}}}, 1000) is expected
+diff --git a/tests/hermes_cli/test_auth_codex_quota_probe.py b/tests/hermes_cli/test_auth_codex_quota_probe.py
+index 96a78567f4..66e0f09af6 100644
+--- a/tests/hermes_cli/test_auth_codex_quota_probe.py
++++ b/tests/hermes_cli/test_auth_codex_quota_probe.py
+@@ -431,8 +431,9 @@ def test_pool_selection_keeps_probe_rotated_tokens_when_quota_restored(tmp_path,
+     refresh_calls: list = []
+     _fake_refresh(monkeypatch, fresh, refresh_calls)
+     payload = _usage_payload(0.0, 0.0)
+-    # Restoration must prove the same weekly window, not just anonymous percentages.
+-    payload["rate_limit"]["secondary_window"]["reset_at"] = store["credential_pool"]["openai-codex"][0]["last_error_reset_at"]
++    # Restoration must cover the walled window, not just anonymous percentages: a redeemed
++    # banked reset reopens it with a later reset than the persisted wall.
++    payload["rate_limit"]["secondary_window"]["reset_at"] = now + 7 * 86400
+     http_calls = _patch_expiry_aware_httpx(monkeypatch, _StubResponse(200, payload))
+     from agent.credential_pool import load_pool
+ 
+-- 
+2.43.0
+

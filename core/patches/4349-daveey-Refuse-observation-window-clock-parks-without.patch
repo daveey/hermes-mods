@@ -1,0 +1,330 @@
+From a166e164db36f5ab1ad8bddb902c9158ca6ccb55 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 23:05:27 +0000
+Subject: [PATCH] [daveey] Refuse observation-window clock parks without
+ explicit soak request
+
+---
+ hermes_cli/kanban_awaiting.py             |  16 ++-
+ hermes_cli/kanban_soak_wait.py            |  61 ++++++++++
+ tests/hermes_cli/test_kanban_awaiting.py  |  20 ++--
+ tests/hermes_cli/test_kanban_soak_wait.py | 129 ++++++++++++++++++++++
+ 4 files changed, 212 insertions(+), 14 deletions(-)
+ create mode 100644 hermes_cli/kanban_soak_wait.py
+ create mode 100644 tests/hermes_cli/test_kanban_soak_wait.py
+
+diff --git a/hermes_cli/kanban_awaiting.py b/hermes_cli/kanban_awaiting.py
+index 4755d0b198..46cf8c2048 100644
+--- a/hermes_cli/kanban_awaiting.py
++++ b/hermes_cli/kanban_awaiting.py
+@@ -17,7 +17,9 @@ Each park now carries ``awaiting = {kind, ref, why}`` on its parking event:
+   over 15 min and no runner is refused (``ci_run_unstartable``), and a card parked on one is woken
+   (``kanban_ci_progress``).
+ * ``external``: ``ref`` names the vendor or ticket and ``why`` gives the evidence.
+-* ``clock``: a real window (a soak, a cooldown, a release slot).
++* ``clock``: a real cooldown or release slot. Observation-window parks are refused (``soak_wait``):
++  check now and report the actual elapsed window. Quota resets, short continuation pacing (<=2 h),
++  and an explicit ``soak_requested_by: David — "<his words>"`` line on the card are exempt.
+ * ``resource``: an internal resource gate (a governor's pool or host-pressure hold) whose own
+   ``wake_check`` passes once the reading drops below its threshold. It needs that probe, never
+   escalates into an "Unstick" owner card (nobody can act on a transient load reading), and a
+@@ -69,7 +71,9 @@ OPAQUE_PROBE_WAIT = "opaque_probe_wait"
+ PRODUCER_DONE = "producer_done"
+ # The CI run the park names has a job queued past the limit with no runner (``kanban_ci_progress``).
+ CI_RUN_UNSTARTABLE = "ci_run_unstartable"
+-CODES = (AGENT_ACTION_WAIT, HUMAN_WAIT, INVALID_AWAITING, OPAQUE_PROBE_WAIT, PRODUCER_DONE, CI_RUN_UNSTARTABLE)
++SOAK_WAIT = "soak_wait"
++CODES = (AGENT_ACTION_WAIT, HUMAN_WAIT, INVALID_AWAITING, OPAQUE_PROBE_WAIT, PRODUCER_DONE, CI_RUN_UNSTARTABLE,
++         SOAK_WAIT)
+ # Parks in a row on one premise before the next one escalates instead (the 3rd park = 2nd re-park).
+ REPARK_LIMIT = 2
+ # Fires of one opaque probe, each followed by a re-park on it, before the next park escalates: a probe
+@@ -559,9 +563,13 @@ def resolve(conn: sqlite3.Connection, task_id: str, *, awaiting: Any, reason: Op
+     from hermes_cli.kanban_comment_origin import check_park
+     check_park(conn, task_id, wake_check)
+     declared = normalize(awaiting)
++    from hermes_cli import kanban_soak_wait
+     if declared is None:
+-        return _infer(conn, task_id, reason=reason, wake_check=wake_check, clock_only=clock_only,
+-                      op=op, wake_in=wake_in)
++        inferred = _infer(conn, task_id, reason=reason, wake_check=wake_check, clock_only=clock_only,
++                          op=op, wake_in=wake_in)
++        kanban_soak_wait.check(conn, task_id, inferred, reason, short_continue=_short_continue(op, wake_in))
++        return inferred
++    kanban_soak_wait.check(conn, task_id, declared, reason, short_continue=_short_continue(op, wake_in))
+     text = " ".join(x for x in (reason, declared.get("why"), declared.get("ref")) if x)
+     if declared["kind"] == RESOURCE and not (wake_check and str(wake_check).strip()):
+         raise AwaitingError(INVALID_AWAITING, (
+diff --git a/hermes_cli/kanban_soak_wait.py b/hermes_cli/kanban_soak_wait.py
+new file mode 100644
+index 0000000000..d0e47c3315
+--- /dev/null
++++ b/hermes_cli/kanban_soak_wait.py
+@@ -0,0 +1,61 @@
++"""Reject nominal observation windows; measure the evidence already available. [daveey]"""
++from __future__ import annotations
++
++import re
++import sqlite3
++
++_NUMBER_WORDS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
++                 "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
++                 "a": 1, "an": 1}
++_DURATION = re.compile(
++    r"\b(\d+(?:\.\d+)?(?=[\s-]*[a-z])|(?:one|two|three|four|five|six|seven|eight|nine|ten|an?)(?=[\s-]))"
++    r"[\s-]*(minutes?|mins?|m|hours?|hrs?|h|days?|d|weeks?|w)\b", re.IGNORECASE)
++_OBSERVATION = re.compile(
++    r"\b(?:window|watch|observation|readback|recount|live check)\b|"
++    r"\bafter\s+(?:deploy\w*|merge\w*|landed|went live)\b", re.IGNORECASE)
++_SOAK = re.compile(r"\bsoak\b", re.IGNORECASE)
++_QUOTA_RESET = re.compile(r"\bquota[\s-]*reset\b|\b(?:quota|pool)\b[^.;\n]{0,60}\breset\b", re.IGNORECASE)
++_REQUEST = re.compile(r'^\s*soak_requested_by: David — "[^"\n]*\S[^"\n]*"[ \t]*$', re.MULTILINE)
++
++
++def observation_wait(text: str) -> bool:
++    """A soak, or >=1h with observation wording; quota resets are real clock producers."""
++    if _QUOTA_RESET.search(text):
++        return False
++    if _SOAK.search(text):
++        return True
++    if not _OBSERVATION.search(text):
++        return False
++    for amount, unit in _DURATION.findall(text.lower()):
++        value = _NUMBER_WORDS[amount] if amount in _NUMBER_WORDS else float(amount)
++        hours = value * {"m": 1 / 60, "h": 1, "d": 24, "w": 168}[unit[0]]
++        if hours >= 1:
++            return True
++    return False
++
++
++def requested(conn: sqlite3.Connection, task_id: str) -> bool:
++    """Only a complete opt-in line on this card, not park prose claiming prior approval."""
++    rows = conn.execute(
++        "SELECT body FROM tasks WHERE id=? UNION ALL SELECT body FROM task_comments WHERE task_id=?",
++        (task_id, task_id))
++    return any(_REQUEST.search(row[0] or "") for row in rows)
++
++
++def check(conn: sqlite3.Connection, task_id: str, record: dict, reason: str | None,
++          *, short_continue: bool) -> None:
++    from hermes_cli.kanban_awaiting import AwaitingError
++
++    if record["kind"] != "clock" or short_continue:
++        return
++    text = " ".join((reason or "", record.get("why", "")))
++    if not observation_wait(text) or requested(conn, task_id):
++        return
++    raise AwaitingError("soak_wait", (
++        'David\'s rule: "i dont want to wait for any soaking, if something is waiting for a soak, '
++        'run the check immediately and complete". Run the check now on evidence gathered since the '
++        'event and state the real window (e.g. "3.2 h", never "24 h"). A deploy precondition parks '
++        "as kind='deploy' on a tested probe (e.g. hub-admin fleet-has-core.sh <sha>). A natural-event "
++        "precondition required by acceptance parks on a wake_check for that condition with its producer. "
++        'Only an explicit request recorded on the card as soak_requested_by: David — "<his words>" '
++        "permits an observation-window clock park."))
+diff --git a/tests/hermes_cli/test_kanban_awaiting.py b/tests/hermes_cli/test_kanban_awaiting.py
+index 5b3db207f1..68ee12c2d8 100644
+--- a/tests/hermes_cli/test_kanban_awaiting.py
++++ b/tests/hermes_cli/test_kanban_awaiting.py
+@@ -3,7 +3,7 @@
+ Replays of the four 10-26/27 orphan waits (``~/.hermes/kanban/evidence/orphan-waits-20261027/
+ 5whys.md``; reasons verbatim from the parking events and the state-branch fixtures in
+ ``tests/test_session_idle_orphan_wait.py``) must be refused with a typed error, and the controls
+-from those fixtures (a running card, an in-progress CI run, a pure clock soak, a wait on a card
++from those fixtures (a running card, an in-progress CI run, a pure clock wait, a wait on a card
+ blocked on David with a visible ask) must still park.
+ """
+ from __future__ import annotations
+@@ -224,10 +224,10 @@ def test_replay_tracker_card_that_produces_nothing_is_refused(kanban_home, monke
+     "Waiting for AWS support to grant the quota increase (case 1234567).",
+     "Upstream API returns 403 Forbidden while their maintenance runs; SCHEDULED_UNTIL=2099-01-01T00:00:00Z",
+     "Rate limiter returned 401 unauthorized until the token rotates at 02:00.",
+-    "No permissions changes needed; waiting for nightly soak.",
++    "No permissions changes needed; waiting for nightly release slot.",
+     "Earlier run hit permission denied on cache; fixed in PR 12. Waiting for CI rerun.",
+-    "Per David's decision yesterday, deploy then soak 24h.",
+-    "Following David's approval in chat, rollout is live; 24h soak.",
++    "Per David's decision yesterday, deploy at the release slot.",
++    "Following David's approval in chat, rollout is live; cooldown.",
+     "David's decision recorded 23:06 (design A); waiting for TestFlight processing build 412.",
+ ])
+ def test_ordinary_park_prose_is_not_a_wall(kanban_home, monkeypatch, reason) -> None:
+@@ -264,8 +264,8 @@ def test_ci_wait_needs_a_run_id(kanban_home, monkeypatch) -> None:
+ 
+ 
+ @pytest.mark.parametrize("reason", [
+-    "SCHEDULED_UNTIL=2099-01-01T00:00:00Z \u2014 24h OOM soak window after deploy.",
+-    "No David decision needed; waiting on the 24h soak. SCHEDULED_UNTIL=2099-01-01T00:00:00Z",
++    "SCHEDULED_UNTIL=2099-01-01T00:00:00Z \u2014 release slot.",
++    "No David decision needed; waiting on cooldown. SCHEDULED_UNTIL=2099-01-01T00:00:00Z",
+     "Fixed file permissions on the cache dir; waiting for the nightly run at 02:00 to confirm.",
+ ])
+ def test_pure_clock_waits_park(kanban_home, monkeypatch, reason) -> None:
+@@ -533,7 +533,7 @@ def test_pacing_continues_and_distinct_clock_windows_never_escalate(kanban_home,
+             out = _repark(conn, monkeypatch, a, "continue", {
+                 "checkpoint": "Build still running; check again.", "resume_after_seconds": 300})
+             assert out.get("status") == "scheduled", out
+-        for why in ("24h soak after deploy A", "release slot Monday", "cooldown after B", "soak after C"):
++        for why in ("release slot A", "release slot Monday", "cooldown after B", "cooldown after C"):
+             out = _repark(conn, monkeypatch, b, "schedule", {
+                 "reason": "window", "clock_only": True, "awaiting": {"kind": "clock", "why": why}})
+             assert out.get("status") == "scheduled", out
+@@ -610,7 +610,7 @@ def test_opaque_probe_with_a_declared_external_producer_parks(kanban_home, monke
+     ("schedule", {"reason": "Owner card builds the image.", "wake_check": "hermes kanban wait-check task {owner}"}),
+     ("continue", {"checkpoint": "Build still running; check again.", "resume_after_seconds": 600,
+                   "wake_check": "! ps -p 3966721 >/dev/null"}),
+-    ("block", {"reason": "SCHEDULED_UNTIL=2099-01-01T00:00:00Z \u2014 24h soak window.", "kind": "time",
++    ("block", {"reason": "SCHEDULED_UNTIL=2099-01-01T00:00:00Z \u2014 release slot.", "kind": "time",
+                "clock_only": True}),
+ ])
+ def test_named_producers_and_short_continues_still_park(kanban_home, monkeypatch, op, args) -> None:
+@@ -728,9 +728,9 @@ def test_wake_probe_naming_a_descendant_is_refused(kanban_home, monkeypatch) ->
+         parent = _running(conn)
+         child = _linked_child(conn, parent)
+         _as_worker(monkeypatch, conn, parent)
+-        out = _tool("schedule", {"reason": "soak", "clock_only": True,
++        out = _tool("schedule", {"reason": "release slot", "clock_only": True,
+                                  "wake_check": f"hermes kanban wait-check task {child}",
+-                                 "awaiting": {"kind": "clock", "why": "24h soak"}})
++                                 "awaiting": {"kind": "clock", "why": "release slot"}})
+         assert out.get("rejection") == kaw.INVALID_AWAITING or out.get("code") == kaw.INVALID_AWAITING, out
+         assert "descendant" in (out.get("error") or "")
+         assert kb.get_task(conn, parent).status == "running"
+diff --git a/tests/hermes_cli/test_kanban_soak_wait.py b/tests/hermes_cli/test_kanban_soak_wait.py
+new file mode 100644
+index 0000000000..0cb5ac670b
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_soak_wait.py
+@@ -0,0 +1,129 @@
++"""Clock observation parks must run their checks now, not wait out a nominal soak."""
++import pytest
++
++from hermes_cli import kanban_awaiting as kaw
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_wake_check as kwc
++from tests.hermes_cli import test_kanban_awaiting as helpers
++
++kanban_home = helpers.kanban_home
++
++SOAKS = [
++    "24 h soak after PR #3051 (landed yesterday)",
++    "48 h post-apply measurement window for the governor",
++    "7-day soak of 141bcec62a",
++    "one-week acceptance watch",
++    "SCHEDULED_UNTIL=2099-01-01T00:00:00Z — 24h OOM soak window after deploy.",
++    "No David decision needed; waiting on the 24h soak. SCHEDULED_UNTIL=2099-01-01T00:00:00Z",
++    "No permissions changes needed; waiting for nightly soak.",
++    "Per David's decision yesterday, deploy then soak 24h.",
++    "Following David's approval in chat, rollout is live; 24h soak.",
++    "1 h live check", "60-min observation", "0.5-day recount", "two-hour readback",
++    "24 hours after merge", "1 hour after went live",
++]
++
++
++@pytest.mark.parametrize("reason", SOAKS)
++@pytest.mark.parametrize("declared", [False, True])
++def test_soak_refused_without_mutation(kanban_home, reason, declared):
++    with kbc.connect_closing() as conn:
++        tid = helpers._running(conn)
++        with pytest.raises(kaw.AwaitingError, match="soak_wait"):
++            kb.schedule_task(conn, tid, reason=reason, clock_only=True,
++                             awaiting={"kind": "clock"} if declared else None)
++        assert kb.get_task(conn, tid).status == "running"
++        assert kwc.get_state(conn, tid) is None
++
++
++@pytest.mark.parametrize("op", ["schedule", "block", "continue"])
++def test_tool_entry_refusal(kanban_home, monkeypatch, op):
++    with kbc.connect_closing() as conn:
++        tid = helpers._running(conn)
++        helpers._as_worker(monkeypatch, conn, tid)
++        args = {"clock_only": True}
++        if op == "continue":
++            args.update(checkpoint=SOAKS[0], resume_after_seconds=7201)
++        else:
++            args["reason"] = SOAKS[0]
++        if op == "block":
++            args["kind"] = "time"
++        out = helpers._tool(op, args)
++        assert "soak_wait" in (out.get("code"), out.get("rejection")), out
++        assert "real window" in out["error"]
++        assert kb.get_task(conn, tid).status == "running"
++
++
++def test_cli_schedule_refusal(kanban_home, capsys):
++    with kbc.connect_closing() as conn:
++        tid = helpers._running(conn)
++    assert helpers._cli()("schedule", tid, SOAKS[0], "--clock-only") != 0
++    assert "soak_wait" in capsys.readouterr().err
++
++
++@pytest.mark.parametrize("seconds", [1800, 7200])
++@pytest.mark.parametrize("declared", [False, True])
++def test_short_continue_exempt(kanban_home, monkeypatch, seconds, declared):
++    with kbc.connect_closing() as conn:
++        tid = helpers._running(conn)
++        helpers._as_worker(monkeypatch, conn, tid)
++        out = helpers._tool("continue", {"checkpoint": SOAKS[0], "resume_after_seconds": seconds,
++                                        "awaiting": {"kind": "clock"} if declared else None})
++        assert out.get("status") == "scheduled", out
++
++
++@pytest.mark.parametrize("location", ["body", "comment"])
++def test_explicit_request_exempt(kanban_home, location):
++    with kbc.connect_closing() as conn:
++        tid = helpers._running(conn)
++        marker = 'soak_requested_by: David — "wait a full day for this check"'
++        if location == "body":
++            with kb.write_txn(conn):
++                conn.execute("UPDATE tasks SET body=? WHERE id=?", (marker, tid))
++        else:
++            kb.add_comment(conn, tid, author="operator", body=marker)
++        assert kb.schedule_task(conn, tid, reason=SOAKS[0], clock_only=True)
++
++
++@pytest.mark.parametrize("marker", [
++    'soak_requested_by: David',
++    'soak_requested_by: David — ""',
++    'example: soak_requested_by: David — "wait a day"',
++    'soak_requested_by: Someone — "wait a day"',
++])
++def test_marker_must_be_a_complete_request_line(kanban_home, marker):
++    with kbc.connect_closing() as conn:
++        tid = helpers._running(conn)
++        kb.add_comment(conn, tid, author="operator", body=marker)
++        with pytest.raises(kaw.AwaitingError, match="soak_wait"):
++            kaw.resolve(conn, tid, awaiting={"kind": "clock"}, reason=SOAKS[0])
++
++
++@pytest.mark.parametrize("reason", [
++    "30-min observation", "0.5 h live check", "release slot Monday", "cooldown for 3h",
++    "quota-reset in 24h; monitoring window", "weekly quota reset; soak check deferred",
++    "watch the release", "1 h build", "0-hour observation",
++    "Await review and next window", "Brand watch", "expand observation",
++])
++def test_non_observation_and_quota_clocks(kanban_home, reason):
++    with kbc.connect_closing() as conn:
++        tid = helpers._running(conn)
++        assert kaw.resolve(conn, tid, awaiting={"kind": "clock"}, reason=reason)["kind"] == "clock"
++
++
++@pytest.mark.parametrize("kind", ["ci", "deploy", "external", "resource", "card"])
++def test_non_clock_producers_exempt(kanban_home, monkeypatch, kind):
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    with kbc.connect_closing() as conn:
++        tid, owner = helpers._running(conn), helpers._running(conn)
++        rec = {"kind": kind, "ref": owner if kind == "card" else "release 12345", "why": SOAKS[0]}
++        assert kaw.resolve(conn, tid, awaiting=rec, reason=SOAKS[0], wake_check="exit 1")["kind"] == kind
++        assert kaw.resolve(conn, tid, awaiting=None, reason=f"awaiting card {owner}")["kind"] == "card"
++
++
++def test_why_is_checked_but_ref_is_not_observation_prose(kanban_home):
++    with kbc.connect_closing() as conn:
++        tid = helpers._running(conn)
++        with pytest.raises(kaw.AwaitingError, match="soak_wait"):
++            kaw.resolve(conn, tid, awaiting={"kind": "clock", "why": SOAKS[0]}, reason="pending")
++        assert kaw.resolve(conn, tid, awaiting={"kind": "clock", "ref": "soak"}, reason="release slot")
+-- 
+2.43.0
+

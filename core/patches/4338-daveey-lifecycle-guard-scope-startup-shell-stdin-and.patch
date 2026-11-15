@@ -1,0 +1,160 @@
+From 7229d06016634d5cf01d59d90ebbfefcd529e297 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 02:42:12 +0000
+Subject: [PATCH] [daveey] lifecycle guard: scope startup-shell stdin and
+ environment inputs
+
+Treat here-string and stdin-file inputs of startup-file shells with unknown alias names. Cover runuser login shells, doas -s, su --command= and bash BASH_ENV while retaining plain-child and non-shell controls. Printed-pipe handling is owned by the separate pipe-scope change.
+
+Proof: baseline session-alias suite 16 failures, 62 passes; implementation 78 passes before three extra direct-user controls. Final full lifecycle suite: 20 files, 1214 passed. scripts/check --base origin/main: 20 checks OK, zero health findings. Base includes merged PR #2560 at 8d2f341c788da0b7e9a1f76077baf6adfb4a4f62.
+---
+ cron/lifecycle_guard_nested_shells.py         | 50 ++++++++++++++++---
+ .../test_lifecycle_guard_session_aliases.py   | 33 +++++++++++-
+ 2 files changed, 76 insertions(+), 7 deletions(-)
+
+diff --git a/cron/lifecycle_guard_nested_shells.py b/cron/lifecycle_guard_nested_shells.py
+index e1864f70b0..c0f4c83244 100644
+--- a/cron/lifecycle_guard_nested_shells.py
++++ b/cron/lifecycle_guard_nested_shells.py
+@@ -14,6 +14,7 @@ from pathlib import Path
+ from typing import TYPE_CHECKING, Optional
+ 
+ from cron.lifecycle_guard import (
++    _REDIRECTION,
+     _SHELL_EXECUTABLES,
+     _command_token_index,
+     _executable_name,
+@@ -99,7 +100,7 @@ _LOGIN_SHELL_OPTION_RE = re.compile(r"-[A-Za-z]*[il][A-Za-z]*|--login|--interact
+ _SUDO_SHELL_OPTION_RE = re.compile(r"-[A-Za-z]*[is][A-Za-z]*|--login|--shell")
+ _SUDO_VALUE_OPTIONS = frozenset("ugUCprtTh")
+ # Cheap pre-filter: every such shell's name ends in "sh" or is su/sudo/exec.
+-_NESTED_SHELL_HINT_RE = re.compile(r"sh\b|\bsu(?:do)?\b|\bexec\b")
++_NESTED_SHELL_HINT_RE = re.compile(r"sh\b|\bsu(?:do)?\b|\b(?:exec|runuser|doas)\b")
+ 
+ 
+ def _option_words(arguments: list[str], value_letters: frozenset[str]) -> tuple[list[str], int]:
+@@ -163,12 +164,24 @@ def _nested_shell_input(view: list[str]) -> Optional[tuple[str, Optional[str]]]:
+     if index is None:
+         return None
+     name = _executable_name(view[index])
+-    if name == "su":
++    if name in ("su", "runuser"):
+         options = view[index + 1:]
+-        for position, word in enumerate(options[:-1]):
+-            if word in ("-c", "--command"):
++        for position, word in enumerate(options):
++            if word.startswith("--command="):
++                return "payload", word.partition("=")[2]
++            if word in ("-c", "--command") and position + 1 < len(options):
+                 return "payload", options[position + 1]
+-        return "stdin", None
++        direct_user = any(
++            word == "--user" or word.startswith("--user=")
++            or re.fullmatch(r"-[mpPl]*u.*", word)
++            for word in _option_words(options, frozenset("ucsg"))[0]
++        )
++        if name == "su" or not direct_user:
++            return "stdin", None
++    if name == "doas":
++        options, _operand = _option_words(view[index + 1:], frozenset("uC"))
++        if any(re.fullmatch(r"-[A-Za-z]*s[A-Za-z]*", word) for word in options):
++            return "stdin", None
+     if name == "sudo":
+         options, operand = _option_words(view[index + 1:], _SUDO_VALUE_OPTIONS)
+         if any(_SUDO_SHELL_OPTION_RE.fullmatch(word) for word in options):
+@@ -189,7 +202,10 @@ def _nested_shell_input(view: list[str]) -> Optional[tuple[str, Optional[str]]]:
+     if name not in _SHELL_EXECUTABLES:
+         return None
+     options_end = _shell_options_end(arguments, name)[0]
+-    if name == "zsh" or login_exec or any(
++    # ENV is read by interactive POSIX shells (already covered by -i); BASH_ENV
++    # additionally lets a plain non-interactive bash define and enable aliases.
++    startup_env = name == "bash" and any(word.startswith("BASH_ENV=") for word in view[:peeled])
++    if name == "zsh" or login_exec or startup_env or any(
+             _LOGIN_SHELL_OPTION_RE.fullmatch(word) for word in arguments[:options_end]):
+         return _shell_inputs(arguments, name)
+     return None
+@@ -232,3 +248,25 @@ def _iter_nested_shell_inputs(
+         elif kind == "script" and value:
+             for path in _resolved_or_nothing(value, cwd):
+                 yield None, path
++        elif kind == "stdin":
++            yield from _redirected_shell_inputs(view, cwd=cwd)
++
++
++def _redirected_shell_inputs(
++    view: list[str], *, cwd: Optional[str],
++) -> Iterator[tuple[Optional[str], Optional[Path]]]:
++    """Keep stdin redirections in the consuming shell's scope, not the session's."""
++    words = iter(view)
++    for word in words:
++        match = _REDIRECTION.match(word)
++        if match is None:
++            continue
++        fd, operator, target = match.groups()
++        target = target or next(words, "")
++        if fd not in ("", "0"):
++            continue
++        if operator == "<<<":
++            yield target, None
++        elif operator in ("<", "<>"):
++            for path in _resolved_or_nothing(target, cwd):
++                yield None, path
+diff --git a/tests/cron/test_lifecycle_guard_session_aliases.py b/tests/cron/test_lifecycle_guard_session_aliases.py
+index 69f2b3a328..0c302bc4a9 100644
+--- a/tests/cron/test_lifecycle_guard_session_aliases.py
++++ b/tests/cron/test_lifecycle_guard_session_aliases.py
+@@ -243,6 +243,24 @@ _NESTED_FOREIGN_SHELLS = [
+     "zsh -ec 't ( bash {db} )'",
+     "bash -l <<'EOF'\npython3 - <<'PY'\nprint(1)\nPY\nt ( bash {db} )\nEOF",
+     "bash -l {script}",
++    "bash -l <<< 't ( bash {db} )'",
++    "bash -l < {script}",
++    "bash -l 0< {script}",
++    "bash -l 0<<< 't ( bash {db} )'",
++    "bash -l <> {script}",
++    "runuser -c 't ( bash {db} )' bob",
++    "runuser --command='t ( bash {db} )' bob",
++    "su -c 't ( bash {db} )' bob",
++    "doas -u bob -s <<'EOF'\nt ( bash {db} )\nEOF",
++    "env BASH_ENV=x bash -c 't ( bash {db} )'",
++    "BASH_ENV=x bash {script}",
++    "runuser -l bob <<'EOF'\nt ( bash {db} )\nEOF",
++    "doas -s <<'EOF'\nt ( bash {db} )\nEOF",
++    "su --command='t ( bash {db} )' bob",
++    "BASH_ENV=x bash -c 't ( bash {db} )'",
++    "BASH_ENV=x bash <<< 't ( bash {db} )'",
++    "BASH_ENV=x bash < {script}",
++    "ENV=x sh -i -c 't ( bash {db} )'",
+ ]
+ 
+ 
+@@ -263,11 +281,24 @@ def test_nested_login_shell_body_treats_names_as_unknown(tmp_path, live_kanban_d
+     "bash <<'EOF'\nt ( bash {db} )\nEOF",  # a non-login, non-interactive child inherits no aliases
+     "bash -s <<'EOF'\nt ( bash {db} )\nEOF",
+     "t2 ( bash {db} )",
++    "bash <<< 't ( bash {db} )'",
++    "bash < {script}",
++    "bash -l 3<<< 't ( bash {db} )'",
++    "ENV=x sh -c 't ( bash {db} )'",
++    "BASH_ENV=x sh -c 't ( bash {db} )'",
++    "OTHER=x bash -c 't ( bash {db} )'",
++    "doas python3 - <<'EOF'\nprint('t ( bash {db} )')\nEOF",
++    "runuser -u bob -- python3 - <<'EOF'\nprint('t ( bash {db} )')\nEOF",
++    "runuser -ubob -- python3 - <<'EOF'\nprint('t ( bash {db} )')\nEOF",
++    "runuser --user bob -- python3 - <<'EOF'\nprint('t ( bash {db} )')\nEOF",
++    "runuser --user=bob -- python3 - <<'EOF'\nprint('t ( bash {db} )')\nEOF",
+ ])
+ def test_plain_child_shell_keeps_session_names(tmp_path, live_kanban_db, shape):
+     """Controls: no login/interactive shell, so the session's names still decide (#2358)."""
+     assert "alias" not in str(tmp_path).lower()
+-    text = shape.format(db=live_kanban_db)
++    script = tmp_path / "inner.sh"
++    script.write_text(f"t ( bash {live_kanban_db} )\n")
++    text = shape.format(db=live_kanban_db, script=script)
+     assert scan_gateway_lifecycle(text, cwd=str(tmp_path), session_aliases=frozenset({"zz"})) == (
+         False, None)
+ 
+-- 
+2.43.0
+

@@ -1,0 +1,106 @@
+From fb8e67793748341e9365eecd70f0e450f600f3a5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 17:26:35 +0000
+Subject: [PATCH] [daveey] fix(kanban): a hold-retire clear is not a dispatcher
+ release
+
+`_operator_released` read a card's newest `unblocked` as the dispatcher's
+whenever the very next event was `shared_blocker_cleared`. But
+`release_cleared_blockers` also appends that event to cards already
+`ready`/`review` to retire their historical hold: no unblock, no `woke`.
+When an operator unblocked a card and the wall cleared before it spawned,
+that annotation followed the operator's `unblocked`, so the release was
+misread as the dispatcher's and a peer's newer assertion held the card
+(fail-closed: held, never spawned wrongly). #2923 exempts operator releases.
+
+Fix: a CLEARED event counts as a dispatcher release only with
+`woke: True`, which the unblock branch sets and the hold-retire branch
+does not (kanban_awaiting.prior_same_premise tells a real wake apart by
+the same key). PROBE_RELEASED always follows a real unblock and is unchanged.
+Legacy blocked-branch clears written before `woke` existed now read as
+operator releases, which is main's pre-#3026 behaviour for them.
+
+Proof:
+- RED: new test_operator_release_then_hold_retire_clear_stays_exempt fails
+  at 80b73aa16f (_operator_released False); GREEN with the fix.
+- 29 test files importing kanban_shared_blocker*: 664 passed, 0 failed.
+- Mutants: dropping the woke check fails the post-recovery-assertion test;
+  dropping the CLEARED kind check fails the probe-release test.
+
+Follow-up from the #3026 review (card t_01a1db1133aa5368).
+---
+ hermes_cli/kanban_shared_blockers.py          | 12 ++++++--
+ ...est_kanban_shared_blocker_release_kinds.py | 29 +++++++++++++++++++
+ 2 files changed, 39 insertions(+), 2 deletions(-)
+
+diff --git a/hermes_cli/kanban_shared_blockers.py b/hermes_cli/kanban_shared_blockers.py
+index e87309dda2..d35d6e1a76 100644
+--- a/hermes_cli/kanban_shared_blockers.py
++++ b/hermes_cli/kanban_shared_blockers.py
+@@ -530,8 +530,12 @@ def _operator_released(conn: sqlite3.Connection, task_id: str, blocker_id: str)
+     ``kb.unblock_task`` too, then record :data:`CLEARED_EVENT` / :data:`PROBE_RELEASED_EVENT` as the
+     card's very next event. Such a release answers the wall's state at that moment; a run started after
+     it that hits the wall again is newer evidence, so the card falls back to the normal rule instead of
+-    spawning only to rediscover the wall (one wasted run per released card per episode). [daveey]
++    spawning only to rediscover the wall (one wasted run per released card per episode). A
++    :data:`CLEARED_EVENT` without ``woke: True`` retired a ready/review card's hold and released
++    nothing, so it leaves an operator's unblock just before it the operator's. [daveey]
+     """
++    from hermes_cli import kanban_db as kb
++
+     if not _unblocked_since_assertion(conn, task_id, blocker_id, own_only=True):
+         return False
+     rows = conn.execute("SELECT * FROM task_events WHERE task_id=? AND kind='unblocked'", (task_id,)).fetchall()
+@@ -542,7 +546,11 @@ def _operator_released(conn: sqlite3.Connection, task_id: str, blocker_id: str)
+         (task_id, newest["created_at"], newest["id"]),
+     ) if _event_order(row) > order]
+     after = min(following, key=_event_order, default=None)
+-    return after is None or after["kind"] not in _DISPATCHER_RELEASES
++    if after is None or after["kind"] not in _DISPATCHER_RELEASES:
++        return True
++    # Hold-retirement annotation (release_cleared_blockers' ready/review branch): no ``woke``, no
++    # release; kanban_awaiting.prior_same_premise tells a real wake apart by the same key.
++    return after["kind"] == CLEARED_EVENT and kb._json_dict(after["payload"]).get("woke") is not True
+ 
+ 
+ def shared_blocker_guard(
+diff --git a/tests/hermes_cli/test_kanban_shared_blocker_release_kinds.py b/tests/hermes_cli/test_kanban_shared_blocker_release_kinds.py
+index 3eba18783e..6ce157ec27 100644
+--- a/tests/hermes_cli/test_kanban_shared_blocker_release_kinds.py
++++ b/tests/hermes_cli/test_kanban_shared_blocker_release_kinds.py
+@@ -102,3 +102,32 @@ def test_operator_release_after_dispatcher_release_stays_exempt(kanban_home, clo
+         helpers._blocked_behind(conn, 'peer reasserts', blocker_id=WALL)
+         assert blockers.blocker_states(conn)[WALL].is_open
+         assert blockers.shared_blocker_guard(conn, target) is None
++
++
++def test_operator_release_then_hold_retire_clear_stays_exempt(kanban_home, clock):
++    """A clear that only retires a ready card's historical hold is not a dispatcher release.
++
++    ``release_cleared_blockers`` appends :data:`CLEARED_EVENT` (no ``woke``) to cards already
++    ``ready`` when the wall clears; that annotation must not turn the operator's earlier unblock
++    into the dispatcher's, or a peer's newer assertion would hold the operator-released card.
++    """
++    with kbc.connect_closing() as conn:
++        # The check's evidence lands on the lowest card id, so the lower id plays the parked peer
++        # and the clear's annotation is the target's very next event after the operator's unblock.
++        pair = [helpers._legacy_blocked_behind(conn, f'waiter {i}', blocker_id=WALL) for i in range(2)]
++        peer, target = sorted(pair)
++        clock[0] += 10
++        assert kb.unblock_task(conn, target)   # the operator says: try again now
++        assert kb.get_task(conn, target).status == 'ready'
++        clock[0] += 60
++        assert checks.run_due_checks(conn, cfg=CFG) == [WALL]
++        clock[0] += 30
++        assert blockers.release_cleared_blockers(conn) == [peer]
++        kinds = [r['kind'] for r in conn.execute(
++            'SELECT kind FROM task_events WHERE task_id=? ORDER BY id', (target,))]
++        assert kinds[-2:] == ['unblocked', blockers.CLEARED_EVENT]
++        clock[0] += 60
++        helpers._blocked_behind(conn, 'fresh run hits the wall again', blocker_id=WALL)
++        assert blockers.blocker_states(conn)[WALL].is_open
++        assert blockers._operator_released(conn, target, WALL) is True
++        assert blockers.shared_blocker_guard(conn, target) is None
+-- 
+2.43.0
+

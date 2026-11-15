@@ -1,0 +1,99 @@
+From 484df69c8433c79606269c75e15d7ee4479225f6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 06:38:47 -0800
+Subject: [PATCH] [daveey] Sessions poll: read update-paused gateway turns by
+ index, not an admissions table scan
+
+`turn_session_activity._update_paused_gateway_turns` runs for every profile state.db on each
+`live_turn_session_ids` collect (2 s cache) behind /api/profiles/sessions, the sidebar and
+projects.tree. Its join started from `session_admissions WHERE status='started'`, and no index
+leads with status, so SQLite scanned the whole table (`SCAN a`), payload overflow pages included.
+
+Measured on the mini (kanban card t_01a1d889abf75d78, gateway pid 85886, 10 state.dbs, warm cache):
+104.9 ms CPU per collect (bb-aux 87 ms / 4,822 admissions, bb-dev 16 ms / 3,296, default 1 ms /
+11,085). It was about half of the active samples in the sessions-route and tui-rpc threads of a
+60 s / 50 Hz gateway profile, up to ~5% of a core per polling process, growing with every admission.
+
+Fix: drive the join from the checkpoint keys (state_meta primary-key range, usually empty) and
+reach the admission by its unique admission_id; CROSS JOIN pins that order. Same rows, 0.11 ms per
+collect on the same stores.
+
+Why not caught: the reader's tests used one admission row, where a scan costs nothing; nothing
+asserted the plan. The new test records the statements the reader runs and requires every plan
+step to be an index SEARCH, with 200 settled admissions and a foreign-prefix key present.
+RED on the old query: ['SCAN a', 'SEARCH m USING INDEX sqlite_autoindex_state_meta_1 (key=?)'].
+---
+ hermes_cli/turn_session_activity.py           | 10 ++++---
+ .../hermes_cli/test_turn_session_activity.py  | 26 +++++++++++++++++++
+ 2 files changed, 33 insertions(+), 3 deletions(-)
+
+diff --git a/hermes_cli/turn_session_activity.py b/hermes_cli/turn_session_activity.py
+index 32eed80976..b95c463bc5 100644
+--- a/hermes_cli/turn_session_activity.py
++++ b/hermes_cli/turn_session_activity.py
+@@ -95,6 +95,7 @@ def _holder_dead(holder: str) -> bool:
+ # max_attempts), so a pause nobody will continue stops counting. The gateway bound (1 h) is this reader's
+ # own fail-closed cap on a checkpoint, not a mirrored producer setting.
+ _GATEWAY_CHECKPOINT_PREFIX = "gateway.update_checkpoint.v1."
++_GATEWAY_CHECKPOINT_END = _GATEWAY_CHECKPOINT_PREFIX[:-1] + chr(ord(_GATEWAY_CHECKPOINT_PREFIX[-1]) + 1)  # key range end
+ _GATEWAY_PAUSE_FRESH_S = 3600.0
+ _TUI_PAUSE_REASON = "core_update_pause"
+ 
+@@ -102,11 +103,14 @@ _TUI_PAUSE_REASON = "core_update_pause"
+ def _update_paused_gateway_turns(conn: sqlite3.Connection, now: float) -> set[str]:
+     """Sessions whose started gateway admission is parked on an update checkpoint
+     (``hermes_state_update_pause.checkpoint_session_input``), dated by the checkpointed last message."""
++    # Driven from the checkpoint keys (state_meta's primary-key range, usually empty), then the admission by
++    # its unique id: CROSS JOIN pins that order. Starting from session_admissions scans the whole table (no
++    # index leads with status), 87 ms of CPU per poll on one 4.8k-admission profile store.
+     try:
+         rows = conn.execute(
+-            "SELECT a.target_session_id, m.value FROM session_admissions a JOIN state_meta m"
+-            " ON m.key = ? || a.admission_id WHERE a.status = 'started'",
+-            (_GATEWAY_CHECKPOINT_PREFIX,)).fetchall()
++            "SELECT a.target_session_id, m.value FROM state_meta m CROSS JOIN session_admissions a"
++            " ON a.admission_id = substr(m.key, ?) WHERE m.key >= ? AND m.key < ? AND a.status = 'started'",
++            (len(_GATEWAY_CHECKPOINT_PREFIX) + 1, _GATEWAY_CHECKPOINT_PREFIX, _GATEWAY_CHECKPOINT_END)).fetchall()
+     except sqlite3.Error:  # no admissions table (older store) or a busy one
+         return set()
+     out: set[str] = set()
+diff --git a/tests/hermes_cli/test_turn_session_activity.py b/tests/hermes_cli/test_turn_session_activity.py
+index d616aaad43..7168cf3eac 100644
+--- a/tests/hermes_cli/test_turn_session_activity.py
++++ b/tests/hermes_cli/test_turn_session_activity.py
+@@ -201,6 +201,32 @@ def test_gateway_checkpoint_that_cannot_continue_does_not_count(home, kwargs):
+     assert "turn_live" not in tsa.annotate_turn_activity([{"id": "paused_chat"}])[0]
+ 
+ 
++def test_gateway_checkpoint_read_never_scans_the_admissions_table(home):
++    """The poll runs every 2 s in every profile store: it must reach admissions by index, whatever their
++    count, and still find the one checkpointed started admission among settled ones."""
++    _checkpointed_db(home, "paused_chat")
++    conn = sqlite3.connect(home / "state.db")
++    conn.executemany(
++        "INSERT INTO session_admissions(admission_id, request_id, principal_id, target_session_id, lineage_json,"
++        " payload_json, payload_digest, intent, status) VALUES (?, ?, 'p', 'paused_chat', '[]', '{}', 'd', 'queue',"
++        " 'terminal')", [(f"old{i}", f"old-r{i}") for i in range(200)])
++    conn.execute("INSERT INTO state_meta(key, value) VALUES ('gateway.update_checkpoint.v1.old7', '{}')")
++    conn.execute("INSERT INTO state_meta(key, value) VALUES ('gateway.update_checkpoint.v2.adm1', '{}')")
++    conn.commit()
++    seen: list[str] = []
++    conn.set_trace_callback(seen.append)
++    try:
++        assert tsa._update_paused_gateway_turns(conn, time.time()) == {"paused_chat"}
++    finally:
++        conn.set_trace_callback(None)
++    reads = [sql for sql in seen if "session_admissions" in sql]
++    assert reads
++    for sql in reads:
++        plan = [row[3] for row in conn.execute("EXPLAIN QUERY PLAN " + sql)]
++        assert plan and all(step.startswith("SEARCH") for step in plan), plan
++    conn.close()
++
++
+ def _marker(home, key, **entry):
+     (home / "desktop").mkdir(parents=True, exist_ok=True)
+     (home / "desktop" / "interrupted_turns.json").write_text(json.dumps({key: entry}), encoding="utf-8")
+-- 
+2.43.0
+

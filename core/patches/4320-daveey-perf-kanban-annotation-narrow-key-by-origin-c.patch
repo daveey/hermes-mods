@@ -1,0 +1,1354 @@
+From 1b5374d2745d3458d8bce5d6b2059f7fad3a4eba Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 17:50:52 +0000
+Subject: [PATCH] [daveey] perf(kanban): annotation narrow key by origin
+ content, not raw board/shadow revisions
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The holder's narrow key (card B, e85501de30f) hashed every own board's and sync shadow's content
+key verbatim. Those revisions move on any non-bookkeeping commit anywhere in the file, so on
+hermes-hub the shared default board and its sync shadow moved every scope's key on nearly every
+2 s probe: each of the 8 demanded scopes refreshed every 12 s (floor + probe) instead of every
+20 s renewal, and the holder cost 17.9% of a core against a 2.4% budget (t_01a1db1387f61a98).
+
+Five whys: the holder refreshed at the floor -> the narrow key moved every probe -> it carried
+raw board/shadow revisions (plus 180 s buckets of ~11 owners' heartbeat clocks, plus the
+chat-closeout waiting inputs, which embed every board's raw content key) -> C2 was measured on
+linked shadow rows and referenced own-board content, but the key was built from the exact
+fingerprint's inputs -> the benchmarks' synthetic stream never churned board/shadow revisions.
+
+Now (new kanban_annotation_local):
+- own boards: the open cards this profile's sessions own (session_id) or shepherd (tui notify
+  sub) and their open ancestors: status, needs-human verdict, block_kind, human_request digest,
+  watch flag. Claims, heartbeats, runs, events, comments and other origins' cards do not enter.
+  Per-board reads are memoised on the board's content key, shared by every scope; a moved
+  revision re-reads only the cards the per-task change cursor (kanban_task_change) names, or
+  the whole board when the cursor cannot vouch for the gap. Session-id lookups read only ids
+  not yet checked.
+- sync shadows: this origin's unreleased link rows joined to their cards (the replica_cards
+  rows, same memo via kanban_chat_links.replica_link_rows), minus lease_expires, plus the
+  replica's stale verdict.
+- gateway info observed_at clocks and last_ok enter as freshness verdicts at now, not buckets.
+- waiting sources enter by code identity, not their declared inputs.
+- past the floor the holder probe answers from the narrow key alone; the exact fingerprint
+  (waiting-input probes) is read only when no narrow verdict exists.
+Strict callers keep the exact fingerprint unchanged; any read error is None (= moved).
+Display state the key omits (unseen cursors, run liveness, stall verdicts) stays bounded by the
+20 s forced renewal, as before.
+
+Tests: tests/hermes_cli/test_kanban_annotation_narrow_local.py — 10 of the liveness/other-origin
+cases fail on the old key; status, membership and link changes move both; patched board rows
+equal a full read under random churn.
+
+Benchmark (scripts/benchmark_kanban_annotation_holder.py) now churns a real own board and sync
+shadow every window: raw revisions moved in 150/150 windows, the key in 0 of 84-98 windows
+without an own substantive change (large tier, 10k cards, also with a 400 MB WAL: 37 ms/key).
+Live hub replay (8 scopes, 120 x 5 s, same files): old key moved 110-115 times per scope, new
+key 0 times in all 7 non-default scopes.
+---
+ hermes_cli/kanban_annotation_host.py          |  72 ++--
+ hermes_cli/kanban_annotation_local.py         | 310 ++++++++++++++++++
+ hermes_cli/kanban_annotation_narrow.py        |  95 +++---
+ hermes_cli/kanban_chat_links.py               |  26 +-
+ scripts/benchmark_kanban_annotation_holder.py | 134 +++++++-
+ .../test_kanban_annotation_holder_narrow.py   |  16 +-
+ .../hermes_cli/test_kanban_annotation_host.py |  13 +
+ .../test_kanban_annotation_narrow.py          |  38 ++-
+ .../test_kanban_annotation_narrow_local.py    | 268 +++++++++++++++
+ 9 files changed, 876 insertions(+), 96 deletions(-)
+ create mode 100644 hermes_cli/kanban_annotation_local.py
+ create mode 100644 tests/hermes_cli/test_kanban_annotation_narrow_local.py
+
+diff --git a/hermes_cli/kanban_annotation_host.py b/hermes_cli/kanban_annotation_host.py
+index 2983233e69..b7579c86bb 100644
+--- a/hermes_cli/kanban_annotation_host.py
++++ b/hermes_cli/kanban_annotation_host.py
+@@ -56,7 +56,6 @@ HOLDER_REFRESH_AGE_S = 20.0  # the holder re-reads an unchanged scope this long
+ NARROW_CONFIRM_S = 6.0  # an unchanged narrow key re-stamps the copy's display ``verified_at`` this often
+ _VERSION = 1
+ _UNDECLARED = "undeclared"
+-_fp_local = threading.local()  # .waiting: the declared waiting inputs the last fingerprint() on this thread read
+ _holder_ctx = threading.local()  # .active: this thread is the holder (only it pays for a narrow key)
+ 
+ 
+@@ -181,11 +180,9 @@ def fingerprint(scope: tuple[str, ...], full: tuple, wall: float) -> tuple[str,
+     from hermes_cli import kanban_session_activity as _ksa
+ 
+     try:
+-        _fp_local.waiting = None
+         if not _ksa._revalidate.revalidatable(full, wall):
+             return None
+         waiting, complete = _waiting_inputs(dict(_ksa._waiting_sources))
+-        _fp_local.waiting = waiting
+         body = [_VERSION, list(scope), core_sha(), _portable(full),
+                 [[name, _code_id(fn)] for name, fn in sorted(_ksa._done_checks.items())], waiting]
+         digest = hashlib.sha256(json.dumps(body, separators=(",", ":"), sort_keys=True).encode()).hexdigest()
+@@ -206,17 +203,31 @@ def _inputs_now(scope: tuple[str, ...]) -> tuple[tuple, tuple, float, tuple[str,
+     return local, full, wall, fingerprint(scope, full, wall)
+ 
+ 
+-def _narrow_now(scope: tuple[str, ...], full: tuple, fp: tuple[str, bool] | None) -> str | None:
+-    """The display/holder-only narrow key (``kanban_annotation_narrow``) for the inputs :func:`fingerprint` just
+-    read on this thread; None (= moved) whenever it is unknown. Never used to certify an exact adoption."""
+-    waiting = getattr(_fp_local, "waiting", None)
+-    if fp is None or waiting is None:
+-        return None
++def _narrow_now(scope: tuple[str, ...], full: tuple) -> str | None:
++    """The display/holder-only narrow key (``kanban_annotation_narrow``) for the activity fingerprint ``full``;
++    None (= moved) whenever it is unknown. Never used to certify an exact adoption. [daveey] It keys the waiting
++    sources' code identity, not their declared inputs, so it never runs a waiting-input probe."""
+     from hermes_cli import kanban_annotation_narrow as _narrow
+ 
++    try:
++        waiting = waiting_identity()[0]
++    except Exception:  # health: allow BLE001 -- unknown code identity is no key (= moved)
++        log.debug("kanban annotation waiting identity unavailable", exc_info=True)
++        return None
+     return _narrow.key(scope, full, waiting)
+ 
+ 
++def _activity_now() -> tuple[tuple, float]:
++    """``(full, wall)``: the activity fingerprint with shadows (or the pinned one), without waiting inputs."""
++    from hermes_cli import kanban_session_activity as _ksa
++
++    wall = time.time()
++    pinned = getattr(_ksa._revalidate.inputs_pin, "fingerprints", None)
++    if pinned is not None and pinned[1] is not None:
++        return pinned[1], wall
++    return _ksa._activity_fingerprint(include_shadows=False) + _ksa._shadow_fingerprint(), wall
++
++
+ # -- the read -----------------------------------------------------------------------------------------------------
+ 
+ # Per origin scope, the last frozen annotation parts (``read_annotation_parts``).
+@@ -253,8 +264,9 @@ def read_annotation_parts() -> tuple:
+ 
+ # -- adopt --------------------------------------------------------------------------------------------------------
+ 
+-def _display_identity(scope: tuple[str, ...]) -> tuple[str, bool]:
+-    """Code/registration identity only: never runs a waiting input probe."""
++def waiting_identity() -> tuple[list, bool]:
++    """``([[name, code id, inputs code id or "undeclared"]...], all declared)`` of the registered waiting sources:
++    code/registration identity only, never a waiting input probe."""
+     from hermes_cli import kanban_session_activity as _ksa
+ 
+     sources = dict(_ksa._waiting_sources)
+@@ -264,6 +276,14 @@ def _display_identity(scope: tuple[str, ...]) -> tuple[str, bool]:
+         has_inputs = declared is not None and declared[0] is fn
+         complete = complete and has_inputs
+         waiting.append([name, _code_id(fn), _code_id(declared[1]) if declared is not None and has_inputs else _UNDECLARED])
++    return waiting, complete
++
++
++def _display_identity(scope: tuple[str, ...]) -> tuple[str, bool]:
++    """Code/registration identity only: never runs a waiting input probe."""
++    from hermes_cli import kanban_session_activity as _ksa
++
++    waiting, complete = waiting_identity()
+     body = [_VERSION, list(scope), core_sha(),
+             [[name, _code_id(fn)] for name, fn in sorted(_ksa._done_checks.items())], waiting]
+     return hashlib.sha256(json.dumps(body, separators=(",", ":"), sort_keys=True).encode()).hexdigest(), complete
+@@ -349,7 +369,7 @@ def prepare(scope: tuple[str, ...]) -> tuple | None:
+         # counts that predate a closeout mutation outside the board fingerprint.
+         token = _mutation.current(scope) if getattr(_ksa._revalidate.force_read, "scope", None) == scope else None
+         local, full, wall, fp = _inputs_now(scope)
+-        narrow = _narrow_now(scope, full, fp) if getattr(_holder_ctx, "active", False) else None
++        narrow = _narrow_now(scope, full) if fp is not None and getattr(_holder_ctx, "active", False) else None
+     except Exception:  # health: allow BLE001 -- the read itself reports a board error
+         log.debug("kanban annotation host inputs unavailable", exc_info=True)
+         return None
+@@ -454,19 +474,25 @@ def _holder_refresh_scope(scope: tuple[str, ...]) -> bool:
+     renew = copy_age is not None and copy_age >= HOLDER_REFRESH_AGE_S
+     kicked = _mutation.pending(scope)
+     if copy is not None and not renew and not kicked:
+-        _local, full, wall, fp = _inputs_now(scope)
+-        if fp is not None and fp[0] == copy[0]:
+-            return False
++        # [daveey] Inside the floor nothing refreshes either way: return before reading any input.
+         if copy_age is not None and 0 <= copy_age < HOLDER_MOVED_FLOOR_S:
+             return False
+-        # [daveey] Exact inputs moved past the floor: refresh only for a substantive move (narrow key). An
+-        # unchanged narrow key re-stamps the display ``verified_at`` (header only) and waits for the 20 s renewal.
+-        published = header.get("narrow_key")
+-        if published and _narrow_now(scope, full, fp) == published:
+-            verified = header.get("verified_at")
+-            if not isinstance(verified, (int, float)) or wall - verified >= NARROW_CONFIRM_S:
+-                _disk.confirm_host(scope, published, wall)
+-            return False
++        # Past the floor: refresh only for a substantive move (narrow key). An unchanged narrow key re-stamps the
++        # display ``verified_at`` (header only) and waits for the 20 s renewal. The narrow key needs no exact
++        # fingerprint (whose waiting-input probes cost more than it), so a known key answers alone.
++        published, narrow = header.get("narrow_key"), None
++        if published:
++            full, wall = _activity_now()
++            narrow = _narrow_now(scope, full)
++            if narrow == published:
++                verified = header.get("verified_at")
++                if not isinstance(verified, (int, float)) or wall - verified >= NARROW_CONFIRM_S:
++                    _disk.confirm_host(scope, published, wall)
++                return False
++        if not published or narrow is None:  # no narrow verdict: the exact fingerprint decides
++            _local, full, wall, fp = _inputs_now(scope)
++            if fp is not None and fp[0] == copy[0]:
++                return False
+     if not _ksa._annotate_refresh_lock.acquire(blocking=False):
+         return False  # a poll here is already reading (it publishes)
+     # [daveey] An aging copy is renewed by a real read: the counts cache would answer the unchanged inputs with the
+diff --git a/hermes_cli/kanban_annotation_local.py b/hermes_cli/kanban_annotation_local.py
+new file mode 100644
+index 0000000000..24f6802873
+--- /dev/null
++++ b/hermes_cli/kanban_annotation_local.py
+@@ -0,0 +1,310 @@
++"""Own-board and sync-shadow content of the annotation holder's narrow key, by origin. [daveey]
++
++``kanban_annotation_narrow`` used to hash every own board's and sync shadow's content key (``kanban_activity_revision``)
++verbatim. Those revisions move on any non-bookkeeping commit anywhere in the file: a run row, a ``spawned`` event,
++a pulled event on the shadow. On hermes-hub the default shadow moved on every 10 s sample and the default board on
++about half of them, so all 8 demanded scopes' narrow keys moved on nearly every holder probe and each scope refreshed
++every 12 s (floor + probe) instead of every 20 s renewal (t_01a1db1387f61a98, P1 at 17.9% vs a 2.4% budget).
++
++This module keys on what one origin's annotation reads from those files instead:
++
++* **Own boards** (status and membership). Per board, the open cards (status not ``done``/``archived``) a session of
++  this origin profile owns or shepherds: ``tasks.session_id``, or a ``tui`` notify sub's ``chat_id`` (with whether
++  that sub counts, ``_counted_sub_clause``), and for each: status, the needs-human verdict, ``block_kind``, the
++  ``human_request`` text digest and the watch-park flag; plus every open ancestor of those cards over ``task_links``
++  with its status and needs-human verdict (``_parked_on``'s held/parked test). "This origin profile's sessions" are
++  the candidates found in this profile's ``state.db``. Claims, leases, heartbeats, run rows, comments and events of
++  other kinds do not enter. A card leaving the open set (done/archived) moves the key.
++* **Sync shadows** (linked rows). This origin's unreleased ``task_chat_links`` rows joined to their card rows
++  (``kanban_chat_links.replica_link_rows``, the same rows ``replica_cards`` reads, from the same memo), with the
++  replica's liveness field ``lease_expires`` dropped, and the replica's stale verdict at now (``pulled_at`` against
++  ``_stale_after_s``), never the ``pulled_at`` clock.
++
++Display-only state these omit (unseen-notice cursors, run liveness and execution evidence, the 24 h attention
++window, stall verdicts, done receipts aging out) is bounded by the holder's 20 s forced renewal, like everything
++else the narrow key misses. Per-board reads are memoised on the board's content key (shared by every scope in the
++process), so a board commit is read once. Any read error raises; the caller returns None (= moved).
++"""
++from __future__ import annotations
++
++import hashlib
++import json
++import sqlite3
++import threading
++import time
++from pathlib import Path
++from typing import Any
++
++FINISHED = ("done", "archived")
++_SHADOW_DROP = frozenset({"lease_expires"})
++_lock = threading.Lock()
++_board_memo: dict[str, tuple] = {}  # board path -> (content key, change cursor or None, board rows)
++_sessions_memo: dict[str, tuple] = {}  # state.db path -> (file ident, negatives since, found, checked)
++_shadow_digests: dict[tuple, tuple] = {}  # (shadow path, profile) -> (link rows object, digest)
++stats = {"board_reads": 0, "board_patches": 0, "session_reads": 0}
++_PATCH_MAX = 400  # changed tasks above this: one full read is cheaper than the IN lists
++
++
++def _digest(value: Any) -> str:
++    return hashlib.sha256(json.dumps(value, separators=(",", ":"), sort_keys=True, allow_nan=False,
++                                     default=str).encode()).hexdigest()
++
++
++def _chunks(ids: list[str]):
++    for i in range(0, len(ids), 500):
++        yield ids[i:i + 500]
++
++
++def _board_rows(conn: sqlite3.Connection, ids: frozenset | None = None) -> dict:
++    """Membership and status inputs of every open card on one board (``ids``: only those cards, and every link
++    touching them), on ``conn``'s current read transaction. ``edges`` are raw ``(parent, child)`` links; finished
++    ends are dropped where the key is built (``_board_part``)."""
++    from hermes_cli.kanban_session_activity import _counted_sub_clause, _not_watch
++    from hermes_cli.kanban_session_wait_rows import _stored_needs_human
++
++    cols = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
++    if "session_id" not in cols:
++        return {"tasks": {}, "subs": {}, "edges": set()}  # pre-session schema: the counts read nothing here
++    request = "t.human_request" if "human_request" in cols else "NULL"
++    kind = "t.block_kind" if "block_kind" in cols else "NULL"
++    finished = ",".join("?" * len(FINISHED))
++    groups = [(None, ())] if ids is None else [(c, c) for c in _chunks(sorted(ids))]
++    tasks: dict[str, list] = {}
++    subs: dict[str, list] = {}
++    edges: set[tuple[str, str]] = set()
++    for chunk, args in groups:
++        only = "" if chunk is None else f" AND t.id IN ({','.join('?' * len(chunk))})"
++        for tid, status, sid, hr, bk, not_watch in conn.execute(
++                f"SELECT t.id, t.status, t.session_id, {request}, {kind}, ({_not_watch(conn)}) FROM tasks t "
++                f"WHERE t.status NOT IN ({finished}){only}", (*FINISHED, *args)):
++            tasks[str(tid)] = [str(status), str(sid) if sid else None, bool(_stored_needs_human(hr, bk)),
++                               bk, hashlib.sha256(str(hr).encode()).hexdigest()[:16] if hr is not None else None,
++                               not bool(not_watch)]
++        try:
++            for tid, chat, counted in conn.execute(
++                    f"SELECT s.task_id, s.chat_id, ({_counted_sub_clause(conn)}) FROM kanban_notify_subs s "
++                    f"JOIN tasks t ON t.id = s.task_id WHERE s.platform = 'tui' AND s.chat_id != '' "
++                    f"AND t.status NOT IN ({finished}){only}", (*FINISHED, *args)):
++                subs.setdefault(str(tid), []).append([str(tid), str(chat), bool(counted)])
++        except sqlite3.OperationalError as exc:
++            if "no such table" not in str(exc):
++                raise
++        try:
++            where = "" if chunk is None else (f" WHERE parent_id IN ({','.join('?' * len(chunk))}) "
++                                              f"OR child_id IN ({','.join('?' * len(chunk))})")
++            edges.update((str(p), str(c)) for p, c in conn.execute(
++                f"SELECT parent_id, child_id FROM task_links{where}", (*args, *args)))
++        except sqlite3.OperationalError as exc:
++            if "no such table" not in str(exc):
++                raise
++    return {"tasks": tasks, "subs": {k: sorted(v) for k, v in subs.items()}, "edges": edges}
++
++
++def _patched(rows: dict, ids: frozenset, fresh: dict) -> dict:
++    """``rows`` with every card in ``ids`` (and every link touching one) replaced by ``fresh``; ``rows`` itself is
++    left alone (other scopes may hold it)."""
++    tasks = {k: v for k, v in rows["tasks"].items() if k not in ids}
++    tasks.update(fresh["tasks"])
++    subs = {k: v for k, v in rows["subs"].items() if k not in ids}
++    subs.update(fresh["subs"])
++    edges = {e for e in rows["edges"] if e[0] not in ids and e[1] not in ids} | fresh["edges"]
++    return {"tasks": tasks, "subs": subs, "edges": edges}
++
++
++def board_rows(path: Path, content: Any) -> dict:
++    """``_board_rows`` of ``path``, memoised on its content key when that key is a trigger-backed revision. A moved
++    revision re-reads only the cards its per-task change cursor names (``kanban_task_change``), or the whole board
++    when the cursor cannot vouch for the gap."""
++    from hermes_cli import kanban_task_change as change
++    from hermes_cli.kanban_activity_revision import LOCAL_TABLES, is_revision
++    from hermes_cli.kanban_session_activity import cached_ro
++
++    revision = isinstance(content, tuple) and is_revision(content)
++    with _lock:
++        hit = _board_memo.get(str(path))
++    if revision and hit is not None and hit[0] == content:
++        return hit[2]
++    with cached_ro(path, busy_budget=0) as conn:
++        conn.execute("BEGIN")
++        try:
++            changed, cursor = change.changed_since(conn, hit[1] if hit is not None else None, tables=LOCAL_TABLES)
++            if hit is not None and isinstance(changed, frozenset) and len(changed) <= _PATCH_MAX:
++                rows = _patched(hit[2], changed, _board_rows(conn, changed)) if changed else hit[2]
++                stats["board_patches"] += 1
++            else:
++                rows = _board_rows(conn)
++                stats["board_reads"] += 1
++        finally:
++            conn.rollback()
++    with _lock:
++        # The cursor describes the snapshot just read, whatever ``content`` (read a moment earlier) says; a revision
++        # content key still gates reuse, so a stat key never answers a later call from this memo.
++        _board_memo[str(path)] = (content if revision else None, cursor, rows)
++    return rows
++
++
++_SESSION_NEGATIVE_TTL_S = 300.0
++
++
++def profile_sessions(candidates: set[str]) -> set[str]:
++    """The ``candidates`` that are sessions of this origin profile (its ``state.db``). A missing state.db has none.
++    Only ids not yet looked up are read: a session is never re-homed to another profile, so a found id stays found
++    (deletion is rare); an id not found is looked up again after ``_SESSION_NEGATIVE_TTL_S`` (a card can name a chat
++    before its session row lands; the holder's forced renewal covers that window)."""
++    from hermes_constants import get_hermes_home
++    from hermes_cli.kanban_session_activity import cached_ro
++
++    db = get_hermes_home() / "state.db"
++    if not candidates:
++        return set()
++    try:
++        st = db.stat()
++    except FileNotFoundError:
++        return set()
++    ident, now = (st.st_dev, st.st_ino), time.monotonic()
++    with _lock:
++        hit = _sessions_memo.get(str(db))
++    if hit is None or hit[0] != ident or now - hit[1] > _SESSION_NEGATIVE_TTL_S:
++        hit = (ident, now, frozenset(), frozenset())  # (file, negatives since, found, checked)
++    found, checked = set(hit[2]), set(hit[3])
++    ids = sorted(set(candidates) - checked)
++    if ids:
++        with cached_ro(db, busy_budget=0) as conn:
++            for chunk in _chunks(ids):
++                found.update(str(r[0]) for r in conn.execute(
++                    f"SELECT id FROM sessions WHERE id IN ({','.join('?' * len(chunk))})", chunk))
++        checked.update(ids)
++        stats["session_reads"] += 1
++        with _lock:
++            _sessions_memo[str(db)] = (ident, hit[1], frozenset(found), frozenset(checked))
++            while len(_sessions_memo) > 64:
++                del _sessions_memo[next(iter(_sessions_memo))]
++    return found & set(candidates)
++
++
++def _parents(rows: dict) -> dict[str, list[str]]:
++    """``child -> [open parents]`` of ``rows``, built once per rows object (rows are never mutated once built)."""
++    index = rows.get("_parents")
++    if index is None:
++        tasks, out = rows["tasks"], {}
++        for parent, child in rows["edges"]:
++            if child in tasks and parent in tasks:  # finished/unknown parents never wait
++                out.setdefault(child, []).append(parent)
++        index = rows["_parents"] = {k: sorted(v) for k, v in out.items()}
++    return index
++
++
++def _candidates(rows: dict) -> frozenset:
++    found = rows.get("_candidates")
++    if found is None:
++        found = rows["_candidates"] = frozenset(
++            {t[1] for t in rows["tasks"].values() if t[1]} | {s[1] for v in rows["subs"].values() for s in v})
++    return found
++
++
++def _board_part(rows: dict, mine: frozenset) -> list:
++    """The cards of ``rows`` this origin's sessions own or shepherd, plus their open ancestors (memoised per rows
++    object and session set: every scope of the process shares one board read)."""
++    parts = rows.setdefault("_parts", {})
++    hit = parts.get(mine)
++    if hit is not None:
++        return hit
++    tasks, parents = rows["tasks"], _parents(rows)
++    subs = sorted(s for v in rows["subs"].values() for s in v if s[1] in mine)
++    own = {tid for tid, t in tasks.items() if t[1] in mine} | {s[0] for s in subs}
++    cards = [[tid, *tasks[tid][:1], tasks[tid][1] if tasks[tid][1] in mine else None, *tasks[tid][2:],
++              parents.get(tid, [])] for tid in sorted(own) if tid in tasks]
++    seen: set[str] = set()
++    stack = [p for tid in own for p in parents.get(tid, ())]
++    while stack:
++        p = stack.pop()
++        if p not in seen and p in tasks:
++            seen.add(p)
++            stack.extend(parents.get(p, ()))
++    ancestors = [[p, tasks[p][0], tasks[p][2], parents.get(p, [])] for p in sorted(seen - own)]
++    out = [cards, subs, ancestors]
++    if len(parts) > 16:
++        parts.clear()
++    parts[mine] = out
++    return out
++
++
++def boards_part(entries: list[tuple[str, Any]]) -> list:
++    """Own-board component for ``entries`` (``(board path, content key)`` from the exact fingerprint)."""
++    reads = [(path, board_rows(Path(path), content)) for path, content in entries]
++    candidates = set().union(*(_candidates(rows) for _, rows in reads)) if reads else set()
++    mine = frozenset(profile_sessions(candidates))
++    return [[path, _board_part(rows, mine)] for path, rows in reads]
++
++
++def _shadow_gateway() -> str | None:
++    from hermes_cli import kanban_sync_client as ksc
++    try:
++        return ksc.load_identity().gateway or None
++    except ksc.SyncUnavailable:
++        return None
++
++
++def shadows_part(entries: list[tuple[str, Any]], profile: str, now: float | None = None) -> list:
++    """Sync-shadow component: per shadow, this origin's linked rows (liveness dropped) and its stale verdict."""
++    from hermes_cli import kanban_chat_links as links
++    from hermes_cli.kanban_session_activity import cached_ro
++
++    if not entries:
++        return []
++    gateway = _shadow_gateway()
++    if not gateway:
++        return [["no-gateway", [path for path, _ in entries]]]
++    now = time.time() if now is None else now
++    stale_after = links._stale_after_s()
++    out = []
++    for path, content in entries:
++        with cached_ro(Path(path), busy_budget=0) as conn:
++            conn.row_factory = sqlite3.Row
++            try:
++                rows = links.replica_link_rows(conn, Path(path), gateway, profile, content)
++                try:
++                    row = conn.execute("SELECT pulled_at FROM kanban_sync_state LIMIT 1").fetchone()
++                    pulled = float(row[0]) if row and row[0] is not None else None
++                except sqlite3.OperationalError:  # replica written before pulls were stamped
++                    pulled = None
++            finally:
++                conn.row_factory = None
++        with _lock:
++            memo = _shadow_digests.get((path, profile))
++        if memo is not None and memo[0] is rows:
++            body = memo[1]
++        else:
++            body = _digest(sorted(_digest({k: v for k, v in r.items() if k not in _SHADOW_DROP}) for r in rows))
++            with _lock:
++                _shadow_digests[(path, profile)] = (rows, body)
++                while len(_shadow_digests) > 64:
++                    del _shadow_digests[next(iter(_shadow_digests))]
++        out.append([path, body, pulled is None or now - pulled > stale_after])
++    return out
++
++
++def local_part(local: list, profile: str, now: float | None = None) -> list:
++    """Both components for the exact fingerprint's local entries (``(path, content key)``, boards then shadows).
++    Raises ``ValueError`` on an entry of unknown shape."""
++    from hermes_cli.kanban_activity_revision import is_shadow
++
++    boards, shadows, missing = [], [], []
++    for entry in local:
++        if not (isinstance(entry, (tuple, list)) and len(entry) == 2 and isinstance(entry[0], str)):
++            raise ValueError("unknown activity fingerprint entry")
++        content = entry[1]
++        if isinstance(content, (tuple, list)) and content[:1] in (("stat",), ["stat"]) and len(content) != 4:
++            raise ValueError("unreadable board")  # unknown, never unchanged (``host._portable``'s rule)
++        if not Path(entry[0]).is_file():
++            missing.append(entry[0])  # no file reads nothing; its appearance moves the key
++            continue
++        (shadows if is_shadow(entry[0]) else boards).append((entry[0], content))
++    return [boards_part(boards), shadows_part(shadows, profile, now), sorted(missing)]
++
++
++def reset() -> None:
++    with _lock:
++        _board_memo.clear()
++        _sessions_memo.clear()
++        _shadow_digests.clear()
+diff --git a/hermes_cli/kanban_annotation_narrow.py b/hermes_cli/kanban_annotation_narrow.py
+index 5f3864ff45..20a60a4d55 100644
+--- a/hermes_cli/kanban_annotation_narrow.py
++++ b/hermes_cli/kanban_annotation_narrow.py
+@@ -1,23 +1,29 @@
+ """Display/holder-only narrow origin key for the annotation holder. [daveey]
+ 
+-The holder probes the exact fingerprint every 2 s. When it moved, this key
+-decides whether the move was substantive for the annotation of one origin
+-scope. It is NEVER used by strict callers (task APIs, closeout, the default
+-``_remote_links()``): those keep the exact ``_links_fingerprint`` path.
++The holder probes it every 2 s once a scope's copy is past the 10 s floor, and it decides whether the inputs moved
++substantively for the annotation of one origin scope. It is NEVER used by strict callers (task APIs, closeout, the
++default ``_remote_links()``, ``kanban_annotation_host.adopt``): those keep the exact ``_links_fingerprint`` / host
++``fingerprint`` path, whose inputs are unchanged.
+ 
+ Key inputs (union for one origin ``(gateway, profile)``):
+-  * hub replica rows linking this origin (and ledger-bound owner rows, plus
+-    every same ``(board, id)`` publisher) by liveness-normalized semantic token
+-    (``kanban_annotation_semantic``): ``activity_at``/``activity_kind`` and a
++  * hub replica rows linking this origin (and ledger-bound owner rows, plus every same ``(board, id)`` publisher) by
++    liveness-normalized semantic token (``kanban_annotation_semantic``): ``activity_at``/``activity_kind`` and a
+     valid observation's ``task_hash`` restamp do not move the key;
+   * the scoped origin-ledger snapshot token and its raw current-match bits;
+-  * gateway info rows with ``observed_at`` clocks reduced to 180 s buckets,
+-    and the replica's ``last_ok`` as a 180 s bucket plus ``offline_since``;
+-  * every own-board and sync-shadow content key from the exact fingerprint
+-    (unchanged), plus the exact waiting inputs and code identity.
+-
+-Anything the key misses is bounded by the holder's 20 s forced renewal; any
+-read error returns None, which the holder treats as "moved" (exact fallback).
++  * gateway info rows with every ``observed_at`` clock replaced by its freshness verdict at now (the owner's
++    ``scope_window``, as ``scope_heartbeats`` judges it), and the replica's ``last_ok`` stale verdict at now
++    (``HUB_STALE_AFTER_S``) plus ``offline_since``. A clock that only advances never moves the key; a freshness flip
++    does, even with no new row. (180 s buckets of each owner's clock moved the key once per bucket per owner: with
++    ~11 owners on hermes-hub, every ~16 s.)
++  * own boards and sync shadows by origin content, never their raw revisions (``kanban_annotation_local``): the open
++    cards this profile's sessions own or shepherd and their open ancestors (status, membership, needs-human), and
++    this origin's linked shadow rows with the shadow's stale verdict. Raw revisions moved on every commit to the
++    shared default board or shadow, so every scope's key moved on nearly every probe (t_01a1db1387f61a98);
++  * each waiting source's and done check's code identity. A waiting source's declared inputs are not keyed: the
++    chat-closeout inputs carry every board's and shadow's raw content key, so they moved with the same churn.
++
++Anything the key misses is bounded by the holder's 20 s forced renewal, and an own mutation kicks the scope past
++the floor; any read error returns None, which the holder treats as "moved" (exact fallback).
+ """
+ from __future__ import annotations
+ 
+@@ -26,47 +32,56 @@ import json
+ import logging
+ import math
+ import threading
++import time
+ from pathlib import Path
+ 
+ log = logging.getLogger(__name__)
+ 
+-_VERSION = 1
+-BUCKET_S = 180.0
++_VERSION = 2
+ stats = {"keys": 0, "errors": 0, "selections": 0}
+ 
+ 
+-def _bucket(value) -> int | None:
+-    if value is None:
+-        return None
+-    value = float(value)
+-    if not math.isfinite(value):
+-        raise ValueError("nonfinite clock")
+-    return int(value // BUCKET_S)
+-
+-
+-def _normalize_info(value):
+-    """Gateway info with every ``observed_at`` clock bucketed; other fields verbatim."""
++def _normalize_info(value, fresh):
++    """Gateway info with every ``observed_at`` clock replaced by ``fresh(clock)``; other fields verbatim."""
+     if isinstance(value, dict):
+-        return {k: (_bucket(v) if k == "observed_at" and isinstance(v, (int, float)) else _normalize_info(v))
+-                for k, v in value.items()}
++        return {k: (fresh(v) if k == "observed_at" else _normalize_info(v, fresh)) for k, v in value.items()}
+     if isinstance(value, list):
+-        return [_normalize_info(v) for v in value]
++        return [_normalize_info(v, fresh) for v in value]
+     return value
+ 
+ 
+-def _infos(rows: tuple) -> list:
++def _infos(rows: tuple, now: float) -> list:
++    from hermes_cli import kanban_scope_heartbeat as hb
+     from hermes_cli.kanban_replica_rows import text
+ 
+     out = []
+     for gw, data in rows:
+         info = json.loads(text(data) if not isinstance(data, str) else data)
++        window = hb.scope_window(info)  # this owner's window, read before the period is rounded below
++
++        def fresh(clock, window=window):
++            if isinstance(clock, float) and not math.isfinite(clock):
++                raise ValueError("nonfinite clock")
++            return None if clock is None else hb.fresh(clock, now, window)
+         # A collector's heartbeat period jitters by seconds; it only sizes a >=450 s window.
+         if isinstance(info, dict) and isinstance(info.get("scope_heartbeat_period_s"), (int, float)):
+             info = dict(info, scope_heartbeat_period_s=round(info["scope_heartbeat_period_s"] / 60))
+-        out.append([gw, _normalize_info(info)])
++        out.append([gw, _normalize_info(info, fresh)])
+     return out
+ 
+ 
++def _stale(last_ok, now: float) -> bool:
++    """``_project_replica``'s staleness test of the replica's last successful sync (``offline_since`` is keyed apart)."""
++    from hermes_cli.kanban_session_activity import HUB_STALE_AFTER_S
++
++    if last_ok is None:
++        return True
++    last_ok = float(last_ok)
++    if not math.isfinite(last_ok):
++        raise ValueError("nonfinite clock")
++    return now - last_ok > HUB_STALE_AFTER_S
++
++
+ class _ScopeState:
+     def __init__(self) -> None:
+         self.lock = threading.Lock()
+@@ -102,8 +117,11 @@ def _state(scope: tuple[str, ...]) -> _ScopeState:
+ 
+ 
+ def reset() -> None:
++    from hermes_cli import kanban_annotation_local as local
++
+     with _states_lock:
+         _states.clear()
++    local.reset()
+ 
+ 
+ def _ledger_path() -> Path:
+@@ -112,7 +130,7 @@ def _ledger_path() -> Path:
+     return get_hermes_home() / "kanban" / "origin-ledger.db"
+ 
+ 
+-def _origin_part(state: _ScopeState, profile: str) -> list:
++def _origin_part(state: _ScopeState, profile: str, now: float) -> list:
+     from hermes_cli import kanban_annotation_ledger as kal
+     from hermes_cli import kanban_session_activity as ksa
+ 
+@@ -158,13 +176,15 @@ def _origin_part(state: _ScopeState, profile: str) -> list:
+                                            allow_nan=False).encode()).hexdigest()
+         state.memo = (selection, digest)
+     return [snap.gateway, ledger_token, [list(c) for c in current], state.memo[1],
+-            _infos(snap.info_rows), _bucket(snap.last_ok), snap.offline_since is not None]
++            _infos(snap.info_rows, now), _stale(snap.last_ok, now), snap.offline_since is not None]
+ 
+ 
+ def key(scope: tuple[str, ...], full: tuple, waiting: list) -> str | None:
+     """Narrow key for ``scope``; ``full`` is the exact activity fingerprint (hub signature first when a hub
+-    exists), ``waiting`` the exact declared waiting inputs. None = unknown (caller treats as moved)."""
++    exists; its board and shadow entries name the files and memoise their reads), ``waiting`` the waiting sources'
++    code identity (``kanban_annotation_host.waiting_identity``). None = unknown (caller treats as moved)."""
+     from hermes_cli import kanban_annotation_host as host
++    from hermes_cli import kanban_annotation_local as own
+     from hermes_cli import kanban_session_activity as ksa
+ 
+     if len(scope) < 2:
+@@ -173,10 +193,11 @@ def key(scope: tuple[str, ...], full: tuple, waiting: list) -> str | None:
+     if not state.lock.acquire(blocking=False):
+         return None
+     try:
++        now = time.time()
+         local = list(full[1:]) if ksa._hub_db_path() is not None else list(full)
+-        body = [_VERSION, list(scope), host.core_sha(), host._portable(local), waiting,
++        body = [_VERSION, list(scope), host.core_sha(), own.local_part(local, scope[1], now), waiting,
+                 [[name, host._code_id(fn)] for name, fn in sorted(ksa._done_checks.items())],
+-                _origin_part(state, scope[1])]
++                _origin_part(state, scope[1], now)]
+         stats["keys"] += 1
+         return hashlib.sha256(json.dumps(body, separators=(",", ":"), sort_keys=True,
+                                          allow_nan=False).encode()).hexdigest()
+diff --git a/hermes_cli/kanban_chat_links.py b/hermes_cli/kanban_chat_links.py
+index 6b4aa44bef..e31ea925cf 100644
+--- a/hermes_cli/kanban_chat_links.py
++++ b/hermes_cli/kanban_chat_links.py
+@@ -523,18 +523,12 @@ def _read_replica(path: Path, gateway: str,
+     2026-11-13). Each link now carries its own answer, as ``replica_cards`` says: only a released link drops it."""
+-    from hermes_cli.kanban_activity_revision import SHADOW_TABLES, is_revision
++    from hermes_cli.kanban_activity_revision import SHADOW_TABLES
+     from hermes_cli.kanban_session_activity import _board_content_key, cached_ro  # lazy: that module imports this one
+     # [daveey] The link rows only change with the replica's tasks/task_chat_links content; a pull that only moves
+     # ``pulled_at`` (every few seconds) re-reads the stamp, not the ~10k links. Rows are read-only to callers.
+-    memo_key = (str(path), gateway, profile)
+     content = _board_content_key(path, SHADOW_TABLES)
+-    hit = _replica_rows.get(memo_key)
+     with cached_ro(path) as conn:
+         conn.row_factory = sqlite3.Row
+-        # Only a trigger-backed revision vouches for the rows; a stat key (no counter) always reads.
+-        rows = hit[1] if hit is not None and hit[0] == content and is_revision(content) else None
+-        if rows is None:
+-            rows = _read_replica_links(conn, gateway, profile)
+-            _replica_rows[memo_key] = (content, rows)
++        rows = replica_link_rows(conn, path, gateway, profile, content)
+         # Never memoised: a pulled heartbeat is bookkeeping, so ``content`` does not move for it, while the run's
+         # newest liveness event is exactly what dates the card (review t_01a1d0f7c4cc4688).
+         runs = read_runs(conn, gateway, profile)
+@@ -550,6 +544,22 @@ def _read_replica(path: Path, gateway: str,
+ _replica_rows: dict[tuple[str, str, str], tuple[tuple, list[dict[str, Any]]]] = {}
+ 
+ 
++def replica_link_rows(conn: sqlite3.Connection, path: Path, gateway: str, profile: str,
++                      content: tuple) -> list[dict[str, Any]]:
++    """[daveey] This origin's unreleased link rows in replica ``path`` (``_read_replica_links`` on ``conn``, whose
++    ``row_factory`` must be ``sqlite3.Row``), memoised under ``content`` (the shadow's content key). Only a
++    trigger-backed revision vouches for the rows; a stat key (no counter) always reads. Shared with the annotation
++    holder's narrow key (``kanban_annotation_narrow``), so a shadow commit is read once for both."""
++    from hermes_cli.kanban_activity_revision import is_revision
++    memo_key = (str(path), gateway, profile)
++    hit = _replica_rows.get(memo_key)
++    if hit is not None and hit[0] == content and is_revision(content):
++        return hit[1]
++    rows = _read_replica_links(conn, gateway, profile)
++    _replica_rows[memo_key] = (content, rows)
++    return rows
++
++
+ def _read_replica_links(conn: sqlite3.Connection, gateway: str, profile: str) -> list[dict[str, Any]]:
+     return [dict(r) for r in conn.execute(
+         "SELECT l.task_id AS id, t.id AS task_row, t.title, t.status, t.assignee, t.created_at, t.started_at, "
+diff --git a/scripts/benchmark_kanban_annotation_holder.py b/scripts/benchmark_kanban_annotation_holder.py
+index 4c88843d0d..1d6213a792 100644
+--- a/scripts/benchmark_kanban_annotation_holder.py
++++ b/scripts/benchmark_kanban_annotation_holder.py
+@@ -10,7 +10,10 @@ Two parts, both printed as one JSON document:
+    rows (67% liveness-only: ``activity_at``/``activity_kind`` + observation ``task_hash`` restamp), ~7.9 changed
+    session rows, then calls the real ``kanban_annotation_narrow.key`` and records its process CPU. ``--wal-mb``
+    first grows the WAL to >= N MB with autocheckpoint off (card M: read cost follows the active log), else the
+-   WAL is checkpointed (TRUNCATE) before the replay.
++   WAL is checkpointed (TRUNCATE) before the replay. Each window also churns a real own board and sync shadow
++   (``churn_local``: other origins' cards, run/event rows, pull stamps every window, as measured on hermes-hub, plus
++   an own substantive change at ``OWN_CHANGE_P``), so raw board/shadow revisions move on nearly every window
++   (t_01a1db1387f61a98: the key used to carry them verbatim).
+ 
+ 2. **Replay** (decision model). The C2 census stream (``c2-union.json``: per 2 s window, which components of the
+    default scope's union moved) drives the holder rule: 2 s probe, refresh only when the narrow key moved and the
+@@ -43,6 +46,9 @@ TIERS = {
+ }
+ WINDOWS = 150
+ ORIGIN = ("me", "default")
++MINE = 300  # own-board cards of this profile's sessions
++LINKED_SHADOW = 100  # shadow cards linked to this origin
++OWN_CHANGE_P = 0.02  # own substantive board/shadow change per 2 s window
+ 
+ 
+ STATE: dict[int, dict] = {}
+@@ -131,6 +137,100 @@ def grow_wal(conn: sqlite3.Connection, path: Path, mb: int) -> int:
+     return os.path.getsize(str(path) + "-wal")
+ 
+ 
++def build_local(tmp: Path, tasks: int) -> dict:
++    """A real own board (kanban_db schema + revision triggers) and a sync shadow, each with ``tasks // 4`` cards:
++    ``MINE`` owned by this profile's sessions (in its ``state.db``) and ``LINKED_SHADOW`` shadow cards linked to this
++    origin; the rest belong to other origins, as on the hub's shared default board."""
++    from hermes_cli import kanban_activity_revision as revision
++    from hermes_cli import kanban_db_connect as kdb
++    from hermes_cli.kanban_db_sync import SHADOW_DIR
++
++    n = max(tasks // 4, MINE + 10)
++    os.environ["HERMES_KANBAN_HOME"] = str(tmp)
++    board = kdb.init_db(tmp / "kanban.db")
++    bconn = sqlite3.connect(board, isolation_level=None)
++    bconn.execute("BEGIN")
++    for i in range(n):
++        sid = f"mine{i % 200}" if i < MINE else f"remote{i % 3000}"
++        bconn.execute("INSERT INTO tasks (id, title, status, session_id, created_at) VALUES (?, ?, 'running', ?, 1)",
++                      (f"b{i}", f"card {i}", sid))
++    bconn.execute("COMMIT")
++    from hermes_constants import get_hermes_home
++
++    with sqlite3.connect(get_hermes_home() / "state.db") as st:  # health: allow HX015 -- benchmark's temp HERMES_HOME
++        st.execute("CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY)")
++        st.executemany("INSERT OR IGNORE INTO sessions (id) VALUES (?)", [(f"mine{i}",) for i in range(200)])
++    st.close()
++    shadow = tmp / SHADOW_DIR / "default.db"
++    shadow.parent.mkdir(parents=True, exist_ok=True)
++    sconn = sqlite3.connect(shadow, isolation_level=None)
++    sconn.execute("PRAGMA journal_mode=WAL")
++    sconn.executescript(
++        "CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, status TEXT, assignee TEXT, created_at INTEGER, "
++        "started_at INTEGER, priority INTEGER, block_kind TEXT, human_request TEXT, created_on TEXT, "
++        "lease_expires INTEGER);"
++        "CREATE TABLE task_links (parent_id TEXT, child_id TEXT);"
++        "CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT, status TEXT);"
++        "CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT);"
++        "CREATE TABLE task_comments (id INTEGER PRIMARY KEY, task_id TEXT, body TEXT);"
++        "CREATE TABLE task_chat_links (uid TEXT, task_id TEXT, chat_gateway TEXT, chat_profile TEXT, "
++        "chat_session TEXT, kind TEXT, released INTEGER, created_at INTEGER);"
++        "CREATE INDEX task_chat_links_origin ON task_chat_links(chat_gateway, chat_profile, released);"
++        "CREATE TABLE kanban_sync_state (board_id TEXT PRIMARY KEY, cursor INTEGER, gateway_id TEXT, "
++        "hlc_last TEXT, mode TEXT, applying INTEGER, pending_run_uid TEXT, pulled_at REAL);")
++    revision.ensure_revision(sconn, revision.SHADOW_TABLES)
++    sconn.execute("BEGIN")
++    for i in range(n):
++        sconn.execute("INSERT INTO tasks VALUES (?, ?, 'running', 'w', 1, NULL, 0, NULL, NULL, 'owner', 0)",
++                      (f"r{i}", f"card {i}"))
++        if i < LINKED_SHADOW:
++            sconn.execute("INSERT INTO task_chat_links VALUES (?, ?, ?, ?, ?, 'created', 0, 1)",
++                          (f"u{i}", f"r{i}", ORIGIN[0], ORIGIN[1], f"mine{i % 200}"))
++    sconn.execute("INSERT INTO kanban_sync_state VALUES ('default', 0, ?, '', 'shadow', 0, NULL, ?)",
++                  (ORIGIN[0], time.time()))
++    sconn.execute("COMMIT")
++    return {"board": board, "bconn": bconn, "shadow": shadow, "sconn": sconn, "n": n}
++
++
++def local_full(local: dict) -> tuple:
++    from hermes_cli import kanban_activity_revision as revision
++    from hermes_cli import kanban_session_activity as ksa
++
++    return ("hubsig", (str(local["board"]), ksa._board_content_key(local["board"])),
++            (str(local["shadow"]), ksa._board_content_key(local["shadow"], revision.SHADOW_TABLES)))
++
++
++def churn_local(local: dict, rng: random.Random, step: int) -> int:
++    """One 2 s window of board/shadow revision churn, as measured on hermes-hub (t_01a1db1387f61a98: the default
++    shadow's revision moved on every 10 s sample, the default board's on about half): other origins' cards, run rows,
++    events and pull stamps, plus a rare own substantive change. Returns the number of own substantive changes."""
++    bconn, sconn, n = local["bconn"], local["sconn"], local["n"]
++    if rng.random() < 0.5:
++        i = rng.randrange(MINE, n)
++        bconn.execute("UPDATE tasks SET status=? WHERE id=?", (rng.choice(["running", "ready", "blocked"]), f"b{i}"))
++    bconn.execute("INSERT INTO task_events (task_id, kind, created_at) VALUES (?, 'spawned', ?)",
++                  (f"b{rng.randrange(n)}", step))
++    sconn.execute("BEGIN")
++    sconn.execute("UPDATE tasks SET status=? WHERE id=?",
++                  (rng.choice(["running", "ready", "blocked"]), f"r{rng.randrange(LINKED_SHADOW, n)}"))
++    sconn.execute("INSERT INTO task_events (task_id, kind) VALUES (?, 'spawned')", (f"r{rng.randrange(n)}",))
++    sconn.execute("UPDATE tasks SET lease_expires=? WHERE id=?", (step, f"r{rng.randrange(n)}"))
++    sconn.execute("UPDATE kanban_sync_state SET pulled_at=?", (time.time(),))
++    sconn.execute("COMMIT")
++    own = 0
++    if rng.random() < OWN_CHANGE_P:
++        own += 1
++        if rng.random() < 0.5:
++            i = rng.randrange(MINE)
++            bconn.execute("UPDATE tasks SET status=CASE status WHEN 'running' THEN 'blocked' ELSE 'running' END "
++                          "WHERE id=?", (f"b{i}",))
++        else:
++            i = rng.randrange(LINKED_SHADOW)
++            sconn.execute("UPDATE tasks SET status=CASE status WHEN 'running' THEN 'blocked' ELSE 'running' END "
++                          "WHERE id=?", (f"r{i}",))
++    return own
++
++
+ def churn(conn: sqlite3.Connection, rng: random.Random, linked: int, tasks: int, sessions: int, step: int) -> dict:
+     """One 2 s window of the rf2 mix. Returns what kind of change happened to linked rows."""
+     kinds = {"liveness_linked": 0, "substantive_linked": 0, "unlinked": 0, "sessions": 0}
+@@ -163,6 +263,7 @@ def churn(conn: sqlite3.Connection, rng: random.Random, linked: int, tasks: int,
+ 
+ 
+ def scale_tier(name: str, wal_mb: int, seed: int = 7) -> dict:
++    from hermes_cli import kanban_annotation_local as own
+     from hermes_cli import kanban_annotation_narrow as narrow
+     from hermes_cli import kanban_session_activity as ksa
+ 
+@@ -180,40 +281,55 @@ def scale_tier(name: str, wal_mb: int, seed: int = 7) -> dict:
+     ksa._hub_db_path = lambda: hub
+     narrow._ledger_path = lambda: ledger
+     narrow.reset()
++    local = build_local(tmp, tasks)
++    own._shadow_gateway = lambda: ORIGIN[0]
+     scope = ("home", ORIGIN[1], "kh", "hub", "mail")
+-    full = ("hubsig", ("board", 1))
++    full = local_full(local)
+     t0 = time.process_time()
+     first = narrow.key(scope, full, [])
+     cold_ms = (time.process_time() - t0) * 1000
+     assert first is not None, "narrow key unavailable on a healthy store"
+     rng = random.Random(seed)
+     costs, moved, liveness_only_windows, liveness_moved = [], 0, 0, 0
++    raw_moved, own_changes = 0, 0
+     previous = first
+     for step in range(WINDOWS):
+         kinds = churn(conn, rng, linked, tasks, sessions, step)
++        changed_own = churn_local(local, rng, step)
++        own_changes += changed_own
++        before_full, full = full, local_full(local)
++        raw_moved += before_full[1:] != full[1:]
+         t0 = time.process_time()
+         k = narrow.key(scope, full, [])
+         costs.append((time.process_time() - t0) * 1000)
+         assert k is not None, f"narrow key unavailable at step {step}"
+         if k != previous:
+             moved += 1
+-        if kinds["substantive_linked"] == 0:
++        if kinds["substantive_linked"] == 0 and not changed_own:
+             liveness_only_windows += 1
+             liveness_moved += k != previous
+         previous = k
+     conn.close()
++    local["bconn"].close()
++    local["sconn"].close()
+     costs.sort()
+     return {"tier": name, "linked": linked, "replica_tasks": tasks, "sessions": sessions,
+             "obligations": obligations, "wal_bytes": wal, "cold_ms": round(cold_ms, 3),
++            "board_cards": local["n"], "shadow_cards": local["n"], "own_cards": MINE, "linked_shadow": LINKED_SHADOW,
++            "board_or_shadow_revision_moved_windows": raw_moved, "own_substantive_changes": own_changes,
+             "key_ms_mean": round(statistics.fmean(costs), 3), "key_ms_p50": round(costs[len(costs) // 2], 3),
+             "key_ms_p95": round(costs[int(len(costs) * 0.95)], 3), "key_ms_max": round(costs[-1], 3),
+-            "windows": WINDOWS, "key_moved_windows": moved, "windows_without_substantive_linked": liveness_only_windows,
+-            "key_moved_without_substantive_linked": liveness_moved, "narrow_stats": dict(narrow.stats)}
++            "windows": WINDOWS, "key_moved_windows": moved, "windows_without_substantive": liveness_only_windows,
++            "key_moved_without_substantive": liveness_moved, "narrow_stats": dict(narrow.stats),
++            "local_stats": dict(own.stats)}
+ 
+ 
+-def replay(union: dict, key_ms: float, per_refresh_ms: float, probe_ms: float, exact_move_rate: float) -> dict:
++def replay(union: dict, key_ms: float, per_refresh_ms: float, probe_ms: float, exact_move_rate: float,
++           local_move_rate: float = OWN_CHANGE_P) -> dict:
+     """Holder decisions over the c2 census stream for the default scope."""
+-    comps = {"hub", "ledger", "own_boards", "shadows", "freshness_bucket"}
++    # [daveey] Raw own_boards/shadows revisions and 180 s freshness buckets no longer move the key
++    # (t_01a1db1387f61a98): own content moves it at ``local_move_rate`` per window (scale part: OWN_CHANGE_P).
++    comps = {"hub", "ledger"}
+     samples = union["samples"]
+     last, refreshes, renews, keys, probes, pending = -1e9, 0, 0, 0, 0, False
+     exact_since = False
+@@ -222,7 +338,7 @@ def replay(union: dict, key_ms: float, per_refresh_ms: float, probe_ms: float, e
+         moved = set(s["moved"].get("default", ()))
+         probes += 1
+         exact_since = exact_since or bool(moved) or random.random() < exact_move_rate
+-        pending = pending or bool(moved & comps)
++        pending = pending or bool(moved & comps) or random.random() < local_move_rate
+         if t - last >= 20.0:
+             refreshes, renews, last, pending, exact_since = refreshes + 1, renews + 1, t, False, False
+             continue
+@@ -270,7 +386,7 @@ def main() -> int:
+     # holder-side share over the replay (calls x the largest tier's mean cost) must stay <= 0.5% of a core.
+     # The total holder figure is REPORTED (``over_budget``), not gated here: the forced 20 s renewal alone costs
+     # ``renewal_only_floor_pct`` at the measured per-refresh cost, so 2.4% needs per-refresh work cuts (P1).
+-    bad = [s["tier"] for s in out["scale"] if s["key_moved_without_substantive_linked"]]
++    bad = [s["tier"] for s in out["scale"] if s["key_moved_without_substantive"]]
+     if out.get("replay") and out["replay"]["narrow_key_pct"] > 0.5:
+         bad.append("narrow_key_pct")
+     if bad:
+diff --git a/tests/hermes_cli/test_kanban_annotation_holder_narrow.py b/tests/hermes_cli/test_kanban_annotation_holder_narrow.py
+index 5c422ba20e..999fae19c0 100644
+--- a/tests/hermes_cli/test_kanban_annotation_holder_narrow.py
++++ b/tests/hermes_cli/test_kanban_annotation_holder_narrow.py
+@@ -15,9 +15,9 @@ SCOPE = helpers.SCOPE
+ def gate(world, monkeypatch):
+     state = {"key": "K1", "calls": 0}
+ 
+-    def narrow_now(scope, full, fp):
++    def narrow_now(scope, full):
+         state["calls"] += 1
+-        return state["key"] if fp is not None else None
++        return state["key"]
+ 
+     monkeypatch.setattr(host, "_narrow_now", narrow_now)
+     helpers._poll()
+@@ -110,11 +110,17 @@ def test_own_mutation_bypasses_narrow_gate(world, gate):
+     assert host._holder_refresh_scope(SCOPE)
+ 
+ 
+-def test_unmoved_inputs_skip_narrow_key(world, gate):
+-    calls = gate["calls"]
++def test_unmoved_inputs_answered_by_narrow_key_alone(world, gate, monkeypatch):
++    """Past the floor the narrow key alone answers: the exact fingerprint (waiting-input probes) is not read."""
++    monkeypatch.setattr(host, "fingerprint", lambda *a: pytest.fail("a known narrow key needs no exact fingerprint"))
+     helpers._advance(world, 12)
+     assert not host._holder_refresh_scope(SCOPE)
+-    assert gate["calls"] == calls  # exact fingerprint equal: no narrow read at all
++
++
++def test_unknown_narrow_key_falls_back_to_exact(world, gate):
++    gate["key"] = None
++    helpers._advance(world, 12)
++    assert not host._holder_refresh_scope(SCOPE)  # exact fingerprint unchanged: still no refresh
+ 
+ 
+ def test_floor_skips_narrow_key(world, gate):
+diff --git a/tests/hermes_cli/test_kanban_annotation_host.py b/tests/hermes_cli/test_kanban_annotation_host.py
+index 44b178e115..c0bda6ef50 100644
+--- a/tests/hermes_cli/test_kanban_annotation_host.py
++++ b/tests/hermes_cli/test_kanban_annotation_host.py
+@@ -48,6 +48,7 @@ def world(tmp_path, monkeypatch):
+     now["calls"] = calls
+     conn = _board(tmp_path / "kanban.db", [("t1", "running", "s1"), ("t2", "blocked", "s1"), ("t3", "ready", "s2")])
+     now["conn"] = conn
++    _sessions(["s1", "s2", "s3"])  # this profile's chats: the holder's narrow key counts only their cards
+     ksa._reset_cache_for_tests()
+     yield now
+     conn.close()
+@@ -63,6 +64,18 @@ def _board(path: Path, rows) -> sqlite3.Connection:
+     return conn
+ 
+ 
++def _sessions(ids) -> None:
++    """Sessions of this origin profile (its ``state.db``)."""
++    from hermes_constants import get_hermes_home
++
++    db = get_hermes_home() / "state.db"
++    db.parent.mkdir(parents=True, exist_ok=True)
++    with sqlite3.connect(db) as conn:
++        conn.execute("CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY)")
++        conn.executemany("INSERT OR IGNORE INTO sessions (id) VALUES (?)", [(i,) for i in ids])
++    conn.close()
++
++
+ def _advance(world, seconds):
+     world["mono"] += seconds
+     world["wall"] += seconds
+diff --git a/tests/hermes_cli/test_kanban_annotation_narrow.py b/tests/hermes_cli/test_kanban_annotation_narrow.py
+index fed6917ed2..e46ba29b58 100644
+--- a/tests/hermes_cli/test_kanban_annotation_narrow.py
++++ b/tests/hermes_cli/test_kanban_annotation_narrow.py
+@@ -81,27 +81,37 @@ def test_new_link_moves_key(hub):
+     assert key() != before
+ 
+ 
+-def test_freshness_only_as_bucket_transitions(hub):
+-    before = key()
+-    hub("UPDATE meta SET v='1100' WHERE k='last_ok'")  # 1000//180 == 5 -> 1100//180 == 6: a bucket transition
+-    moved = key()
+-    hub("UPDATE meta SET v='1150' WHERE k='last_ok'")  # 1150//180 == 6: same bucket as 1100
+-    assert key() == moved
+-    assert moved != before
+-    hub("UPDATE replica SET data=json_set(data,'$.task_scopes[0].observed_at',1010.0), seq=:seq "
+-        "WHERE coll='gateway'")  # 1010//180 == 1000//180
+-    assert key() == moved
++def test_freshness_only_as_verdict_flips(hub, monkeypatch):
++    """Clocks enter as freshness verdicts at now: an advancing clock never moves the key, a flip does. (180 s
++    buckets of each owner's clock moved it once per bucket per owner: every ~16 s with ~11 owners on the hub.)"""
++    now = {"t": 1100.0}
++    monkeypatch.setattr(narrow.time, "time", lambda: now["t"])
++    before = key()  # last_ok 1000: fresh (100 s); heartbeat 1000: fresh in a >= 450 s window
++    hub("UPDATE meta SET v='1090' WHERE k='last_ok'")
++    hub("UPDATE replica SET data=json_set(data,'$.task_scopes[0].observed_at',1095.0), seq=:seq "
++        "WHERE coll='gateway'")
+     hub("UPDATE replica SET data=json_set(data,'$.scope_heartbeat_period_s',184), seq=:seq WHERE coll='gateway'")
+-    assert key() == moved
++    now["t"] = 1200.0  # crosses the old 180 s bucket boundary (1080) for both clocks
++    assert key() == before
++    now["t"] = 1300.0  # last_ok 1090 is 210 s old: stale
++    stale = key()
++    assert stale != before
++    hub("UPDATE meta SET v='1290' WHERE k='last_ok'")
++    assert key() == before  # fresh again
++    now["t"] = 1095.0 + 2000  # the heartbeat ages out of its window (last_ok kept fresh)
++    hub("UPDATE meta SET v=? WHERE k='last_ok'", (str(now["t"] - 1),))
++    assert key() not in (before, stale)
+     hub("UPDATE replica SET data=json_set(data,'$.task_scopes[0].state','error'), seq=:seq WHERE coll='gateway'")
+-    assert key() != moved
++    aged = key()
++    hub("UPDATE replica SET data=json_set(data,'$.task_scopes[0].state','ok'), seq=:seq WHERE coll='gateway'")
++    assert key() != aged  # other info fields stay verbatim
+ 
+ 
+-def test_own_board_and_waiting_inputs_are_exact(hub):
++def test_waiting_code_identity_moves_key_hub_signature_does_not(hub):
+     base = key()
+-    assert narrow.key(SCOPE, ("hubsig", ("board", 2)), []) != base
+     assert narrow.key(SCOPE, ("hubsig", ("board", 1)), [["src", "x", 1]]) != base
+     assert narrow.key(SCOPE, ("other-hubsig", ("board", 1)), []) == base  # hub signature is replaced
++    assert narrow.key(SCOPE, ("hubsig", ("board", 2)), []) == base  # a missing board reads nothing either way
+ 
+ 
+ def test_unreadable_row_is_unknown_never_stale(hub):
+diff --git a/tests/hermes_cli/test_kanban_annotation_narrow_local.py b/tests/hermes_cli/test_kanban_annotation_narrow_local.py
+new file mode 100644
+index 0000000000..ebcde7a329
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_annotation_narrow_local.py
+@@ -0,0 +1,268 @@
++"""Narrow key, own boards and sync shadows: keyed by origin content, never by raw revision. [daveey]
++
++t_01a1db1387f61a98: the key hashed every board's and shadow's content key verbatim, so any commit to the shared
++default board or shadow (another gateway's card, a run row, a pulled event) moved all 8 scopes' keys on hermes-hub
++and each refreshed every 12 s. Each "keeps" test asserts the board's content key DID move (the old key moved with
++it) while the narrow key did not.
++"""
++import sqlite3
++import time
++
++import pytest
++
++from hermes_cli import kanban_activity_revision as revision
++from hermes_cli import kanban_annotation_local as own
++from hermes_cli import kanban_annotation_narrow as narrow
++from hermes_cli import kanban_session_activity as ksa
++from hermes_cli.kanban_db_sync import SHADOW_DIR
++from tests.hermes_cli.test_kanban_annotation_narrow import SCOPE, hub  # fixture
++
++PROFILE = SCOPE[1]
++ME = "me"
++REQUEST = '{"action": "Reply A or B. Unblock = build it; archive = drop it.", "why_human": "taste", ' \
++          '"interaction": "reply", "scope": "this card", "evidence": "two options"}'
++
++
++def _sessions(ids):
++    from hermes_constants import get_hermes_home
++
++    db = get_hermes_home() / "state.db"
++    db.parent.mkdir(parents=True, exist_ok=True)
++    with sqlite3.connect(db) as conn:
++        conn.execute("CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY)")
++        conn.executemany("INSERT OR IGNORE INTO sessions (id) VALUES (?)", [(i,) for i in ids])
++    conn.close()
++
++
++@pytest.fixture
++def world(hub, tmp_path, monkeypatch):
++    from hermes_cli import kanban_db_connect as kdb
++
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
++    board = kdb.init_db(tmp_path / "kanban.db")
++    conn = sqlite3.connect(board, isolation_level=None)
++    cols = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
++    assert {"session_id", "human_request", "block_kind"} <= cols
++    for tid, status, sid in [("t1", "running", "mine1"), ("t2", "todo", "mine1"), ("tp", "running", "other"),
++                             ("tx", "running", "other")]:
++        conn.execute("INSERT INTO tasks (id, title, status, session_id, created_at) VALUES (?, ?, ?, ?, 1)",
++                     (tid, f"title {tid}", status, sid))
++    conn.execute("INSERT INTO task_links (parent_id, child_id) VALUES ('tp', 't2')")
++    _sessions(["mine1", "mine2"])
++
++    shadow = tmp_path / SHADOW_DIR / "default.db"
++    shadow.parent.mkdir(parents=True)
++    sconn = sqlite3.connect(shadow, isolation_level=None)
++    sconn.executescript(
++        "CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, status TEXT, assignee TEXT, created_at INTEGER, "
++        "started_at INTEGER, priority INTEGER, block_kind TEXT, human_request TEXT, created_on TEXT, "
++        "lease_expires INTEGER);"
++        "CREATE TABLE task_links (parent_id TEXT, child_id TEXT);"
++        "CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT, status TEXT);"
++        "CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT);"
++        "CREATE TABLE task_comments (id INTEGER PRIMARY KEY, task_id TEXT, body TEXT);"
++        "CREATE TABLE task_chat_links (uid TEXT, task_id TEXT, chat_gateway TEXT, chat_profile TEXT, "
++        "chat_session TEXT, kind TEXT, released INTEGER, created_at INTEGER);"
++        "CREATE TABLE kanban_sync_state (board_id TEXT PRIMARY KEY, cursor INTEGER, gateway_id TEXT, "
++        "hlc_last TEXT, mode TEXT, applying INTEGER, pending_run_uid TEXT, pulled_at REAL);")
++    revision.ensure_revision(sconn, revision.SHADOW_TABLES)
++    for tid, status, origin in [("r1", "running", "owner"), ("r2", "running", "owner")]:
++        sconn.execute("INSERT INTO tasks VALUES (?, ?, ?, 'w', 1, NULL, 0, NULL, NULL, ?, 100)",
++                      (tid, f"title {tid}", status, origin))
++    sconn.execute("INSERT INTO task_chat_links VALUES ('u1', 'r1', ?, ?, 'mine1', 'created', 0, 1)", (ME, PROFILE))
++    sconn.execute("INSERT INTO kanban_sync_state VALUES ('default', 0, ?, '', 'shadow', 0, NULL, ?)",
++                  (ME, time.time()))
++    monkeypatch.setattr(own, "_shadow_gateway", lambda: ME)
++    narrow.reset()
++    yield {"board": board, "conn": conn, "shadow": shadow, "sconn": sconn}
++    conn.close()
++    sconn.close()
++    narrow.reset()
++
++
++def _full(w):
++    return ("hubsig", (str(w["board"]), ksa._board_content_key(w["board"])),
++            (str(w["shadow"]), ksa._board_content_key(w["shadow"], revision.SHADOW_TABLES)))
++
++
++def key(w):
++    return narrow.key(SCOPE, _full(w), [])
++
++
++def _keeps(w, conn, sql, args=()):
++    before, content = key(w), _full(w)
++    assert before is not None
++    conn.execute(sql, args)
++    assert _full(w) != content, "the board's raw revision must move (the old key moved with it)"
++    assert key(w) == before
++
++
++def _moves(w, conn, sql, args=()):
++    before = key(w)
++    assert before is not None
++    conn.execute(sql, args)
++    after = key(w)
++    assert after is not None and after != before
++
++
++def test_key_is_revision_backed(world):
++    full = _full(world)
++    assert revision.is_revision(full[1][1]) and revision.is_revision(full[2][1])
++
++
++# -- own board: liveness and other origins' cards keep the key -----------------------------------------------------
++
++def test_other_origin_card_commit_keeps_key(world):
++    _keeps(world, world["conn"], "UPDATE tasks SET status='blocked' WHERE id='tx'")
++
++
++def test_new_card_of_another_origin_keeps_key(world):
++    _keeps(world, world["conn"], "INSERT INTO tasks (id, title, status, session_id, created_at) "
++                                 "VALUES ('ty', 'y', 'ready', 'remote-chat', 1)")
++
++
++def test_run_and_event_rows_keep_key(world):
++    _keeps(world, world["conn"], "INSERT INTO task_events (task_id, kind, created_at) VALUES ('t1', 'spawned', 1)")
++    _keeps(world, world["conn"], "INSERT INTO task_comments (task_id, author, body, created_at) "
++                                 "VALUES ('tx', 'a', 'b', 1)")
++
++
++def test_own_card_title_edit_keeps_key(world):
++    _keeps(world, world["conn"], "UPDATE tasks SET title='renamed' WHERE id='t1'")
++
++
++# -- own board: status, membership and waits move it --------------------------------------------------------------
++
++def test_own_card_status_moves_key(world):
++    _moves(world, world["conn"], "UPDATE tasks SET status='blocked' WHERE id='t1'")
++
++
++def test_own_card_finishing_moves_key(world):
++    _moves(world, world["conn"], "UPDATE tasks SET status='done' WHERE id='t1'")
++
++
++def test_new_own_card_moves_key(world):
++    _moves(world, world["conn"], "INSERT INTO tasks (id, title, status, session_id, created_at) "
++                                 "VALUES ('t3', 'z', 'ready', 'mine2', 1)")
++
++
++def test_card_rehomed_to_this_origin_moves_key(world):
++    _moves(world, world["conn"], "UPDATE tasks SET session_id='mine2' WHERE id='tx'")
++
++
++def test_human_request_moves_key(world):
++    _moves(world, world["conn"], "UPDATE tasks SET status='blocked', block_kind='needs_input', human_request=? "
++                                 "WHERE id='t1'", (REQUEST,))
++
++
++def test_shepherd_sub_moves_key(world):
++    _moves(world, world["conn"], "INSERT INTO kanban_notify_subs (task_id, platform, chat_id, created_at) "
++                                 "VALUES ('tx', 'tui', 'mine2', 1)")
++
++
++def test_parent_status_moves_key(world):
++    _moves(world, world["conn"], "UPDATE tasks SET status='done' WHERE id='tp'")
++
++
++def test_new_dependency_moves_key(world):
++    _moves(world, world["conn"], "INSERT INTO task_links (parent_id, child_id) VALUES ('tx', 't1')")
++
++
++# -- sync shadow: liveness keeps it, link and linked card changes move it -----------------------------------------
++
++def test_unlinked_shadow_card_keeps_key(world):
++    _keeps(world, world["sconn"], "UPDATE tasks SET status='blocked' WHERE id='r2'")
++
++
++def test_shadow_lease_and_events_keep_key(world):
++    before = key(world)
++    world["sconn"].execute("UPDATE tasks SET lease_expires=999 WHERE id='r1'")  # bookkeeping: no revision either
++    assert key(world) == before
++    _keeps(world, world["sconn"], "INSERT INTO task_events (task_id, kind) VALUES ('r1', 'spawned')")
++    _keeps(world, world["sconn"], "INSERT INTO task_runs (task_id, status) VALUES ('r1', 'running')")
++
++
++def test_pull_stamp_keeps_key_until_stale(world, monkeypatch):
++    before = key(world)
++    world["sconn"].execute("UPDATE kanban_sync_state SET pulled_at = pulled_at + 5")
++    assert key(world) == before
++    world["sconn"].execute("UPDATE kanban_sync_state SET pulled_at = 0")
++    assert key(world) != before  # the replica went stale: a verdict flip
++
++
++def test_linked_shadow_card_status_moves_key(world):
++    _moves(world, world["sconn"], "UPDATE tasks SET status='blocked' WHERE id='r1'")
++
++
++def test_new_and_released_link_move_key(world):
++    _moves(world, world["sconn"], "INSERT INTO task_chat_links VALUES ('u2', 'r2', ?, ?, 'mine1', 'shepherd', 0, 1)",
++           (ME, PROFILE))
++    _moves(world, world["sconn"], "UPDATE task_chat_links SET released=1 WHERE uid='u1'")
++
++
++def test_other_profiles_link_keeps_key(world):
++    _keeps(world, world["sconn"], "INSERT INTO task_chat_links VALUES ('u3', 'r2', ?, 'someone-else', 'c', "
++                                  "'created', 0, 1)", (ME,))
++
++
++# -- fail closed ---------------------------------------------------------------------------------------------------
++
++def test_unreadable_board_is_unknown(world):
++    full = list(_full(world))
++    full[1] = (full[1][0], ("stat", ((1, 2, 3, 4), None), object()))
++    assert narrow.key(SCOPE, tuple(full), []) is None
++
++
++def test_failed_board_read_is_unknown_and_not_memoised(world, monkeypatch):
++    assert key(world) is not None
++    world["conn"].execute("UPDATE tasks SET status='blocked' WHERE id='tx'")
++    real = own._board_rows
++
++    def broken(conn):
++        raise sqlite3.DatabaseError("database disk image is malformed")
++    monkeypatch.setattr(own, "_board_rows", broken)
++    assert key(world) is None
++    monkeypatch.setattr(own, "_board_rows", real)
++    assert key(world) is not None
++
++
++def test_board_read_once_then_patched_per_revision(world):
++    key(world)
++    reads, patches = own.stats["board_reads"], own.stats["board_patches"]
++    for _ in range(3):
++        key(world)
++    assert (own.stats["board_reads"], own.stats["board_patches"]) == (reads, patches)
++    world["conn"].execute("UPDATE tasks SET status='blocked' WHERE id='tx'")
++    key(world)
++    assert (own.stats["board_reads"], own.stats["board_patches"]) == (reads, patches + 1)  # changed cards only
++
++
++@pytest.mark.parametrize("seed", range(4))
++def test_patched_rows_equal_a_full_read(world, seed):
++    """Incremental board rows (per-task change cursor) always give the key a fresh full read gives."""
++    import random
++
++    rng = random.Random(seed)
++    conn = world["conn"]
++    ids = ["t1", "t2", "tp", "tx", "n1", "n2"]
++    ops = [
++        ("UPDATE tasks SET status=? WHERE id=?", lambda a, b: (rng.choice(["running", "blocked", "done", "todo"]), a)),
++        ("INSERT OR IGNORE INTO tasks (id, title, status, session_id, created_at) VALUES (?, 'n', 'ready', ?, 1)",
++         lambda a, b: (a, rng.choice(["mine1", "mine2", "other"]))),
++        ("INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)", lambda a, b: (a, b)),
++        ("DELETE FROM task_links WHERE parent_id=? OR child_id=?", lambda a, b: (a, a)),
++        ("INSERT OR IGNORE INTO kanban_notify_subs (task_id, platform, chat_id, created_at) VALUES (?, 'tui', ?, 1)",
++         lambda a, b: (a, rng.choice(["mine2", "other"]))),
++        ("DELETE FROM tasks WHERE id=?", lambda a, b: (a,)),
++    ]
++    key(world)
++    for step in range(25):
++        a, b = rng.sample(ids, 2)
++        op = rng.randrange(len(ops))
++        sql, args = ops[op]
++        conn.execute(sql, args(a, b))
++        incremental = key(world)
++        own.reset()
++        narrow.reset()
++        assert key(world) == incremental, f"step {step} op {op}"
++    assert own.stats["board_patches"] > 0
+-- 
+2.43.0
+

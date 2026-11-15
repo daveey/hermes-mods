@@ -1,0 +1,76 @@
+From d556853ca00713a7311872d0d1240e643be82289 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 22:56:29 +0000
+Subject: [PATCH] [daveey] Keep deleted wall replay plans absent on retry
+
+Retry persistence now updates only an existing state_meta row. Initial creation, retry accounting and stale limits remain unchanged.
+
+Proof: regression failed on main at assert replay._get(db, key) is None after a committed delete followed by stale_generation. After the fix: regression 1 passed; unchanged automation wake suite 26 passed, 0 skipped. scripts/check: 20 checks OK.
+---
+ gateway/session_wall_replay.py                |  6 ++--
+ .../gateway/test_session_wall_replay_retry.py | 36 +++++++++++++++++++
+ 2 files changed, 40 insertions(+), 2 deletions(-)
+ create mode 100644 tests/gateway/test_session_wall_replay_retry.py
+
+diff --git a/gateway/session_wall_replay.py b/gateway/session_wall_replay.py
+index c86edebbe9..0adf05a340 100644
+--- a/gateway/session_wall_replay.py
++++ b/gateway/session_wall_replay.py
+@@ -319,8 +319,10 @@ async def _retry(authority, intent: dict, tries: int, persist: bool = False) ->
+         return 'dropped'
+     if persist:
+         try:
+-            await asyncio.to_thread(_write, authority.db, PREFIX + intent['admission_id'],
+-                                    json.dumps({**intent, 'tries': tries + 1}))
++            # Another owner may have finished and deleted the plan since our read.
++            await asyncio.to_thread(authority.db._execute_write, lambda conn: conn.execute(
++                'UPDATE state_meta SET value=? WHERE key=?',
++                (json.dumps({**intent, 'tries': tries + 1}), PREFIX + intent['admission_id'])))
+         except Exception:  # health: allow BLE001 -- this process still counts; a restart may grant a few more
+             logger.debug('wall-replay: could not record the tries of %s', intent['admission_id'], exc_info=True)
+     _arm(authority, intent, RETRY_S, tries + 1)
+diff --git a/tests/gateway/test_session_wall_replay_retry.py b/tests/gateway/test_session_wall_replay_retry.py
+new file mode 100644
+index 0000000000..59a35544a5
+--- /dev/null
++++ b/tests/gateway/test_session_wall_replay_retry.py
+@@ -0,0 +1,36 @@
++"""A retry must not resurrect a replay plan another owner finished."""
++import pytest
++
++from tests.gateway.test_wall_replay_automation_wake import _authority, _intents, _seed, _stop
++
++
++@pytest.mark.asyncio
++async def test_retry_does_not_resurrect_a_concurrently_deleted_plan(tmp_path, monkeypatch):
++    from gateway import session_automation, session_wall_replay as replay
++    from hermes_state_runtime import RuntimeStoreError
++
++    runner, db, authority = await _authority(tmp_path, monkeypatch)
++    calls = []
++    try:
++        intent = _seed(db)
++        key = replay.PREFIX + intent['admission_id']
++
++        async def admit(*args, **kwargs):
++            # fire_replay has read the plan; another owner now finishes and deletes it
++            # before the stale owner's admission refusal reaches retry persistence.
++            assert replay._get(db, key) is not None
++            replay._write(db, key, None)
++            assert replay._get(db, key) is None
++            calls.append('deleted')
++            raise RuntimeStoreError('stale_generation')
++
++        monkeypatch.setattr(session_automation, 'admit_route_wake', admit)
++        monkeypatch.setattr(runner, '_adapter_for_source', lambda source: object())
++        assert await replay.fire_replay(authority, intent['admission_id']) == 'retry'
++        assert calls == ['deleted']
++        assert replay._get(db, key) is None
++        assert _intents(db) == {}
++        assert await replay.fire_replay(authority, intent['admission_id']) == 'gone'
++        assert calls == ['deleted']
++    finally:
++        await _stop(authority, db)
+-- 
+2.43.0
+

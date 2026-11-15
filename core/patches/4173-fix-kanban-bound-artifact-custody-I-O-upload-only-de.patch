@@ -1,0 +1,684 @@
+From e2776b9199e7687966ee84981db619f194b76fea Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 09:33:38 +0000
+Subject: [PATCH] fix(kanban): bound artifact custody I/O, upload only declared
+ artifacts, keep copies on the task's board [daveey]
+
+Follow-ups from the independent review of #2910 (card t_01a1d88201a36e8e).
+
+1. No large-file I/O under the board write lock. record_files ran inside
+   complete_task's / request_review's write_txn and SHA256-hashed (and for
+   large scratch files copied + fsynced) every declared artifact and absolute
+   evidence ref with no size bound, so a multi-GB checkpoint held the
+   board-wide SQLite write lock and could fail other writers past the 120 s
+   busy timeout. New kanban_artifact_prestage reads files over
+   KANBAN_ATTACHMENT_MAX_BYTES before write_txn (digest, and for managed
+   scratch a durable copy under a hidden temp name). Under the lock
+   record_files re-verifies stat identity (dev, inode, size, mtime_ns) and only
+   renames the copy. A large file that changed or failed its pre-lock read is
+   never read under the lock: scratch fails closed (ArtifactPreservationError,
+   task stays running), elsewhere the record carries size + a "not hashed"
+   warning. Unclaimed temp copies are removed on exit.
+2. The gateway notifier digests receipt files via asyncio.to_thread, off the
+   event loop.
+3. Records carry role=artifact|evidence. Only declared artifacts become native
+   chat uploads (pre-#2910 behaviour); evidence keeps custody (attachment,
+   digest) without an upload. Evidence refs that name no file (API routes,
+   /path:123, "/repo commit ...", /healthz, existing directories) get no
+   receipt record and so no "File missing" notice line; missing exact paths,
+   scratch refs and declared artifacts still warn.
+4. Attachment and retained copies resolve the task's board (scratch workspace
+   board, else the connection's board) instead of the current board.
+
+RED (8 failing before the fix): tests/hermes_cli/test_kanban_artifact_custody_bounds.py
+- large file read while write lock held (scratch + external)
+- changed-after-pre-lock-read file claimed with a digest / no fail-closed
+- evidence refs uploaded to chat and /api route recorded
+- copies under the default board's attachments for a card on board "other"
+- delivery_paths ran on the event-loop thread
+GREEN: the same 9 tests pass; 75 related test files (1525 tests) pass. Two
+existing tests updated for the moved internals (pre-lock copy failure now
+injected at prestage._read; notifier tests keep sqlite fixtures on their
+own thread).
+---
+ gateway/kanban_watchers.py                    |   6 +-
+ hermes_cli/kanban_artifact_delivery.py        |   2 +
+ hermes_cli/kanban_artifact_prestage.py        | 117 ++++++++++++
+ hermes_cli/kanban_artifact_receipt.py         | 144 ++++++++++-----
+ hermes_cli/kanban_db.py                       |   6 +-
+ .../test_kanban_artifact_custody_bounds.py    | 166 ++++++++++++++++++
+ .../test_kanban_artifact_delivery.py          |  10 +-
+ .../test_kanban_scratch_artifact_custody.py   |   9 +-
+ website/docs/user-guide/features/kanban.md    |   2 +-
+ 9 files changed, 413 insertions(+), 49 deletions(-)
+ create mode 100644 hermes_cli/kanban_artifact_prestage.py
+ create mode 100644 tests/hermes_cli/test_kanban_artifact_custody_bounds.py
+
+diff --git a/gateway/kanban_watchers.py b/gateway/kanban_watchers.py
+index dbbe6cf534..f71f0d6d89 100644
+--- a/gateway/kanban_watchers.py
++++ b/gateway/kanban_watchers.py
+@@ -262,7 +262,11 @@ class GatewayKanbanWatchersMixin:
+             from hermes_cli.kanban_artifact_delivery import delivery_paths
+ 
+             records = event_payload["artifact_receipt"]
+-            raw_paths = delivery_paths(task.id, records, board) if task is not None and isinstance(records, list) else []
++            # Digesting writer-local files reads them in full: keep it off the gateway loop.
++            raw_paths = (
++                await asyncio.to_thread(delivery_paths, task.id, records, board)
++                if task is not None and isinstance(records, list) else []
++            )
+         candidates: list[str] = []
+         for path in raw_paths:
+             expanded = os.path.expanduser(path) if path else ""
+diff --git a/hermes_cli/kanban_artifact_delivery.py b/hermes_cli/kanban_artifact_delivery.py
+index a94a8abde7..f2c2d9cca3 100644
+--- a/hermes_cli/kanban_artifact_delivery.py
++++ b/hermes_cli/kanban_artifact_delivery.py
+@@ -16,6 +16,8 @@ def receipt_delivery_paths(conn, task_id: str, records: list) -> list[str]:
+     for record in records:
+         if not isinstance(record, dict) or record.get("warning") or not record.get("sha256"):
+             continue
++        if record.get("role") == "evidence":
++            continue  # Evidence keeps custody; only declared artifacts become chat uploads.
+         uid = record.get("attachment_uid")
+         # Large files have no replicated attachment. Only their writer may use
+         # the original (or scratch-GC-retained) path, with the recorded digest.
+diff --git a/hermes_cli/kanban_artifact_prestage.py b/hermes_cli/kanban_artifact_prestage.py
+new file mode 100644
+index 0000000000..dc3e2ba199
+--- /dev/null
++++ b/hermes_cli/kanban_artifact_prestage.py
+@@ -0,0 +1,117 @@
++"""Read large completion files before the board write lock. [daveey]
++
++``record_files`` runs inside ``complete_task``'s and ``request_review``'s write
++transaction, which holds the board-wide SQLite write lock. Hashing (or copying)
++a multi-GB evidence file there stalls the dispatcher and every other worker
++until ``DEFAULT_BUSY_TIMEOUT_MS`` fails them. Files over the in-transaction cap
++(``KANBAN_ATTACHMENT_MAX_BYTES``) are read here instead, before the lock: their
++SHA256 and, for managed-scratch files, a durable executor-local copy written to
++a hidden temp name. Under the lock ``record_files`` re-verifies each file by
++stat identity (device, inode, size, mtime) and only renames the copy; it never
++reads a large file itself.
++"""
++from __future__ import annotations
++
++import contextlib
++import contextvars
++import hashlib
++import os
++import uuid
++from pathlib import Path
++from typing import Optional
++
++_CHUNK = 1024 * 1024
++_CACHE: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar(
++    "kanban_artifact_prestage", default=None,
++)
++
++
++def signature(st: os.stat_result) -> tuple:
++    """Identity a file keeps unless it is replaced or written."""
++    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
++
++
++def _read(source: Path, dest: Optional[Path]) -> Optional[tuple[tuple, str]]:
++    """Digest (and optionally copy) one file; None when it changed while read."""
++    before = signature(source.stat())
++    digest = hashlib.sha256()
++    with source.open("rb") as src, (dest.open("xb") if dest else contextlib.nullcontext()) as dst:
++        while chunk := src.read(_CHUNK):
++            digest.update(chunk)
++            if dst is not None:
++                dst.write(chunk)
++        if dst is not None:
++            dst.flush()
++            os.fsync(dst.fileno())
++    if signature(source.stat()) != before:
++        return None
++    return before, digest.hexdigest()
++
++
++def _fill(conn, task_id: str, metadata: dict, cache: dict) -> None:
++    from gateway.platforms.base import validate_media_delivery_path
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_artifact_receipt import (
++        attachment_board, declared_files, in_managed_workspace,
++    )
++
++    for raw in declared_files(metadata):
++        source = Path(raw).expanduser()
++        dest = None
++        try:
++            if not source.is_file() or validate_media_delivery_path(str(source)) is None:
++                continue
++            if source.stat().st_size <= kb.KANBAN_ATTACHMENT_MAX_BYTES:
++                continue  # Small files stay bounded under the lock.
++            if in_managed_workspace(conn, task_id, source):
++                board = attachment_board(conn, task_id)
++                directory = kb.task_attachments_dir(task_id, board=board) / "local-artifacts"
++                directory.mkdir(parents=True, exist_ok=True)
++                dest = directory / f".prestage-{uuid.uuid4().hex}"
++            observed = _read(source, dest)
++            error = None if observed else "changed while it was read before the completion lock"
++        except OSError as exc:
++            observed, error = None, f"unreadable before the completion lock: {exc}"
++        if observed is None:
++            if dest is not None:
++                with contextlib.suppress(OSError):
++                    dest.unlink(missing_ok=True)
++            # record_files reports the failure without reading the file itself.
++            cache[str(source)] = {"error": error}
++            continue
++        cache[str(source)] = {"signature": observed[0], "sha256": observed[1], "temp": dest}
++
++
++@contextlib.contextmanager
++def prestaged(conn, task_id: str, metadata):
++    """Make large-file digests and copies available to ``record_files``.
++
++    Enter BEFORE ``write_txn``. Copies the transaction never claimed are removed
++    on exit; claimed copies follow the caller's staged-copy rollback.
++    """
++    cache: dict = {}
++    token = _CACHE.set(cache)
++    try:
++        if isinstance(metadata, dict):
++            _fill(conn, task_id, metadata, cache)
++        yield
++    finally:
++        _CACHE.reset(token)
++        for entry in cache.values():
++            if entry.get("temp") is not None:  # unclaimed by the transaction
++                with contextlib.suppress(OSError):
++                    entry["temp"].unlink(missing_ok=True)
++
++
++def take(source: Path, st: os.stat_result) -> Optional[dict]:
++    """The pre-lock observation of *source*, only if it is still the same file.
++
++    An entry with ``error`` reports why the pre-lock read failed.
++    """
++    cache = _CACHE.get()
++    entry = cache.get(str(source)) if cache else None
++    if entry is None or "error" in entry:
++        return entry
++    if entry["signature"] != signature(st):
++        return None
++    return entry
+diff --git a/hermes_cli/kanban_artifact_receipt.py b/hermes_cli/kanban_artifact_receipt.py
+index 5a9c27fb4e..bdae8f879d 100644
+--- a/hermes_cli/kanban_artifact_receipt.py
++++ b/hermes_cli/kanban_artifact_receipt.py
+@@ -3,8 +3,6 @@ from __future__ import annotations
+ 
+ import contextlib
+ import hashlib
+-import os
+-import shutil
+ import socket
+ from pathlib import Path
+ 
+@@ -61,7 +59,7 @@ def declared_files(metadata: dict) -> list[str]:
+     return list(dict.fromkeys(paths))
+ 
+ 
+-def _in_managed_workspace(conn, task_id: str, source: Path) -> bool:
++def in_managed_workspace(conn, task_id: str, source: Path) -> bool:
+     from hermes_cli.kanban_db_workspace import _scratch_workspace, _managed_scratch_path_info
+ 
+     workspace = _scratch_workspace(conn, task_id)
+@@ -69,6 +67,71 @@ def _in_managed_workspace(conn, task_id: str, source: Path) -> bool:
+                 and source.resolve().is_relative_to(workspace.resolve()))
+ 
+ 
++def attachment_board(conn, task_id: str):
++    """The task's own board, never the process's current board.
++
++    A card on a non-default board can complete while another board is current
++    (machine flows resolve through the pin); its copies must land under its own
++    board's attachments root, where per-board cleanup looks for them.
++    """
++    from hermes_cli.kanban_db_workspace import _scratch_workspace, _managed_scratch_path_info
++
++    workspace = _scratch_workspace(conn, task_id)
++    if workspace is not None:
++        managed, board = _managed_scratch_path_info(workspace)
++        if managed and board:
++            return board
++    from hermes_cli.kanban_host_counts import board_of
++
++    return board_of(conn)
++
++
++def _names_missing_file(conn, task_id: str, raw: str) -> bool:
++    """Whether an absent evidence ref claims a file, so its absence earns a warning.
++
++    Evidence refs are free text: ``/api/v1/tasks``, ``/src/x.py:12`` or ``/repo
++    commit abc`` start with ``/`` but name no file. Scratch refs always count
++    (they are preserved or fail closed); otherwise only an exact path whose
++    parent directory exists below the filesystem root.
++    """
++    path = Path(raw).expanduser()
++    if in_managed_workspace(conn, task_id, path):
++        return True
++    if any(ch.isspace() for ch in raw) or ":" in raw or path.exists():
++        return False
++    parent = path.parent
++    return parent != Path(parent.anchor) and parent.is_dir()
++
++
++def _large(conn, task_id: str, source: Path, stat, record: dict, staged: list[Path], board) -> None:
++    """Record a file over the attachment cap from its pre-lock observation only.
++
++    This runs under the board write lock, so it never reads the file: the digest
++    (and a managed-scratch copy) come from :mod:`kanban_artifact_prestage`,
++    re-verified here by stat identity.
++    """
++    from hermes_cli import kanban_artifact_prestage as prestage
++    from hermes_cli import kanban_db as kb
++
++    observed = prestage.take(source, stat)
++    managed = in_managed_workspace(conn, task_id, source)
++    if observed is None or "error" in observed:
++        reason = observed["error"] if observed else "changed after it was read before the completion lock"
++        if managed:
++            raise kb.ArtifactPreservationError(f"{reason}; retry")
++        record["warning"] = f"Over {kb.KANBAN_ATTACHMENT_MAX_BYTES} bytes and not hashed: {reason}"
++        return
++    if managed:
++        # Large files cannot use blob sync, but must outlive scratch GC.
++        directory = kb.task_attachments_dir(task_id, board=board) / "local-artifacts"
++        dest = kb._unique_attachment_path(directory, source.name, set(staged))
++        staged.append(dest)
++        observed["temp"].rename(dest)
++        observed["temp"] = None
++        record["retained_path"] = str(dest)
++    record["sha256"] = observed["sha256"]
++
++
+ def record_files(conn, task_id: str, metadata: dict, originals: list[str], now: int,
+                  staged: list[Path], *, uploaded_by: str, relocated: dict[str, str]) -> None:
+     """Attach small external files through the same byte-sync as scratch copies.
+@@ -76,18 +139,26 @@ def record_files(conn, task_id: str, metadata: dict, originals: list[str], now:
+     The generated receipt never rewrites an observed evidence identity. A local
+     attachment path is useful only alongside its machine; attachment_uid locates
+     the bytes on another replica after normal Board blob synchronization.
++    ``role`` separates declared deliverables (``artifact``, uploaded to chat)
++    from ``evidence`` refs (custody only). Free-text evidence that names no file
++    gets no record. Files over the attachment cap are never read here (``_large``).
+     """
+     from hermes_cli import kanban_db as kb
+-    from hermes_cli.kanban_metadata_files import ATTACHED_KEY
++    from hermes_cli.kanban_metadata_files import ATTACHED_KEY, cleaned_artifact_paths
+ 
+     machine = executing_machine(conn)
++    board = attachment_board(conn, task_id)
++    declared = set(cleaned_artifact_paths(metadata))
+     kept = dict(relocated)
+     kept.update(metadata.get(ATTACHED_KEY, {}))
+     records = []
+     for raw in originals:
+-        record: dict = {"machine": machine, "path": raw}
+-        records.append(record)
++        role = "artifact" if raw in declared else "evidence"
+         source = Path(kept.get(raw, raw)).expanduser()
++        if role == "evidence" and not source.is_file() and not _names_missing_file(conn, task_id, raw):
++            continue
++        record: dict = {"machine": machine, "path": raw, "role": role}
++        records.append(record)
+         dest = None
+         try:
+             if not source.is_file():
+@@ -98,44 +169,34 @@ def record_files(conn, task_id: str, metadata: dict, originals: list[str], now:
+             if validate_media_delivery_path(str(source)) is None:
+                 record["warning"] = "Artifact denied by delivery policy on executing machine"
+                 continue
+-            size = source.stat().st_size
+-            record["size"] = size
+-            if size <= kb.KANBAN_ATTACHMENT_MAX_BYTES:
+-                row = conn.execute(
+-                    "SELECT * FROM task_attachments WHERE task_id=? AND stored_path=?",
+-                    (task_id, str(source)),
+-                ).fetchone()
+-                if row is None:
+-                    directory = kb.task_attachments_dir(task_id)
+-                    directory.mkdir(parents=True, exist_ok=True)
+-                    dest = kb._unique_attachment_path(directory, source.name, set(staged))
+-                    staged.append(dest)
+-                    kb._copy_capped(source, dest, raw)
+-                    kb._insert_completion_attachment(
+-                        conn, task_id, filename=dest.name, stored_path=str(dest),
+-                        size=dest.stat().st_size, created_at=now, uploaded_by=uploaded_by,
+-                    )
+-                    source = dest
+-                    row = conn.execute(
+-                        "SELECT * FROM task_attachments WHERE task_id=? AND stored_path=?",
+-                        (task_id, str(dest)),
+-                    ).fetchone()
+-                record["attachment_id"] = row["id"]
+-                if "uid" in row.keys():
+-                    record["attachment_uid"] = row["uid"]
+-                record["attachment_path"] = row["stored_path"]
+-            elif _in_managed_workspace(conn, task_id, source):
+-                # Large files cannot use blob sync, but must outlive scratch GC.
+-                directory = kb.task_attachments_dir(task_id) / "local-artifacts"
++            stat = source.stat()
++            record["size"] = stat.st_size
++            if stat.st_size > kb.KANBAN_ATTACHMENT_MAX_BYTES:
++                _large(conn, task_id, source, stat, record, staged, board)
++                continue
++            row = conn.execute(
++                "SELECT * FROM task_attachments WHERE task_id=? AND stored_path=?",
++                (task_id, str(source)),
++            ).fetchone()
++            if row is None:
++                directory = kb.task_attachments_dir(task_id, board=board)
+                 directory.mkdir(parents=True, exist_ok=True)
+                 dest = kb._unique_attachment_path(directory, source.name, set(staged))
+                 staged.append(dest)
+-                with source.open("rb") as src, dest.open("xb") as dst:
+-                    shutil.copyfileobj(src, dst, 1024 * 1024)
+-                    dst.flush()
+-                    os.fsync(dst.fileno())
++                kb._copy_capped(source, dest, raw)
++                kb._insert_completion_attachment(
++                    conn, task_id, filename=dest.name, stored_path=str(dest),
++                    size=dest.stat().st_size, created_at=now, uploaded_by=uploaded_by,
++                )
+                 source = dest
+-                record["retained_path"] = str(dest)
++                row = conn.execute(
++                    "SELECT * FROM task_attachments WHERE task_id=? AND stored_path=?",
++                    (task_id, str(dest)),
++                ).fetchone()
++            record["attachment_id"] = row["id"]
++            if "uid" in row.keys():
++                record["attachment_uid"] = row["uid"]
++            record["attachment_path"] = row["stored_path"]
+             with source.open("rb") as stream:
+                 record["sha256"] = hashlib.file_digest(stream, "sha256").hexdigest()
+         except (OSError, kb.ArtifactPreservationError) as exc:
+@@ -144,7 +205,8 @@ def record_files(conn, task_id: str, metadata: dict, originals: list[str], now:
+                 with contextlib.suppress(OSError):
+                     dest.unlink(missing_ok=True)
+             record.pop("retained_path", None)
+-            if _in_managed_workspace(conn, task_id, Path(raw).expanduser()):
++            record.pop("sha256", None)
++            if in_managed_workspace(conn, task_id, Path(raw).expanduser()):
+                 raise kb.ArtifactPreservationError(
+                     f"could not preserve scratch artifact {raw}: {exc}"
+                 ) from exc
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index d619bb75d1..356ddc0234 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -2501,7 +2501,7 @@ def complete_task(
+         return False
+     from hermes_cli.kanban_metadata_files import discard_on_error
+     staged: list[Path] = []
+-    with discard_on_error(staged), write_txn(conn):
++    with _prestaged(conn, task_id, metadata), discard_on_error(staged), write_txn(conn):
+         require_review(conn, task_id, expected_run_id, placement_settled=placement_settled)
+         if not _parents_satisfied(conn, task_id):
+             return False
+@@ -2624,7 +2624,7 @@ def _substantive_text(value: Optional[str]) -> bool:
+ 
+ 
+ from hermes_cli.kanban_completion_evidence import gate_empty_completion as _gate_empty_completion
+-
++from hermes_cli.kanban_artifact_prestage import prestaged as _prestaged  # large files are read before the write lock
+ 
+ 
+ from hermes_cli.kanban_metadata_files import stage_completion_artifacts as _stage_completion_artifacts
+@@ -3055,7 +3055,7 @@ def request_review(
+     # leave orphans that make the retry stage ``name_1.ext`` beside them.
+     staged_copies: list[Path] = []
+     try:
+-        with write_txn(conn):
++        with _prestaged(conn, task_id, metadata), write_txn(conn):
+             if not _parents_satisfied(conn, task_id):
+                 return _ret(False, "parent dependencies are not satisfied")
+             trow = conn.execute(
+diff --git a/tests/hermes_cli/test_kanban_artifact_custody_bounds.py b/tests/hermes_cli/test_kanban_artifact_custody_bounds.py
+new file mode 100644
+index 0000000000..1c60199744
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_artifact_custody_bounds.py
+@@ -0,0 +1,166 @@
++"""Artifact custody stays bounded, declared-only for chat, and on the task's board."""
++if not __name__.startswith("tests."):
++    raise ImportError("Use scripts/run_tests.sh; unittest discovery bypasses test isolation")
++
++import hashlib
++import threading
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import AsyncMock
++
++import pytest
++
++from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
++from tests.hermes_cli import test_kanban_metadata_files as helpers
++from tests.hermes_cli.test_kanban_receipt_artifacts import receipt
++
++kanban_home = helpers.kanban_home
++BIG = b"larger than the fixture cap"
++
++
++def _spy_reads(monkeypatch, conn, target: Path) -> list[bool]:
++    """Record, for every read-open of *target*, whether the write txn was open."""
++    seen: list[bool] = []
++    original = Path.open
++
++    def spy(self, mode="r", *args, **kwargs):
++        if "r" in mode and self.expanduser() == target:
++            seen.append(conn.in_transaction)
++        return original(self, mode, *args, **kwargs)
++
++    monkeypatch.setattr(Path, "open", spy)
++    return seen
++
++
++@pytest.mark.parametrize("in_scratch", [True, False])
++def test_large_file_is_never_read_under_the_write_lock(kanban_home, monkeypatch, tmp_path, in_scratch):
++    monkeypatch.setattr(kb, "KANBAN_ATTACHMENT_MAX_BYTES", 4)
++    with kbc.connect_closing() as conn:
++        task, ws, run = helpers._scratch_card(conn)
++        source = (ws if in_scratch else tmp_path) / "checkpoint.bin"
++        source.write_bytes(BIG)
++        reads = _spy_reads(monkeypatch, conn, source)
++        assert kb.complete_task(conn, task, summary="Checkpoint", expected_run_id=run,
++                                metadata={"completion_receipt": receipt(str(source))})
++        record = kb.latest_run(conn, task).metadata["artifact_receipt"][0]
++    assert reads and not any(reads), "large file read while the board write lock was held"
++    assert record["sha256"] == hashlib.sha256(BIG).hexdigest()
++    assert record["size"] == len(BIG)
++    if in_scratch:
++        retained = Path(record["retained_path"])
++        assert retained.read_bytes() == BIG
++        assert not list(retained.parent.glob(".prestage-*"))
++
++
++@pytest.mark.parametrize("in_scratch", [True, False])
++def test_large_file_changed_after_pre_lock_read_is_not_claimed(kanban_home, monkeypatch, tmp_path, in_scratch):
++    from hermes_cli import kanban_artifact_prestage as prestage
++
++    monkeypatch.setattr(kb, "KANBAN_ATTACHMENT_MAX_BYTES", 4)
++    with kbc.connect_closing() as conn:
++        task, ws, run = helpers._scratch_card(conn)
++        source = (ws if in_scratch else tmp_path) / "checkpoint.bin"
++        source.write_bytes(BIG)
++        fill = prestage._fill
++
++        def fill_then_write(*args):
++            fill(*args)
++            with source.open("ab") as stream:
++                stream.write(b"more")
++
++        monkeypatch.setattr(prestage, "_fill", fill_then_write)
++        metadata = {"artifacts": [str(source)]}
++        if in_scratch:
++            with pytest.raises(kb.ArtifactPreservationError, match="checkpoint.bin"):
++                kb.complete_task(conn, task, summary="Checkpoint", expected_run_id=run, metadata=metadata)
++            assert kb.get_task(conn, task).status == "running"
++            assert not [p for p in kb.task_attachments_dir(task).rglob("*") if p.is_file()]
++            return
++        assert kb.complete_task(conn, task, summary="Checkpoint", expected_run_id=run, metadata=metadata)
++        record = kb.latest_run(conn, task).metadata["artifact_receipt"][0]
++    assert "sha256" not in record
++    assert "not hashed" in record["warning"]
++
++
++def test_evidence_refs_keep_custody_but_only_declared_artifacts_upload(kanban_home, tmp_path):
++    from hermes_cli import kanban_artifact_delivery as delivery
++    from hermes_cli.kanban_artifact_receipt import format_receipt
++
++    deliverable = tmp_path / "deliverable.md"
++    deliverable.write_text("deliverable")
++    evidence = tmp_path / "evidence.log"
++    evidence.write_text("evidence")
++    value = receipt(str(evidence))
++    value["items"][0]["evidence"] += [
++        {"ref": ref, "observed_at": "2026-01-01T00:00:00Z", "verification": "reported"}
++        for ref in ("/api/v1/tasks", f"{evidence}:12", "/repo commit abc123", "/healthz", str(tmp_path / "gone.md"))
++    ]
++    with kbc.connect_closing() as conn:
++        task, _, run = helpers._scratch_card(conn)
++        assert kb.complete_task(conn, task, summary="Report", expected_run_id=run,
++                                metadata={"artifacts": [str(deliverable)], "completion_receipt": value})
++        records = kb.latest_run(conn, task).metadata["artifact_receipt"]
++        by_path = {r["path"]: r for r in records}
++        assert set(by_path) == {str(deliverable), str(evidence), str(tmp_path / "gone.md")}
++        assert by_path[str(evidence)]["sha256"]  # custody is still recorded and attached
++        assert "missing" in by_path[str(tmp_path / "gone.md")]["warning"].lower()
++        uploads = delivery.receipt_delivery_paths(conn, task, records)
++    assert [Path(p).read_text() for p in uploads] == ["deliverable"]
++    notice = format_receipt({"artifact_receipt": records})
++    assert "/api/v1/tasks" not in notice and "/healthz" not in notice and "commit" not in notice
++
++
++def test_missing_declared_artifact_still_warns_whatever_its_shape(kanban_home):
++    with kbc.connect_closing() as conn:
++        task, _, run = helpers._scratch_card(conn)
++        assert kb.complete_task(conn, task, summary="Report", expected_run_id=run,
++                                metadata={"artifacts": ["/api/v1/report"]})
++        record = kb.latest_run(conn, task).metadata["artifact_receipt"][0]
++    assert record["path"] == "/api/v1/report"
++    assert "missing" in record["warning"].lower()
++
++
++@pytest.mark.parametrize("large", [False, True])
++def test_custody_copies_land_on_the_tasks_board(kanban_home, monkeypatch, tmp_path, large):
++    kb.create_board("other")
++    if large:
++        monkeypatch.setattr(kb, "KANBAN_ATTACHMENT_MAX_BYTES", 4)
++    with kbc.connect_closing(board="other") as conn:
++        task = kb.create_task(conn, title="other board", assignee="default")
++        ws = helpers.kbw.resolve_workspace(kb.get_task(conn, task), board="other")
++        helpers.kbw.set_workspace_path(conn, task, ws)
++        assert kb.claim_task(conn, task)
++        run = kb.get_task(conn, task).current_run_id
++        sources = [ws / "report.bin", tmp_path / "outside.bin"]
++        for source in sources:
++            source.write_bytes(BIG if large else b"ok")
++        assert kb.get_current_board() == kb.DEFAULT_BOARD
++        assert kb.complete_task(conn, task, summary="Report", expected_run_id=run,
++                                metadata={"artifacts": [str(p) for p in sources]})
++        records = kb.latest_run(conn, task).metadata["artifact_receipt"]
++    root = kb.attachments_root(board="other").resolve()
++    kept = [r.get("attachment_path") or r.get("retained_path") for r in records]
++    kept = [Path(p).resolve() for p in kept if p]
++    assert kept and all(p.is_relative_to(root) for p in kept), (kept, root)
++
++
++@pytest.mark.asyncio
++async def test_notifier_digests_off_the_event_loop(monkeypatch):
++    from gateway.kanban_watchers import GatewayKanbanWatchersMixin
++    from hermes_cli import kanban_artifact_delivery as delivery
++
++    loop_thread = threading.get_ident()
++    seen = []
++
++    def fake(task_id, records, board):
++        seen.append(threading.get_ident())
++        return []
++
++    monkeypatch.setattr(delivery, "delivery_paths", fake)
++    adapter = SimpleNamespace(extract_local_files=lambda text: ([], []), send_document=AsyncMock())
++    await GatewayKanbanWatchersMixin._deliver_kanban_artifacts(
++        None, adapter=adapter, chat_id="chat", metadata={},
++        event_payload={"artifact_receipt": [{"machine": "m", "path": "/x", "sha256": "0"}]},
++        task=SimpleNamespace(id="t_1", result="done"),
++    )
++    assert seen and seen[0] != loop_thread
+diff --git a/tests/hermes_cli/test_kanban_artifact_delivery.py b/tests/hermes_cli/test_kanban_artifact_delivery.py
+index cb61238d27..adc4d8395d 100644
+--- a/tests/hermes_cli/test_kanban_artifact_delivery.py
++++ b/tests/hermes_cli/test_kanban_artifact_delivery.py
+@@ -47,7 +47,10 @@ async def test_notifier_uploads_large_artifact_on_writer(stores, monkeypatch):
+     monkeypatch.setattr(kb, "KANBAN_ATTACHMENT_MAX_BYTES", 1)
+     payload = support.complete(conn, tid, [str(report)])
+     adapter = SimpleNamespace(extract_local_files=lambda text: ([], []), send_document=AsyncMock())
+-    monkeypatch.setattr(delivery, "delivery_paths", lambda task_id, records, board: delivery.receipt_delivery_paths(conn, task_id, records))
++    # Resolved on the test thread: the notifier digests on a worker thread, where
++    # this fixture's sqlite connection may not be used.
++    resolved = delivery.receipt_delivery_paths(conn, tid, payload["artifact_receipt"])
++    monkeypatch.setattr(delivery, "delivery_paths", lambda task_id, records, board: resolved)
+     await GatewayKanbanWatchersMixin._deliver_kanban_artifacts(
+         None, adapter=adapter, chat_id="chat", metadata={},
+         event_payload=payload, task=SimpleNamespace(id=tid, result="done"),
+@@ -101,6 +104,11 @@ async def test_notifier_uses_replicated_attachment_and_not_foreign_paths(stores,
+     task = SimpleNamespace(id=tid, result=str(report))
+     adapter = SimpleNamespace(extract_local_files=lambda text: ([text], []), send_document=AsyncMock())
+     monkeypatch.setattr(delivery, "delivery_paths", lambda task_id, records, board: delivery.receipt_delivery_paths(home_conn, task_id, records))
++    from gateway import kanban_watchers
++
++    async def inline(fn, *args):  # home_conn is bound to this thread; off-loop digesting has its own test
++        return fn(*args)
++    monkeypatch.setattr(kanban_watchers.asyncio, "to_thread", inline)
+     call = dict(adapter=adapter, chat_id="chat", metadata={}, event_payload=payload, task=task)
+     # Both writer-local paths exist here: receiver must not use either before sync.
+     await GatewayKanbanWatchersMixin._deliver_kanban_artifacts(None, **call)
+diff --git a/tests/hermes_cli/test_kanban_scratch_artifact_custody.py b/tests/hermes_cli/test_kanban_scratch_artifact_custody.py
+index 09689aaf08..3470167399 100644
+--- a/tests/hermes_cli/test_kanban_scratch_artifact_custody.py
++++ b/tests/hermes_cli/test_kanban_scratch_artifact_custody.py
+@@ -48,13 +48,18 @@ def test_missing_declared_scratch_file_completes_with_warning(kanban_home):
+ 
+ @pytest.mark.parametrize("large", [False, True])
+ def test_scratch_copy_failure_does_not_destroy_existing_evidence(kanban_home, monkeypatch, large):
+-    from hermes_cli import kanban_artifact_receipt as custody
++    from hermes_cli import kanban_artifact_prestage as prestage
+ 
+     if large:
+         monkeypatch.setattr(kb, "KANBAN_ATTACHMENT_MAX_BYTES", 4)
+     def fail(*args, **kwargs):
+         raise OSError("controlled preservation failure")
+-    monkeypatch.setattr(custody.shutil, "copyfileobj", fail)
++
++    def fail_partway(source, dest):
++        if dest is not None:
++            dest.write_bytes(b"pa")  # a partial pre-lock copy must not survive
++        fail()
++    monkeypatch.setattr(prestage, "_read", fail_partway)
+     if not large:
+         monkeypatch.setattr(kb, "_copy_capped", fail)
+     with kbc.connect_closing() as conn:
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index 3a146c9477..447beb01db 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -213,7 +213,7 @@ They also coexist inside one run. A kanban task executes in an isolated managed
+ - **Link** — `task_links` row recording a parent → child dependency. The dispatcher promotes `todo → ready` when all parents are `done`. Adding a link to a running child is rejected because it cannot gate work already claimed; the one exception is an active worker linking its own card, with dispatcher-provided run ownership, immediately before a dependency-block handoff.
+ - **Comment** — the inter-agent protocol. Agents and humans append comments; when a worker is (re-)spawned it reads the full comment thread as part of its context.
+ - **Workspace** — the directory a worker operates in. Three kinds:
+-  - `scratch` (default) — fresh tmp dir under `~/.hermes/kanban/workspaces/<id>/` (or `~/.hermes/kanban/boards/<slug>/workspaces/<id>/` on non-default boards). **Deleted when the task completes** — scratch is ephemeral by design. Files explicitly declared through `kanban_complete(artifacts=[...])` or `kanban_request_review(artifacts=[...])` are copied into durable per-task attachment storage before cleanup (a review handoff stages them at handoff time, since the reviewer's later completion is what deletes the scratch workspace); existing deliverable paths in legacy completion summaries receive the same treatment. Other scratch files are removed. Completion records a machine-qualified `artifact_receipt` for declared artifacts and absolute file paths in completion evidence. Missing paths, including scratch paths, produce visible warnings rather than a file-delivery claim; failures preserving existing scratch bytes still keep the task in-flight. Files up to 25 MB are copied into card attachments even when outside scratch and replicated to the home board, increasing storage on the executor and receiving replicas by the declared file sizes (declare only evidence you intend to retain). Larger files retain a machine-qualified path and SHA256; large scratch files receive a durable executor-local copy before cleanup. Native chat uploads use verified local bytes: replicated attachments on receivers, or digest-checked large files only on their executing machine. Use `worktree:` or `dir:<path>` when the whole workspace should remain available. The first time a scratch workspace is created on an install, the dispatcher logs a warning and emits a `tip_scratch_workspace` event on the task (visible via `hermes kanban show <id>`).
++  - `scratch` (default) — fresh tmp dir under `~/.hermes/kanban/workspaces/<id>/` (or `~/.hermes/kanban/boards/<slug>/workspaces/<id>/` on non-default boards). **Deleted when the task completes** — scratch is ephemeral by design. Files explicitly declared through `kanban_complete(artifacts=[...])` or `kanban_request_review(artifacts=[...])` are copied into durable per-task attachment storage before cleanup (a review handoff stages them at handoff time, since the reviewer's later completion is what deletes the scratch workspace); existing deliverable paths in legacy completion summaries receive the same treatment. Other scratch files are removed. Completion records a machine-qualified `artifact_receipt` for declared artifacts and absolute file paths in completion evidence. Missing paths, including scratch paths, produce visible warnings rather than a file-delivery claim; failures preserving existing scratch bytes still keep the task in-flight. Files up to 25 MB are copied into card attachments even when outside scratch and replicated to the home board, increasing storage on the executor and receiving replicas by the declared file sizes (declare only evidence you intend to retain). Larger files retain a machine-qualified path and SHA256; large scratch files receive a durable executor-local copy before cleanup. Native chat uploads use verified local bytes: replicated attachments on receivers, or digest-checked large files only on their executing machine. Only declared `artifacts` are uploaded to chat; evidence files keep custody (attachment, digest) without a chat upload, and evidence refs that name no file (`/api/route`, `/src/x.py:12`, `/repo commit abc`) get no receipt line. Files over 25 MB are hashed (and large scratch files copied) before the completion takes the board write lock, never under it. Use `worktree:` or `dir:<path>` when the whole workspace should remain available. The first time a scratch workspace is created on an install, the dispatcher logs a warning and emits a `tip_scratch_workspace` event on the task (visible via `hermes kanban show <id>`).
+   - `dir:<path>` — an existing shared directory (Obsidian vault, mail ops dir, per-account folder). **Must be an absolute path.** Relative paths like `dir:../tenants/foo/` are rejected at dispatch because they'd resolve against whatever CWD the dispatcher happens to be in, which is ambiguous and a confused-deputy escape vector. The path is otherwise trusted — it's your box, your filesystem, the worker runs with your uid. This is the trusted-local-user threat model; kanban is single-host by design. **Preserved on completion.**
+   - `worktree` — a git worktree under `.worktrees/<id>/` for coding tasks. Use `worktree:<path>` to pin the exact target path. Worker-side `git worktree add` creates it, using `--branch` when provided. **Preserved on completion.**
+ - **Dispatcher** — a long-lived loop that, every N seconds (default 60): reclaims stale claims, reclaims crashed workers (PID gone but TTL not yet expired), reaps workers that outlived their finished run (a worker still alive after its own `kanban_complete`/`kanban_block` is terminated once its run has been closed for two minutes, leaving it time to finish its final turn — matched by PID *and* spawn-time fingerprint, so a recycled PID is never signalled; recorded as a `terminal_worker_reaped` event), promotes ready tasks, atomically claims, spawns assigned profiles. Runs **inside the gateway** by default (`kanban.dispatch_in_gateway: true`). One dispatcher sweeps all boards per tick; workers are spawned with `HERMES_KANBAN_BOARD` pinned so they can't see other boards. After `kanban.failure_limit` consecutive spawn failures on the same task (default: 2) the dispatcher auto-blocks it with the last error as the reason — prevents thrashing on tasks whose profile doesn't exist, workspace can't mount, etc.
+-- 
+2.43.0
+

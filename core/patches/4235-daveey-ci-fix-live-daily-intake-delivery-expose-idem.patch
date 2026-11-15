@@ -1,0 +1,147 @@
+From b516b90b4009908580ed33c1a67ac69871f54da7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 17:37:27 +0000
+Subject: [PATCH] [daveey] ci: fix live daily-intake delivery (expose
+ idempotency_key; reopen --reason)
+
+The first natural hub run after 15c81a3 created intake card t_01a1db0c65e3d5e3
+but logged "FAILED intake delivery page=1" every poll:
+
+- `hermes kanban show/list --json` never emitted `idempotency_key`
+  (kanban_output._TASK_DICT_FIELDS omitted it), so the intake identity
+  readback always raised. The same omission silently disabled the
+  `deflake:<id>` key match in flaky_kanban._is_about.
+- CliBoard.reopen called `hermes kanban reopen <id>` without the required
+  `--reason`, so a done intake could never be reopened for new arrivals.
+
+In-memory board fakes supplied both, hiding the bugs. New
+tests/ci/test_flaky_intake_real_board.py drives the real `hermes kanban`
+CLI in an isolated HERMES_HOME: 30 occurrences -> one keyed intake card with
+every page read back, replay is a no-op, and a later same-day occurrence
+reopens the done intake. Both fixes fail it when reverted.
+---
+ hermes_cli/kanban_output.py              |  2 +
+ scripts/ci/flaky_kanban.py               |  2 +-
+ tests/ci/test_flaky_intake_real_board.py | 84 ++++++++++++++++++++++++
+ 3 files changed, 87 insertions(+), 1 deletion(-)
+ create mode 100644 tests/ci/test_flaky_intake_real_board.py
+
+diff --git a/hermes_cli/kanban_output.py b/hermes_cli/kanban_output.py
+index de00d19287..3acaac74ab 100644
+--- a/hermes_cli/kanban_output.py
++++ b/hermes_cli/kanban_output.py
+@@ -21,6 +21,8 @@ _TASK_DICT_FIELDS = (
+     "skills", "max_runtime_seconds", "max_retries", "goal_mode", "goal_max_turns", "review_required",
+     "model_override", "provider_override",
+     "session_id", "workflow_template_id", "current_step_key", "completion_contract", "last_failure_error",
++    # Consumers that create with --idempotency-key (ci flaky intake, deflake owner match) read it back.
++    "idempotency_key",
+ )
+ _SHOW_RUN_FIELDS = (
+     "id", "profile", "step_key", "status", "outcome", "summary", "error",
+diff --git a/scripts/ci/flaky_kanban.py b/scripts/ci/flaky_kanban.py
+index 4d166d6fb7..78b4c0b96f 100644
+--- a/scripts/ci/flaky_kanban.py
++++ b/scripts/ci/flaky_kanban.py
+@@ -146,7 +146,7 @@ class CliBoard:
+         return list(json.loads(self._run("list", "--archived", "--json")))
+ 
+     def reopen(self, card_id: str) -> None:
+-        self._run("reopen", card_id)
++        self._run("reopen", card_id, "--reason", "new CI flake occurrences for this daily intake")
+ 
+     def comments(self, card_id: str, board: str | None = None) -> list[str]:
+         data = self._show(card_id, board) or {}
+diff --git a/tests/ci/test_flaky_intake_real_board.py b/tests/ci/test_flaky_intake_real_board.py
+new file mode 100644
+index 0000000000..fed636b349
+--- /dev/null
++++ b/tests/ci/test_flaky_intake_real_board.py
+@@ -0,0 +1,84 @@
++"""Daily intake delivery through the REAL `hermes kanban` CLI (isolated HERMES_HOME), not an in-memory Board.
++
++The in-memory fakes returned ``idempotency_key`` from card/list readback; the real CLI JSON did not, so every
++production delivery failed its identity readback ("FAILED intake delivery page=1") after creating the card.
++"""
++import json
++import subprocess
++import sys
++from pathlib import Path
++
++import pytest
++
++from scripts.ci import flaky_intake as intake
++from scripts.ci import flaky_kanban as fk
++
++_ROOT = Path(__file__).resolve().parents[2]
++REPO = "o/r"
++
++
++@pytest.fixture
++def cli(tmp_path, monkeypatch):
++    pytest.importorskip("dotenv", reason="needs the repo environment (hermes_cli imports python-dotenv)")
++    home = tmp_path / "hermes-home"
++    home.mkdir()
++    for var in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_HOME", "HERMES_KANBAN_TASK",
++                "HERMES_KANBAN_RUN_ID", "HERMES_DELEGATED_CHILD_CONTEXT", "HERMES_DELEGATED_CHILD_OWNER",
++                "HERMES_SESSION_ID", "HERMES_SESSION_KEY"):
++        monkeypatch.delenv(var, raising=False)
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.chdir(_ROOT)
++
++    def run(*args):
++        return subprocess.run([sys.executable, "-m", "hermes_cli.main", "kanban", *args], capture_output=True,
++                              text=True, timeout=120, check=True, cwd=_ROOT).stdout
++    return run
++
++
++def _record(journal, run, tests):
++    journal.record(REPO, [(9, [{"test_id": t, "retried": "tests"} for t in tests])],
++                   {"id": run, "head_sha": "a" * 40})
++    journal.plan_pages(REPO, journal.pending(REPO))
++
++
++@pytest.mark.platforms("posix")
++def test_kanban_json_exposes_idempotency_key(cli):
++    tid = json.loads(cli("create", "keyed", "--idempotency-key", "k:1", "--json"))["id"]
++    assert json.loads(cli("show", tid, "--json"))["task"]["idempotency_key"] == "k:1"
++    assert [c["idempotency_key"] for c in json.loads(cli("list", "--archived", "--json"))] == ["k:1"]
++    board = fk.CliBoard([sys.executable, "-m", "hermes_cli.main"])
++    assert board.card(tid)["idempotency_key"] == "k:1"
++
++
++@pytest.mark.platforms("posix")
++def test_daily_intake_delivers_through_real_cli_and_reopens_done(cli, tmp_path):
++    board = fk.CliBoard([sys.executable, "-m", "hermes_cli.main"])
++    journal = intake.Journal(tmp_path / "queue.sqlite3")
++    tests = [f"tests/a.py::test_{i}" for i in range(30)]
++    _record(journal, 1, tests)
++
++    log = journal.deliver(REPO, board)
++    assert log and not any(line.startswith("FAILED") for line in log), log
++    assert tuple(journal.db.execute("SELECT count(*), sum(delivered) FROM occurrences").fetchone()) == (30, 30)
++    cards = json.loads(cli("list", "--archived", "--json"))
++    day = journal.db.execute("SELECT day FROM pages").fetchone()[0]
++    assert [c["idempotency_key"] for c in cards] == [f"ci-flaky-intake:{REPO}:{day}"]
++    card = cards[0]["id"]
++    payloads = [r[0] for r in journal.db.execute("SELECT payload FROM pages ORDER BY id")]
++    comments = [c["body"] for c in json.loads(cli("show", card, "--json"))["comments"]]
++    assert comments == payloads
++    assert journal.deliver(REPO, board) == []  # replay: no duplicate card or comment
++
++    # A triaged (done) intake must not swallow a later same-day occurrence: it is reopened and receives it.
++    cli("complete", card, "--summary", "triaged")
++    _record(journal, 2, ["tests/b.py::test_late"])
++    log = journal.deliver(REPO, board)
++    assert not any(line.startswith("FAILED") for line in log), log
++    assert tuple(journal.db.execute("SELECT count(*), sum(delivered) FROM occurrences").fetchone()) == (31, 31)
++    assert len(json.loads(cli("list", "--archived", "--json"))) == 1
++    shown = json.loads(cli("show", card, "--json"))
++    assert shown["task"]["status"] != "done"
++    bodies = [c["body"] for c in shown["comments"]]
++    late = journal.db.execute("SELECT payload FROM pages ORDER BY id DESC LIMIT 1").fetchone()[0]
++    assert bodies[:len(payloads)] == payloads and bodies.count(late) == 1 and late not in payloads
++    journal.close()
+-- 
+2.43.0
+

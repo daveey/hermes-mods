@@ -1,0 +1,106 @@
+From 5565de004cccf7fc61513a59f241a08ee491becb Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:10:38 +0000
+Subject: [PATCH] [daveey] post_tool_call waits out an in-flight plugin reload
+ before emitting
+
+A tool call that started before a force plugin reload (hub mods-reload) and
+returned while the pass held the hook registry empty emitted post_tool_call to
+no one, so observers lost the call for good. On the hub the coach plugin never
+saw a chat's `gh pr view` that ended 2 s into a coach reload and failed the
+reply that reported its result as an unread PR-state claim (self-heal
+agent-42414133d9). Emission now waits for the pass, like dispatch does before
+resolving (off the event loop only, bounded by RELOAD_WAIT_SECONDS).
+
+Regression: test_post_tool_call_of_a_call_that_ends_mid_reload_reaches_the_plugin_hook
+(red before: observed == []).
+---
+ model_tools.py                              |  5 +++
+ tests/tools/test_registry_reload_barrier.py | 35 +++++++++++++++++++++
+ 2 files changed, 40 insertions(+)
+
+diff --git a/model_tools.py b/model_tools.py
+index 030d30b074..dec5c9e491 100644
+--- a/model_tools.py
++++ b/model_tools.py
+@@ -768,6 +768,11 @@ def _emit_post_tool_call_hook(
+     fields are derived from the result only past that gate when status is None."""
+     if _post_tool_call_hook_suppressed.get():
+         return
++    # [daveey] A call that started before a plugin force reload can return while the pass holds the
++    # hook registry empty; emitting then drops the observation for good (self-heal agent-42414133d9:
++    # the coach never saw a `gh pr view` that ended mid mods-reload). Wait the pass out, as dispatch
++    # does before resolving; never on an event-loop thread (see tools/registry_reload.py).
++    wait_for_reload_off_loop()
+     try:
+         from hermes_cli.lifecycle import has_hook, invoke_hook
+         if not has_hook("post_tool_call"):
+diff --git a/tests/tools/test_registry_reload_barrier.py b/tests/tools/test_registry_reload_barrier.py
+index f77539ffa5..b0ff3e0c79 100644
+--- a/tests/tools/test_registry_reload_barrier.py
++++ b/tests/tools/test_registry_reload_barrier.py
+@@ -38,9 +38,17 @@ def register(ctx):
+             raise RuntimeError("reload failed on purpose")
+ 
+     def handler(args, **kwargs):
++        if gate.hold_handler:
++            gate.handler_entered.set()
++            gate.handler_release.wait(30)
+         gate.calls.append(dict(args))
+         return json.dumps({{"ok": True, "host": args.get("host")}})
+ 
++    def observe(tool_name="", args=None, **kwargs):
++        gate.observed.append((tool_name, dict(args or {{}})))
++
++    ctx.register_hook("post_tool_call", observe)
++
+     ctx.register_tool({TOOL!r}, {TOOLSET!r}, {{
+         "name": {TOOL!r}, "description": "probe",
+         "parameters": {{"type": "object", "properties": {{"host": {{"type": "string"}}}}}},
+@@ -56,9 +64,14 @@ def gate(monkeypatch):
+     module.entered = threading.Event()
+     module.release = threading.Event()
+     module.calls = []
++    module.observed = []
++    module.hold_handler = False
++    module.handler_entered = threading.Event()
++    module.handler_release = threading.Event()
+     monkeypatch.setitem(sys.modules, GATE, module)
+     yield module
+     module.release.set()
++    module.handler_release.set()
+ 
+ 
+ @pytest.fixture
+@@ -121,6 +134,28 @@ def test_tool_call_during_force_reload_waits_and_runs_once(manager, gate):
+     assert gate.calls == [{"host": "mini"}]
+ 
+ 
++def test_post_tool_call_of_a_call_that_ends_mid_reload_reaches_the_plugin_hook(manager, gate):
++    """A call that started before a force reload and returns while the pass holds the hook registry
++    empty still reaches the plugin's post_tool_call observer, once the pass re-registers it
++    (self-heal agent-42414133d9: a hub mods-reload of the coach plugin landed between a chat's
++    `gh pr view` call and its result; the coach never saw the read and flagged the reply that
++    reported it as an unread PR-state claim)."""
++    gate.hold_handler = True
++    call_thread, call_box = _start(_tool_call)
++    assert gate.handler_entered.wait(20), "the tool handler never started"
++    reload_thread, reload_box = _reload_held_open(manager, gate)
++
++    gate.handler_release.set()  # the handler returns now, mid-reload
++    call_thread.join(0.5)
++    gate.release.set()
++    reload_thread.join(20)
++    call_thread.join(20)
++    assert not reload_thread.is_alive() and "error" not in reload_box, reload_box
++    assert call_box.get("value") == {"ok": True, "host": "mini"}, call_box
++    assert gate.calls == [{"host": "mini"}]
++    assert [a for t, a in gate.observed if t == TOOL] == [{"host": "mini"}], gate.observed
++
++
+ def test_direct_dispatch_during_force_reload_waits(manager, gate):
+     reload_thread, _ = _reload_held_open(manager, gate)
+     call_thread, call_box = _start(lambda: json.loads(registry.dispatch(TOOL, {"host": "hub"})))
+-- 
+2.43.0
+

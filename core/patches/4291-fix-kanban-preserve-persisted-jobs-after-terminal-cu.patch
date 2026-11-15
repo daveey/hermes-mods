@@ -1,0 +1,80 @@
+From 72a001148b5a1556a60cf36ed045c1bf72fc1c63 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 23:02:23 +0000
+Subject: [PATCH] fix(kanban): preserve persisted jobs after terminal custody
+ release [daveey]
+
+Custody prevents another host claiming a retry while its persisted jobs live. The sweep spared running retries but still killed jobs after completion or archive, although those cards cannot be claimed. Release terminal custody before applying the bound, retaining the existing running and ready paths.
+
+Proof: four real-child done/archived cases before/after bound fail on base and pass with fix; all 14 custody tests and 68 neighboring core-update requeue tests pass. scripts/check --base origin/main: 20 checks pass.
+---
+ hermes_cli/kanban_requeue_custody.py          |  7 ++++
+ .../hermes_cli/test_kanban_requeue_custody.py | 34 +++++++++++++++++++
+ 2 files changed, 41 insertions(+)
+
+diff --git a/hermes_cli/kanban_requeue_custody.py b/hermes_cli/kanban_requeue_custody.py
+index 92ef86b867..70cdcb47ba 100644
+--- a/hermes_cli/kanban_requeue_custody.py
++++ b/hermes_cli/kanban_requeue_custody.py
+@@ -293,6 +293,13 @@ def sweep(conn: sqlite3.Connection, *, now: Optional[float] = None,
+         for task_id, _run, custody in _custodies(conn, None, moment - SWEEP_WINDOW_SECONDS):
+             if custody.get("host") != me:
+                 continue
++            row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
++            if row is not None and row["status"] in {"done", "archived"}:
++                # Terminal cards cannot be claimed elsewhere. Custody no longer protects a retry,
++                # and must not shorten the lifetime of its persist_on_release jobs.
++                _release(conn, task_id, custody, "terminal", {"status": row["status"]})
++                released.append(task_id)
++                continue
+             procs = [p for p in custody["processes"] if isinstance(p, dict)]
+             live = [p for p in procs if _alive(p.get("pid"), p.get("start"))]
+             if live and (moment < float(custody.get("until") or 0) or _held_here(conn, task_id)):
+diff --git a/tests/hermes_cli/test_kanban_requeue_custody.py b/tests/hermes_cli/test_kanban_requeue_custody.py
+index fa72fccca8..22ea382b63 100644
+--- a/tests/hermes_cli/test_kanban_requeue_custody.py
++++ b/tests/hermes_cli/test_kanban_requeue_custody.py
+@@ -251,6 +251,40 @@ def test_bound_spares_the_job_while_the_custody_hosts_retry_runs(board, procs, m
+     assert _wait_dead(ship, start)
+ 
+ 
++@pytest.mark.parametrize("status", ["done", "archived"])
++@pytest.mark.parametrize("bound_offset", [-1, 1])
++def test_terminal_card_releases_custody_without_signalling_job(
++        board, procs, monkeypatch, status, bound_offset):
++    tid = _running_card(board, max_runtime=60)
++    ship = _ready(procs(SLEEPER))
++    start = custody._start_ticks(ship)
++    assert start is not None
++    _checkpoint(board, _entry(ship, persist=True, command="ship"))
++    monkeypatch.setattr(custody, "own_host", lambda conn: HOST)
++    until = _requeue(board, tid)["custody"]["until"]
++    assert kb.claim_task(board, tid) is not None
++    if status == "done":
++        assert kb.complete_task(board, tid, summary="finished", fire_lifecycle_hook=False)
++    else:
++        assert kb.archive_task(board, tid, signal_fn=lambda *_: None)
++    assert kb.get_task(board, tid).status == status
++    assert custody._alive(ship, start)
++
++    signalled = []
++    def terminate_spy(processes):
++        signalled.extend(processes)
++        return custody.terminate(processes)
++
++    assert custody.sweep(board, now=until + bound_offset, terminate_fn=terminate_spy) == [tid]
++    assert signalled == []
++    assert custody._alive(ship, start)
++    (released,) = [e for e in kb.list_events(board, tid) if e.kind == custody.RELEASED_EVENT]
++    assert released.payload["outcome"] == "terminal"
++    assert released.payload["status"] == status
++    assert custody.sweep(board, now=until + 2, terminate_fn=terminate_spy) == []
++    assert signalled == [] and custody._alive(ship, start)
++
++
+ def test_liveness_without_proc_uses_the_registry_fingerprint(procs, monkeypatch):
+     """Review nit of 478094ef: on macOS (no /proc) every pid read as dead, so no custody was ever recorded.
+     Without /proc the fingerprint is the process registry's own (psutil), matching checkpoint entries."""
+-- 
+2.43.0
+

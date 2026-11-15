@@ -1,0 +1,170 @@
+From 777f940537acd5c51a151bcb8491728a5e8489d1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 16:08:52 +0000
+Subject: [PATCH] [daveey] fix(kanban): annotation host-copy custody falls back
+ to msvcrt without fcntl
+
+custody() imported fcntl unconditionally, so on Windows save_host/load_host/
+confirm_host hit ImportError inside their broad except and the cross-process
+annotation host copy was never written or adopted (fails closed: each process
+read for itself, but Windows lost the shared-read saving main had).
+
+Without fcntl, custody() now takes an msvcrt.locking byte-0 lock on the same
+.host.lock file. msvcrt has no shared mode, so readers lock exclusively too;
+any contention still raises and fails closed, exactly like flock LOCK_NB on
+POSIX. POSIX behaviour is unchanged. A host with neither primitive still
+raises ImportError (no copy), as before.
+
+Five whys: why no copy on Windows -> ImportError in custody(); why -> the
+lock was flock-only; why -> PR #2995 added custody for the split header/body
+copy and only exercised POSIX. Follow-up from review 5905021745 on #2995.
+
+Proof: tests/hermes_cli/test_kanban_annotation_storage_windows.py simulates
+fcntl unavailable (sys.modules['fcntl']=None) with a modelled msvcrt.
+RED on f5705ef2: 2 failed (round-trip, contention), 1 passed (no-primitive).
+GREEN: 6 annotation files, 63 passed. scripts/check: 20 checks ok.
+
+Kanban: t_01a1dac9f34cd04d
+---
+ hermes_cli/kanban_annotation_storage.py       | 26 +++++-
+ .../test_kanban_annotation_storage_windows.py | 84 +++++++++++++++++++
+ 2 files changed, 109 insertions(+), 1 deletion(-)
+ create mode 100644 tests/hermes_cli/test_kanban_annotation_storage_windows.py
+
+diff --git a/hermes_cli/kanban_annotation_storage.py b/hermes_cli/kanban_annotation_storage.py
+index 7d69d9b9fa..612ec147fa 100644
+--- a/hermes_cli/kanban_annotation_storage.py
++++ b/hermes_cli/kanban_annotation_storage.py
+@@ -18,7 +18,14 @@ def signature(path: Path) -> tuple[int, ...] | None:
+ def custody(path: Path, *, writer: bool):
+     # Fail closed on unsupported hosts or contention: this is a cache, never a
+     # reason to block a request. A stable lock inode is never removed by pruning.
+-    import fcntl
++    try:
++        import fcntl
++    except ImportError:  # Windows: no flock; msvcrt below (ImportError there too = no copy)
++        fcntl = None
++    if fcntl is None:
++        with _msvcrt_custody(path):
++            yield
++        return
+ 
+     path.parent.mkdir(parents=True, exist_ok=True)
+     with path.with_suffix('.host.lock').open('a') as lock:
+@@ -30,6 +37,23 @@ def custody(path: Path, *, writer: bool):
+             fcntl.flock(lock, fcntl.LOCK_UN)
+ 
+ 
++@contextmanager
++def _msvcrt_custody(path: Path):
++    # msvcrt.locking has no shared mode, so readers take the same exclusive byte-0 lock as writers: a reader that
++    # meets another holder fails closed (reads for itself), exactly like flock contention on POSIX.
++    import msvcrt
++
++    path.parent.mkdir(parents=True, exist_ok=True)
++    with path.with_suffix('.host.lock').open('a+b') as lock:
++        lock.seek(0)
++        msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
++        try:
++            yield
++        finally:
++            lock.seek(0)
++            msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
++
++
+ def body_matches(path: Path, parts: list) -> bool:
+     """A new publisher may reuse a prior publisher's body only after verification."""
+     try:
+diff --git a/tests/hermes_cli/test_kanban_annotation_storage_windows.py b/tests/hermes_cli/test_kanban_annotation_storage_windows.py
+new file mode 100644
+index 0000000000..72177e0a90
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_annotation_storage_windows.py
+@@ -0,0 +1,84 @@
++"""Annotation host-copy custody without ``fcntl`` (Windows): msvcrt byte-range lock, still fail closed. [daveey]"""
++import os
++import sys
++import types
++
++import pytest
++
++from hermes_cli import kanban_annotation_disk as disk
++from hermes_cli import kanban_annotation_storage as storage
++
++SCOPE = ('win-host', 'default')
++
++
++def _fake_msvcrt():
++    """Models ``msvcrt.locking``: one exclusive byte-range lock per file, nonblocking attempt raises OSError."""
++    held: dict[tuple[int, int], int] = {}
++    calls: list[tuple[int, int, int]] = []
++    mod = types.SimpleNamespace(LK_NBLCK=2, LK_UNLCK=0)
++
++    def locking(fd, mode, nbytes):
++        st = os.fstat(fd)
++        key = (st.st_dev, st.st_ino)
++        assert os.lseek(fd, 0, os.SEEK_CUR) == 0, 'lock must cover byte 0 for every holder'
++        calls.append((fd, mode, nbytes))
++        if mode == mod.LK_NBLCK:
++            if key in held:
++                raise OSError(36, 'Resource deadlock avoided')
++            held[key] = fd
++        elif mode == mod.LK_UNLCK:
++            if held.get(key) != fd:
++                raise OSError(13, 'Permission denied')
++            del held[key]
++
++    mod.locking = locking
++    mod.held, mod.calls = held, calls
++    return mod
++
++
++@pytest.fixture
++def windows(tmp_path, monkeypatch):
++    monkeypatch.setitem(sys.modules, 'fcntl', None)  # ``import fcntl`` -> ImportError, as on Windows
++    fake = _fake_msvcrt()
++    monkeypatch.setitem(sys.modules, 'msvcrt', fake)
++    monkeypatch.setattr(disk, 'FORCE', True)
++    monkeypatch.setattr(disk, '_path', lambda scope: tmp_path / (scope[0] + '.json'))
++    monkeypatch.setattr(disk.time, 'time', lambda: 1000.0)
++    disk.reset()
++    yield fake
++    disk.reset()
++
++
++def parts(value=1):
++    return ({'session': value},) + tuple({} for _ in range(11))
++
++
++def test_host_copy_round_trips_without_fcntl(windows):
++    assert disk.save_host(SCOPE, 'input-1', 990, parts(), narrow_key='k1')
++    disk.reset()  # another process knows only disk state
++    header = {}
++    assert disk.load_host(SCOPE, header_out=header) == ('input-1', 990, parts())
++    assert header['parts_digest'] and header['verified_at'] == 990
++    assert disk.confirm_host(SCOPE, 'k1', 995)
++    header.clear()
++    assert disk.load_host(SCOPE, shared=True, header_out=header) == ('input-1', 990, parts())
++    assert header['verified_at'] == 995
++    assert windows.calls and not windows.held  # locked and released every time
++
++
++def test_contention_still_fails_closed_without_fcntl(windows, tmp_path):
++    assert disk.save_host(SCOPE, 'input-1', 990, parts())
++    with storage.custody(tmp_path / 'win-host.json', writer=True):
++        assert disk.load_host(SCOPE) is None
++        assert not disk.save_host(SCOPE, 'input-2', 999, parts(2))
++    assert not windows.held
++    disk.reset()
++    assert disk.load_host(SCOPE) == ('input-1', 990, parts())
++
++
++def test_no_lock_primitive_fails_closed(windows, monkeypatch, tmp_path):
++    monkeypatch.setitem(sys.modules, 'msvcrt', None)
++    assert not disk.save_host(SCOPE, 'input-1', 990, parts())
++    with pytest.raises(ImportError):
++        with storage.custody(tmp_path / 'x.json', writer=False):
++            pass
+-- 
+2.43.0
+

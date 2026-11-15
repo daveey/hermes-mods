@@ -1,0 +1,1213 @@
+From 4729d9e5dd02271dd87662598e395a119a079118 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 18:27:09 +0000
+Subject: [PATCH] [daveey] D2: incremental ranked session ids for the session
+ list, sidebar and project tree
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Design t_01a1d563324d7e8e §3 D2 (review R5, C3, C9), card t_01a1d59ed6d15f90.
+
+- hermes_state_rank_memo: one per-store memo of ranked page ids, shared by every
+  list_sessions_rich(order_by_last_active) first page (/api/profiles/sessions, /sidebar,
+  /projects/tree and each slice). Clock = D1 session cursor + messages.id watermark +
+  a session_rank_lowered counter (AFTER DELETE / active / timestamp-or-session_id
+  rewrite on messages, own trigger prefix). Moved sessions re-rank prev page ∪ dirty ∪
+  ancestors ∪ direct children with the exact query restricted to them; a removed or
+  lowered page row, a lowered counter (delete, rewind), an untrusted cursor or a params
+  change takes the exact path. Rows are re-projected every request.
+- Exactly invalidated preview cache keyed on transcript_revision (both revision
+  triggers verified), installed only by a reader whose clock generation is current.
+- Preview SQL: SUBSTR before the newline REPLACE (identical result, half the preview
+  cost on the hub's 10 KB worker prompts).
+- Store LRU reserves profiles + 4 (hub serves 11 profiles; _MAX_STORES was 8).
+- scripts/benchmark_rank_memo.py: 5k/23k scale (memo growth <= 1.09x vs exact 2.8x)
+  and a replay mix (synthetic 0.75x, copy of hub bb-tuner store 0.55x, fallback 10.6%).
+---
+ hermes_cli/web_routers/profiles.py   |   3 +
+ hermes_state_common.py               |  18 +-
+ hermes_state_rank_memo.py            | 402 +++++++++++++++++++++++++++
+ hermes_state_recency.py              |  68 ++++-
+ hermes_state_schema.py               |   2 +
+ scripts/benchmark_rank_memo.py       | 200 +++++++++++++
+ tests/hermes_state/test_rank_memo.py | 372 +++++++++++++++++++++++++
+ 7 files changed, 1059 insertions(+), 6 deletions(-)
+ create mode 100644 hermes_state_rank_memo.py
+ create mode 100644 scripts/benchmark_rank_memo.py
+ create mode 100644 tests/hermes_state/test_rank_memo.py
+
+diff --git a/hermes_cli/web_routers/profiles.py b/hermes_cli/web_routers/profiles.py
+index 16d08dd78a..a74b27369f 100644
+--- a/hermes_cli/web_routers/profiles.py
++++ b/hermes_cli/web_routers/profiles.py
+@@ -174,6 +174,9 @@ def _profile_targets(log_label: str) -> list[tuple[str, Path]]:
+         targets = []
+     if not targets:
+         targets.append(("default", profiles_mod.get_profile_dir("default")))
++    # [daveey] D2: keep every profile's ranked-id memo resident across a fan-out (+4 for transient stores).
++    import hermes_state_recency
++    hermes_state_recency.reserve_stores(len(targets) + 4)
+     return scope_to_launch_profile(targets, lambda target: target[0])
+ 
+ 
+diff --git a/hermes_state_common.py b/hermes_state_common.py
+index 0b5c188cc4..5aaa07e36d 100644
+--- a/hermes_state_common.py
++++ b/hermes_state_common.py
+@@ -67,7 +67,15 @@ def escape_like(text: str) -> str:
+     return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+ 
+ 
+-_PREVIEW_CONTENT_SQL = "REPLACE(REPLACE(m.content, X'0A', ' '), X'0D', ' ')"
++_PREVIEW_CONTENT_SQL = "REPLACE(REPLACE(m.content, X'0A', ' '), X'0D', ' ')"  # the reference the window equals
++
++
++def _sql_preview_window(start: int, length: "int | None" = None) -> str:
++    """``SUBSTR(<_PREVIEW_CONTENT_SQL>, start[, length])`` cut BEFORE the newline replacement: one character
++    replaced by one keeps every position, so the result is identical, without copying a 50 KB worker prompt
++    twice per listed row (~half the page projection on the hub, t_01a1d59ed6d15f90)."""
++    cut = f"SUBSTR(m.content, {start})" if length is None else f"SUBSTR(m.content, {start}, {length})"
++    return f"REPLACE(REPLACE({cut}, X'0A', ' '), X'0D', ' ')"
+ # User-invoked and gateway auto-load scaffolds both get the head+tail excerpt window:
+ # the typed request sits at the tail (auto-load) or behind the instruction marker.
+ # No LIKE wildcards in either prefix, so no ESCAPE clause is needed.
+@@ -154,10 +162,10 @@ _PREVIEW_RAW_SELECT = (
+     f"CASE WHEN {_PREVIEW_STANDALONE_SUMMARY_SQL} THEN {_PREVIEW_FORCE_USER_REMAINDER_SQL}"
+     f" WHEN {_PREVIEW_MERGED_SUMMARY_SQL} THEN {_PREVIEW_MERGED_PRIOR_UNWRAPPED_SQL}"
+     f" WHEN {_PREVIEW_SCAFFOLDED_SQL} AND LENGTH(m.content) > {_PREVIEW_SCAFFOLD_WINDOW * 2}"
+-    f" THEN SUBSTR({_PREVIEW_CONTENT_SQL}, 1, {_PREVIEW_SCAFFOLD_WINDOW}) || '{SKILL_EXCERPT_JOINT}'"
+-    f" || SUBSTR({_PREVIEW_CONTENT_SQL}, -{_PREVIEW_SCAFFOLD_WINDOW})"
+-    f" WHEN {_PREVIEW_SCAFFOLDED_SQL} THEN SUBSTR({_PREVIEW_CONTENT_SQL}, 1, {_PREVIEW_SCAFFOLD_WINDOW * 2})"
+-    f" ELSE SUBSTR({_PREVIEW_CONTENT_SQL}, 1, {_PREVIEW_HEAD_CHARS}) END")
++    f" THEN {_sql_preview_window(1, _PREVIEW_SCAFFOLD_WINDOW)} || '{SKILL_EXCERPT_JOINT}'"
++    f" || {_sql_preview_window(-_PREVIEW_SCAFFOLD_WINDOW)}"
++    f" WHEN {_PREVIEW_SCAFFOLDED_SQL} THEN {_sql_preview_window(1, _PREVIEW_SCAFFOLD_WINDOW * 2)}"
++    f" ELSE {_sql_preview_window(1, _PREVIEW_HEAD_CHARS)} END")
+ 
+ 
+ def _shape_preview(raw: Any) -> str:
+diff --git a/hermes_state_rank_memo.py b/hermes_state_rank_memo.py
+new file mode 100644
+index 0000000000..d51745a2a5
+--- /dev/null
++++ b/hermes_state_rank_memo.py
+@@ -0,0 +1,402 @@
++"""[daveey] Incremental ranked session ids (design t_01a1d563324d7e8e §3 D2, review R5, C9).
++
++``/api/profiles/sessions``, the batched sidebar and ``/projects/tree`` all read
++``list_sessions_rich(order_by_last_active=True)`` pages; the Desktop refreshes them on every
++``sessions.changed`` (at most each 10 s), and each read re-ranked the store. This module keeps, per store
++(``hermes_state_recency._StoreRecency``), a memo of RANKED PAGE IDS ONLY, keyed by the page's exact
++filter (WHERE text, bound params, seed form) and its length. Rows are projected on every request.
++
++Clock. The store keeps one clock: D1's session cursor (``hermes_state_session_change``), the
++``messages.id`` watermark and the ``session_rank_lowered`` counter. Each request advances it inside its
++own read snapshot and adds the ids that moved (changed sessions, sessions with new messages) to every
++entry's ``dirty`` set. The clock is untrusted (cursor FULL/None, watermark not AUTOINCREMENT or moved
++back, the lowered triggers not exactly installed): every entry and preview is dropped, the read takes the
++exact path. The counter moved (a message deleted, (de)activated by a rewind or compaction, or its
++``timestamp``/``session_id`` rewritten): same.
++
++Re-rank. An entry with ``dirty`` re-ranks ``R`` = previous page ∪ dirty ∪ every ancestor of dirty (chain
++roots: a member's change moves its root) ∪ the direct children of dirty (a child's admission reads its
++parent) with the exact ranked query restricted to ``R`` (the chain walk itself is not restricted). If
++every previous page row is still in the result with a sort key (effective_last_active, started_at, id;
++SQLite's order) no lower than before, the new page is the top of ``R``. Proof: a row outside ``R`` was not
++on the previous page, so it was not admitted or ranked strictly below the previous boundary, and none of
++its inputs moved (its own row, its parent, its chain's rows and messages); the previous page rows alone
++still fill the page at or above that boundary. Otherwise (a page row removed or lowered) the exact query
++runs. A params change is a different key, so a fresh entry from the exact query.
++
++Previews. ``_preview_raw`` (the first eligible user message, ~95% of the page projection on the hub) is
++cached per store as ``{session_id: (transcript_revision, raw)}`` and used in SQL only when the row's
++``transcript_revision`` still matches (the ``messages_*_revision_update`` triggers bump it on a content,
++role or ``display_kind`` rewrite; both must be exactly installed or the cache is off). An entry is dropped
++when its session moves on the clock (a new message, or a session-row change: ``transcript_revision``
++restarts at 0 on a re-insert), and the cache is cleared with the clock. A projection installs previews only
++if the clock did not advance since its own snapshot advanced it (a slower, older reader never installs).
++
++Assumptions shared with ``hermes_state_recency``: ``messages.id`` is AUTOINCREMENT and no writer inserts
++an explicit old id or ``INSERT OR REPLACE``s a message (REPLACE deletes fire no DELETE trigger).
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++import os
++import re
++import sqlite3
++import threading
++from collections import Counter, OrderedDict
++from dataclasses import dataclass, field
++from typing import Any, Optional
++
++logger = logging.getLogger("hermes_state")
++
++PREFIX = "session_rank_on_"
++LOWERED_TABLE = "session_rank_lowered"
++OUTCOMES: Counter = Counter()  # served / reranked / fallback/<reason> (tests, P1 via loop_accounting)
++
++_MAX_ENTRIES = 64
++_MAX_PREVIEWS = 8192
++_MAX_PREVIEW_CHARS = 4096
++_PREVIEW_TRIGGERS = {  # name -> columns its UPDATE OF list must name for the preview cache to be exact
++    "messages_transcript_revision_update": ("role", "content"),
++    "messages_display_revision_update": ("display_kind",),
++}
++
++
++# ── the lowered counter ───────────────────────────────────────────────────────
++
++def _bump() -> str:
++    return f"UPDATE {LOWERED_TABLE} SET n = n + 1 WHERE id = 1;"
++
++
++def wanted_triggers(conn: sqlite3.Connection) -> dict[str, str]:
++    """Trigger name -> CREATE statement. Message deletes, (de)activations and in-place moves can LOWER a
++    session's rank (or its chain root's), which a page memo cannot see through the clock's other parts."""
++    columns = {r[1] for r in conn.execute("PRAGMA table_info(messages)")}
++    if not {"id", "session_id", "timestamp"} <= columns:
++        return {}
++    out = {f"{PREFIX}messages_delete": f"CREATE TRIGGER {PREFIX}messages_delete AFTER DELETE ON messages "
++                                       f"BEGIN {_bump()} END",
++           f"{PREFIX}messages_move": (f"CREATE TRIGGER {PREFIX}messages_move AFTER UPDATE OF timestamp, session_id "
++                                      "ON messages WHEN OLD.timestamp IS NOT NEW.timestamp OR "
++                                      f"OLD.session_id IS NOT NEW.session_id BEGIN {_bump()} END")}
++    if "active" in columns:
++        out[f"{PREFIX}messages_active"] = (f"CREATE TRIGGER {PREFIX}messages_active AFTER UPDATE OF active ON "
++                                           f"messages WHEN OLD.active IS NOT NEW.active BEGIN {_bump()} END")
++    return out
++
++
++def _installed(conn: sqlite3.Connection) -> dict[str, str]:
++    return dict(conn.execute("SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND name GLOB ?",
++                             (PREFIX + "*",)))
++
++
++def ensure_installed(conn: sqlite3.Connection) -> bool:
++    """Install or repair the counter and its triggers; True when it wrote. Own prefix, so D1's
++    ``ensure_installed`` (which drops unknown ``session_change_on_*`` triggers) never touches these."""
++    wanted = wanted_triggers(conn)
++    if not wanted:
++        return False
++    found = _installed(conn)
++    has_row = conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
++                           (LOWERED_TABLE,)).fetchone() and conn.execute(
++        f"SELECT 1 FROM {LOWERED_TABLE} WHERE id = 1").fetchone()
++    if found == wanted and has_row:
++        return False
++    own = not conn.in_transaction
++    if own:
++        conn.execute("BEGIN IMMEDIATE")
++    try:
++        conn.execute(f"CREATE TABLE IF NOT EXISTS {LOWERED_TABLE} "
++                     "(id INTEGER PRIMARY KEY CHECK (id = 1), n INTEGER NOT NULL)")
++        conn.execute(f"INSERT OR IGNORE INTO {LOWERED_TABLE} (id, n) VALUES (1, 0)")
++        # A (re)install counts as a lowering: no memo built across a gap in coverage is trusted.
++        conn.execute(f"UPDATE {LOWERED_TABLE} SET n = n + 1 WHERE id = 1")
++        for name in set(found) - set(wanted):
++            conn.execute(f"DROP TRIGGER IF EXISTS {name}")
++        for name, sql in wanted.items():
++            if found.get(name) != sql:
++                conn.execute(f"DROP TRIGGER IF EXISTS {name}")
++                conn.execute(sql)
++        if own:
++            conn.execute("COMMIT")
++    except BaseException:
++        if own and conn.in_transaction:
++            conn.execute("ROLLBACK")
++        raise
++    return True
++
++
++def install_fail_open(conn: sqlite3.Connection) -> None:
++    """``ensure_installed`` for the writer init: a failure never fails the open; memos fall back."""
++    try:
++        ensure_installed(conn)
++    except sqlite3.Error as exc:
++        logger.warning("session rank memo triggers not installed (pages use the exact ranking): %s", exc)
++
++
++_COVERED: dict[tuple, tuple[bool, bool]] = {}  # (path, dev, ino, cookie) -> (lowered ok, preview ok)
++_COVERED_LOCK = threading.Lock()
++
++
++def _update_of(sql: str) -> set[str]:
++    m = re.search(r"AFTER\s+UPDATE\s+OF\s+(.*?)\s+ON\s+messages", sql or "", re.IGNORECASE | re.DOTALL)
++    return {c.strip().strip('"').lower() for c in m.group(1).split(",")} if m else set()
++
++
++def _coverage(conn: sqlite3.Connection, key: tuple) -> tuple[bool, bool]:
++    with _COVERED_LOCK:
++        hit = _COVERED.get(key)
++    if hit is not None:
++        return hit
++    wanted = wanted_triggers(conn)
++    lowered = bool(wanted) and _installed(conn) == wanted and bool(conn.execute(
++        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (LOWERED_TABLE,)).fetchone())
++    found = dict(conn.execute("SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND name IN (?, ?)",
++                              tuple(_PREVIEW_TRIGGERS)))
++    preview = all(set(cols) <= _update_of(found.get(name, "")) for name, cols in _PREVIEW_TRIGGERS.items())
++    preview = preview and "transcript_revision" in {r[1] for r in conn.execute("PRAGMA table_info(sessions)")}
++    with _COVERED_LOCK:
++        if len(_COVERED) >= 64:
++            _COVERED.clear()
++        _COVERED[key] = (lowered, preview)
++    return lowered, preview
++
++
++# ── sort keys in SQLite's order ───────────────────────────────────────────────
++
++def _v(value: Any) -> tuple:
++    """SQLite's cross-type order: NULL < numbers < TEXT (BINARY: UTF-8 bytes order = code point order) < BLOB."""
++    if value is None:
++        return (0, 0)
++    if isinstance(value, (int, float)):
++        return (1, value)
++    if isinstance(value, str):
++        return (2, value)
++    return (3, bytes(value))
++
++
++def sort_key(eff: Any, started_at: Any, sid: Any) -> tuple:
++    return (_v(eff), _v(started_at), _v(sid))
++
++
++# ── per-store memo ────────────────────────────────────────────────────────────
++
++@dataclass
++class _Entry:
++    ids: list  # ranked page ids, best first
++    keys: dict  # id -> sort key
++    eff: dict  # id -> effective_last_active as SQLite returned it
++    dirty: set = field(default_factory=set)
++
++
++@dataclass
++class _Clock:
++    cursor: Any
++    watermark: int
++    lowered: int
++
++
++class RankMemo:
++    """Lives on ``_StoreRecency.rank_memo``; every method runs under ``_StoreRecency.lock`` except
++    ``install_previews``/``preview_rows`` (they take it themselves)."""
++
++    def __init__(self, lock: threading.Lock):
++        self.lock = lock
++        self.clock: Optional[_Clock] = None
++        self.generation = 0
++        self.entries: OrderedDict[tuple, _Entry] = OrderedDict()
++        self.previews: OrderedDict[str, tuple] = OrderedDict()
++        self.preview_ok = False
++
++    def _reset(self) -> None:
++        self.clock = None
++        self.entries.clear()
++        self.previews.clear()
++        self.generation += 1
++
++    def advance_for_test(self) -> None:
++        with self.lock:
++            self.generation += 1
++
++    def advance(self, conn: sqlite3.Connection) -> Optional[str]:
++        """Move the clock to this snapshot; None, or the fallback reason (every entry was dropped)."""
++        import hermes_state_session_change as sc
++        changed, cursor = sc.changed_since(conn, self.clock.cursor if self.clock else None)
++        seq_row = conn.execute("SELECT seq FROM sqlite_sequence WHERE name = 'messages'").fetchone()
++        max_id = conn.execute("SELECT MAX(id) FROM messages").fetchone()[0]
++        path = sc._main_path(conn)
++        ident = sc._identity(path)
++        cookie = int(conn.execute("PRAGMA schema_version").fetchone()[0])
++        lowered_ok, self.preview_ok = _coverage(conn, (path, *(ident[:2] if ident else (None, None)), cookie))
++        if cursor is None or (seq_row is None and max_id is not None) or not lowered_ok:
++            self._reset()
++            return "untrusted"
++        watermark = max(int(seq_row[0]) if seq_row else 0, int(max_id or 0))
++        lowered = int(conn.execute(f"SELECT n FROM {LOWERED_TABLE} WHERE id = 1").fetchone()[0])
++        previous = self.clock
++        if previous is None:
++            self._reset()
++            self.clock = _Clock(cursor, watermark, lowered)
++            return None
++        if changed is sc.FULL or watermark < previous.watermark:
++            self._reset()
++            self.clock = _Clock(cursor, watermark, lowered)
++            return "untrusted"
++        if lowered != previous.lowered:
++            self._reset()
++            self.clock = _Clock(cursor, watermark, lowered)
++            return "lowered"
++        moved = set(changed)
++        if watermark > previous.watermark:
++            moved |= {sid for (sid,) in conn.execute(
++                "SELECT DISTINCT session_id FROM messages NOT INDEXED WHERE id > ? AND id <= ?",
++                (previous.watermark, watermark)) if sid is not None}
++        self.clock = _Clock(cursor, watermark, lowered)
++        if moved:
++            self.generation += 1
++            for sid in moved:
++                self.previews.pop(sid, None)
++            for key in list(self.entries):
++                entry = self.entries[key]
++                entry.dirty |= moved
++                if len(entry.dirty) > max(256, 4 * len(entry.ids)):
++                    del self.entries[key]
++        return None
++
++    def put(self, key: tuple, rows: list) -> _Entry:
++        entry = _Entry([r[0] for r in rows], {r[0]: sort_key(r[3], r[1], r[0]) for r in rows},
++                       {r[0]: r[3] for r in rows})
++        self.entries[key] = entry
++        self.entries.move_to_end(key)
++        while len(self.entries) > _MAX_ENTRIES:
++            self.entries.popitem(last=False)
++        return entry
++
++    def cached_previews(self, ids: list) -> list:
++        with self.lock:
++            if not self.preview_ok:
++                return []
++            out = []
++            for sid in ids:
++                hit = self.previews.get(sid)
++                if hit is not None:
++                    self.previews.move_to_end(sid)
++                    out.append([sid, hit[0], hit[1]])
++            return out
++
++    def install_previews(self, generation: int, values: dict) -> None:
++        with self.lock:
++            if generation != self.generation or not self.preview_ok:
++                return  # the clock moved past this reader's snapshot
++            for sid, (rev, raw) in values.items():
++                if isinstance(raw, str) and len(raw) <= _MAX_PREVIEW_CHARS and rev is not None:
++                    self.previews[sid] = (rev, raw)
++                    self.previews.move_to_end(sid)
++            while len(self.previews) > _MAX_PREVIEWS:
++                self.previews.popitem(last=False)
++
++
++# ── the page ──────────────────────────────────────────────────────────────────
++
++_RELATIVES_SQL = """
++    WITH RECURSIVE up(id) AS (
++        SELECT value FROM json_each(?1)
++        UNION SELECT s.parent_session_id FROM up JOIN sessions s ON s.id = up.id
++        WHERE s.parent_session_id IS NOT NULL
++    )
++    SELECT id FROM up
++    UNION SELECT c.id FROM sessions c WHERE c.parent_session_id IN (SELECT value FROM json_each(?1))"""
++
++_IDS_HEAD = "SELECT s.id, s.started_at, "  # + last_active, _effective_last_active from ranked_query
++
++
++def _account(outcome: str) -> None:
++    OUTCOMES[outcome] += 1
++    try:
++        from hermes_cli import loop_accounting as la
++        la.record("recency.rank_memo", skipped=outcome == "served", changed=outcome == "reranked",
++                  fallback=outcome.startswith("fallback/"), outer=False)
++        if outcome.startswith("fallback/"):
++            la.record(f"recency.rank_memo.{outcome}", outer=False)
++    except Exception:
++        pass
++
++
++def ranked_ids(conn, memo: RankMemo, key: tuple, need: int, exact_ids, restricted_ids) -> list:
++    """``[(id, started_at, last_active, effective_last_active)]`` of the top ``need`` rows, from the memo
++    when provable, else ``exact_ids()``. ``restricted_ids(ids)`` is the exact ranking of ``ids`` alone.
++    Called under the store lock inside the caller's read snapshot."""
++    reason = memo.advance(conn)
++    entry = memo.entries.get(key) if reason is None else None
++    if entry is None:
++        rows = exact_ids()
++        if memo.clock is not None:
++            memo.put(key, rows)
++        _account(f"fallback/{reason or 'no_entry'}")
++        return rows
++    memo.entries.move_to_end(key)
++    if not entry.dirty:
++        _account("served")
++        return [(sid, None, None, entry.eff[sid]) for sid in entry.ids]
++    dirty = json.dumps(sorted(entry.dirty))
++    relatives = {sid for (sid,) in conn.execute(_RELATIVES_SQL, (dirty,)) if sid is not None}
++    rows = restricted_ids(sorted(set(entry.ids) | relatives))
++    got = {r[0]: sort_key(r[3], r[1], r[0]) for r in rows}
++    for sid in entry.ids:
++        if sid not in got:
++            reason = "removed"
++            break
++        if got[sid] < entry.keys[sid]:
++            reason = "rank_lowered"
++            break
++    if reason is None and len(entry.ids) >= need and len(rows) >= need and sorted(got.values())[-need] < min(
++            entry.keys.values()):
++        reason = "threshold"  # unreachable when the checks above hold; kept as a guard
++    if reason is not None:
++        del memo.entries[key]
++        rows = exact_ids()
++        memo.put(key, rows)
++        _account(f"fallback/{reason}")
++        return rows
++    rows = rows[:need]
++    memo.put(key, rows)
++    _account("reranked")
++    return rows
++
++
++def project(conn, memo: RankMemo, ids_rows: list, select_head: str, prompt_join: str, preview_sql: str,
++            last_active_sql: str, generation: int) -> list:
++    """The page's rows in ranked order: ``select_head`` columns + ``last_active`` + ``_effective_last_active``,
++    exactly what ``ranked_query`` projects, read in the caller's snapshot. Cached previews replace the
++    correlated preview subquery only for rows whose ``transcript_revision`` still matches."""
++    # The cached (revision, raw) rides on the page row itself: one PK join per row, no second json_each to
++    # join against (an unindexed CTE join was quadratic on a 2000-row tree page).
++    use_cache = preview_sql in select_head
++    cached = {c[0]: (c[1], c[2]) for c in memo.cached_previews([r[0] for r in ids_rows])} if use_cache else {}
++    page = json.dumps([[r[0], r[3], *cached.get(r[0], (None, None))] for r in ids_rows])
++    head = select_head
++    if use_cache:
++        body = preview_sql[: -len(" AS _preview_raw")]
++        head = select_head.replace(
++            preview_sql, f"CASE WHEN _pg.pc_rev IS NOT NULL AND _pg.pc_rev = s.transcript_revision THEN _pg.pc_raw"
++                         f" ELSE {body} END AS _preview_raw")
++    sql = (f"WITH _pg(page_id, eff, pc_rev, pc_raw, ord) AS (SELECT json_extract(value, '$[0]'), "
++           f"json_extract(value, '$[1]'), json_extract(value, '$[2]'), json_extract(value, '$[3]'), key "
++           f"FROM json_each(?)) "
++           f"{head}{last_active_sql} AS last_active, _pg.eff AS _effective_last_active "
++           f"FROM _pg JOIN sessions s ON s.id = _pg.page_id {prompt_join} ORDER BY _pg.ord")
++    rows = conn.execute(sql, (page,)).fetchall()
++    if use_cache and rows:
++        fresh = {}
++        for row in rows:
++            keys = row.keys()
++            if "transcript_revision" in keys and cached.get(row["id"], (None,))[0] != row["transcript_revision"]:
++                fresh[row["id"]] = (row["transcript_revision"], row["_preview_raw"])
++        if fresh:
++            memo.install_previews(generation, fresh)
++    return rows
++
++
++def enabled() -> bool:
++    return os.environ.get("HERMES_RANK_MEMO", "1") != "0"
+diff --git a/hermes_state_recency.py b/hermes_state_recency.py
+index 9b73145718..c54637df1f 100644
+--- a/hermes_state_recency.py
++++ b/hermes_state_recency.py
+@@ -40,11 +40,25 @@ from hermes_state_common import _sql_session_last_active, _sql_session_last_acti
+ from hermes_cli.timefmt import EPOCH_MAX
+ 
+ ENABLED = True  # tests flip it to compare against the unrestricted query
++# [daveey] D2: every profile's store must stay resident (the hub serves 11 profiles; an LRU of 8 evicted
++# and rebuilt a store on each fan-out). The routes reserve ``profiles + 4`` (reserve_stores).
+ _MAX_STORES = 8
++_reserved_stores = 0
+ _STORES: "OrderedDict[tuple, _StoreRecency]" = OrderedDict()
+ _STORES_LOCK = threading.Lock()
+ 
+ 
++def reserve_stores(count: int) -> None:
++    """Keep at least ``count`` stores resident for the rest of this process (never shrinks)."""
++    global _reserved_stores
++    with _STORES_LOCK:
++        _reserved_stores = max(_reserved_stores, int(count))
++
++
++def max_stores() -> int:
++    return max(_MAX_STORES, _reserved_stores)
++
++
+ def _msg_max_sql(session_id_expr: str) -> str:
+     # The same probe _sql_freshest_of embeds, so a cached value is the value the exact query reads.
+     return (f"(SELECT MAX(_rc_m.timestamp) FROM messages _rc_m INDEXED BY idx_messages_session"
+@@ -130,6 +144,8 @@ class _StoreRecency:
+         self.watermark: Optional[int] = None  # None: never built
+         self.msg_max: dict[str, Any] = {}
+         self.stale = False
++        from hermes_state_rank_memo import RankMemo
++        self.rank_memo = RankMemo(self.lock)  # [daveey] D2: ranked page ids + previews (same lock)
+ 
+     def probe(self, conn, ids) -> None:
+         ids = list(ids)
+@@ -173,7 +189,7 @@ def _store_for(path: str) -> Optional[_StoreRecency]:
+         if store is None:
+             store = _STORES[key] = _StoreRecency()
+         _STORES.move_to_end(key)
+-        while len(_STORES) > _MAX_STORES:
++        while len(_STORES) > max(_MAX_STORES, _reserved_stores):
+             _STORES.popitem(last=False)
+         return store
+ 
+@@ -229,6 +245,16 @@ def ranked_rows(db, where_clauses: list[str], params: list, select_head: str, pr
+     store = _store_for(path) if ENABLED and path and not (id_needle or search_needle) else None
+     if store is None or limit is None or limit <= 0 or (offset or 0) < 0:
+         return db._read_all(query, query_params)
++    import hermes_state_rank_memo as rank_memo
++    if not offset and rank_memo.enabled():
++        try:
++            return _memo_rows(db, store, rank_memo, where_sql, where_clauses, params, outer_where, id_params,
++                              seed_from, select_head, prompt_join, need)
++        except sqlite3.Error:
++            with store.lock:
++                store.stale = True
++                store.rank_memo._reset()
++            return db._read_all(query, query_params)
+     try:
+         with db._read_ctx() as conn:
+             began = not conn.in_transaction
+@@ -250,3 +276,43 @@ def ranked_rows(db, where_clauses: list[str], params: list, select_head: str, pr
+         with store.lock:
+             store.stale = True
+         return db._read_all(query, query_params)  # reports a real storage fault through its own path
++
++
++def _memo_rows(db, store, rank_memo, where_sql, where_clauses, params, outer_where, id_params, seed_from,
++               select_head, prompt_join, need) -> list:
++    """[daveey] D2: the first page from the store's ranked-id memo (hermes_state_rank_memo), projected in
++    the same snapshot. Same rows and columns as the exact query."""
++    from hermes_state_common import _sql_preview_raw
++    from hermes_state_sessions import _where_sql
++    ids_head = rank_memo._IDS_HEAD
++    key = (where_sql, repr(tuple(params)), seed_from, need)
++
++    def restricted(ids, limit):
++        narrowed = _where_sql([*where_clauses, "s.id IN (SELECT value FROM json_each(?))"])
++        narrowed_params = [*params, json.dumps(ids)]
++        return conn.execute(ranked_query(narrowed, narrowed, seed_from, ids_head, ""),
++                            narrowed_params + narrowed_params + [limit, 0]).fetchall()
++
++    def exact_ids():
++        picked = _candidates(conn, store, where_clauses, params, need)
++        if picked is None:
++            return conn.execute(ranked_query(where_sql, outer_where, seed_from, ids_head, ""),
++                                params + params + id_params + [need, 0]).fetchall()
++        return restricted(picked, need)
++
++    with db._read_ctx() as conn:
++        began = not conn.in_transaction
++        if began:
++            conn.execute("BEGIN")  # one snapshot: the clock, the ranking and the projection
++        try:
++            with store.lock:
++                ids_rows = rank_memo.ranked_ids(conn, store.rank_memo, key, need, exact_ids,
++                                                lambda ids: restricted(ids, -1))
++                generation = store.rank_memo.generation
++            if not ids_rows:
++                return []
++            return rank_memo.project(conn, store.rank_memo, ids_rows, select_head, prompt_join, _sql_preview_raw(),
++                                     _sql_session_last_active("s"), generation)
++        finally:
++            if began and conn.in_transaction:
++                conn.execute("ROLLBACK")
+diff --git a/hermes_state_schema.py b/hermes_state_schema.py
+index f9959078b2..6638637bd8 100644
+--- a/hermes_state_schema.py
++++ b/hermes_state_schema.py
+@@ -33,6 +33,7 @@ from hermes_state_fts import (_drop_orphan_fts_shadow_tables, base_index_recogni
+ from hermes_state_holders import _read_proc_argv
+ from hermes_state_search import _delete_meta, _meta_row
+ from hermes_state_session_change import install_fail_open as install_session_change
++from hermes_state_rank_memo import install_fail_open as install_rank_memo  # [daveey] D2 lowered counter
+ from hermes_state_errors import is_sqlite_lock_error
+ from hermes_state_titles import next_title_in_lineage
+ 
+@@ -1075,6 +1076,7 @@ class SessionSchemaMixin:
+         self._execute_ddl_skipping_settled_triggers(cursor, DEFERRED_INDEX_SQL)  # same ordering constraint (``active``)
+         self._ensure_session_projection(cursor)
+         install_session_change(cursor.connection)
++        install_rank_memo(cursor.connection)
+ 
+         # After DEFERRED_INDEX_SQL: its partial index on ``active IS NULL`` serves the probe.
+         healed = self._heal_null_active_rows(cursor) and healed
+diff --git a/scripts/benchmark_rank_memo.py b/scripts/benchmark_rank_memo.py
+new file mode 100644
+index 0000000000..6d669cc80f
+--- /dev/null
++++ b/scripts/benchmark_rank_memo.py
+@@ -0,0 +1,200 @@
++"""[daveey] D2 benchmark: ranked-id memo vs the exact ranking (design t_01a1d563324d7e8e §3 D2).
++
++Scale: per-request CPU of the 200-row first page at 5k and 23k sessions for an unchanged store (served),
++one mid-turn activity bump and one new message (both re-rank), against the exact path. The memo's growth from
++5k to 23k must stay <= 1.5x (exit 1 otherwise); the exact path grows with the store.
++
++Replay: a Desktop-shaped refresh (sessions page, sidebar recents/cron, project tree) every round, with a hub-like
++write mix between refreshes (heartbeats, message appends, titles, archives, rare rewinds), run against both paths
++on identically seeded stores. Reports CPU per refresh, the ratio and the memo's outcome mix (fallback rate).
++
++    hermes-core-python scripts/benchmark_rank_memo.py [--sizes 5000,23000] [--rounds 60] [--json out.json]
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++import random
++import statistics
++import sys
++import tempfile
++import time
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++sys.path.insert(0, str(ROOT))
++
++import hermes_state_rank_memo as memo
++import hermes_state_recency as recency
++from hermes_state import SessionDB
++
++BASE = 1_700_000_000.0
++PROMPT = "You are a Kanban worker.\n" * 400  # ~10 KB first user message, like the hub's worker prompts
++SLICES = (dict(limit=200, min_message_count=1, include_pinned=True),
++          dict(limit=40, min_message_count=1, exclude_sources=["cron", "telegram"], include_pinned=True),
++          dict(limit=20, min_message_count=1, source="cron"),
++          dict(limit=2000, min_message_count=1))
++
++
++def seed(db: SessionDB, n: int, rng: random.Random) -> list[str]:
++    ids = [f"s{i:06d}" for i in range(n)]
++
++    def write(conn):
++        rows, msgs = [], []
++        for i, sid in enumerate(ids):
++            parent = ids[rng.randrange(0, i)] if i and rng.random() < 0.08 else None
++            ts = BASE + i * 30
++            rows.append((sid, rng.choice(("cli", "cli", "cron", "telegram", "kanban")), ts,
++                         ts + rng.randrange(0, 600), parent, f"title {i}"))
++            for k in range(rng.randrange(1, 4)):
++                msgs.append((sid, "user" if k == 0 else "assistant", PROMPT if k == 0 else "ok", ts + k))
++        conn.executemany("INSERT INTO sessions (id, source, started_at, last_activity_at, message_count,"
++                         " parent_session_id, title) VALUES (?, ?, ?, ?, 1, ?, ?)", rows)
++        conn.executemany("UPDATE sessions SET end_reason = 'compression', ended_at = started_at + 1 WHERE id = ?",
++                         [(r[4],) for r in rows if r[4]])
++        conn.executemany("INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)", msgs)
++    db._execute_write(write)
++    return ids
++
++
++def read(db, **kw):
++    return db.list_sessions_rich(order_by_last_active=True, compact_rows=True, **kw)
++
++
++def _timed(fn) -> float:
++    t = time.thread_time()
++    fn()
++    return (time.thread_time() - t) * 1000
++
++
++def scale(n: int) -> dict:
++    rng = random.Random(n)
++    page = SLICES[0]
++    with tempfile.TemporaryDirectory() as tmp:
++        db = SessionDB(db_path=Path(tmp) / "state.db")
++        try:
++            ids = seed(db, n, rng)
++            recency.clear()
++            recency.ENABLED = False
++            exact = statistics.median(_timed(lambda: read(db, **page)) for _ in range(5))
++            recency.ENABLED = True
++            read(db, **page)
++            served = statistics.median(_timed(lambda: read(db, **page)) for _ in range(5))
++            clock = [BASE + n * 40]
++
++            def heartbeat():
++                clock[0] += 1
++                db._execute_write(lambda c: c.execute("UPDATE sessions SET last_activity_at = ? WHERE id = ?",
++                                                      (clock[0], rng.choice(ids))))
++                return _timed(lambda: read(db, **page))
++
++            def message():
++                db.append_message(session_id=rng.choice(ids), role="assistant", content="tick")
++                return _timed(lambda: read(db, **page))
++
++            hb = statistics.median(heartbeat() for _ in range(9))
++            msg = statistics.median(message() for _ in range(9))
++            return dict(sessions=n, exact_ms=round(exact, 2), served_ms=round(served, 2),
++                        heartbeat_rerank_ms=round(hb, 2), message_rerank_ms=round(msg, 2),
++                        outcomes=dict(memo.OUTCOMES))
++        finally:
++            db.close()
++            recency.clear()
++            memo.OUTCOMES.clear()
++
++
++def replay(n: int, rounds: int, store: str | None = None) -> dict:
++    out: dict = {}
++    for mode in ("exact", "memo"):
++        r = random.Random(99)
++        with tempfile.TemporaryDirectory() as tmp:  # TMPDIR: never beside the live store
++            if store:  # a real store: replay on a consistent private copy (sqlite backup API)
++                import sqlite3
++                src = sqlite3.connect(f"file:{store}?mode=ro", uri=True)
++                dst = sqlite3.connect(Path(tmp) / "state.db")
++                src.backup(dst)
++                src.close()
++                dst.close()
++            db = SessionDB(db_path=Path(tmp) / "state.db")
++            real_enabled = memo.enabled
++            try:
++                if store:
++                    with db._read_ctx() as conn:
++                        ids = [row[0] for row in conn.execute(
++                            "SELECT id FROM sessions ORDER BY started_at DESC LIMIT 4000")][::-1]
++                    n = 0
++                else:
++                    ids = seed(db, n, random.Random(1))
++                recency.clear()
++                memo.OUTCOMES.clear()
++                if mode == "exact":
++                    memo.enabled = lambda: False  # type: ignore[assignment]  # today's exact ranking
++                spent, clock, per_slice = 0.0, BASE + n * 40, {}
++                for _ in range(rounds):
++                    for _ in range(r.randrange(0, 6)):  # writes between two Desktop refreshes
++                        sid = r.choice(ids[-400:]) if r.random() < 0.9 else r.choice(ids)
++                        roll = r.random()
++                        clock += r.random() * 3
++                        if roll < 0.45:
++                            db._execute_write(lambda c: c.execute(
++                                "UPDATE sessions SET last_activity_at = ? WHERE id = ?", (clock, sid)))
++                        elif roll < 0.85:
++                            db.append_message(session_id=sid, role="assistant", content="tick")
++                        elif roll < 0.93:
++                            db._execute_write(lambda c: c.execute(
++                                "UPDATE sessions SET title = ? WHERE id = ?", (f"t{clock}", sid)))
++                        elif roll < 0.97:
++                            db._execute_write(lambda c: c.execute(
++                                "UPDATE sessions SET archived = 1 - archived WHERE id = ?", (sid,)))
++                        else:
++                            db._execute_write(lambda c: c.execute(
++                                "UPDATE messages SET active = 0 WHERE id = (SELECT MAX(id) FROM messages"
++                                " WHERE session_id = ?)", (sid,)))
++                    for i, sl in enumerate(SLICES):
++                        ms = _timed(lambda: read(db, **sl))
++                        spent += ms
++                        per_slice[i] = per_slice.get(i, 0.0) + ms
++                out[mode] = dict(cpu_ms_per_refresh=round(spent / rounds, 2), outcomes=dict(memo.OUTCOMES),
++                                 per_slice_ms={f"limit{SLICES[i]['limit']}": round(v / rounds, 2)
++                                               for i, v in per_slice.items()})
++            finally:
++                memo.enabled = real_enabled  # type: ignore[assignment]
++                db.close()
++                recency.clear()
++    out["ratio"] = round(out["memo"]["cpu_ms_per_refresh"] / out["exact"]["cpu_ms_per_refresh"], 3)
++    total = sum(out["memo"]["outcomes"].values()) or 1
++    out["fallback_rate"] = round(sum(v for k, v in out["memo"]["outcomes"].items()
++                                     if k.startswith("fallback/")) / total, 3)
++    return out
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--sizes", default="5000,23000")
++    ap.add_argument("--rounds", type=int, default=60)
++    ap.add_argument("--replay-size", type=int, default=5000)
++    ap.add_argument("--store", help="replay on a private copy of this real state.db (skips the scale run)")
++    ap.add_argument("--json")
++    a = ap.parse_args()
++    if a.store:
++        result = {"replay": replay(0, a.rounds, a.store)}
++        print(json.dumps(result, indent=1))
++        if a.json:
++            Path(a.json).write_text(json.dumps(result, indent=1))
++        return 0
++    sizes = [int(s) for s in a.sizes.split(",")]
++    result: dict = {"scale": [scale(n) for n in sizes]}
++    lo, hi = result["scale"][0], result["scale"][-1]
++    result["growth"] = {k: round(hi[k] / lo[k], 3) for k in ("exact_ms", "served_ms", "heartbeat_rerank_ms",
++                                                              "message_rerank_ms") if lo[k]}
++    result["replay"] = replay(a.replay_size, a.rounds)
++    print(json.dumps(result, indent=1))
++    if a.json:
++        Path(a.json).write_text(json.dumps(result, indent=1))
++    worst = max(result["growth"].get(k, 0) for k in ("served_ms", "heartbeat_rerank_ms", "message_rerank_ms"))
++    return 0 if worst <= 1.5 else 1
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tests/hermes_state/test_rank_memo.py b/tests/hermes_state/test_rank_memo.py
+new file mode 100644
+index 0000000000..8f758ff8d6
+--- /dev/null
++++ b/tests/hermes_state/test_rank_memo.py
+@@ -0,0 +1,372 @@
++"""Incremental ranked session ids (hermes_state_rank_memo, design t_01a1d563324d7e8e §3 D2).
++
++The session list, the batched sidebar and the project tree share one per-store memo of ranked page ids.
++Between requests only the sessions D1's cursor or the ``messages.id`` watermark name are re-ranked
++(with the previous page and their chain roots); anything that could LOWER a ranked row falls back to the
++exact query. Every test compares against the exact path (``hermes_state_recency.ENABLED = False``).
++"""
++
++import random
++
++import pytest
++
++import hermes_state_rank_memo as memo
++import hermes_state_recency
++from hermes_state import SessionDB
++
++_BASE = 1_700_000_000.0
++
++
++@pytest.fixture
++def db(tmp_path):
++    hermes_state_recency.clear()
++    memo.OUTCOMES.clear()
++    database = SessionDB(db_path=tmp_path / "state.db")
++    try:
++        yield database
++    finally:
++        database.close()
++        hermes_state_recency.clear()
++
++
++def _write(db, sql, params=()):
++    db._execute_write(lambda conn: conn.execute(sql, params))
++
++
++def _seed(db, count, prefix="s"):
++    def seed(conn):
++        conn.executemany(
++            "INSERT INTO sessions (id, source, started_at, last_activity_at, message_count, title)"
++            " VALUES (?, 'cli', ?, ?, 1, ?)",
++            [(f"{prefix}{i:04d}", _BASE + i, _BASE + i + 0.5, f"title {i}") for i in range(count)])
++        conn.executemany("INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, 'user', ?, ?)",
++                         [(f"{prefix}{i:04d}", f"hello {i}", _BASE + i + 0.25) for i in range(count)])
++    db._execute_write(seed)
++
++
++def _page(db, **kwargs):
++    kwargs.setdefault("limit", 10)
++    return db.list_sessions_rich(order_by_last_active=True, compact_rows=True, min_message_count=1, **kwargs)
++
++
++def _exact(db, monkeypatch, **kwargs):
++    monkeypatch.setattr(hermes_state_recency, "ENABLED", False)
++    try:
++        return _page(db, **kwargs)
++    finally:
++        monkeypatch.setattr(hermes_state_recency, "ENABLED", True)
++
++
++def _ids(rows):
++    return [r["id"] for r in rows]
++
++
++def _outcome(fn):
++    before = memo.OUTCOMES.copy()
++    out = fn()
++    delta = memo.OUTCOMES - before
++    assert sum(delta.values()) >= 1, "the memo path did not run"
++    return out, delta
++
++
++def test_unchanged_store_serves_the_memo_without_ranking(db, monkeypatch):
++    _seed(db, 40)
++    first, delta = _outcome(lambda: _page(db))
++    assert set(delta) == {"fallback/no_entry"}
++    second, delta = _outcome(lambda: _page(db))
++    assert set(delta) == {"served"}
++    assert second == first == _exact(db, monkeypatch)
++
++
++def test_mid_turn_activity_with_no_message_reorders_the_page(db, monkeypatch):
++    _seed(db, 40)
++    _page(db)
++    # touch_session_activity's mid-turn heartbeat: last_activity_at moves, no message lands
++    _write(db, "UPDATE sessions SET last_activity_at = ? WHERE id = 's0003'", (_BASE + 10_000,))
++    rows, delta = _outcome(lambda: _page(db))
++    assert set(delta) == {"reranked"}
++    assert _ids(rows)[0] == "s0003"
++    assert rows == _exact(db, monkeypatch)
++
++
++def test_new_message_reorders_through_the_watermark(db, monkeypatch):
++    _seed(db, 40)
++    _page(db)
++    _write(db, "INSERT INTO messages (session_id, role, content, timestamp) VALUES ('s0005', 'user', 'new', ?)",
++           (_BASE + 20_000,))
++    rows, delta = _outcome(lambda: _page(db))
++    assert set(delta) == {"reranked"}
++    assert _ids(rows)[0] == "s0005"
++    assert rows == _exact(db, monkeypatch)
++
++
++def test_a_new_continuation_lifts_its_root(db, monkeypatch):
++    _seed(db, 40)
++    _page(db)
++
++    def continue_root(conn):
++        conn.execute("UPDATE sessions SET end_reason = 'compression', ended_at = ? WHERE id = 's0002'",
++                     (_BASE + 30,))
++        conn.execute("INSERT INTO sessions (id, source, started_at, last_activity_at, message_count,"
++                     " parent_session_id) VALUES ('tip', 'cli', ?, ?, 1, 's0002')",
++                     (_BASE + 50_000, _BASE + 50_000))
++        conn.execute("INSERT INTO messages (session_id, role, content, timestamp) VALUES ('tip', 'user', 'go', ?)",
++                     (_BASE + 50_001,))
++    db._execute_write(continue_root)
++    for project in (True, False):
++        rows, delta = _outcome(lambda: _page(db, project_compression_tips=project))
++        assert "reranked" in delta or "served" in delta, delta
++        assert rows == _exact(db, monkeypatch, project_compression_tips=project)
++    assert _ids(_page(db, project_compression_tips=False))[0] == "s0002"
++
++
++def test_archiving_a_page_row_falls_back(db, monkeypatch):
++    _seed(db, 40)
++    assert "s0039" in _ids(_page(db))
++    _write(db, "UPDATE sessions SET archived = 1 WHERE id = 's0039'")
++    rows, delta = _outcome(lambda: _page(db))
++    assert set(delta) == {"fallback/removed"}
++    assert "s0039" not in _ids(rows)
++    assert rows == _exact(db, monkeypatch)
++
++
++def test_a_title_change_on_a_page_row_is_projected(db, monkeypatch):
++    _seed(db, 40)
++    _page(db)
++    _write(db, "UPDATE sessions SET title = 'renamed' WHERE id = 's0035'")
++    rows, delta = _outcome(lambda: _page(db))
++    assert set(delta) == {"reranked"}
++    assert {r["id"]: r["title"] for r in rows}["s0035"] == "renamed"
++    assert rows == _exact(db, monkeypatch)
++
++
++def test_a_session_delete_falls_back(db, monkeypatch):
++    _seed(db, 40)
++    _page(db)
++    db.delete_session("s0038")
++    rows, delta = _outcome(lambda: _page(db))
++    # delete_session removes the transcript first, so the lowered counter (C9) trips before the page check
++    assert set(delta) == {"fallback/lowered"}
++    assert "s0038" not in _ids(rows)
++    assert rows == _exact(db, monkeypatch)
++
++
++def test_a_session_row_removed_without_its_messages_falls_back(db, monkeypatch):
++    _seed(db, 40)
++    _write(db, "INSERT INTO sessions (id, source, started_at, last_activity_at, message_count)"
++               " VALUES ('bare', 'cli', ?, ?, 1)", (_BASE + 900, _BASE + 900))
++    assert "bare" in _ids(_page(db))
++    _write(db, "DELETE FROM sessions WHERE id = 'bare'")
++    rows, delta = _outcome(lambda: _page(db))
++    assert set(delta) == {"fallback/removed"}
++    assert rows == _exact(db, monkeypatch)
++
++
++def test_a_message_delete_falls_back(db, monkeypatch):
++    _seed(db, 40)
++    _write(db, "INSERT INTO messages (session_id, role, content, timestamp) VALUES ('s0001', 'user', 'x', ?)",
++           (_BASE + 90_000,))
++    assert _ids(_page(db))[0] == "s0001"
++    _write(db, "DELETE FROM messages WHERE session_id = 's0001' AND content = 'x'")
++    rows, delta = _outcome(lambda: _page(db))
++    assert set(delta) == {"fallback/lowered"}
++    assert "s0001" not in _ids(rows)
++    assert rows == _exact(db, monkeypatch)
++
++
++def test_a_message_rewind_falls_back(db, monkeypatch):
++    _seed(db, 40)
++    _page(db)
++    # rewind_in_transaction's model-side soft delete (hermes_state_mutation_transcript)
++    _write(db, "UPDATE messages SET active = 0 WHERE session_id = 's0039'")
++    rows, delta = _outcome(lambda: _page(db))
++    assert set(delta) == {"fallback/lowered"}
++    assert rows == _exact(db, monkeypatch)
++
++
++def test_a_session_lowered_in_rank_falls_back(db, monkeypatch):
++    _seed(db, 40)
++    _page(db)
++    _write(db, "UPDATE sessions SET last_activity_at = ?, started_at = ? WHERE id = 's0039'", (_BASE, _BASE))
++    rows, delta = _outcome(lambda: _page(db))
++    assert set(delta) == {"fallback/rank_lowered"}
++    assert rows == _exact(db, monkeypatch)
++
++
++def test_params_change_starts_a_new_entry(db, monkeypatch):
++    _seed(db, 40)
++    _page(db)
++    rows, delta = _outcome(lambda: _page(db, exclude_sources=["cron"]))
++    assert set(delta) == {"fallback/no_entry"}
++    assert rows == _exact(db, monkeypatch, exclude_sources=["cron"])
++
++
++def test_untrusted_cursor_falls_back(db, monkeypatch):
++    _seed(db, 40)
++    _page(db)
++
++    def drop(conn):
++        import hermes_state_session_change as sc
++        sc.drop_triggers(conn)
++    db._execute_write(drop)
++    _write(db, "UPDATE sessions SET last_activity_at = ? WHERE id = 's0003'", (_BASE + 10_000,))
++    rows, delta = _outcome(lambda: _page(db))
++    assert set(delta) == {"fallback/untrusted"}
++    assert rows == _exact(db, monkeypatch)
++
++
++def test_missing_lowered_trigger_is_untrusted(db, monkeypatch):
++    _seed(db, 40)
++    _page(db)
++    _write(db, f"DROP TRIGGER {memo.PREFIX}messages_delete")
++    _write(db, "DELETE FROM messages WHERE session_id = 's0039'")
++    rows, delta = _outcome(lambda: _page(db))
++    assert set(delta) == {"fallback/untrusted"}
++    assert rows == _exact(db, monkeypatch)
++
++
++# ── preview cache: exact, or not used ─────────────────────────────────────────
++
++def test_preview_follows_a_hidden_flag_a_redaction_and_a_first_message(db, monkeypatch):
++    _seed(db, 20)
++    _write(db, "INSERT INTO sessions (id, source, started_at, last_activity_at, message_count)"
++               " VALUES ('empty', 'cli', ?, ?, 1)", (_BASE + 500, _BASE + 500))
++    _page(db)
++    _page(db)  # the second read serves every preview from the cache
++    first = {r["id"]: r["preview"] for r in _page(db)}
++    assert first["s0019"] == "hello 19" and first["empty"] == ""
++    _write(db, "UPDATE messages SET content = 'redacted' WHERE session_id = 's0019'")
++    _write(db, "INSERT INTO messages (session_id, role, content, timestamp) VALUES ('s0018', 'user', 'later', ?)",
++           (_BASE + 18.5,))
++    _write(db, "UPDATE messages SET display_kind = 'hidden' WHERE session_id = 's0018' AND content = 'hello 18'")
++    _write(db, "INSERT INTO messages (session_id, role, content, timestamp) VALUES ('empty', 'user', 'first!', ?)",
++           (_BASE + 501,))
++    rows = _page(db)
++    got = {r["id"]: r["preview"] for r in rows}
++    assert (got["s0019"], got["s0018"], got["empty"]) == ("redacted", "later", "first!")
++    assert rows == _exact(db, monkeypatch)
++
++
++def test_a_stale_snapshot_never_installs_a_preview(db):
++    _seed(db, 5)
++    _page(db)
++    store = next(iter(hermes_state_recency._STORES.values()))
++    gen = store.rank_memo.generation
++    store.rank_memo.advance_for_test()  # another reader moved the clock after this one read
++    store.rank_memo.install_previews(gen, {"s0001": (0, "stale")})
++    assert "s0001" not in store.rank_memo.previews or store.rank_memo.previews["s0001"][1] != "stale"
++
++
++def test_preview_cache_is_off_without_the_display_revision_trigger(db, monkeypatch):
++    _seed(db, 10)
++    _page(db)
++    _page(db)
++    _write(db, "DROP TRIGGER messages_display_revision_update")
++    _write(db, "UPDATE messages SET display_kind = 'hidden' WHERE session_id = 's0009'")
++    rows = _page(db)
++    assert {r["id"]: r["preview"] for r in rows}["s0009"] == ""
++    assert rows == _exact(db, monkeypatch)
++
++
++# ── the store LRU holds every profile ─────────────────────────────────────────
++
++def test_store_capacity_covers_every_profile():
++    hermes_state_recency.reserve_stores(11 + 4)
++    assert hermes_state_recency.max_stores() >= 15
++    hermes_state_recency.reserve_stores(2)
++    assert hermes_state_recency.max_stores() >= 15  # never shrinks below a reservation this process made
++
++
++# ── randomized equivalence ────────────────────────────────────────────────────
++
++def _mutate(db, rng, ids):
++    sid = rng.choice(ids)
++    roll = rng.random()
++    ts = _BASE + rng.randrange(0, 6000) + rng.choice((0, 0.5))
++    if roll < 0.3:
++        _write(db, "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, 'user', ?, ?)",
++               (sid, f"m{rng.random()}", ts))
++    elif roll < 0.45:
++        _write(db, "UPDATE sessions SET last_activity_at = ? WHERE id = ?", (ts, sid))
++    elif roll < 0.5:
++        _write(db, "UPDATE sessions SET title = ? WHERE id = ?", (f"t{rng.random()}", sid))
++    elif roll < 0.55:
++        _write(db, "UPDATE sessions SET archived = ? WHERE id = ?", (rng.randrange(0, 2), sid))
++    elif roll < 0.6:
++        _write(db, "DELETE FROM messages WHERE id = (SELECT MAX(id) FROM messages WHERE session_id = ?)", (sid,))
++    elif roll < 0.65:
++        _write(db, "UPDATE sessions SET end_reason = ?, ended_at = ? WHERE id = ?",
++               (rng.choice(("compression", None, "branched")), _BASE + 1, sid))
++    elif roll < 0.72:
++        new = f"c{rng.randrange(10**9)}"
++        ids.append(new)
++        _write(db, "INSERT INTO sessions (id, source, started_at, last_activity_at, message_count, parent_session_id)"
++                   " VALUES (?, ?, ?, ?, 1, ?)", (new, rng.choice(("cli", "cron")), ts, ts, sid))
++    elif roll < 0.76:
++        _write(db, "UPDATE sessions SET source = ? WHERE id = ?", (rng.choice(("cli", "cron", "telegram")), sid))
++    elif roll < 0.8:
++        _write(db, "UPDATE sessions SET message_count = ? WHERE id = ?", (rng.randrange(0, 3), sid))
++    elif roll < 0.84:
++        _write(db, "UPDATE messages SET active = 0 WHERE id = (SELECT MAX(id) FROM messages WHERE session_id = ?)",
++               (sid,))
++    elif roll < 0.88:
++        _write(db, "UPDATE sessions SET started_at = ? WHERE id = ?", (ts, sid))
++    elif roll < 0.9:
++        def drop(conn):
++            if conn.execute("SELECT 1 FROM sessions WHERE parent_session_id = ?", (sid,)).fetchone():
++                return
++            conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
++            conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
++        db._execute_write(drop)
++    else:
++        _write(db, "UPDATE messages SET display_kind = ? WHERE id = (SELECT MIN(id) FROM messages WHERE"
++                   " session_id = ?)", (rng.choice(("hidden", None)), sid))
++
++
++@pytest.mark.parametrize("seed", range(6))
++def test_memo_pages_match_the_exact_ranking_through_writes(db, monkeypatch, seed):
++    rng = random.Random(seed)
++    ids = [f"r{i:03d}" for i in range(90)]
++
++    def seed_store(conn):
++        for i, sid in enumerate(ids):
++            parent = ids[rng.randrange(0, i)] if i and rng.random() < 0.2 else None
++            if parent:
++                conn.execute("UPDATE sessions SET end_reason = 'compression', ended_at = ? WHERE id = ?",
++                             (_BASE + 1, parent))
++            ts = _BASE + rng.randrange(0, 5000)
++            conn.execute("INSERT INTO sessions (id, source, started_at, last_activity_at, message_count,"
++                         " parent_session_id) VALUES (?, ?, ?, ?, ?, ?)",
++                         (sid, rng.choice(("cli", "cli", "cron")), ts,
++                          rng.choice((None, ts + rng.randrange(0, 900))), rng.randrange(0, 3), parent))
++            for _ in range(rng.randrange(0, 3)):
++                conn.execute("INSERT INTO messages (session_id, role, content, timestamp)"
++                             " VALUES (?, 'user', ?, ?)", (sid, f"x{rng.random()}", ts + rng.randrange(0, 900)))
++    db._execute_write(seed_store)
++    shapes = [dict(limit=5), dict(limit=25), dict(limit=200), dict(limit=10, exclude_sources=["cron"]),
++              dict(limit=12, include_pinned=True), dict(limit=8, project_compression_tips=False)]
++    for _ in range(25):
++        for shape in shapes:
++            fast = _page(db, **shape)
++            assert fast == _exact(db, monkeypatch, **shape), (seed, shape)
++        for _ in range(rng.randrange(1, 4)):
++            _mutate(db, rng, ids)
++    assert memo.OUTCOMES["reranked"] + memo.OUTCOMES["served"] > 0
++
++
++# ── the SUBSTR-first preview window equals the replace-first one ──────────────
++
++def test_preview_window_equals_replacing_the_whole_content_first():
++    import sqlite3
++
++    from hermes_state_common import _PREVIEW_CONTENT_SQL, _sql_preview_window
++    rng = random.Random(7)
++    alphabet = ["a", "\n", "\r", " ", "é", "😀", "\r\n", "z", "\t"]
++    conn = sqlite3.connect(":memory:")
++    conn.execute("CREATE TABLE m (content TEXT)")
++    for _ in range(300):
++        conn.execute("INSERT INTO m VALUES (?)", ("".join(rng.choice(alphabet) for _ in range(rng.randrange(0, 400))),))
++    for start, length in ((1, 63), (1, 1), (1, 500), (-200, None), (-1, None), (5, 3)):
++        old = f"SUBSTR({_PREVIEW_CONTENT_SQL}, {start}" + (f", {length})" if length else ")")
++        new = _sql_preview_window(start, length)
++        assert conn.execute(f"SELECT COUNT(*) FROM m WHERE {old} IS NOT {new}").fetchone()[0] == 0, (start, length)
+-- 
+2.43.0
+

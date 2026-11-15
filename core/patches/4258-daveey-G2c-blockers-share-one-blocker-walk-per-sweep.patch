@@ -1,0 +1,1316 @@
+From d159b46dc6658edb3178548413fbd22d73c85e5c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 18:06:23 +0000
+Subject: [PATCH] [daveey] G2c-blockers: share one blocker walk per sweep pass
+ + per-task decoded-run cache
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+sweep_shared_blockers derived blocker_states three times per pass (once per lane), each walking ~1.4k runs of
+every task that asserted in the 14-day lookback with ~225 SQL statements. On the hub's busy default board the
+revision gates miss nearly every tick, so this cost was paid on every dirty tick (design t_01a1d563324d7e8e
+§1 option 1, §2 P2, R13; card t_01a1db0791738a4f under G2b t_01a1d701bfd0abb6).
+
+- hermes_cli/kanban_blocker_rows.py (new): per-board-file cache of each asserting task's decoded own rows (run
+  tuples with effect/bid/epochs/explicit-clear flag, the assertion-scan rows with provider/model/lane/reason/uid,
+  and the task status). Refreshed with kanban_task_change.changed_since in one BEGIN..COMMIT snapshot; FULL on
+  an untrusted cursor (R7), an alias-snapshot change, or a caller window earlier than the fill cutoff. Never
+  stored from inside a caller transaction or with a None cursor; swapped immutably under a lock with a
+  never-backwards compare. Memory bounded to tasks with an in-window assertion. The window, walk, routes,
+  condition_met evidence (live: heartbeats move its MAX(id) without marking), check clears and the fence
+  rerun every call.
+- blocker_states: the walk (_walk) runs on those rows and is shared by the lanes of one pass via
+  kanban_blocker_inputs.read, keyed with the commit counters, file identity, alias snapshot and the set of
+  in-window assertion run ids; each consumer gets a deep copy and applies check clears and the fence itself.
+  The kanban_blocker_inputs docstring rule now reads: derived BlockerState is retained only within one pass
+  under that key, never across passes (G2b owner sign-off on the card).
+- _read_assertion_tokens and the quota fence read the decoded rows (same cohort and identity formulas) instead of
+  re-querying and re-decoding every assertion row; the fence's per-row run_identity query becomes the row's uid.
+- The three lanes ask foreign_among(conn, behind ids) (primary-key reads of only the parked cards) instead of
+  kanban_wake_check.foreign_ids, a full tasks scan whose memo misses on every dirty tick.
+- scripts/kanban_reclaim_replay_bench.py: --blockers N dirty-tick sweep_shared_blockers case.
+
+Bench (hub, copy of the default board, t01a1d701_dirty.py, N=11, same script and copy):
+  sweep_shared_blockers dirty median 38.68-40.74 ms before (deployed 854519ff) -> 4.96-5.41 ms after.
+  kanban_reclaim_replay_bench.py --blockers 15: 40.77 ms -> 4.51 ms median.
+  t01a1d701_blk.py lanes: states 13.5 -> 1.8, checks 12.3 -> 2.7, release 11.7 -> 1.9, probe 13.7 -> 2.4,
+  sweep 31.9 -> 4.4 ms.
+
+Tests: tests/hermes_cli/test_kanban_blocker_rows.py compares cached against cold derivations (cross-task write,
+window exit with no write, earlier caller now, alias change, equal ended_at tie by run id, late heartbeat after
+condition_met, txn write+rollback+rev reuse, FULL_MARK/file replace/shm/task delete, two-thread race, CAS,
+randomized write sequences, walk sharing and lane-write invalidation, window-keyed walk, held-set bound);
+12 targeted mutants of the cache and walk are each killed.
+---
+ hermes_cli/kanban_blocker_inputs.py           |   6 +-
+ hermes_cli/kanban_blocker_rows.py             | 313 +++++++++++++
+ hermes_cli/kanban_idle_candidates.py          |   5 +-
+ hermes_cli/kanban_shared_blocker_checks.py    |  36 +-
+ hermes_cli/kanban_shared_blocker_fence.py     |  13 +-
+ hermes_cli/kanban_shared_blockers.py          | 112 ++---
+ scripts/kanban_reclaim_replay_bench.py        |  24 +-
+ .../test_kanban_blocker_input_config.py       |   5 +-
+ .../hermes_cli/test_kanban_blocker_inputs.py  |  14 +-
+ tests/hermes_cli/test_kanban_blocker_rows.py  | 416 ++++++++++++++++++
+ .../test_kanban_shared_blocker_check_edges.py |  24 +-
+ .../test_kanban_shared_blocker_checks.py      |  12 +-
+ 12 files changed, 884 insertions(+), 96 deletions(-)
+ create mode 100644 hermes_cli/kanban_blocker_rows.py
+ create mode 100644 tests/hermes_cli/test_kanban_blocker_rows.py
+
+diff --git a/hermes_cli/kanban_blocker_inputs.py b/hermes_cli/kanban_blocker_inputs.py
+index 4052a51e99..71c681853b 100644
+--- a/hermes_cli/kanban_blocker_inputs.py
++++ b/hermes_cli/kanban_blocker_inputs.py
+@@ -1,7 +1,9 @@
+ """Call-scoped, validated input reuse for shared-blocker derivation.
+ 
+-Never retain derived BlockerState or a transaction across a shell probe. Values
+-are privately copied; a caller cannot mutate a later consumer's observations.
++Never retain a transaction across a shell probe. Derived BlockerState is retained only within one pass, under
++``read``'s key (G2c: the ``blocker_states`` walk before check clears and the fence, keyed with the in-window
++assertion run ids), never across passes. Values are privately copied; a caller cannot mutate a later consumer's
++observations.
+ """
+ from __future__ import annotations
+ 
+diff --git a/hermes_cli/kanban_blocker_rows.py b/hermes_cli/kanban_blocker_rows.py
+new file mode 100644
+index 0000000000..be76bb0f54
+--- /dev/null
++++ b/hermes_cli/kanban_blocker_rows.py
+@@ -0,0 +1,313 @@
++"""Per-task decoded own-row inputs of ``blocker_states`` (G2c, P2 cache). [daveey]
++
++``blocker_states`` walks the run history of every task that asserted a shared blocker in the 14-day lookback: on the
++hub board ~1.4k runs of ~100 tasks, two SQL statements and a metadata decode per task, three times a sweep pass. Each
++task's slice of those inputs (its runs decoded into :class:`Run` tuples, the asserting rows the fence and window exit
++read, and its status) is a pure function of that task's own rows plus the shared-blocker alias snapshot, so it is kept
++across passes per board file and re-read only for the tasks ``kanban_task_change.changed_since`` names.
++
++What is cached, and what is not:
++
++- cached per task: run id, outcome, started/ended epochs, the run's effect and blocker id, the explicit-clear flag,
++  whether its metadata matches the assertion scan's ``LIKE``, and for those rows the asserting-row fields (provider,
++  model and lane text, first summary line); the task's status. An alias change re-reads everything (``FULL``);
++- never cached: the window (callers pass different ``now``), the global walk, ``states`` membership and
++  ``blocker_provider``, route reads, condition_met evidence, ``apply_check_clears`` and the fences. No time or
++  liveness decision is cached.
++
++Window: the cache holds every task with a matching run that ended at or after its fill cutoff (``now - lookback`` at
++the fill). A caller whose ``now - lookback`` is earlier than that cutoff gets a full read, so a held set is always a
++superset of any window it answers. The cutoff is refreshed by a full read once it trails by more than
++:data:`REFILL_SECONDS`, which bounds memory to tasks with recent assertions.
++
++Snapshot: ``BEGIN; changed_since; reads; COMMIT`` on the caller's connection, so the cursor and the rows come from one
++snapshot. A connection already inside a transaction (a caller's write or read transaction) reads afresh and never
++stores. ``FULL`` follows the trust rules of ``changed_since`` (R7); a ``None`` cursor is never stored. The
++``(cursor, tasks)`` pair is swapped immutably under a lock and never moves backwards on the same file.
++"""
++from __future__ import annotations
++
++import sqlite3
++import threading
++from copy import deepcopy
++from dataclasses import dataclass
++from typing import TYPE_CHECKING, Mapping, NamedTuple, Optional
++
++if TYPE_CHECKING:
++    from hermes_cli.kanban_task_change import Cursor
++
++ASSERT_LIKE = "metadata LIKE '%\"blocker_id\"%'"
++# The fill cutoff trails ``now - lookback`` by at most this much before a full read drops tasks whose assertions
++# all left every window a later caller can ask about.
++REFILL_SECONDS = 6 * 3600
++_MAX_FILES = 16
++_CHUNK = 400
++
++
++class AssertRow:
++    """One run whose metadata matches the assertion scan, in the row shape ``_note_window_exit`` and the fence
++    read (``row["ended_at"]`` ...). Immutable, so lanes share it without copying."""
++
++    __slots__ = (
++        "bid",
++        "effect",
++        "ended",
++        "ended_at",
++        "id",
++        "lane",
++        "metadata",
++        "model",
++        "outcome",
++        "provider",
++        "reason",
++        "started",
++        "started_at",
++        "summary",
++        "task_id",
++        "uid",
++    )
++    _KEYS = ("id", "task_id", "started_at", "ended_at", "outcome", "metadata", "summary")
++
++    def __init__(self, **values):
++        for name in self.__slots__:
++            object.__setattr__(self, name, values[name])
++
++    def __setattr__(self, name, value):
++        raise AttributeError("AssertRow is immutable")
++
++    def __getitem__(self, key):
++        if key not in self._KEYS:
++            raise KeyError(key)
++        return getattr(self, key)
++
++    def keys(self):
++        return self._KEYS
++
++    def __copy__(self):
++        return self
++
++    def __deepcopy__(self, memo):
++        return self
++
++    def __repr__(self) -> str:
++        return f"AssertRow(id={self.id}, task_id={self.task_id!r}, ended_at={self.ended_at!r})"
++
++
++class Run(NamedTuple):
++    id: int
++    outcome: Optional[str]
++    started: int            # epoch, 0 when unset
++    ended_raw: object       # the stored ended_at (None while the run is open)
++    ended: int              # epoch, 0 when unset
++    effect: str
++    bid: Optional[str]
++    explicit_clear: bool    # the run's ``clear_blocker`` attestation (``_explicit_clear``)
++    assert_row: Optional[AssertRow]   # set when the metadata matches the assertion scan and the run ended
++
++
++class TaskRows(NamedTuple):
++    status: Optional[str]   # None: the task row is gone
++    runs: tuple[Run, ...]
++
++
++class Frozen(tuple):
++    """A tuple that deep-copies to itself (its members are immutable)."""
++
++    def __deepcopy__(self, memo):
++        return self
++
++
++def foreign_among(conn, ids) -> frozenset[str]:
++    """The ids in ``ids`` that ``kanban_wake_check.foreign_ids`` would name (cards another gateway created).
++
++    G2c: the blocker lanes only ask about the cards parked behind a wall. ``foreign_ids`` scans all of ``tasks``
++    and its memo is keyed on the content revision a dirty tick moves, so each lane paid a full scan (~2 ms on the
++    hub board); this reads only the asked rows by primary key, in the caller's snapshot."""
++    from hermes_cli import kanban_wake_check as kwc
++
++    ids = sorted(set(ids))
++    own = kwc.own_gateway(conn) if ids else None
++    if not own:
++        return frozenset()
++    out: set[str] = set()
++    try:
++        for i in range(0, len(ids), _CHUNK):
++            part = ids[i:i + _CHUNK]
++            marks = ",".join("?" * len(part))
++            out.update(r[0] for r in conn.execute(
++                f"SELECT id FROM tasks WHERE id IN ({marks}) AND created_on IS NOT NULL AND created_on != ?",
++                (*part, own)))
++    except sqlite3.OperationalError:   # no sync columns: like ``foreign_ids``, nothing is foreign
++        return frozenset()
++    return frozenset(out)
++
++
++@dataclass(frozen=True)
++class _State:
++    cursor: Cursor
++    aliases: object
++    cutoff: int
++    tasks: Mapping[str, TaskRows]
++
++
++_LOCK = threading.Lock()
++_STATES: dict[str, _State] = {}
++
++
++def _lookback() -> int:
++    from hermes_cli.kanban_shared_blockers import _LOOKBACK_SECONDS
++    return _LOOKBACK_SECONDS
++
++
++def sql_ge(value, bound: int) -> bool:
++    """SQLite's ``value >= bound`` for an integer bound: text and blobs sort after every number."""
++    if value is None:
++        return False
++    if isinstance(value, (int, float)):
++        return value >= bound
++    return True
++
++
++def _alias_snapshot():
++    """The pass's alias snapshot (what ``normalize_blocker_id`` decodes with), or None when unknown."""
++    from hermes_cli.config_backend import ConfigBackendUnavailable
++    from hermes_cli.kanban_blocker_inputs import _aliases, config
++    try:
++        return deepcopy(_aliases(config()))
++    except ConfigBackendUnavailable:
++        return None
++
++
++def _decode(rows, statuses: Mapping[str, Optional[str]]) -> dict[str, TaskRows]:
++    """``rows``: (id, task_id, started_at, ended_at, outcome, metadata, summary, uid, matches) ordered by task, id."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_shared_blockers import _explicit_clear, run_effect
++
++    out: dict[str, list] = {}
++    for rid, tid, started_at, ended_at, outcome, metadata, summary, uid, matches in rows:
++        effect, bid = run_effect(outcome, metadata)
++        explicit = _explicit_clear(kb, metadata)
++        started = kb._to_epoch(started_at) or 0
++        ended = (kb._to_epoch(ended_at) or 0) if ended_at is not None else 0
++        arow = None
++        if matches and ended_at is not None:
++            meta = kb._json_dict(metadata)
++            provider = meta.get("blocker_provider")
++            model, lane = meta.get("blocker_model"), meta.get("blocker_lane")
++            arow = AssertRow(
++                id=int(rid), task_id=tid, started_at=started_at, ended_at=ended_at, outcome=outcome,
++                metadata=metadata, summary=summary, uid=uid, effect=effect, bid=bid, started=started, ended=ended,
++                provider=provider if isinstance(provider, str) else None,
++                model=model.strip() or None if isinstance(model, str) else None,
++                lane=lane.strip() or None if isinstance(lane, str) else None,
++                reason=kb._first_line(summary, 300))
++        out.setdefault(tid, []).append(Run(int(rid), outcome, started, ended_at, ended, effect, bid, explicit, arow))
++    return {tid: TaskRows(statuses.get(tid), tuple(runs)) for tid, runs in out.items()}
++
++
++_HELD_SQL = f"SELECT task_id FROM task_runs WHERE ended_at IS NOT NULL AND ended_at >= ? AND {ASSERT_LIKE}"
++
++
++def _run_cols(conn) -> str:
++    # Legacy unsynced schemas have no run uid (``kanban_shared_blocker_checks``: task/time identity instead).
++    uid = "uid" if any(r[1] == "uid" for r in conn.execute("PRAGMA table_info(task_runs)")) else "NULL AS uid"
++    return f"id, task_id, started_at, ended_at, outcome, metadata, summary, {uid}, {ASSERT_LIKE} AS m"
++
++
++def _read_all(conn, cutoff: int) -> dict[str, TaskRows]:
++    rows = conn.execute(f"SELECT {_run_cols(conn)} FROM task_runs WHERE task_id IN ({_HELD_SQL}) "
++                        "ORDER BY task_id, id", (cutoff,)).fetchall()
++    statuses = dict(conn.execute(f"SELECT id, status FROM tasks WHERE id IN ({_HELD_SQL})", (cutoff,)).fetchall())
++    return _decode(rows, statuses)
++
++
++def _read_tasks(conn, ids) -> dict[str, TaskRows]:
++    ids = sorted(ids)
++    cols = _run_cols(conn)
++    rows: list = []
++    statuses: dict = {}
++    for i in range(0, len(ids), _CHUNK):
++        part = ids[i:i + _CHUNK]
++        marks = ",".join("?" * len(part))
++        rows += conn.execute(f"SELECT {cols} FROM task_runs WHERE task_id IN ({marks}) ORDER BY task_id, id",
++                             part).fetchall()
++        statuses.update(conn.execute(f"SELECT id, status FROM tasks WHERE id IN ({marks})", part).fetchall())
++    return _decode(rows, statuses)
++
++
++def _held(entry: TaskRows, cutoff: int) -> bool:
++    return any(r.assert_row is not None and sql_ge(r.ended_raw, cutoff) for r in entry.runs)
++
++
++def _main_path(conn) -> Optional[str]:
++    for _seq, name, file in conn.execute("PRAGMA database_list"):
++        if name == "main":
++            return file or None
++    return None
++
++
++def _store(path: str, new: _State) -> None:
++    with _LOCK:
++        old = _STATES.get(path)
++        if old is not None:
++            a, b = old.cursor, new.cursor
++            same = (a.dev, a.ino, a.shm, a.schema_version) == (b.dev, b.ino, b.shm, b.schema_version)
++            if same and b.revision < a.revision:
++                return  # a slower reader of an older snapshot: never move backwards
++        elif len(_STATES) >= _MAX_FILES:
++            _STATES.pop(next(iter(_STATES)))
++        _STATES[path] = new
++
++
++def task_rows(conn, now: int, *, cache: bool = True) -> Mapping[str, TaskRows]:
++    """Decoded rows of every task with a matching run ended at or after ``now - lookback`` (possibly more)."""
++    from hermes_cli.kanban_task_change import changed_since
++
++    cutoff = int(now) - _lookback()
++    aliases = _alias_snapshot() if cache else None
++    if not cache or aliases is None or conn.in_transaction:
++        return _read_all(conn, cutoff)
++    path = _main_path(conn)
++    if path is None:
++        return _read_all(conn, cutoff)
++    with _LOCK:
++        held = _STATES.get(path)
++    if held is not None and (held.aliases != aliases or cutoff < held.cutoff
++                             or cutoff - held.cutoff > REFILL_SECONDS):
++        held = None
++    conn.execute("BEGIN")
++    try:
++        changed, cursor = changed_since(conn, held.cursor if held is not None else None)
++        if held is None or not isinstance(changed, frozenset):  # FULL
++            tasks, fill = _read_all(conn, cutoff), cutoff
++        else:
++            fill = held.cutoff
++            tasks = dict(held.tasks)
++            if changed:
++                fresh = _read_tasks(conn, changed)
++                for tid in changed:
++                    entry = fresh.get(tid)
++                    if entry is not None and _held(entry, fill):
++                        tasks[tid] = entry
++                    else:
++                        tasks.pop(tid, None)
++    finally:
++        conn.execute("COMMIT")
++    if cursor is not None:
++        _store(path, _State(cursor, aliases, fill, tasks))
++    return tasks
++
++
++def inputs(conn, now: int, *, cache: bool = True) -> tuple[Frozen, Mapping[str, TaskRows]]:
++    """``(asserting rows in the window sorted by run id, task rows)``: the in-window slice of the assertion scan
++    (``ended_at >= now - lookback`` and the metadata ``LIKE``), rebuilt every call from the held rows."""
++    tasks = task_rows(conn, now, cache=cache)
++    bound = int(now) - _lookback()
++    asserting = sorted((r.assert_row for entry in tasks.values() for r in entry.runs
++                        if r.assert_row is not None and sql_ge(r.ended_raw, bound)), key=lambda a: a.id)
++    return Frozen(asserting), tasks
++
++
++def _reset_for_tests() -> None:
++    with _LOCK:
++        _STATES.clear()
+diff --git a/hermes_cli/kanban_idle_candidates.py b/hermes_cli/kanban_idle_candidates.py
+index 0acf9f71d2..6f14d4bbde 100644
+--- a/hermes_cli/kanban_idle_candidates.py
++++ b/hermes_cli/kanban_idle_candidates.py
+@@ -64,8 +64,9 @@ def sweep_shared_blockers(conn, result) -> None:
+     """Skip proven-empty lanes; positive candidates still obey time-based policy.
+ 
+     G2b: the three lanes share one blocker-input scope (``kanban_blocker_inputs``): a lane's write, a
+-    peer's commit or a config alias change still invalidates every retained input, and no derived
+-    ``BlockerState`` is shared.
++    peer's commit or a config alias change still invalidates every retained input. G2c: the lanes also share one
++    ``blocker_states`` walk under that key (each lane gets a private copy and applies check clears and the fence
++    itself); it is never kept past this pass.
+ 
+     [daveey] G2: each lane also skips while the board's content revision, this gateway's id and the config hold
+     and none of its clocks ran out (``kanban_sweep_gate``). Both lanes read only content rows (``task_runs``
+diff --git a/hermes_cli/kanban_shared_blocker_checks.py b/hermes_cli/kanban_shared_blocker_checks.py
+index fd9b9ab439..ecdb4bffee 100644
+--- a/hermes_cli/kanban_shared_blocker_checks.py
++++ b/hermes_cli/kanban_shared_blocker_checks.py
+@@ -67,25 +67,23 @@ def _read_assertion_tokens(conn, now=None) -> dict[str, str]:
+     Synced run UIDs survive integer-id remapping and same-second runs. Sorting
+     identities also survives opposite import order. Older assertions aging out
+     must not revoke a successful check. Unsynced legacy schemas use task/time.
++
++    G2c: the cohort is every in-window assertion of the id whose ended_at epoch is the newest, an
++    order-free function of the assertion scan, so it reads the rows ``blocker_states`` decoded
++    (``kanban_blocker_rows``; afresh inside a transaction).
+     """
+-    from hermes_cli import kanban_db as kb
+-    from hermes_cli.kanban_shared_blockers import run_effect
++    from hermes_cli import kanban_blocker_rows as rows
+ 
++    ts = int(time.time()) if now is None else int(now)
++    window, _tasks = rows.inputs(conn, ts)
+     tokens, newest = {}, {}
+-    columns = {row[1] for row in conn.execute('PRAGMA table_info(task_runs)')}
+-    identity = 'uid' if 'uid' in columns else 'NULL AS uid'
+-    for row in conn.execute(
+-            f"SELECT id, {identity}, task_id, started_at, ended_at, outcome, metadata FROM task_runs "
+-            "WHERE ended_at IS NOT NULL AND ended_at >= ? AND metadata LIKE '%\"blocker_id\"%' "
+-            "ORDER BY ended_at, id", (_lookback(now),)):
+-        effect, bid = run_effect(row["outcome"], row["metadata"])
+-        if effect == "assert":
+-            raw = str(row['uid'] or (f"{row['task_id']}|{kb._to_epoch(row['started_at']) or 0}|"
+-                                     f"{kb._to_epoch(row['ended_at']) or 0}|{bid}"))
+-            ended = kb._to_epoch(row['ended_at']) or 0
+-            if ended > newest.get(bid, -1):
+-                newest[bid], tokens[bid] = ended, []
+-            if ended == newest[bid]:
++    for row in window:
++        if row.effect == "assert":
++            bid = row.bid
++            raw = str(row.uid or f"{row.task_id}|{row.started}|{row.ended}|{bid}")
++            if row.ended > newest.get(bid, -1):
++                newest[bid], tokens[bid] = row.ended, []
++            if row.ended == newest[bid]:
+                 tokens[bid].append(raw)
+     return {bid: hashlib.sha256('\n'.join(sorted(ids)).encode()).hexdigest()
+             for bid, ids in tokens.items()}
+@@ -213,7 +211,7 @@ def run_due_checks(conn, *, cfg=None, now=None, due_out=None) -> list[str]:
+     """
+     from hermes_cli import kanban_db as kb
+     from hermes_cli.kanban_shared_blockers import blocker_states
+-    from hermes_cli.kanban_wake_check import foreign_ids
++    from hermes_cli import kanban_blocker_rows as blocker_rows
+ 
+     if conn.in_transaction:
+         raise ValueError("shared blocker checks must run outside a write transaction")
+@@ -221,7 +219,7 @@ def run_due_checks(conn, *, cfg=None, now=None, due_out=None) -> list[str]:
+     commands = registered_checks(cfg)
+     states = blocker_states(conn, now=ts)
+     apply_check_clears(conn, states, ts)
+-    foreign = foreign_ids(conn)
++    foreign = blocker_rows.foreign_among(conn, (t for st in states.values() for t in st.behind))   # G2c
+     tokens, previous = _assertion_tokens(conn, ts), _latest_results(conn, ts)
+     attempts = _latest_attempts(conn, ts)
+     cleared = []
+@@ -263,7 +261,7 @@ def run_due_checks(conn, *, cfg=None, now=None, due_out=None) -> list[str]:
+                    "started_at": ts, "checked_at": checked_at, "assertion_id": token, "fails": fails}
+         with kb.write_txn(conn):
+             # A shell check can overlap a new assertion or a home ownership change.
+-            if homes[0] in foreign_ids(conn):
++            if blocker_rows.foreign_among(conn, (homes[0],)):
+                 continue
+             if _assertion_tokens(conn, ts).get(bid) != token:
+                 kb._append_event(conn, homes[0], ATTEMPT_EVENT, {
+diff --git a/hermes_cli/kanban_shared_blocker_fence.py b/hermes_cli/kanban_shared_blocker_fence.py
+index d1641b8fdd..1279e9e44a 100644
+--- a/hermes_cli/kanban_shared_blocker_fence.py
++++ b/hermes_cli/kanban_shared_blocker_fence.py
+@@ -60,9 +60,7 @@ def fence_stale_quota_assertions(conn, states, asserting, *, now):
+     after the recovery can report a genuinely new wall: ``run_due_checks`` runs
+     the cheap check only while a wall is open, so it never re-opens one.
+     """
+-    from hermes_cli import kanban_db as kb
+-    from hermes_cli.kanban_shared_blockers import _mark_cleared, run_effect
+-    from hermes_cli.kanban_shared_blocker_checks import run_identity
++    from hermes_cli.kanban_shared_blockers import _mark_cleared
+ 
+     st = states.get('github-rest-quota')
+     if st is None:
+@@ -79,11 +77,10 @@ def fence_stale_quota_assertions(conn, states, asserting, *, now):
+         return
+     eligible = []
+     for row in asserting:
+-        effect, bid = run_effect(row['outcome'], row['metadata'])
+-        if effect != 'assert' or bid != st.blocker_id:
++        # G2c: ``asserting`` holds ``kanban_blocker_rows.AssertRow``s, decoded once per task and run.
++        if row.effect != 'assert' or row.bid != st.blocker_id:
+             continue
+-        started = kb._to_epoch(row['started_at']) or 0
+-        ended = kb._to_epoch(row['ended_at']) or 0
++        started, ended = row.started, row.ended
+         known = in_flight.get(st.cleared_at, False)
+         if known is False:
+             admitted = started <= st.cleared_at        # non-check clear: unchanged
+@@ -92,7 +89,7 @@ def fence_stale_quota_assertions(conn, states, asserting, *, now):
+         else:
+             # Snapshot absence does not prove freshness: a remote claim may not
+             # have synced yet. Its portable UUID can carry earlier clock evidence.
+-            identity = run_identity(conn, row['id'])
++            identity = str(row.uid or f"{row.task_id}|{started}")   # == run_identity(conn, row.id)
+             admitted = started < st.cleared_at or (
+                 started == st.cleared_at and (identity in known or
+                     _uid_before_check(identity, started, receipts.get(st.cleared_at, {}))))
+diff --git a/hermes_cli/kanban_shared_blockers.py b/hermes_cli/kanban_shared_blockers.py
+index d35d6e1a76..43ef34f3ed 100644
+--- a/hermes_cli/kanban_shared_blockers.py
++++ b/hermes_cli/kanban_shared_blockers.py
+@@ -331,78 +331,93 @@ def blocker_states(conn: sqlite3.Connection, *, now: Optional[int] = None,
+     """Derive every recently asserted blocker's state from ``task_runs`` (read-only).
+ 
+     ``oldest_out`` (G2) receives the moment the oldest assertion inside the lookback window leaves it: then
+-    this derivation can change with no row changing."""
+-    from hermes_cli import kanban_db as kb
++    this derivation can change with no row changing.
++
++    G2c: each task's own rows come decoded from ``kanban_blocker_rows`` (kept across passes, re-read only for tasks
++    the per-task change cursor names). The walk over them (:func:`_walk`) is shared by the lanes of one pass under
++    ``kanban_blocker_inputs.read``'s key (commit counters, file identity, alias snapshot) plus the set of in-window
++    assertion run ids, so a lane write or a peer commit recomputes it. Check clears and the quota fence run live on
++    each consumer's private copy."""
++    from hermes_cli import kanban_blocker_rows as rows
++    from hermes_cli.kanban_blocker_inputs import read
+ 
+     now = int(time.time()) if now is None else int(now)
+-    asserting = conn.execute(
+-        "SELECT id, task_id, started_at, ended_at, outcome, metadata, summary FROM task_runs "
+-        "WHERE ended_at IS NOT NULL AND ended_at >= ? AND metadata LIKE '%\"blocker_id\"%' "
+-        "ORDER BY id",
+-        (now - _LOOKBACK_SECONDS,),
+-    ).fetchall()
++    window, _tasks = rows.inputs(conn, now)
++    states, asserting = read("walk", conn, ("walk", frozenset(r.id for r in window)),
++                             lambda: _walk(conn, *rows.inputs(conn, now)))
+     _note_window_exit(oldest_out, asserting)
++    if not states:
++        return states
++    from hermes_cli.kanban_shared_blocker_checks import apply_check_clears
++    apply_check_clears(conn, states, now=now)
++    from hermes_cli.kanban_shared_blocker_fence import fence_stale_quota_assertions
++    fence_stale_quota_assertions(conn, states, asserting, now=now)
++    return states
++
++
++def _walk(conn: sqlite3.Connection, asserting, tasks) -> tuple[dict[str, BlockerState], tuple]:
++    """The run-history walk of :func:`blocker_states`, before check clears and the fence.
++
++    ``asserting``: the in-window assertion-scan rows sorted by run id; ``tasks``: each task's decoded runs and status
++    (``kanban_blocker_rows``). Routes and condition_met evidence are read live on every walk."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_blocker_inputs import memo
++
+     states: dict[str, BlockerState] = {}
+     scopes: dict[str, set[Optional[str]]] = {}
+     task_ids: set[str] = set()
+     for row in asserting:
+-        effect, bid = run_effect(row["outcome"], row["metadata"])
+-        if effect != "assert" or bid is None:
++        bid = row.bid
++        if row.effect != "assert" or bid is None:
+             continue
+         st = states.setdefault(bid, BlockerState(bid))
+-        ended = kb._to_epoch(row["ended_at"]) or 0
+-        meta = kb._json_dict(row["metadata"])
+-        scopes.setdefault(bid, set()).add(_provider(meta.get("blocker_provider")))
+-        if ended >= st.asserted_at:
+-            st.asserted_at = ended
+-            st.reason = kb._first_line(row["summary"], 300)
+-            st.blocker_model = _optional_text(meta.get("blocker_model"))
+-            st.blocker_lane = _optional_text(meta.get("blocker_lane"))
+-        task_ids.add(row["task_id"])
++        raw = row.provider
++        scopes.setdefault(bid, set()).add(memo("blocker_provider", raw, lambda: _provider(raw)))
++        if row.ended >= st.asserted_at:   # rows are in id order: a tie goes to the higher run id
++            st.asserted_at = row.ended
++            st.reason = row.reason
++            st.blocker_model = row.model
++            st.blocker_lane = row.lane
++        task_ids.add(row.task_id)
+     if not states:
+-        return states
++        return states, asserting
+     for bid, st in states.items():
+         # Union of every recent assertion: any unscoped or differing provider keeps it board-wide.
+         providers = scopes.get(bid, set())
+         st.blocker_provider = next(iter(providers)) if len(providers) == 1 else None
+-    for tid in task_ids:
+-        status_row = conn.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()
+-        live = status_row is not None and status_row["status"] not in ("done", "archived")
+-        runs = conn.execute(
+-            "SELECT id, outcome, started_at, ended_at, metadata FROM task_runs "
+-            "WHERE task_id = ? ORDER BY id", (tid,),
+-        ).fetchall()
++    for tid in sorted(task_ids):
++        entry = tasks[tid]
++        live = entry.status is not None and entry.status not in ("done", "archived")
+         current: Optional[tuple[str, int]] = None   # (blocker, asserting ended_at)
+         asserting_run: Optional[int] = None
+-        for run in runs:
+-            started = kb._to_epoch(run["started_at"]) or 0
++        for run in entry.runs:
+             applicable = True
+             if current is not None and current[0] in states:
+                 st = states[current[0]]
+                 provider = None
+                 if st.blocker_provider:
+-                    provider = (_run_route(conn, tid, run["id"])[1] if run["ended_at"] is not None
++                    provider = (_run_route(conn, tid, run.id)[1] if run.ended_raw is not None
+                                 else task_route(conn, tid)[1])
+                 applicable = _run_is_evidence(st, provider)
+                 if applicable:
+-                    st.probe_starts[tid] = max(st.probe_starts.get(tid, 0), started)
+-            if run["ended_at"] is None:
++                    st.probe_starts[tid] = max(st.probe_starts.get(tid, 0), run.started)
++            if run.ended_raw is None:
+                 continue
+-            ended = kb._to_epoch(run["ended_at"]) or 0
+-            effect, bid = run_effect(run["outcome"], run["metadata"])
++            effect, bid = run.effect, run.bid
+             if effect == "assert" and bid is not None:
+                 if applicable and current is not None and current[0] != bid and current[0] in states:
+-                    _mark_cleared(states[current[0]], tid, run["id"], ended)
+-                current, asserting_run = (bid, ended), int(run["id"])
++                    _mark_cleared(states[current[0]], tid, run.id, run.ended)
++                current, asserting_run = (bid, run.ended), run.id
+                 continue
+-            if effect == "pass" or not (applicable or _explicit_clear(kb, run["metadata"])):
++            if effect == "pass" or not (applicable or run.explicit_clear):
+                 continue
+             if current is not None and current[0] in states:
+-                _mark_cleared(states[current[0]], tid, run["id"], ended)
++                _mark_cleared(states[current[0]], tid, run.id, run.ended)
+             current = None
+         if current is not None and current[0] in states:
+             # The card's own wake_check exiting 0 after it parked behind X is evidence too.
+-            # Ordered by event id after the asserting run's own events (same-second safe).
++            # Ordered by event id after the asserting run's own events (same-second safe). Read live, never
++            # cached: a late heartbeat of the asserting run moves MAX(id) without marking the task.
+             met = conn.execute(
+                 "SELECT id, created_at, payload FROM task_events WHERE task_id = ? AND kind = ? AND id > COALESCE("
+                 "(SELECT MAX(id) FROM task_events WHERE task_id = ? AND run_id = ?), 0) "
+@@ -416,11 +431,7 @@ def blocker_states(conn: sqlite3.Connection, *, now: Optional[int] = None,
+     for st in states.values():
+         # Probe starts only count once the card is (still) behind the blocker.
+         st.probe_starts = {t: s for t, s in st.probe_starts.items() if t in st.behind}
+-    from hermes_cli.kanban_shared_blocker_checks import apply_check_clears
+-    apply_check_clears(conn, states, now=now)
+-    from hermes_cli.kanban_shared_blocker_fence import fence_stale_quota_assertions
+-    fence_stale_quota_assertions(conn, states, asserting, now=now)
+-    return states
++    return states, asserting
+ 
+ 
+ def _probe_parked_behind(conn: sqlite3.Connection, kb, task_id: str, met, blocker_id: str) -> bool:
+@@ -671,11 +682,13 @@ def release_cleared_blockers(conn: sqlite3.Connection, *, now: Optional[int] = N
+     Returns only task ids whose lane changed (ready/review cards remain queued)."""
+     from hermes_cli import kanban_db as kb
+     from hermes_cli import kanban_wake_check as kwc
++    from hermes_cli.kanban_blocker_rows import foreign_among
+ 
+     # Retained executor copies own host-local wake probes, not shared-wall policy writes.
+-    foreign = kwc.foreign_ids(conn)
++    states = blocker_states(conn, now=now, oldest_out=oldest_out)
++    foreign = foreign_among(conn, (t for st in states.values() for t in st.behind))   # G2c: only the asked cards
+     released: list[str] = []
+-    for st in blocker_states(conn, now=now, oldest_out=oldest_out).values():
++    for st in states.values():
+         if st.is_open or st.cleared_by is None:
+             continue
+         by_task, by_run = st.cleared_by
+@@ -735,14 +748,15 @@ def probe_stranded_blockers(conn: sqlite3.Connection, *, now: Optional[int] = No
+     assertion is oldest is unblocked; it then spawns as the probe. Cards carrying a human ask
+     (``human_request``) are left for the human. [daveey]"""
+     from hermes_cli import kanban_db as kb
+-    from hermes_cli import kanban_wake_check as kwc
++    from hermes_cli.kanban_blocker_rows import foreign_among
+ 
+-    foreign = kwc.foreign_ids(conn)
+     now = int(time.time()) if now is None else int(now)
+     if interval is None:
+         interval = probe_interval_seconds()
+     probed: list[str] = []
+-    for st in blocker_states(conn, now=now, oldest_out=due_out).values():
++    states = blocker_states(conn, now=now, oldest_out=due_out)
++    foreign = foreign_among(conn, (t for st in states.values() for t in st.behind))   # G2c: only the asked cards
++    for st in states.values():
+         if not st.is_open or not st.behind:
+             continue
+         if st.blocker_provider and due_out is not None:
+diff --git a/scripts/kanban_reclaim_replay_bench.py b/scripts/kanban_reclaim_replay_bench.py
+index 29928357df..84b9bef252 100644
+--- a/scripts/kanban_reclaim_replay_bench.py
++++ b/scripts/kanban_reclaim_replay_bench.py
+@@ -2,11 +2,13 @@
+ ticks over a COPY of a board in a scratch home, CPU per tick per sweep from ``loop_accounting``.
+ 
+ usage: scripts/hermes-python scripts/kanban_reclaim_replay_bench.py <worktree> <board copy> <ticks>
+-           [--churn N | --replay SECONDS] [--json out] [--profile]
++           [--churn N | --replay SECONDS] [--blockers N] [--json out] [--profile]
+ 
+ --churn N       before every Nth tick, one content write (a comment), so the board revision moves; 0 = write-free.
+ --replay S      replay the copy's own write cadence: tick i writes iff the i-th 15 s bucket of the last S seconds
+                 of the board's history had a content event (heartbeats excluded: they never move the revision).
++--blockers N    after the ticks, N dirty-tick passes of ``sweep_shared_blockers`` alone (a comment write before each
++                pass), reported as ``dirty_shared_blockers`` median/min/max CPU ms per pass (G2c).
+ 
+ Side effects are stubbed: wake-check probes, the CI sweep, the capability refresh, worker placement (Board),
+ spawns (max_spawn=0), signals and subprocesses; any DB path outside the scratch home opens an empty read-only file.
+@@ -25,6 +27,7 @@ wt, src, ticks = sys.argv[1], sys.argv[2], int(sys.argv[3])
+ churn = int(sys.argv[sys.argv.index("--churn") + 1]) if "--churn" in sys.argv else 0
+ replay = int(sys.argv[sys.argv.index("--replay") + 1]) if "--replay" in sys.argv else 0
+ out = sys.argv[sys.argv.index("--json") + 1] if "--json" in sys.argv else None
++blocker_ticks = int(sys.argv[sys.argv.index("--blockers") + 1]) if "--blockers" in sys.argv else 0
+ schedule = None
+ if replay:
+     ro = sqlite3.connect(f"file:{os.path.abspath(src)}?mode=ro", uri=True)
+@@ -140,9 +143,28 @@ for k, v in la.counters().items():
+         b = base.get(k, {})
+         res[k] = {"runs": v["runs"] - b.get("runs", 0), "skips": v["skips"] - b.get("skips", 0),
+                   "cpu_ms_per_tick": round(1000 * (v["cpu_s"] - b.get("cpu_s", 0.0)) / ticks, 3)}
++blockers = None
++if blocker_ticks:
++    # G2c dirty-tick blocker case: one content write (a comment), then one ``sweep_shared_blockers`` pass (its three
++    # lanes), so every pass misses the revision gates the way the hub's busy board does. CPU per pass, ms.
++    from types import SimpleNamespace
++    from hermes_cli.kanban_idle_candidates import sweep_shared_blockers
++    samples = []
++    for i in range(blocker_ticks):
++        if t_open:
++            with kb.write_txn(conn):
++                kb._insert_comment(conn, t_open, "bench", f"blocker churn {i}", int(time.time()))
++        b0 = time.thread_time()
++        sweep_shared_blockers(conn, SimpleNamespace())
++        samples.append(1000 * (time.thread_time() - b0))
++    samples.sort()
++    blockers = {"passes": blocker_ticks, "median_ms": round(samples[len(samples) // 2], 3),
++                "min_ms": round(samples[0], 3), "max_ms": round(samples[-1], 3)}
+ summary = {"board": os.path.basename(src), "ticks": ticks, "churn": churn, "replay_s": replay,
+            "write_ticks": writes, "cpu_ms_per_tick_total": round(1000 * cpu / ticks, 3),
+            "core_pct_at_interval": round(100 * cpu / ticks / INTERVAL, 3), "wall_s": round(wall, 2), "sweeps": res}
++if blockers is not None:
++    summary["dirty_shared_blockers"] = blockers
+ print(json.dumps(summary, indent=1))
+ if out:
+     with open(out, "w", encoding="utf-8") as f:
+diff --git a/tests/hermes_cli/test_kanban_blocker_input_config.py b/tests/hermes_cli/test_kanban_blocker_input_config.py
+index 5348f790e6..710b7ddba7 100644
+--- a/tests/hermes_cli/test_kanban_blocker_input_config.py
++++ b/tests/hermes_cli/test_kanban_blocker_input_config.py
+@@ -27,8 +27,9 @@ def test_derivation_loads_config_per_pass_not_per_run(kanban_home, monkeypatch):
+         calls = _counting_config(monkeypatch, {'kanban': {'shared_blocker_aliases': {}}})
+         states = blockers.blocker_states(conn)
+         assert len(states['test-wall'].behind) == 12
+-        # The snapshot itself plus each validated input read (tokens, check events): not one per row.
+-        assert len(calls) <= 6, len(calls)
++        # The snapshot itself plus each validated input read (tokens, check events, the G2c shared walk), each
++        # keyed before and after: not one per row.
++        assert len(calls) <= 7, len(calls)
+ 
+ 
+ def test_sweep_lanes_share_one_snapshot(kanban_home, monkeypatch):
+diff --git a/tests/hermes_cli/test_kanban_blocker_inputs.py b/tests/hermes_cli/test_kanban_blocker_inputs.py
+index 391ded4bc4..d52d2e364a 100644
+--- a/tests/hermes_cli/test_kanban_blocker_inputs.py
++++ b/tests/hermes_cli/test_kanban_blocker_inputs.py
+@@ -12,15 +12,21 @@ from tests.hermes_cli import test_kanban_shared_blockers as helpers
+ kanban_home = helpers.kanban_home
+ 
+ 
+-def test_real_due_pass_reads_assertion_cohort_once(kanban_home):
++def test_real_due_pass_reads_assertion_cohort_once(kanban_home, monkeypatch):
+     with kbc.connect_closing() as conn:
+         helpers._blocked_behind(conn, 'quota', blocker_id='github-rest-quota')
+         now = blockers.blocker_states(conn)['github-rest-quota'].asserted_at + 1
+-        queries = []
++        queries, cohorts = [], []
++        real = checks._read_assertion_tokens
++
++        def spy(*args, **kwargs):
++            cohorts.append(1)
++            return real(*args, **kwargs)
++        monkeypatch.setattr(checks, '_read_assertion_tokens', spy)
+         conn.set_trace_callback(queries.append)
+         checks.run_due_checks(conn, cfg={'kanban': {'shared_blocker_checks': {'github-rest-quota': ''}}}, now=now)
+-        cohort = [q for q in queries if 'ORDER BY ended_at, id' in q]
+-        assert len(cohort) == 1
++        # G2c: the cohort comes from the decoded assertion rows (``kanban_blocker_rows``), derived once a pass.
++        assert len(cohorts) == 1
+         events = [q for q in queries if "SELECT payload FROM task_events WHERE kind='shared_blocker_check'" in q]
+         assert len(events) == 1
+ 
+diff --git a/tests/hermes_cli/test_kanban_blocker_rows.py b/tests/hermes_cli/test_kanban_blocker_rows.py
+new file mode 100644
+index 0000000000..93ff81becb
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_blocker_rows.py
+@@ -0,0 +1,416 @@
++"""G2c: per-task decoded-row cache and the per-pass shared walk of ``blocker_states``. [daveey]
++
++Design t_01a1d563324d7e8e §1 option 1 / §2 P2 / R13: ``kanban_blocker_rows`` keeps each asserting task's decoded runs
++across passes and re-reads only the tasks ``kanban_task_change.changed_since`` names; the walk itself, check clears
++and the fence rerun every pass. Every test compares the cached derivation with a cold (uncached) one.
++"""
++from __future__ import annotations
++
++import dataclasses
++import json
++import random
++import sqlite3
++import threading
++
++import pytest
++
++from hermes_cli import kanban_blocker_inputs as inputs
++from hermes_cli import kanban_blocker_rows as rows
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_idle_candidates as idle
++from hermes_cli import kanban_shared_blockers as ksb
++from hermes_cli import kanban_task_change as tc
++from tests.hermes_cli import test_kanban_shared_blockers as helpers
++
++kanban_home = helpers.kanban_home
++BID = helpers.BID
++DAY = 86400
++
++
++@pytest.fixture(autouse=True)
++def _fresh_caches():
++    rows._reset_for_tests()
++    tc._reset_for_tests()
++    yield
++    rows._reset_for_tests()
++    tc._reset_for_tests()
++
++
++def _snap(states) -> dict:
++    return {bid: dataclasses.asdict(st) for bid, st in sorted(states.items())}
++
++
++def cached(conn, now) -> dict:
++    return _snap(ksb.blocker_states(conn, now=now))
++
++
++def cold(conn, now) -> dict:
++    """The same derivation with no retained rows (and nothing retained afterwards)."""
++    with rows._LOCK:
++        saved = dict(rows._STATES)
++        rows._STATES.clear()
++    try:
++        return _snap(ksb.blocker_states(conn, now=now))
++    finally:
++        with rows._LOCK:
++            rows._STATES.clear()
++            rows._STATES.update(saved)
++
++
++def _same(conn, now) -> dict:
++    want = cold(conn, now)
++    got = cached(conn, now)
++    assert got == want
++    return got
++
++
++@pytest.fixture
++def full_reads(monkeypatch):
++    calls = []
++    real = rows._read_all
++
++    def spy(conn, cutoff):
++        calls.append(cutoff)
++        return real(conn, cutoff)
++    monkeypatch.setattr(rows, "_read_all", spy)
++    return calls
++
++
++def _now(conn) -> int:
++    return int(conn.execute("SELECT MAX(ended_at) FROM task_runs").fetchone()[0]) + 1
++
++
++def _finish_clean(conn, tid) -> None:
++    """``tid`` is unblocked, claimed and completes without hitting the wall (a clearing run)."""
++    assert kb.unblock_task(conn, tid)
++    conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
++    conn.commit()
++    assert kb.claim_task(conn, tid) is not None
++    assert kb.complete_task(conn, tid, result="ok")
++
++
++def _age_task(conn, tid, seconds) -> None:
++    with kb.write_txn(conn):
++        conn.execute("UPDATE task_runs SET started_at = started_at - ?, ended_at = CASE WHEN ended_at IS NULL "
++                     "THEN NULL ELSE ended_at - ? END WHERE task_id = ?", (seconds, seconds, tid))
++
++
++def test_the_cache_is_incremental_on_a_covered_board(kanban_home, full_reads):
++    """Precondition for every test below: without it they would only exercise the cold path."""
++    with kbc.connect_closing() as conn:
++        helpers._blocked_behind(conn, "a")
++        now = _now(conn)
++        cached(conn, now)
++        assert len(full_reads) == 1
++        kb.add_comment(conn, kb.create_task(conn, title="x", assignee="default"), "u", "body")
++        cached(conn, now)
++        assert len(full_reads) == 1
++
++
++def test_a_write_to_task_b_changes_task_a_derivation(kanban_home, full_reads):
++    """Cross-task: only B is written; A's behind/cleared/applicable come from B's run."""
++    with kbc.connect_closing() as conn:
++        a = helpers._blocked_behind(conn, "a")
++        b = helpers._blocked_behind(conn, "b")
++        now = _now(conn) + 5
++        before = _same(conn, now)
++        assert set(before[BID]["behind"]) == {a, b} and before[BID]["cleared_at"] == 0
++        _finish_clean(conn, b)
++        after = _same(conn, _now(conn) + 5)
++        assert after[BID]["cleared_by"][0] == b and set(after[BID]["behind"]) == {a}
++        assert len(full_reads) == 3   # two cold comparisons and the first fill: only B was re-read after
++
++
++def test_an_assertion_leaves_the_window_with_no_write(kanban_home):
++    with kbc.connect_closing() as conn:
++        helpers._blocked_behind(conn, "a")
++        now = _now(conn)
++        assert BID in _same(conn, now)
++        assert _same(conn, now + ksb._LOOKBACK_SECONDS + 1) == {}
++        assert BID in _same(conn, now)
++
++
++def test_a_caller_now_earlier_than_the_fill(kanban_home, full_reads):
++    """A task whose assertions are outside the fill's window is not held; an earlier caller window needs it."""
++    with kbc.connect_closing() as conn:
++        old = helpers._blocked_behind(conn, "old")
++        helpers._blocked_behind(conn, "new")
++        _age_task(conn, old, 20 * DAY)
++        now = _now(conn)
++        assert set(_same(conn, now)[BID]["behind"]) != {old}
++        assert old not in _same(conn, now)[BID]["behind"]
++        earlier = now - 10 * DAY
++        got = _same(conn, earlier)
++        assert old in got[BID]["behind"]
++
++
++def test_an_alias_change_with_no_board_write(kanban_home, monkeypatch):
++    from hermes_cli import config
++    cfg = {"kanban": {"shared_blocker_aliases": {}}}
++    monkeypatch.setattr(config, "load_config_readonly", lambda: cfg)
++    with kbc.connect_closing() as conn:
++        helpers._blocked_behind(conn, "a", blocker_id="old-wall")
++        now = _now(conn)
++        assert set(_same(conn, now)) == {"old-wall"}
++        monkeypatch.setattr(config, "load_config_readonly",
++                            lambda: {"kanban": {"shared_blocker_aliases": {"old-wall": "new-wall"}}})
++        assert set(_same(conn, now)) == {"new-wall"}
++
++
++def test_equal_ended_at_tie_goes_to_the_higher_run_id(kanban_home):
++    """The asserting rows are rebuilt from per-task entries; they must be re-sorted by run id across tasks."""
++    with kbc.connect_closing() as conn:
++        first = kb.create_task(conn, title="first", assignee="default")
++        second = kb.create_task(conn, title="second", assignee="default")
++        # ``second`` asserts first (lower run id), ``first`` last (higher run id): task order != run order.
++        for tid, why in ((second, "older run"), (first, "newer run")):
++            assert kb.claim_task(conn, tid) is not None
++            assert kb.block_task(conn, tid, reason=why, kind="capability", blocker_id=BID)
++        with kb.write_txn(conn):
++            conn.execute("UPDATE task_runs SET ended_at = (SELECT MAX(ended_at) FROM task_runs)")
++        now = _now(conn)
++        assert _same(conn, now)[BID]["reason"] == "newer run"
++        for _ in range(2):
++            assert cached(conn, now)[BID]["reason"] == "newer run"
++
++
++@pytest.mark.parametrize("synced", [False, True])
++def test_a_late_heartbeat_after_condition_met(kanban_home, synced):
++    """condition_met evidence is read live: a heartbeat of the asserting run (which never marks a task) that lands
++    after the condition_met event hides it, cached and uncached alike."""
++    with kbc.connect_closing() as conn:
++        a = helpers._blocked_behind(conn, "a")
++        helpers._blocked_behind(conn, "b")
++        run = conn.execute("SELECT MAX(id) FROM task_runs WHERE task_id = ?", (a,)).fetchone()[0]
++        now = _now(conn) + 5
++        _same(conn, now)
++        with kb.write_txn(conn):
++            kb._append_event(conn, a, ksb.CONDITION_MET_EVENT, {"rc": 0})
++        met = _same(conn, now)
++        assert met[BID]["cleared_via"] == ksb.CONDITION_MET_EVENT
++        with kb.write_txn(conn):
++            conn.execute("INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
++                         "VALUES (?, ?, 'heartbeat', ?, ?)", (a, run, json.dumps({"synced": synced}), now))
++        assert _same(conn, now)[BID]["cleared_via"] != ksb.CONDITION_MET_EVENT
++
++
++def test_a_rolled_back_write_never_seeds_the_cache(kanban_home):
++    """A result read inside a transaction is not stored: after a rollback the next write reuses the revision."""
++    with kbc.connect_closing() as conn:
++        a = helpers._blocked_behind(conn, "a")
++        b = helpers._blocked_behind(conn, "b")
++        now = _now(conn) + 5
++        _same(conn, now)
++        conn.execute("BEGIN IMMEDIATE")
++        conn.execute("UPDATE task_runs SET metadata = NULL, outcome = 'completed' WHERE task_id = ?", (a,))
++        inside = cached(conn, now)
++        assert a not in inside[BID]["behind"]
++        conn.execute("ROLLBACK")
++        rev_before = conn.execute("SELECT revision FROM kanban_activity_revision").fetchone()[0]
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET title = 'b2' WHERE id = ?", (b,))
++        assert conn.execute("SELECT revision FROM kanban_activity_revision").fetchone()[0] == rev_before + 1
++        got = _same(conn, now)
++        assert a in got[BID]["behind"]
++
++
++@pytest.mark.parametrize("case", ["full_mark", "file_replace", "shm", "task_delete"])
++def test_untrusted_cursors_and_deletes(kanban_home, full_reads, monkeypatch, tmp_path, case):
++    with kbc.connect_closing() as conn:
++        a = helpers._blocked_behind(conn, "a")
++        helpers._blocked_behind(conn, "b")
++        now = _now(conn) + 5
++        snapshot = sqlite3.connect(tmp_path / "snap.db")
++        conn.backup(snapshot)
++        _same(conn, now)
++        reads = len(full_reads)
++        if case == "full_mark":
++            from hermes_cli import kanban_activity_revision as rev
++            with kb.write_txn(conn):
++                conn.execute(rev._BUMP)
++                conn.execute(rev._mark("NULL"))
++        elif case == "file_replace":
++            _finish_clean(conn, a)
++            cached(conn, _now(conn) + 5)
++            reads = len(full_reads)
++            snapshot.backup(conn)   # restored in place: same inode, regressed revision
++        elif case == "shm":
++            from hermes_cli import kanban_lockguard
++            monkeypatch.setattr(kanban_lockguard, "shm_identity", lambda _path: ("another-wal-generation",))
++        else:
++            with kb.write_txn(conn):
++                conn.execute("DELETE FROM task_events WHERE task_id = ?", (a,))
++                conn.execute("DELETE FROM task_runs WHERE task_id = ?", (a,))
++                conn.execute("DELETE FROM tasks WHERE id = ?", (a,))
++        snapshot.close()
++        got = _same(conn, now if case != "file_replace" else _now(conn) + 5)
++        if case == "task_delete":
++            assert a not in got[BID]["behind"]
++            assert len(full_reads) == reads + 1   # the cold comparison only: the cache stayed incremental
++        else:
++            assert len(full_reads) >= reads + 2   # the cold comparison and the cache's own FULL
++        if case == "file_replace":
++            assert a in got[BID]["behind"]
++
++
++def test_two_threads_racing_writes_and_reads(kanban_home):
++    with kbc.connect_closing() as conn:
++        tids = [helpers._blocked_behind(conn, f"t{i}") for i in range(6)]
++        now = _now(conn) + 5
++        stop = threading.Event()
++        errors: list[BaseException] = []
++
++        def reader():
++            with kbc.connect_closing() as rc:
++                while not stop.is_set():
++                    try:
++                        ksb.blocker_states(rc, now=now)
++                    except sqlite3.OperationalError:
++                        pass   # busy: the race is the point, not lock waits
++                    except BaseException as exc:
++                        errors.append(exc)
++                        return
++
++        threads = [threading.Thread(target=reader) for _ in range(2)]
++        for t in threads:
++            t.start()
++        try:
++            for tid in tids[:3]:
++                _finish_clean(conn, tid)
++                with kb.write_txn(conn):
++                    conn.execute("UPDATE tasks SET title = title || '!' WHERE id = ?", (tids[-1],))
++        finally:
++            stop.set()
++            for t in threads:
++                t.join()
++        assert not errors
++        _same(conn, _now(conn) + 5)
++
++
++def test_store_never_moves_backwards(kanban_home):
++    with kbc.connect_closing() as conn:
++        helpers._blocked_behind(conn, "a")
++        now = _now(conn)
++        cached(conn, now)
++        path = rows._main_path(conn)
++        newer = rows._STATES[path]
++        older = dataclasses.replace(newer, cursor=dataclasses.replace(newer.cursor, revision=newer.cursor.revision - 1),
++                                    tasks={})
++        rows._store(path, older)
++        assert rows._STATES[path] is newer
++
++
++def test_randomized_cached_equals_uncached(kanban_home):
++    rng = random.Random(20261114)
++    with kbc.connect_closing() as conn:
++        tids = [kb.create_task(conn, title=f"t{i}", assignee="default") for i in range(6)]
++        walls = [BID, "other-wall", "third-wall"]
++        for _step in range(60):
++            tid = rng.choice(tids)
++            status = conn.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()[0]
++            op = rng.random()
++            if status in ("ready", "todo") and op < 0.6:
++                assert kb.claim_task(conn, tid) is not None
++                if rng.random() < 0.7:
++                    kb.block_task(conn, tid, reason=f"wall {_step}", kind="capability", blocker_id=rng.choice(walls))
++                else:
++                    kb.complete_task(conn, tid, result="ok")
++            elif status == "blocked" and op < 0.5:
++                kb.unblock_task(conn, tid)
++            elif status == "done" and op < 0.2:
++                with kb.write_txn(conn):
++                    conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
++            elif op < 0.7:
++                _age_task(conn, tid, rng.choice([DAY, 5 * DAY]))
++            else:
++                kb.add_comment(conn, tid, "u", f"c{_step}")
++            base = _now(conn) if conn.execute("SELECT COUNT(*) FROM task_runs").fetchone()[0] else 2000000000
++            for when in (base + 1, base - 3 * DAY, base + 13 * DAY):
++                _same(conn, when)
++
++
++def test_the_shared_walk_is_reused_within_a_pass_and_dropped_by_a_lane_write(kanban_home, monkeypatch):
++    with kbc.connect_closing() as conn:
++        a = helpers._blocked_behind(conn, "a")
++        helpers._blocked_behind(conn, "b")
++        now = _now(conn) + 5
++        walks = []
++        real = ksb._walk
++
++        def spy(*args):
++            walks.append(1)
++            return real(*args)
++        monkeypatch.setattr(ksb, "_walk", spy)
++
++        @inputs.input_pass
++        def one_pass():
++            first = ksb.blocker_states(conn, now=now)
++            first[BID].behind.clear()   # a consumer's private copy: never seen by the next lane
++            second = ksb.blocker_states(conn, now=now)
++            assert a in second[BID].behind and len(walks) == 1
++            with kb.write_txn(conn):   # a lane write in the same pass
++                conn.execute("UPDATE task_runs SET metadata = NULL, outcome = 'completed' WHERE task_id = ?", (a,))
++            third = ksb.blocker_states(conn, now=now)
++            assert len(walks) == 2 and a not in third[BID].behind
++        one_pass()
++
++
++def test_a_shared_walk_is_keyed_by_the_callers_window(kanban_home):
++    """Lanes pass different ``now``: one pass must not hand a later window the walk of an earlier one."""
++    with kbc.connect_closing() as conn:
++        helpers._blocked_behind(conn, "a")
++        now = _now(conn)
++
++        @inputs.input_pass
++        def one_pass():
++            assert BID in ksb.blocker_states(conn, now=now)
++            assert ksb.blocker_states(conn, now=now + ksb._LOOKBACK_SECONDS + 1) == {}
++            assert BID in ksb.blocker_states(conn, now=now)
++        one_pass()
++
++
++def test_held_rows_are_bounded_to_tasks_with_assertions(kanban_home):
++    with kbc.connect_closing() as conn:
++        a = helpers._blocked_behind(conn, "a")
++        b = helpers._blocked_behind(conn, "b")
++        now = _now(conn)
++        cached(conn, now)
++        path = rows._main_path(conn)
++        assert set(rows._STATES[path].tasks) == {a, b}
++        with kb.write_txn(conn):
++            conn.execute("UPDATE task_runs SET metadata = NULL WHERE task_id = ?", (a,))
++        cached(conn, now)
++        assert set(rows._STATES[path].tasks) == {b}
++
++
++def test_the_sweep_shares_one_walk_across_lanes(kanban_home, monkeypatch):
++    with kbc.connect_closing() as conn:
++        helpers._blocked_behind(conn, "a")
++        walks = []
++        real = ksb._walk
++
++        def spy(*args):
++            walks.append(1)
++            return real(*args)
++        monkeypatch.setattr(ksb, "_walk", spy)
++
++        class Result:
++            pass
++        idle.sweep_shared_blockers(conn, Result())
++        assert len(walks) == 1
++
++
++def test_foreign_among_matches_foreign_ids(kanban_home, monkeypatch):
++    from hermes_cli import kanban_wake_check as kwc
++    with kbc.connect_closing() as conn:
++        ids = [kb.create_task(conn, title=f"t{i}", assignee="default") for i in range(4)]
++        assert rows.foreign_among(conn, ids) == frozenset()   # no gateway: nothing is foreign
++        if "created_on" not in {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}:
++            conn.execute("ALTER TABLE tasks ADD COLUMN created_on TEXT")
++        monkeypatch.setattr(kwc, "own_gateway", lambda _conn: "home")
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET created_on = ? WHERE id = ?", ("worker", ids[0]))
++            conn.execute("UPDATE tasks SET created_on = ? WHERE id = ?", ("home", ids[1]))
++        assert rows.foreign_among(conn, ids) == frozenset(kwc.foreign_ids(conn)) & set(ids) == {ids[0]}
++        assert rows.foreign_among(conn, ids[1:]) == frozenset()
+diff --git a/tests/hermes_cli/test_kanban_shared_blocker_check_edges.py b/tests/hermes_cli/test_kanban_shared_blocker_check_edges.py
+index f98d03a438..44da1cf306 100644
+--- a/tests/hermes_cli/test_kanban_shared_blocker_check_edges.py
++++ b/tests/hermes_cli/test_kanban_shared_blocker_check_edges.py
+@@ -57,14 +57,27 @@ def test_older_text_stamped_assertion_does_not_join_newest_cohort(kanban_home, m
+         assert not blockers.blocker_states(conn)[WALL].is_open
+ 
+ 
+-def test_check_evidence_lands_on_home_card_when_a_foreign_card_sorts_first(kanban_home, monkeypatch, clock):
++def _own_gateway(conn, monkeypatch):
++    """Make this board a synced home (``own_gateway``) whose cards carry ``created_on`` (foreign when not ours)."""
+     from hermes_cli import kanban_wake_check as wake
+ 
++    if "created_on" not in {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}:
++        conn.execute("ALTER TABLE tasks ADD COLUMN created_on TEXT")
++    monkeypatch.setattr(wake, "own_gateway", lambda _conn: "home-gw")
++
++
++def _created_on(conn, tid, gateway):
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET created_on = ? WHERE id = ?", (gateway, tid))
++
++
++def test_check_evidence_lands_on_home_card_when_a_foreign_card_sorts_first(kanban_home, monkeypatch, clock):
+     with kbc.connect_closing() as conn:
+         first = _blocked_behind(conn, "a", blocker_id=WALL)
+         second = _blocked_behind(conn, "b", blocker_id=WALL)
+         foreign, home = sorted([first, second])
+-        monkeypatch.setattr(wake, "foreign_ids", lambda _conn: {foreign})
++        _own_gateway(conn, monkeypatch)
++        _created_on(conn, foreign, "worker-gw")
+         monkeypatch.setattr(checks, "_run_check", lambda c: (0, "recovered"))
+         clock[0] += 30
+         assert checks.run_due_checks(conn, cfg=CFG) == [WALL]
+@@ -74,15 +87,12 @@ def test_check_evidence_lands_on_home_card_when_a_foreign_card_sorts_first(kanba
+ 
+ 
+ def test_home_turning_foreign_during_check_writes_no_evidence(kanban_home, monkeypatch, clock):
+-    from hermes_cli import kanban_wake_check as wake
+-
+     with kbc.connect_closing() as conn:
+         tid = _blocked_behind(conn, "home", blocker_id=WALL)
+-        foreign = set()
+-        monkeypatch.setattr(wake, "foreign_ids", lambda _conn: set(foreign))
++        _own_gateway(conn, monkeypatch)
+ 
+         def handed_over(_command):
+-            foreign.add(tid)  # ownership moved to another gateway while the shell ran
++            _created_on(conn, tid, "worker-gw")  # ownership moved to another gateway while the shell ran
+             return 0, ""
+ 
+         monkeypatch.setattr(checks, "_run_check", handed_over)
+diff --git a/tests/hermes_cli/test_kanban_shared_blocker_checks.py b/tests/hermes_cli/test_kanban_shared_blocker_checks.py
+index b42086719f..20e37637ed 100644
+--- a/tests/hermes_cli/test_kanban_shared_blocker_checks.py
++++ b/tests/hermes_cli/test_kanban_shared_blocker_checks.py
+@@ -119,15 +119,23 @@ def test_three_errors_stop_checks_without_clearing(kanban_home, caplog):
+ 
+ 
+ def test_home_authority_uses_foreign_ids(kanban_home, monkeypatch):
++    from hermes_cli import kanban_blocker_rows as blocker_rows
+     from hermes_cli import kanban_shared_blocker_checks as checks
+     from hermes_cli import kanban_wake_check as wake
+ 
+     with kbc.connect_closing() as conn:
+         tid = _blocked_behind(conn, "foreign copy", blocker_id="test-wall")
+-        monkeypatch.setattr(wake, "foreign_ids", lambda _: {tid})
++        if "created_on" not in {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}:
++            conn.execute("ALTER TABLE tasks ADD COLUMN created_on TEXT")
++        monkeypatch.setattr(wake, "own_gateway", lambda _conn: "home-gw")
++        conn.execute("UPDATE tasks SET created_on = 'worker-gw' WHERE id = ?", (tid,))
++        conn.commit()
++        assert blocker_rows.foreign_among(conn, [tid]) == {tid}
+         assert checks.run_due_checks(conn, cfg=_cfg("exit 0")) == []
+         assert not [e for e in kb.list_events(conn, tid) if e.kind == checks.CHECK_EVENT]
+-        monkeypatch.setattr(wake, "foreign_ids", lambda _: set())
++        conn.execute("UPDATE tasks SET created_on = 'home-gw' WHERE id = ?", (tid,))
++        conn.commit()
++        assert blocker_rows.foreign_among(conn, [tid]) == frozenset()
+         assert checks.run_due_checks(conn, cfg=_cfg("exit 0")) == ["test-wall"]
+ 
+ 
+-- 
+2.43.0
+

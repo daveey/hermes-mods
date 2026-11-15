@@ -1,0 +1,79 @@
+From 27aa6fad1b762825347bce9781045fb258303033 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 23:54:53 +0000
+Subject: [PATCH] [daveey] Wait for gateway lease metadata publication in
+ handoff test
+
+The real flock is acquired before _become_holder publishes held metadata. The old test waited only for _held and could read the prior serve release record. _drop writes before unlock, so this is fixture readiness rather than a release overwrite.
+
+Keep production ordering unchanged. Await the parsed gateway-held snapshot and retain PID, role, held, serve release, real lease and next-index publication assertions. Exercise ordinary scheduling and an Event-gated writer that forces observation of the stale release record.
+
+Proof: exact historical test and production bytes match current main; controlled writer/read handshake reproduces original False is True assertion twice (including runner retry), then passes with readiness fix. Canonical remote-index plus host-loop-lease suites passed three runs, 43 tests each; scripts/check --base origin/main passed.
+---
+ tests/tui_gateway/test_kanban_remote_index.py | 32 +++++++++++++++++--
+ 1 file changed, 30 insertions(+), 2 deletions(-)
+
+diff --git a/tests/tui_gateway/test_kanban_remote_index.py b/tests/tui_gateway/test_kanban_remote_index.py
+index a4a523b8d4..8a2367824e 100644
+--- a/tests/tui_gateway/test_kanban_remote_index.py
++++ b/tests/tui_gateway/test_kanban_remote_index.py
+@@ -409,12 +409,24 @@ def test_holder_backoff_restarts_on_a_new_replica_stamp(tmp_path, monkeypatch):
+         thread.join(5)
+ 
+ 
+-def test_serve_holder_hands_the_lease_to_a_gateway_claim_in_the_same_process(tmp_path, monkeypatch):
++@pytest.mark.parametrize("delay_metadata", [False, True], ids=["ordinary", "held-before-metadata"])
++def test_serve_holder_hands_the_lease_to_a_gateway_claim_in_the_same_process(tmp_path, monkeypatch, delay_metadata):
+     """Two real ``HostLoopLease`` objects in one process: the serve refresher holds, a gateway claim stops it, its
+     ``release()`` unlocks, and the gateway lease's blocked ``LOCK_EX`` waiter becomes the holder and publishes."""
+     import agent.memory_provider as mp
+     from hermes_cli import host_loop_lease as hll
+ 
++    metadata_observed = threading.Event()
++    real_write = hll.HostLoopLease._write_meta
++
++    def write_meta(lease, *, held):
++        if delay_metadata and lease.role == "gateway" and held:
++            # Hold the actual acquisition-to-publication gap until the reader
++            # observes it, rather than hoping thread scheduling exposes it.
++            assert metadata_observed.wait(15)
++        real_write(lease, held=held)
++
++    monkeypatch.setattr(hll.HostLoopLease, "_write_meta", write_meta)
+     monkeypatch.setenv("HERMES_HUB_STATE", str(tmp_path))
+     replica, _ = _home(tmp_path, _cards())
+     ledger = krn.ledger_path()
+@@ -439,13 +451,29 @@ def test_serve_holder_hands_the_lease_to_a_gateway_claim_in_the_same_process(tmp
+         serve_thread.join(15)
+         assert not serve_thread.is_alive() and not serve._held  # the serve refresher stopped and released
+         wait_until(lambda: gateway._held, timeout=15, what="the gateway lease takes over the released lock")
+-        meta = json.loads(gateway.path.read_text())
++        # _held describes the acquired flock, not completion of _become_holder's
++        # subsequent metadata write. Observe publication before asserting its fields.
++        meta = {}
++
++        def gateway_metadata_published():
++            nonlocal meta
++            try:
++                meta = json.loads(gateway.path.read_text())
++            except json.JSONDecodeError:  # lock-free reader may overlap an in-place write
++                return False
++            if delay_metadata and not metadata_observed.is_set():
++                assert meta["held"] is False and meta["role"] == "serve"
++            metadata_observed.set()
++            return meta.get("held") is True and meta.get("role") == "gateway"
++
++        wait_until(gateway_metadata_published, timeout=15, what="gateway lease metadata publication")
+         assert meta["held"] is True and meta["role"] == "gateway" and meta["pid"] == os.getpid()
+         assert not gateway._waiting
+         _add(replica, _linked("t_new", CHAT), 50)  # the gateway refresher publishes the next state
+         wait_until(lambda: kri.published_key(ledger) == kri.replica_key(replica), timeout=15,
+                    what="gateway publish")
+     finally:
++        metadata_observed.set()
+         kri.reset()
+         for thread, _lease in spawned:
+             thread.join(15)
+-- 
+2.43.0
+

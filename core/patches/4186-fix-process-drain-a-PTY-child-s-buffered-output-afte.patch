@@ -1,0 +1,188 @@
+From 863b5272d8c8a27c3d1f845a17fd1741da324322 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 14:33:56 +0000
+Subject: [PATCH] fix(process): drain a PTY child's buffered output after it
+ exits [daveey]
+
+The PTY reader loop ran `while pty.isalive()`, and isalive() turns False as soon as
+the child is reaped. A reader thread starved of CPU from spawn to the child's exit
+therefore left the loop without reading anything and published an exited session
+with an empty output, though the child's bytes were still in the master buffer.
+
+That is the CI flake of
+tests/tools/test_process_registry.py::TestStdinHelpers::test_close_stdin_allows_eof_driven_process_to_finish
+(run 43582221114, job 132409314320: exit_code 0, `assert 'hello' in ''`).
+
+Five whys:
+1. The poll returned exited/0 with output_preview == "" -> the reader never ingested the child's output.
+2. It never read it -> the loop condition isalive() was already False on the reader's first check.
+3. isalive() was False -> the child had written "hello" and exited before the reader thread ran.
+4. The reader still exited the loop -> nothing drained the master after the loop; only the decoder tail was flushed.
+5. No drain existed -> the loop assumed it would always observe output before exit, true only on a quiet host.
+
+Fix: after the loop (POSIX), read whatever the master holds right now through the
+shared fd_wait selector with a zero timeout, capped at the existing
+_FINAL_DRAIN_MAX_CHARS. Only already-readable bytes are read, so a descendant that
+keeps the slave open cannot hold up completion. Chunk handling (query responder,
+decoder, ingest) moved into one local function shared by the loop and the drain;
+tools/process_registry.py stays at its line count.
+
+Proof:
+- tests/tools/test_process_registry_pty_drain.py gates the reader's first isalive()
+  until the child has exited (os.waitid WNOWAIT, child stays unreaped): RED on base
+  with the exact CI assertion `assert 'hello' in ''`, GREEN with the fix.
+- process_registry, pty_kill, submit, write_stdin_surrogates, completion_races,
+  pty_query_responder and the new file: 147 passed, 4 skipped.
+- SIGSTOP/SIGCONT duty-cycle (40 ms run / 160 ms stop) of the original test: 12/12 pass.
+- scripts/check --base origin/main: ok.
+---
+ .../tools/test_process_registry_pty_drain.py  | 48 +++++++++++++++++++
+ tools/process_registry.py                     | 32 ++++++-------
+ tools/process_registry_pty_drain.py           | 32 +++++++++++++
+ 3 files changed, 96 insertions(+), 16 deletions(-)
+ create mode 100644 tests/tools/test_process_registry_pty_drain.py
+ create mode 100644 tools/process_registry_pty_drain.py
+
+diff --git a/tests/tools/test_process_registry_pty_drain.py b/tests/tools/test_process_registry_pty_drain.py
+new file mode 100644
+index 0000000000..d0ea3542b0
+--- /dev/null
++++ b/tests/tools/test_process_registry_pty_drain.py
+@@ -0,0 +1,48 @@
++"""A PTY session keeps the output its child wrote before the reader thread first ran [daveey].
++
++``PtyProcess.isalive()`` turns False once the child is reaped, so a reader starved of CPU from spawn to
++the child's exit used to leave its loop without reading anything and publish an exited session with an
++empty output (CI flake of ``TestStdinHelpers.test_close_stdin_allows_eof_driven_process_to_finish``:
++``assert 'hello' in ''``). The reader now drains what the master already holds before it records the exit.
++"""
++
++from __future__ import annotations
++
++import os
++import shlex
++import sys
++
++import pytest
++from ptyprocess import PtyProcess
++
++from tests.waiting import wait_until
++from tools.process_registry import ProcessRegistry
++
++
++@pytest.fixture
++def registry(monkeypatch):
++    monkeypatch.setattr("hermes_cli.process_identity._update_supervised_pgids", lambda verb, pgids: None)
++    return ProcessRegistry()
++
++
++@pytest.mark.platforms("linux")
++def test_reader_that_first_runs_after_child_exit_keeps_its_output(registry, tmp_path, monkeypatch):
++    real_isalive = PtyProcess.isalive
++    gated = set()
++
++    def isalive_after_exit(self):
++        # Hold the reader's first liveness check until the child has exited (WNOWAIT leaves it
++        # unreaped for ptyprocess): the schedule of a reader starved from spawn to exit.
++        if self.pid not in gated:
++            gated.add(self.pid)
++            os.waitid(os.P_PID, self.pid, os.WEXITED | os.WNOWAIT)
++        return real_isalive(self)
++
++    monkeypatch.setattr(PtyProcess, "isalive", isalive_after_exit)
++    command = f"{shlex.quote(sys.executable)} -c \"print('hello')\""
++    session = registry.spawn_local(command, cwd=str(tmp_path), use_pty=True)
++
++    poll = wait_until(lambda: (p := registry.poll(session.id))["status"] == "exited" and p,
++                      timeout=30, what="PTY session exited")
++    assert poll["exit_code"] == 0
++    assert "hello" in poll["output_preview"]
+diff --git a/tools/process_registry.py b/tools/process_registry.py
+index e3e5292201..bf1ebbee82 100644
+--- a/tools/process_registry.py
++++ b/tools/process_registry.py
+@@ -1458,27 +1458,27 @@ class ProcessRegistry(ProcessObligationMixin, ProcessTerminationMixin, ProcessCh
+             # but leave the killed session's output as the kill reported it.
+             self._ingest_output(session, text, unless_exited=True)
+ 
++        def handle(chunk) -> None:  # ptyprocess returns bytes; pywinpty returns str
++            if responder is not None and isinstance(chunk, bytes):
++                chunk, replies = responder.process(chunk)
++                if replies:
++                    try:
++                        pty.write(replies)
++                    except Exception:
++                        logger.debug("PTY query response write failed", exc_info=True)
++            if text := (chunk if isinstance(chunk, str) else decoder.decode(chunk)):
++                ingest(text)
++
+         try:
+             while pty.isalive():
+                 try:
+-                    chunk = pty.read(4096)
+-                    if chunk:
+-                        # ptyprocess returns bytes; pywinpty returns str
+-                        if responder is not None and isinstance(chunk, bytes):
+-                            chunk, replies = responder.process(chunk)
+-                            if replies:
+-                                try:
+-                                    pty.write(replies)
+-                                except Exception:
+-                                    logger.debug(
+-                                        "PTY query response write failed",
+-                                        exc_info=True,
+-                                    )
+-                        text = chunk if isinstance(chunk, str) else decoder.decode(chunk)
+-                        if text:
+-                            ingest(text)
++                    if chunk := pty.read(4096):
++                        handle(chunk)
+                 except Exception:  # EOFError included
+                     break
++            if not _IS_WINDOWS:  # the child can exit (isalive False) before a starved reader read it
++                from tools.process_registry_pty_drain import drain_exited_pty
++                drain_exited_pty(pty, handle, _FINAL_DRAIN_MAX_CHARS)
+         except Exception as e:
+             logger.debug("PTY stdout reader ended: %s", e)
+         if responder is not None:
+diff --git a/tools/process_registry_pty_drain.py b/tools/process_registry_pty_drain.py
+new file mode 100644
+index 0000000000..c7057cb114
+--- /dev/null
++++ b/tools/process_registry_pty_drain.py
+@@ -0,0 +1,32 @@
++"""Final drain of a PTY master after its child exits.
++
++``PtyProcess.isalive()`` turns False the moment the child is reaped, which can be before the reader
++thread has read anything the child wrote: a reader starved of CPU from spawn to exit used to leave the
++loop with the whole output still in the master's buffer and publish an exited session with no output.
++"""
++
++from tools.environments.fd_wait import open_fd_waiter
++
++
++def drain_exited_pty(pty, handle_chunk, max_bytes: int) -> None:
++    """Read what the master holds right now, without blocking. A descendant that keeps the slave open
++    must not hold up completion, so only already-readable bytes are read, at most *max_bytes* of them."""
++    fd = getattr(pty, "fd", None)
++    if not isinstance(fd, int) or fd < 0:
++        return
++    waiter = open_fd_waiter(fd)
++    if waiter is None:
++        return
++    drained = 0
++    try:
++        while drained < max_bytes and waiter.wait(0):
++            try:
++                chunk = pty.read(4096)
++            except (EOFError, OSError):  # EIO: the slave side is closed and the buffer is empty
++                return
++            if not chunk:
++                return
++            drained += len(chunk)
++            handle_chunk(chunk)
++    finally:
++        waiter.close()
+-- 
+2.43.0
+

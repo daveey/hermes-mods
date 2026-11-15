@@ -1,0 +1,150 @@
+From a60b0d27dc30a9631e497bc66c50efe45e19a381 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 23:21:58 +0000
+Subject: [PATCH] [daveey] Prove ready-floor numeric type-key equivalence
+
+Counter-analysis: run-end timestamps normalize to int and unused-grant classification treats equal numeric scalars identically. Add warm/cold/output-type and diagnostic coverage across all run-dependent fields without changing production semantics.
+
+Proof: five history suites 132 passed, zero skips on GREEN and exact drop-type-key mutant. Positive float-output control: 58 assertion failures, 8 passed, zero skips. scripts/check: 20 checks passed. Document equivalent-mutant boundary rather than inventing float output semantics.
+---
+ docs/ready-floor-type-key-counter-analysis.md | 79 +++++++++++++++++++
+ .../test_kanban_history_ready_reductions.py   | 37 +++++++++
+ 2 files changed, 116 insertions(+)
+ create mode 100644 docs/ready-floor-type-key-counter-analysis.md
+
+diff --git a/docs/ready-floor-type-key-counter-analysis.md b/docs/ready-floor-type-key-counter-analysis.md
+new file mode 100644
+index 0000000000..e7a321a4a6
+--- /dev/null
++++ b/docs/ready-floor-type-key-counter-analysis.md
+@@ -0,0 +1,79 @@
++# Ready-floor type-key counter-analysis
++
++The `drop-type-key` mutation replaces `(name, type(value), value)` with
++`(name, object, value)` in `EventHistory.ready_floor`. It is behaviorally equivalent
++for the current production scalar run snapshots, not a missing float-output test.
++No production change is proposed here.
++
++## Why equal int/float snapshots cannot change the floor
++
++The cache admits only exact `str`, `int`, `float`, `bytes` and `NoneType` values.
++Booleans, subclasses and mutable metadata take the uncached fallback. Among
++admitted values the cross-type equality relevant here is int/float equality.
++
++The reduction has just two run-dependent operations:
++
++* `unused_grant_run_ids` groups by run ID using normal dictionary/set equality,
++  so equal numeric IDs already identify the same events. Its classifier tests
++  status/outcome against strings, checks timestamps/worker fields for `None`,
++  tests summary/error truthiness, and parses metadata. Equal int/float values
++  give the same answers: numeric metadata is not the required JSON object.
++  The `unused_grant is True` predicate applies to parsed metadata, not an admitted
++  bool scalar in the cache key.
++* `_last_run_end_ts` passes each end through `kanban_db._to_epoch` (numeric values
++  become `int`) and explicitly returns `int(max(...))`. Equal finite numeric ends
++  therefore yield the same value **and type**. Non-finite floats do not equal any
++  integer; changing them into a different type cannot create this collision.
++
++The event snapshot is unchanged while run snapshots change. Event-derived
++candidates and the filtered event set consequently remain unchanged too. The
++source comment claiming `100` versus `100.0` would change the floor type is
++inaccurate for this reduction. Keeping that comment/key unchanged avoids turning
++this investigation into a product optimization.
++
++## Consumer boundary
++
++`EventHistory.ready_floor` is called by `_last_ready_entry_ts`. Its production
++callers are the stranded-ready and assigned-ready diagnostic rules in
++`kanban_diagnostics.py`, and `kanban_parent_unclaimed.ready_since`. The latter
++passes an ordinary event list and additionally casts the result to `int`; it
++does not use this cache. No production reader inspects the private cache key.
++Thus skipping a recomputation for equal int/float snapshots does not change a
++production result. This is not a promise about future reducers or arbitrary
++custom objects, nor a recommendation to remove the type key.
++
++## Executable evidence
++
++`test_ready_floor_equal_numeric_snapshots_are_behaviorally_equivalent` in
++`tests/plugins/test_kanban_history_ready_reductions.py` exercises all eleven
++run fields read by the reduction, at zero, matching run ID and a later timestamp,
++with ordinary and unused-grant runs. Each case reuses one EventHistory through
++int → float → int snapshots, comparing its floor value and exact type to both a
++cold EventHistory and the uncached list path, and compares visible diagnostics.
++
++At base `eb7c3bfb240cc839ba68267e48f2042d6fe87d51`:
++
++| Variant | Result | Skips |
++| --- | --- | --- |
++| Unmodified production code, five history suites | 132 passed | 0 |
++| Exact `drop-type-key` mutation, same five suites | 132 passed | 0 |
++| Positive control: `_last_run_end_ts` returns `float(max(...))` instead of `int(max(...))`; new matrix only | 58 assertion failures, 8 passed | 0 |
++
++The positive control fails the exact output-type assertion, demonstrating that
++the test observes type behavior rather than just comparing numerically equal
++outputs. It is **not** a claimed kill of `drop-type-key`. All mutations were
++restored; the committed change contains tests and this analysis only.
++
++Run with `HERMES_TEST_FILE_RETRIES=0 bash scripts/run_tests.sh` and these files:
++
++* `tests/plugins/test_kanban_board_history.py`
++* `tests/plugins/test_kanban_event_marks.py`
++* `tests/plugins/test_kanban_history_ready_reductions.py`
++* `tests/plugins/test_kanban_history_reductions.py`
++* `tests/plugins/test_kanban_run_history.py`
++
++Use a separate `--junitxml` path for each file when collecting skip counts: the
++parallel runner forwards a shared path to every subprocess, so a shared XML path
++contains only the last writer's results. The positive control can be selected
++with `-k equal_numeric` on the ready-reductions file. Run mutations only in an
++isolated worktree and restore production files before publication.
+diff --git a/tests/plugins/test_kanban_history_ready_reductions.py b/tests/plugins/test_kanban_history_ready_reductions.py
+index 58bd6c34c1..0c08490efc 100644
+--- a/tests/plugins/test_kanban_history_ready_reductions.py
++++ b/tests/plugins/test_kanban_history_ready_reductions.py
+@@ -65,6 +65,43 @@ def test_ready_floor_key_distinguishes_equal_values_of_other_types():
+         assert (actual, type(actual)) == (expected, type(expected))
+ 
+ 
++@pytest.mark.parametrize('field', [
++    'id', 'ended_at', 'worker_pid', 'worker_started_at', 'last_heartbeat_at',
++    'claim_lock', 'summary', 'error', 'status', 'outcome', 'metadata',
++])
++@pytest.mark.parametrize('number', [0, 7, 300])
++@pytest.mark.parametrize('unused', [False, True])
++def test_ready_floor_equal_numeric_snapshots_are_behaviorally_equivalent(field, number, unused):
++    # Counter-analysis for drop-type-key: run ends are normalized to int, and
++    # grant classification uses equality, truthiness and None/True identity.
++    # Keep one history warm through int -> float -> int, not three cold caches.
++    rows = [
++        {'kind': 'unblocked', 'created_at': 10},
++        {'kind': 'claimed', 'created_at': 100, 'run_id': 7},
++        {'kind': 'released', 'created_at': 200, 'run_id': 7,
++         'payload': '{"unused_grant":true}'},
++    ]
++    history = EventHistory(rows)
++    base = {'id': 7, 'status': 'released' if unused else 'done',
++            'outcome': 'released' if unused else 'completed', 'ended_at': 300,
++            'metadata': '{"unused_grant":true}' if unused else '{}'}
++    task = {'id': 't', 'status': 'ready', 'assignee': 'worker', 'created_at': 1}
++    floors, diagnostics = [], []
++    for value in (number, float(number), number):
++        runs = (MappingProxyType(dict(base, **{field: value})),)
++        uncached = kd._last_ready_entry_ts(rows, runs)
++        cold = kd._last_ready_entry_ts(EventHistory(rows), runs)
++        warm = kd._last_ready_entry_ts(history, runs)
++        assert type(uncached) is type(cold) is type(warm) is int
++        assert warm == cold == uncached
++        floors.append(warm)
++        actual = kd.compute_task_diagnostics(task, history, list(runs), now=10000)
++        assert actual == kd.compute_task_diagnostics(task, rows, list(runs), now=10000)
++        diagnostics.append(actual)
++    assert floors[0] == floors[1] == floors[2]
++    assert diagnostics[0] == diagnostics[1] == diagnostics[2]
++
++
+ def test_assigned_ready_run_mutations_change_visible_diagnostic():
+     events = EventHistory([{'kind': 'unblocked', 'created_at': 10}])
+     task = {'id': 't', 'status': 'ready', 'assignee': 'worker', 'created_at': 1}
+-- 
+2.43.0
+

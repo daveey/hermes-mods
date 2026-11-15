@@ -1,0 +1,312 @@
+From 32e62c7da0a8b58d3ea1eb002b348ea595382316 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 09:38:27 +0000
+Subject: [PATCH] fix(kanban): surface custody warnings in kanban_complete;
+ drop executor-local attachment_path [daveey]
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Live proof t_01a1d95bebb9b7a8 (home worker-8, executed worker-3) of PR #2910 showed two gaps:
+
+1. The completing worker never saw its artifact_receipt warnings: the kanban_complete
+   result carried only `attachments`, so a missing declared file ("File missing or not a
+   regular file on executing machine") was silent until someone read the receipt.
+   The result now also carries `artifact_receipt` and `artifact_warnings`
+   (`machine:path — warning` lines) read from the completed event.
+
+2. Receipt records stored `attachment_path`, the executor's flat
+   `attachments/<task>/<name>` path, while the home keeps the bytes under
+   `attachments/<task>/<attachment_uid>/<name>`. New receipts no longer store it
+   (staging keeps the local mapping in a private dict); readers already resolve by
+   attachment_id/attachment_uid. The legacy `artifacts` list keeps its executor-local
+   path (executor-local consumers such as review handoff uploads read it), but the
+   worker-context handoff display now machine-qualifies those paths (`worker-3:/...`) and
+   hides `attachment_path` on older records. Old records are not rewritten.
+
+Tests: tests/tools/test_kanban_complete_artifact_warnings.py (3 new) and the updated
+receipt test fail on origin/main (4 failures) and pass here; 41 files importing the
+touched modules: 891 passed, 0 failed, 0 skipped. scripts/check --base origin/main ok.
+---
+ hermes_cli/kanban_artifact_receipt.py         | 52 ++++++++++--
+ hermes_cli/kanban_db_context.py               |  5 +-
+ hermes_cli/kanban_metadata_files.py           |  6 +-
+ .../test_kanban_artifact_custody_bounds.py    |  5 +-
+ .../test_kanban_receipt_artifacts.py          |  4 +-
+ .../test_kanban_complete_artifact_warnings.py | 83 +++++++++++++++++++
+ tools/kanban_tools.py                         |  5 +-
+ website/docs/user-guide/features/kanban.md    |  2 +-
+ 8 files changed, 148 insertions(+), 14 deletions(-)
+ create mode 100644 tests/tools/test_kanban_complete_artifact_warnings.py
+
+diff --git a/hermes_cli/kanban_artifact_receipt.py b/hermes_cli/kanban_artifact_receipt.py
+index 5a0f1254e3..c60ae78a7d 100644
+--- a/hermes_cli/kanban_artifact_receipt.py
++++ b/hermes_cli/kanban_artifact_receipt.py
+@@ -7,6 +7,45 @@ import socket
+ from pathlib import Path
+ 
+ 
++def warnings(records) -> list[str]:
++    """``machine:path — warning`` lines the completing worker must see."""
++    if not isinstance(records, list):
++        return []
++    return [f"{r.get('machine')}:{r.get('path')} — {r['warning']}"
++            for r in records if isinstance(r, dict) and r.get("warning")]
++
++
++def completion_custody(events) -> dict:
++    """The kanban_complete result's receipt plus its warnings, surfaced to the worker."""
++    custody = latest_receipt(events)
++    return {**custody, "artifact_warnings": warnings(custody["artifact_receipt"])}
++
++
++def display_metadata(metadata):
++    """Handoff display copy: executor-local paths name their machine.
++
++    Receipt attachments resolve by ``attachment_uid`` on every replica; a bare
++    executor-local path (legacy ``artifacts``, or the ``attachment_path`` older
++    receipts stored) misleads a reader on another machine.
++    """
++    records = metadata.get("artifact_receipt") if isinstance(metadata, dict) else None
++    if not isinstance(records, list):
++        return metadata
++    machines = {r.get("machine") for r in records if isinstance(r, dict) and r.get("machine")}
++    if len(machines) != 1:
++        return metadata
++    (machine,) = machines
++    shown = dict(metadata)
++    shown["artifact_receipt"] = [
++        {k: v for k, v in r.items() if k != "attachment_path"} if isinstance(r, dict) else r
++        for r in records]
++    artifacts = metadata.get("artifacts")
++    if isinstance(artifacts, list):
++        shown["artifacts"] = [f"{machine}:{p}" if isinstance(p, str) and p.startswith(("/", "~")) else p
++                              for p in artifacts]
++    return shown
++
++
+ def latest_receipt(events) -> dict:
+     """Expose custody independently of truncated event-history views."""
+     for event in reversed(events):
+@@ -140,12 +179,14 @@ def _large(conn, task_id: str, source: Path, stat, record: dict, staged: list[Pa
+ 
+ 
+ def record_files(conn, task_id: str, metadata: dict, originals: list[str], now: int,
+-                 staged: list[Path], *, uploaded_by: str, relocated: dict[str, str]) -> None:
++                 staged: list[Path], *, uploaded_by: str, relocated: dict[str, str],
++                 local_copies: dict[str, str] | None = None) -> None:
+     """Attach small external files through the same byte-sync as scratch copies.
+ 
+-    The generated receipt never rewrites an observed evidence identity. A local
+-    attachment path is useful only alongside its machine; attachment_uid locates
+-    the bytes on another replica after normal Board blob synchronization.
++    The generated receipt never rewrites an observed evidence identity. The
++    executor-local attachment path goes only to ``local_copies`` (this staging
++    pass), never into the receipt: attachment_uid locates the bytes on another
++    replica after normal Board blob synchronization.
+     ``role`` separates declared deliverables (``artifact``, uploaded to chat)
+     from ``evidence`` refs (custody only). Free-text evidence that names no file
+     gets no record. Files over the attachment cap are never read here (``_large``).
+@@ -203,7 +244,8 @@ def record_files(conn, task_id: str, metadata: dict, originals: list[str], now:
+             record["attachment_id"] = row["id"]
+             if "uid" in row.keys():
+                 record["attachment_uid"] = row["uid"]
+-            record["attachment_path"] = row["stored_path"]
++            if local_copies is not None:
++                local_copies[raw] = row["stored_path"]
+             with source.open("rb") as stream:
+                 record["sha256"] = hashlib.file_digest(stream, "sha256").hexdigest()
+         except (OSError, kb.ArtifactPreservationError) as exc:
+diff --git a/hermes_cli/kanban_db_context.py b/hermes_cli/kanban_db_context.py
+index ca1f969a7d..2545215f40 100644
+--- a/hermes_cli/kanban_db_context.py
++++ b/hermes_cli/kanban_db_context.py
+@@ -67,8 +67,11 @@ def _ctx_stamp(ts: int, now: int) -> str:
+ def _ctx_metadata_line(metadata: Any) -> Optional[str]:
+     if not metadata:
+         return None
++    from hermes_cli.kanban_artifact_receipt import display_metadata
++
+     try:
+-        return f"_metadata_: `{_ctx_cap(json.dumps(metadata, ensure_ascii=False, sort_keys=True))}`"
++        shown = display_metadata(metadata)
++        return f"_metadata_: `{_ctx_cap(json.dumps(shown, ensure_ascii=False, sort_keys=True))}`"
+     except Exception:
+         return None
+ 
+diff --git a/hermes_cli/kanban_metadata_files.py b/hermes_cli/kanban_metadata_files.py
+index 042ca0c335..3022234004 100644
+--- a/hermes_cli/kanban_metadata_files.py
++++ b/hermes_cli/kanban_metadata_files.py
+@@ -267,11 +267,11 @@ def stage_completion_artifacts(
+     metadata.pop(SKIPPED_KEY, None)
+     metadata.pop("_staged_artifacts", None)
+     with discard_on_error(staged):
++        mapping: dict[str, str] = {}
+         record_files(conn, task_id, metadata, originals, now, staged,
+-                     uploaded_by=uploaded_by, relocated={})
++                     uploaded_by=uploaded_by, relocated={}, local_copies=mapping)
+         records = metadata.get("artifact_receipt", [])
+-        mapping = {r["path"]: r.get("attachment_path", r.get("retained_path"))
+-                   for r in records if r.get("attachment_path") or r.get("retained_path")}
++        mapping.update({r["path"]: r["retained_path"] for r in records if r.get("retained_path")})
+         known = {str(Path(raw).expanduser().resolve()): kept for raw, kept in mapping.items()}
+         if "artifacts" in metadata:
+             metadata["artifacts"] = [mapping.get(raw, raw) for raw in cleaned_artifact_paths(metadata)]
+diff --git a/tests/hermes_cli/test_kanban_artifact_custody_bounds.py b/tests/hermes_cli/test_kanban_artifact_custody_bounds.py
+index 3af9acb2ba..06cb4ef962 100644
+--- a/tests/hermes_cli/test_kanban_artifact_custody_bounds.py
++++ b/tests/hermes_cli/test_kanban_artifact_custody_bounds.py
+@@ -180,8 +180,11 @@ def test_custody_copies_land_on_the_tasks_board(kanban_home, monkeypatch, tmp_pa
+         assert kb.complete_task(conn, task, summary="Report", expected_run_id=run,
+                                 metadata={"artifacts": [str(p) for p in sources]})
+         records = kb.latest_run(conn, task).metadata["artifact_receipt"]
++        # Receipts carry no executor-local attachment_path: resolve by attachment_id.
++        stored = {row["id"]: row["stored_path"] for row in conn.execute(
++            "SELECT id, stored_path FROM task_attachments WHERE task_id=?", (task,))}
+     root = kb.attachments_root(board="other").resolve()
+-    kept = [r.get("attachment_path") or r.get("retained_path") for r in records]
++    kept = [stored.get(r.get("attachment_id")) or r.get("retained_path") for r in records]
+     kept = [Path(p).resolve() for p in kept if p]
+     assert kept and all(p.is_relative_to(root) for p in kept), (kept, root)
+ 
+diff --git a/tests/hermes_cli/test_kanban_receipt_artifacts.py b/tests/hermes_cli/test_kanban_receipt_artifacts.py
+index 91250a2002..2232ad3d32 100644
+--- a/tests/hermes_cli/test_kanban_receipt_artifacts.py
++++ b/tests/hermes_cli/test_kanban_receipt_artifacts.py
+@@ -47,7 +47,9 @@ def test_exact_receipt_records_missing_or_attaches_beyond_incidental_budget(kanb
+         record = meta["artifact_receipt"][0]
+         assert record["path"] == str(report)
+         if exists:
+-            assert Path(record["attachment_path"]).read_text() == "exceeds incidental cap"
++            assert "attachment_path" not in record  # readers resolve by attachment id/uid
++            (row,) = [a for a in kb.list_attachments(conn, task) if a.id == record["attachment_id"]]
++            assert Path(row.stored_path).read_text() == "exceeds incidental cap"
+             assert "warning" not in record
+         else:
+             assert "missing" in record["warning"].lower()
+diff --git a/tests/tools/test_kanban_complete_artifact_warnings.py b/tests/tools/test_kanban_complete_artifact_warnings.py
+new file mode 100644
+index 0000000000..313c8ddf6b
+--- /dev/null
++++ b/tests/tools/test_kanban_complete_artifact_warnings.py
+@@ -0,0 +1,83 @@
++"""kanban_complete shows its own custody warnings; displays never offer a foreign flat path."""
++if not __name__.startswith("tests."):
++    raise ImportError("Use scripts/run_tests.sh; unittest discovery bypasses test isolation")
++
++import json
++
++from tests.tools import test_kanban_tools as helpers
++
++worker_env = helpers.worker_env
++
++MISSING = "File missing or not a regular file on executing machine"
++
++
++def _scratch(worker_env):
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from hermes_cli import kanban_db_workspace as kbw
++
++    with kbc.connect() as conn:
++        ws = kbw.resolve_workspace(kb.get_task(conn, worker_env))
++        kbw.set_workspace_path(conn, worker_env, ws)
++    return ws
++
++
++def test_complete_result_surfaces_receipt_warnings(worker_env, tmp_path):
++    """The live proof's worker read only the tool result and saw no missing-file warning."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from tools import kanban_tools as kt
++
++    present = _scratch(worker_env) / "artifact-proof.txt"
++    present.write_text("proof")
++    missing = tmp_path / "does-not-exist-proof.txt"
++
++    out = json.loads(kt._handle_complete({
++        "summary": "done", "artifacts": [str(present), str(missing)]}))
++
++    assert out["ok"] is True, out
++    with kbc.connect() as conn:
++        stored = kb.latest_run(conn, worker_env).metadata["artifact_receipt"]
++    assert out["artifact_receipt"] == stored
++    machine = stored[0]["machine"]
++    assert out["artifact_warnings"] == [f"{machine}:{missing} — {MISSING}"]
++
++
++def test_complete_result_has_no_warnings_when_all_files_kept(worker_env):
++    from tools import kanban_tools as kt
++
++    present = _scratch(worker_env) / "kept.txt"
++    present.write_text("kept")
++    out = json.loads(kt._handle_complete({"summary": "done", "artifacts": [str(present)]}))
++    assert out["ok"] is True, out
++    assert out["artifact_warnings"] == []
++    assert [r["path"] for r in out["artifact_receipt"]] == [str(present)]
++
++
++def test_receipt_resolves_by_uid_and_handoff_display_is_machine_qualified(worker_env, tmp_path):
++    """The executor's flat attachment path is not where another replica keeps the bytes."""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    from tools import kanban_tools as kt
++
++    report = tmp_path / "artifact-proof.txt"
++    report.write_text("proof")
++    with kbc.connect() as conn:
++        child = kb.create_task(conn, title="downstream", assignee="test-worker", parents=[worker_env])
++    out = json.loads(kt._handle_complete({"summary": "done", "artifacts": [str(report)]}))
++    assert out["ok"] is True, out
++
++    with kbc.connect() as conn:
++        meta = kb.latest_run(conn, worker_env).metadata
++        record = meta["artifact_receipt"][0]
++        assert "attachment_path" not in record
++        (row,) = kb.list_attachments(conn, worker_env)
++        assert record["attachment_id"] == row.id
++        flat = meta["artifacts"][0]
++        assert flat == row.stored_path  # executor-local legacy consumers keep their local copy
++        context = kb.build_worker_context(conn, child)
++
++    machine = record["machine"]
++    assert json.dumps(f"{machine}:{flat}") in context
++    assert json.dumps(flat) not in context
++    assert "attachment_path" not in context
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index b27d48d7ad..8233c50a71 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -968,11 +968,12 @@ def _handle_complete(args: dict, **kw) -> str:
+         # Artifact staging is atomic with the completion write, so a worker that
+         # read `kanban_attachments` before completing saw an empty list and has
+         # no way to observe what its completion just registered (#117360).
+-        # Report the card's durable attachment set in the result.
++        # Report the card's durable attachment set and custody warnings in the result.
++        from hermes_cli.kanban_artifact_receipt import completion_custody
+         return _ok(task_id=tid, run_id=run.id if run else None,
+                    attachments=[
+                        _fields(a, _ATTACHMENT_FIELDS)
+-                       for a in kb.list_attachments(conn, tid)])
++                       for a in kb.list_attachments(conn, tid)], **completion_custody(kb.list_events(conn, tid)))
+ 
+ 
+ def _awaiting_arg(args: dict, wake: tuple) -> tuple[Optional[dict], tuple]:
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index 447beb01db..a28460649e 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -213,7 +213,7 @@ They also coexist inside one run. A kanban task executes in an isolated managed
+ - **Link** — `task_links` row recording a parent → child dependency. The dispatcher promotes `todo → ready` when all parents are `done`. Adding a link to a running child is rejected because it cannot gate work already claimed; the one exception is an active worker linking its own card, with dispatcher-provided run ownership, immediately before a dependency-block handoff.
+ - **Comment** — the inter-agent protocol. Agents and humans append comments; when a worker is (re-)spawned it reads the full comment thread as part of its context.
+ - **Workspace** — the directory a worker operates in. Three kinds:
+-  - `scratch` (default) — fresh tmp dir under `~/.hermes/kanban/workspaces/<id>/` (or `~/.hermes/kanban/boards/<slug>/workspaces/<id>/` on non-default boards). **Deleted when the task completes** — scratch is ephemeral by design. Files explicitly declared through `kanban_complete(artifacts=[...])` or `kanban_request_review(artifacts=[...])` are copied into durable per-task attachment storage before cleanup (a review handoff stages them at handoff time, since the reviewer's later completion is what deletes the scratch workspace); existing deliverable paths in legacy completion summaries receive the same treatment. Other scratch files are removed. Completion records a machine-qualified `artifact_receipt` for declared artifacts and absolute file paths in completion evidence. Missing paths, including scratch paths, produce visible warnings rather than a file-delivery claim; failures preserving existing scratch bytes still keep the task in-flight. Files up to 25 MB are copied into card attachments even when outside scratch and replicated to the home board, increasing storage on the executor and receiving replicas by the declared file sizes (declare only evidence you intend to retain). Larger files retain a machine-qualified path and SHA256; large scratch files receive a durable executor-local copy before cleanup. Native chat uploads use verified local bytes: replicated attachments on receivers, or digest-checked large files only on their executing machine. Only declared `artifacts` are uploaded to chat; evidence files keep custody (attachment, digest) without a chat upload, and evidence refs that name no file (`/api/route`, `/src/x.py:12`, `/repo commit abc`) get no receipt line. Files over 25 MB are hashed (and large scratch files copied) before the completion takes the board write lock, never under it. Use `worktree:` or `dir:<path>` when the whole workspace should remain available. The first time a scratch workspace is created on an install, the dispatcher logs a warning and emits a `tip_scratch_workspace` event on the task (visible via `hermes kanban show <id>`).
++  - `scratch` (default) — fresh tmp dir under `~/.hermes/kanban/workspaces/<id>/` (or `~/.hermes/kanban/boards/<slug>/workspaces/<id>/` on non-default boards). **Deleted when the task completes** — scratch is ephemeral by design. Files explicitly declared through `kanban_complete(artifacts=[...])` or `kanban_request_review(artifacts=[...])` are copied into durable per-task attachment storage before cleanup (a review handoff stages them at handoff time, since the reviewer's later completion is what deletes the scratch workspace); existing deliverable paths in legacy completion summaries receive the same treatment. Other scratch files are removed. Completion records a machine-qualified `artifact_receipt` for declared artifacts and absolute file paths in completion evidence. Missing paths, including scratch paths, produce visible warnings rather than a file-delivery claim (the `kanban_complete` result repeats them as `artifact_warnings`); failures preserving existing scratch bytes still keep the task in-flight. Files up to 25 MB are copied into card attachments even when outside scratch and replicated to the home board, increasing storage on the executor and receiving replicas by the declared file sizes (declare only evidence you intend to retain). Larger files retain a machine-qualified path and SHA256; large scratch files receive a durable executor-local copy before cleanup. Native chat uploads use verified local bytes: replicated attachments on receivers, or digest-checked large files only on their executing machine. Only declared `artifacts` are uploaded to chat; evidence files keep custody (attachment, digest) without a chat upload, and evidence refs that name no file (`/api/route`, `/src/x.py:12`, `/repo commit abc`) get no receipt line. Files over 25 MB are hashed (and large scratch files copied) before the completion takes the board write lock, never under it. Use `worktree:` or `dir:<path>` when the whole workspace should remain available. The first time a scratch workspace is created on an install, the dispatcher logs a warning and emits a `tip_scratch_workspace` event on the task (visible via `hermes kanban show <id>`).
+   - `dir:<path>` — an existing shared directory (Obsidian vault, mail ops dir, per-account folder). **Must be an absolute path.** Relative paths like `dir:../tenants/foo/` are rejected at dispatch because they'd resolve against whatever CWD the dispatcher happens to be in, which is ambiguous and a confused-deputy escape vector. The path is otherwise trusted — it's your box, your filesystem, the worker runs with your uid. This is the trusted-local-user threat model; kanban is single-host by design. **Preserved on completion.**
+   - `worktree` — a git worktree under `.worktrees/<id>/` for coding tasks. Use `worktree:<path>` to pin the exact target path. Worker-side `git worktree add` creates it, using `--branch` when provided. **Preserved on completion.**
+ - **Dispatcher** — a long-lived loop that, every N seconds (default 60): reclaims stale claims, reclaims crashed workers (PID gone but TTL not yet expired), reaps workers that outlived their finished run (a worker still alive after its own `kanban_complete`/`kanban_block` is terminated once its run has been closed for two minutes, leaving it time to finish its final turn — matched by PID *and* spawn-time fingerprint, so a recycled PID is never signalled; recorded as a `terminal_worker_reaped` event), promotes ready tasks, atomically claims, spawns assigned profiles. Runs **inside the gateway** by default (`kanban.dispatch_in_gateway: true`). One dispatcher sweeps all boards per tick; workers are spawned with `HERMES_KANBAN_BOARD` pinned so they can't see other boards. After `kanban.failure_limit` consecutive spawn failures on the same task (default: 2) the dispatcher auto-blocks it with the last error as the reason — prevents thrashing on tasks whose profile doesn't exist, workspace can't mount, etc.
+-- 
+2.43.0
+

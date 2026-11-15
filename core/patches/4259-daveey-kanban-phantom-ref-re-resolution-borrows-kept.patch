@@ -1,0 +1,504 @@
+From b17b8b71219cc9e182e78213361b8e974051ba81 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 18:06:34 +0000
+Subject: [PATCH] [daveey] kanban: phantom-ref re-resolution borrows kept
+ replica readers and reuses hub task-key scans
+
+Card E P1 (t_01a1d59e5543daa1): on hermes-hub one displayed card with an active
+suspected_hallucinated_references event made every GET /board open 21 SQLite
+connections (each Board replica twice plus hub.db) and scan ~20k hub replica
+task keys for its short-form ref: ~79 ms of a ~130 ms GET (live in-process
+profile, 30 GETs at the Desktop's 3.9 s cadence).
+
+- Board replica lookups (replica_tasks/replica_prefixes) and the hub lookup
+  (replica_task_resolution) use kanban_session_activity.cached_ro, with one retry
+  when the kept reader is evicted while waiting. An idle autocommit reader holds
+  no snapshot, so every lookup still sees the latest commit.
+- hub_tasks_found reuses answers while the hub replica's task-row probe
+  (count, count(seq), max(seq), total(seq)) and file identity are unchanged;
+  after a pull a known-absent ref is re-checked only against rows above the old
+  max(seq) (hermes-hub stamps every replica write with its monotonic feed seq,
+  the invariant kanban_replica_rows and _remote_read_memo already rely on); a
+  known-present ref, a lower max(seq), rows without seq, or a replaced file
+  look up in full. Freshness (offline/last_ok) is still read and judged per call.
+
+Live hub A/B, same process environment, 25 GETs at 3.9 s with cProfile:
+median 131 ms -> 49 ms per board GET (diagnostics projection 110 -> 30 ms).
+Tests: 3 perf tests RED on the original source with 10 exactness controls
+GREEN, all 13 GREEN after; 67 related tests pass.
+---
+ hermes_cli/kanban_board_replica_refs.py       | 121 +++++++--
+ hermes_cli/kanban_prose_refs.py               |  12 +-
+ hermes_cli/kanban_session_activity.py         |  21 +-
+ .../test_kanban_replica_refs_kept_readers.py  | 229 ++++++++++++++++++
+ 4 files changed, 352 insertions(+), 31 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_replica_refs_kept_readers.py
+
+diff --git a/hermes_cli/kanban_board_replica_refs.py b/hermes_cli/kanban_board_replica_refs.py
+index b8cb132ce6..8b112a09c7 100644
+--- a/hermes_cli/kanban_board_replica_refs.py
++++ b/hermes_cli/kanban_board_replica_refs.py
+@@ -4,13 +4,22 @@ A Board-synced host's live board file holds only part of each board (its own car
+ Board replica holds the whole board. So an id the live file lacks may still be a real card, and the phantom-ref
+ checks (the ``created_cards`` completion gate and the summary scan/diagnostics) ask the replica before the hub
+ replica, which can answer "fresh" yet lack a card minted minutes earlier.
++
++Lookups borrow the kept read-only readers (``kanban_session_activity.cached_ro``): the board diagnostics re-resolve
++an active phantom-ref warning on every ``GET /board``, and opening each replica afresh (twice, plus hub.db) cost
++~55 ms of a ~130 ms GET on hermes-hub (card E, t_01a1d59e5543daa1). An idle autocommit reader holds no snapshot, so
++every lookup still sees the latest commit.
+ """
+ 
+ from __future__ import annotations
+ 
++import os
+ import sqlite3
++import threading
+ from pathlib import Path
+-from typing import Iterable, Optional
++from typing import Callable, Iterable, Optional, TypeVar
++
++T = TypeVar("T")
+ 
+ 
+ def _replica_paths() -> list[Path]:
+@@ -23,51 +32,127 @@ def _replica_paths() -> list[Path]:
+         return []
+ 
+ 
++def with_reader(path: Path, body: Callable[[sqlite3.Connection], T]) -> T:
++    """``body(conn)`` on the kept read-only reader of ``path``. A reader evicted while this call waited for it is
++    retried once on a fresh one (a one-shot open never saw that race); any other sqlite error propagates."""
++    from hermes_cli.kanban_generation import DeletedWalGenerationError
++    from hermes_cli.kanban_session_activity import cached_ro
++
++    for attempt in (0, 1):
++        try:
++            with cached_ro(path) as conn:
++                return body(conn)
++        except DeletedWalGenerationError:
++            if attempt:
++                raise
++    raise AssertionError("unreachable")
++
++
+ def replica_tasks(ids: Iterable[str], parent: Optional[str] = None) -> tuple[dict[str, Optional[str]], set[str]]:
+     """``({id: created_by}, linked)`` for the ``ids`` any Board replica holds; ``linked`` = those the replica links as
+     children of ``parent``. An unreadable replica answers nothing (read-only; a missing file is never created)."""
+-    from hermes_cli.kanban_generation import open_ro
+-
+     want = list(dict.fromkeys(ids))
+     found: dict[str, Optional[str]] = {}
+     linked: set[str] = set()
+     for path in _replica_paths() if want else ():  # nothing to look up: open no file (perf only)
+         rest = [i for i in want if i not in found]
+         marks = ",".join("?" * len(rest))
++
++        def read(conn: sqlite3.Connection) -> tuple[list, list]:
++            return (conn.execute(f"SELECT id, created_by FROM tasks WHERE id IN ({marks})", rest).fetchall(),
++                    conn.execute(f"SELECT child_id FROM task_links WHERE parent_id = ? AND child_id IN ({marks})",
++                                 (parent, *rest)).fetchall())
++
+         try:
+-            conn = open_ro(path)
+-            try:
+-                found.update((r[0], r[1]) for r in conn.execute(
+-                    f"SELECT id, created_by FROM tasks WHERE id IN ({marks})", rest))
+-                linked.update(r[0] for r in conn.execute(
+-                    f"SELECT child_id FROM task_links WHERE parent_id = ? AND child_id IN ({marks})",
+-                    (parent, *rest)))
+-            finally:
+-                conn.close()
++            rows, links = with_reader(path, read)
+         except sqlite3.Error:
+             continue
++        found.update((r[0], r[1]) for r in rows)
++        linked.update(r[0] for r in links)
+     return found, linked
+ 
+ 
+ def replica_prefixes(refs: Iterable[str]) -> set[str]:
+     """The short-form ``refs`` (shorter than a full id) that prefix a card id in any Board replica."""
+-    from hermes_cli.kanban_generation import open_ro
+     from hermes_cli.kanban_prose_refs import has_task_with_prefix, is_prefix_ref
+ 
+     want = [r for r in dict.fromkeys(refs) if is_prefix_ref(r)]
+     found: set[str] = set()
+     for path in _replica_paths() if want else ():
+         try:
+-            conn = open_ro(path)
+-            try:
+-                found.update(r for r in want if r not in found and has_task_with_prefix(conn, r))
+-            finally:
+-                conn.close()
++            found |= with_reader(path, lambda conn: {r for r in want if r not in found and has_task_with_prefix(conn, r)})
+         except sqlite3.Error:
+             continue
+     return found
+ 
+ 
++# Hub replica task-key lookups, reused while the replica's task rows are unchanged. hermes-hub stamps every replica
++# write with its feed's monotonic ``seq`` (see ``kanban_replica_rows``), so an insert or a rewrite raises
++# ``max(seq)`` and ``total(seq)``, and a delete lowers ``count``. A row without ``seq`` proves nothing, so then the
++# memo is never used. hub.db is written ~45 times a minute (meta, outbox, ledger) while task rows move only when a
++# pull lands; the scan this skips (``key GLOB '*/<ref>*'`` over ~20k keys) was ~25 ms per board GET.
++_HUB_TASKS_PROBE = "SELECT count(*), count(seq), max(seq), total(seq) FROM replica WHERE coll = 'tasks'"
++_HUB_MEMO_REFS = 4096
++_hub_lock = threading.Lock()
++_hub_memo: dict[str, tuple[tuple, dict[str, bool]]] = {}  # path -> (key, {ref: found}); replaced, never mutated
++
++
++def _file_ident(path: Path) -> tuple | None:
++    try:
++        st = os.stat(path)
++    except OSError:
++        return None
++    return st.st_dev, st.st_ino
++
++
++def hub_tasks_found(conn: sqlite3.Connection, path: Path, ids: list[str]) -> set[str]:
++    """The ``ids`` the hub replica ``conn`` holds as task keys (``kanban_prose_refs.hub_replica_lookup``). Call it
++    inside one read transaction on ``conn`` so the probe describes the rows the lookups read.
++
++    Reused answers: all of them while the probe is unchanged. After a pull (same file, ``max(seq)`` not lower) a
++    ref known absent can only have appeared in a row written since, so it is re-checked against rows above the old
++    ``max(seq)`` alone; a ref known present is looked up again in full (its row may be gone)."""
++    from hermes_cli import kanban_prose_refs
++
++    def lookup(want: Iterable[str], after_seq: int | None = None) -> dict[str, bool]:
++        return {tid: conn.execute(*kanban_prose_refs.hub_replica_lookup(tid, after_seq)).fetchone() is not None
++                for tid in want}
++
++    ident = _file_ident(path)
++    try:
++        probe = tuple(conn.execute(_HUB_TASKS_PROBE).fetchone())
++    except sqlite3.OperationalError:  # an old replica without ``seq``: nothing proves its rows unchanged
++        probe = None
++    if ident is None or probe is None or probe[0] != probe[1] or probe[2] is None:
++        return {tid for tid, hit in lookup(ids).items() if hit}
++    key, tag = (ident, probe), str(path)
++    with _hub_lock:
++        memo = _hub_memo.get(tag)
++    want = list(dict.fromkeys(ids))
++    if memo is not None and memo[0] == key:
++        known = dict(memo[1])
++    elif memo is not None and memo[0][0] == ident and probe[2] >= memo[0][1][2]:
++        absent = [tid for tid in want if memo[1].get(tid) is False]
++        known = {tid: False for tid in absent}
++        known.update((tid, True) for tid, hit in lookup(absent, after_seq=memo[0][1][2]).items() if hit)
++    else:
++        known = {}
++    missing = [tid for tid in want if tid not in known]
++    known.update(lookup(missing))
++    if memo is None or memo[0] != key or missing:
++        if len(known) > _HUB_MEMO_REFS:
++            known = {tid: known[tid] for tid in want}
++        with _hub_lock:
++            _hub_memo[tag] = (key, known)
++    return {tid for tid in want if known[tid]}
++
++
++def reset() -> None:
++    """Drop the hub lookup memo (tests)."""
++    with _hub_lock:
++        _hub_memo.clear()
++
++
+ def unresolved_after_replica(missing: list[str]) -> list[str]:
+     """``missing`` (not on the local board) minus ids a Board replica or the hub replica knows (a short-form ref by
+     prefix); [] when the hub replica cannot say for the rest."""
+diff --git a/hermes_cli/kanban_prose_refs.py b/hermes_cli/kanban_prose_refs.py
+index e33136bd0a..c26610f5ea 100644
+--- a/hermes_cli/kanban_prose_refs.py
++++ b/hermes_cli/kanban_prose_refs.py
+@@ -26,13 +26,15 @@ def has_task_with_prefix(conn: sqlite3.Connection, prefix: str) -> bool:
+     return conn.execute("SELECT 1 FROM tasks WHERE id GLOB ? LIMIT 1", (prefix + "*",)).fetchone() is not None
+ 
+ 
+-def hub_replica_lookup(ref: str) -> tuple[str, tuple]:
++def hub_replica_lookup(ref: str, after_seq: int | None = None) -> tuple[str, tuple]:
+     """``(sql, params)`` finding ``ref`` among the hub replica's task keys (``[profile/]board/<id>``): the key's last
+-    segment equals a full id, or starts with a short-form ref."""
++    segment equals a full id, or starts with a short-form ref. ``after_seq`` narrows it to rows written after that
++    feed ``seq`` (``kanban_board_replica_refs`` re-checks a known-absent ref against only the rows a pull added)."""
++    newer, extra = ("", ()) if after_seq is None else (" AND seq > ?", (after_seq,))
+     if is_prefix_ref(ref):
+-        return "SELECT 1 FROM replica WHERE coll = 'tasks' AND key GLOB ? LIMIT 1", (f"*/{ref}*",)
+-    return ("SELECT 1 FROM replica WHERE coll = 'tasks' AND substr(key, -?) = ? LIMIT 1",
+-            (len(ref) + 1, "/" + ref))
++        return f"SELECT 1 FROM replica WHERE coll = 'tasks' AND key GLOB ?{newer} LIMIT 1", (f"*/{ref}*", *extra)
++    return (f"SELECT 1 FROM replica WHERE coll = 'tasks' AND substr(key, -?) = ?{newer} LIMIT 1",
++            (len(ref) + 1, "/" + ref, *extra))
+ 
+ 
+ def _missing_task_refs(conn: sqlite3.Connection, refs: Iterable[str]) -> list[str]:
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index 384bcd5532..786cb76526 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -419,14 +419,19 @@ def replica_task_resolution(ids: list[str], now: float | None = None) -> tuple[s
+     if path is None or not ids:  # sync_enabled never raises: an unreadable config reads as sync off (standalone)
+         return set(), not ids or not _board_sync_enabled()
+     try:
+-        conn = _open_ro(path)
+-        try:
+-            offline = _meta_float(conn, "offline_since")
+-            synced = max(filter(None, (_meta_float(conn, "last_ok"), _meta_float(conn, "last_digest"))), default=None)
+-            from hermes_cli.kanban_prose_refs import hub_replica_lookup
+-            found = {tid for tid in ids if conn.execute(*hub_replica_lookup(tid)).fetchone()}
+-        finally:
+-            conn.close()
++        from hermes_cli.kanban_board_replica_refs import hub_tasks_found, with_reader
++
++        def read(conn: sqlite3.Connection) -> tuple:
++            conn.execute("BEGIN")  # one snapshot: the task-row probe must describe the rows the lookups read
++            try:
++                offline = _meta_float(conn, "offline_since")
++                synced = max(filter(None, (_meta_float(conn, "last_ok"), _meta_float(conn, "last_digest"))),
++                             default=None)
++                return offline, synced, hub_tasks_found(conn, path, ids)
++            finally:
++                conn.execute("ROLLBACK")
++
++        offline, synced, found = with_reader(path, read)  # kept reader: ~2 ms an open on every board GET
+     except sqlite3.Error:
+         return set(), False
+     now = time.time() if now is None else now
+diff --git a/tests/hermes_cli/test_kanban_replica_refs_kept_readers.py b/tests/hermes_cli/test_kanban_replica_refs_kept_readers.py
+new file mode 100644
+index 0000000000..f5427bf798
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_replica_refs_kept_readers.py
+@@ -0,0 +1,229 @@
++"""Phantom-ref re-resolution must not reopen every replica (or rescan the hub replica) on each board GET. [daveey]
++
++Card E P1 (t_01a1d59e5543daa1): on hermes-hub one displayed card with an active ``suspected_hallucinated_references``
++event made every ``GET /board`` open 21 SQLite connections (each Board replica twice plus hub.db) and scan ~20k
++hub replica task keys for its short-form ref: ~79 ms of a ~130 ms GET. The answer depends only on rows that rarely
++change, so lookups use the kept read-only readers and the hub scan is reused while the replica's task-key probe
++(count, count(seq), max(seq), total(seq)) is unchanged. Every answer stays exactly what a fresh lookup returns.
++"""
++
++from __future__ import annotations
++
++import sqlite3
++import time
++
++import pytest
++
++from hermes_cli import kanban_board_replica_refs as refs
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_generation
++from hermes_cli import kanban_prose_refs
++from hermes_cli import kanban_session_activity as ksa
++from hermes_cli import kanban_sync_client as ksc
++from tests.hermes_cli import kanban_sync_support as support
++
++BOARD_CARD = "t_01a1cf4d49ca68bb"
++HUB_ONLY = "t_01a1cf00000a0b0c"
++NOWHERE_PREFIX = "t_203c2f81"
++NOWHERE = "t_01a1cfdeadbeef00"
++
++
++def _hub(state_dir, rows=(), *, synced_ago=2.0):
++    state_dir.mkdir(parents=True, exist_ok=True)
++    conn = sqlite3.connect(state_dir / "hub.db")
++    conn.execute("CREATE TABLE replica (gw TEXT, coll TEXT, key TEXT, version INTEGER, seq INTEGER, data TEXT, "
++                 "updated_at INTEGER, PRIMARY KEY (gw, coll, key))")
++    conn.execute("CREATE INDEX replica_poll_metadata ON replica(coll, gw, seq)")
++    conn.execute("CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT)")
++    conn.execute("INSERT INTO meta VALUES ('gateway', 'worker-1')")
++    conn.execute("INSERT INTO meta VALUES ('last_ok', ?)", (str(time.time() - synced_ago),))
++    for seq, (gw, key) in enumerate(rows, 1):
++        _hub_put(conn, gw, key, seq)
++    conn.commit()
++    conn.close()
++    return state_dir / "hub.db"
++
++
++def _hub_put(conn, gw, key, seq):
++    conn.execute("INSERT OR REPLACE INTO replica VALUES (?, 'tasks', ?, 1, ?, '{}', 0)", (gw, key, seq))
++
++
++def _write(path, *sql):
++    conn = sqlite3.connect(path)
++    try:
++        for stmt, args in sql:
++            conn.execute(stmt, args)
++        conn.commit()
++    finally:
++        conn.close()
++
++
++@pytest.fixture
++def host(tmp_path, monkeypatch):
++    home = support.kanban_home(tmp_path, monkeypatch)
++    monkeypatch.setenv("HERMES_HUB_STATE", str(tmp_path / "hubstate"))
++    support.write_sync_config(home, True)
++    hub = _hub(tmp_path / "hubstate", [("gw-a", f"default/{HUB_ONLY}"), ("gw-b", "p/default/t_01a1cf0000000001")])
++    for board in ("bb", "default"):
++        replica = kbc.connect(ksc.shadow_path(board))
++        try:
++            with kbc.write_txn(replica):
++                if board == "default":
++                    replica.execute("INSERT INTO tasks (id, title, status, created_at, created_by, created_on) "
++                                    "VALUES (?, 't', 'todo', 0, 'default', 'hub')", (BOARD_CARD,))
++        finally:
++            replica.close()
++    _reset = getattr(refs, "reset", lambda: None)  # absent before the memo existed
++    _reset()
++    yield hub
++    _reset()
++
++
++@pytest.fixture
++def opens(monkeypatch):
++    """Every new SQLite connection the lookups open (one-shot opens and kept-reader (re)opens alike)."""
++    seen = []
++    real_gen, real_ksa = kanban_generation.open_ro, ksa._open_ro
++
++    def spy(real):
++        def open_ro(path, *a, **k):
++            seen.append(str(path))
++            return real(path, *a, **k)
++        return open_ro
++
++    monkeypatch.setattr(kanban_generation, "open_ro", spy(real_gen))
++    monkeypatch.setattr(ksa, "_open_ro", spy(real_ksa))
++    return seen
++
++
++@pytest.fixture
++def hub_scans(monkeypatch):
++    calls = []
++    real = kanban_prose_refs.hub_replica_lookup
++
++    def spy(ref, *after):
++        calls.append(ref if not after or after[0] is None else (ref, after[0]))  # (ref, seq): rows after seq only
++        return real(ref, *after)
++
++    monkeypatch.setattr(kanban_prose_refs, "hub_replica_lookup", spy)
++    return calls
++
++
++MISSING = [BOARD_CARD, BOARD_CARD[:10], HUB_ONLY, NOWHERE_PREFIX, NOWHERE]
++
++
++def test_answers_match_the_replicas(host):
++    assert refs.unresolved_after_replica(list(MISSING)) == [NOWHERE_PREFIX, NOWHERE]
++
++
++def test_a_repeat_lookup_opens_no_connection(host, opens):
++    """RED before: each call opened every Board replica twice plus hub.db."""
++    first = refs.unresolved_after_replica(list(MISSING))
++    opens.clear()
++    for _ in range(3):
++        assert refs.unresolved_after_replica(list(MISSING)) == first
++    assert opens == []
++
++
++def test_unchanged_hub_task_rows_are_not_rescanned(host, hub_scans):
++    """RED before: every call scanned the hub replica once per unresolved ref."""
++    refs.unresolved_after_replica(list(MISSING))
++    assert hub_scans
++    hub_scans.clear()
++    _write(host, ("UPDATE meta SET v = ? WHERE k = 'last_ok'", (str(time.time()),)))  # a pull with no task rows
++    assert refs.unresolved_after_replica(list(MISSING)) == [NOWHERE_PREFIX, NOWHERE]
++    assert hub_scans == []
++
++
++def test_a_pull_rechecks_absent_refs_against_new_rows_only(host, hub_scans):
++    """Task rows moved: a known-absent ref can only have appeared in a row written after the old max(seq); a
++    known-present one is looked up in full again (its row may have gone)."""
++    assert refs.unresolved_after_replica([HUB_ONLY, NOWHERE_PREFIX, NOWHERE]) == [NOWHERE_PREFIX, NOWHERE]
++    hub_scans.clear()
++    _write(host, ("INSERT INTO replica VALUES ('gw-c', 'tasks', 'default/t_01a1cf0000000777', 1, 70, '{}', 0)", ()))
++    assert refs.unresolved_after_replica([HUB_ONLY, NOWHERE_PREFIX, NOWHERE]) == [NOWHERE_PREFIX, NOWHERE]
++    assert sorted(map(str, hub_scans)) == sorted(map(str, [(NOWHERE_PREFIX, 2), (NOWHERE, 2), HUB_ONLY]))
++    hub_scans.clear()
++    _write(host, ("INSERT INTO replica VALUES ('gw-c', 'tasks', ?, 1, 71, '{}', 0)", (f"p/b/{NOWHERE}",)))
++    assert refs.unresolved_after_replica([HUB_ONLY, NOWHERE_PREFIX, NOWHERE]) == [NOWHERE_PREFIX]
++    assert sorted(map(str, hub_scans)) == sorted(map(str, [(NOWHERE_PREFIX, 70), (NOWHERE, 70), HUB_ONLY]))
++
++
++def test_a_lower_max_seq_rereads_in_full(host, hub_scans):
++    """A feed that went back (a reset hub) proves nothing about rows above the old seq: full lookups."""
++    _write(host, ("UPDATE replica SET seq = 40 WHERE gw = 'gw-b'", ()))
++    assert refs.unresolved_after_replica([NOWHERE]) == [NOWHERE]
++    hub_scans.clear()
++    _write(host, ("UPDATE replica SET seq = 3 WHERE gw = 'gw-b'", ()),
++           ("INSERT INTO replica VALUES ('gw-c', 'tasks', ?, 1, 2, '{}', 0)", (f"d/{NOWHERE}",)))
++    assert refs.unresolved_after_replica([NOWHERE]) == []
++    assert hub_scans == [NOWHERE]
++
++
++def test_a_hub_row_landing_later_resolves_on_the_next_lookup(host):
++    assert refs.unresolved_after_replica(list(MISSING)) == [NOWHERE_PREFIX, NOWHERE]
++    _write(host, ("INSERT INTO replica VALUES ('gw-c', 'tasks', ?, 1, 99, '{}', 0)", (f"x/default/{NOWHERE}",)))
++    assert refs.unresolved_after_replica(list(MISSING)) == [NOWHERE_PREFIX]
++    _write(host, ("INSERT INTO replica VALUES ('gw-c', 'tasks', ?, 1, 100, '{}', 0)",
++                  (f"default/{NOWHERE_PREFIX}00000000",)))
++    assert refs.unresolved_after_replica(list(MISSING)) == []
++
++
++def test_a_deleted_hub_row_is_unresolved_again(host):
++    assert refs.unresolved_after_replica([HUB_ONLY, NOWHERE]) == [NOWHERE]
++    _write(host, ("DELETE FROM replica WHERE key = ?", (f"default/{HUB_ONLY}",)))
++    assert refs.unresolved_after_replica([HUB_ONLY, NOWHERE]) == [HUB_ONLY, NOWHERE]
++
++
++def test_a_rewritten_key_at_a_new_seq_is_seen(host):
++    """An in-place key rewrite keeps the row count; the hub stamps it with a new seq."""
++    assert refs.unresolved_after_replica([HUB_ONLY]) == []
++    _write(host, ("UPDATE replica SET key = 'default/t_01a1cf0000ffffff', seq = 50 WHERE key = ?",
++                  (f"default/{HUB_ONLY}",)))
++    assert refs.unresolved_after_replica([HUB_ONLY]) == [HUB_ONLY]
++
++
++def test_rows_without_seq_are_never_memoized(host, hub_scans):
++    _write(host, ("INSERT INTO replica VALUES ('gw-z', 'tasks', 'default/t_01a1cf000000abcd', 1, NULL, '{}', 0)", ()))
++    refs.unresolved_after_replica([NOWHERE])
++    hub_scans.clear()
++    refs.unresolved_after_replica([NOWHERE])
++    assert hub_scans == [NOWHERE]
++    _write(host, ("UPDATE replica SET key = ? WHERE gw = 'gw-z'", (f"default/{NOWHERE}",)))  # seq still NULL
++    assert refs.unresolved_after_replica([NOWHERE]) == []
++
++
++def test_a_stale_hub_is_unknown_even_when_its_rows_are_memoized(host):
++    assert refs.unresolved_after_replica([NOWHERE]) == [NOWHERE]
++    _write(host, ("UPDATE meta SET v = ? WHERE k = 'last_ok'", (str(time.time() - 10 ** 6),)))
++    assert refs.unresolved_after_replica([NOWHERE]) == []  # unknown, never flagged
++    found, fresh = ksa.replica_task_resolution([HUB_ONLY, NOWHERE])
++    assert found == {HUB_ONLY} and fresh is False
++
++
++def test_a_replaced_hub_file_is_reread(host, tmp_path):
++    assert refs.unresolved_after_replica([HUB_ONLY]) == []
++    host.unlink()
++    for side in ("-wal", "-shm"):
++        host.with_name(host.name + side).unlink(missing_ok=True)
++    _hub(tmp_path / "hubstate", [("gw-a", "default/t_01a1cf0000000002")])  # same probe shape, other keys
++    assert refs.unresolved_after_replica([HUB_ONLY]) == [HUB_ONLY]
++
++
++def test_a_board_replica_row_landing_later_is_seen_through_the_kept_reader(host):
++    assert refs.unresolved_after_replica([NOWHERE]) == [NOWHERE]
++    replica = kbc.connect(ksc.shadow_path("bb"))
++    try:
++        with kbc.write_txn(replica):
++            replica.execute("INSERT INTO tasks (id, title, status, created_at, created_by, created_on) "
++                            "VALUES (?, 't', 'todo', 0, 'default', 'hub')", (NOWHERE,))
++    finally:
++        replica.close()
++    assert refs.unresolved_after_replica([NOWHERE]) == []
++    assert refs.replica_tasks([NOWHERE])[0] == {NOWHERE: "default"}
++
++
++def test_an_unreadable_board_replica_still_skips_and_others_answer(host):
++    ksc.shadow_path("aaa-broken").write_bytes(b"not a sqlite file" * 64)
++    assert refs.unresolved_after_replica([BOARD_CARD, NOWHERE]) == [NOWHERE]
++    assert refs.unresolved_after_replica([BOARD_CARD, NOWHERE]) == [NOWHERE]
+-- 
+2.43.0
+

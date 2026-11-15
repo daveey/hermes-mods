@@ -1,0 +1,227 @@
+From cffb863ad872279b13b2e48890c69f52ca9362f2 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 05:04:54 +0000
+Subject: [PATCH] [daveey] fix(kanban): validate review handoffs and accept
+ legacy automatic class routing
+
+Problem: class:deep/board-default handoffs were persisted successfully but
+review dispatch rejected them before spawning.
+Root (happened): ingress and dispatch had inconsistent metadata contracts.
+Root (not caught): validation ran only after the durable review transition;
+existing tests exercised bad metadata only at dispatch.
+Recurrence: searched current main history and PRs for review board-default;
+no prior compatibility fix found.
+
+Share the override parser between ingress and dispatch. Only the historical
+board-default sentinel on class selectors aliases auto; concrete/unknown
+providers paired with class selectors remain rejected. Refuse invalid
+handoffs before artifact handling or task/run/event mutation. Preserve
+existing override precedence, registry checks and independent fallback.
+Move unchanged review redaction helper into the topical module, retaining
+its kanban_db import alias to respect the facade size ratchet.
+
+Proof: new regression suite RED 7 failed/2 passed on unchanged source;
+GREEN 264 tests across seven review/managed-policy/tool-contract suites,
+zero failures. scripts/check --base origin/main: 20 checks passed.
+Historical invalid-metadata dispatcher tests now seed persisted fixtures
+directly, preserving fail-closed coverage after ingress refusal.
+---
+ hermes_cli/kanban_db.py                       | 19 ++----
+ hermes_cli/kanban_review_model.py             | 29 ++++++++-
+ .../test_kanban_review_handoff_validation.py  | 62 +++++++++++++++++++
+ tests/hermes_cli/test_kanban_review_model.py  |  9 ++-
+ 4 files changed, 101 insertions(+), 18 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_review_handoff_validation.py
+
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 5677c0666c..d619bb75d1 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -3009,19 +3009,7 @@ def block_task(
+     return True
+ 
+ 
+-def redact_review_value(value: Any) -> Any:
+-    """Redact secrets at the domain boundary for durable review handoffs."""
+-    if isinstance(value, str):
+-        from agent.redact import redact_sensitive_text
+-
+-        return redact_sensitive_text(value, force=True)
+-    if isinstance(value, dict):
+-        return {key: redact_review_value(item) for key, item in value.items()}
+-    if isinstance(value, list):
+-        return [redact_review_value(item) for item in value]
+-    if isinstance(value, tuple):
+-        return tuple(redact_review_value(item) for item in value)
+-    return value
++from hermes_cli.kanban_review_model import redact_review_value
+ 
+ 
+ @publication_guard
+@@ -3053,6 +3041,11 @@ def request_review(
+ 
+     summary = redact_review_value(summary)
+     metadata = redact_review_value(metadata)
++    from hermes_cli.kanban_review_model import ReviewModelUnavailable, validate_review_override
++    try:
++        validate_review_override(metadata or {})
++    except ReviewModelUnavailable as exc:
++        return _ret(False, str(exc))
+     # Declared (metadata["artifacts"]) and prose-referenced files
+     # must be durable BEFORE anything can clean the scratch workspace up: for a
+     # review-bound card the reviewer's completion is the cleanup trigger.
+diff --git a/hermes_cli/kanban_review_model.py b/hermes_cli/kanban_review_model.py
+index 93dd77818a..8145dea4f9 100644
+--- a/hermes_cli/kanban_review_model.py
++++ b/hermes_cli/kanban_review_model.py
+@@ -2,9 +2,26 @@
+ from __future__ import annotations
+ 
+ import json
++from typing import Any
+ 
+ from agent.model_routing import ModelRoutingError, eligible_routes, is_class_selector, validate_policy
+ 
++
++def redact_review_value(value: Any) -> Any:
++    """Redact secrets at the domain boundary for durable review handoffs."""
++    if isinstance(value, str):
++        from agent.redact import redact_sensitive_text
++
++        return redact_sensitive_text(value, force=True)
++    if isinstance(value, dict):
++        return {key: redact_review_value(item) for key, item in value.items()}
++    if isinstance(value, list):
++        return [redact_review_value(item) for item in value]
++    if isinstance(value, tuple):
++        return tuple(redact_review_value(item) for item in value)
++    return value
++
++
+ # model_tier reason when this host's routing registry refuses the handoff's review_model: the review runs on a
+ # registered model distinct from the implementer instead of spawning a worker that dies at startup.
+ OVERRIDE_REFUSED = "review_override_refused"
+@@ -29,7 +46,11 @@ def _handoff(conn, task):
+ 
+ 
+ def _override(conn, task):
+-    metadata = _handoff(conn, task)[1]
++    return validate_review_override(_handoff(conn, task)[1])
++
++
++def validate_review_override(metadata):
++    """Shared ingress/dispatch contract, including legacy automatic class routing."""
+     model = metadata.get("review_model")
+     if model is None:
+         return None
+@@ -41,8 +62,10 @@ def _override(conn, task):
+         raise ReviewModelUnavailable("review_provider must be a nonempty provider identifier")
+     model = model.strip()
+     provider = (provider or ("auto" if is_class_selector(model) else infer_provider(model)))
+-    if is_class_selector(model) and provider != "auto":
+-        raise ReviewModelUnavailable("A review class requires provider auto")
++    if is_class_selector(model):
++        if provider not in ("auto", "board-default"):
++            raise ReviewModelUnavailable("A review class requires provider auto")
++        provider = "auto"  # Historical handoffs used the board-default sentinel.
+     return model, provider, "review_override"
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_review_handoff_validation.py b/tests/hermes_cli/test_kanban_review_handoff_validation.py
+new file mode 100644
+index 0000000000..0e34300847
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_review_handoff_validation.py
+@@ -0,0 +1,62 @@
++"""Validate review routing before ending the implementer's run."""
++import json
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_model_tier as tier
++from tests.hermes_cli import test_kanban_review_model as helpers
++
++board = helpers.board
++
++
++@pytest.mark.parametrize("provider", ["auto", "board-default", None])
++def test_class_provider_roundtrip(board, provider):
++    cfg = helpers.config(board)
++    with kbc.connect() as conn:
++        task = helpers.task(conn)
++        kb.claim_task(conn, task.id)
++        metadata = {"review_model": "class:deep", "review_provider": provider}
++        assert kb.request_review(conn, task.id, metadata=metadata)
++        assert tier.resolve_model_tier(conn, task, lane="review", cfg=cfg) == (
++            "class:deep", "auto", "review_override")
++        assert kb.get_task(conn, task.id).model_override == helpers.SONNET
++
++
++def test_historical_board_default_handoff(board):
++    cfg = helpers.config(board)
++    with kbc.connect() as conn:
++        task = helpers.task(conn)
++        kb.claim_task(conn, task.id)
++        assert kb.request_review(conn, task.id)
++        # Replay already-persisted legacy metadata, independent of ingress normalization.
++        conn.execute("UPDATE task_runs SET metadata=? WHERE task_id=?", (
++            json.dumps({"review_model": "class:deep", "review_provider": "board-default"}), task.id))
++        assert tier.resolve_model_tier(conn, task, lane="review", cfg=cfg) == (
++            "class:deep", "auto", "review_override")
++
++
++@pytest.mark.parametrize("metadata", [
++    {"review_model": "class:deep", "review_provider": "anthropic"},
++    {"review_model": "class:deep", "review_provider": "unknown-provider"},
++    {"review_model": []},
++    {"review_model": ""},
++    {"review_model": helpers.OPUS, "review_provider": []},
++])
++def test_invalid_handoff_refused_without_transition(board, metadata):
++    helpers.config(board)
++    with kbc.connect() as conn:
++        task = helpers.task(conn)
++        kb.claim_task(conn, task.id)
++        before = kb.get_task(conn, task.id)
++        events = kb.list_events(conn, task.id)
++        ok, reason = kb.request_review(conn, task.id, metadata=metadata, with_reason=True)
++        assert not ok
++        assert reason
++        after = kb.get_task(conn, task.id)
++        assert (after.status, after.current_run_id, after.claim_lock) == (
++            before.status, before.current_run_id, before.claim_lock)
++        assert kb.list_events(conn, task.id) == events
++        assert conn.execute("SELECT outcome FROM task_runs WHERE id=?", (
++            before.current_run_id,)).fetchone()[0] is None
+diff --git a/tests/hermes_cli/test_kanban_review_model.py b/tests/hermes_cli/test_kanban_review_model.py
+index e3a0c0e408..a0e721e25e 100644
+--- a/tests/hermes_cli/test_kanban_review_model.py
++++ b/tests/hermes_cli/test_kanban_review_model.py
+@@ -93,7 +93,11 @@ def test_review_admission_failure_never_spawns_or_spends_retry(board, monkeypatc
+     with kbc.connect() as conn:
+         t = task(conn, OPUS)
+         kb.claim_task(conn, t.id)
+-        kb.request_review(conn, t.id, metadata={"review_model": []} if failure == "bad_metadata" else None)
++        kb.request_review(conn, t.id)
++        if failure == "bad_metadata":
++            conn.execute("UPDATE task_runs SET metadata=? WHERE task_id=?", (
++                json.dumps({"review_model": []}), t.id))
++            conn.commit()
+         if failure == "receipt_write":
+             config(board, strong=FABLE)
+             original = kb._append_event
+@@ -196,7 +200,8 @@ def test_bad_override_fails_closed(board, metadata):
+     with kbc.connect() as conn:
+         t = task(conn)
+         kb.claim_task(conn, t.id)
+-        kb.request_review(conn, t.id, metadata=metadata)
++        kb.request_review(conn, t.id)
++        conn.execute("UPDATE task_runs SET metadata=? WHERE task_id=?", (json.dumps(metadata), t.id))
+         with pytest.raises(ReviewModelUnavailable):
+             tier.apply_model_tier(conn, t, lane="review", cfg=cfg)
+ 
+-- 
+2.43.0
+

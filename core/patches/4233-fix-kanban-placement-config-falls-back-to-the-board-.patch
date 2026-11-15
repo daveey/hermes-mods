@@ -1,0 +1,178 @@
+From 0ae229feabe9dcf526312e9b97cec1b0110fd093 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 17:21:03 +0000
+Subject: [PATCH] fix(kanban): placement config falls back to the board home's
+ block [daveey]
+
+kanban_placement.config() read kanban.placement only from the active
+profile's config.yaml. The managed worker profiles (bb-tuner, coach,
+alpha-follow) carry a kanban: section with no placement block, so under
+them config() was {}: a portable card they created on a pool worker never
+got runs_on [pool:worker], extra_home_markers / hub_read_roots were not
+applied, and destinations({}) was empty (t_01a1d8146b9ef790 kept local
+with 'needs worker coordination capability').
+
+The board is shared by every profile on the host (kanban_db.kanban_home()),
+so its placement policy is a machine fact carried by the board home's
+config.yaml, the same place kanban_capabilities, kanban_db_sync and
+kanban_gate_only already read board-wide policy from. config() now uses
+the active profile's non-empty block when there is one (it wins whole, no
+per-key merge) and otherwise the board home's. A config_snapshot pins the
+fallback block like any other.
+
+Chosen over provisioning a placement copy into each managed profile from
+hermes-state: a copy goes stale whenever the root block changes, and it
+would cover only install-profiles.py's three worker profiles, not hub or
+Mac profiles that create cards on the same board.
+
+Proof (worker-7, HERMES_HOME=~/.hermes/profiles/bb-tuner, read-only
+kp.decide + _local_placement for a host-neutral portable bb-tuner card):
+  live core:  placement keys [], queue_label None,
+              local 'assignee not allowlisted', no runs_on
+  this patch: queue_label pool:worker, runs_on ['pool:worker'],
+              'portable: queued for any machine labelled pool:worker'
+
+Tests: tests/hermes_cli/test_kanban_placement_board_home.py (3 of 5 RED
+on main, 5/5 GREEN here).
+
+Refs t_01a1db0fb5d6a9cc
+---
+ hermes_cli/kanban_placement.py                | 27 ++++++-
+ .../test_kanban_placement_board_home.py       | 81 +++++++++++++++++++
+ 2 files changed, 105 insertions(+), 3 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_placement_board_home.py
+
+diff --git a/hermes_cli/kanban_placement.py b/hermes_cli/kanban_placement.py
+index b91aa82fa7..94e92464ed 100644
+--- a/hermes_cli/kanban_placement.py
++++ b/hermes_cli/kanban_placement.py
+@@ -442,15 +442,36 @@ def config_snapshot() -> Iterator[dict]:
+         _round_config.cfg = None
+ 
+ 
++def _placement_block(doc) -> dict:
++    cfg = (((doc or {}).get("kanban") or {}).get("placement") or {}) if isinstance(doc, dict) else {}
++    return cfg if isinstance(cfg, dict) else {}
++
++
+ def config() -> dict:
++    """``kanban.placement`` of the active profile, else of the board home (``kanban_home()/config.yaml``). [daveey]
++
++    The board is shared by every profile on the host, so its placement policy (worker_queue, worker_pools,
++    hub_read_roots, extra_home_markers) is a machine fact the root config carries. A named profile with no
++    ``placement`` block (managed worker profiles bb-tuner/coach/alpha-follow) used to read ``{}``: its creates
++    never queued ``pool:worker`` and home markers were skipped (t_01a1db0fb5d6a9cc). A profile's own non-empty
++    block still wins whole; there is no per-key merge.
++    """
+     pinned = getattr(_round_config, "cfg", None)
+     if pinned is not None:
+         return pinned
+     try:
+         from hermes_cli.config import load_config_readonly
+-        cfg = ((load_config_readonly() or {}).get("kanban") or {}).get("placement") or {}
+-        return cfg if isinstance(cfg, dict) else {}
+-    except Exception:
++        cfg = _placement_block(load_config_readonly())
++    except Exception:  # health: allow BLE001 S110 -- an unreadable profile config falls through to the board home
++        cfg = {}
++    if cfg:
++        return cfg
++    try:
++        from hermes_cli.config_backend import config_exists, read_config_doc_readonly
++        from hermes_cli.kanban_db import kanban_home
++        path = kanban_home() / "config.yaml"
++        return _placement_block(read_config_doc_readonly(path)) if config_exists(path) else {}
++    except Exception:  # health: allow BLE001 S110 -- an unreadable board config means no placement policy
+         return {}
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_placement_board_home.py b/tests/hermes_cli/test_kanban_placement_board_home.py
+new file mode 100644
+index 0000000000..28a0b3f342
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_placement_board_home.py
+@@ -0,0 +1,81 @@
++"""``kanban_placement.config()`` falls back to the board home's ``kanban.placement``. [daveey]
++
++Managed worker profiles (bb-tuner, coach, alpha-follow) carry a ``kanban:`` section with no ``placement``
++block, while the shared board's policy lives in the root ``config.yaml``. Before the fallback a create under
++such a profile read ``{}``: no ``pool:worker`` queue, no home markers (t_01a1db0fb5d6a9cc).
++"""
++from __future__ import annotations
++
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_placement as kp
++
++ROOT_PLACEMENT = """\
++kanban:
++  placement:
++    worker_queue:
++      worker-7: pool:worker
++    worker_pools:
++      hub: [worker-7]
++    extra_home_markers: [/srv/only-here]
++"""
++
++
++def _homes(tmp_path: Path, profile_kanban: str) -> tuple[Path, Path]:
++    root = tmp_path / ".hermes"
++    profile = root / "profiles" / "bb-tuner"
++    profile.mkdir(parents=True)
++    (root / "config.yaml").write_text(ROOT_PLACEMENT)
++    (profile / "config.yaml").write_text(profile_kanban)
++    return root, profile
++
++
++@pytest.fixture
++def no_kanban_override(monkeypatch: pytest.MonkeyPatch):
++    monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
++
++
++def test_profile_without_placement_reads_the_board_home_block(tmp_path, monkeypatch, no_kanban_override):
++    root, profile = _homes(tmp_path, "kanban:\n  review_dispatch: true\n")
++    monkeypatch.setenv("HERMES_HOME", str(profile))
++    from hermes_cli.kanban_db import kanban_home
++    assert kanban_home() == root  # the profile's board is the root's board
++    cfg = kp.config()
++    assert cfg["worker_queue"] == {"worker-7": "pool:worker"}
++    assert cfg["extra_home_markers"] == ["/srv/only-here"]
++
++
++def test_profile_with_its_own_placement_wins_whole(tmp_path, monkeypatch, no_kanban_override):
++    _, profile = _homes(tmp_path, "kanban:\n  placement:\n    worker_queue:\n      worker-9: pool:other\n")
++    monkeypatch.setenv("HERMES_HOME", str(profile))
++    assert kp.config() == {"worker_queue": {"worker-9": "pool:other"}}
++
++
++def test_explicit_kanban_home_is_where_the_fallback_reads(tmp_path, monkeypatch):
++    board = tmp_path / "board"
++    board.mkdir()
++    (board / "config.yaml").write_text(ROOT_PLACEMENT)
++    lone = tmp_path / "lone"
++    lone.mkdir()
++    (lone / "config.yaml").write_text("kanban: {}\n")
++    monkeypatch.setenv("HERMES_HOME", str(lone))
++    monkeypatch.setenv("HERMES_KANBAN_HOME", str(board))
++    assert kp.config()["worker_pools"] == {"hub": ["worker-7"]}
++
++
++def test_no_placement_anywhere_stays_empty(tmp_path, monkeypatch, no_kanban_override):
++    root, profile = _homes(tmp_path, "kanban:\n  review_dispatch: true\n")
++    (root / "config.yaml").write_text("kanban:\n  review_dispatch: true\n")
++    monkeypatch.setenv("HERMES_HOME", str(profile))
++    assert kp.config() == {}
++
++
++def test_snapshot_pins_the_fallback_block(tmp_path, monkeypatch, no_kanban_override):
++    root, profile = _homes(tmp_path, "kanban: {}\n")
++    monkeypatch.setenv("HERMES_HOME", str(profile))
++    with kp.config_snapshot() as snap:
++        (root / "config.yaml").write_text("kanban: {}\n")
++        assert kp.config() is snap
++        assert snap["worker_queue"] == {"worker-7": "pool:worker"}
+-- 
+2.43.0
+

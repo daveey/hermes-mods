@@ -1,0 +1,112 @@
+From 0542edee4bbfeffd13ac18b64a87bef1c19c1a21 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 14:32:32 +0000
+Subject: [PATCH] [daveey] worker policy: resolve the account scratch dir
+ before admitting TMPDIR
+
+_override_temp_roots compared the realpath of TMPDIR with the literal
+<account>/.hermes/cache/scratch. On mac-mini-1, ~/.hermes -> .alternate-hermes and
+cache/scratch -> scratch.noindex, so the worker default TMPDIR (the Hermes
+scratch dir) never counted as ephemeral. HERMES_TEST_POLICY_ROOT under it was
+refused and policy_root() fell back to the real ~/.hermes. In hermes-mods,
+`scripts/test-all --exact -k plugins/chat-closeout` with TMPDIR unset gave 16
+test_watchdog_resolution fixture errors ("policy override ... not honoured").
+
+Fix: compare against the realpath of the scratch dir. Every other rule is
+unchanged: deny by default, and a TMPDIR that contains the account or HOME
+never joins. The scratch rule now runs last in the OR chain because realpath
+reads the account home. A TMPDIR that the system-root or macOS
+/var/folders/*/*/T rule already admits never touches the home, so test runs
+stay clear of the real-home I/O guard.
+
+Tests:
+- New test_a_symlinked_account_scratch_tmpdir_still_admits_the_override builds
+  an account whose .hermes and cache/scratch are both symlinks, sets TMPDIR to
+  the scratch dir, and asserts that the override under it is honoured. The
+  scratch dir itself and a durable sibling stay refused. RED before the fix
+  (None != <...>/.alternate-hermes/cache/scratch.noindex/t1/.hermes), GREEN after.
+- test_a_relative_policy_root_is_refused_even_when_the_cwd_is_a_temp_root
+  stubs the system roots, so pytest's TMPDIR now reaches the scratch rule. The
+  test's setup now pins _account_home to a fixture so realpath does not read
+  the real ~/.hermes. No assertion changed.
+- 26 test files that reference the module or HERMES_TEST_POLICY_ROOT: 342
+  passed. Four failures in tests/scripts/test_worker_test_budget.py
+  (host_slots_enabled) also fail on origin/main 09080c07b8 on this worker
+  and are unrelated.
+- scripts/check --base origin/main: 20 checks, ok.
+
+Card: t_01a1d974a89f6ff6 (from the review of t_01a1d77378a77bbf).
+---
+ hermes_cli/worker_compute_capacity.py         |  7 +++--
+ .../test_worker_compute_capacity.py           | 28 +++++++++++++++++++
+ 2 files changed, 33 insertions(+), 2 deletions(-)
+
+diff --git a/hermes_cli/worker_compute_capacity.py b/hermes_cli/worker_compute_capacity.py
+index b1c7f42029..0a5eaa0d20 100644
+--- a/hermes_cli/worker_compute_capacity.py
++++ b/hermes_cli/worker_compute_capacity.py
+@@ -191,10 +191,13 @@ def _override_temp_roots() -> list[Path]:
+     if account.is_relative_to(tmp) or home.is_relative_to(tmp):
+         return roots
+     macos = [Path(os.path.realpath(parent)) for parent in MACOS_USER_TEMP_PARENTS]
++    # The scratch dir is resolved like tmp (the mini's ~/.hermes and cache/scratch are both symlinks,
++    # t_01a1d974a89f6ff6), and last: realpath reads the account home, so a TMPDIR the system or macOS
++    # rules already admit never touches it.
+     ephemeral = (any(tmp.is_relative_to(root) for root in roots)
+-                 or tmp.is_relative_to(account / '.hermes' / 'cache' / 'scratch')
+                  or any(tmp.is_relative_to(parent) and tmp.relative_to(parent).parts[2:3] == ('T',)
+-                        for parent in macos))
++                        for parent in macos)
++                 or tmp.is_relative_to(Path(os.path.realpath(account / '.hermes' / 'cache' / 'scratch'))))
+     if ephemeral:
+         roots.append(tmp)
+     return roots
+diff --git a/tests/hermes_cli/test_worker_compute_capacity.py b/tests/hermes_cli/test_worker_compute_capacity.py
+index aa3c5794ac..015d6dd88c 100644
+--- a/tests/hermes_cli/test_worker_compute_capacity.py
++++ b/tests/hermes_cli/test_worker_compute_capacity.py
+@@ -109,6 +109,32 @@ def test_an_odd_tmpdir_never_admits_a_durable_policy_root(tmp_path, monkeypatch,
+     assert got == (Path(os.path.realpath(raw)) if honoured else None)
+ 
+ 
++def test_a_symlinked_account_scratch_tmpdir_still_admits_the_override(tmp_path, monkeypatch):
++    """mac-mini-1 (t_01a1d974a89f6ff6): ``~/.hermes -> .alternate-hermes`` and ``cache/scratch -> scratch.noindex``. TMPDIR
++    was realpath'd but the account scratch dir was not, so the worker default TMPDIR never joined and the override
++    was refused: policy_root() fell back to the real ``~/.hermes`` (16 watchdog fixture errors in hermes-mods)."""
++    import os
++    import tempfile
++    from pathlib import Path
++    from hermes_cli import worker_compute_capacity as capacity
++    account, home, system, folders = (tmp_path / name for name in ('account', 'home', 'sys', 'folders'))
++    for path in (account / '.alternate-hermes' / 'cache' / 'scratch.noindex', home, system, folders):
++        path.mkdir(parents=True)
++    (account / '.hermes').symlink_to('.alternate-hermes')
++    (account / '.alternate-hermes' / 'cache' / 'scratch').symlink_to('scratch.noindex')
++    monkeypatch.setattr('hermes_constants._account_home', lambda: account)
++    monkeypatch.setattr(capacity, 'SYSTEM_TEMP_ROOTS', (str(system),))
++    monkeypatch.setattr(capacity, 'MACOS_USER_TEMP_PARENTS', (str(folders),))
++    monkeypatch.setenv('HOME', str(home))
++    scratch = account / '.hermes' / 'cache' / 'scratch'
++    monkeypatch.setattr(tempfile, 'tempdir', str(scratch))
++    raw = str(scratch / 't1' / '.hermes')
++    assert capacity._test_policy_override({'HERMES_TEST_POLICY_ROOT': raw}) == Path(os.path.realpath(raw))
++    # The scratch dir itself is still no harness dir, and durable dirs beside it stay refused.
++    assert capacity._test_policy_override({'HERMES_TEST_POLICY_ROOT': str(scratch)}) is None
++    assert capacity._test_policy_override({'HERMES_TEST_POLICY_ROOT': str(account / '.hermes' / 'x')}) is None
++
++
+ def test_a_relative_policy_root_is_refused_even_when_the_cwd_is_a_temp_root(tmp_path, monkeypatch):
+     """#2454 post-merge mutant C2 (t_01a1d62f12ab6265): realpath resolves a relative value against the cwd, so
+     without the isabs check a process whose cwd sits under a temp root would honour ``relative/.hermes``."""
+@@ -118,6 +144,8 @@ def test_a_relative_policy_root_is_refused_even_when_the_cwd_is_a_temp_root(tmp_
+     cwd = tmp_path / 'cwd'
+     cwd.mkdir()
+     monkeypatch.setattr(capacity, 'SYSTEM_TEMP_ROOTS', (str(tmp_path),))
++    # TMPDIR is outside the stand-in root, so the account scratch rule resolves the account: keep it a fixture.
++    monkeypatch.setattr('hermes_constants._account_home', lambda: tmp_path / 'account')
+     monkeypatch.chdir(cwd)
+     resolved = Path(os.path.realpath('relative/.hermes'))
+     assert capacity._test_policy_override({'HERMES_TEST_POLICY_ROOT': str(resolved)}) == resolved  # cwd: a temp root
+-- 
+2.43.0
+

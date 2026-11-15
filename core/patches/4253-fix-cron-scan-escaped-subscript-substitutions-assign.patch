@@ -1,0 +1,198 @@
+From e167049d61f30c1a27d2d4c8c07f7d58ef322291 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 17:52:45 +0000
+Subject: [PATCH] fix(cron): scan escaped subscript substitutions assigned to
+ integer variables [daveey]
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Real bash 5.2.21: after `declare -i x` (also `typeset -i`, `local -i`, `-xi`,
+`eval "declare -i x"`), a later plain `x=a[\$\(S\)]` is dequoted to `a[$(S)]` and
+arithmetic-evaluated because x has the integer attribute, so the subscript RUNS S.
+The same holds for `x+=…`, `x[0]=…`, `declare x=…` and `for x in …`.
+`scan_gateway_lifecycle` returned (False, None) for these when S holds
+`hermes gateway restart`: the escaped-word hook from t_01a1db0af44d1601 only
+looked at `let` / `[[ -eq ]]` / `declare -i` operands, not later assignments.
+
+Five whys:
+1. Why ran S unscanned? The walk never read S: no `$(` in the raw text.
+2. Why no payload? iter_arithmetic_word_payloads only dequoted let/-eq/declare -i
+   operands.
+3. Why only those? Integer-attribute assignments need variable state the guard
+   does not keep.
+4. Why not fail closed? Nothing marked the text as integer-capable.
+5. Fix: when any segment (eval strings, function bodies included) sets an
+   integer attribute, every dequoted word holding `[` plus `$(`/backtick is a
+   payload. A payload only makes the walk READ the file; it refuses only when the
+   file holds a lifecycle command. Without an integer declaration a plain
+   `x=a[\$\(S\)]` stays data (bash does not run it).
+
+Proof (stacked on PR #3073, which adds cron/lifecycle_guard_arith_words.py):
+- tests/cron/test_lifecycle_guard_arith_int_assign.py: 15 real-bash marker
+  shapes, each with a clean twin, plus 4 controls bash does not run (plain
+  assignment, `declare x`, `declare +i x`, no subscript) and 2 unit checks.
+  RED on the #3073 head: 15 failed / 6 passed. GREEN: 21/21.
+- 40 lifecycle_guard test files: 2690 passed (test_large_no_sink_heredoc_scan_stays_fast
+  timed out once under load, passed on retry and alone: 192/192).
+- scripts/check --base origin/main: 20 checks ok.
+
+Task: t_01a1db20266865b2
+---
+ cron/lifecycle_guard_arith_words.py           | 24 ++++-
+ .../test_lifecycle_guard_arith_int_assign.py  | 94 +++++++++++++++++++
+ 2 files changed, 116 insertions(+), 2 deletions(-)
+ create mode 100644 tests/cron/test_lifecycle_guard_arith_int_assign.py
+
+diff --git a/cron/lifecycle_guard_arith_words.py b/cron/lifecycle_guard_arith_words.py
+index fab5f84ad3..aaa1e7d6c7 100644
+--- a/cron/lifecycle_guard_arith_words.py
++++ b/cron/lifecycle_guard_arith_words.py
+@@ -13,6 +13,13 @@ Deliberately coarse, failing towards scanning: any ``[`` plus opener counts, and
+ operand of an integer operator counts wherever the operator sits (``[ … ]``/``test``
+ included). A payload only makes the walk READ the referenced file; it refuses only
+ when that file holds a lifecycle command (or cannot be scanned).
++
++A LATER assignment to an integer variable is arithmetic too: after
++``declare -i x``, ``x=a[\\$\\(S\\)]``, ``x+=…``, ``x[0]=…``, ``declare x=…`` and
++``for x in …`` all run ``S`` (bash 5.2.21, t_01a1db20266865b2). The guard keeps no
++variable state, so once the text sets an integer attribute anywhere (``eval``
++strings and function bodies included) every word holding a subscript and an opener
++is a payload. Without such a declaration a plain ``x=a[\\$\\(S\\)]`` stays data.
+ """
+ from __future__ import annotations
+ 
+@@ -23,6 +30,13 @@ _INT_OPERATORS = frozenset({"-eq", "-ne", "-lt", "-le", "-gt", "-ge"})
+ _INTEGER_DECLARERS = frozenset({"declare", "typeset", "local", "readonly", "export"})
+ _BACKTICK_SPAN_RE = re.compile(r"`([^`]*)`")
+ _SUBSTITUTION_OPENERS = ("$(", "`")
++# A declare-family name followed, anywhere later in the dequoted segment, by an option word
++# carrying ``i``. Matched on the joined words so ``eval "declare -i x"`` and
++# ``builtin declare -xi x`` count; over-matching only makes the walk read more files.
++_INTEGER_DECLARATION_RE = re.compile(
++    r"(?:^|[\s/])(?:declare|typeset|local|readonly|export)\s(?:.*\s)?-[A-Za-z]*i",
++    re.DOTALL,
++)
+ 
+ 
+ def _integer_declaration(arguments: list[str]) -> bool:
+@@ -61,8 +75,14 @@ def iter_arithmetic_word_payloads(command: str) -> Iterator[str]:
+     if "[" not in command or ("$" not in command and "`" not in command):
+         return
+     seen: set[str] = set()
+-    for segment in guard._iter_command_segments(command):
+-        for operand in _arithmetic_operands(segment):
++    segments = list(guard._iter_command_segments(command))
++    # With an integer attribute set anywhere, any word may be an assignment to it.
++    integer_text = any(
++        _INTEGER_DECLARATION_RE.search(" ".join(segment)) for segment in segments
++    )
++    for segment in segments:
++        operands = segment if integer_text else _arithmetic_operands(segment)
++        for operand in operands:
+             if "[" not in operand or not any(o in operand for o in _SUBSTITUTION_OPENERS):
+                 continue
+             payload = _BACKTICK_SPAN_RE.sub(r"$(\1)", operand)
+diff --git a/tests/cron/test_lifecycle_guard_arith_int_assign.py b/tests/cron/test_lifecycle_guard_arith_int_assign.py
+new file mode 100644
+index 0000000000..6fc571dec6
+--- /dev/null
++++ b/tests/cron/test_lifecycle_guard_arith_int_assign.py
+@@ -0,0 +1,94 @@
++"""Real Bash regressions: escaped substitutions assigned to integer variables (t_01a1db20266865b2).
++
++After ``declare -i x`` (or ``typeset -i``/``local -i``), a later plain ``x=a[\\$\\(S\\)]`` is
++dequoted to ``a[$(S)]`` and then evaluated as arithmetic, so the subscript runs ``S``.
++The raw text shows no substitution and the word is no ``let``/``declare -i`` operand, so
++the referenced-script walk never read ``S``: a script holding ``hermes gateway restart``
++ran unscanned.
++"""
++
++import shutil
++import subprocess
++
++import pytest
++
++from cron.lifecycle_guard import scan_gateway_lifecycle
++from cron.lifecycle_guard_arith_words import iter_arithmetic_word_payloads
++
++SHAPES = [
++    r"declare -i x; x=a[\$\(SCRIPT\)]",
++    r"typeset -i x; x=a[\$\(SCRIPT\)]",
++    r"f(){ local -i x; x=a[\$\(SCRIPT\)]; }; f",
++    r"declare -i x; x+=a[\$\(SCRIPT\)]",
++    r"declare -ai x; x[0]=a[\$\(SCRIPT\)]",
++    r"declare -i x; x=a[\`SCRIPT\`]",
++    r"declare -i x; x=a[$\(SCRIPT\)]",
++    "declare -i x\nx=a[\\$\\(SCRIPT\\)]",
++    r"declare -i x && x=a[\$\(SCRIPT\)]",
++    r"declare -xi x; x=a[\$\(SCRIPT\)]",
++    r"declare -i -x x; x=a[\$\(SCRIPT\)]",
++    r"declare -i x; declare x=a[\$\(SCRIPT\)]",
++    r'eval "declare -i x"; x=a[\$\(SCRIPT\)]',
++    r"declare -i x; for x in a[\$\(SCRIPT\)]; do :; done",
++    r"declare -i x; x='a[$(SCRIPT)]'",
++]
++
++# Bash does not run SCRIPT for these: no integer attribute is set, the assigned
++# word has no subscript, or the word is plain data.
++CONTROLS = [
++    r"x=a[\$\(SCRIPT\)]",
++    r"declare x; x=a[\$\(SCRIPT\)]",
++    r"declare +i x; x=a[\$\(SCRIPT\)]",
++    r"declare -i x; x=\$\(SCRIPT\)",
++]
++
++
++def _run_bash(tmp_path, command):
++    bash = shutil.which("bash")
++    if bash is None:
++        pytest.skip("Bash required for execution proof")
++    marker = tmp_path / "ran"
++    script = tmp_path / "payload.sh"
++    script.write_text(f"touch '{marker}'\nprintf 0\n", encoding="utf-8")
++    script.chmod(0o755)
++    subprocess.run(
++        [bash, "--noprofile", "--norc", "-c", command], cwd=tmp_path,
++        env={"PATH": "/usr/bin:/bin"}, capture_output=True, text=True,
++        encoding="utf-8", timeout=10, check=False,
++    )
++    return marker.exists(), script
++
++
++@pytest.mark.platforms("posix")
++@pytest.mark.parametrize("shape", SHAPES)
++def test_integer_assignment_scripts_are_scanned(tmp_path, shape):
++    script = tmp_path / "payload.sh"
++    command = shape.replace("SCRIPT", str(script))
++    ran, script = _run_bash(tmp_path, command)
++    assert ran, "bash must run the referenced script for this shape"
++    script.write_text("hermes gateway restart\n", encoding="utf-8")
++    assert scan_gateway_lifecycle(command, cwd=str(tmp_path)) == (True, None)
++    # Clean twin: the same reference to a harmless script stays allowed.
++    script.write_text("echo hello\n", encoding="utf-8")
++    assert scan_gateway_lifecycle(command, cwd=str(tmp_path)) == (False, None)
++
++
++@pytest.mark.platforms("posix")
++@pytest.mark.parametrize("shape", CONTROLS)
++def test_assignments_without_integer_arithmetic_are_inert(tmp_path, shape):
++    script = tmp_path / "payload.sh"
++    command = shape.replace("SCRIPT", str(script))
++    ran, script = _run_bash(tmp_path, command)
++    assert not ran
++    script.write_text("hermes gateway restart\n", encoding="utf-8")
++    assert scan_gateway_lifecycle(command, cwd=str(tmp_path)) == (False, None)
++
++
++def test_plain_assignment_yields_no_payload():
++    assert list(iter_arithmetic_word_payloads(r"x=a[\$\(S\)]")) == []
++    assert list(iter_arithmetic_word_payloads(r"declare x; x=a[\$\(S\)]")) == []
++
++
++def test_integer_declaration_makes_assignments_payloads():
++    assert list(iter_arithmetic_word_payloads(r"declare -i x; x=a[\$\(S\)]")) == ["x=a[$(S)]"]
++    assert list(iter_arithmetic_word_payloads(r"local -i x; x+=a[\`S\`]")) == ["x+=a[$(S)]"]
+-- 
+2.43.0
+

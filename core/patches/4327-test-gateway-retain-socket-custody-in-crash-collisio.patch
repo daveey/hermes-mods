@@ -1,0 +1,141 @@
+From b16f4ba490c1c5f6d85201e1b9465c72c2cecd7d Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:04:18 +0000
+Subject: [PATCH] test(gateway): retain socket custody in crash collision probe
+ [daveey]
+
+The old controlled-reproduction test forced the restarted dashboard to bind
+the previous aiohttp API port. That port was no longer reserved, so another
+owner made the injection itself fail EADDRINUSE before daemon readiness.
+PR3125's failing head and main have identical probe/runtime bytes; its
+annotation changes did not introduce this fixture's fixed-port claim.
+
+Replace that injection with continuous socket custody: bind once in the
+parent, let the selected predecessor serve the real aiohttp API through an
+inherited descriptor, then retain the parent's duplicate across SIGKILL.
+Both successors retain ordinary port0 allocation and fresh listener receipts.
+Cover collisions at both restart boundaries; assert the predecessor actually
+used the retained socket and successors avoided it. Preserve all existing
+unknown-execution, safe-queue, retained-result and exactly-once assertions.
+Descriptor sharing is POSIX-only; ordinary portable recovery is unchanged.
+No production or retry/deadline changes.
+
+Proof: restoring the old fixed-dashboard injection under controlled socket
+ownership fails both cases at listener.bind with errno98. Removing fresh
+log offsets fails both collision cases. Canonical owning suite (3 cases)
+passes GREEN and three further repetitions with HERMES_TEST_FILE_RETRIES=0.
+Full scripts/check --base origin/main passes, including staged new fixture.
+---
+ .../gateway/fixtures/api_collision_daemon.py  | 24 ++++++++
+ .../gateway/test_api_crash_collision_probe.py | 61 ++++++++++++-------
+ 2 files changed, 62 insertions(+), 23 deletions(-)
+ create mode 100644 tests/gateway/fixtures/api_collision_daemon.py
+
+diff --git a/tests/gateway/fixtures/api_collision_daemon.py b/tests/gateway/fixtures/api_collision_daemon.py
+new file mode 100644
+index 0000000000..05e5aa5eb4
+--- /dev/null
++++ b/tests/gateway/fixtures/api_collision_daemon.py
+@@ -0,0 +1,24 @@
++"""Serve the real API on a socket whose parent retains custody across SIGKILL."""
++import os
++import runpy
++import socket
++import sys
++
++from aiohttp import web
++from gateway.platforms import api_server
++
++
++async def inherited_site(runner, host, port, *, log_tag):
++    assert host == '127.0.0.1' and port == 0, (host, port)
++    listener = socket.socket(fileno=int(os.environ['HERMES_TEST_API_SOCKET']))
++    site = web.SockSite(runner, listener)
++    await site.start()
++    return site
++
++
++api_server.start_tcp_site = inherited_site
++if len(sys.argv) == 2:
++    fixture = sys.argv.pop()
++    runpy.run_path(fixture, run_name='__main__')
++else:
++    runpy.run_module('gateway.run', run_name='__main__')
+diff --git a/tests/gateway/test_api_crash_collision_probe.py b/tests/gateway/test_api_crash_collision_probe.py
+index 897f18ff1f..a83a24f3e8 100644
+--- a/tests/gateway/test_api_crash_collision_probe.py
++++ b/tests/gateway/test_api_crash_collision_probe.py
+@@ -1,32 +1,47 @@
+-"""Controlled reproduction: the dashboard takes the released API port on restart."""
+-import subprocess
++"""Crash recovery must not reuse a predecessor's now-occupied API port."""
++import os
+ from pathlib import Path
+ import re
++import socket
++import subprocess
++
++import pytest
+ 
+ from tests.gateway.test_api_crash_recovery import test_api_crash_queue_and_identified_result_retry as exercise
+ 
+ 
+-def test_dashboard_takes_released_port(tmp_path, monkeypatch):
++@pytest.mark.skipif(os.name == 'nt', reason='socket custody uses POSIX pass_fds; ordinary recovery runs everywhere')
++@pytest.mark.parametrize('collision_restart', [1, 2])
++def test_api_recovers_while_previous_port_is_owned(tmp_path, monkeypatch, collision_restart):
+     original = subprocess.Popen
++    boots = 0
++    # Never reclaim a released port: another test (or the successor's API) may
++    # already own it. The predecessor serves its real aiohttp app on this socket;
++    # our duplicate stays open across SIGKILL, making the collision deterministic.
++    with socket.socket() as custody:
++        custody.bind(('127.0.0.1', 0))
++        custody.listen()
++        occupied_port = custody.getsockname()[1]
+ 
+-    restarts = 0
+-
+-    def spawn(command, **kwargs):
+-        nonlocal restarts
+-        if command[1:] == ['-m', 'gateway.run']:
+-            restarts += 1
+-        if command[1:] == ['-m', 'gateway.run'] and restarts == 2:
+-            log = Path(kwargs['env']['HERMES_HOME']) / 'logs/gateway.log'
+-            ports = re.findall(r'API server listening on http://127\.0\.0\.1:([0-9]+)', log.read_text(encoding='utf-8'))
+-            previous_port = int(ports[-1])
+-            code = (
+-                'import functools, runpy; from gateway import run_api; '
+-                'run_api.start_gateway_api = functools.partial(run_api.start_gateway_api, '
+-                f'port={previous_port}); '
+-                'runpy.run_module("gateway.run", run_name="__main__")'
+-            )
+-            command = [command[0], '-c', code]
+-        return original(command, **kwargs)
++        def spawn(command, **kwargs):
++            nonlocal boots
++            initial = command[1:] == [str(Path(__file__).parent / 'fixtures/api_recovery_daemon.py')]
++            restart = command[1:] == ['-m', 'gateway.run']
++            if initial or restart:
++                boot = boots
++                boots += 1
++                if boot == collision_restart - 1:
++                    wrapper = str(Path(__file__).parent / 'fixtures/api_collision_daemon.py')
++                    command = [command[0], wrapper, *([command[1]] if initial else [])]
++                    kwargs['env'] = {**kwargs['env'], 'HERMES_TEST_API_SOCKET': str(custody.fileno())}
++                    kwargs['pass_fds'] = (custody.fileno(),)
++            return original(command, **kwargs)
+ 
+-    monkeypatch.setattr(subprocess, 'Popen', spawn)
+-    exercise(tmp_path)
++        monkeypatch.setattr(subprocess, 'Popen', spawn)
++        exercise(tmp_path)
++        ports = [int(port) for port in re.findall(
++            r'API server listening on http://127\.0\.0\.1:([0-9]+)',
++            (tmp_path / 'state/logs/gateway.log').read_text(encoding='utf-8'))]
++        assert boots == 3 and len(ports) == 3, (boots, ports)
++        assert ports[collision_restart - 1] == occupied_port, ports
++        assert all(port != occupied_port for port in ports[collision_restart:]), ports
+-- 
+2.43.0
+
