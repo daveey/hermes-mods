@@ -170,8 +170,28 @@ class SuiteSelection(unittest.TestCase):
         # ci_run_cancel.py since c89ec6c6) is selected with it.
         picked = self.pick("skills/devops/github-ci-wait/SKILL.md")
         self.assertIn("skills/devops/github-ci-wait", picked)
-        self.assertNotIn("plugins/ask-gate", picked)
+        # ask-gate now references push-guard, which references this skill: it is a
+        # legitimate transitive dependent, not a stable unrelated-suite control.
+        self.assertIn("plugins/push-guard", picked)
+        self.assertIn("plugins/ask-gate", picked)
         self.assertIn("plugins/inbox", self.pick("desktop-plugins/inbox/plugin.js"))
+
+    def test_skill_dependency_closure_excludes_unrelated_suite(self):
+        # Keep negative coverage independent of the evolving repository graph.
+        suites = ["skills/devops/example", "plugins/direct", "plugins/transitive",
+                  "plugins/unrelated", "repo-guards", "tests"]
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            for suite, source in {
+                "plugins/direct": 'SKILL = "skills/devops/example/scripts/check.py"',
+                "plugins/transitive": 'DEPENDENCY = "plugins/direct/helper.py"',
+                "plugins/unrelated": 'VALUE = 1',
+            }.items():
+                directory = root / suite
+                directory.mkdir(parents=True)
+                (directory / "helper.py").write_text(source)
+            picked, _ = self.mod.select(root, suites, ["skills/devops/example/SKILL.md"])
+            self.assertEqual(picked, suites[:3])
 
 
 class ChangedPaths(unittest.TestCase):
