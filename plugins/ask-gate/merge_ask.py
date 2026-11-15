@@ -34,7 +34,8 @@ _ASK_TAIL = re.compile(r"\bun-?block\s*=", re.I)
 _LIMITS = (
     ("ci_not_green", re.compile(
         r"\b(?:ci|checks?|builds?|tests?)\b[^.;\n]{0,30}?\b(?:is|are|went|turned|still)\s+(?:red|failing|failed|"
-        r"pending|broken)\b|\bchecks?\s+(?:is|are)\s+(?:not\s+(?:green|passing))\b", re.I)),
+        r"pending|broken)\b|\b(?:ci|checks?)\s+(?:is|are)\s+not\s+(?:green|passing)\b"
+        r"|\bchecks?\s+failed\b", re.I)),
     ("not_approved", re.compile(
         r"\bnot\s+(?:yet\s+)?(?:been\s+)?(?:approved|reviewed)\b|\bunreviewed\b|\bunapproved\b"
         r"|\bwithout\s+(?:an?\s+)?(?:independent\s+)?(?:review|approval|ci|tests?|checks?)\b"
