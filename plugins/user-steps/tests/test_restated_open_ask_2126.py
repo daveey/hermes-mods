@@ -243,6 +243,41 @@ def test_headingless_reply_right_under_a_quote_still_names_its_card_by_id():
     assert core.cited_cards('reply here.', reply, [card_entry(), kitchen()]) == [card_entry()]
 
 
+def test_headingless_explicit_id_excludes_a_different_listed_quote():
+    quoted = card_entry(tid='t_0a0a0a0a', action=QUOTED_ASK)
+    own = card_entry()
+    reply = f"> {QUOTED_ASK}\n\nAbout card {LOCAL_CARD} instead: reply here."
+    assert core.cited_cards('reply here.', reply, [quoted, own]) == [own]
+
+
+def test_headingless_previous_prose_is_not_a_quoted_citation():
+    # An action mentioned as prose above is not a citation for this separate paragraph.
+    other = card_entry(tid='t_0a0a0a0a', action=QUOTED_ASK)
+    reply = f"{QUOTED_ASK}\n\n{PARAPHRASE}"
+    assert core.cited_cards(PARAPHRASE, reply, [other, kitchen()]) == [other, kitchen()]
+    assert core.card_ask_for(PARA_STEP, [other, kitchen()], (), reply) == kitchen()
+    # A generic reply does not have the strong ask-word match that stops the current scan.
+    generic = f"{QUOTED_ASK}\n\nReply here."
+    assert core.cited_cards('Reply here.', generic, [other, card_entry()]) == [other, card_entry()]
+
+
+def test_headingless_first_paragraph_does_not_wrap_to_a_trailing_quote():
+    reply = f"{PARAPHRASE}\n\n> {QUOTED_ASK}"
+    assert core.cited_cards(PARAPHRASE, reply, [kitchen()]) == [kitchen()]
+    assert core.card_ask_for(PARA_STEP, [kitchen()], (), reply) == kitchen()
+
+
+def test_quote_only_span_has_no_prose_target_and_cannot_expand_a_section():
+    # A6 is caller-equivalent: locate never returns a quote as the own paragraph.
+    reply = f"> {QUOTED_ASK}\n\n> {PARAPHRASE}"
+    assert core.locate(reply, PARAPHRASE) is None
+    assert core._section(reply, PARAPHRASE) == ''
+    assert core.cited_cards(PARAPHRASE, reply, [kitchen()]) == [kitchen()]
+    mixed = reply + f"\n\n{PARAPHRASE}"
+    target = core.locate(mixed, PARAPHRASE)
+    assert target is not None and not target['quote'] and target['text'] == PARAPHRASE
+
+
 # ---- (a) the gate holds what the transform would mint -------------------------------------------------------
 
 FRESH = 'how are the four PRs doing?'
@@ -264,6 +299,84 @@ def plugin(tmp_path, monkeypatch):
     monkeypatch.setattr(mod, '_eligible', lambda *a, **k: True)
     monkeypatch.setattr(mod, '_framed', lambda *a: True)
     return mod
+
+
+def test_shared_extraction_hot_lookup_progresses_during_another_model_call(plugin, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError
+    from threading import Event
+
+    started, release = Event(), Event()
+
+    def model(system, user):
+        if user == 'slow':
+            started.set()
+            assert release.wait(5), 'fixture did not release the slow model'
+        return 'answer:' + user
+
+    monkeypatch.setattr(plugin, 'aux_llm', model)
+    assert plugin.shared_llm('system', 'hot') == 'answer:hot'
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        slow = pool.submit(plugin.shared_llm, 'system', 'slow')
+        try:
+            assert started.wait(5), 'slow model did not start'
+            hot = pool.submit(plugin.shared_llm, 'system', 'hot')
+            try:
+                assert hot.result(timeout=2) == 'answer:hot'
+            except TimeoutError:
+                pytest.fail('cached lookup stalled behind an unrelated model callback')
+        finally:
+            release.set()
+        assert slow.result(timeout=5) == 'answer:slow'
+
+
+def test_shared_extraction_serializes_iteration_against_another_writer(plugin, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event, Lock, current_thread
+
+    traversing, second_boundary = Event(), Event()
+    first_thread = []
+
+    class CoordinatedLock:
+        def __init__(self):
+            self.lock = Lock()
+
+        def __enter__(self):
+            # Tell the paused iterator the other caller has reached the cache boundary.
+            if traversing.is_set() and current_thread() is not first_thread[0]:
+                second_boundary.set()
+            self.lock.acquire()
+            return self
+
+        def __exit__(self, *exc):
+            self.lock.release()
+
+    class PausedTraversal(dict):
+        def __setitem__(self, key, value):
+            super().__setitem__(key, value)
+            if traversing.is_set() and current_thread() is not first_thread[0]:
+                # Without serialization the insertion, rather than lock admission, releases the iterator.
+                second_boundary.set()
+
+        def items(self):
+            iterator = iter(super().items())
+            if not first_thread:
+                first_thread.append(current_thread())
+                yield next(iterator)
+                traversing.set()
+                assert second_boundary.wait(5), 'second caller never reached the cache boundary'
+            yield from iterator
+
+    monkeypatch.setattr(plugin, '_EXTRACTIONS', PausedTraversal())
+    monkeypatch.setattr(plugin, '_EXTRACTIONS_LOCK', CoordinatedLock())
+    monkeypatch.setattr(plugin, 'aux_llm', lambda system, user: 'answer:' + user)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(plugin.shared_llm, 'system', 'one')
+        assert traversing.wait(5), 'first writer never reached eviction traversal'
+        second = pool.submit(plugin.shared_llm, 'system', 'two')
+        assert first.result(timeout=5) == 'answer:one'
+        assert second.result(timeout=5) == 'answer:two'
+    assert plugin.shared_llm('system', 'one') == 'answer:one'
+    assert plugin.shared_llm('system', 'two') == 'answer:two'
 
 
 def test_shared_extraction_expires_at_900_seconds_without_sliding_on_hits(plugin, monkeypatch):
