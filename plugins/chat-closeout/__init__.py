@@ -1894,7 +1894,10 @@ def waiting_inputs() -> Any:
 
 
 def _waiting_scope() -> Any:
-    from hermes_cli import kanban_session_activity as ksa
+    try:
+        from hermes_cli import kanban_session_activity as ksa
+    except ImportError:  # standalone plugin tools and old cores have no annotation seam
+        return None
     return tuple(ksa._origin_scope()) if hasattr(ksa, "_origin_scope") else None
 
 
