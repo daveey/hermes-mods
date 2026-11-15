@@ -1145,6 +1145,7 @@ export function DecisionRow({ request, route, call = api, unavailable = false, p
       age && jsx('time', { 'data-asked-age': '', dateTime: r.createdAt, title: `${new Date(r.createdAt).toLocaleString()} · revision ${r.revision}`, style: { flex: 'none' }, children: age })
     ] }),
     !presentation && jsx('h3', { style: { margin: '2px 0 4px', fontSize: 14, fontWeight: 600, lineHeight: 1.4, overflowWrap: 'anywhere', minWidth: 0 }, children: r.title }),
+    presentation && jsx('div', { 'data-action-card-title': '', style: { fontWeight: 600, fontSize: 13, overflowWrap: 'anywhere' }, children: r.title }),
     presentation && jsxs('div', { 'data-clarify-question': '', style: { display: 'flex', alignItems: 'baseline', gap: 8, margin: '8px 0 4px', fontSize: 13, lineHeight: 1.5 }, children: [jsx('p', { style: { margin: 0, flex: 1, overflowWrap: 'anywhere' }, children: `${position}/${total} — ${presentation.question}` }), jsx('span', { style: { flex: 'none', color: 'var(--muted-foreground)', fontSize: 10 }, children: 'Pick one' })] }),
     !locked && presentation && jsx('div', { role: 'group', 'aria-label': 'Options', children: [
       ...ordered.map((c, i) => questionRow(c.id, i, `${c.label.replace(/\s*\(recommended\)\s*$/i, '')}${c === recommended ? ' (recommended)' : ''}`, () => void send(c), choiceDisabled(c), c === recommended)),

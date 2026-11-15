@@ -412,7 +412,9 @@ export function sessionTaskChips(tasks, route) {
     const key = taskKey(t?.gateway || t?.connectionId, t?.board, t?.id, t?.profile)
     if (!t?.id || (!KANBAN_ACTIVE.has(status) && status !== 'unknown') || seen.has(key)) continue
     seen.add(key)
-    out.push(taskChip(t, status))
+    // A successful session-task read dates the board lifecycle, not the executor.
+    // Do not stamp legacy board fallbacks or cached failed reads as fresh evidence.
+    out.push({ ...taskChip(t, status), boardStatus: { state: status, readAt: Date.now(), source: t.remote || t.source === 'replica' ? 'replica' : 'owner' } })
   }
   return byRank(out)
 }
