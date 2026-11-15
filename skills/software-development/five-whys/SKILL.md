@@ -111,7 +111,7 @@ another actor before filesystem or log forensics: open cards on that subsystem o
 comments, and sessions working on the same object. Agents often write to a host over ssh from another host, so the
 target host's logs, process list and session DB never show the change; the actor's card or transcript does.
 
-**Before profiling a live service, rule out observer-induced stalls.** Use `py-spy record/top --nonblocking` for attached production targets, with a bounded duration. Default ptrace sampling can suspend threads long enough to create the timeout being investigated; a requested duration is not a bound when sampling falls behind. Correlate profiler start/end and lag warnings with server loop coverage gaps and client failures, and discard those intervals as ordinary-load evidence. Never reproduce blocking attachment against the user's live backend; use a separate fixture. The coach profiler-safety pre-tool guard enforces common command forms, not dynamically generated scripts; on the hub and MacBook `~/.local/bin/py-spy` is a wrapper (hermes-mods `tools/process-safety/py_spy_nonblocking.py`) that adds `--nonblocking` to every attached record/top/dump, so check `ls -l ~/.local/bin/py-spy` still points there before profiling another host. When a backend stalls, grep the host's `journalctl` for `COMMAND=.*py-spy` in the window before blaming load.
+**Before profiling a live service, rule out observer-induced stalls:** read `references/resource-observability-pitfalls.md` (non-blocking py-spy, the profiler guard and wrapper, the journalctl check).
 
 Before superseding a duplicate transcript row, inspect whether its carrier already folded unrelated input. A retained notice ID identifies the original row, not necessarily all current content. Exercise interleaved A/B/A rows and both sidecar orders; guard differing composite content from wholesale retirement, and verify unrelated text and durable row identities survive.
 
@@ -190,13 +190,10 @@ the update). Write that precondition into the live-check acceptance and confirm 
 it was absent, report "no regression; prevention not yet observed live". The reverse holds for a check that the old
 symptom stopped: count only hits from processes started after the fix landed (a worker spawned before the update keeps
 the old code until it exits; date each line by its session-id stamp or the run's `spawned` time), and anchor the
-match at line start (timestamp, level, the optional `[<session>] ` tag that lines logged inside a session carry,
-emitting logger, then the message: `WARNING (\[[^]]*\] )?agent\.conversation_loop: <message>`), never the bare phrase:
-card titles, comments and your own grep commands (desktop.log echoes tool-call arguments) quote it in the same logs.
-Dry-run the probe on the live log (current and rotated files) and on one synthetic hit right after filing it, before
-parking. Copy that hit from a real line of the same logger in the live log and swap only the message: a hit typed from
-the format you assumed passes a probe that shares the wrong assumption (an anchor without the session tag kept a
-verify card asleep 29 h past its real hit, and a sweep that re-ran the probe trusted it). A guard that "works"
+match at line start (timestamp, level, optional `[<session>] ` tag, emitting logger, then the message), never the bare
+phrase: card titles, comments and your own grep commands (desktop.log echoes tool-call arguments) quote it in the same
+logs. Dry-run the probe on the live log (rotated files too) and on one synthetic hit copied from a real line of that
+logger, right after filing it, before parking: a hit typed from an assumed format passes a probe sharing the error. A guard that "works"
 often moves the failure somewhere quieter: a loud error that falls back to a slow path, an estimate that drifted from
 the real count, an urgent route parked by an unrelated hold. Each of those is a new why-chain.
 
