@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from . import approval_adapter_loading, approval_reconciliation, lifecycle, user_step_lifecycle, runtime_contract, core, handoff, pr_approval_request, chat_delivery, superseding, physical_asks, replan, agent_condition, owner_recommendation, access_scope, approval_reuse, judge as judge_mod
+    from . import approval_adapter_loading, approval_reconciliation, lifecycle, user_step_lifecycle, runtime_contract, core, handoff, pr_approval_request, chat_delivery, superseding, physical_asks, replan, agent_condition, owner_recommendation, merge_ask, access_scope, approval_reuse, judge as judge_mod
 except ImportError:  # pytest/spec loading imports the hyphenated plugin dir without a parent package
     import importlib.util as _ilu
     import sys as _sys
@@ -44,6 +44,7 @@ except ImportError:  # pytest/spec loading imports the hyphenated plugin dir wit
     replan = _sib("replan")
     agent_condition = _sib("agent_condition")
     owner_recommendation = _sib("owner_recommendation")
+    merge_ask = _sib("merge_ask")
     access_scope = _sib("access_scope")
     approval_reuse = _sib("approval_reuse")
 
@@ -938,6 +939,43 @@ def _agent_condition_hold(session_id: str, tool_name: str, request: dict) -> dic
         return None
 
 
+# Process-local hold counts per (session, tool, card or request title), like _OWNER_RECOMMENDATION_HELD.
+_MERGE_ASK_HELD: dict[tuple[str, str, str], int] = {}
+
+
+def _merge_ask_gate(session_id: str, tool_name: str, args: dict) -> dict | None:
+    """Hold an ask that hands David the merge of a PR while naming no limit only he can change (self-heal
+    agent-b62d798d7d). Covers human_request on kanban_block / kanban_create and action_request approvals/choices.
+    Runs before the chat-delivery and judge checks so the refusal names the real fix. Deterministic, bounded to
+    merge_ask.MAX_HOLDS per (session, tool, card or title); fails open."""
+    try:
+        if tool_name == "action_request":
+            req = args.get("request")
+            if "withdraw" in args or not isinstance(req, dict):
+                return None
+            found = merge_ask.action_request_hit(req)
+            ident = " ".join(str(req.get("title") or "").split())
+        elif tool_name in ("kanban_block", "kanban_create") and isinstance(args.get("human_request"), dict):
+            found = merge_ask.hit(args["human_request"])
+            ident = next(iter(_block_card(tool_name, args)), "") or str(args.get("title") or "")
+        else:
+            return None
+        if found is None:
+            return None
+        key = (session_id, tool_name, ident)
+        n = _MERGE_ASK_HELD.get(key, 0)
+        if n >= merge_ask.MAX_HOLDS:
+            core.log_event("merge_ask_released", tool=tool_name, session=session_id, holds=n, quote=found["quote"])
+            return None
+        _MERGE_ASK_HELD[key] = n + 1
+        core.log_event("merge_ask_hold", tool=tool_name, session=session_id, attempt=n,
+                       task=os.environ.get("HERMES_KANBAN_TASK") or "", quote=found["quote"])
+        return {"action": "block", "message": merge_ask.HOLD_MESSAGE}
+    except Exception as e:
+        core.log_event("merge_ask_error", tool=tool_name, session=session_id, error=repr(e)[:300])
+        return None
+
+
 # Process-local hold counts per (session, tool, blocked card), not per ask text: an agent rewords a held ask, and a
 # text key would restart the bound on every rewording, holding a real ask whose limit the regex misses forever.
 _OWNER_RECOMMENDATION_HELD: dict[tuple[str, str, str], int] = {}
@@ -1138,6 +1176,9 @@ def pre_tool_call(tool_name: str = "", args: Any = None, session_id: str = "", *
             replanned = _replan_hold(session_id, tool_name, "\n".join(replan.chat_hits(candidates)), chat=True)
             if replanned is not None:
                 return replanned
+        merged = _merge_ask_gate(session_id, tool_name, args)
+        if merged is not None:
+            return merged
         delivery = _chat_delivery_gate(session_id, tool_name, args)
         if delivery is not None:
             return delivery
