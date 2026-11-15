@@ -67,6 +67,55 @@ test('board freshness expires even without execution observations or an SDK verd
   }
 })
 
+test('board read timestamps must be numbers, not coercible values', () => {
+  // Near epoch zero, booleans and null also pass the relational freshness checks.
+  for (const [nowMs, readAt] of [[10_000, '10000'], [10_000, true], [10_000, false], [10_000, null]]) {
+    const chips = tasks.sessionTaskChips([{ id: 't_x', title: 'Parked', status: 'scheduled' }])
+    const chip = { ...chips[0], boardStatus: { ...chips[0].boardStatus, readAt } }
+    const sorted = m.classify([chip], { nowMs })
+    assert.equal(sorted.waiting.length, 1)
+    assert.match(sorted.waiting[0].detail, /^status unknown/, `readAt=${JSON.stringify(readAt)}`)
+  }
+})
+
+test('known execution evidence takes precedence over fresh parked board status', () => {
+  at(10)
+  const chips = tasks.sessionTaskChips([{ id: 't_x', title: 'Review work', status: 'review' }])
+  const opts = { nowMs: Date.now(), evidence: () => ({ state: 'running', sourced: true }) }
+  const sorted = m.classify(chips, opts)
+  assert.equal(sorted.active.length, 1)
+  assert.match(sorted.active[0].detail, /^in review/)
+  assert.equal(sorted.waiting.length, 0)
+})
+
+test('stale or mismatched board stamps cannot hide known execution evidence', () => {
+  at(10)
+  const chips = tasks.sessionTaskChips([{ id: 't_x', title: 'Running work', status: 'running' }])
+  for (const boardStatus of [
+    { ...chips[0].boardStatus, readAt: Date.now() - 60_001 },
+    { ...chips[0].boardStatus, state: 'scheduled' },
+  ]) {
+    const sorted = m.classify([{ ...chips[0], boardStatus }], {
+      nowMs: Date.now(), evidence: () => ({ state: 'running', sourced: true }),
+    })
+    assert.equal(sorted.active.length, 1)
+    assert.match(sorted.active[0].detail, /^running/)
+    assert.equal(sorted.waiting.length, 0)
+  }
+})
+
+test('a fresh running board read cannot establish execution liveness', () => {
+  at(10)
+  const chips = tasks.sessionTaskChips([{ id: 't_x', title: 'Running work', status: 'running' }])
+  for (const evidence of [() => null, () => ({ state: 'unknown', sourced: true })]) {
+    const sorted = m.classify(chips, { nowMs: Date.now(), evidence })
+    assert.equal(sorted.active.length, 0)
+    assert.equal(sorted.waiting.length, 1)
+    assert.match(sorted.waiting[0].detail, /^status unknown/)
+    assert.doesNotMatch(sorted.waiting[0].detail, /board status/)
+  }
+})
+
 test('needs-you shows the plain card title next to the action', async () => {
   bridges({ chips: [card('t_x', 'blocked', { label: 'Choose the release window', look: 'needs-you', humanRequest: { action: 'Choose A or B' } })] })
   await show(React.createElement(m.Panel, { key: 'ask-context' }))
