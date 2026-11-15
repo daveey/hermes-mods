@@ -899,6 +899,8 @@ class _CarryObjects:
             objects = os.path.join(out[0].strip(), "objects")
             if not os.path.isabs(objects) or not os.path.isdir(objects) or objects in stores:
                 continue
+            if _partial_clone(out[0].strip()):
+                continue
             stores.append(objects)
         if not stores:
             return
@@ -1001,6 +1003,22 @@ class _CarryObjects:
         self._settled.set()
         if self._tmp is not None:
             self._tmp.cleanup()
+
+
+def _partial_clone(common_dir):
+    """True when a repository may lack objects its refs reach (a promisor/partial clone), or it cannot tell.
+
+    Borrowed as alternates, such a store's commits become fetch "haves", so the server leaves out blobs the
+    store never downloaded and the fetch fails `missing blob object` (t_01a1de17dd481488: the hub's
+    blob:none core checkout). Promisor packs mark lazily-filled history; the config keys mark a partial
+    clone that has not fetched one yet. Unreadable means unknown, and unknown is not borrowed."""
+    try:
+        if any(Path(common_dir, "objects", "pack").glob("*.promisor")):
+            return True
+        config = Path(common_dir, "config").read_text(errors="replace")
+    except OSError:
+        return True
+    return re.search(r"^\s*(partialclone(filter)?|promisor)\s*=", config, re.I | re.M) is not None
 
 
 def _maybe_repo(path):

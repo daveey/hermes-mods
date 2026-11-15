@@ -172,3 +172,45 @@ def test_deadline_during_reference_probe_still_fails_closed(monkeypatch, tmp_pat
     finally:
         g._PREFLIGHT_DEADLINE.reset(token)
     assert not any("fetch" in argv for argv, _ in calls)
+
+
+@pytest.mark.parametrize("checkout", [False, True])
+def test_partial_clone_reference_is_not_borrowed(monkeypatch, tmp_path, git_history, checkout):
+    """A blob:none partial clone advertises commits whose blobs it lacks (t_01a1de17dd481488).
+
+    Borrowed as alternates, those commits become fetch "haves", so the server omits their blobs and the
+    fetch dies `missing blob object` / `remote did not send all necessary objects`. On the hub the core
+    checkout (a blob:none clone) was the observer's cwd; every carry then fell back to `gh api git/trees`
+    reads larger than the observer's bound. A promisor store is skipped like a shallow one.
+    """
+    repo, heads = git_history
+    _git(repo, "config", "uploadpack.allowFilter", "true")
+    for i, sha in enumerate(sorted({s for trio in heads.values() for s in trio})):
+        _git(repo, "update-ref", f"refs/heads/h{i}", sha)
+    local_git_verifier(monkeypatch, tmp_path, repo)
+    partial = tmp_path / "partial"
+    REAL_RUN(["git", "clone", "-q", "--filter=blob:none", *([] if checkout else ["--no-checkout"]),
+              "file://" + str(repo), str(partial)], check=True, capture_output=True)
+    env = {"HERMES_HOME": str(tmp_path / "home")}
+    seen = _record_stores(monkeypatch)
+    baseline = _verdicts(heads, None, env)
+    seen.clear()
+    assert _verdicts(heads, str(partial), env) == baseline
+    assert seen and all(alt is None and n > 0 for alt, n in seen)
+
+
+def test_partial_clone_policy_reference_skipped_but_full_one_borrowed(monkeypatch, tmp_path, git_history,
+                                                                      reference):
+    repo, heads = git_history
+    _git(repo, "config", "uploadpack.allowFilter", "true")
+    local_git_verifier(monkeypatch, tmp_path, repo)
+    partial = tmp_path / "partial"
+    REAL_RUN(["git", "clone", "-q", "--filter=blob:none", "--no-checkout", "file://" + str(repo), str(partial)],
+             check=True, capture_output=True)
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "ship-only-guard.json").write_text(json.dumps(
+        {"repos": [R], "reference_repos": [str(partial), str(reference)]}))
+    seen = _record_stores(monkeypatch)
+    assert GIT_VERIFY(*heads["clean"], R, str(partial), {"HERMES_HOME": str(home)}) == ""
+    assert seen == [(str((reference / ".git" / "objects").resolve()) + "\n", 0)]
