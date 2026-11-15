@@ -40,6 +40,39 @@ def test_pagination_precharged_before_wire_and_partial_preserved():
     assert len(h.calls) == 1
 
 
+def test_app_bucket_does_not_spend_or_wait_on_pat_cap():
+    from plugins.runners.providers.base import Credential
+    h = capped([response(), response(), response()], cap=1)
+    assert h.api.enumerate(scope()).complete
+    before = h.api.export_state()['@global-hourly-attempts']
+    h.api.credential_resolver = lambda ref: Credential(
+        'github-app-installation:123', 'opaque-app-handle', quota_kind='installation')
+    assert h.api.enumerate(scope()).complete
+    assert h.api.enumerate(scope()).complete
+    assert len(h.calls) == 3
+    assert h.api.export_state()['@global-hourly-attempts'] == before
+    h.api.credential_resolver = lambda ref: Credential('pat-other', 'opaque-pat-handle')
+    assert not h.api.enumerate(scope()).complete
+    assert len(h.calls) == 3
+
+
+def test_app_named_key_alone_cannot_bypass_cap():
+    from plugins.runners.providers.base import Credential
+    h = capped([response()], cap=1)
+    h.api.credential_resolver = lambda ref: Credential('github-app-installation:123', 'pat')
+    assert h.api.enumerate(scope()).complete
+    assert not h.api.enumerate(scope()).complete
+    assert len(h.calls) == 1
+
+
+def test_invalid_quota_kind_fails_before_network():
+    from plugins.runners.providers.base import Credential
+    h = capped([])
+    h.api.credential_resolver = lambda ref: Credential('key', 'token', quota_kind='unlimited')
+    assert h.api.enumerate(scope()).error == 'credential_unavailable'
+    assert not h.calls
+
+
 def test_network_failure_is_charged():
     h = capped([TimeoutError()], cap=1)
     assert not h.api.enumerate(scope()).complete

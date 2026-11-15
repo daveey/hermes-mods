@@ -659,7 +659,8 @@ class BrokerVendGitHub:
                 spec = self._references[ref]
                 identity = _credential_identity(spec)
                 self._live(identity)
-                return Credential(spec.key, self._handles[identity])
+                return Credential(spec.key, self._handles[identity],
+                                  quota_kind='installation' if spec.app is not None else 'user')
             except Exception:
                 raise RuntimeBoundaryError('credential_unavailable') from None
 

@@ -14,6 +14,9 @@ from typing import Any, Callable, Mapping, Protocol
 class Credential:
     key: str
     token: str = field(repr=False)
+    # Only the validated broker App path supplies installation. Unknown/user
+    # credentials remain inside the shared observe-only PAT attempt cap.
+    quota_kind: str = 'user'
 
 
 @dataclass(frozen=True)

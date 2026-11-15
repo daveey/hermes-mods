@@ -174,7 +174,7 @@ class GitHubActions:
     def _credential(self, scope):
         try:
             c = self.credential_resolver(scope['credential_ref'])
-            if not isinstance(c, Credential) or not c.key or c.key == '@global-hourly-attempts' or not isinstance(c.token, str) or not c.token or any(ord(x) < 33 or ord(x) > 126 for x in c.token):
+            if not isinstance(c, Credential) or c.quota_kind not in ('user', 'installation') or not c.key or c.key == '@global-hourly-attempts' or not isinstance(c.token, str) or not c.token or any(ord(x) < 33 or ord(x) > 126 for x in c.token):
                 raise ValueError()
             return c
         except Exception:
@@ -219,7 +219,8 @@ class GitHubActions:
     def _request(self, credential, path, *, redirect=True, metadata=False):
         # All routes are generated locally, including the one-hop numeric alias.
         now = self.clock()
-        if self.hourly_request_cap is not None:
+        capped = self.hourly_request_cap is not None and credential.quota_kind != 'installation'
+        if capped:
             if self.state_sink is None:
                 raise BudgetPersistenceError('hourly_cap_requires_durable_sink')
             self._hourly_attempts = [t for t in self._hourly_attempts if t > now - 3600]
@@ -267,7 +268,7 @@ class GitHubActions:
             if self._cycle_remaining is not None:
                 self._cycle_remaining -= 1
             budget.next_at = max(now, budget.next_at) + self._request_spacing(budget, now)
-        if self.hourly_request_cap is not None:
+        if capped:
             self._hourly_attempts.append(now)
         reservation = self.export_state()
         reservation[credential.key]['until'] = max(
