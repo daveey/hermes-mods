@@ -134,11 +134,12 @@ def _core_root():
     return root
 
 
-def _long_options(parser):
+def _options(parser):
+    # Every option string, short ones included: a new `-a` alias in core would otherwise pass this check while
+    # the reader takes `-a` for the task id and fails open (review of PR #251).
     values, flags = set(), set()
     for action in parser._actions:
-        longs = {o for o in action.option_strings if o.startswith("--")}
-        (flags if action.nargs == 0 else values).update(longs)
+        (flags if action.nargs == 0 else values).update(action.option_strings)
     return values, flags
 
 
@@ -153,10 +154,9 @@ def _sub(parser, name):
 def test_static_lists_match_core_parser():
     """Drift check: the reader's option lists are exactly the options core's parser defines."""
     kanban = _sub(_core_root(), "kanban")
-    values, flags = _long_options(_sub(kanban, "comment"))
-    assert values == set(cb.COMMENT_VALUE_OPTIONS)
-    assert flags == set(cb.COMMENT_FLAG_OPTIONS)
-    assert _long_options(kanban) == (set(cb.KANBAN_VALUE_OPTIONS), set(cb.COMMENT_FLAG_OPTIONS))
+    help_flags = {*cb.COMMENT_FLAG_OPTIONS, "-h"}  # the reader handles `-h` by its exact token
+    assert _options(_sub(kanban, "comment")) == (set(cb.COMMENT_VALUE_OPTIONS), help_flags)
+    assert _options(kanban) == (set(cb.KANBAN_VALUE_OPTIONS), help_flags)
 
 
 KANBAN_OPTS = [[], ["--board", "b1"], ["--boa", "b1"], ["--b=b1"]]
