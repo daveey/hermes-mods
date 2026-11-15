@@ -2486,9 +2486,20 @@ def _push(words, cwd, repos, config):
     return None
 
 
+def _depth_refusal(repos, env):
+    """An exhausted inspection budget is uncertainty, not permission to execute."""
+    if repos is None:
+        repos = load_repos(os.environ if env is None else env)
+    if repos:
+        return "ship-only-guard: inspection depth limit exceeded; simplify nested wrappers and retry."
+    return None
+
+
 def check_argv(argv, cwd=None, repos=None, env=None, _depth=0):
     """Check a literal executable argv, with optional cwd/environment snapshot."""
-    if _depth > 12 or not isinstance(argv, (list, tuple)) or not all(isinstance(x, str) for x in argv):
+    if _depth > 12:
+        return _depth_refusal(repos, env)
+    if not isinstance(argv, (list, tuple)) or not all(isinstance(x, str) for x in argv):
         return None
     env = dict(os.environ if env is None else env)
     repos = load_repos(env) if repos is None else {x.lower() for x in repos}
@@ -2615,7 +2626,7 @@ def _source_nodes(node):
 def check_python(code, cwd=None, repos=None, env=None, _depth=0):
     """Inspect literal subprocess/os.system/terminal/tool_call calls, not prose."""
     if _depth > 12:
-        return None
+        return _depth_refusal(repos, env)
     env = dict(os.environ if env is None else env)
     repos = load_repos(env) if repos is None else repos
     try:
@@ -2658,7 +2669,9 @@ def check_python(code, cwd=None, repos=None, env=None, _depth=0):
 
 
 def check_tool(name, args, cwd=None, repos=None, env=None, _depth=0):
-    if _depth > 12 or not isinstance(args, dict):
+    if _depth > 12:
+        return _depth_refusal(repos, env)
+    if not isinstance(args, dict):
         return None
     name = name.rsplit("__", 1)[-1].rsplit(".", 1)[-1]
     cwd = args.get("workdir") or cwd

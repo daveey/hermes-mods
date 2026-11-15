@@ -1,5 +1,6 @@
 """Literal wrapper classification only; no command or network mutation."""
 import importlib.util
+import shlex
 from pathlib import Path
 
 import pytest
@@ -58,6 +59,45 @@ def test_wrapped_state_preflight_matches_bare(monkeypatch, tmp_path, approved):
     assert [argv for argv, kwargs in calls] == bare_calls
     assert bare_calls[0][:3] == ["gh", "pr", "view"]
     assert (bare is None) == approved
+
+
+def nested_shell(command, count):
+    for _ in range(count):
+        command = "sh -c " + shlex.quote(command)
+    return command
+
+
+def test_wrapper_fallback_consumes_last_depth_step(tmp_path):
+    # terminal -> shell -> argv starts at 2; five shells reach argv at 12.
+    # The fallback gh candidate is at 13, so classification must stop closed,
+    # not silently allow it or run the ordinary merge/preflight classifier.
+    refusal = check(nested_shell(BROKER + MERGE, 5), tmp_path)
+    assert refusal and "inspection depth limit" in refusal
+    ordinary = check(nested_shell(BROKER + MERGE, 4), tmp_path)
+    assert ordinary and "inspection depth limit" not in ordinary
+    # A read-only candidate makes the lost increment an allow/refuse change,
+    # not merely a different diagnostic for the already-forbidden merge.
+    view = BROKER + f"gh pr view 1 -R {REPO}"
+    assert check(nested_shell(view, 4), tmp_path) is None
+    assert "inspection depth limit" in check(nested_shell(view, 5), tmp_path)
+
+
+@pytest.mark.parametrize("route", ["shell", "python", "tool_call"])
+def test_nested_inspection_exhaustion_is_fail_closed(route, tmp_path):
+    if route == "shell":
+        name, args = "terminal", {"command": nested_shell(MERGE, 6)}
+    elif route == "python":
+        # argv at 12 enters Python at 13.
+        command = "python3 -c " + shlex.quote(f"import os; os.system({MERGE!r})")
+        name, args = "terminal", {"command": nested_shell(command, 5)}
+    else:
+        name, args = "terminal", {"command": MERGE}
+        for _ in range(13):
+            name, args = "tool_call", {"calls": [{"name": name, "arguments": args}]}
+    refusal = g.check_tool(name, args, cwd=str(tmp_path), repos={REPO}, env={})
+    assert refusal and "inspection depth limit" in refusal
+    # Disabling all protected repos still disables this guard.
+    assert g.check_tool(name, args, cwd=str(tmp_path), repos=set(), env={}) is None
 
 
 def test_wrapped_git_preserves_context(tmp_path, monkeypatch):
