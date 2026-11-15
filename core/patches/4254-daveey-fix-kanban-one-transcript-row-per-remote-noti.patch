@@ -1,0 +1,407 @@
+From 6b16a91ae091bfc61ce9d3f83c70ef9b50cc9078 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 18:34:53 +0000
+Subject: [PATCH] [daveey] fix(kanban): one transcript row per remote notice
+ when a second profile's sweeper is on the install
+
+A remote notice that woke a turn landed twice: a passive row, then the woken turn's own row (hub: 156 remote
+notice_ids in 3 days). Cause: the claim ledger lived in get_hermes_home(), so the example gateways (own profile
+homes, sweeping the default chats) claimed in their own ledger. Their wake could not resume the chat
+("missing") and wrote the passive row; the Desktop's sweep, in the default ledger, still offered the notice,
+woke a turn, and the turn wrote it again. Its own-claim ack was then satisfied by the passive row.
+
+- ledger_path(): one ledger per install (get_default_hermes_root()), so every profile's process sees the claim.
+- _claim_notice: a fresh notice whose key is already in the transcript is acked, never offered (no wake).
+- Alternation repair: two adjacent user rows of one notice_id keep ONE row, the one with api_content (the
+  woken turn's ask-gate block), instead of concatenating the text twice and dropping api_content.
+
+Card t_01a1db370b459fab.
+---
+ agent/agent_runtime_helpers.py                |  16 +-
+ agent/agent_runtime_helpers_user_rows.py      |  41 ++++
+ .../test_kanban_remote_owner_delivery.py      |  11 +-
+ .../test_kanban_remote_index_defer.py         |   4 +-
+ .../test_kanban_remote_notice_once.py         | 198 ++++++++++++++++++
+ tui_gateway/kanban_remote_notices.py          |  21 +-
+ 6 files changed, 270 insertions(+), 21 deletions(-)
+ create mode 100644 agent/agent_runtime_helpers_user_rows.py
+ create mode 100644 tests/tui_gateway/test_kanban_remote_notice_once.py
+
+diff --git a/agent/agent_runtime_helpers.py b/agent/agent_runtime_helpers.py
+index 82448743cf..17218875a4 100644
+--- a/agent/agent_runtime_helpers.py
++++ b/agent/agent_runtime_helpers.py
+@@ -36,6 +36,7 @@ from agent.retry_utils import LIVE_RETRY_WAIT_CAP_S, parse_retry_after_seconds,
+ from agent.message_metadata import MERGED_TURN_PREFIX
+ from agent.turn_context import drop_stale_api_content
+ from agent.agent_runtime_helpers_placeholders import _INTERRUPTED_PLACEHOLDER
++from agent.agent_runtime_helpers_user_rows import _remember_own_row, keep_one_notice_row
+ from agent.primary_runtime_snapshot import _build_primary_runtime_snapshot
+ from utils import base_url_host_matches, base_url_hostname, env_var_enabled, atomic_json_write
+ logger = logging.getLogger(__name__)
+@@ -517,18 +518,6 @@ def _count_unnamed_row(survivor: dict[str, Any], retired: dict[str, Any]) -> Non
+             survivor.setdefault(RETIRED_DURABLE_ROWS, []).append(retired_row_payload(retired))
+ 
+ 
+-def _remember_own_row(survivor: dict[str, Any]) -> None:
+-    """An assistant fold rewrites *survivor*'s text, so on a reload without row ids its own row no longer
+-    matches it by content. Record its loaded fields first, once."""
+-    from agent.context_compressor import _DB_PERSISTED_MARKER
+-    from agent.conversation_compression_archive import OWN_ROW, RETIRED_DURABLE_ROWS, retired_row_payload
+-
+-    recorded = survivor.get(RETIRED_DURABLE_ROWS) or ()
+-    if (survivor.get(_DB_PERSISTED_MARKER) and not isinstance(survivor.get("_row_id"), int)
+-            and not any(isinstance(row, dict) and row.get(OWN_ROW) for row in recorded)):
+-        survivor.setdefault(RETIRED_DURABLE_ROWS, []).append({**retired_row_payload(survivor), OWN_ROW: True})
+-
+-
+ def _retire_dropped_row(kept: list[dict], dropped: dict[str, Any], leading: list[dict]) -> None:
+     """A durable row the repair drops was still handed to the caller, so the survivor before it stands
+     for it. Left unnamed, an in-place compaction takes it for a row another surface appended and
+@@ -674,6 +663,9 @@ def _merge_consecutive_users(messages: list[dict]) -> tuple[list[dict], int]:
+     merged: list[dict] = []
+     for msg in messages:
+         prev = merged[-1] if merged and isinstance(merged[-1], dict) else None
++        if prev is not None and (kept := keep_one_notice_row(prev, msg)) is not None:
++            merged[-1], repairs = kept, repairs + 1
++            continue
+         if (
+             prev is not None and prev.get("role") == "user"
+             and isinstance(msg, dict) and msg.get("role") == "user"
+diff --git a/agent/agent_runtime_helpers_user_rows.py b/agent/agent_runtime_helpers_user_rows.py
+new file mode 100644
+index 0000000000..9913ef654b
+--- /dev/null
++++ b/agent/agent_runtime_helpers_user_rows.py
+@@ -0,0 +1,41 @@
++"""Alternation-repair helpers for durable user rows: one row per Kanban notice, and own-row bookkeeping."""
++
++from __future__ import annotations
++
++from typing import Any, Optional
++
++
++def _remember_own_row(survivor: dict[str, Any]) -> None:
++    """An assistant fold rewrites *survivor*'s text, so on a reload without row ids its own row no longer
++    matches it by content. Record its loaded fields first, once."""
++    from agent.context_compressor import _DB_PERSISTED_MARKER
++    from agent.conversation_compression_archive import OWN_ROW, RETIRED_DURABLE_ROWS, retired_row_payload
++
++    recorded = survivor.get(RETIRED_DURABLE_ROWS) or ()
++    if (survivor.get(_DB_PERSISTED_MARKER) and not isinstance(survivor.get("_row_id"), int)
++            and not any(isinstance(row, dict) and row.get(OWN_ROW) for row in recorded)):
++        survivor.setdefault(RETIRED_DURABLE_ROWS, []).append({**retired_row_payload(survivor), OWN_ROW: True})
++
++
++def _notice_id(msg: Any) -> Optional[str]:
++    meta = msg.get("display_metadata") if isinstance(msg, dict) else None
++    if msg.get("role") != "user" or msg.get("display_kind") != "kanban_notice" or not isinstance(meta, dict):
++        return None
++    value = meta.get("notice_id")
++    return value if isinstance(value, str) and value else None
++
++
++def keep_one_notice_row(prev: dict[str, Any], msg: Any) -> Optional[dict[str, Any]]:
++    """Two adjacent user rows of ONE Kanban notice (a passive row, then the turn it woke): the row to keep, else None.
++
++    [daveey] Concatenating them (the plain user-user merge) made the model read the notice twice and dropped the
++    turn's api_content (its ask-gate live-state block) with the stale sidecar (t_01a1db370b459fab). The row
++    carrying api_content is kept (the woken turn's), else the first; the other is retired onto it, unfolded."""
++    from agent.agent_runtime_helpers import _count_unnamed_row, _remember_absorbed_row
++
++    if not isinstance(msg, dict) or (nid := _notice_id(prev)) is None or _notice_id(msg) != nid:
++        return None
++    keep, drop = (msg, prev) if ("api_content" in msg and "api_content" not in prev) else (prev, msg)
++    _count_unnamed_row(keep, drop)
++    _remember_absorbed_row(keep, drop, folded=False)
++    return keep
+diff --git a/tests/gateway/test_kanban_remote_owner_delivery.py b/tests/gateway/test_kanban_remote_owner_delivery.py
+index ab3dc40e36..ab56d7a96d 100644
+--- a/tests/gateway/test_kanban_remote_owner_delivery.py
++++ b/tests/gateway/test_kanban_remote_owner_delivery.py
+@@ -603,19 +603,18 @@ def test_a_notice_already_in_the_lineage_with_no_ledger_row_under_the_link_is_ac
+ 
+ 
+ def test_a_late_group_with_one_member_already_written_acks_it_and_releases_the_rest(env):
+-    """The partly written late group: the written member is acked, the other goes back unclaimed and is
+-    admitted on its own by the next pass, so each lands exactly once."""
++    """The partly written late group: the written member is acked from the transcript at claim time (never
++    offered: t_01a1db370b459fab), and the other is admitted on its own, so each lands exactly once."""
+     hub, runner, authority, fifo, db = env
+     authority.sessions[CHAT] = _Live(CHAT)
+     _publish(hub, [])  # baseline: arrivals after it are new
+     _write_notice_row(db, CHAT, _key("t_01a1cf4eda4b1ad4", 336647))
+     _busy(db, fifo)
+     _publish(hub, [_late("t_01a1cf4eda4b1ad4", 336647), _late("t_01a1cfd7578b3af4", 466999)])
+-    assert _tick(runner) == []
+-    assert fifo.queued() == []
++    admitted = _tick(runner)
++    assert len(admitted) == 1  # only the unwritten member
++    assert _key("t_01a1cf4eda4b1ad4", 336647) not in json.dumps(admitted)
+     assert _ledger("t_01a1cf4eda4b1ad4")["delivered"] == krn.DELIVERED
+-    assert _ledger("t_01a1cfd7578b3af4") is None  # released, not left in flight
+-    assert len(_tick(runner)) == 1  # offered on its own and admitted
+     fifo.boundary()
+     _tick(runner)
+     assert len(_rows(_key("t_01a1cf4eda4b1ad4", 336647))) == 1
+diff --git a/tests/tui_gateway/test_kanban_remote_index_defer.py b/tests/tui_gateway/test_kanban_remote_index_defer.py
+index d78c33504a..794024b6d4 100644
+--- a/tests/tui_gateway/test_kanban_remote_index_defer.py
++++ b/tests/tui_gateway/test_kanban_remote_index_defer.py
+@@ -223,7 +223,9 @@ def test_a_profile_home_never_defers_to_the_root_holder(own, tmp_path, monkeypat
+     (profile / "kanban").mkdir(parents=True)
+     (profile / "config.yaml").write_text("{}\n")
+     monkeypatch.setenv("HERMES_HOME", str(profile))
+-    assert krn.ledger_path() == profile / "kanban" / "remote-notices.db"
++    # One claim ledger per install (t_01a1db370b459fab): a profile home shares the root's ledger, and still
++    # computes its own miss instead of deferring (conservative; the holder's lease is the root's).
++    assert krn.ledger_path() == tmp_path / "home" / "kanban" / "remote-notices.db"
+     computes = _count_computes(monkeypatch)
+     assert _refs(_poll()) == {"hub/default/default/t_seed"} and len(computes) == 1
+     assert kri.stats["deferred"] == 0
+diff --git a/tests/tui_gateway/test_kanban_remote_notice_once.py b/tests/tui_gateway/test_kanban_remote_notice_once.py
+new file mode 100644
+index 0000000000..fc40c78b80
+--- /dev/null
++++ b/tests/tui_gateway/test_kanban_remote_notice_once.py
+@@ -0,0 +1,198 @@
++"""One transcript row per (chat, remote Kanban notice), whichever sweeper reaches it (t_01a1db370b459fab).
++
++Hub 2026-11-14 17:30Z, chat 20000101_020000_000001: the example-reviewer gateway (its own profile home, so its own
++claim ledger) swept the default chat's notice, could not resume the chat ("missing") and wrote the passive row; 13 s
++later the Desktop backend claimed the same notice in the default ledger, woke a turn, and that turn wrote a second
++row with the same notice_id. Its own-claim ack ("in the transcript; acked") was satisfied by the passive row.
++"""
++
++import contextlib
++import json
++import sqlite3
++import time
++
++from hermes_state import SessionDB
++from tui_gateway import kanban_remote_notices as krn
++from tui_gateway.kanban_remote_notices import sweep_remote_notices
++
++CHAT = "20000101_020000_000001"
++
++
++def _hub(tmp_path, now):
++    task = {"id": "t_dup", "status": "done", "title": "review", "board": "default", "assignee": "default",
++            "completed_at": now - 5,
++            "completion_notice": {"event_id": 662789, "payload": {"summary": "VERDICT: APPROVE"}},
++            "sessions": [{"gw": "macbook", "profile": "default", "session": CHAT, "rel": "shepherd"}]}
++    path = tmp_path / "hub.db"
++    with sqlite3.connect(path) as conn:
++        conn.execute("CREATE TABLE meta(k TEXT, v TEXT)")
++        conn.execute("INSERT INTO meta VALUES ('gateway', 'macbook')")
++        conn.execute("CREATE TABLE replica(gw TEXT, coll TEXT, key TEXT, data TEXT, seq INTEGER)")
++        conn.execute("INSERT INTO replica VALUES (?,?,?,?,1)", ("hub", "tasks", "default/default/t_dup", json.dumps(task)))
++    return path
++
++
++class _Waker:
++    """``_RemoteWaker``'s contract: ``started`` admits a turn (its row lands later, on the turn thread), anything
++    else writes the passive row through ``persist()``."""
++
++    supports_defer = False
++
++    def __init__(self, verdict, pending=None):
++        self.grace_s, self.verdict, self.pending, self.calls = 0.0, verdict, pending, 0
++
++    def deliver(self, tip, text, metadata, task, now, *, persist, started):
++        self.calls += 1
++        if self.verdict != "started":
++            persist()
++            return self.verdict
++        if self.pending is not None:  # the turn thread writes its row after admission
++            self.pending.append((tip, text, metadata))
++        started()
++        return "started"
++
++
++def _turn_row(db, tip, text, metadata):
++    db.append_message(tip, "user", text, api_content=text + "\n\n[ask-gate] live state",
++                      display_kind="kanban_notice", display_metadata={**metadata, "woken": True})
++
++
++def _rows(db):
++    out = {}
++    for msg in db.get_messages(CHAT):
++        meta = msg.get("display_metadata") or {}
++        if isinstance(meta, str):
++            meta = json.loads(meta)
++        out.setdefault(meta.get("notice_id"), []).append(msg)
++    return out
++
++
++@contextlib.contextmanager
++def _chat(tmp_path):
++    with SessionDB(tmp_path / "state.db") as db:
++        db.create_session(CHAT, "desktop")
++
++        @contextlib.contextmanager
++        def opener(profile, sid):
++            yield (db, sid) if sid == CHAT else (None, None)
++
++        yield db, opener
++
++
++def _profile_home(root, monkeypatch, name):
++    home = root if name == "default" else root / "profiles" / name
++    home.mkdir(parents=True, exist_ok=True)
++    (home / "config.yaml").write_text("{}\n")
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    return home
++
++
++def test_every_profile_process_on_an_install_shares_one_claim_ledger(tmp_path, monkeypatch):
++    """The example gateways run as their own profiles; their claims must be the Desktop's claims too."""
++    root = tmp_path / ".hermes"
++    _profile_home(root, monkeypatch, "default")
++    default = krn.ledger_path()
++    _profile_home(root, monkeypatch, "example-reviewer")
++    assert krn.ledger_path() == default
++
++
++def test_woken_turn_row_is_the_only_row_when_another_profile_sweeps_meanwhile(tmp_path, monkeypatch):
++    """Regression (acceptance 1): the Desktop's claim is in flight (turn admitted, row not yet written) when a
++    sweeper running as another profile reaches the notice. That sweeper must see the claim and write nothing; the
++    claim is then acked by the turn's own row."""
++    now = time.time()
++    hub = _hub(tmp_path, now)
++    root = tmp_path / ".hermes"
++    krn._reset_for_tests()
++    pending: list = []
++    with _chat(tmp_path) as (db, opener):
++        _profile_home(root, monkeypatch, "default")
++        desktop = _Waker("started", pending)
++        sweep_remote_notices(replica_path=hub, gateway="macbook", session_db=opener, now=now, waker=desktop)
++        assert desktop.calls == 1 and len(pending) == 1
++
++        _profile_home(root, monkeypatch, "example-reviewer")  # another gateway, same install, same chat store
++        example = _Waker("missing")  # it cannot resume a default-profile chat: it would write the passive row
++        sweep_remote_notices(replica_path=hub, gateway="macbook", session_db=opener, now=now + 13, waker=example)
++        assert example.calls == 0
++        assert _rows(db) == {}
++
++        _turn_row(db, *pending.pop())  # the woken turn persists its user row
++        _profile_home(root, monkeypatch, "default")
++        sweep_remote_notices(replica_path=hub, gateway="macbook", session_db=opener, now=now + 14, waker=desktop)
++        rows = _rows(db)
++        assert len(rows) == 1
++        (only,) = rows.values()
++        assert len(only) == 1 and only[0]["display_metadata"].get("woken") is True and only[0].get("api_content")
++        with sqlite3.connect(krn.ledger_path()) as conn:
++            assert conn.execute("SELECT delivered, holder_pid FROM notices").fetchall() == [(krn.DELIVERED, None)]
++
++
++def test_a_notice_already_in_the_transcript_never_wakes_a_second_turn(tmp_path):
++    """Incident order: another ledger's sweeper wrote the passive row first (its wake could not start). A later
++    sweep with no claim of its own must ack it from the transcript, not wake a turn that writes it again."""
++    now = time.time()
++    hub = _hub(tmp_path, now)
++    krn._reset_for_tests()
++    with _chat(tmp_path) as (db, opener):
++        example = _Waker("missing")
++        sweep_remote_notices(replica_path=hub, gateway="macbook", session_db=opener, ledger=tmp_path / "example.db",
++                             now=now, waker=example)
++        assert example.calls == 1 and len(_rows(db)) == 1
++        krn._reset_for_tests()  # the Desktop is another process: no shared memo
++        pending: list = []
++        desktop = _Waker("started", pending)
++        sweep_remote_notices(replica_path=hub, gateway="macbook", session_db=opener, ledger=tmp_path / "desktop.db",
++                             now=now + 13, waker=desktop)
++        for args in pending:
++            _turn_row(db, *args)
++        assert desktop.calls == 0
++        (only,) = _rows(db).values()
++        assert len(only) == 1
++
++
++def test_a_wake_that_cannot_start_leaves_exactly_one_passive_row(tmp_path, monkeypatch):
++    """Acceptance 2 (guard on current behaviour): no turn starts, so the passive row is the only row, also when a
++    second profile's sweeper passes over the chat afterwards."""
++    now = time.time()
++    hub = _hub(tmp_path, now)
++    root = tmp_path / ".hermes"
++    krn._reset_for_tests()
++    with _chat(tmp_path) as (db, opener):
++        for name in ("default", "example-reviewer"):
++            _profile_home(root, monkeypatch, name)
++            sweep_remote_notices(replica_path=hub, gateway="macbook", session_db=opener, now=now,
++                                 waker=_Waker("missing"))
++        (only,) = _rows(db).values()
++        assert len(only) == 1 and not only[0].get("api_content") and "woken" not in only[0]["display_metadata"]
++
++
++def test_alternation_repair_keeps_one_copy_of_a_notice_and_its_api_content():
++    """Acceptance 3: two adjacent user rows of one notice collapse to the woken turn's row, not a concatenation
++    that repeats the text and drops the ask-gate api_content (hub rows 1288375/1288376 -> 1288499)."""
++    from agent.agent_runtime_helpers import repair_message_sequence
++
++    meta = {"notice_id": "remote:worker-6:default/default/t_dup:662789:default:" + CHAT}
++    text = "✔ [default] @default Kanban t_dup done — review"
++    passive = {"role": "user", "content": text, "display_kind": "kanban_notice", "display_metadata": dict(meta),
++               "_row_id": 1288375}
++    woken = {"role": "user", "content": text, "api_content": text + "\n\n[ask-gate] live state",
++             "display_kind": "kanban_notice", "display_metadata": {**meta, "woken": True}, "_row_id": 1288376}
++    messages = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "ok"}, passive, woken]
++    assert repair_message_sequence(None, messages) == 1
++    assert len(messages) == 3
++    kept = messages[-1]
++    assert kept["content"] == text and kept["api_content"].endswith("[ask-gate] live state")
++    assert kept["_row_id"] == 1288376 and 1288375 in kept.get("_absorbed_row_ids", [])
++
++    # Neither row has api_content: the first is kept, still one copy.
++    a, b = dict(passive), {**passive, "_row_id": 7}
++    messages = [{"role": "assistant", "content": "ok"}, a, b]
++    assert repair_message_sequence(None, messages) == 1
++    assert messages[-1]["content"] == text and messages[-1]["_row_id"] == 1288375
++
++    # Different notices still merge as before (no user text lost).
++    other = {**woken, "display_metadata": {"notice_id": "remote:other"}}
++    messages = [{"role": "assistant", "content": "ok"}, dict(passive), other]
++    repair_message_sequence(None, messages)
++    assert messages[-1]["content"].count(text) == 2
+diff --git a/tui_gateway/kanban_remote_notices.py b/tui_gateway/kanban_remote_notices.py
+index a3de782512..1df728f3d9 100644
+--- a/tui_gateway/kanban_remote_notices.py
++++ b/tui_gateway/kanban_remote_notices.py
+@@ -66,8 +66,14 @@ def hub_db_path() -> Path:
+ 
+ 
+ def ledger_path() -> Path:
+-    from hermes_constants import get_hermes_home
+-    return Path(get_hermes_home()) / "kanban" / "remote-notices.db"
++    """ONE claim ledger per install, beside the hub replica it tracks, whatever profile this process runs as.
++
++    [daveey] It was ``get_hermes_home()``: a process running as another profile (an example gateway holding the
++    ``kanban-unloaded`` host-loop lease, or its pre-lease sweep) claimed the default chats' notices in its OWN
++    ledger, so the Desktop's claim and its never saw each other. Each wrote the notice, one as the passive row
++    and one as a woken turn's row: 156 duplicated remote notices on the hub in 3 days (t_01a1db370b459fab)."""
++    from hermes_constants import get_default_hermes_root
++    return Path(get_default_hermes_root()) / "kanban" / "remote-notices.db"
+ 
+ 
+ def _ro(path: Path) -> sqlite3.Connection:
+@@ -567,6 +573,17 @@ def _claim_notice(conn, *, session, ref, state, now, fresh, notice_key, task_id,
+         (session, ref, state)).fetchone()
+     pid, start = _my_holder()
+     if row is None:
++        if fresh and notice_key and transcript_has is not None and transcript_has(notice_key, ""):
++            # [daveey] Another writer already put this notice in the chat (a second sweeper, another ledger):
++            # offering it again woke a turn whose row duplicated the passive one (t_01a1db370b459fab).
++            with conn:
++                conn.execute(
++                    "INSERT INTO notices (session, ref, state, at, delivered, notice_key, legacy_seen) "
++                    "VALUES (?,?,?,?,?,?,0)", (session, ref, state, now, DELIVERED, notice_key))
++                _swept_row(conn, swept_key, "transcript")
++            logger.info("remote kanban: notice %s %s for chat %s is already in the transcript; acked, not offered",
++                        ref, state, session)
++            return "acked"
+         if not fresh and isinstance(settle_reason, _ExpiredReason):
+             settle_reason = settle_reason()  # outside the write txn: it may scan the transcript
+         reason = str(settle_reason)
+-- 
+2.43.0
+

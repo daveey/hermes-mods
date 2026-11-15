@@ -1,0 +1,165 @@
+From f57b179cc01cfda59276448141084fdc66e4d3c4 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 23:16:02 +0000
+Subject: [PATCH] [daveey] Refuse portable core check execution on Macs
+
+Canonical remote-test snapshot pushes execute pre-push checks locally before transfer. Reject scripts/check on Darwin rather than silently skipping required gates; protect historical candidates at installed hook judgment too. Hook management and candidates without scripts/check remain unchanged. Pool fixtures cover shell/Python subprocess and real Git-hook descendants; RED 6 failures, GREEN 72 tests including existing code-health CLI. scripts/check: 20 checks pass.
+---
+ scripts/check                             |  15 +++-
+ tests/scripts/test_check_mac_admission.py | 104 ++++++++++++++++++++++
+ 2 files changed, 118 insertions(+), 1 deletion(-)
+ create mode 100644 tests/scripts/test_check_mac_admission.py
+
+diff --git a/scripts/check b/scripts/check
+index dd95081007..575d1c6a83 100755
+--- a/scripts/check
++++ b/scripts/check
+@@ -11,7 +11,10 @@ profile-archive, prompt-surface and blob-size guards that CI runs in workflows o
+     python scripts/check --uninstall-hook
+ 
+ CI runs the same command (``.github/workflows/lint.yml``), so a green local run means a green
+-lint lane. Hooks are skippable (``--no-verify``); CI is not. The code-health part honours the
++lint lane. On macOS execution is refused: portable core checks belong on a pool worker.
++Hook management remains available. Refresh installed hooks after updating; their admission
++also protects historical candidates whose own checker predates this policy.
++Hooks are skippable (``--no-verify``); CI is not. The code-health part honours the
+ ``ENFORCEMENT`` switch in ``scripts/code_health/config.py`` (blocking / advisory / off).
+ """
+ 
+@@ -113,6 +116,12 @@ done
+ judge() {  # judge TREE-ISH ARGS...: check out TREE-ISH alone and run its own scripts/check ARGS
+   local tree=$1 tmp dir rc
+   shift
++  # The installed hook must also protect pushes of historical candidates whose
++  # own scripts/check predates Mac admission. Refuse, never skip a required gate.
++  if [ "$(uname -s)" = Darwin ]; then
++    echo "scripts/check: portable core checks belong on a pool worker, not this Mac" >&2
++    return 2
++  fi
+   tmp="$(mktemp -d)" || return 1
+   # Git for Windows: native git and python get this path verbatim when MSYS path conversion
+   # is off (MSYS_NO_PATHCONV=1, as Hermes' terminal sets it), so hand them C:/... spelling.
+@@ -339,6 +348,10 @@ def main(argv: list[str] | None = None) -> int:
+         return install_hook(args.install_hook)
+     if args.uninstall_hook:
+         return uninstall_hooks()
++    if sys.platform == "darwin":
++        print("scripts/check: portable core checks belong on a pool worker, not this Mac; "
++              "run the unchanged required gates there", file=sys.stderr)
++        return 2
+     if args.commit and _upstream_sync_refused(args.commit):
+         return 1
+     try:
+diff --git a/tests/scripts/test_check_mac_admission.py b/tests/scripts/test_check_mac_admission.py
+new file mode 100644
+index 0000000000..bbbc054337
+--- /dev/null
++++ b/tests/scripts/test_check_mac_admission.py
+@@ -0,0 +1,104 @@
++"""Pool-only Darwin decision fixtures; never run a portable suite on a Mac."""
++from __future__ import annotations
++
++import os
++from pathlib import Path
++import runpy
++import shlex
++import subprocess
++import sys
++from unittest.mock import Mock
++
++import pytest
++
++pytestmark = pytest.mark.platforms("linux", "macos")
++ROOT = Path(__file__).resolve().parents[2]
++
++
++@pytest.mark.parametrize("args", [[], ["--only", "health"], ["--commit", "HEAD"], ["--staged"]])
++def test_check_refuses_darwin_before_guards(monkeypatch, capsys, args):
++    ns = runpy.run_path(str(ROOT / "scripts/check"))
++    run = Mock(return_value={})
++    upstream = Mock(return_value=False)
++    monkeypatch.setitem(ns["main"].__globals__, "_run_all", run)
++    monkeypatch.setitem(ns["main"].__globals__, "_upstream_sync_refused", upstream)
++    monkeypatch.setattr(sys, "platform", "darwin")
++    assert ns["main"](args) == 2
++    assert "pool worker" in capsys.readouterr().err
++    run.assert_not_called()
++    upstream.assert_not_called()
++
++
++def test_check_management_and_linux_execution_remain_available(monkeypatch):
++    ns = runpy.run_path(str(ROOT / "scripts/check"))
++    install, uninstall = Mock(return_value=0), Mock(return_value=0)
++    run = Mock(return_value={})
++    monkeypatch.setitem(ns["main"].__globals__, "install_hook", install)
++    monkeypatch.setitem(ns["main"].__globals__, "uninstall_hooks", uninstall)
++    monkeypatch.setitem(ns["main"].__globals__, "_run_all", run)
++    monkeypatch.setattr(sys, "platform", "darwin")
++    assert ns["main"](["--install-hook", "pre-push"]) == 0
++    assert ns["main"](["--uninstall-hook"]) == 0
++    install.assert_called_once_with("pre-push")
++    uninstall.assert_called_once_with()
++    run.assert_not_called()
++    monkeypatch.setattr(sys, "platform", "linux")
++    assert ns["main"]([]) == 0
++    run.assert_called_once()
++
++
++def _run(argv, cwd, env):
++    return subprocess.run(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
++                          capture_output=True, text=True, encoding="utf-8", timeout=30, check=False)
++
++
++@pytest.mark.parametrize("caller", ["terminal", "execute_code"])
++@pytest.mark.parametrize("host,candidate,ref", [
++    ("Darwin", True, "refs/core-wt-test/fixture"),
++    ("Darwin", True, "refs/heads/topic"),
++    ("Darwin", True, "refs/tags/v1"),
++    ("Darwin", False, "refs/heads/state"),
++    ("Linux", True, "refs/core-wt-test/fixture"),
++])
++def test_git_snapshot_push_refuses_before_historical_checker(tmp_path, caller, host, candidate, ref):
++    """Real Git -> generated hook -> old candidate, via shell and Python callers."""
++    ns = runpy.run_path(str(ROOT / "scripts/check"))
++    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
++    env.update(HOME=str(tmp_path), HERMES_HOME=str(tmp_path / "home"),
++               GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
++    shim = tmp_path / "bin"
++    shim.mkdir()
++    uname = shim / "uname"
++    uname.write_text(f"#!/bin/sh\nprintf '{host}\\n'\n", encoding="utf-8")
++    uname.chmod(0o755)
++    env["PATH"] = str(shim) + os.pathsep + env["PATH"]
++    repo = tmp_path / "repo"
++    repo.mkdir()
++    remote = tmp_path / "remote.git"
++    for argv in (["git", "init", "-q", "-b", "main"],
++                 ["git", "config", "user.name", "Fixture"],
++                 ["git", "config", "user.email", "fixture@example.com"]):
++        result = _run(argv, repo, env)
++        assert result.returncode == 0, result.stderr
++    scripts = repo / "scripts"
++    scripts.mkdir()
++    sentinel = tmp_path / "checker-started"
++    (scripts / ("check" if candidate else "other")).write_text(
++        f"from pathlib import Path\nPath({str(sentinel)!r}).touch()\n", encoding="utf-8")
++    for argv in (["git", "add", "."], ["git", "commit", "-qm", "historical checker"],
++                 ["git", "init", "-q", "--bare", str(remote)]):
++        result = _run(argv, repo, env)
++        assert result.returncode == 0, result.stderr
++    hook = repo / ".git/hooks/pre-push"
++    hook.write_text(ns["_HOOKS"]["pre-push"], encoding="utf-8")
++    hook.chmod(0o755)
++    push = ["git", "push", str(remote), f"HEAD:{ref}"]
++    argv = (["bash", "-c", shlex.join(push)] if caller == "terminal" else
++            [sys.executable, "-c", "import subprocess,sys; sys.exit(subprocess.call(sys.argv[1:]))", *push])
++    result = _run(argv, repo, env)
++    refused = host == "Darwin" and candidate
++    assert (result.returncode != 0) == refused, result.stdout + result.stderr
++    assert ("pool worker" in result.stderr) == refused
++    assert sentinel.exists() == (candidate and not refused)
++    refs = _run(["git", "--git-dir", str(remote), "show-ref"], repo, env)
++    assert refs.returncode == (1 if refused else 0), refs.stdout
+-- 
+2.43.0
+

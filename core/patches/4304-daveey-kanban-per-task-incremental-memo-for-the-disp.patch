@@ -1,0 +1,1089 @@
+From 0d342a7e001a2179df1f572f0c36f28c716e20f4 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 17:21:39 +0000
+Subject: [PATCH] [daveey] kanban: per-task incremental memo for the
+ dispatcher's structural scans (G2c)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Why: the dispatcher's structural scans (`kanban_wake_check.foreign_ids`, `kanban_idle_candidates.candidate_task_ids`)
+were memoized on the whole-board content revision. On the hub's default board that revision moves ~16x/min, so the
+memo missed on nearly every tick, and each miss was a full scan: foreign_ids reads every `tasks` row (~5 ms, no index
+on created_on) and runs ~7 times a tick via wake_due_continuations and recompute_ready (kanban_review_release.prepare);
+candidate_task_ids ran 4x per apply_remote_archives plus a BEGIN + sqlite_master read_key each call. The live P1 at
+854519ff measured the reclaim phase at 0.925% of a core against a 0.4% budget (G2b t_01a1d701bfd0abb6).
+
+What: new `hermes_cli/kanban_task_memo.py`, a generic per-task memo driven by the P2 change cursor
+(`kanban_task_change.changed_since`). State per (file identity, name, extra key) is an immutable (Cursor,
+task_id -> value) pair, stored by compare-and-swap so it never goes backwards. Each call reads in one snapshot:
+FULL -> full(conn); changed ids -> partial(conn, ids) merged (absent ids removed). Inside a caller transaction it
+reads through and never stores; nothing is stored without a cursor. Consumers declare the columns they read: the
+cursor is trusted only while each table's update trigger watches each column (a sync migration's ADD COLUMN
+created_on on an open board is unwatched until a writer init reinstalls the triggers), and bookkeeping columns or
+UNREAD_EVENT_KINDS (heartbeats) are refused. Truthy values only; memory bounded (MAX_SLOTS, MAX_ENTRIES).
+
+foreign_ids and candidate_task_ids port to it with id-driven partial queries (O(changed) per dirty tick). An index
+on tasks(created_on) was measured instead and rejected: fast only where the foreign count is 0 (hub, 0.015 ms), but
+5.85 ms vs a 7.15 ms full scan on a worker view with 5,865 foreign rows; the memo is ~0.1 ms in both.
+restore_missing_checks is unchanged: its task_wake_checks LEFT JOIN stays live (that table is unwatched), and a test
+pins that a deleted probe is still re-registered with the memo warm. parent_states/unsatisfied_parents stay live.
+
+Proof (hub, copy of the default board, deployed venv; base = 5eec3bedbbb, after = base + this change):
+  t01a1d701_dirty.py N=15 median ms      before   after   card target
+    apply_remote_archives                 9.02     0.33    <= 2
+    wake_due_continuations                7.50     2.09    <= 3
+    recompute_ready                       7.17     1.64    <= 3
+    sweep_shared_blockers                40.32    35.10    (owned by G2c-blockers)
+  scripts/kanban_reclaim_replay_bench.py --phases (new dirty-tick case) agrees: 8.51/7.29/6.86 -> 0.35/2.34/2.03.
+
+Tests: tests/hermes_cli/test_kanban_task_memo.py (RED with the base consumers: 5 of 20 fail; GREEN here, 20 pass): created_on change,
+insert and delete each reflected after one call; candidate event insert and status in/out; heartbeat-kind and
+bookkeeping-column refusal; unwatched added column never trusted; txn write + rollback + revision reuse with
+nothing stored inside the txn; current pair serves a read inside write_txn; FULL_MARK, file replace, shm change and
+schema change read in full; two-thread race never moves the pair backwards; concurrent readers + writer; randomized
+equivalence against a fresh full scan over 3x120 write sequences (incl. rollbacks and heartbeats); bounded memory;
+a task_wake_checks delete still makes restore_missing_checks re-register. test_kanban_watcher_idle_work.py's memo
+tests now count full vs partial scans.
+
+Card: t_01a1db079d8d4505 (G2c-structural); design t01a1d563 §2 P2, review R13.
+---
+ hermes_cli/kanban_idle_candidates.py          |  73 ++-
+ hermes_cli/kanban_task_memo.py                | 210 ++++++++
+ hermes_cli/kanban_wake_check.py               |  23 +-
+ scripts/kanban_reclaim_replay_bench.py        |  43 +-
+ tests/hermes_cli/test_kanban_task_memo.py     | 500 ++++++++++++++++++
+ .../test_kanban_watcher_idle_work.py          |  50 +-
+ 6 files changed, 823 insertions(+), 76 deletions(-)
+ create mode 100644 hermes_cli/kanban_task_memo.py
+ create mode 100644 tests/hermes_cli/test_kanban_task_memo.py
+
+diff --git a/hermes_cli/kanban_idle_candidates.py b/hermes_cli/kanban_idle_candidates.py
+index 6f14d4bbde..d2951c69e5 100644
+--- a/hermes_cli/kanban_idle_candidates.py
++++ b/hermes_cli/kanban_idle_candidates.py
+@@ -1,8 +1,6 @@
+ """Memoize structural candidates, never time or process-liveness decisions."""
+-from pathlib import Path
+ import sqlite3
+ 
+-from hermes_cli import kanban_activity_revision as revision
+ from hermes_cli.kanban_blocker_inputs import input_pass
+ 
+ 
+@@ -14,49 +12,38 @@ def event_candidates(conn: sqlite3.Connection, statuses: tuple[str, ...], kinds:
+ 
+ def candidate_task_ids(conn: sqlite3.Connection, statuses: tuple[str, ...], kinds: tuple[str, ...],
+                        *, exclude_statuses: bool = False) -> tuple[str, ...]:
+-    """Retain an observer so fresh dispatcher connections share the structural memo.
+-
+-    Caller transactions see their uncommitted writes. File/WAL generation fences
+-    belong to the shared reader; no stat-only cache of commit-visible data.
++    """Ids of the tasks whose status is (or, with ``exclude_statuses``, is not) in ``statuses`` and that carry an
++    event of one of ``kinds``, sorted.
++
++    [daveey] G2c: a per-task memo (``kanban_task_memo``). The answer for a task reads only its own status and its
++    own events, so a write marks exactly the tasks whose answer can move; only those are re-read. The memo it
++    replaces was keyed on the whole-board revision (plus a BEGIN and ``sqlite_master`` scan per call), which moved
++    on nearly every hub tick. Inside a caller's transaction the answer includes its uncommitted writes and is not
++    stored.
+     """
+-    from hermes_cli.kanban_reader_retention import reader
+-
+-    if not conn.in_transaction:
+-        path = conn.execute('PRAGMA database_list').fetchone()[2]
+-        if path:
+-            try:
+-                with reader(Path(path).resolve()) as observer:
+-                    return _on_connection(observer, statuses, kinds, exclude_statuses)
+-            except (sqlite3.Error, OSError):
+-                pass  # use the caller's connection if the optional observer is unavailable
+-    return _on_connection(conn, statuses, kinds, exclude_statuses)
+-
+-
+-def _on_connection(conn, statuses, kinds, exclude_statuses=False):
+-    stamp = None
+-    if not conn.in_transaction and hasattr(conn, '__dict__'):
+-        try:
+-            stamp = revision.read_key(conn, ('tasks', 'task_events'))
+-        except sqlite3.Error:
+-            stamp = None  # a failed optimization must not suppress the real query
+-    key = (statuses, kinds, exclude_statuses)
+-    cache = getattr(conn, '_idle_candidates', {})
+-    if stamp is not None and cache.get(key, (None,))[0] == stamp:
+-        return cache[key][1]
++    from hermes_cli import kanban_task_memo as memo
++
++    statuses, kinds = tuple(statuses), tuple(kinds)
+     operator = 'NOT IN' if exclude_statuses else 'IN'
+-    # [daveey] G2: drive from the event-kind index (a handful of rows) rather than probing it once per task in the
+-    # status set (~6k done/archived cards on the hub board, ~5 ms a call, 5 calls a tick). Same rows.
+-    found = tuple(row[0] for row in conn.execute(
+-        f"SELECT t.id FROM tasks t WHERE t.status {operator} ({','.join('?' * len(statuses))}) AND t.id IN "
+-        f"(SELECT e.task_id FROM task_events e WHERE e.kind IN ({','.join('?' * len(kinds))}))",
+-        (*statuses, *kinds),
+-    ).fetchall())
+-    if stamp is not None:
+-        if len(cache) >= 16:
+-            cache.clear()
+-        cache[key] = stamp, found
+-        conn._idle_candidates = cache
+-    return found
++    # Drive from the event-kind index (a handful of rows) rather than probing it once per task in the status set.
++    sql = (f"SELECT t.id FROM tasks t WHERE t.status {operator} ({','.join('?' * len(statuses))}) AND t.id IN "
++           f"(SELECT e.task_id FROM task_events e WHERE e.kind IN ({','.join('?' * len(kinds))}))")
++
++    def full(c):
++        return {row[0]: True for row in c.execute(sql, (*statuses, *kinds)).fetchall()}
++
++    def partial(c, ids):
++        # Driven from the ids (primary key), each probing the (kind, task_id) event index.
++        return {row[0]: True for row in c.execute(
++            f"SELECT t.id FROM tasks t WHERE t.id IN ({','.join('?' * len(ids))}) "
++            f"AND t.status {operator} ({','.join('?' * len(statuses))}) AND EXISTS (SELECT 1 FROM task_events e "
++            f"WHERE e.task_id = t.id AND e.kind IN ({','.join('?' * len(kinds))}))",
++            (*ids, *statuses, *kinds)).fetchall()}
++
++    st = memo.state(f"idle_candidates:{statuses!r}:{kinds!r}:{bool(exclude_statuses)}", conn, full=full,
++                    partial=partial, columns={'tasks': ('status',), 'task_events': ('kind', 'task_id')},
++                    event_kinds=kinds)
++    return st.view('sorted', lambda values: tuple(sorted(values)))
+ 
+ 
+ @input_pass
+diff --git a/hermes_cli/kanban_task_memo.py b/hermes_cli/kanban_task_memo.py
+new file mode 100644
+index 0000000000..b3aed6b387
+--- /dev/null
++++ b/hermes_cli/kanban_task_memo.py
+@@ -0,0 +1,210 @@
++"""Per-task incremental memo for dispatcher structural scans (P2 consumer, G2c t_01a1db079d8d4505). [daveey]
++
++``kanban_sweep_gate.memo`` reuses a whole-board scan while the board's content revision holds. On the hub's
++``default`` board that revision moves ~16 times a minute, so such a memo misses on nearly every dispatcher tick and
++each structural scan (``foreign_ids``: every ``tasks`` row; ``candidate_task_ids``: a status/event join) ran in full,
++several times a tick. This memo keeps a per-task answer instead and refreshes only the tasks the per-task change
++cursor (``kanban_task_change.changed_since``) names.
++
++State per (file identity, name, extra key) is one immutable ``(Cursor, mapping task_id -> value)`` pair:
++
++* each call opens one snapshot (``BEGIN``), asks ``changed_since`` which tasks moved after the stored cursor, and
++  then reads in that same snapshot: ``full(conn)`` on ``FULL``, else ``partial(conn, ids)``, merged over the stored
++  mapping (an id ``partial`` does not return is removed: it was deleted or no longer qualifies). ``COMMIT``; the new
++  cursor describes exactly the rows read;
++* the pair is swapped in under a lock only when it is newer than the stored one (compare-and-swap on the
++  revision), so a slower thread never moves it backwards;
++* inside a caller's transaction the memo reads through (the cursor then also covers the caller's own uncommitted
++  writes, which ``partial`` sees) but never stores: the caller may roll back and the revision it bumped to can be
++  reused by other rows (as ``kanban_sweep_gate.memo``);
++* nothing is stored without a cursor (in-memory file, untrusted coverage, a file swapped while reading);
++* only tasks whose value is truthy are stored, and memory is bounded (``MAX_SLOTS`` slots, ``MAX_ENTRIES`` per slot).
++
++Values must be functions of the task's OWN rows only (its ``tasks`` row and rows keyed by its ``task_id`` in the
++watched tables): a change to another task marks only that task, so a value embedding another task's row would go
++stale. A consumer declares the columns it reads (``columns``); the cursor is trusted only while each table's update
++trigger watches each of them (a column added after the triggers were installed is not watched until a writer init
++reinstalls them), and a bookkeeping column (``kanban_activity_revision.BOOKKEEPING_COLUMNS``) is refused. It also
++declares the event kinds it reads (``event_kinds``); a kind in ``kanban_activity_revision.UNREAD_EVENT_KINDS``
++(heartbeats) is refused, because its inserts never mark a task. Tables outside the watched set
++(``task_wake_checks``, ``kanban_sync_state``) are never memoized here.
++"""
++from __future__ import annotations
++
++import sqlite3
++import threading
++from types import MappingProxyType
++from typing import Any, Callable, Hashable, Iterable, Mapping, Optional
++
++from hermes_cli import kanban_activity_revision as _rev
++from hermes_cli import kanban_task_change as _tc
++
++MAX_SLOTS = 256
++MAX_ENTRIES = 200_000
++CHUNK = 500  # ids per ``partial`` call (well under SQLite's bound-parameter limit)
++
++_EMPTY: Mapping[str, Any] = MappingProxyType({})
++
++
++class _State:
++    """An immutable (cursor, mapping) pair, plus the derived views consumers ask for (built once per pair)."""
++
++    __slots__ = ("_views", "cursor", "values")
++
++    def __init__(self, cursor: Optional[_tc.Cursor], values: Mapping[str, Any]):
++        self.cursor = cursor
++        self.values = values
++        self._views: dict = {}
++
++    def view(self, name: str, build: Callable[[Mapping[str, Any]], Any]) -> Any:
++        hit = self._views.get(name)
++        if hit is None:
++            hit = self._views[name] = build(self.values)
++        return hit
++
++
++_STATES: dict[tuple, _State] = {}
++_LOCK = threading.Lock()
++
++
++def _check_kinds(event_kinds: Iterable[str]) -> None:
++    unread = set(event_kinds) & set(_rev.UNREAD_EVENT_KINDS)
++    if unread:
++        raise ValueError(f"kanban_task_memo: event kinds {sorted(unread)} never mark their task (heartbeats do not "
++                         "bump the activity revision), so a per-task memo of them would go stale")
++
++
++def _check_columns(watched: tuple) -> None:
++    for table, cols in watched:
++        unwatched = set(cols) & _rev.BOOKKEEPING_COLUMNS.get(table, frozenset())
++        if unwatched:
++            raise ValueError(f"kanban_task_memo: {table} columns {sorted(unwatched)} are bookkeeping (their updates "
++                             "never mark a task), so a per-task memo of them would go stale")
++
++
++# (path, dev, ino, schema_version, watched) -> whether every declared column is in its table's update trigger. A
++# column added after the triggers were installed (``ALTER TABLE ... ADD COLUMN``: a sync migration on an open
++# connection) is not watched until the next writer init reinstalls them; ``schema_version`` moves with either.
++_WATCHES: dict[tuple, bool] = {}
++
++
++def _watches(conn: sqlite3.Connection, ident: tuple, schema: int, watched: tuple) -> bool:
++    key = (*ident, schema, watched)
++    hit = _WATCHES.get(key)
++    if hit is not None:
++        return hit
++    ok = True
++    for table, cols in watched:
++        row = conn.execute("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?",
++                           (f"{_rev.PREFIX}{table}_update",)).fetchone()
++        sql = row[0] if row else ""
++        if any(f"OLD.{_rev._quote(col)} IS NOT NEW.{_rev._quote(col)}" not in sql for col in cols):
++            ok = False
++            break
++    with _LOCK:
++        if len(_WATCHES) >= MAX_SLOTS:
++            _WATCHES.clear()
++        _WATCHES[key] = ok
++    return ok
++
++
++def _store(slot: tuple, state: _State) -> None:
++    """Compare-and-swap: keep the stored pair unless ``state`` is newer (same file and schema, higher revision) or
++    the stored pair describes another file generation (whose cursor could never be trusted again anyway)."""
++    new = state.cursor
++    if new is None:  # never store without a cursor
++        return
++    with _LOCK:
++        held = _STATES.get(slot)
++        if held is not None and held.cursor is not None:
++            old = held.cursor
++            same = (old.dev, old.ino, old.shm, old.schema_version, old.tables) == (
++                new.dev, new.ino, new.shm, new.schema_version, new.tables)
++            if same and new.revision <= old.revision:
++                return
++        if held is None and len(_STATES) >= MAX_SLOTS:
++            _STATES.clear()
++        _STATES[slot] = state
++
++
++def _partial(conn: sqlite3.Connection, partial: Callable, ids: list[str]) -> dict[str, Any]:
++    out: dict[str, Any] = {}
++    for i in range(0, len(ids), CHUNK):
++        out.update(partial(conn, ids[i:i + CHUNK]))
++    return out
++
++
++def state(name: str, conn: sqlite3.Connection, *,
++          full: Callable[[sqlite3.Connection], Mapping[str, Any]],
++          partial: Callable[[sqlite3.Connection, list[str]], Mapping[str, Any]],
++          columns: Mapping[str, Iterable[str]], extra: Hashable = None,
++          event_kinds: Iterable[str] = ()) -> _State:
++    """The memo's current pair for ``name`` (see the module docstring). ``full(conn)`` returns ``task_id -> value``
++    for every task; ``partial(conn, ids)`` returns it for the tasks among ``ids`` that still exist. Falsy values are
++    dropped. ``columns`` names every column the value reads, per watched table: the cursor is trusted only while each
++    table's update trigger watches each of them. Raises ``ValueError`` for a heartbeat-kind or bookkeeping-column
++    consumer and ``sqlite3.Error`` like any read."""
++    _check_kinds(event_kinds)
++    watched = tuple(sorted((table, tuple(sorted(set(cols)))) for table, cols in columns.items()))
++    _check_columns(watched)
++    tables = tuple(table for table, _cols in watched)
++    from hermes_cli.kanban_sweep_gate import file_identity
++    ident = file_identity(conn)
++    if ident is None:
++        return _State(None, _clean(full(conn)))
++    slot = (ident, name, extra)
++    held = _STATES.get(slot)
++    own = not conn.in_transaction
++    if own:
++        conn.execute("BEGIN")  # one snapshot: the cursor describes exactly the rows read below
++    try:
++        try:
++            changed, fresh = _tc.changed_since(conn, held.cursor if held is not None else None, tables=tables)
++            if fresh is not None and not _watches(conn, ident, fresh.schema_version, watched):
++                changed, fresh = _tc.FULL, None  # a column added after the triggers: its updates mark nothing
++        except sqlite3.Error:
++            changed, fresh = _tc.FULL, None  # a failed cursor read only costs the full read; nothing is stored
++        if changed is _tc.FULL or held is None:
++            values: Mapping[str, Any] = _clean(full(conn))
++        elif not changed:
++            values = held.values
++        else:
++            ids = sorted(changed)  # type: ignore[arg-type]  # a frozenset here: FULL took the branch above
++            got = _partial(conn, partial, ids)
++            old = held.values
++            moved = [tid for tid in ids if (got.get(tid) or None) != (old.get(tid) or None)]
++            if not moved:
++                values = old  # e.g. a comment on a task whose value did not change: keep the derived views
++            else:
++                merged = dict(old)
++                for tid in moved:
++                    value = got.get(tid)
++                    if value:
++                        merged[tid] = value
++                    else:
++                        merged.pop(tid, None)
++                values = MappingProxyType(merged)
++    finally:
++        if own:
++            conn.execute("COMMIT")
++    if held is not None and values is held.values:
++        if fresh == held.cursor:
++            return held
++        result = _State(fresh, values)
++        result._views = held._views  # same values: the derived views still hold (read-only after build)
++    else:
++        result = _State(fresh, values)
++    if own and fresh is not None and result is not held and len(values) <= MAX_ENTRIES:
++        _store(slot, result)
++    return result
++
++
++def _clean(values: Mapping[str, Any]) -> Mapping[str, Any]:
++    return MappingProxyType({k: v for k, v in values.items() if v})
++
++
++def reset() -> None:
++    """Forget every memo (tests)."""
++    with _LOCK:
++        _STATES.clear()
++        _WATCHES.clear()
+diff --git a/hermes_cli/kanban_wake_check.py b/hermes_cli/kanban_wake_check.py
+index f6ffbc948e..33dfda3f09 100644
+--- a/hermes_cli/kanban_wake_check.py
++++ b/hermes_cli/kanban_wake_check.py
+@@ -321,17 +321,26 @@ def foreign_ids(conn: sqlite3.Connection, own: Optional[str] = None) -> set[str]
+     if not own:
+         return set()
+ 
+-    def scan(c: sqlite3.Connection) -> frozenset[str]:
+-        rows = c.execute("SELECT id FROM tasks WHERE created_on IS NOT NULL AND created_on != ?", (own,))
+-        return frozenset(r[0] for r in rows.fetchall())
++    sql = "SELECT id FROM tasks WHERE created_on IS NOT NULL AND created_on != ?"
+ 
+-    # [daveey] Structural (``created_on`` is a content column, so any change moves the task-table revision):
+-    # reuse the scan while the revision holds. It ran ~7 times a tick, a full ``tasks`` scan each (G2).
+-    from hermes_cli.kanban_sweep_gate import memo
++    def full(c: sqlite3.Connection) -> dict[str, bool]:
++        return {r[0]: True for r in c.execute(sql, (own,)).fetchall()}
++
++    def partial(c: sqlite3.Connection, ids: list[str]) -> dict[str, bool]:
++        marks = ",".join("?" * len(ids))
++        return {r[0]: True for r in c.execute(f"SELECT id FROM tasks WHERE id IN ({marks}) AND created_on IS NOT NULL "
++                                              "AND created_on != ?", (*ids, own)).fetchall()}
++
++    # [daveey] Structural: a card's ``created_on`` is its own content column, so a change marks that card in the
++    # per-task change cursor. G2c: refresh only the marked cards; the whole-board revision moved on nearly every
++    # hub tick, and the full ``tasks`` scan (~5 ms) ran several times a tick.
++    from hermes_cli import kanban_task_memo as memo
+     try:
+-        return memo(f"foreign_ids:{own}", conn, scan)
++        st = memo.state("foreign_ids", conn, full=full, partial=partial, extra=own,
++                        columns={"tasks": ("created_on",)})
+     except sqlite3.OperationalError:
+         return set()
++    return st.view("ids", frozenset)
+ 
+ 
+ def foreign_copy(conn: sqlite3.Connection, task_id: str) -> bool:
+diff --git a/scripts/kanban_reclaim_replay_bench.py b/scripts/kanban_reclaim_replay_bench.py
+index 84b9bef252..78b7a67ae9 100644
+--- a/scripts/kanban_reclaim_replay_bench.py
++++ b/scripts/kanban_reclaim_replay_bench.py
+@@ -2,13 +2,16 @@
+ ticks over a COPY of a board in a scratch home, CPU per tick per sweep from ``loop_accounting``.
+ 
+ usage: scripts/hermes-python scripts/kanban_reclaim_replay_bench.py <worktree> <board copy> <ticks>
+-           [--churn N | --replay SECONDS] [--blockers N] [--json out] [--profile]
++           [--churn N | --replay SECONDS | --phases] [--blockers N] [--json out] [--profile]
+ 
+ --churn N       before every Nth tick, one content write (a comment), so the board revision moves; 0 = write-free.
+ --replay S      replay the copy's own write cadence: tick i writes iff the i-th 15 s bucket of the last S seconds
+                 of the board's history had a content event (heartbeats excluded: they never move the revision).
+ --blockers N    after the ticks, N dirty-tick passes of ``sweep_shared_blockers`` alone (a comment write before each
+                 pass), reported as ``dirty_shared_blockers`` median/min/max CPU ms per pass (G2c).
++--phases        dirty-tick case: instead of whole ticks, <ticks> rounds of (one comment write, then one reclaim-phase
++                entry point: apply_remote_archives, wake_due_continuations, recompute_ready, sweep_shared_blockers),
++                reporting each phase's median CPU per call. Every call sees a moved board revision.
+ 
+ Side effects are stubbed: wake-check probes, the CI sweep, the capability refresh, worker placement (Board),
+ spawns (max_spawn=0), signals and subprocesses; any DB path outside the scratch home opens an empty read-only file.
+@@ -117,6 +120,44 @@ def tick():
+ 
+ 
+ tick()  # warm: first tick installs triggers and imports
++if "--phases" in sys.argv:
++    # Dirty-tick case (G2c, t_01a1db079d8d4505): one content write before every round, then each reclaim-phase entry
++    # point alone, CPU per call (``time.process_time``). Matches the G2b replay (t01a1d701_dirty.py), whose revision-
++    # keyed memos missed on every such round.
++    import statistics
++    import types
++    from hermes_cli.kanban_continuation import wake_due_continuations
++    from hermes_cli.kanban_idle_candidates import sweep_shared_blockers
++    from hermes_cli.kanban_owner_archive_relay import apply_remote_archives
++    phases = {
++        "apply_remote_archives": lambda: apply_remote_archives(conn),
++        "wake_due_continuations": lambda: wake_due_continuations(conn),
++        "recompute_ready": lambda: kb.recompute_ready(conn),
++        "sweep_shared_blockers": lambda: sweep_shared_blockers(conn, types.SimpleNamespace()),
++    }
++    for fn in phases.values():  # warm each phase's memos
++        fn()
++    samples: dict = {name: [] for name in phases}
++    for i in range(ticks):
++        for name, fn in phases.items():
++            if t_open:
++                with kb.write_txn(conn):
++                    kb._insert_comment(conn, t_open, "bench", f"dirty {i} {name}", int(time.time()))
++            c = time.process_time()
++            try:
++                fn()
++            except Exception as exc:  # health: allow BLE001 -- a stubbed side effect; the CPU spent still counts
++                print(f"bench: {name}: {exc!r}"[:200], file=sys.stderr)
++            samples[name].append(time.process_time() - c)
++    summary = {"board": os.path.basename(src), "rounds": ticks, "dirty_phase_ms": {
++        name: {"median": round(1000 * statistics.median(s), 3), "min": round(1000 * min(s), 3)}
++        for name, s in samples.items()}}
++    print(json.dumps(summary, indent=1))
++    if out:
++        with open(out, "w", encoding="utf-8") as f:
++            json.dump(summary, f, indent=1)
++    shutil.rmtree(home, ignore_errors=True)
++    sys.exit(0)
+ base = {k: dict(v) for k, v in la.counters().items()}
+ prof = None
+ if "--profile" in sys.argv:
+diff --git a/tests/hermes_cli/test_kanban_task_memo.py b/tests/hermes_cli/test_kanban_task_memo.py
+new file mode 100644
+index 0000000000..4b3cb8cc9e
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_task_memo.py
+@@ -0,0 +1,500 @@
++"""Per-task incremental memo for dispatcher structural scans (G2c, t_01a1db079d8d4505). [daveey]
++
++``kanban_task_memo`` keeps ``task_id -> value`` per (file, name, extra key) and refreshes only the tasks the P2
++change cursor (``kanban_task_change``) marks. Its consumers here: ``kanban_wake_check.foreign_ids`` (cards another
++gateway created) and ``kanban_idle_candidates.candidate_task_ids`` (status + own event kinds). Every answer must equal
++a fresh full scan, whatever the write sequence; anything the cursor cannot vouch for reads in full.
++"""
++from __future__ import annotations
++
++import os
++import random
++import shutil
++import sqlite3
++import threading
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_activity_revision as rev
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_idle_candidates as cand
++from hermes_cli import kanban_task_change as tc
++from hermes_cli import kanban_task_memo as memo
++from hermes_cli import kanban_wake_check as kwc
++
++OWN, OTHER = "hub", "worker-7"
++CREATED_ON = {"tasks": ("created_on",)}
++FOREIGN_FULL = "SELECT id FROM tasks WHERE created_on IS NOT NULL"
++CAND_FULL = "SELECT t.id FROM tasks t WHERE t.status"
++
++
++@pytest.fixture(autouse=True)
++def _fresh():
++    memo.reset()
++    tc._reset_for_tests()
++    yield
++    memo.reset()
++    tc._reset_for_tests()
++
++
++def _set_gateway(conn, gateway=OWN):
++    """This gateway's id, as a synced board's ``kanban_sync_state`` row holds it (a minimal table here)."""
++    with kbc.write_txn(conn):
++        conn.execute("CREATE TABLE IF NOT EXISTS kanban_sync_state (gateway_id TEXT)")
++        if conn.execute("UPDATE kanban_sync_state SET gateway_id = ?", (gateway,)).rowcount == 0:
++            conn.execute("INSERT INTO kanban_sync_state (gateway_id) VALUES (?)", (gateway,))
++
++
++def _open(path):
++    """A board connection whose ``tasks`` carry ``created_on`` (a synced board's column) and whose activity
++    triggers watch it, with this gateway's id set."""
++    conn = kbc.connect(path)
++    if "created_on" not in [r[1] for r in conn.execute("PRAGMA table_info(tasks)")]:
++        with kbc.write_txn(conn):
++            conn.execute("ALTER TABLE tasks ADD COLUMN created_on TEXT")
++        rev.ensure_revision(conn, rev.LOCAL_TABLES)  # the update trigger now names the new column
++    _set_gateway(conn)
++    return conn
++
++
++@pytest.fixture
++def board(tmp_path):
++    conn = _open(tmp_path / "board.db")
++    try:
++        yield conn
++    finally:
++        conn.close()
++
++
++def _write(conn, sql, params=()):
++    with kbc.write_txn(conn):
++        conn.execute(sql, params)
++
++
++def _task(conn, created_on=None, status=None):
++    tid = kb.create_task(conn, title="t", assignee="w")
++    with kbc.write_txn(conn):
++        conn.execute("UPDATE tasks SET created_on = ? WHERE id = ?", (created_on, tid))
++        if status:
++            conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, tid))
++    return tid
++
++
++def _delete(conn, tid):
++    with kbc.write_txn(conn):
++        for table in ("task_events", "task_comments", "task_runs", "task_links"):
++            cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})")]
++            for col in ("task_id", "parent_id", "child_id"):
++                if col in cols:
++                    conn.execute(f"DELETE FROM {table} WHERE {col} = ?", (tid,))
++        conn.execute("DELETE FROM tasks WHERE id = ?", (tid,))
++
++
++def _truth_foreign(conn):
++    return {r[0] for r in conn.execute(
++        "SELECT id FROM tasks WHERE created_on IS NOT NULL AND created_on != ?", (OWN,))}
++
++
++def _truth_cand(conn, statuses, kinds, exclude=False):
++    op = "NOT IN" if exclude else "IN"
++    return tuple(sorted(r[0] for r in conn.execute(
++        f"SELECT id FROM tasks WHERE status {op} ({','.join('?' * len(statuses))}) AND id IN (SELECT task_id FROM "
++        f"task_events WHERE kind IN ({','.join('?' * len(kinds))}))", (*statuses, *kinds))))
++
++
++class _Trace:
++    def __init__(self, conn):
++        self.conn, self.sql = conn, []
++
++    def __enter__(self):
++        self.conn.set_trace_callback(self.sql.append)
++        return self
++
++    def __exit__(self, *exc):
++        self.conn.set_trace_callback(None)
++
++    def count(self, prefix):
++        return sum(s.startswith(prefix) for s in self.sql)
++
++
++# --- foreign_ids --------------------------------------------------------------------------------------------------
++
++def test_foreign_ids_reflect_created_on_change_insert_and_delete_after_one_call(board):
++    mine, theirs = _task(board, OWN), _task(board, OTHER)
++    assert kwc.foreign_ids(board) == {theirs}
++    _write(board, "UPDATE tasks SET created_on = ? WHERE id = ?", (OTHER, mine))
++    assert kwc.foreign_ids(board) == {mine, theirs}
++    _write(board, "UPDATE tasks SET created_on = ? WHERE id = ?", (OWN, theirs))
++    assert kwc.foreign_ids(board) == {mine}
++    new = _task(board, OTHER)
++    assert kwc.foreign_ids(board) == {mine, new}
++    _delete(board, mine)
++    assert kwc.foreign_ids(board) == {new}
++    assert kwc.foreign_ids(board) == _truth_foreign(board)
++
++
++def test_foreign_ids_never_rescan_the_board_on_an_unrelated_write(board):
++    theirs = _task(board, OTHER)
++    other = _task(board, OWN)
++    assert kwc.foreign_ids(board) == {theirs}
++    with _Trace(board) as t:
++        for i in range(5):
++            kb.add_comment(board, other, "x", f"churn {i}")
++            assert kwc.foreign_ids(board) == {theirs}
++    assert t.count(FOREIGN_FULL) == 0
++
++
++def test_foreign_ids_are_keyed_by_own_gateway(board):
++    a, b = _task(board, OWN), _task(board, OTHER)
++    assert kwc.foreign_ids(board) == {b}
++    assert kwc.foreign_ids(board, OTHER) == {a}
++    _set_gateway(board, OTHER)
++    assert kwc.foreign_ids(board) == {a}
++
++
++# --- candidate_task_ids ---------------------------------------------------------------------------------------------
++
++def test_candidates_reflect_an_event_insert_and_a_status_change_in_and_out(board):
++    tid = _task(board, status="running")
++    q = (("running",), ("remote_stop_requested",))
++    assert cand.candidate_task_ids(board, *q) == ()
++    with kbc.write_txn(board):
++        kb._append_event(board, tid, "remote_stop_requested", {})
++    assert cand.candidate_task_ids(board, *q) == (tid,)
++    _write(board, "UPDATE tasks SET status = 'done' WHERE id = ?", (tid,))
++    assert cand.candidate_task_ids(board, *q) == ()
++    _write(board, "UPDATE tasks SET status = 'running' WHERE id = ?", (tid,))
++    assert cand.candidate_task_ids(board, *q) == (tid,)
++    _write(board, "DELETE FROM task_events WHERE task_id = ? AND kind = 'remote_stop_requested'", (tid,))
++    assert cand.candidate_task_ids(board, *q) == ()
++    # the exclude_statuses form is a separate memo
++    with kbc.write_txn(board):
++        kb._append_event(board, tid, "remote_stop_requested", {})
++    assert cand.candidate_task_ids(board, ("archived",), q[1], exclude_statuses=True) == (tid,)
++    assert cand.candidate_task_ids(board, ("running",), q[1], exclude_statuses=True) == ()
++
++
++def test_a_heartbeat_kind_declaration_is_refused(board):
++    with pytest.raises(ValueError, match="heartbeat"):
++        cand.candidate_task_ids(board, ("running",), ("heartbeat",))
++    with pytest.raises(ValueError):
++        memo.state("x", board, full=lambda c: {}, partial=lambda c, ids: {}, columns=CREATED_ON,
++                   event_kinds=rev.UNREAD_EVENT_KINDS)
++    with pytest.raises(ValueError, match="bookkeeping"):
++        memo.state("x", board, full=lambda c: {}, partial=lambda c, ids: {}, columns={"tasks": ("claim_expires",)})
++
++
++def test_a_column_added_after_the_triggers_is_never_trusted(tmp_path):
++    """A sync migration's ``ADD COLUMN created_on`` on an open board: the update trigger does not watch it until a
++    writer init reinstalls the triggers, so its changes mark nothing and every call must read in full."""
++    conn = kbc.connect(tmp_path / "board.db")
++    try:
++        _set_gateway(conn)
++        with kbc.write_txn(conn):
++            conn.execute("ALTER TABLE tasks ADD COLUMN created_on TEXT")  # no ensure_revision afterwards
++        tid = _task(conn, OTHER)
++        assert kwc.foreign_ids(conn) == {tid}
++        _write(conn, "UPDATE tasks SET created_on = ? WHERE id = ?", (OWN, tid))  # marks nothing
++        assert kwc.foreign_ids(conn) == frozenset()
++        assert not any(k[1] == "foreign_ids" for k in memo._STATES)
++        rev.ensure_revision(conn, rev.LOCAL_TABLES)  # the next writer init watches the column
++        _write(conn, "UPDATE tasks SET created_on = ? WHERE id = ?", (OTHER, tid))
++        assert kwc.foreign_ids(conn) == {tid}
++        _write(conn, "UPDATE tasks SET created_on = ? WHERE id = ?", (OWN, tid))
++        with _Trace(conn) as t:
++            assert kwc.foreign_ids(conn) == frozenset()
++        assert t.count(FOREIGN_FULL) == 0  # trusted again: the partial read found it
++    finally:
++        conn.close()
++
++
++# --- transactions ---------------------------------------------------------------------------------------------------
++
++def test_a_rolled_back_write_is_seen_inside_the_txn_never_stored_and_its_revision_reuse_is_caught(board):
++    theirs = _task(board, OTHER)
++    assert kwc.foreign_ids(board) == {theirs}
++    slot = next(k for k in memo._STATES if k[1] == "foreign_ids")
++    stored = memo._STATES[slot]
++    board.execute("BEGIN IMMEDIATE")
++    try:
++        board.execute("INSERT INTO tasks (id, title, status, created_at, created_on) "
++                      "VALUES ('t_rolled', 'r', 'todo', 1, ?)", (OTHER,))
++        assert kwc.foreign_ids(board) == {theirs, "t_rolled"}  # the caller sees its own write
++        assert memo._STATES[slot] is stored                    # ...and nothing was stored
++    finally:
++        board.rollback()
++    assert kwc.foreign_ids(board) == {theirs}
++    # The next write reuses the rolled-back revision number on another task.
++    rolled_rev = stored.cursor.revision + 1
++    reused = _task(board, OTHER)
++    assert board.execute("SELECT rev FROM kanban_task_change WHERE task_id = ?", (reused,)).fetchone()[0] >= rolled_rev
++    assert kwc.foreign_ids(board) == {theirs, reused} == _truth_foreign(board)
++
++
++def test_a_current_stored_pair_serves_a_read_inside_a_write_txn(board):
++    """``recompute_ready`` calls foreign_ids inside ``write_txn``: with the pair current, no full scan runs."""
++    theirs = _task(board, OTHER)
++    assert kwc.foreign_ids(board) == {theirs}
++    with _Trace(board) as t:
++        with kbc.write_txn(board):
++            assert kwc.foreign_ids(board) == {theirs}
++    assert t.count(FOREIGN_FULL) == 0
++
++
++# --- untrusted cursors read in full ---------------------------------------------------------------------------------
++
++def test_full_mark_reads_in_full(board):
++    theirs = _task(board, OTHER)
++    assert kwc.foreign_ids(board) == {theirs}
++    with kbc.write_txn(board):
++        board.execute(rev._BUMP)
++        board.execute(rev._mark("NULL"))
++    with _Trace(board) as t:
++        assert kwc.foreign_ids(board) == {theirs}
++    assert t.count(FOREIGN_FULL) == 1
++
++
++def test_a_schema_change_reads_in_full(board):
++    theirs = _task(board, OTHER)
++    assert kwc.foreign_ids(board) == {theirs}
++    _write(board, "CREATE TABLE t01a1db07_unrelated (x)")
++    with _Trace(board) as t:
++        assert kwc.foreign_ids(board) == {theirs}
++    assert t.count(FOREIGN_FULL) == 1
++
++
++def test_a_shm_identity_change_reads_in_full(board, monkeypatch):
++    from hermes_cli import kanban_lockguard
++    theirs = _task(board, OTHER)
++    assert kwc.foreign_ids(board) == {theirs}
++    monkeypatch.setattr(kanban_lockguard, "shm_identity", lambda _path: ("new-wal-generation",))
++    with _Trace(board) as t:
++        assert kwc.foreign_ids(board) == {theirs}
++    assert t.count(FOREIGN_FULL) == 1
++    with _Trace(board) as t:
++        assert kwc.foreign_ids(board) == {theirs}
++    assert t.count(FOREIGN_FULL) == 0  # re-armed on the new generation
++
++
++def test_a_replaced_file_reads_in_full(tmp_path):
++    path = tmp_path / "board.db"
++    conn = _open(path)
++    first = _task(conn, OTHER)
++    assert kwc.foreign_ids(conn) == {first}
++    conn.close()
++    other = _open(tmp_path / "other.db")
++    second = _task(other, OTHER)
++    other.close()
++    for suffix in ("-wal", "-shm"):
++        for p in (Path(str(path) + suffix), Path(str(tmp_path / "other.db") + suffix)):
++            if p.exists():
++                p.unlink()
++    shutil.copy(tmp_path / "other.db", tmp_path / "staged.db")
++    os.replace(tmp_path / "staged.db", path)  # a new inode at the same path
++    conn = kbc.connect(path)
++    try:
++        assert kwc.foreign_ids(conn) == {second}
++    finally:
++        conn.close()
++
++
++def test_an_untrusted_cursor_never_stores(board):
++    theirs = _task(board, OTHER)
++    rev.drop_triggers(board)
++    with _Trace(board) as t:
++        for _ in range(3):
++            assert kwc.foreign_ids(board) == {theirs}
++    assert t.count(FOREIGN_FULL) == 3
++    assert not any(k[1] == "foreign_ids" for k in memo._STATES)
++
++
++# --- concurrency ----------------------------------------------------------------------------------------------------
++
++def test_a_slower_thread_never_moves_the_pair_backwards(tmp_path):
++    path = tmp_path / "board.db"
++    main = _open(path)
++    first = _task(main, OTHER)
++    entered, release = threading.Event(), threading.Event()
++    slow_thread = {}
++
++    def full(c):
++        if threading.current_thread() is slow_thread.get("t"):
++            entered.set()
++            assert release.wait(10)
++        return {r[0]: True for r in c.execute(
++            "SELECT id FROM tasks WHERE created_on IS NOT NULL AND created_on != ?", (OWN,))}
++
++    def partial(c, ids):
++        return {r[0]: True for r in c.execute(
++            f"SELECT id FROM tasks WHERE id IN ({','.join('?' * len(ids))}) AND created_on IS NOT NULL "
++            "AND created_on != ?", (*ids, OWN))}
++
++    out = {}
++
++    def slow():
++        conn = kbc.connect(path)
++        try:
++            out["slow"] = memo.state("race", conn, full=full, partial=partial, columns=CREATED_ON)
++        finally:
++            conn.close()
++
++    t = threading.Thread(target=slow)
++    slow_thread["t"] = t
++    t.start()
++    assert entered.wait(10)            # the slow reader holds a snapshot at the old revision
++    second = _task(main, OTHER)        # a writer moves on
++    fast = memo.state("race", main, full=full, partial=partial, columns=CREATED_ON)
++    assert set(fast.values) == {first, second}
++    release.set()
++    t.join(10)
++    assert set(out["slow"].values) == {first}  # its own snapshot
++    slot = next(k for k in memo._STATES if k[1] == "race")
++    kept = memo._STATES[slot].cursor
++    assert kept is not None and fast.cursor is not None
++    assert kept.revision == fast.cursor.revision  # not moved backwards
++    assert set(memo.state("race", main, full=full, partial=partial, columns=CREATED_ON).values) == {first, second}
++    main.close()
++
++
++def test_concurrent_readers_and_a_writer_stay_equal_to_a_full_scan(tmp_path):
++    path = tmp_path / "board.db"
++    main = _open(path)
++    stop, errors = threading.Event(), []
++    seen: list[int] = []
++
++    def reader():
++        conn = kbc.connect(path)
++        try:
++            while not stop.is_set():
++                kwc.foreign_ids(conn)
++                slot = next((k for k in memo._STATES if k[1] == "foreign_ids"), None)
++                if slot is not None:
++                    seen.append(memo._STATES[slot].cursor.revision)
++        except Exception as exc:  # health: allow BLE001 -- surfaced by the assertion below
++            errors.append(exc)
++        finally:
++            conn.close()
++
++    threads = [threading.Thread(target=reader) for _ in range(3)]
++    for t in threads:
++        t.start()
++    try:
++        for i in range(40):
++            _task(main, OTHER if i % 2 else OWN)
++    finally:
++        stop.set()
++        for t in threads:
++            t.join(10)
++    assert not errors
++    assert kwc.foreign_ids(main) == _truth_foreign(main)
++    main.close()
++
++
++# --- randomized equivalence -----------------------------------------------------------------------------------------
++
++@pytest.mark.parametrize("seed", [1, 2, 3])
++def test_memo_equals_a_fresh_full_scan_over_random_write_sequences(board, seed):
++    rng = random.Random(seed)
++    kinds = ("remote_stop_requested", "owner_archive_requested")
++    statuses = ("todo", "ready", "running", "done", "archived")
++    queries = ((("running",), (kinds[0],), False), (("archived",), (kinds[1],), True),
++               (("done", "archived"), kinds, False))
++    tasks = [_task(board, rng.choice((OWN, OTHER, None)), rng.choice(statuses)) for _ in range(6)]
++    for step in range(120):
++        op = rng.randrange(8)
++        tid = rng.choice(tasks) if tasks else None
++        in_txn_rollback = rng.random() < 0.1
++        if in_txn_rollback:
++            board.execute("BEGIN IMMEDIATE")
++        try:
++            if op == 0 or tid is None:
++                if in_txn_rollback:
++                    board.execute("INSERT INTO tasks (id, title, status, created_at, created_on) VALUES "
++                                  "(?, 't', 'todo', 1, ?)", (f"t_rb{step}", OTHER))
++                else:
++                    tasks.append(_task(board, rng.choice((OWN, OTHER, None)), rng.choice(statuses)))
++            elif op == 1:
++                sql, args = "UPDATE tasks SET created_on = ? WHERE id = ?", (rng.choice((OWN, OTHER, None)), tid)
++                board.execute(sql, args) if in_txn_rollback else _write(board, sql, args)
++            elif op == 2:
++                sql, args = "UPDATE tasks SET status = ? WHERE id = ?", (rng.choice(statuses), tid)
++                board.execute(sql, args) if in_txn_rollback else _write(board, sql, args)
++            elif op == 3:
++                if in_txn_rollback:
++                    kb._append_event(board, tid, rng.choice(kinds), {})
++                else:
++                    with kbc.write_txn(board):
++                        kb._append_event(board, tid, rng.choice(kinds), {})
++            elif op == 4 and not in_txn_rollback:
++                _delete(board, tid)
++                tasks.remove(tid)
++            elif op == 5 and not in_txn_rollback:
++                _write(board, "DELETE FROM task_events WHERE task_id = ? AND kind IN (?, ?)", (tid, *kinds))
++            elif op == 6 and not in_txn_rollback:
++                kb.add_comment(board, tid, "x", "noise")
++            elif not in_txn_rollback:
++                with kbc.write_txn(board):  # a heartbeat: never marks, never read by these consumers
++                    kb._append_event(board, tid, "heartbeat", {})
++            if in_txn_rollback:  # read-through inside the txn sees the uncommitted state
++                assert kwc.foreign_ids(board) == _truth_foreign(board)
++        finally:
++            if in_txn_rollback:
++                board.rollback()
++        assert kwc.foreign_ids(board) == _truth_foreign(board), step
++        for statuses_q, kinds_q, exclude in queries:
++            assert tuple(sorted(cand.candidate_task_ids(board, statuses_q, kinds_q, exclude_statuses=exclude))) == \
++                _truth_cand(board, statuses_q, kinds_q, exclude), step
++
++
++def test_memory_is_bounded(board, monkeypatch):
++    monkeypatch.setattr(memo, "MAX_SLOTS", 3)
++    for i in range(10):
++        memo.state(f"slot{i}", board, full=lambda c: {"a": True}, partial=lambda c, ids: {}, columns=CREATED_ON)
++        assert len(memo._STATES) <= 3
++    monkeypatch.setattr(memo, "MAX_ENTRIES", 1)
++    memo.reset()
++    memo.state("big", board, full=lambda c: {"a": True, "b": True}, partial=lambda c, ids: {}, columns=CREATED_ON)
++    assert not memo._STATES
++    memo.state("falsy", board, full=lambda c: {"a": 0, "b": None, "c": True}, partial=lambda c, ids: {},
++               columns=CREATED_ON)
++    assert dict(next(iter(memo._STATES.values())).values) == {"c": True}
++
++
++# --- restore_missing_checks stays live on task_wake_checks ----------------------------------------------------------
++
++def test_a_deleted_probe_is_still_re_registered_with_the_memo_warm(tmp_path, monkeypatch):
++    from hermes_cli import kanban_timed_park as ktp
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setenv("HERMES_KANBAN_WAKE_DRYRUN", "0")
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    kb.init_db()
++    getattr(kwc, "_RESTORE_SEEN", {}).clear()
++    try:
++        with kbc.connect_closing() as conn:
++            if "created_on" not in [r[1] for r in conn.execute("PRAGMA table_info(tasks)")]:
++                with kbc.write_txn(conn):
++                    conn.execute("ALTER TABLE tasks ADD COLUMN created_on TEXT")
++                rev.ensure_revision(conn, rev.LOCAL_TABLES)
++            _set_gateway(conn)
++            tid = kb.create_task(conn, title="t", assignee="worker")
++            with kb.write_txn(conn):
++                conn.execute("UPDATE tasks SET status='ready', created_on = ? WHERE id=?", (OWN, tid))
++            assert kb.claim_task(conn, tid, claimer="worker") is not None
++            probe = f"test -f {tmp_path / 'flag'}"
++            with kb.write_txn(conn):
++                assert ktp.park(conn, tid, reason="SCHEDULED_UNTIL=2099-01-01T00:00:00Z wait", requested_kind="time",
++                                source_status="running", wake_check=probe, check_every=300,
++                                awaiting={"kind": "external", "ref": "build", "why": "a build writes the flag"})
++            assert kwc.get_state(conn, tid) is not None
++            assert kwc.foreign_ids(conn) == frozenset()  # warm the memo
++            assert kwc.restore_missing_checks(conn) == {"restored": [], "woken": []}
++            with kb.write_txn(conn):  # task_wake_checks is unwatched: this marks no task
++                conn.execute("DELETE FROM task_wake_checks WHERE task_id = ?", (tid,))
++            assert kwc.restore_missing_checks(conn) == {"restored": [tid], "woken": []}
++            assert kwc.get_state(conn, tid)["cmd"] == probe
++    finally:
++        kwc._shutdown_for_tests()
+diff --git a/tests/hermes_cli/test_kanban_watcher_idle_work.py b/tests/hermes_cli/test_kanban_watcher_idle_work.py
+index acddc2f2f2..e796d1b53d 100644
+--- a/tests/hermes_cli/test_kanban_watcher_idle_work.py
++++ b/tests/hermes_cli/test_kanban_watcher_idle_work.py
+@@ -242,8 +242,14 @@ def test_remote_archive_empty_sources_skipped_but_pending_source_retried(board,
+     assert stop_call.call_count == owner_call.call_count == 1
+ 
+ 
++_FULL_SCAN = 'SELECT t.id FROM tasks t WHERE t.status'
++_PARTIAL_SCAN = 'SELECT t.id FROM tasks t WHERE t.id IN'
++
++
+ def test_candidate_memo_skips_scan_and_external_status_commit_invalidates(board):
+-    from hermes_cli.kanban_idle_candidates import _on_connection as event_candidates
++    """G2c: a per-task memo. Unchanged calls run no candidate query; another connection's status commit re-reads
++    only the task it marked (the partial query), never the whole board again."""
++    from hermes_cli.kanban_idle_candidates import event_candidates
+     task = kb.create_task(board, title='held history', assignee='default')
+     with kbc.write_txn(board):
+         board.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (task,))
+@@ -253,8 +259,8 @@ def test_candidate_memo_skips_scan_and_external_status_commit_invalidates(board)
+     try:
+         for _ in range(20):
+             assert not event_candidates(board, ('ready',), ('respawn_guarded',))
+-        scans = lambda: sum(q.startswith('SELECT t.id FROM tasks t') for q in queries)
+-        assert scans() == 1
++        count = lambda prefix: sum(q.startswith(prefix) for q in queries)
++        assert (count(_FULL_SCAN), count(_PARTIAL_SCAN)) == (1, 0)
+         path = Path(board.execute('PRAGMA database_list').fetchone()[2])
+         writer = kbc.connect(path)
+         try:
+@@ -263,36 +269,32 @@ def test_candidate_memo_skips_scan_and_external_status_commit_invalidates(board)
+         finally:
+             writer.close()
+         assert event_candidates(board, ('ready',), ('respawn_guarded',))
+-        assert scans() == 2
++        assert (count(_FULL_SCAN), count(_PARTIAL_SCAN)) == (1, 1)
+     finally:
+         board.set_trace_callback(None)
+ 
+ 
+-def test_candidate_memo_survives_dispatch_connection_reopen(board, monkeypatch):
++def test_candidate_memo_survives_dispatch_connection_reopen(board):
++    """The memo is per file, not per connection: fresh dispatcher connections share it."""
+     from hermes_cli import kanban_idle_candidates as candidates
+-    from hermes_cli.kanban_reader_retention import reader
+     path = Path(board.execute('PRAGMA database_list').fetchone()[2])
+     queries = []
+-    with reader(path) as observer:
+-        observer.set_trace_callback(queries.append)
+-    try:
+-        for _ in range(3):
+-            conn = kbc.connect(path)
+-            conn.set_trace_callback(queries.append)
+-            try:
+-                assert not candidates.event_candidates(conn, ('ready',), ('respawn_guarded',))
+-            finally:
+-                conn.close()
+-        assert sum(q.startswith('SELECT t.id FROM tasks t') for q in queries) == 1
+-    finally:
+-        with reader(path) as observer:
+-            observer.set_trace_callback(None)
++    for _ in range(3):
++        conn = kbc.connect(path)
++        conn.set_trace_callback(queries.append)
++        try:
++            assert not candidates.event_candidates(conn, ('ready',), ('respawn_guarded',))
++        finally:
++            conn.close()
++    assert sum(q.startswith(_FULL_SCAN) for q in queries) == 1
+ 
+ 
+ def test_candidate_key_failure_falls_back_to_real_query(board, monkeypatch):
+     import sqlite3
+     from hermes_cli import kanban_idle_candidates as candidates
+-    monkeypatch.setattr(candidates.revision, 'read_key', Mock(side_effect=sqlite3.OperationalError('key unavailable')))
++    from hermes_cli import kanban_task_change
++    monkeypatch.setattr(kanban_task_change, 'changed_since',
++                        Mock(side_effect=sqlite3.OperationalError('key unavailable')))
+     task = kb.create_task(board, title='candidate despite key failure', assignee='default')
+     with kbc.write_txn(board):
+         board.execute("UPDATE tasks SET status='ready' WHERE id=?", (task,))
+@@ -362,7 +364,7 @@ def test_registry_concurrent_misses_are_single_flight(monkeypatch):
+ def test_candidate_memo_bypassed_for_transactions_and_missing_triggers(board, public):
+     from hermes_cli import kanban_activity_revision as revision
+     from hermes_cli import kanban_idle_candidates as candidates
+-    event_candidates = candidates.event_candidates if public else candidates._on_connection
++    event_candidates = candidates.event_candidates if public else candidates.candidate_task_ids
+     assert not event_candidates(board, ('ready',), ('respawn_guarded',))
+     board.execute('BEGIN')
+     try:
+@@ -374,13 +376,11 @@ def test_candidate_memo_bypassed_for_transactions_and_missing_triggers(board, pu
+         board.rollback()
+     assert not event_candidates(board, ('ready',), ('respawn_guarded',))
+     revision.drop_triggers(board)
+-    # Trace the caller connection rather than the retained reader for this check.
+-    event_candidates = candidates._on_connection
+     queries = []
+     board.set_trace_callback(queries.append)
+     try:
+         for _ in range(2):
+             assert not event_candidates(board, ('ready',), ('respawn_guarded',))
+-        assert sum(q.startswith('SELECT t.id FROM tasks t') for q in queries) == 2
++        assert sum(q.startswith(_FULL_SCAN) for q in queries) == 2  # no coverage, no cursor: every call reads
+     finally:
+         board.set_trace_callback(None)
+-- 
+2.43.0
+

@@ -1,0 +1,459 @@
+From 95e3d3cf3511161124e5f96a6dd9159373560a56 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 16:29:17 +0000
+Subject: [PATCH] [daveey] Close merged-path fail-opens in the
+ no-required-check CI fallback
+
+Follow-up to review t_01a1daca670511da of PR #2830 (both are narrow fail-opens
+on the MERGED path of the no-required-check fallback; the required-check path
+is unchanged).
+
+1. A completed 0-run check suite that did not pass (workflow failed before
+   creating jobs: failure, cancelled, timed_out, action_required,
+   startup_failure, stale or no conclusion) was ignored once the PR was MERGED,
+   because fallback_outcomes only added empty-suite rows when not merged.
+   It is now a `failure` row on both paths. On the merged path a suite
+   provably created after mergedAt (e.g. a main-push workflow on the landed
+   sha) is post-merge evidence instead; a tied or unreadable creation time
+   fails closed (counts as failure). Passing or still-open empty suites keep
+   their prior semantics (OPEN missing, MERGED ignored).
+
+2. _unsuperseded (merge_time, distinct_suites path) dropped an earlier failure
+   whenever a later same-name run in the same suite started after it ended,
+   which cannot tell a rerun from a later sibling job (max-parallel:1 matrix
+   with a static job name). A run is now superseded only by a proven rerun:
+   both resolve through the Actions jobs API (check_run_url names the check
+   run, head_sha matches) to the same workflow run id with a higher
+   run_attempt, and every same-key run (pre- and post-merge) resolves to a
+   distinct (run id, attempt), i.e. one such job per attempt. Non-Actions apps,
+   unreadable jobs (401/403/404) and ambiguous attempts keep the earlier run
+   (fail closed). The jobs API is read only when chronology already suggests
+   a rerun.
+
+Proof:
+- RED: 34 of the 41 new cases in test_kanban_pr_fallback_merged.py fail on
+  edee8e41 (the review probes: MERGED + green run + failed empty suite ->
+  success; failure ended 12:10, sibling started 12:20 -> success). The other
+  7 are controls (passing empty suites, proven rerun chain).
+- GREEN: 19 consumer files (every test importing the touched modules)
+  515 passed, 0 failed, 1 skipped.
+- Mutants: 19/19 killed (every new condition, incl. the old chronology-only
+  rule and the old OPEN-only empty-suite rule).
+---
+ hermes_cli/kanban_pr_acceptance.py            |   6 +-
+ hermes_cli/kanban_pr_fallback.py              |  56 ++++++-
+ hermes_cli/kanban_pr_merge_time.py            |  57 +++++--
+ tests/hermes_cli/test_kanban_pr_fallback.py   |  24 ++-
+ .../test_kanban_pr_fallback_merged.py         | 148 ++++++++++++++++++
+ 5 files changed, 268 insertions(+), 23 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_pr_fallback_merged.py
+
+diff --git a/hermes_cli/kanban_pr_acceptance.py b/hermes_cli/kanban_pr_acceptance.py
+index 254c289707..4d5264d1f1 100644
+--- a/hermes_cli/kanban_pr_acceptance.py
++++ b/hermes_cli/kanban_pr_acceptance.py
+@@ -254,11 +254,13 @@ def collect_acceptance(contract: str, published_pr: str | None,
+         else:
+             runs = complete_runs(pages)
+         phase = "reading commit statuses"
+-        from hermes_cli.kanban_pr_fallback import complete_statuses, fallback_outcomes, mark_absence
++        from hermes_cli.kanban_pr_fallback import (actions_attempts, complete_statuses,
++                                                   fallback_outcomes, mark_absence)
+         statuses = complete_statuses(_api(f"repos/{repo}/commits/{sha}/statuses?per_page=100",
+                                           paginate=True, profile_home=profile_home), sha)
+         phase = "selecting merge-time evidence"
+-        runs, statuses = merge_evidence(receipt, pr, repo, runs, statuses, distinct_suites=not required)
++        runs, statuses = merge_evidence(receipt, pr, repo, runs, statuses, distinct_suites=not required,
++                                        attempt_of=actions_attempts(_api, repo, profile_home))
+         outcomes = []
+         app_of_bot: dict[str, int | None] = {}
+         for context, app_id in sorted(required, key=str):
+diff --git a/hermes_cli/kanban_pr_fallback.py b/hermes_cli/kanban_pr_fallback.py
+index b6ebf73747..d5c9020457 100644
+--- a/hermes_cli/kanban_pr_fallback.py
++++ b/hermes_cli/kanban_pr_fallback.py
+@@ -2,7 +2,7 @@
+ from datetime import UTC, datetime, timedelta
+ 
+ from hermes_cli.kanban_pr_check_runs import _complete
+-from hermes_cli.kanban_pr_merge_time import check_receipt, timestamp
++from hermes_cli.kanban_pr_merge_time import check_receipt, job_attempt, timestamp
+ 
+ # A just-created empty suite may be CI that has not started its jobs yet.
+ IDLE_SUITE_GRACE = timedelta(minutes=15)
+@@ -73,16 +73,60 @@ def fallback_outcomes(receipt, required, outcomes, runs, statuses, suites, *, me
+                                "status": s.get("status"), "created_at": s.get("created_at")}
+                               for s in idle]
+     idle_ids = {s["id"] for s in idle}
+-    if not merged:
+-        for suite in suite_rows:
++    for suite in suite_rows:
++        if suite["latest_check_runs_count"] != 0 or suite["id"] in idle_ids:
++            continue
++        failed = _failed_empty_suite(suite, sha)
++        if failed and merged and _created_after_merge(suite, receipt.get("merged_at")):
++            receipt["post_merge_checks"].append(failed)
++        elif failed:
++            # Workflow failed before creating jobs: red on both paths.
++            receipt["checks"].append(failed)
++        elif not merged:
+             # An empty latest attempt can be queued CI, not absence, even if
+             # other producers already succeeded. Required-context logic is separate.
+-            if suite["latest_check_runs_count"] == 0 and suite["id"] not in idle_ids:
+-                receipt["checks"].append({"name": f"check suite {suite['id']}",
+-                    "classification": "missing", "head_sha": sha})
++            receipt["checks"].append({"name": f"check suite {suite['id']}",
++                "classification": "missing", "head_sha": sha})
+     return [c["classification"] for c in receipt["checks"]]
+ 
+ 
++def _failed_empty_suite(suite, sha):
++    """A completed 0-run suite that did not pass (e.g. invalid workflow file)."""
++    if suite.get("status") != "completed" or suite.get("conclusion") in ("success", *_PASSING_CONCLUSIONS):
++        return None
++    return {"name": f"check suite {suite['id']}", "id": suite["id"], "classification": "failure",
++            "conclusion": suite.get("conclusion"), "completed_at": suite.get("updated_at"),
++            "head_sha": sha}
++
++
++def _created_after_merge(suite, merged_at):
++    """Only a suite provably created after the merge is post-merge (else fail closed)."""
++    try:
++        return timestamp(suite["created_at"].replace("Z", "+00:00")) > timestamp(
++            merged_at.replace("Z", "+00:00"))
++    except (AttributeError, KeyError, TypeError, ValueError):
++        return False
++
++
++def actions_attempts(api, repo, profile_home):
++    """Resolve a check run to its Actions (run id, run_attempt) to prove a rerun.
++
++    Non-Actions runs and unreadable jobs are unprovable (None): the earlier run
++    then stays as evidence. Transport failures still propagate (infra).
++    """
++    from hermes_cli.kanban_pr_acceptance import _GateAuthError
++
++    def attempt_of(check):
++        if (check.get("app") or {}).get("id") != GITHUB_ACTIONS_APP_ID:
++            return None
++        try:
++            job = api(f"repos/{repo}/actions/jobs/{int(check['id'])}", profile_home=profile_home)
++        except _GateAuthError:
++            return None
++        return job_attempt(job, check) if isinstance(job, dict) else None
++    return attempt_of
++
++
+ def mark_absence(receipt, required, outcomes, suites, where):
+     """Waive only proven absence, never missing/pending or post-merge-only CI.
+ 
+diff --git a/hermes_cli/kanban_pr_merge_time.py b/hermes_cli/kanban_pr_merge_time.py
+index 1ba4192bec..b039a3deb3 100644
+--- a/hermes_cli/kanban_pr_merge_time.py
++++ b/hermes_cli/kanban_pr_merge_time.py
+@@ -27,7 +27,7 @@ def check_receipt(check, sha):
+             "classification": _classify(check, sha, outcome, is_run), "conclusion": outcome}
+ 
+ 
+-def partition_at_merge(checks, merged_at, *, runs, distinct_suites=False):
++def partition_at_merge(checks, merged_at, *, runs, distinct_suites=False, attempt_of=None):
+     """Latest pre-merge execution per producer, plus every later execution.
+ 
+     App identities stay distinct: an unpinned context must not hide another app's
+@@ -82,36 +82,69 @@ def partition_at_merge(checks, merged_at, *, runs, distinct_suites=False):
+         if key not in latest or order > latest[key][0]:
+             latest[key] = (order, check)
+     if runs and distinct_suites:
+-        return [c for group in latest.values() for c in _unsuperseded(group, start)], post
++        family = {}
++        for check in checks:
++            family.setdefault(key_of(check), []).append(check)
++        return [c for key, group in latest.items()
++                for c in _unsuperseded(group, start, family[key], attempt_of)], post
+     return [entry[1] for entry in latest.values()], post
+ 
+ 
+-def _unsuperseded(group, start):
+-    """Drop a same-name, same-suite run only when another started after it ended.
++def _unsuperseded(group, start, family, attempt_of):
++    """Drop a same-name, same-suite run only when a proven rerun of it followed.
+ 
+-    That is a rerun (GitHub re-runs a failed job in the same suite). Overlapping or
+-    tied runs can be concurrent sibling jobs, and a run that never completed has no
+-    end to start after, so both stay as evidence (fail closed).
++    Chronology alone cannot tell a rerun from a later same-named sibling job in
++    the suite (a max-parallel:1 matrix with a static job name). A rerun is proven
++    only by its Actions identity: the same workflow run at a higher run_attempt,
++    each attempt holding exactly one job of this name (``family`` is every
++    same-key run, pre- and post-merge). Overlapping, tied, never-completed and
++    unprovable runs all stay as evidence (fail closed).
+     """
+     def ended(check):
+         done = check.get("completed_at")
+         return timestamp(done) if check.get("status") == "completed" and done else None
+ 
+-    starts = [start(c) for c in group]
++    cache = {}
++
++    def attempt(check):
++        if check["id"] not in cache:
++            cache[check["id"]] = attempt_of(check) if attempt_of else None
++        return cache[check["id"]]
++
++    def attempts_unique():
++        seen = [attempt(c) for c in family]
++        return None not in seen and len(seen) == len(set(seen))
++
+     kept = []
+     for check in group:
+         end = ended(check)
+-        if end is None or not any(s > end for s in starts):
+-            kept.append(check)
++        later = [c for c in group if end is not None and start(c) > end]
++        mine = attempt(check) if later else None
++        if mine and attempts_unique() and any(
++                (other := attempt(c)) and other[0] == mine[0] and other[1] > mine[1] for c in later):
++            continue
++        kept.append(check)
+     return kept
+ 
+ 
+-def merge_evidence(receipt, pr, repo, runs, statuses, *, distinct_suites=False):
++def job_attempt(job, check):
++    """(workflow run id, run_attempt) of an Actions job, only if it is this check run."""
++    url, run_id, run_attempt = job.get("check_run_url"), job.get("run_id"), job.get("run_attempt")
++    if not (isinstance(url, str) and url.endswith(f"/check-runs/{check['id']}")
++            and job.get("head_sha") == check.get("head_sha")):
++        return None
++    if any(type(v) is not int for v in (run_id, run_attempt)):
++        return None
++    return run_id, run_attempt
++
++
++def merge_evidence(receipt, pr, repo, runs, statuses, *, distinct_suites=False, attempt_of=None):
+     if pr["state"] != "MERGED":
+         return runs, statuses
+     merged_at = pr["mergedAt"]
+     receipt["merged_at"] = merged_at
+-    runs, post_runs = partition_at_merge(runs, merged_at, runs=True, distinct_suites=distinct_suites)
++    runs, post_runs = partition_at_merge(runs, merged_at, runs=True, distinct_suites=distinct_suites,
++                                         attempt_of=attempt_of)
+     statuses, post_statuses = partition_at_merge(statuses, merged_at, runs=False)
+     sha = receipt["head_sha"]
+     receipt["post_merge_checks"] = [check_receipt(c, sha) for c in post_runs + post_statuses]
+diff --git a/tests/hermes_cli/test_kanban_pr_fallback.py b/tests/hermes_cli/test_kanban_pr_fallback.py
+index 92113b1b8d..28d2c61b44 100644
+--- a/tests/hermes_cli/test_kanban_pr_fallback.py
++++ b/tests/hermes_cli/test_kanban_pr_fallback.py
+@@ -33,6 +33,11 @@ def evidence(monkeypatch):
+                 rows.insert(0, {"id": 7, "app": {"id": 1}, "head_sha": SHA,
+                                 "latest_check_runs_count": len(state["runs"])})
+             return [{"total_count": len(rows), "check_suites": rows}]
++        if "/actions/jobs/" in endpoint:
++            job = state.get("jobs", {}).get(int(endpoint.rsplit("/", 1)[1]))
++            if job is None:
++                raise gate._GateAuthError("HTTP 404 on " + endpoint)
++            return job
+         if "/statuses?" in endpoint:
+             return state.get("status_pages", [state["statuses"]])
+         if "/pulls/" in endpoint:
+@@ -131,10 +136,23 @@ def rerun_pair(first, *, second="success", second_start="2026-11-02T12:30:00Z",
+     return [earlier, later]
+ 
+ 
++ACTIONS = 15368
++
++
++def as_actions(evidence, runs, attempts, *, run_id=99):
++    """Make ``runs`` Actions jobs of workflow run ``run_id`` at the given attempts."""
++    for check in runs:
++        check["app"] = {"id": ACTIONS}
++    evidence["jobs"] = {c["id"]: {"run_id": run_id, "run_attempt": a, "head_sha": SHA,
++                                  "check_run_url": f"https://api.github.com/repos/acme/repo/check-runs/{c['id']}"}
++                        for c, a in zip(runs, attempts)}
++    return runs
++
++
+ @pytest.mark.parametrize("first", ["failure", "cancelled", "timed_out"])
+ def test_merged_fallback_rerun_before_merge_supersedes_failure(evidence, first):
+     # hermes-mods #183/#178: a failed job re-run to success before the merge.
+-    evidence.update(merged=True, runs=rerun_pair(first))
++    evidence.update(merged=True, runs=as_actions(evidence, rerun_pair(first), [1, 2]))
+     receipt = gate.collect_acceptance(URL, None)
+     assert receipt["classification"] == "success"
+     assert receipt["ok"] is True
+@@ -156,7 +174,7 @@ def test_merged_fallback_red_rerun_stays_red(evidence, second, expected):
+     {"suite": 8},                              # another workflow suite, not a rerun
+ ])
+ def test_merged_fallback_unproven_supersession_keeps_failure(evidence, kw):
+-    evidence.update(merged=True, runs=rerun_pair("failure", **kw))
++    evidence.update(merged=True, runs=as_actions(evidence, rerun_pair("failure", **kw), [1, 2]))
+     receipt = gate.collect_acceptance(URL, None)
+     assert receipt["classification"] == "failure"
+     assert receipt["ok"] is False
+@@ -181,7 +199,7 @@ def test_merged_fallback_rerun_after_merge_keeps_failure(evidence):
+ def test_merged_fallback_rerun_finishing_after_merge_is_pending(evidence):
+     runs = rerun_pair("failure", second_start="2026-11-02T12:50:00Z")
+     runs[1]["completed_at"] = "2026-11-02T13:10:00Z"
+-    evidence.update(merged=True, runs=runs)
++    evidence.update(merged=True, runs=as_actions(evidence, runs, [1, 2]))
+     assert gate.collect_acceptance(URL, None)["classification"] == "pending"
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_pr_fallback_merged.py b/tests/hermes_cli/test_kanban_pr_fallback_merged.py
+new file mode 100644
+index 0000000000..295668df30
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_pr_fallback_merged.py
+@@ -0,0 +1,148 @@
++"""Merged-path fail-opens in the no-required-check fallback (review of PR #2830).
++
++1. A completed 0-run suite that failed (workflow broke before creating jobs)
++   must be red on the MERGED path too, not only OPEN.
++2. A later same-name run in the same suite supersedes an earlier failure only
++   when Actions proves it is a rerun (same workflow run, higher run_attempt,
++   one such job per attempt); a later sibling job never does.
++"""
++import pytest
++
++from hermes_cli import kanban_pr_acceptance as gate
++from tests.hermes_cli import test_kanban_pr_fallback as base
++
++evidence = base.evidence
++URL, SHA, run, suite, rerun_pair, as_actions = (
++    base.URL, base.SHA, base.run, base.suite, base.rerun_pair, base.as_actions)
++PRE_MERGE = "2026-11-02T12:00:00Z"   # merge is 13:00
++POST_MERGE = "2026-11-02T13:30:00Z"
++
++
++def failed_suite(conclusion="failure", *, created=PRE_MERGE, app=base.ACTIONS):
++    return {**suite(100, app, status="completed", created=created), "conclusion": conclusion}
++
++
++@pytest.mark.parametrize("conclusion", ["failure", "cancelled", "timed_out", "action_required",
++                                        "startup_failure", "stale", None])
++@pytest.mark.parametrize("merged", [False, True])
++def test_failed_empty_suite_is_red_on_both_paths(evidence, conclusion, merged):
++    evidence.update(merged=merged, runs=[run("success")], extra_suites=[failed_suite(conclusion)])
++    receipt = gate.collect_acceptance(URL, None)
++    assert receipt["classification"] == "failure"
++    assert receipt["ok"] is False
++    assert receipt["checks"][-1]["id"] == 100
++    assert receipt["checks"][-1]["conclusion"] == conclusion
++
++
++@pytest.mark.parametrize("merged", [False, True])
++def test_failed_empty_suite_alone_is_not_waivable_absence(evidence, merged):
++    evidence.update(merged=merged, extra_suites=[failed_suite()])
++    assert gate.collect_acceptance(URL, None)["classification"] == "failure"
++
++
++def test_failed_empty_suite_after_merge_is_post_merge_evidence(evidence):
++    # A main-push workflow on the merged sha belongs to ci-main-watch.
++    evidence.update(merged=True, runs=[run("success")], extra_suites=[failed_suite(created=POST_MERGE)])
++    receipt = gate.collect_acceptance(URL, None)
++    assert receipt["classification"] == "success"
++    assert [c["id"] for c in receipt["post_merge_checks"]] == [100]
++
++
++@pytest.mark.parametrize("created", [None, "not a time", "2026-11-02T13:00:00Z"])
++def test_failed_empty_suite_unprovable_or_tied_age_fails_closed(evidence, created):
++    evidence.update(merged=True, runs=[run("success")], extra_suites=[failed_suite(created=created)])
++    assert gate.collect_acceptance(URL, None)["classification"] == "failure"
++
++
++@pytest.mark.parametrize("conclusion", ["success", "neutral", "skipped"])
++@pytest.mark.parametrize("merged,expected", [(False, "missing"), (True, "success")])
++def test_passing_empty_suite_keeps_prior_semantics(evidence, conclusion, merged, expected):
++    evidence.update(merged=merged, runs=[run("success")], extra_suites=[failed_suite(conclusion)])
++    assert gate.collect_acceptance(URL, None)["classification"] == expected
++
++
++def test_later_same_name_without_rerun_proof_keeps_failure(evidence):
++    # Review probe: failure ended 12:10, same-suite success started 12:20.
++    evidence.update(merged=True, runs=rerun_pair("failure", second_start="2026-11-02T12:20:00Z"))
++    receipt = gate.collect_acceptance(URL, None)
++    assert receipt["classification"] == "failure"
++    assert [c["id"] for c in receipt["checks"]] == [1, 2]
++
++
++def test_sequential_matrix_sibling_is_not_a_rerun(evidence):
++    # max-parallel: 1 matrix with a static job name: same workflow run AND attempt.
++    runs = as_actions(evidence, rerun_pair("failure", second_start="2026-11-02T12:20:00Z"), [1, 1])
++    evidence.update(merged=True, runs=runs)
++    assert gate.collect_acceptance(URL, None)["classification"] == "failure"
++
++
++def test_rerun_of_one_sibling_cannot_hide_the_others_failure(evidence):
++    # Attempt 1 ran two same-name jobs; attempt 2 re-ran one. Which one is unprovable.
++    a1_fail, a1_pass = rerun_pair("failure", second_start="2026-11-02T12:20:00Z")
++    a1_pass["completed_at"] = "2026-11-02T12:25:00Z"
++    a2 = run("success", id=3, started="2026-11-02T12:40:00Z")
++    evidence.update(merged=True, runs=as_actions(evidence, [a1_fail, a1_pass, a2], [1, 1, 2]))
++    assert gate.collect_acceptance(URL, None)["classification"] == "failure"
++
++
++@pytest.mark.parametrize("tamper", [
++    {"run_id": 100},                                                 # another workflow run
++    {"run_attempt": 1},                                              # same attempt
++    {"run_attempt": 0},                                              # an earlier attempt
++    {"run_attempt": "2"},                                            # unreadable attempt
++    {"check_run_url": "https://api.github.com/repos/acme/repo/check-runs/9"},  # another job
++    {"head_sha": "b" * 40},                                          # another commit
++    None,                                                            # job unreadable (404)
++])
++def test_rerun_identity_must_be_proven(evidence, tamper):
++    runs = as_actions(evidence, rerun_pair("failure"), [1, 2])
++    if tamper is None:
++        del evidence["jobs"][2]
++    else:
++        evidence["jobs"][2].update(tamper)
++    evidence.update(merged=True, runs=runs)
++    assert gate.collect_acceptance(URL, None)["classification"] == "failure"
++
++
++def test_non_actions_app_rerun_is_unprovable(evidence):
++    runs = as_actions(evidence, rerun_pair("failure"), [1, 2])
++    for check in runs:
++        check["app"] = {"id": 1}
++    evidence.update(merged=True, runs=runs)
++    assert gate.collect_acceptance(URL, None)["classification"] == "failure"
++
++
++def test_proven_rerun_chain_supersedes_each_failed_attempt(evidence):
++    runs = [{**run("failure"), "completed_at": "2026-11-02T12:05:00Z"},
++            {**run("failure", id=2, started="2026-11-02T12:10:00Z"), "completed_at": "2026-11-02T12:15:00Z"},
++            run("success", id=3, started="2026-11-02T12:20:00Z")]
++    evidence.update(merged=True, runs=as_actions(evidence, runs, [1, 2, 3]))
++    receipt = gate.collect_acceptance(URL, None)
++    assert receipt["classification"] == "success"
++    assert [c["id"] for c in receipt["checks"]] == [3]
++
++
++def test_post_merge_sibling_in_rerun_attempt_blocks_proof(evidence):
++    # Attempt 2 holds two same-name jobs once its post-merge one counts.
++    runs = rerun_pair("failure") + [run("success", id=3, started=POST_MERGE)]
++    evidence.update(merged=True, runs=as_actions(evidence, runs, [1, 2, 2]))
++    assert gate.collect_acceptance(URL, None)["classification"] == "failure"
++
++
++def test_unreadable_same_name_job_blocks_proof(evidence):
++    # A same-name job of unknown attempt may be a sibling of either run.
++    runs = rerun_pair("failure") + [run("success", id=3, started=POST_MERGE)]
++    evidence.update(merged=True, runs=as_actions(evidence, runs, [1, 2, 3]))
++    del evidence["jobs"][3]
++    assert gate.collect_acceptance(URL, None)["classification"] == "failure"
++
++
++def test_required_path_never_reads_actions_jobs(evidence):
++    from hermes_cli import kanban_pr_merge_time as mt
++
++    runs = as_actions(evidence, rerun_pair("failure"), [1, 2])
++    receipt = {"head_sha": SHA}
++    pr = {"state": "MERGED", "mergedAt": "2026-11-02T13:00:00Z", "baseRefName": "main"}
++    kept, _ = mt.merge_evidence(receipt, pr, "acme/repo", runs, [], distinct_suites=False,
++                                attempt_of=lambda c: pytest.fail("required path proved a rerun"))
++    assert [c["id"] for c in kept] == [2]  # required semantics: latest per (name, app)
+-- 
+2.43.0
+

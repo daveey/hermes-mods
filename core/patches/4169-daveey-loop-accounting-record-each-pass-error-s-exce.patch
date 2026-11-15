@@ -1,0 +1,228 @@
+From 14ad1c5b0f690ec8e3a8f6e234270514d34d336c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 09:26:04 +0000
+Subject: [PATCH] [daveey] loop accounting: record each pass error's exception
+ class in a bounded error_kinds map
+
+Why: the chat-closeout.waiting_inputs P1 counter reported errors that were
+not failures (MacBook PID 9941: 333 inputs, 6 errors; traced probes 1/400 on
+the hub and 26/400 on the MacBook). Diagnosis card t_01a1d82d05161637 found
+the escaping exception was the plugin's designed `Unportable` no-adoption
+signal, but "historical counters lack exception details, so individual
+earlier increments cannot be conclusively attributed". Every live check that
+reads `errors` therefore files another diagnosis card.
+
+Change: each `_Stat` keeps `error_kinds` ({"OperationalError": 2}) next to
+`errors`, in `counters()` and so in the snapshot file. `Pass.__exit__` names
+the exception class; `record()` and `span_close()` take an optional
+`error_kind` (an error without one counts as `unknown`). At most
+MAX_ERROR_KINDS (8) class names per pass, the rest under `other`; the map is
+created on the first error only. The plugin-side fix (hermes-mods
+chat-closeout: Unportable counts as a fallback) does not depend on this.
+
+Tests (tests/hermes_cli/test_loop_accounting.py): counts by class and a
+handled fallback is no error; the cap keeps 8 names + other and kept names
+keep counting; record/span kinds and `unknown`; snapshot carries the map.
+RED on the old module: the 4 new tests fail, 44 pass. GREEN: 50 passed
+(module + bench), 0 skipped. Mutant (cap removed): the cap test fails.
+Every test importing loop_accounting/host_loop_lease/kanban_sync_timing:
+20 files, 393 passed. scripts/check --base origin/main: ok.
+
+Card: t_01a1d874dd5fd457
+---
+ hermes_cli/loop_accounting.py            | 42 +++++++++++++++----
+ tests/hermes_cli/test_loop_accounting.py | 52 ++++++++++++++++++++++++
+ 2 files changed, 86 insertions(+), 8 deletions(-)
+
+diff --git a/hermes_cli/loop_accounting.py b/hermes_cli/loop_accounting.py
+index ddfb214956..9cee4b1632 100644
+--- a/hermes_cli/loop_accounting.py
++++ b/hermes_cli/loop_accounting.py
+@@ -10,6 +10,11 @@ measured CPU unattributed). Per pass name it counts:
+ * ``fallbacks``: passes that took the full / fallback path;
+ * ``rows``: rows the pass changed or processed, where the loop knows it;
+ * ``errors``: passes that raised;
++* ``error_kinds``: those errors by exception class name (``{"OperationalError": 2}``), at most
++  ``MAX_ERROR_KINDS`` names plus ``other`` for the rest; an error reported without a class (``record`` /
++  ``span_close`` with ``error=True`` and no ``error_kind``) counts as ``unknown``. A designed fallback the
++  caller handles must not escape the pass (call :meth:`Pass.fallback` instead): this map tells a live
++  check reading ``errors`` what actually raised;
+ * ``cpu_s`` / ``cpu_max_s``: ``time.thread_time()`` spent inside the pass (sum / worst), and ``wall_s``.
+ 
+ Per process it also records every live thread's CPU (``/proc/self/task/<tid>/stat`` on Linux) next to the
+@@ -70,6 +75,9 @@ SCHEMA_VERSION = 1
+ DEFAULT_INTERVAL_S = 60.0
+ MAX_NAMES = 2048  # distinct pass names; later names fold into OVERFLOW (a per-method name must not grow forever)
+ OVERFLOW = "_overflow"
++MAX_ERROR_KINDS = 8  # distinct exception class names per pass name; later ones count under ERROR_KIND_OTHER
++ERROR_KIND_OTHER = "other"
++ERROR_KIND_UNKNOWN = "unknown"
+ PRUNE_AFTER_S = 3600.0
+ 
+ _thread_time = time.thread_time
+@@ -82,6 +90,7 @@ class _Stat:
+         "changes",
+         "cpu_max_s",
+         "cpu_s",
++        "error_kinds",
+         "errors",
+         "fallbacks",
+         "last_at",
+@@ -95,10 +104,23 @@ class _Stat:
+         self.runs = self.skips = self.changes = self.fallbacks = self.rows = self.errors = 0
+         self.cpu_s = self.cpu_max_s = self.wall_s = 0.0
+         self.last_at = 0.0
++        self.error_kinds: Optional[dict[str, int]] = None  # created on the first error
++
++    def error(self, kind: Optional[str]) -> None:
++        """Count one error of exception class ``kind`` (caller holds ``_lock``); the map stays bounded."""
++        self.errors += 1
++        kinds = self.error_kinds
++        if kinds is None:
++            kinds = self.error_kinds = {}
++        kind = kind or ERROR_KIND_UNKNOWN
++        if kind not in kinds and len(kinds) - (ERROR_KIND_OTHER in kinds) >= MAX_ERROR_KINDS:
++            kind = ERROR_KIND_OTHER
++        kinds[kind] = kinds.get(kind, 0) + 1
+ 
+     def as_dict(self) -> dict[str, Any]:
+         return {"runs": self.runs, "skips": self.skips, "changes": self.changes, "fallbacks": self.fallbacks,
+-                "rows": self.rows, "errors": self.errors, "cpu_s": round(self.cpu_s, 6),
++                "rows": self.rows, "errors": self.errors, "error_kinds": dict(self.error_kinds or {}),
++                "cpu_s": round(self.cpu_s, 6),
+                 "cpu_max_s": round(self.cpu_max_s, 6), "wall_s": round(self.wall_s, 6),
+                 "last_at": round(self.last_at, 3)}
+ 
+@@ -227,7 +249,7 @@ class Pass:
+                 st.fallbacks += 1
+             st.rows += self.nrows
+             if exc_type is not None:
+-                st.errors += 1
++                st.error(getattr(exc_type, "__name__", None))
+             st.cpu_s += cpu
+             st.cpu_max_s = max(st.cpu_max_s, cpu)
+             st.wall_s += wall
+@@ -244,8 +266,9 @@ def pass_(name: str, *, skipped: bool = False, changed: Optional[bool] = None, f
+ 
+ def record(name: str, *, cpu_s: float = 0.0, wall_s: float = 0.0, skipped: bool = False,
+            changed: Optional[bool] = None, fallback: bool = False, rows: int = 0, error: bool = False,
+-           outer: bool = True) -> None:
+-    """Account a pass measured elsewhere (``cpu_s`` from the caller's own ``thread_time`` delta, on this thread)."""
++           outer: bool = True, error_kind: Optional[str] = None) -> None:
++    """Account a pass measured elsewhere (``cpu_s`` from the caller's own ``thread_time`` delta, on this thread).
++    ``error_kind`` names the exception class of an ``error`` (else it counts as ``unknown``)."""
+     outer = outer and getattr(_local, "depth", 0) <= 0
+     tid = _own_tid() if outer else 0
+     with _lock:
+@@ -255,7 +278,8 @@ def record(name: str, *, cpu_s: float = 0.0, wall_s: float = 0.0, skipped: bool
+         st.changes += bool(changed)
+         st.fallbacks += bool(fallback)
+         st.rows += int(rows or 0)
+-        st.errors += bool(error)
++        if error:
++            st.error(error_kind)
+         st.cpu_s += cpu_s
+         st.cpu_max_s = max(st.cpu_max_s, cpu_s)
+         st.wall_s += wall_s
+@@ -275,8 +299,9 @@ def span_open(name: str) -> tuple:
+     return name, tid, _thread_time(), _perf(), acc0
+ 
+ 
+-def span_close(token: tuple, *, error: bool = False) -> bool:
+-    """Close a :func:`span_open` token. False (nothing recorded) when called on another thread."""
++def span_close(token: tuple, *, error: bool = False, error_kind: Optional[str] = None) -> bool:
++    """Close a :func:`span_open` token. False (nothing recorded) when called on another thread. ``error_kind``
++    names the exception class of an ``error`` (else it counts as ``unknown``)."""
+     name, tid, c0, w0, acc0 = token
+     if tid != _native_id():
+         return False
+@@ -285,7 +310,8 @@ def span_close(token: tuple, *, error: bool = False) -> bool:
+     with _lock:
+         st = _stat(name)
+         st.runs += 1
+-        st.errors += bool(error)
++        if error:
++            st.error(error_kind)
+         st.cpu_s += cpu
+         st.cpu_max_s = max(st.cpu_max_s, cpu)
+         st.wall_s += wall
+diff --git a/tests/hermes_cli/test_loop_accounting.py b/tests/hermes_cli/test_loop_accounting.py
+index 2a219bcd2c..08c0b1b4aa 100644
+--- a/tests/hermes_cli/test_loop_accounting.py
++++ b/tests/hermes_cli/test_loop_accounting.py
+@@ -4,6 +4,7 @@ from __future__ import annotations
+ 
+ import json
+ import os
++import sqlite3
+ import subprocess
+ import sys
+ import threading
+@@ -51,6 +52,56 @@ def test_pass_counts_an_error_and_reraises():
+     assert la.counters()["boom"]["runs"] == 1
+ 
+ 
++OperationalError = sqlite3.OperationalError  # the class the chat-closeout live check saw
++
++
++def test_errors_are_counted_by_exception_class():
++    for exc in (OperationalError, OperationalError, KeyError):
++        with pytest.raises(exc):
++            with la.pass_("kinds"):
++                raise exc("x")
++    with la.pass_("kinds") as p:  # a handled fallback is no error
++        p.fallback()
++    c = la.counters()["kinds"]
++    assert (c["runs"], c["errors"], c["fallbacks"]) == (4, 3, 1)
++    assert c["error_kinds"] == {"OperationalError": 2, "KeyError": 1}
++    with la.pass_("clean"):
++        pass
++    assert la.counters()["clean"]["error_kinds"] == {}
++
++
++def test_error_kinds_cap_names_and_fold_the_rest_into_other():
++    names = [f"E{i}" for i in range(la.MAX_ERROR_KINDS + 3)]
++    for name in names + names[:2]:
++        with pytest.raises(Exception):
++            with la.pass_("many"):
++                raise type(name, (Exception,), {})("x")
++    c = la.counters()["many"]
++    kinds = c["error_kinds"]
++    assert len(kinds) == la.MAX_ERROR_KINDS + 1  # 8 class names plus "other"
++    assert {n: kinds[n] for n in names[:la.MAX_ERROR_KINDS]} == dict.fromkeys(names[:la.MAX_ERROR_KINDS], 1) | {
++        names[0]: 2, names[1]: 2}  # an already-kept class keeps counting under its own name
++    assert kinds[la.ERROR_KIND_OTHER] == 3
++    assert sum(kinds.values()) == c["errors"] == len(names) + 2
++
++
++def test_record_and_span_errors_carry_a_kind_or_count_as_unknown():
++    la.record("rec", error=True, error_kind="TimeoutError")
++    la.record("rec", error=True)
++    la.record("rec", error=False, error_kind="Ignored")
++    la.span_close(la.span_open("span"), error=True)
++    assert la.counters()["rec"]["error_kinds"] == {"TimeoutError": 1, la.ERROR_KIND_UNKNOWN: 1}
++    assert la.counters()["span"]["error_kinds"] == {la.ERROR_KIND_UNKNOWN: 1}
++
++
++def test_snapshot_carries_error_kinds_next_to_errors():
++    with pytest.raises(OperationalError):
++        with la.pass_("snap"):
++            raise OperationalError("locked")
++    loop = json.loads(json.dumps(la.snapshot()))["loops"]["snap"]
++    assert (loop["errors"], loop["error_kinds"]) == (1, {"OperationalError": 1})
++
++
+ def test_cpu_is_thread_time_sum_and_max():
+     with la.pass_("cpu"):
+         _burn(0.02)
+@@ -694,6 +745,7 @@ def test_real_fork_subtracts_nonzero_clocks_from_inherited_passes():
+     # A subprocess confines the registered at-fork hook and child assertions.
+     result = subprocess.run([sys.executable, "-c", '''
+ import os
++import sqlite3
+ from hermes_cli import loop_accounting as la
+ 
+ clock = [50.0, 1000.0]
+-- 
+2.43.0
+

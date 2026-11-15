@@ -1,0 +1,324 @@
+From 0e60b2c4357f20c3326313a18796829f1a33083c Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 17:19:48 +0000
+Subject: [PATCH] [daveey] shell_arith_sink: quoted subscript substitutions in
+ `let` / `[[ -eq ]]` operands are sinks
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+`let` and `[[ … -eq … ]]` remove their operands' shell quotes, then bash evaluates
+the remaining text as arithmetic, and an array subscript in that text runs its
+command substitutions. The scanner skipped apostrophe spans in those frames as
+data ("let and [[ ]] parse shell words before evaluating operands"), so these
+real bash 5.2.21 marker runs were missed on main (t_01a1dace884ce45d, found in
+review of PR #2981):
+
+  let 'a[$(bash P)]=1'          let 'x=a[$(bash P)]'
+  declare -A h; let 'h[$(bash P)]+=1'
+  [[ 1 -eq 'a[$(bash P)]' ]]    [[ 'a[$(bash P)]' -eq 1 ]]
+
+The same hole covered every other way to hide the opener from the shell but
+not from the evaluator: `$'…'` (also `\x24(` / `\x5b`), double-quoted `\$(`
+and `` \` ``, unquoted `\$\(`, `$\(`, `'$'\(`, quote concatenation
+(`'x=a[''$(P)]'`), and `${v:-a[\$(P)]}`.
+
+Fix: `let` / `]]` frames record where their operands start. In such a frame
+(subscript and parameter frames inside it belong to the same word), a quoted
+span that can supply a substitution opener (`$(`, `$((` — `$((P) )` runs —,
+backtick, or a trailing `$`), an escaped opener (`\$(`, `\$\(`, `$\(`,
+`` \` ``) or a `"$"` close fails closed when a `[` appears earlier in the
+frame. An ANSI-C span with any escape fails closed outright (escapes can spell
+both `[` and `$(`). The `[` search resumes past the last miss, so the scan
+stays linear. The quick no-substitution exit now also requires no backslash.
+
+Kept as data (real bash runs none of them; regression-tested): the control
+`let '${v:-$(P)}'`, `let '$(P)'`, `let 'x=$(( $(P) ))'`,
+`[[ 1 -eq 1 && x == '$(P)' ]]`, `[[ 1 -eq '$(P)' && 1 -eq a[1] ]]`,
+`let 'a[$i]=1'`, `let 'a[$(date +%s)]=1'`, and quoted text after the frame
+ends. No existing data case flips. Known coarse false positives (all fail
+closed, none runs in bash): a `[` in an earlier separate `let` argument or
+`[[` operand (`let 'a[1]=1' 'b=$(P)'`), `let 'a[1]+$(P)'`, and syntax-error
+shapes such as `let a[\$(P)]=1`.
+
+Guard level: scan_gateway_lifecycle now refuses the quoted shapes (padded
+payload past the scan cap). It still cannot see the referenced script behind
+unquoted backslash-escaped substitutions (t_01a1db0af44d1601) or any backtick
+substitution, even `echo \`payload.sh\`` on main (t_01a1db0c38d72914); those
+9 guard-level shapes are strict xfail naming their follow-up card.
+
+Proof:
+- RED on origin/main be9b942274: new tests/cron/test_lifecycle_guard_arith_word_quotes.py
+  fails 24/24 sink shapes, every one on `substitution_in_arithmetic` (bash
+  marker ran each time); 10 data shapes pass.
+- GREEN: all 41 test files importing shell_arith_sink / shell_heredoc /
+  lifecycle_guard plus the new file: 2824 passed, 0 failed.
+- scripts/check --base origin/main: 20 checks ok.
+---
+ .../test_lifecycle_guard_arith_word_quotes.py | 125 ++++++++++++++++++
+ tools/shell_arith_sink.py                     |  70 +++++++++-
+ 2 files changed, 190 insertions(+), 5 deletions(-)
+ create mode 100644 tests/cron/test_lifecycle_guard_arith_word_quotes.py
+
+diff --git a/tests/cron/test_lifecycle_guard_arith_word_quotes.py b/tests/cron/test_lifecycle_guard_arith_word_quotes.py
+new file mode 100644
+index 0000000000..5cb8f4a797
+--- /dev/null
++++ b/tests/cron/test_lifecycle_guard_arith_word_quotes.py
+@@ -0,0 +1,125 @@
++"""Real Bash regressions: quoted subscripts in ``let`` / ``[[ … -eq … ]]`` operands.
++
++Bash removes the shell quotes of those operands, then evaluates the remaining text as
++arithmetic, and an array subscript in it runs its command substitutions. Apostrophes,
++ANSI-C strings, double-quoted ``\\$(`` and backslash escapes all hide the opener from the
++shell but not from the evaluator (t_01a1dace884ce45d).
++"""
++
++import shutil
++import subprocess
++
++import pytest
++
++from cron.lifecycle_guard import scan_gateway_lifecycle
++from tools.shell_arith_sink import substitution_in_arithmetic
++from tools.shell_heredoc import output_reaches_shell
++
++# SCRIPT is an executable payload that touches a marker and prints 0.
++SINKS = [
++    "let 'a[$(SCRIPT)]=1'",
++    "let 'x=a[$(SCRIPT)]'",
++    "declare -A h; h[k]=1; let 'h[$(SCRIPT)]+=1'",
++    "[[ 1 -eq 'a[$(SCRIPT)]' ]]",
++    "[[ 'a[$(SCRIPT)]' -eq 1 ]]",
++    "let '1+a[$(SCRIPT)]'",
++    "let 'a[`SCRIPT`]=1'",
++    "let 'a[$((1+$(SCRIPT)))]=1'",
++    "let 'a[$((SCRIPT) )]=1'",
++    "let $'a[$(SCRIPT)]=1'",
++    r"let $'a[\x24(SCRIPT)]=1'",
++    r"let $'a\x5b\x24(SCRIPT)]=1'",
++    "let 'x=a[''$(SCRIPT)]'",
++    "let 'x=a[ ''$(SCRIPT)]'",
++    r'let "a[\$(SCRIPT)]=1"',
++    r'let "a[\`SCRIPT\`]=1"',
++    r'unset v; let "${v:-a[\$(SCRIPT)]}"',
++    r"let x=a[\`SCRIPT\`]",
++    r"let x=a[\$\(SCRIPT\)]",
++    r"let x=a\[\$\(SCRIPT\)\]",
++    r"let x=a[$\(SCRIPT\)]",
++    r"let x=a['$'\(SCRIPT\)]",
++    r"let x=a[' '\$\(SCRIPT\)]",
++    r"[[ 1 -eq a\[\$\(SCRIPT\)\] ]]",
++]
++
++# Bash runs none of these: no subscript holds the substitution after quote removal.
++DATA = [
++    "let '${v:-$(SCRIPT)}'",
++    "let '$(SCRIPT)'",
++    "let 'x=$(( $(SCRIPT) ))'",
++    "[[ 1 -eq 1 && x == '$(SCRIPT)' ]]",
++    "[[ 1 -eq '$(SCRIPT)' && 1 -eq a[1] ]]",
++    "let 'a[1]=1'; echo '[$(SCRIPT)]'",
++    "let 'a[1]=1' && echo '$(SCRIPT)'",
++    "[[ 1 -eq 1 ]] && echo 'a[$(SCRIPT)]'",
++    "let 'a[$i]=1'; echo '$(SCRIPT)'",
++    "let 'a[$(date +%s)]=1'",
++]
++
++
++def _run(tmp_path, shape):
++    bash = shutil.which("bash")
++    if bash is None:
++        pytest.skip("Bash required for execution proof")
++    marker = tmp_path / "ran"
++    script = tmp_path / "payload.sh"
++    script.write_text(f"#!/bin/sh\ntouch '{marker}'\nprintf 0\n", encoding="utf-8")
++    script.chmod(0o755)
++    command = shape.replace("SCRIPT", str(script))
++    result = subprocess.run(
++        [bash, "--noprofile", "--norc", "-c", command], cwd=tmp_path,
++        env={"PATH": "/usr/bin:/bin"}, capture_output=True, text=True,
++        encoding="utf-8", timeout=10, check=False,
++    )
++    return command, marker.exists(), result
++
++
++@pytest.mark.platforms("posix")
++@pytest.mark.parametrize("shape", SINKS)
++def test_quoted_word_arithmetic_subscripts_are_sinks(tmp_path, shape):
++    command, ran, result = _run(tmp_path, shape)
++    # Invalid arithmetic can error only AFTER the command substitution has run.
++    assert ran, (result.returncode, result.stderr)
++    assert substitution_in_arithmetic(command, date_exempt=True)
++    assert output_reaches_shell(command)
++
++
++# The guard finds the referenced script only behind a `$(…)` it recognizes. Unquoted
++# backslash-escaped substitutions (t_01a1db0af44d1601) and backticks
++# (t_01a1db0c38d72914) still hide it; the scanner above already flags these sinks.
++_GUARD_GAPS = {
++    r"let x=a[\`SCRIPT\`]": "t_01a1db0af44d1601",
++    r"let x=a[\$\(SCRIPT\)]": "t_01a1db0af44d1601",
++    r"let x=a\[\$\(SCRIPT\)\]": "t_01a1db0af44d1601",
++    r"let x=a[$\(SCRIPT\)]": "t_01a1db0af44d1601",
++    r"let x=a['$'\(SCRIPT\)]": "t_01a1db0af44d1601",
++    r"let x=a[' '\$\(SCRIPT\)]": "t_01a1db0af44d1601",
++    r"[[ 1 -eq a\[\$\(SCRIPT\)\] ]]": "t_01a1db0af44d1601",
++    "let 'a[`SCRIPT`]=1'": "t_01a1db0c38d72914",
++    r'let "a[\`SCRIPT\`]=1"': "t_01a1db0c38d72914",
++}
++
++
++@pytest.mark.platforms("posix")
++@pytest.mark.parametrize("shape", [
++    pytest.param(shape, marks=pytest.mark.xfail(strict=True, reason=_GUARD_GAPS[shape]))
++    if shape in _GUARD_GAPS else shape
++    for shape in SINKS
++])
++def test_lifecycle_guard_scans_the_quoted_subscript_payload(tmp_path, shape):
++    script = tmp_path / "payload.sh"
++    script.write_text("# padding\n" * 150000, encoding="utf-8")  # past the scan cap
++    script.chmod(0o755)
++    unsafe, refusal = scan_gateway_lifecycle(
++        shape.replace("SCRIPT", str(script)), cwd=str(tmp_path))
++    assert unsafe, refusal
++    assert refusal and "larger than the scan cap" in refusal
++
++
++@pytest.mark.platforms("posix")
++@pytest.mark.parametrize("shape", DATA)
++def test_word_arithmetic_without_a_quoted_subscript_stays_data(tmp_path, shape):
++    command, ran, result = _run(tmp_path, shape)
++    assert not ran, (result.returncode, result.stderr)
++    assert not substitution_in_arithmetic(command, date_exempt=True)
+diff --git a/tools/shell_arith_sink.py b/tools/shell_arith_sink.py
+index 90359aa618..323625c448 100644
+--- a/tools/shell_arith_sink.py
++++ b/tools/shell_arith_sink.py
+@@ -79,8 +79,12 @@ def substitution_in_arithmetic(command: str, *, date_exempt: bool, _depth: int =
+             backtick_open = not backtick_open
+             continue
+         if token[0] == "\\":
++            if _escaped_opener(command, token, start) and _subscript_word_before(command, stack, pos):
++                return True
+             continue
+         if token == '"':
++            if quoted and command[start - 1] == "$" and _subscript_word_before(command, stack, pos):
++                return True  # `"$"(…)`: the `$` joins a later `(` after quote removal
+             top[3] = not quoted
+             continue
+         skipped = _skip_data(command, token, start, pos, quoted, stack, pending,
+@@ -125,7 +129,7 @@ def _quick_result(command: str, depth: int) -> bool | None:
+     # Never apply this exception to top-level shell text or code-like bodies.
+     if depth and not any(mark in command for mark in ("$", "`", "<(", ">(")):
+         return False
+-    if "$(" not in command and not any(mark in command for mark in ("'", '"', "`")):
++    if "$(" not in command and not any(mark in command for mark in ("'", '"', "`", "\\")):
+         return False
+     if "$(" in command and _INTEGER_DECLARATION_RE.search(command):
+         return True
+@@ -134,7 +138,8 @@ def _quick_result(command: str, depth: int) -> bool | None:
+ 
+ def _arithmetic_quotes(stack) -> bool:
+     """Parameter words inherit the nearest evaluator's lexical quote rules."""
+-    for kind, closer, _, _ in reversed(stack):
++    for frame in reversed(stack):
++        kind, closer = frame[0], frame[1]
+         if kind == _CMD:
+             return False
+         if kind == _ARITH:
+@@ -143,6 +148,55 @@ def _arithmetic_quotes(stack) -> bool:
+     return False
+ 
+ 
++def _word_arithmetic_frame(stack) -> list | None:
++    """The ``let`` / ``[[ … -eq … ]]`` frame whose operands are evaluated after quote removal.
++
++    Bash removes the shell quotes of those operands first, then evaluates the remaining
++    text as arithmetic, and an array subscript in that text runs its command substitutions:
++    ``let 'a[$(bash F)]=1'`` and ``[[ 1 -eq 'a[$(bash F)]' ]]`` run ``bash F``. Subscript
++    (``]``) and parameter frames inside such an operand belong to the same word.
++    """
++    for frame in reversed(stack):
++        if frame[0] == _CMD:
++            return None
++        if frame[0] == _ARITH and frame[1] != "]":
++            return frame if frame[1] in ("let", "]]") else None
++    return None
++
++
++def _subscript_word_before(command: str, stack, pos: int) -> bool:
++    """Whether a quoted/escaped substitution opener ending before *pos* sits in a word
++    arithmetic frame after a ``[`` (coarse: any ``[`` in the frame so far, so separate
++    ``let`` arguments or ``[[`` operands also count; that only fails closed)."""
++    frame = _word_arithmetic_frame(stack)
++    if frame is None:
++        return False
++    if command.find("[", frame[4], pos) != -1:
++        return True
++    frame[4] = pos  # no `[` up to here: later queries resume past it (linear overall)
++    return False
++
++
++def _escaped_opener(command: str, token: str, start: int) -> bool:
++    """Whether a backslash escape can form ``$(`` or a backtick once quotes are removed."""
++    if token == "\\`":
++        return True
++    if token == "\\$":
++        return command[start + 2:start + 3] in ("(", "\\", "'", '"')
++    if token == "\\(":
++        index = start - 1
++        while index >= 0 and command[index] in "'\"":
++            index -= 1
++        return index >= 0 and command[index] == "$"
++    return False
++
++
++def _quoted_opener(span: str, date_exempt: bool) -> bool:
++    """Whether a quoted span (closing quote included) can supply a substitution opener
++    after quote removal: ``'$('`` itself, or a trailing ``$`` that meets a later ``(``."""
++    return _span_substitutes(span, date_exempt) or span[:-1].endswith("$")
++
++
+ def _span_substitutes(span: str, date_exempt: bool) -> bool:
+     """Whether an apostrophe span evaluated as arithmetic holds a command substitution."""
+     if "`" in span:
+@@ -160,10 +214,16 @@ def _skip_data(command, token, start, pos, quoted, stack, pending, date_exempt,
+         close = _quote_close(command, pos, ansi=token == "$'")
+         if close is None:
+             return -1
+-        if _arithmetic_quotes(stack) and _span_substitutes(command[pos:close], date_exempt):
++        span = command[pos:close]
++        if _arithmetic_quotes(stack) and _span_substitutes(span, date_exempt):
+             # Bash still uses the apostrophes to find the frame's closer, but then
+             # evaluates the text with double-quote semantics, so `$(`/backticks run.
+             return -1
++        if _word_arithmetic_frame(stack) is not None and (
++                (token == "$'" and "\\" in span)  # escapes can spell both `[` and `$(`
++                or (_quoted_opener(span, date_exempt)
++                    and _subscript_word_before(command, stack, close))):
++            return -1
+         return close
+     if quoted:
+         return None
+@@ -264,7 +324,7 @@ def _cmd_token(command, token, start, pos, stack, closes, operators) -> int:
+             return len(command) if newline == -1 else newline
+         return pos
+     if token.startswith("let"):
+-        stack.append([_ARITH, "let", 0, False])
++        stack.append([_ARITH, "let", 0, False, pos])  # [4]: see _subscript_word_before
+         return pos
+     if token == "((":
+         stack.append([_ARITH, "))", 0, False])
+@@ -281,7 +341,7 @@ def _cmd_token(command, token, start, pos, stack, closes, operators) -> int:
+         close = closes[index] if index < len(closes) else len(command)
+         operator = bisect.bisect_left(operators, pos)
+         if operator < len(operators) and operators[operator] < close:
+-            stack.append([_ARITH, "]]", 0, False])
++            stack.append([_ARITH, "]]", 0, False, pos])
+         return pos
+     if token == "[" and start > 0 and (command[start - 1].isalnum() or command[start - 1] == "_"):
+         stack.append([_ARITH, "]", 0, False])  # `a[…]=` subscript
+-- 
+2.43.0
+

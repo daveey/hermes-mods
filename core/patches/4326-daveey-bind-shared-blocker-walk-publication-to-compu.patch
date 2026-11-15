@@ -1,0 +1,112 @@
+From 4fd34261402367bf03f4ab326abdb8dcb880ce45 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:14:34 +0000
+Subject: [PATCH] [daveey] bind shared blocker walk publication to computed
+ window ids
+
+A peer commit between the caller window scan and the pass-cache commit key could store a newer walk under older assertion IDs. A later lane whose now crosses the backdated assertion boundary then hit that invalid entry. Refuse publication when computed assertion IDs differ, retaining all existing commit/config fences and live lane clears. No generic sweep or task memo change.
+
+Proof: deterministic two-connection regression fails on base and with the publication-predicate mutant (21 pass, exactly 1 fail), passes with fix. All 32 consumer files: 701 passed. scripts/check --base origin/main passed. Same board-default copy, canonical replay --churn 1 --blockers 31: dirty sweep median before 8.027ms, after 5.855ms (<=8ms). Optional read-only task mapping considered and left unchanged; current consumers do not mutate it.
+---
+ hermes_cli/kanban_blocker_inputs.py          |  8 +++--
+ hermes_cli/kanban_shared_blockers.py         |  8 +++--
+ tests/hermes_cli/test_kanban_blocker_rows.py | 32 ++++++++++++++++++++
+ 3 files changed, 43 insertions(+), 5 deletions(-)
+
+diff --git a/hermes_cli/kanban_blocker_inputs.py b/hermes_cli/kanban_blocker_inputs.py
+index 71c681853b..f6528828d7 100644
+--- a/hermes_cli/kanban_blocker_inputs.py
++++ b/hermes_cli/kanban_blocker_inputs.py
+@@ -125,7 +125,7 @@ def _key(conn, now, aliases=None):
+         return None
+ 
+ 
+-def read(name, conn, now, compute):
++def read(name, conn, now, compute, *, store_if=lambda _value: True):
+     """Bracket inputs with their commit/config identity; unknown means uncached.
+ 
+     Transactions (including savepoints) always bypass. total_changes catches
+@@ -136,7 +136,9 @@ def read(name, conn, now, compute):
+     solely through the pass snapshot (``config``), so the value is fresh for
+     the key's aliases iff the snapshot still carries them afterwards. A live
+     edit during ``compute`` is caught by the next read's key. With no snapshot
+-    held the post-compute key falls back to a live read.
++    held the post-compute key falls back to a live read. ``store_if`` additionally
++    checks caller-derived key material against the computed value; a mismatch
++    returns the value to this consumer without publishing it for another lane.
+     """
+     scope = _SCOPE.get()
+     if scope is None:
+@@ -151,6 +153,6 @@ def read(name, conn, now, compute):
+         return deepcopy(held[1])
+     scope.pop(slot, None)
+     value = compute()
+-    if _key(conn, now, _snapshot_aliases(scope)) == key:
++    if _key(conn, now, _snapshot_aliases(scope)) == key and store_if(value):
+         scope[slot] = (key, deepcopy(value))
+     return value
+diff --git a/hermes_cli/kanban_shared_blockers.py b/hermes_cli/kanban_shared_blockers.py
+index ea9b489a52..76dc262d39 100644
+--- a/hermes_cli/kanban_shared_blockers.py
++++ b/hermes_cli/kanban_shared_blockers.py
+@@ -343,8 +343,12 @@ def blocker_states(conn: sqlite3.Connection, *, now: Optional[int] = None,
+ 
+     now = int(time.time()) if now is None else int(now)
+     window, _tasks = rows.inputs(conn, now)
+-    states, asserting = read("walk", conn, ("walk", frozenset(r.id for r in window)),
+-                             lambda: _walk(conn, *rows.inputs(conn, now)))
++    window_ids = frozenset(r.id for r in window)
++    # A peer can commit between the window read and read()'s pre-compute key.
++    # Never publish a walk of a different window under that earlier set of ids.
++    states, asserting = read("walk", conn, ("walk", window_ids),
++                             lambda: _walk(conn, *rows.inputs(conn, now)),
++                             store_if=lambda value: frozenset(r.id for r in value[1]) == window_ids)
+     _note_window_exit(oldest_out, asserting)
+     if not states:
+         return states
+diff --git a/tests/hermes_cli/test_kanban_blocker_rows.py b/tests/hermes_cli/test_kanban_blocker_rows.py
+index 93ff81becb..cff557ba90 100644
+--- a/tests/hermes_cli/test_kanban_blocker_rows.py
++++ b/tests/hermes_cli/test_kanban_blocker_rows.py
+@@ -370,6 +370,38 @@ def test_a_shared_walk_is_keyed_by_the_callers_window(kanban_home):
+         one_pass()
+ 
+ 
++def test_peer_commit_between_window_and_walk_key(kanban_home, monkeypatch):
++    """A newly inserted boundary assertion must not be stored under the old window ids."""
++    with kbc.connect_closing() as conn, kbc.connect_closing() as peer:
++        helpers._blocked_behind(conn, "steady")
++        now = _now(conn)
++        original = inputs.read
++        injected = []
++
++        def racing_read(name, connection, key, compute, **kwargs):
++            if name == "walk" and not injected:
++                tid = helpers._blocked_behind(peer, "boundary", blocker_id="boundary-wall")
++                with kb.write_txn(peer):
++                    peer.execute("UPDATE task_runs SET ended_at = ? WHERE task_id = ?",
++                                 (now - ksb._LOOKBACK_SECONDS + 1, tid))
++                injected.append(tid)
++            return original(name, connection, key, compute, **kwargs)
++
++        monkeypatch.setattr(inputs, "read", racing_read)
++
++        @inputs.input_pass
++        def one_pass():
++            first = ksb.blocker_states(conn, now=now)
++            assert "boundary-wall" in first
++            later = ksb.blocker_states(conn, now=now + 3)
++            assert "boundary-wall" not in later
++            return _snap(later)
++
++        got = one_pass()
++        assert injected
++        assert got == cold(conn, now + 3)
++
++
+ def test_held_rows_are_bounded_to_tasks_with_assertions(kanban_home):
+     with kbc.connect_closing() as conn:
+         a = helpers._blocked_behind(conn, "a")
+-- 
+2.43.0
+

@@ -1,0 +1,228 @@
+From 00ff43671b4dfb9892ef7716267c9b38f616b4a7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 23:06:47 +0000
+Subject: [PATCH] [daveey] Bound intake owner diagnostics without discarding
+ history
+
+Why: closed-history inventories are unbounded, but a single page is capped at 6000 bytes. Sixty ordinary candidate notes made one durable occurrence permanently unplannable. Keep small inventories inline; store oversized full JSON by SHA256 in an additive journal table and publish count plus digest, atomically with the immutable page. Owner proof and delivery readback are unchanged.
+
+Proof: regression RED on original plan_pages (60-candidate and long-singleton intake_page_oversize), GREEN 181 tests across nine intake/consumer files. Eight exact-anchor mutants killed: bound removal, boundary off-by-one, truncated details, wrong count, wrong digest, false empty inventory, early commit, non-idempotent insertion. Restart, ambiguous response readback, rollback and changing/repeated inventories covered. scripts/check: 20 checks pass. No production flakes or cadence/threshold changes.
+---
+ docs/ci-flaky-intake.md                   |  16 ++-
+ scripts/ci/flaky_intake.py                |  17 +++-
+ tests/ci/test_flaky_intake_diagnostics.py | 117 ++++++++++++++++++++++
+ 3 files changed, 147 insertions(+), 3 deletions(-)
+ create mode 100644 tests/ci/test_flaky_intake_diagnostics.py
+
+diff --git a/docs/ci-flaky-intake.md b/docs/ci-flaky-intake.md
+index b10d2d75eb..e74f94dc2b 100644
+--- a/docs/ci-flaky-intake.md
++++ b/docs/ci-flaky-intake.md
+@@ -51,7 +51,21 @@ incomplete (published total differs from the visible tail, or any field is at th
+ limit) cannot prove it never cited this job; holding the row would strand every recurrence of a
+ test whose old card is closed with more than three comments. Such rows are admitted with an
+ `owner_check` list naming each candidate (`candidate`, `status`,
+-`reason=closed_history_incomplete`) so triage checks them first. The worst case is a
++`reason=closed_history_incomplete`) so triage checks them first. Lists whose serialized JSON
++exceeds 1024 UTF-8 bytes use `owner_check_ref: {sha256, count}` instead of the inline list;
++this is not an empty inventory or an ownership decision. Full, unshortened JSON is retained
++in the journal's `owner_check_details(digest, payload)` table, committed atomically with the
++page and keyed by the SHA256 of the stored UTF-8 payload. The reference is immutable even
++if a later inventory differs. Retrieve it on the producer host before disposition:
++
++```sh
++sqlite3 -readonly "$QUEUE" "SELECT payload FROM owner_check_details WHERE digest='<owner_check_ref.sha256>';"
++```
++
++Whole-journal backups include these details; an occurrences-only export does not. Export
++`SELECT digest,payload FROM owner_check_details` alongside pages and occurrences for triage
++or rollback. Do not prune referenced details independently of their manifests.
++The worst case is a
+ duplicate triage row, never a dropped occurrence. To revert to holding these rows, restore
+ the `RuntimeError("closed foreign owner history unavailable")` branch in `_foreign_owner`.
+ 
+diff --git a/scripts/ci/flaky_intake.py b/scripts/ci/flaky_intake.py
+index 4ec94966f7..634303df6a 100644
+--- a/scripts/ci/flaky_intake.py
++++ b/scripts/ci/flaky_intake.py
+@@ -23,6 +23,7 @@ except ImportError:
+     import flaky_artifact as fa  # type: ignore[no-redef]
+ 
+ PAGE_BYTES = 6000
++OWNER_CHECK_BYTES = 1024
+ 
+ 
+ def utc_day() -> str:
+@@ -167,6 +168,8 @@ class Journal:
+                 id INTEGER PRIMARY KEY, repo TEXT NOT NULL, day TEXT NOT NULL,
+                 payload TEXT NOT NULL, card TEXT, delivered INTEGER NOT NULL DEFAULT 0,
+                 attempted INTEGER NOT NULL DEFAULT 0);
++            CREATE TABLE IF NOT EXISTS owner_check_details (
++                digest TEXT PRIMARY KEY, payload TEXT NOT NULL);
+         """)
+         columns = {r[1] for r in self.db.execute("PRAGMA table_info(pages)")}
+         if "attempted" not in columns:
+@@ -267,17 +270,27 @@ class Journal:
+         ``owner_check`` names unverifiable prior-owner candidates per occurrence
+         (an empty list means none were found in the inventoried scopes)."""
+         groups: list[list] = []
++        details: dict[str, str] = {}
+         for row in rows:
+             item = {**json.loads(row["metadata"]), "occurrence_id": row["id"],
+                     "observed_day": row["day"], "status": "needs_triage"}
+             if owner_check is not None:
+-                item["owner_check"] = owner_check.get(row["id"], [])
++                notes = owner_check.get(row["id"], [])
++                encoded = json.dumps(notes, sort_keys=True)
++                if len(encoded.encode("utf-8")) > OWNER_CHECK_BYTES:
++                    digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
++                    details[digest] = encoded
++                    item["owner_check_ref"] = {"sha256": digest, "count": len(notes)}
++                else:
++                    item["owner_check"] = notes
+             if not groups or groups[-1][0]["target_day"] != row["target_day"] or len(
+                 json.dumps([r["item"] for r in groups[-1]] + [item]).encode("utf-8")
+             ) > PAGE_BYTES - 300:
+                 groups.append([])
+             groups[-1].append({"id": row["id"], "target_day": row["target_day"], "item": item})
+         with self.db:
++            # Full diagnostics and their manifest references commit atomically.
++            self.db.executemany("INSERT OR IGNORE INTO owner_check_details VALUES (?,?)", details.items())
+             for group in groups:
+                 data = json.dumps({"version": 1, "occurrences": [r["item"] for r in group]}, sort_keys=True)
+                 marker = hashlib.sha256(data.encode()).hexdigest()
+@@ -329,7 +342,7 @@ class Journal:
+                             "Triage related fixes together; create named follow-ups only for genuinely distinct fixes. "
+                             "Existing exact-test owners remain owners. Owner inventory before admission: this "
+                             "board plus hermes-hub replica cards on fresh scopes; unsynced legacy profile boards "
+-                            "are not inventoried, and rows with owner_check candidates had clipped closed-card "
++                            "are not inventoried, and rows with owner_check or owner_check_ref had clipped closed-card "
+                             "history, so check those first. Read the full durable queue before closing; "
+                             "record each test's disposition and follow-up owner. No retry threshold changes.\n"
+                             "Backlog/export: see docs/ci-flaky-intake.md. New arrivals reopen a done intake.")
+diff --git a/tests/ci/test_flaky_intake_diagnostics.py b/tests/ci/test_flaky_intake_diagnostics.py
+new file mode 100644
+index 0000000000..207aba8e11
+--- /dev/null
++++ b/tests/ci/test_flaky_intake_diagnostics.py
+@@ -0,0 +1,117 @@
++"""Large closed-owner inventories must not wedge durable intake delivery."""
++import hashlib
++import json
++
++import pytest
++
++from scripts.ci import flaky_intake as intake
++from tests.ci.test_flaky_intake import Board
++
++
++def seed(journal):
++    journal.record("o/r", [(9, [{"test_id": "tests/a.py::test_a"}])],
++                   {"id": 1, "head_sha": "a" * 40})
++    return journal.pending("o/r")
++
++
++def candidates(count):
++    return [{"candidate": f"@task:default@worker-1/t_{i:016x}", "status": "done",
++             "reason": "closed_history_incomplete"} for i in range(count)]
++
++
++@pytest.mark.parametrize("notes", [candidates(60), [{"candidate": "界" * 7000}], candidates(10)])
++def test_large_diagnostics_survive_restart_and_exact_readback(tmp_path, notes):
++    path = tmp_path / "queue.sqlite3"
++    journal = intake.Journal(path)
++    rows = seed(journal)
++    original = json.loads(rows[0]["metadata"])
++    journal.plan_pages("o/r", rows, {rows[0]["id"]: notes})
++    [page] = journal.db.execute("SELECT * FROM pages").fetchall()
++    payload = page["payload"]
++    assert len(payload.encode("utf-8")) <= intake.PAGE_BYTES
++    item = json.loads(payload.split("```json\n")[1].split("\n```")[0])["occurrences"][0]
++    assert all(item[key] == value for key, value in original.items())
++    assert item["status"] == "needs_triage"
++    assert "owner_check" not in item  # empty means no candidates, not omitted display
++    reference = item["owner_check_ref"]
++    assert reference["count"] == len(notes)
++    journal.close()
++    journal = intake.Journal(path)
++    try:
++        details = journal.db.execute("SELECT payload FROM owner_check_details WHERE digest=?",
++                                     (reference["sha256"],)).fetchone()[0]
++        assert json.loads(details) == notes
++        assert hashlib.sha256(details.encode("utf-8")).hexdigest() == reference["sha256"]
++        board = Board()
++        board.fail = True
++        assert journal.deliver("o/r", board)[0].startswith("FAILED")
++        assert journal.db.execute("SELECT delivered FROM occurrences").fetchone()[0] == 0
++        board.fail = False
++        board.ambiguous = True
++        assert not journal.deliver("o/r", board)[0].startswith("FAILED")
++        assert board.notes["card0"] == [payload]
++        assert journal.db.execute("SELECT delivered FROM occurrences").fetchone()[0] == 1
++        assert journal.deliver("o/r", board) == []
++        assert journal.db.execute("SELECT payload FROM owner_check_details").fetchone()[0] == details
++    finally:
++        journal.close()
++
++
++@pytest.mark.parametrize("notes", [None, [], candidates(1)])
++def test_small_diagnostics_keep_existing_inline_contract(tmp_path, notes):
++    journal = intake.Journal(tmp_path / "queue.sqlite3")
++    try:
++        rows = seed(journal)
++        journal.plan_pages("o/r", rows, None if notes is None else {rows[0]["id"]: notes})
++        payload = journal.db.execute("SELECT payload FROM pages").fetchone()[0]
++        item = json.loads(payload.split("```json\n")[1].split("\n```")[0])["occurrences"][0]
++        assert "owner_check_ref" not in item
++        if notes is None:
++            assert "owner_check" not in item
++        else:
++            assert item["owner_check"] == notes
++    finally:
++        journal.close()
++
++
++@pytest.mark.parametrize("size", [1024, 1025])
++def test_serialized_size_boundary(tmp_path, size):
++    notes = ["x" * (size - 4)]
++    assert len(json.dumps(notes).encode("utf-8")) == size
++    journal = intake.Journal(tmp_path / "queue.sqlite3")
++    try:
++        rows = seed(journal)
++        journal.plan_pages("o/r", rows, {rows[0]["id"]: notes})
++        payload = journal.db.execute("SELECT payload FROM pages").fetchone()[0]
++        item = json.loads(payload.split("```json\n")[1].split("\n```")[0])["occurrences"][0]
++        assert ("owner_check_ref" in item) == (size > 1024)
++    finally:
++        journal.close()
++
++
++def test_replanning_keeps_content_addressed_history(tmp_path):
++    journal = intake.Journal(tmp_path / "queue.sqlite3")
++    try:
++        for notes in (candidates(60), candidates(60), candidates(61)):
++            rows = seed(journal)
++            journal.plan_pages("o/r", rows, {rows[0]["id"]: notes})
++            journal.recheck_unattempted("o/r")
++        stored = [json.loads(row[0]) for row in journal.db.execute(
++            "SELECT payload FROM owner_check_details ORDER BY length(payload)")]
++        assert stored == [candidates(60), candidates(61)]
++    finally:
++        journal.close()
++
++
++def test_details_and_pages_rollback_together(tmp_path, monkeypatch):
++    journal = intake.Journal(tmp_path / "queue.sqlite3")
++    try:
++        rows = seed(journal)
++        monkeypatch.setattr(intake, "PAGE_BYTES", 1)
++        with pytest.raises(ValueError, match="intake_page_oversize"):
++            journal.plan_pages("o/r", rows, {rows[0]["id"]: candidates(60)})
++        assert len(journal.pending("o/r")) == 1
++        assert journal.db.execute("SELECT count(*) FROM pages").fetchone()[0] == 0
++        assert journal.db.execute("SELECT count(*) FROM owner_check_details").fetchone()[0] == 0
++    finally:
++        journal.close()
+-- 
+2.43.0
+

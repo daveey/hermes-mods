@@ -1,0 +1,362 @@
+From be3cf8081d78ca212e82d7002d0e2e7237c450dc Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 04:57:45 +0000
+Subject: [PATCH] fix(kanban): order operator releases by portable event time
+ [daveey]
+
+Copied-in older shared-wall assertions receive larger local row ids and were
+revoking newer operator unblocks. Compare UUIDv7 millisecond clocks (legacy
+created_at fallback), with local ids only breaking exact ties. Extract the
+existing fence decoder rather than creating another UUID parser.
+
+Share the guard's read-only hold evaluator with CLI and tool unblock reporting.
+Name the running sibling or probe interval due in PT; preserve registered-wall
+own-card and unregistered-wall sibling precedence and the public guard contract.
+
+Proof: RED had 10 behavioral failures. GREEN shared-blockers plus all #2923
+files: 160 tests pass. Consumer run: 427 tests pass across 14 files (before
+adding two more clock-selection cases). scripts/check: 20 checks pass.
+Three killed mutants: id-only ordering, omitted id tie-break, ignored UUID.
+Read-only local board replay found no remaining open blockers, so that is not
+live unblock proof; deployed worker proof remains a post-land acceptance step.
+---
+ docs/shared-blocker-recovery.md               | 20 ++++
+ hermes_cli/kanban.py                          |  3 +-
+ hermes_cli/kanban_shared_blocker_fence.py     | 17 ++--
+ hermes_cli/kanban_shared_blockers.py          | 65 +++++++++---
+ .../hermes_cli/test_kanban_shared_blockers.py | 99 +++++++++++++++++++
+ tools/kanban_tools_self_heal.py               |  8 +-
+ 6 files changed, 188 insertions(+), 24 deletions(-)
+
+diff --git a/docs/shared-blocker-recovery.md b/docs/shared-blocker-recovery.md
+index 722d7f46d5..d3385282a3 100644
+--- a/docs/shared-blocker-recovery.md
++++ b/docs/shared-blocker-recovery.md
+@@ -45,3 +45,23 @@ Check events use a fingerprint of portable run identities, not local integer
+ row ids. This fences results racing new assertions and survives synced id
+ remapping and import order. Recovery is not inferred from a failed command,
+ and commands never run under the board's writer lock.
++
++## Operator unblock verdict
++
++An explicit unblock is ordered against assertions using the event UUIDv7's
++millisecond timestamp, falling back to `created_at` for legacy or non-v7
++identities. Only exact time ties use local event ids; delayed replication of an
++older assertion cannot revoke a newer release. UUID random suffixes are not
++clocks. This is wall-clock ordering, not protection against gateway clock skew.
++
++For unregistered walls a running sibling still holds the card; otherwise a
++release newer than every assertion bypasses the probe interval. Registered walls
++retain their own-card release rule, before the sibling check.
++
++`hermes kanban unblock` prints the shared-blocker verdict after the transition;
++`kanban_unblock` returns it as `shared_blocker_verdict`. It either says
++`released: claimable on the next tick`, or names the blocking sibling or the
++probe interval's due time in PT. Reporting uses the same read-only decision as
++the dispatcher guard, without clearing the wall or electing another probe.
++This is a snapshot of the shared-blocker gate only: dependencies, placement,
++capacity and later assertions can still delay actual dispatch.
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index c83083f22f..410e295777 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -1501,7 +1501,8 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
+         if rc:
+             return rc
+         op = _commented(reason, author, "UNBLOCK", lambda tid, comment: kb.unblock_task(conn, tid, comment=comment, event_extra={"actor": cli_actor()}))
+-        return _bulk_apply(ids, op, lambda tid: f"Unblocked {tid}{suffix}",
++        from hermes_cli.kanban_shared_blockers import unblock_verdict
++        return _bulk_apply(ids, op, lambda tid: f"Unblocked {tid}{suffix}; {unblock_verdict(conn, tid)}",
+                            lambda tid: kb.unblock_refusal(conn, tid) or f"cannot unblock {tid} (not blocked/scheduled?)", conn=conn)
+ 
+ 
+diff --git a/hermes_cli/kanban_shared_blocker_fence.py b/hermes_cli/kanban_shared_blocker_fence.py
+index a2ffb656c4..a1b3f527dc 100644
+--- a/hermes_cli/kanban_shared_blocker_fence.py
++++ b/hermes_cli/kanban_shared_blocker_fence.py
+@@ -23,20 +23,25 @@ def _winning_checks(conn, bid, now):
+     return winners
+ 
+ 
++def uid_milliseconds(identity):
++    """Portable UUIDv7 event/claim clock; other identities have no precision."""
++    try:
++        uid = uuid.UUID(identity)
++    except (ValueError, AttributeError, TypeError):
++        return None
++    return uid.int >> 80 if uid.version == 7 else None
++
++
+ def _uid_before_check(identity, started, payload):
+     """UUIDv7 carries claim-initiation milliseconds, not remote commit order.
+ 
+     Use only consistent, strictly earlier clock evidence. Missing/invalid/tied
+     precision retains the legacy fallback; UUID random suffixes never order runs.
+     """
+-    try:
+-        uid = uuid.UUID(identity)
+-    except (ValueError, AttributeError):
+-        return False
++    claimed_ms = uid_milliseconds(identity)
+     checked_ms = payload.get('checked_at_ms')
+-    if uid.version != 7 or type(checked_ms) is not int:
++    if claimed_ms is None or type(checked_ms) is not int:
+         return False
+-    claimed_ms = uid.int >> 80
+     return (claimed_ms // 1000 == started == checked_ms // 1000
+             and claimed_ms < checked_ms)
+ 
+diff --git a/hermes_cli/kanban_shared_blockers.py b/hermes_cli/kanban_shared_blockers.py
+index 6ce9ebdbb8..92457cf1c0 100644
+--- a/hermes_cli/kanban_shared_blockers.py
++++ b/hermes_cli/kanban_shared_blockers.py
+@@ -473,24 +473,37 @@ def blocker_for_task(states: dict[str, BlockerState], task_id: str) -> Optional[
+     return None
+ 
+ 
++def _event_order(row) -> tuple[int, int]:
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_shared_blocker_fence import uid_milliseconds
++
++    stamp = uid_milliseconds(row["uid"] if "uid" in row.keys() else None)
++    if stamp is None:
++        stamp = (kb._to_epoch(row["created_at"]) or 0) * 1000
++    return stamp, int(row["id"])
++
++
+ def _unblocked_since_assertion(conn: sqlite3.Connection, task_id: str, blocker_id: str, *,
+                                own_only: bool = False) -> bool:
+-    """True when ``task_id`` was unblocked after the newest event asserting ``blocker_id``
+-    (event ids, not seconds: a bulk unblock and a re-assertion often share a second)."""
++    """Compare portable event clocks, using local ids only for exact time ties.
++
++    Replication assigns new local ids to old events. UUIDv7 milliseconds (or legacy
++    created_at seconds) preserve occurrence order; tied bulk events retain id order.
++    """
+     from hermes_cli import kanban_db as kb
+ 
+-    unblocked = conn.execute(
+-        "SELECT MAX(id) FROM task_events WHERE task_id=? AND kind='unblocked'", (task_id,)
+-    ).fetchone()[0]
++    unblocked = max((_event_order(row) for row in conn.execute(
++        "SELECT * FROM task_events WHERE task_id=? AND kind='unblocked'", (task_id,)
++    )), default=None)
+     if unblocked is None:
+         return False
++    own = " AND task_id=?" if own_only else ""
+     for row in conn.execute(
+-        "SELECT task_id, payload FROM task_events WHERE kind IN ('blocked', 'scheduled', 'continued', 'block_loop_detected') "
+-        "AND id>=? AND payload LIKE '%\"blocker_id\"%' ORDER BY id DESC", (unblocked,),
++        "SELECT * FROM task_events WHERE kind IN ('blocked', 'scheduled', 'continued', 'block_loop_detected') "
++        "AND payload LIKE '%\"blocker_id\"%'" + own, (task_id,) if own_only else (),
+     ):
+-        if own_only and row["task_id"] != task_id:
+-            continue
+-        if normalize_blocker_id(kb._json_dict(row["payload"]).get("blocker_id")) == blocker_id:
++        if (_event_order(row) >= unblocked and
++                normalize_blocker_id(kb._json_dict(row["payload"]).get("blocker_id")) == blocker_id):
+             return False
+     return True
+ 
+@@ -501,6 +514,27 @@ def shared_blocker_guard(
+ ) -> Optional[str]:
+     """:data:`GUARD_REASON` when ``task_id`` sits behind an open blocker and must wait for the
+     probe; None when it may spawn (no blocker, blocker cleared, or this card is the probe)."""
++    return GUARD_REASON if _shared_blocker_hold(conn, task_id, now=now, interval=interval) else None
++
++
++def unblock_verdict(conn: sqlite3.Connection, task_id: str) -> str:
++    """Read-only shared-blocker verdict, not a promise about other admission gates."""
++    hold = _shared_blocker_hold(conn, task_id)
++    if hold is None:
++        return "released: claimable on the next tick"
++    bid, sibling, due = hold
++    if sibling:
++        why = f"running sibling {sibling}"
++    else:
++        from datetime import datetime
++        from zoneinfo import ZoneInfo
++        at = datetime.fromtimestamp(due, ZoneInfo("America/Los_Angeles"))
++        why = f"probe interval due at {at:%Y-%m-%d %H:%M:%S} PT"
++    return f"still held by shared blocker {bid}: {why}"
++
++
++def _shared_blocker_hold(conn, task_id, *, now=None, interval=None) -> Optional[tuple[str, Optional[str], int]]:
++    """The guard and reporting share one read-only decision, including its reason."""
+     now = int(time.time()) if now is None else int(now)
+     states = blocker_states(conn, now=now)
+     st = blocker_for_task(states, task_id)
+@@ -515,10 +549,11 @@ def shared_blocker_guard(
+     others = [t for t in st.behind if t != task_id and task_applies(conn, st, t)]
+     if others:
+         marks = ",".join("?" * len(others))
+-        if conn.execute(
+-            f"SELECT 1 FROM tasks WHERE id IN ({marks}) AND status = 'running' LIMIT 1", others,
+-        ).fetchone():
+-            return GUARD_REASON   # a probe is already in flight
++        sibling = conn.execute(
++            f"SELECT id FROM tasks WHERE id IN ({marks}) AND status = 'running' ORDER BY id LIMIT 1", others,
++        ).fetchone()
++        if sibling:
++            return st.blocker_id, sibling["id"], 0   # a probe is already in flight
+     if _released_as_probe(conn, st, task_id):
+         return None
+     if interval is None:
+@@ -529,7 +564,7 @@ def shared_blocker_guard(
+     # A human unblock after the newest assertion is a deliberate "try again now".
+     if _unblocked_since_assertion(conn, task_id, st.blocker_id):
+         return None
+-    return GUARD_REASON
++    return st.blocker_id, None, last + interval
+ 
+ 
+ def _released_as_probe(conn: sqlite3.Connection, st: BlockerState, task_id: str) -> bool:
+diff --git a/tests/hermes_cli/test_kanban_shared_blockers.py b/tests/hermes_cli/test_kanban_shared_blockers.py
+index 82a853015a..d8a3b36f9f 100644
+--- a/tests/hermes_cli/test_kanban_shared_blockers.py
++++ b/tests/hermes_cli/test_kanban_shared_blockers.py
+@@ -24,6 +24,105 @@ import tools.kanban_tools as kt
+ BID = "github-actions-billing"
+ 
+ 
++def _event_uid(ms, suffix):
++    import uuid
++    return str(uuid.UUID(int=(ms << 80) | (7 << 76) | (2 << 62) | suffix))
++
++
++@pytest.mark.parametrize("own_only", [False, True])
++@pytest.mark.parametrize("delta,expected", [(-1, True), (0, False), (1, False)])
++@pytest.mark.parametrize("identity", ["v7", "missing", "v4"])
++def test_operator_release_event_time(kanban_home, own_only, delta, expected, identity):
++    """Remote insertion order is not occurrence order; ties retain local order."""
++    with kbc.connect_closing() as conn:
++        target = _blocked_behind(conn, "target")
++        peer = _blocked_behind(conn, "peer")
++        assert kb.unblock_task(conn, target)
++        ms = int(time.time()) * 1000 + 500
++        uid = lambda stamp, suffix: (_event_uid(stamp, suffix) if identity == "v7" else
++                                    None if identity == "missing" else "00000000-0000-4000-8000-000000000001")
++        # Unsynced fixture schema has no transport columns.
++        conn.execute("ALTER TABLE task_events ADD COLUMN uid TEXT")
++        # Keep the initial assertions older than the release, including their UUIDs.
++        with kb.write_txn(conn):
++            conn.execute("UPDATE task_events SET uid=NULL, created_at=?", (ms // 1000 - 10,))
++            conn.execute("UPDATE task_events SET uid=?, created_at=? WHERE task_id=? AND kind='unblocked'",
++                         (uid(ms, 1), ms // 1000, target))
++            kb._append_event(conn, target if own_only else peer, "scheduled", {"blocker_id": BID})
++            conn.execute("UPDATE task_events SET uid=?, created_at=?, origin_gateway='remote' WHERE id=(SELECT MAX(id) FROM task_events)",
++                         (uid(ms + delta, 2), ms // 1000 + (-delta if identity == "v7" else delta)))
++        assert ksb._unblocked_since_assertion(conn, target, BID, own_only=own_only) is expected
++        assert ksb.shared_blocker_guard(conn, target, interval=3600) == (None if expected else ksb.GUARD_REASON)
++
++
++@pytest.mark.parametrize("own_only", [False, True])
++def test_release_selects_latest_clock_not_latest_local_id(kanban_home, own_only):
++    with kbc.connect_closing() as conn:
++        target = _blocked_behind(conn, "target")
++        assert kb.unblock_task(conn, target)
++        conn.execute("ALTER TABLE task_events ADD COLUMN uid TEXT")
++        ms = int(time.time()) * 1000
++        with kb.write_txn(conn):
++            # All earlier assertions and the unblock share the same millisecond.
++            # The UUID's random bits deliberately oppose local event order.
++            conn.execute("UPDATE task_events SET uid=?", (_event_uid(ms, 999),))
++            conn.execute("UPDATE task_events SET uid=? WHERE kind='unblocked'", (_event_uid(ms, 1),))
++            kb._append_event(conn, target, "unblocked", {})
++            conn.execute("UPDATE task_events SET uid=? WHERE id=(SELECT MAX(id) FROM task_events)",
++                         (_event_uid(ms - 1000, 2),))
++        assert ksb._unblocked_since_assertion(conn, target, BID, own_only=own_only)
++        assert ksb.shared_blocker_guard(conn, target, interval=3600) is None
++
++
++@pytest.mark.parametrize("entry", ["cli", "tool"])
++@pytest.mark.parametrize("running_peer", [False, True, "interval"])
++def test_unblock_reports_shared_guard(kanban_home, monkeypatch, capsys, entry, running_peer):
++    from argparse import Namespace
++    from hermes_cli import kanban
++    from tools.kanban_tools_self_heal import handle_unblock
++
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    with kbc.connect_closing() as conn:
++        target = _blocked_behind(conn, "target")
++        peer = _blocked_behind(conn, "peer")
++        if running_peer is True:
++            assert kb.unblock_task(conn, peer)
++            assert kb.claim_task(conn, peer)
++    if running_peer == "interval":
++        # An assertion arriving between the unblock commit and its readback.
++        original = kb.unblock_task
++
++        def reassert(conn, tid, **kwargs):
++            ok = original(conn, tid, **kwargs)
++            with kb.write_txn(conn):
++                kb._append_event(conn, peer, "scheduled", {"blocker_id": BID})
++            return ok
++
++        monkeypatch.setattr(kb, "unblock_task", reassert)
++    if entry == "cli":
++        assert kanban._cmd_unblock(Namespace(task_ids=[target], reason=None)) == 0
++        result = capsys.readouterr().out
++    else:
++        result = handle_unblock({"task_id": target})
++    with kbc.connect_closing() as conn:
++        assert ksb.shared_blocker_guard(conn, target) == (ksb.GUARD_REASON if running_peer else None)
++    expected = (f"still held by shared blocker {BID}: running sibling {peer}" if running_peer is True else
++                "released: claimable on the next tick")
++    if running_peer == "interval":
++        from datetime import datetime
++        from zoneinfo import ZoneInfo
++        with kbc.connect_closing() as conn:
++            state = ksb.blocker_states(conn)[BID]
++            due = min(state.behind.values()) + ksb.probe_interval_seconds()
++            at = datetime.fromtimestamp(due, ZoneInfo("America/Los_Angeles"))
++            expected = f"still held by shared blocker {BID}: probe interval due at {at:%Y-%m-%d %H:%M:%S} PT"
++            writes = conn.total_changes
++            assert ksb.unblock_verdict(conn, target) == expected
++            assert conn.total_changes == writes
++    assert expected in result
++
++
++
+ @pytest.fixture
+ def scoped_routing(monkeypatch):
+     from hermes_cli import kanban_model_tier as tier
+diff --git a/tools/kanban_tools_self_heal.py b/tools/kanban_tools_self_heal.py
+index d211250ac6..3ccbf2401d 100644
+--- a/tools/kanban_tools_self_heal.py
++++ b/tools/kanban_tools_self_heal.py
+@@ -118,6 +118,7 @@ def _forward_missing_parent_unblock(env_tid: str, tid: str) -> Optional[str]:
+ def handle_unblock(args: dict, **kw) -> str:
+     """Transition a blocked/triage/scheduled task, or a card this worker holds a requeue grant for."""
+     from tools import kanban_tools as kt
++    from hermes_cli.kanban_shared_blockers import unblock_verdict
+ 
+     kt._reject_delegated_child_mutation("kanban_unblock")
+     tid = args.get("task_id")
+@@ -173,11 +174,13 @@ def handle_unblock(args: dict, **kw) -> str:
+                         "actor": tool_actor(worker_task=env_tid), "repair_task_id": source, "via": via})
+                     kt._check(ok, f"could not unblock {tid} (missing-parent repair grant no longer holds)")
+                     _log_requeue(conn, kb, tid, env_tid, via, source)
+-                    return kt._ok(task_id=tid, via=via, **kt._fields(kb.get_task(conn, tid), ("status",)))
++                    return kt._ok(task_id=tid, via=via, shared_blocker_verdict=unblock_verdict(conn, tid),
++                                  **kt._fields(kb.get_task(conn, tid), ("status",)))
+                 ok = kb.unblock_task(conn, tid, precondition=precondition)
+                 kt._check(ok, f"could not unblock {tid} (not blocked/triage/scheduled, or unknown)")
+                 _log_requeue(conn, kb, tid, env_tid, via, source)
+-                return kt._ok(task_id=tid, via=via, **kt._fields(kb.get_task(conn, tid), ("status",)))
++                return kt._ok(task_id=tid, via=via, shared_blocker_verdict=unblock_verdict(conn, tid),
++                                  **kt._fields(kb.get_task(conn, tid), ("status",)))
+     kt._require_orchestrator_tool("kanban_unblock")
+     kt._enforce_worker_task_ownership(tid)
+     with kt._board(args.get("board")) as (kb, conn):
+@@ -199,6 +202,7 @@ def handle_unblock(args: dict, **kw) -> str:
+         subscribed = kt._maybe_subscribe_on_touch(conn, tid)
+         task = kb.get_task(conn, tid)
+         return kt._ok(task_id=tid, **kt._fields(task, ("status",)),
++                      shared_blocker_verdict=unblock_verdict(conn, tid),
+                       **({"priority_raised": raised} if raised else {}),
+                       **cw.unblock_fields(conn, task, args.get("board")),
+                       **({"subscribed": True} if subscribed else {}))
+-- 
+2.43.0
+

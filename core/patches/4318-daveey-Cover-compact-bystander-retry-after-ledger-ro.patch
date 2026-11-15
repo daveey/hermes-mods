@@ -1,0 +1,71 @@
+From aab78fde29e88988c87eaf348f6cf6d276093290 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 23:42:49 +0000
+Subject: [PATCH] [daveey] Cover compact bystander retry after ledger rollback
+
+A successful empty baseline followed by two old terminal bystanders exercises pending compact rows rather than naturally retried relevant cards. A SQLite trigger aborts the second INSERT; assert rollback, retry the unchanged replica, and read durable first_seen values through warm and cold polls.
+
+Proof: canonical file GREEN 7 passed, zero skips; scripts/mutants.py M5 (pending put-back replaced with pass) RED 1 failed, 6 passed at the durable observations assertion. scripts/check --base origin/main: 20 checks ok. Scratch stores only.
+---
+ ...test_remote_projection_bystander_memory.py | 38 +++++++++++++++++++
+ 1 file changed, 38 insertions(+)
+
+diff --git a/tests/tui_gateway/test_remote_projection_bystander_memory.py b/tests/tui_gateway/test_remote_projection_bystander_memory.py
+index efeaa82da2..0e899cd99f 100644
+--- a/tests/tui_gateway/test_remote_projection_bystander_memory.py
++++ b/tests/tui_gateway/test_remote_projection_bystander_memory.py
+@@ -12,6 +12,8 @@ import sqlite3
+ import tracemalloc
+ from array import array
+ 
++import pytest
++
+ from hermes_state import SessionDB
+ from tests.tui_gateway.test_kanban_remote_arrival import _hub
+ from tests.tui_gateway.test_kanban_remote_notices import CHAT, _card, _dead_pid, _ledger_row
+@@ -258,6 +260,42 @@ def test_replaced_replica_reclassifies_compact_bystander_with_unchanged_seq(tmp_
+     assert obs.observe(replica, ledger, NOW + 20) == fresh
+ 
+ 
++def test_failed_bystander_write_retries_unchanged_replica(tmp_path):
++    replica = _hub(tmp_path, [])
++    ledger = tmp_path / "remote-notices.db"
++    remote._reset_for_tests()
++    assert obs.observe(replica, ledger, NOW) == {}  # establish the source before these old states arrive
++    source = str(replica.resolve())
++    cards = [_bystander(i, at=NOW - 8 * 3600) for i in range(2)]
++    with sqlite3.connect(replica) as conn:
++        conn.executemany("INSERT INTO replica VALUES ('hub','tasks',?,?,?)",
++                         [(card["key"], json.dumps(card["task"]), i + 101) for i, card in enumerate(cards)])
++    with sqlite3.connect(ledger) as conn:
++        assert conn.execute("SELECT source FROM observation_sources").fetchall() == [(source,)]
++        # Fail a real INSERT, after the first row was inserted, so the whole batch must roll back.
++        conn.execute("CREATE TRIGGER fail_bystander BEFORE INSERT ON observations "
++                     "WHEN (SELECT count(*) FROM observations) = 1 "
++                     "BEGIN SELECT RAISE(ABORT, 'bystander ledger failure'); END")
++    with pytest.raises(sqlite3.IntegrityError, match="bystander ledger failure"):
++        obs.observe(replica, ledger, NOW + 10)
++    (flight,) = obs._retained.values()
++    assert len(flight.lane.table) == 2 and flight.decoded == {}  # not relevant rows that naturally retry
++    with sqlite3.connect(ledger) as conn:
++        assert conn.execute("SELECT * FROM observations").fetchall() == []
++        conn.execute("DROP TRIGGER fail_bystander")
++    # Do not reset the caches, replace either file, or change any replica row before retrying.
++    assert obs.observe(replica, ledger, NOW + 20) == {}
++    expected = sorted((source, f"hub/{card['key']}", f"done@{int(NOW - 8 * 3600)}", NOW + 20)
++                      for card in cards)
++    with sqlite3.connect(ledger) as conn:
++        assert conn.execute("SELECT source, ref, state, first_seen FROM observations ORDER BY ref").fetchall() == expected
++    assert obs.observe(replica, ledger, NOW + 30) == {}
++    remote._reset_for_tests()  # cold reconstruction must retain the successful retry's first_seen, too
++    assert obs.observe(replica, ledger, NOW + 40) == {}
++    with sqlite3.connect(ledger) as conn:
++        assert conn.execute("SELECT source, ref, state, first_seen FROM observations ORDER BY ref").fetchall() == expected
++
++
+ def test_bystander_linked_after_an_in_place_gateway_rename_is_observed(tmp_path):
+     # The replica's meta.gateway changes in place: a row that was a bystander for the old name and is linked to the
+     # new one must be re-classified at once (as main decodes every row), not stay compact until its seq moves.
+-- 
+2.43.0
+

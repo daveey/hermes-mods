@@ -1,0 +1,324 @@
+From f6a4a666491cf66ed6cb37adc70b55a66b45cda1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 17:34:19 +0000
+Subject: [PATCH] fix(cron): scan scripts behind escaped subscript
+ substitutions in arithmetic words [daveey]
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+`let`, `[[ … -eq … ]]` and `declare -i` operands are shell words first: bash
+removes quotes and backslashes, then evaluates the result as arithmetic, and
+an array subscript there runs its command substitution. With
+`let x=a[\$\(S\)]` (or `let x=a[\`S\`]`, `let x=a['$'\(S\)]`,
+`[[ 1 -eq a\[\$\(S\)\] ]]`, …), bash 5.2.21 runs S. The raw text shows no
+substitution, though, so the referenced-script walk never read S, and an S
+holding `hermes gateway restart` was allowed (fail-open, t_01a1db0af44d1601).
+
+Fix: new cron/lifecycle_guard_arith_words.py. For each tokenized (so
+dequoted) segment it takes the operands of an integer operator, the
+arguments of `let` (behind reserved words and transparent wrappers such as
+`builtin`), and the arguments of an integer declaration. Every operand that
+holds a `[` and a `$(`/backtick goes back to the walk as shell text, with
+backtick spans spelled `$( … )`. iter_recursive_payloads yields these next
+to the `sh -c` payloads. A cheap prefilter (a `[` plus a `$` or backtick)
+skips the extra tokenization for most commands. A payload only makes the
+walk read the file: the guard refuses only when that file holds a lifecycle
+command or cannot be scanned. It is independent of
+output_reaches_shell / shell_arith_sink, so it also works on main before the
+quoted-subscript sink fix (t_01a1dace884ce45d) lands.
+
+Proof:
+- tests/cron/test_lifecycle_guard_arith_escaped_words.py: 12 shapes where
+  real bash runs a marker script. They cover the 7 `_GUARD_GAPS` shapes
+  t_01a1dace884ce45d carries as strict xfail, plus `let a[…]=1`,
+  `builtin let`, `if let`, `declare -i` and `[[ … && … -eq … ]]`. Each one
+  is refused when the script holds `hermes gateway restart` and allowed
+  for a clean twin. 5 controls bash does NOT run (echo, `let x=\$\(S\)`
+  with no subscript, plain `declare`, `[[ == ]]`) stay allowed.
+- RED on main (hook removed): 12 failed, 17 passed. GREEN: 36 passed.
+- Mutants: 13/13 killed (each clause, the hook, the dedup and the bounds),
+  plus a tokenization tripwire for the prefilter.
+- All 39 test files that reference lifecycle_guard: 2668 passed. One run of
+  test_large_no_sink_heredoc_scan_stays_fast went over its 5 s wall at host
+  load 11. It passes alone. A direct timing of that input shows 2.07 s with
+  the hook and 1.85 s without.
+- Not covered: `declare -i x; x=a[\$\(S\)]`, a later assignment to an
+  integer variable (that needs variable-attribute state). The guard also
+  never follows backticks in general (`echo \`S\``); sibling
+  t_01a1db0c38d72914 owns that.
+
+Rebased onto main with the quoted-subscript sink fix (0e60b2c435, PR #3062):
+- Dropped the 7 strict `_GUARD_GAPS` xfail marks for this card in
+  tests/cron/test_lifecycle_guard_arith_word_quotes.py; they now XPASS.
+  `let 'a[`SCRIPT`]=1'` (filed under t_01a1db0c38d72914) also passes now
+  because backtick spans in dequoted operands are spelled `$( … )`, so its
+  mark is gone too; `let "a[\`SCRIPT\`]=1"` stays strict xfail for that card.
+- The `echo let x=a[\$\(S\)]` guard-level control moved to the payload-level
+  table: on main the coarse printed-sink check already refuses it (fail-closed,
+  independent of this change), and this module yields no payload for it.
+- Rebased run: both files 93 passed + 1 xfail; all 40 test files referencing
+  lifecycle_guard / shell_arith_sink: 2726 passed.
+---
+ cron/lifecycle_guard_arith_words.py           |  71 +++++++++++
+ cron/lifecycle_guard_output.py                |   4 +
+ ...est_lifecycle_guard_arith_escaped_words.py | 120 ++++++++++++++++++
+ .../test_lifecycle_guard_arith_word_quotes.py |  14 +-
+ 4 files changed, 198 insertions(+), 11 deletions(-)
+ create mode 100644 cron/lifecycle_guard_arith_words.py
+ create mode 100644 tests/cron/test_lifecycle_guard_arith_escaped_words.py
+
+diff --git a/cron/lifecycle_guard_arith_words.py b/cron/lifecycle_guard_arith_words.py
+new file mode 100644
+index 0000000000..fab5f84ad3
+--- /dev/null
++++ b/cron/lifecycle_guard_arith_words.py
+@@ -0,0 +1,71 @@
++"""Subscript substitutions in arithmetic WORDS, recovered after quote removal.
++
++``let`` operands, ``[[ … -eq … ]]`` operands and integer declarations are shell
++words first: bash removes quotes and backslashes, THEN evaluates the result as
++arithmetic, where an array subscript runs its command substitution. So
++``let x=a[\\$\\(S\\)]``, ``let x=a['$'\\(S\\)]`` and ``let x=a[\\`S\\`]`` all run ``S``
++(bash 5.2.21) although no substitution is visible in the raw text the reference
++walk tokenizes (t_01a1db0af44d1601). Each such dequoted operand that holds a
++subscript and a substitution opener is handed back to the walk as shell text, with
++backtick spans spelled ``$( … )`` so the walk follows them like any substitution.
++
++Deliberately coarse, failing towards scanning: any ``[`` plus opener counts, and an
++operand of an integer operator counts wherever the operator sits (``[ … ]``/``test``
++included). A payload only makes the walk READ the referenced file; it refuses only
++when that file holds a lifecycle command (or cannot be scanned).
++"""
++from __future__ import annotations
++
++import re
++from collections.abc import Iterator
++
++_INT_OPERATORS = frozenset({"-eq", "-ne", "-lt", "-le", "-gt", "-ge"})
++_INTEGER_DECLARERS = frozenset({"declare", "typeset", "local", "readonly", "export"})
++_BACKTICK_SPAN_RE = re.compile(r"`([^`]*)`")
++_SUBSTITUTION_OPENERS = ("$(", "`")
++
++
++def _integer_declaration(arguments: list[str]) -> bool:
++    """Whether a declare-family argv sets the integer attribute (``-i``, ``-ai``, ``-i -x``)."""
++    return any(
++        argument.startswith("-") and "i" in argument[1:]
++        for argument in arguments
++    )
++
++
++def _arithmetic_operands(segment: list[str]) -> Iterator[str]:
++    from cron import lifecycle_guard as guard
++
++    for position, token in enumerate(segment):
++        if token in _INT_OPERATORS:
++            if position > 0:
++                yield segment[position - 1]
++            if position + 1 < len(segment):
++                yield segment[position + 1]
++    words = segment[guard._peel_reserved_words(segment):]
++    index = guard._executed_command_index(words)
++    if index is None:
++        return
++    name = guard._executable_name(words[index])
++    arguments = words[index + 1:]
++    if name == "let" or (name in _INTEGER_DECLARERS and _integer_declaration(arguments)):
++        yield from arguments
++
++
++def iter_arithmetic_word_payloads(command: str) -> Iterator[str]:
++    """Yield dequoted arithmetic operands of *command* whose subscript may run a substitution."""
++    from cron import lifecycle_guard as guard
++
++    # Cheap prefilter: without a subscript bracket and a `$`/backtick no operand can qualify,
++    # so most commands never pay for another tokenization.
++    if "[" not in command or ("$" not in command and "`" not in command):
++        return
++    seen: set[str] = set()
++    for segment in guard._iter_command_segments(command):
++        for operand in _arithmetic_operands(segment):
++            if "[" not in operand or not any(o in operand for o in _SUBSTITUTION_OPENERS):
++                continue
++            payload = _BACKTICK_SPAN_RE.sub(r"$(\1)", operand)
++            if payload not in seen:
++                seen.add(payload)
++                yield payload
+diff --git a/cron/lifecycle_guard_output.py b/cron/lifecycle_guard_output.py
+index dfbc297d7f..5359793ceb 100644
+--- a/cron/lifecycle_guard_output.py
++++ b/cron/lifecycle_guard_output.py
+@@ -10,6 +10,8 @@ from __future__ import annotations
+ import re
+ from collections.abc import Iterator
+ 
++from cron.lifecycle_guard_arith_words import iter_arithmetic_word_payloads
++
+ _QUOTED_LITERAL_RES = (re.compile(r"(?='([^']+)')"), re.compile(r'(?="([^"]+)")'))
+ _ARGUMENT_PRINTERS = frozenset({"echo", "printf"})
+ 
+@@ -26,6 +28,8 @@ def iter_recursive_payloads(command, nested_texts, *, cwd, executed, budget, cov
+         yield payload, True, None
+     for payload in guard._iter_shell_command_payloads(command):
+         yield payload, False, None
++    for payload in iter_arithmetic_word_payloads(command):
++        yield payload, False, None
+     # Snapshot after preceding nested-shell walks; shared budget state may have changed.
+     scope = quote_scope(cwd, executed, budget)
+     for payload, raw_quote in iter_printed_shell_payloads(
+diff --git a/tests/cron/test_lifecycle_guard_arith_escaped_words.py b/tests/cron/test_lifecycle_guard_arith_escaped_words.py
+new file mode 100644
+index 0000000000..4065c1a6c6
+--- /dev/null
++++ b/tests/cron/test_lifecycle_guard_arith_escaped_words.py
+@@ -0,0 +1,120 @@
++"""Real Bash regressions: escaped substitutions in arithmetic words (t_01a1db0af44d1601).
++
++``let`` / ``[[ … -eq … ]]`` / ``declare -i`` operands are dequoted before bash evaluates
++them as arithmetic, and an array subscript there runs its command substitution. The raw
++text shows no substitution (``let x=a[\\$\\(S\\)]``), so the referenced-script walk never
++read ``S``: a script holding ``hermes gateway restart`` ran unscanned.
++"""
++
++import shutil
++import subprocess
++
++import pytest
++
++from cron.lifecycle_guard import scan_gateway_lifecycle
++from cron.lifecycle_guard_arith_words import iter_arithmetic_word_payloads
++
++SHAPES = [
++    r"let x=a[\`SCRIPT\`]",
++    r"let x=a[\$\(SCRIPT\)]",
++    r"let x=a\[\$\(SCRIPT\)\]",
++    r"let x=a[$\(SCRIPT\)]",
++    r"let x=a['$'\(SCRIPT\)]",
++    r"let x=a[' '\$\(SCRIPT\)]",
++    r"[[ 1 -eq a\[\$\(SCRIPT\)\] ]]",
++    r"let a[\$\(SCRIPT\)]=1",
++    r"builtin let x=a[\$\(SCRIPT\)]",
++    r"if let x=a[\$\(SCRIPT\)]; then :; fi",
++    r"declare -i x=a[\$\(SCRIPT\)]",
++    r"[[ 1 -eq 1 && 2 -eq a\[\$\(SCRIPT\)\] ]]",
++]
++
++# Bash does not run SCRIPT for these: echoed words are data, and arithmetic with no
++# subscript does not expand the substitution text it receives. `echo let x=a[\$\(S\)]`
++# is inert too, but main's coarse printed-sink check already refuses it (fail-closed),
++# so its twin is asserted at payload level in test_arithmetic_word_payloads.
++CONTROLS = [
++    r"echo x=a[\$\(SCRIPT\)]",
++    r"let x=\$\(SCRIPT\)",
++    r"declare x=a[\$\(SCRIPT\)]",
++    r"[[ x == a\[\$\(SCRIPT\)\] ]]",
++]
++
++
++def _run_bash(tmp_path, command):
++    bash = shutil.which("bash")
++    if bash is None:
++        pytest.skip("Bash required for execution proof")
++    marker = tmp_path / "ran"
++    script = tmp_path / "payload.sh"
++    script.write_text(f"touch '{marker}'\nprintf 0\n", encoding="utf-8")
++    script.chmod(0o755)
++    subprocess.run(
++        [bash, "--noprofile", "--norc", "-c", command], cwd=tmp_path,
++        env={"PATH": "/usr/bin:/bin"}, capture_output=True, text=True,
++        encoding="utf-8", timeout=10, check=False,
++    )
++    return marker.exists(), script
++
++
++@pytest.mark.platforms("posix")
++@pytest.mark.parametrize("shape", SHAPES)
++def test_escaped_arithmetic_word_scripts_are_scanned(tmp_path, shape):
++    script = tmp_path / "payload.sh"
++    command = shape.replace("SCRIPT", str(script))
++    ran, script = _run_bash(tmp_path, command)
++    assert ran, "bash must run the referenced script for this shape"
++    script.write_text("hermes gateway restart\n", encoding="utf-8")
++    assert scan_gateway_lifecycle(command, cwd=str(tmp_path)) == (True, None)
++    # Clean twin: the same reference to a harmless script stays allowed.
++    script.write_text("echo hello\n", encoding="utf-8")
++    assert scan_gateway_lifecycle(command, cwd=str(tmp_path)) == (False, None)
++
++
++@pytest.mark.platforms("posix")
++@pytest.mark.parametrize("shape", CONTROLS)
++def test_inert_escaped_words_are_not_followed(tmp_path, shape):
++    script = tmp_path / "payload.sh"
++    command = shape.replace("SCRIPT", str(script))
++    ran, script = _run_bash(tmp_path, command)
++    assert not ran
++    script.write_text("hermes gateway restart\n", encoding="utf-8")
++    assert scan_gateway_lifecycle(command, cwd=str(tmp_path)) == (False, None)
++
++
++@pytest.mark.parametrize(("command", "payloads"), [
++    (r"let x=a[\`S\`]", ["x=a[$(S)]"]),
++    (r"let x=a[\$\(S\)] y=a[\$\(S\)]", ["x=a[$(S)]", "y=a[$(S)]"]),
++    (r"let x=a[\$\(S\)] x=a[\$\(S\)]", ["x=a[$(S)]"]),
++    (r"declare -ai x=a[\$\(S\)]", ["x=a[$(S)]"]),
++    (r"declare -a x=a[\$\(S\)]", []),
++    (r"declare -- x=a[\$\(S\)]", []),
++    (r"test 1 -eq a[\$\(S\)]", ["a[$(S)]"]),
++    (r"[[ a[\$\(S\)] -lt 1 ]]", ["a[$(S)]"]),
++    (r"let x=1 y=\$\(S\)", []),
++    (r"let x=a[1]", []),
++    ("let", []),
++    ("-eq", []),
++    (r"-eq 1 a[\$\(S\)]", []),
++    (r"xi=a[\$\(S\)]", []),
++    (r"declare xi=a[\$\(S\)]", []),
++    (r"echo let x=a[\$\(S\)]", []),
++])
++def test_arithmetic_word_payloads(command, payloads):
++    assert list(iter_arithmetic_word_payloads(command)) == payloads
++
++
++@pytest.mark.parametrize("command", [
++    "echo hello world | grep x",
++    "let x=a[1]",
++    "echo $HOME",
++    "echo `date`",
++])
++def test_prefilter_skips_tokenization(monkeypatch, command):
++    from cron import lifecycle_guard
++
++    def tripwire(_command):
++        raise AssertionError("tokenized a command the prefilter should skip")
++
++    monkeypatch.setattr(lifecycle_guard, "_iter_command_segments", tripwire)
++    assert list(iter_arithmetic_word_payloads(command)) == []
+diff --git a/tests/cron/test_lifecycle_guard_arith_word_quotes.py b/tests/cron/test_lifecycle_guard_arith_word_quotes.py
+index 5cb8f4a797..b85318a0cb 100644
+--- a/tests/cron/test_lifecycle_guard_arith_word_quotes.py
++++ b/tests/cron/test_lifecycle_guard_arith_word_quotes.py
+@@ -85,18 +85,10 @@ def test_quoted_word_arithmetic_subscripts_are_sinks(tmp_path, shape):
+     assert output_reaches_shell(command)
+ 
+ 
+-# The guard finds the referenced script only behind a `$(…)` it recognizes. Unquoted
+-# backslash-escaped substitutions (t_01a1db0af44d1601) and backticks
+-# (t_01a1db0c38d72914) still hide it; the scanner above already flags these sinks.
++# The guard does not yet follow a script behind an escaped backtick inside a
++# double-quoted `let` operand (t_01a1db0c38d72914); the scanner above already flags
++# that sink.
+ _GUARD_GAPS = {
+-    r"let x=a[\`SCRIPT\`]": "t_01a1db0af44d1601",
+-    r"let x=a[\$\(SCRIPT\)]": "t_01a1db0af44d1601",
+-    r"let x=a\[\$\(SCRIPT\)\]": "t_01a1db0af44d1601",
+-    r"let x=a[$\(SCRIPT\)]": "t_01a1db0af44d1601",
+-    r"let x=a['$'\(SCRIPT\)]": "t_01a1db0af44d1601",
+-    r"let x=a[' '\$\(SCRIPT\)]": "t_01a1db0af44d1601",
+-    r"[[ 1 -eq a\[\$\(SCRIPT\)\] ]]": "t_01a1db0af44d1601",
+-    "let 'a[`SCRIPT`]=1'": "t_01a1db0c38d72914",
+     r'let "a[\`SCRIPT\`]=1"': "t_01a1db0c38d72914",
+ }
+ 
+-- 
+2.43.0
+

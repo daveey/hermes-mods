@@ -1,0 +1,219 @@
+From 13969b908011035434aecac71f2bda2d0ce3be84 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 17:22:26 +0000
+Subject: [PATCH] [daveey] home-marker audit: a pool worker's created event
+ says queue only when the card queues
+
+The 24 h live check of t_01a1d2856e5fec44 (PR #2051) found worker-created cards whose
+created event recorded `home_marker: {decision: queue}` while the store kept runs_on NULL,
+and one home-marker keep with no key at all (fix card t_01a1db073fff0642).
+
+Three shapes, one fix each, all on the real kt._handle_create path (w2 fixture):
+
+1. t_01a1d73ba3627290 (worker-2): an `ssh` hit (class d) queued in pool_worker_markers,
+   then coordination.required_labels returned None (a backticked `hermes-hub tasks` action:
+   portability drops backtick spans, the pickup gate's text keeps them), and queue_decision
+   returned None without unclaimable(). Every pool member's pickup gate refuses that text,
+   so the card cannot queue: the record now becomes keep/gateway-test-failed.
+2. t_01a1d773774908a6 (worker-7, placement_intent explicit): the local-pin note simulates
+   the auto placement (which records queue), then the pin keeps the card. creation_audit
+   now writes `home_marker` only for an auto create; an explicit pin carries no key.
+3. t_01a1d8146b9ef790 (worker-5, created_by bb-tuner): that profile's config has no
+   kanban.placement, so queue_decision had no queue label and returned before any record.
+   A Linux pool worker without a worker_queue label now records its home-marker keep as
+   gateway-test-failed (no_queue), guarded so that, off a create, it reads no registry.
+   (The card's lead, pool_worker_markers L247, cannot name a reason the full portability
+   scan would not name first: same steps, same order before the home step.)
+
+No change to the pass set, the live-check gate or the classification table.
+
+Proof: 4 new fixture tests RED on base, GREEN on head; 3 controls (macbook gateway, local
+marker, no registry read outside a create) green on both. Six mutants, each killed:
+drop unclaimable on the coordination refusal; drop `not explicit`; drop the no_queue call;
+drop the create-observation guard; drop the home-reason check; drop the pool-worker check.
+---
+ hermes_cli/kanban_home_marker_placement.py | 32 ++++++++--
+ hermes_cli/kanban_worker_placement.py      | 14 +++-
+ tests/hermes_cli/test_kanban_pool_queue.py | 74 ++++++++++++++++++++++
+ 3 files changed, 113 insertions(+), 7 deletions(-)
+
+diff --git a/hermes_cli/kanban_home_marker_placement.py b/hermes_cli/kanban_home_marker_placement.py
+index 649deeb312..3501b5ff55 100644
+--- a/hermes_cli/kanban_home_marker_placement.py
++++ b/hermes_cli/kanban_home_marker_placement.py
+@@ -219,12 +219,34 @@ def recorded(args: dict):
+ 
+ 
+ def unclaimable(args: dict) -> None:
+-    """The queue result found no live machine holding its whole label set, so the local keep stands: record that as
+-    ``gateway-test-failed`` (no live label), not as the queue it would have been. A keep never reaches here."""
++    """The queue result found no live machine holding its whole label set, or text every pool member's pickup gate
++    refuses (``coordination.required_labels`` None), so the local keep stands: record that as
++    ``gateway-test-failed`` (no pool member can claim it), not as the queue it would have been. A keep never reaches
++    here."""
+     if (record := recorded(args)) is not None:
+         remember(args, {"decision": "keep", "class": "gateway-test-failed", "hit": record["hit"]})
+ 
+ 
++def _untested(args: dict, cfg) -> None:
++    """Record the card's first home-gateway-marker hit as kept because the gateway (or pool) test failed."""
++    from hermes_cli.kanban_placement_diagnostics import home_marker_hits
++    if hits := home_marker_hits(args, cfg):
++        remember(args, {"decision": "keep", "class": "gateway-test-failed", "hit": hits[0][1].group(0)})
++
++
++def no_queue(args: dict, cfg, gateway: str) -> None:
++    """A pool worker whose placement config names no ``worker_queue`` label cannot queue the card, so its home hit
++    keeps it here: record that as ``gateway-test-failed``. t_01a1db073fff0642 (fixture t_01a1d8146b9ef790): a
++    ``bb-tuner`` profile has no ``kanban.placement`` on the pool workers, and its home-marker card stayed local with
++    no ``home_marker`` key. [daveey]"""
++    from hermes_cli import kanban_placement as kp
++    from hermes_cli.kanban_published_worktree import create_observation
++    # Cheapest first: no create to record for, then the text scan, and only then the (cached) registry read.
++    if (create_observation() is not None and kp.portable_reason(args, cfg) == "home gateway marker"
++            and kp.linux_pool_gateway(gateway, cfg)):
++        _untested(args, cfg)
++
++
+ HOME_WHY = " (home gateway marker {hit} not bound to {gateway})"
+ 
+ 
+@@ -238,11 +260,11 @@ def pool_worker_markers(args: dict, cfg, gateway: str, reason: str, live):
+     t_01a1d2856e5fec44 home markers). [daveey]"""
+     from hermes_cli import kanban_placement as kp
+     from hermes_cli import kanban_worker_placement as kwp
+-    from hermes_cli.kanban_placement_diagnostics import home_marker_hits, portability
++    from hermes_cli.kanban_placement_diagnostics import portability
+ 
+     if not kp.linux_pool_gateway(gateway, cfg) or not live():
+-        if reason == "home gateway marker" and not _is_hub(gateway, cfg) and (hits := home_marker_hits(args, cfg)):
+-            remember(args, {"decision": "keep", "class": "gateway-test-failed", "hit": hits[0][1].group(0)})
++        if reason == "home gateway marker" and not _is_hub(gateway, cfg):
++            _untested(args, cfg)
+         return None
+     if portability(args, cfg, local_markers=False, home_markers=False)[0]:
+         return None
+diff --git a/hermes_cli/kanban_worker_placement.py b/hermes_cli/kanban_worker_placement.py
+index 2e5c3558c1..278b32a318 100644
+--- a/hermes_cli/kanban_worker_placement.py
++++ b/hermes_cli/kanban_worker_placement.py
+@@ -123,7 +123,11 @@ def queue_decision(args, cfg, gateway, pin, machine_ok=None):
+     from hermes_cli import kanban_placement_coordination as coordination
+ 
+     label = placement._Cfg(cfg).queue_label(gateway)
+-    if not label or pin not in ("", "auto") or args.get("runs_on") is not None:
++    if pin not in ("", "auto") or args.get("runs_on") is not None:
++        return None
++    if not label:
++        from hermes_cli.kanban_home_marker_placement import no_queue
++        no_queue(args, cfg, gateway)  # a pool worker's home-marker keep says why (gateway-test-failed)
+         return None
+     unmet = None
+     reason = placement.portable_reason(args, cfg)
+@@ -141,6 +145,10 @@ def queue_decision(args, cfg, gateway, pin, machine_ok=None):
+         return None
+     extra = coordination.required_labels(args, cfg)
+     if extra is None:
++        # Text every pool member's pickup gate refuses (a hermes-hub action portability's backtick-free text never
++        # saw): the card stays here, so a home-marker queue record becomes gateway-test-failed (t_01a1d73ba3627290).
++        from hermes_cli.kanban_home_marker_placement import unclaimable
++        unclaimable(args)
+         return None
+     if unmet is not None:
+         extra = extra | unmet["labels"]
+@@ -207,7 +215,9 @@ def creation_audit(args, cfg=None):
+         cfg = placement.config() if cfg is None else cfg
+         audit = {"portable_reason": placement.portable_reason(args, cfg), "placement_intent": intent}
+         from hermes_cli.kanban_home_marker_placement import recorded
+-        if (home := recorded(args)) is not None:  # how a pool worker resolved its home-marker hits
++        # How a pool worker resolved its home-marker hits. An explicit pin leaves placement unchanged, so it carries
++        # no record even when a front door simulated the auto placement first (t_01a1d773774908a6).
++        if not explicit and (home := recorded(args)) is not None:
+             audit["home_marker"] = home
+         return audit
+     except Exception:  # health: allow BLE001 -- an audit field never blocks a create
+diff --git a/tests/hermes_cli/test_kanban_pool_queue.py b/tests/hermes_cli/test_kanban_pool_queue.py
+index e78fedfcc2..95d0e61127 100644
+--- a/tests/hermes_cli/test_kanban_pool_queue.py
++++ b/tests/hermes_cli/test_kanban_pool_queue.py
+@@ -1450,3 +1450,77 @@ def test_tree_state_without_refresh_never_fetches(tmp_path, monkeypatch):
+     calls.clear()
+     assert kmp.tree_state([str(tree)]) is None  # the default refresh finds HEAD on the moved branch
+     assert "fetch" in [c for c, _ in calls], calls
++
++
++# --- the home_marker audit matches the stored placement (t_01a1db073fff0642) --------------------------------------
++# The 24 h live check of t_01a1d2856e5fec44 found worker-created cards whose created event said ``decision: queue``
++# while the card stayed local (runs_on NULL), or that a home hit kept with no key at all. One test per shape.
++PASS_KEEPS = {"a-this-host", "a-worktree", "a-artifact", "operator", "gateway-test-failed"}
++
++
++def _audit_matches(conn, tid):
++    """The created event's ``home_marker`` says what the store did: queue exactly when ``runs_on`` is set, and a keep
++    only with a class the live check accepts."""
++    marker, runs_on = _home_marker(conn, tid), _runs_on(conn, tid)
++    if marker is not None:
++        assert (marker["decision"] == "queue") == (runs_on is not None), (marker, runs_on)
++        assert marker["decision"] == "queue" or marker["class"] in PASS_KEEPS, marker
++    return marker
++
++
++def test_a_home_hit_whose_text_every_pickup_gate_refuses_is_recorded_as_kept(on_w2):
++    """t_01a1d73ba3627290 (worker-2): an ssh hit queues, but a backticked ``hermes-hub tasks`` action (portability
++    drops backtick spans; the pickup gate's text keeps them) makes ``required_labels`` None, so the card stays."""
++    out = _create(title="Capability owner: ssh:mini for mini/t_01a1d73b8cf9634f",
++                  body="1. Read the waiting card: `hermes-hub tasks --gw mini --json`.\n2. Use ssh to pull the log.")
++    assert _runs_on(on_w2.conn, out["task_id"]) is None, out
++    assert _audit_matches(on_w2.conn, out["task_id"]) == {
++        "decision": "keep", "class": "gateway-test-failed", "hit": "ssh"}
++
++
++@pytest.mark.parametrize("placement", ["local", "worker-2"])
++def test_an_explicit_local_pin_carries_no_home_marker(on_w2, placement):
++    """t_01a1d773774908a6 (worker-7, placement_intent explicit): the local-pin note simulated the auto placement
++    (a queue record), then the pin kept the card here. The rule leaves explicit placement alone: no key."""
++    out = _create(title="Activate the fix in ~/.hermes/plugins/ship-only-guard/__init__.py", placement=placement)
++    assert _runs_on(on_w2.conn, out["task_id"]) is None, out
++    created = _created(on_w2.conn, out["task_id"])
++    assert created["placement_intent"] == "explicit" and "home_marker" not in created, created
++
++
++def test_a_pool_worker_profile_without_a_worker_queue_records_its_home_keep(w2, monkeypatch):
++    """t_01a1d8146b9ef790 (worker-5, created_by bb-tuner): that profile's config has no ``kanban.placement``, so
++    ``queue_decision`` had no queue label and returned before any record: the home hit kept the card with no key."""
++    _on(monkeypatch, "worker-2", {}, _pool_machines())
++    out = _create(title="fix the hermes-sync drain")
++    assert _runs_on(w2.conn, out["task_id"]) is None, out
++    assert _created(w2.conn, out["task_id"])["portable_reason"] == "home gateway marker"
++    assert _audit_matches(w2.conn, out["task_id"]) == {
++        "decision": "keep", "class": "gateway-test-failed", "hit": "hermes-sync"}
++
++
++@pytest.mark.parametrize("gateway, title", [
++    ("macbook", "fix the hermes-sync drain"),  # not a Linux pool worker: no gateway test to fail
++    ("worker-2", "rotate the CI token in the Keychain, then fix the hermes-sync drain"),  # a local marker keeps it
++])
++def test_a_queueless_keep_is_recorded_only_for_a_pool_workers_home_hit(w2, monkeypatch, gateway, title):
++    _on(monkeypatch, gateway, {}, _pool_machines())
++    out = _create(title=title)
++    assert _runs_on(w2.conn, out["task_id"]) is None, out
++    assert "home_marker" not in _created(w2.conn, out["task_id"]), out
++
++
++def test_a_queueless_placement_outside_a_create_reads_no_registry(monkeypatch):
++    """Off a create there is nothing to record, so a gateway without a queue label pays no registry read."""
++    from hermes_cli import kanban_worker_placement as kwp
++    calls = []
++
++    def fetch():
++        calls.append(1)
++        return {"me": "worker-2", "machines": seen_now(_pool_machines().values())}
++    wn.set_registry_fetch(fetch)
++    try:
++        assert kwp.queue_decision({"title": "fix the hermes-sync drain"}, {}, "worker-2", "auto") is None
++    finally:
++        wn.set_registry_fetch(None)
++    assert calls == []
+-- 
+2.43.0
+

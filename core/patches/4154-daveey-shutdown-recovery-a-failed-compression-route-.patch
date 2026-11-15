@@ -1,0 +1,120 @@
+From aea933a8ac647531baea494d7059d3ccd985ebe1 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 05:18:34 +0000
+Subject: [PATCH] [daveey] shutdown recovery: a failed compression-route read
+ holds the chat's later spool rows
+
+Boot recovery (`_recover_one_payload`) called `deferred_transcript_route`
+outside the code that records `blocked_sessions`. A transient lineage-read
+exception for one cap-drop spool file reached only the per-file warning in
+`recover_pending_spool`, so a later file for the same chat (same source id
+or its compression continuation) replayed first and broke chronological
+custody.
+
+Fix: a route failure marks the spooled session blocked before re-raising,
+and the hold check matches any proven source of the route (ancestors and
+tip), not only the destination, because the failed read only knows the
+spooled id. Unrelated chats still progress; the held files stay byte-for-byte
+and the next pass replays all of them in order with no duplicate.
+
+Five whys: rows replayed out of order <- the second file was not held <-
+the failed file never entered blocked_sessions <- the route lookup sat
+before the try that records it, and the hold check keyed only on the
+destination id.
+
+Proof (tests/gateway/test_shutdown_route_order.py, real spool + SessionDB,
+later rows from the source, the compression tip, and both):
+- RED on origin/main source: 3/3 fail (later rows replayed past the held one)
+- GREEN: 3/3 pass; all 14 test files importing shutdown_flush plus
+  session_transcript suites: 164 passed; scripts/check --base origin/main ok.
+
+Finding from PR2753 exact-head review (review 5901769670). Card t_01a1d86c71bdb224.
+---
+ gateway/shutdown_flush.py                  | 12 +++--
+ tests/gateway/test_shutdown_route_order.py | 51 ++++++++++++++++++++++
+ 2 files changed, 59 insertions(+), 4 deletions(-)
+ create mode 100644 tests/gateway/test_shutdown_route_order.py
+
+diff --git a/gateway/shutdown_flush.py b/gateway/shutdown_flush.py
+index d8f9f2c86a..cb60860cf5 100644
+--- a/gateway/shutdown_flush.py
++++ b/gateway/shutdown_flush.py
+@@ -473,10 +473,14 @@ def _recover_one_payload(session_db, path: Path, payload: dict[str, Any], *,
+             logger.warning("Cannot recover structurally invalid transcript spool "
+                            "file %s; preserved for manual inspection", path)
+             return False
+-        target_sid, _sources = deferred_transcript_route(session_db, spooled_sid)
+-        if target_sid in blocked_sessions:
+-            # Ordering belongs to the destination conversation, not one physical spool segment.
+-            blocked_sessions[target_sid] += 1
++        try:
++            target_sid, sources = deferred_transcript_route(session_db, spooled_sid)
++        except Exception:  # health: allow BLE001 -- unknown lineage keeps custody, never a row rejection
++            blocked_sessions[spooled_sid] = blocked_sessions.get(spooled_sid, 0) + 1
++            raise
++        if sources.intersection(blocked_sessions):
++            # A failed lineage read may only know an ancestor's id. Hold its destination too.
++            blocked_sessions[target_sid] = blocked_sessions.get(target_sid, 0) + 1
+             return False
+         try:
+             replay_spooled_row(session_db, target_sid, message, fallback_ts=payload.get("ts"))
+diff --git a/tests/gateway/test_shutdown_route_order.py b/tests/gateway/test_shutdown_route_order.py
+new file mode 100644
+index 0000000000..2a0f0c62dd
+--- /dev/null
++++ b/tests/gateway/test_shutdown_route_order.py
+@@ -0,0 +1,51 @@
++"""Boot recovery retains chronological spool custody on transient lineage reads."""
++import sqlite3
++
++import pytest
++
++from gateway import shutdown_flush
++from tests.gateway import test_parked_passive_row_delivery as helpers
++
++parked = helpers.parked
++spool_home = helpers.spool_home
++
++
++@pytest.mark.parametrize('later_sources', [('s',), ('tip',), ('s', 'tip')])
++def test_route_read_failure_preserves_order(parked, spool_home, monkeypatch, later_sources):
++    db, _, row = parked
++    assert shutdown_flush.defer_row_for_parked_turn('s', {'role': 'user', 'content': 'first'})
++    helpers._resume(db, row)
++    db.publish_compression_child(parent_session_id='s', child_session_id='tip', source='test',
++                                 messages=[{'role': 'user', 'content': 'summary'}], require_compression_lease=False)
++    for index, sid in enumerate(later_sources):
++        assert shutdown_flush.defer_row_for_parked_turn(sid, {'role': 'user', 'content': f'later {index}'})
++    db.create_session('unrelated', source='test')
++    assert shutdown_flush.defer_row_for_parked_turn('unrelated', {'role': 'user', 'content': 'independent'})
++    before = db.get_messages('s')
++    preserved = {p: p.read_bytes() for p in helpers._spool_files()}
++    read = db._read_ctx
++    calls = []
++
++    def fail_once():
++        calls.append(True)
++        if len(calls) == 1:
++            raise sqlite3.OperationalError('transient lineage read failure')
++        return read()
++
++    with monkeypatch.context() as patcher:
++        patcher.setattr(db, '_read_ctx', fail_once)
++        recovered, blocked = shutdown_flush.recover_pending_spool(db)
++    assert recovered == 1
++    assert 's' in blocked
++    assert [m['content'] for m in db.get_messages('tip')] == ['summary']
++    assert [m['content'] for m in db.get_messages('unrelated')] == ['independent']
++    remaining = helpers._spool_files()
++    assert len(remaining) == 1 + len(later_sources)
++    assert all(p.read_bytes() == preserved[p] for p in remaining)
++    assert shutdown_flush.recover_pending_spool(db) == (1 + len(later_sources), set())
++    assert shutdown_flush.recover_pending_spool(db) == (0, set())
++    assert not helpers._spool_files()
++    assert db.get_messages('s') == before
++    assert [m['content'] for m in db.get_messages('tip')] == [
++        'summary', 'first', *(f'later {i}' for i in range(len(later_sources)))]
++    assert [m['content'] for m in db.get_messages('unrelated')] == ['independent']
+-- 
+2.43.0
+

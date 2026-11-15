@@ -1,0 +1,185 @@
+From 0942453d018ca02e0dfabacf30ca3f704e3ddfb6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:24:25 +0000
+Subject: [PATCH] [daveey] Route refused drawer comments to the registered card
+ owner
+
+Problem: a Desktop drawer opened on a replica receives foreign_card and
+shows worker-only instructions instead of posting the user's comment.
+Why: addComment routes only legacy no-profile hubTaskRefs; qualified
+profile/board writes correctly avoid that lossy courier but have no
+foreign-owner recovery. The backend refuses before any write and names
+created_on in its stable foreign_card refusal. Existing drawer tests cover
+an already-correct owner but not an opening connection holding a replica.
+
+Recover only that definite refusal, match this task ID, resolve the owner
+through the existing registered hub connection mapping, and retry once
+with the captured profile and board. Do not retry uncertain network errors,
+loop on the same connection, use an ambient profile or queue a second write.
+Unreachable owners get plain-language next steps; a failed owner attempt
+asks the user to check comments before retrying because its result may be
+uncertain. Structured decisions and their authorization are unchanged.
+
+Proof: new public addComment regressions fail on main (2 failures / 18
+passes); fixed tests plus retry-safety controls pass (28). All Kanban
+Desktop tests, tsc with 4GiB heap, affected eslint and scripts/check pass.
+The default 2GiB tsc heap exhausted memory; 4GiB completed successfully.
+Historical MacBook request route remains inferred, not directly recovered.
+---
+ .../src/plugins/kanban/api.gateways.test.ts   | 25 ++++++++++++
+ apps/desktop/src/plugins/kanban/api.ts        |  7 +++-
+ .../src/plugins/kanban/comment-route.test.ts  | 33 ++++++++++++++++
+ .../src/plugins/kanban/comment-route.ts       | 39 +++++++++++++++++++
+ 4 files changed, 102 insertions(+), 2 deletions(-)
+ create mode 100644 apps/desktop/src/plugins/kanban/comment-route.test.ts
+ create mode 100644 apps/desktop/src/plugins/kanban/comment-route.ts
+
+diff --git a/apps/desktop/src/plugins/kanban/api.gateways.test.ts b/apps/desktop/src/plugins/kanban/api.gateways.test.ts
+index 41f68c1728..bdf535a375 100644
+--- a/apps/desktop/src/plugins/kanban/api.gateways.test.ts
++++ b/apps/desktop/src/plugins/kanban/api.gateways.test.ts
+@@ -91,6 +91,31 @@ afterEach(() => {
+ })
+ 
+ describe('qualified task routes', () => {
++  it('routes a drawer foreign_card 409 to its owner without losing profile or board', async () => {
++    registry('local', 'hub')
++    await bind(({ path, opts }) => path.includes('/comments') && opts?.connectionId !== 'hub'
++      ? new Error('HTTP 409: {"detail":"foreign_card: t_drawer was created on hub and lives there; this gateway has only a replica copy. kanban_supervisor_request hub-comment"}')
++      : { ok: true })
++    calls = []
++    await expect(api.addComment('t_drawer', 'Already answered, here is more context', { gateway: 'local', profile: 'research', board: 'ops' })).resolves.toEqual({ ok: true })
++    expect(calls).toEqual([
++      { path: '/tasks/t_drawer/comments?board=ops', opts: { connectionId: 'local', profile: 'research', method: 'POST', body: { author: 'desktop', body: 'Already answered, here is more context' } } },
++      { path: '/tasks/t_drawer/comments?board=ops', opts: { connectionId: 'hub', profile: 'research', method: 'POST', body: { author: 'desktop', body: 'Already answered, here is more context' } } }
++    ])
++  })
++
++  it('explains an unreachable foreign owner without worker-only instructions', async () => {
++    registry('local')
++    await bind(({ path }) => path.includes('/comments')
++      ? new Error('HTTP 409: foreign_card: t_unreachable was created on worker-8 and lives there; kanban_supervisor_request hub-comment')
++      : { ok: true })
++    calls = []
++    const result = api.addComment('t_unreachable', 'context', { gateway: 'local', profile: 'default', board: 'default' })
++    await expect(result).rejects.toThrow('Your comment was not saved. Connect to that gateway')
++    await expect(result).rejects.not.toThrow(/kanban_supervisor_request|hub-comment/)
++    expect(calls).toHaveLength(1)
++  })
++
+   it('keeps the delayed dispatcher nudge on the immutable owner profile and board', async () => {
+     await bind(() => board({ ready: [] }))
+     const owner = { gateway: 'nudge-owner', profile: 'work', board: 'ops' }
+diff --git a/apps/desktop/src/plugins/kanban/api.ts b/apps/desktop/src/plugins/kanban/api.ts
+index 5d8217c350..1c01c872da 100644
+--- a/apps/desktop/src/plugins/kanban/api.ts
++++ b/apps/desktop/src/plugins/kanban/api.ts
+@@ -33,6 +33,7 @@ import {
+ } from '@hermes/plugin-sdk'
+ 
+ // Native completion notification.
++import { commentOnOwner } from './comment-route'
+ import {
+   bindCompletionNotify,
+   type CompletionEvent,
+@@ -1383,9 +1384,11 @@ export const addComment = (id: string, body: string, owner?: TaskOwner) => {
+     })
+   }
+ 
+-  const [path, opts] = forTask(id, `/tasks/${id}/comments`, {}, captured)
++  return commentOnOwner(id, captured, target => {
++    const [path, opts] = forTask(id, `/tasks/${id}/comments`, {}, target)
+ 
+-  return call(path, { ...opts, method: 'POST', body: { author: 'desktop', body } })
++    return call(path, { ...opts, method: 'POST', body: { author: 'desktop', body } })
++  })
+ }
+ 
+ export const reassignTask = (id: string, profile: string, owner?: TaskOwner) => {
+diff --git a/apps/desktop/src/plugins/kanban/comment-route.test.ts b/apps/desktop/src/plugins/kanban/comment-route.test.ts
+new file mode 100644
+index 0000000000..604dfd4a23
+--- /dev/null
++++ b/apps/desktop/src/plugins/kanban/comment-route.test.ts
+@@ -0,0 +1,33 @@
++import { describe, expect, it, vi } from 'vitest'
++
++vi.mock('@hermes/plugin-sdk', () => ({ connectionForHubGateway: (name: string) => name === 'hub' ? 'hub' : undefined }))
++
++const { commentOnOwner } = await import('./comment-route')
++const owner = { gateway: 'local', profile: 'research', board: 'ops' }
++const refused = new Error('HTTP 409: foreign_card: t_x was created on hub and lives there; kanban_supervisor_request hub-comment')
++
++describe('comment retry safety', () => {
++  it.each([undefined, { ...owner, profile: undefined }, { ...owner, board: '' }, { ...owner, gateway: 'hub' }])('refuses unsafe or looping identity %j', async target => {
++    const send = vi.fn().mockRejectedValue(refused)
++    await expect(commentOnOwner('t_x', target, send)).rejects.toThrow('Your comment was not saved')
++    expect(send).toHaveBeenCalledTimes(1)
++  })
++
++  it.each([new Error('timeout'), new Error('foreign_card: t_other was created on hub and lives there;')])('does not retry uncertain or mismatched failures %s', async error => {
++    const send = vi.fn().mockRejectedValue(error)
++    await expect(commentOnOwner('t_x', owner, send)).rejects.toBe(error)
++    expect(send).toHaveBeenCalledTimes(1)
++  })
++
++  it('never retries an uncertain owner write and tells the user to check first', async () => {
++    const send = vi.fn().mockRejectedValueOnce(refused).mockRejectedValueOnce(new Error('timeout'))
++    await expect(commentOnOwner('t_x', owner, send)).rejects.toThrow('check its comments before trying again')
++    expect(send).toHaveBeenCalledTimes(2)
++  })
++
++  it('does not echo malformed owner text or worker instructions', async () => {
++    const send = vi.fn().mockRejectedValue(new Error('foreign_card: t_x was created on kanban_supervisor_request(...)'))
++    await expect(commentOnOwner('t_x', owner, send)).rejects.toThrow('This card belongs to another gateway.')
++    expect(send).toHaveBeenCalledTimes(1)
++  })
++})
+diff --git a/apps/desktop/src/plugins/kanban/comment-route.ts b/apps/desktop/src/plugins/kanban/comment-route.ts
+new file mode 100644
+index 0000000000..ce3af8923b
+--- /dev/null
++++ b/apps/desktop/src/plugins/kanban/comment-route.ts
+@@ -0,0 +1,39 @@
++import { connectionForHubGateway } from '@hermes/plugin-sdk'
++
++import type { TaskOwner } from './api'
++
++/** A foreign-card refusal proves the first write did not happen. Never retry
++ * timeouts or other uncertain failures: comments have no replay key. */
++export async function commentOnOwner<T>(
++  id: string,
++  owner: TaskOwner | undefined,
++  send: (target: TaskOwner | undefined) => Promise<T>
++): Promise<T> {
++  try {
++    return await send(owner)
++  } catch (error) {
++    const message = error instanceof Error ? error.message : String(error)
++    const prefix = `foreign_card: ${id} was created on `
++    const start = message.indexOf(prefix)
++
++    if (start < 0) {
++      throw error
++    }
++
++    const ownerText = message.slice(start + prefix.length).split(' and lives there;')[0]
++    const gateway = /^[a-zA-Z0-9_-]+$/.test(ownerText) ? ownerText : 'another gateway'
++    const connection = gateway === 'another gateway' ? undefined : connectionForHubGateway(gateway)
++    const unavailable = `This card belongs to ${gateway}. Your comment was not saved. Connect to that gateway and open the card there to comment.`
++
++    if (!connection || !owner?.profile || !owner.board || connection === owner.gateway) {
++      throw new Error(unavailable, { cause: error })
++    }
++
++    try {
++      return await send({ ...owner, gateway: connection })
++    } catch (cause) {
++      // The owner's response can be uncertain. Do not queue or retry again.
++      throw new Error(`Could not confirm that ${gateway} saved your comment. Open the card on that gateway and check its comments before trying again.`, { cause })
++    }
++  }
++}
+-- 
+2.43.0
+

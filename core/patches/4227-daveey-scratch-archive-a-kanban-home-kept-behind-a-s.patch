@@ -1,0 +1,318 @@
+From 10ab6922270444bd0f9275b3c8f9f08c358fe592 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 09:06:55 -0800
+Subject: [PATCH] [daveey] scratch archive: a kanban home kept behind a symlink
+ no longer refuses every aged tree
+
+On mac-mini-1 `~/.hermes` is a symlink to `.alternate-hermes`, and every board row
+spells its workspace through it. The archiver's `_open_root` opened each path
+component `O_DIRECTORY|O_NOFOLLOW` from `/`, so the first component that was a
+link (`.hermes`) failed and each aged scratch tree that is not plain-removable
+was refused on every pass. The publish step's ancestor fsync and
+`remove_archived`'s receipt fsync had the same walk.
+
+`_canonical` replaces one prefix by its real location: the outermost ancestor
+that is, by device and inode, the kanban home or the parent of a
+`HERMES_KANBAN_WORKSPACES_ROOT` override (the anchors
+`_managed_scratch_path_info` already resolves for the same layout). The walk
+itself is unchanged: every component of the result is still opened without
+following links, so a workspace swapped for a link, a link below the home, a
+link back to the home from inside a workspace and a link on a path outside the
+home are refused as before.
+
+Five whys
+
+Problem: on 2026-11-13 14:50 PT the mini's daily `hermes kanban gc` logged
+`SCRATCH kanban gc board=default: removed 0 workspace(s)` while four done-card
+scratch trees 7.5 to 14.9 days past completion (896 MB) sat in
+`~/.hermes/kanban/workspaces`; the data volume was at 13-15 GB free against a
+15 GB floor.
+Why 1: the four trees passed every earlier guard and were refused by the
+archiver. Evidence: `~/.hermes/kanban/scratch-gc/refusals-default.json` holds,
+for each, `<path> is not a plain directory: NotADirectoryError(20, 'Not a
+directory')`, count 1, last 11-13 14:50.
+Why 2: `_scan` -> `_open_root` walks from `/` without following links and
+`~/.hermes` is a link. Evidence (read-only, on the mini):
+`_open_root('/Users/me/.hermes/kanban/workspaces/t_01a1cde0b29ba8f3')`
+raises ENOTDIR; the `.alternate-hermes` spelling opens.
+Why 3: the walk (ae54bbc60d, 11-12) treated every ancestor as untrusted,
+including the operator's own link to the home. It had no trusted anchor,
+although the managed-path check in `kanban_db_workspace` has one.
+Root (happened): the archive's path-safety rule had no notion of an
+operator-chosen prefix, so a supported home layout made every aged
+non-plain tree unarchivable on that host.
+Root (not caught): every archive test builds the home at a real path, so none
+spelled it through a link; and the refusal is an INFO line in agent.log (which
+rotates in under a day on the mini) while `hermes kanban gc` prints only its
+total, so the wrapper's log said `removed 0` with no reason.
+Recurrence: first time for this refusal (the archiver took symlink-holding
+trees from 11-12; the mini's first pass with it was 11-13). Same family as
+0542edee4b (`_override_temp_roots` rejecting a symlinked `~/.hermes`).
+Countermeasures:
+- symptom + root: `_canonical`, used by `_open_root` and the ancestor fsync.
+  proof: tests/hermes_cli/test_kanban_scratch_gc_symlinked_home.py, 7 tests;
+  5 fail on the base with the mini's exact error, the 2 strictness tests pass
+  on both. 20 related test files (527 tests) pass on macOS.
+- detection: keep reasons on the GC's stdout and in mac-worktree-gc.log is
+  card t_01a1db04a011bbc8 (decided spec in its body).
+- live: the mini's next aged tree (bb board, t_01a1bc23bf2b57a2, eligible
+  2026-11-15) is checked on card t_01a1dae91b78f665.
+---
+ hermes_cli/kanban_scratch_archive.py          |  67 +++++++-
+ .../test_kanban_scratch_gc_symlinked_home.py  | 158 ++++++++++++++++++
+ 2 files changed, 222 insertions(+), 3 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_scratch_gc_symlinked_home.py
+
+diff --git a/hermes_cli/kanban_scratch_archive.py b/hermes_cli/kanban_scratch_archive.py
+index 2db2f78d38..cc874527ec 100644
+--- a/hermes_cli/kanban_scratch_archive.py
++++ b/hermes_cli/kanban_scratch_archive.py
+@@ -453,9 +453,69 @@ def _signature(st: os.stat_result) -> list[int]:
+ _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+ 
+ 
++def _trusted_anchors() -> list[Path]:
++    """Directories an operator may keep behind a symlink: the kanban home and the parent of a
++    ``HERMES_KANBAN_WORKSPACES_ROOT`` override (the anchors
++    ``kanban_db_workspace._managed_scratch_path_info`` resolves for the same reason)."""
++    from hermes_cli import kanban_db as kb
++
++    anchors = []
++    override = os.environ.get("HERMES_KANBAN_WORKSPACES_ROOT", "").strip()
++    try:
++        if override:
++            anchors.append(Path(override).expanduser().parent)
++        anchors.append(kb.kanban_home())
++    except (OSError, RuntimeError, ValueError):
++        pass  # no anchor: every path is walked as spelled (fail closed)
++    return anchors
++
++
++def _canonical(path: Path) -> Path:
++    """*path* with a symlinked kanban home replaced by the home's real location.
++
++    An operator may keep the Hermes home behind a link (``~/.hermes -> .alternate-hermes``).
++    Tasks then spell their workspace through it, and a no-follow walk from ``/``
++    refused every aged tree on that host forever. Only that one prefix is
++    resolved: the outermost ancestor of *path* that IS a trusted anchor (same
++    device and inode). The caller still walks the result without following links,
++    so a link below the home, or on a path that is not below it, is refused as
++    before. A relative path, one with ``..`` or one that cannot be judged is
++    returned as spelled.
++    """
++    path = Path(path)
++    if not path.is_absolute() or ".." in path.parts:
++        return path
++    anchors = set()
++    for anchor in _trusted_anchors():
++        try:
++            st = os.stat(anchor)
++        except OSError:
++            continue
++        if stat.S_ISDIR(st.st_mode):
++            anchors.add((st.st_dev, st.st_ino))
++    if not anchors:
++        return path
++    for ancestor in (*reversed(path.parents), path):  # outermost first
++        try:
++            st = os.stat(ancestor)
++            if (st.st_dev, st.st_ino) not in anchors:
++                continue
++            real = Path(os.path.realpath(ancestor))
++            rst = os.stat(real)
++        except OSError:
++            return path
++        if (rst.st_dev, rst.st_ino) != (st.st_dev, st.st_ino):
++            return path  # the link moved while it was read
++        return real.joinpath(*path.parts[len(ancestor.parts):])
++    return path
++
++
+ def _open_root(root: Path) -> int:
+-    """Anchor at / (or cwd), opening every path component without following links."""
+-    root = Path(root)
++    """Anchor at / (or cwd), opening every path component without following links.
++
++    The one exception is the operator's own link to the kanban home, which
++    :func:`_canonical` replaces by its real location before the walk."""
++    root = _canonical(Path(root))
+     fd = os.open(root.anchor or ".", _DIR_FLAGS)
+     try:
+         for part in root.parts[1:] if root.is_absolute() else root.parts:
+@@ -872,7 +932,8 @@ def archive_workspace(workspace: Path, archive_dir: Path, *, task_id: str,
+             # Persist every ancestor entry, not just the published name. Existing
+             # directories may come from an interrupted prior attempt whose mkdir
+             # was never flushed, so existence cannot serve as a durability fence.
+-            for parent in final.absolute().parents:
++            # Through _canonical: a home kept behind a link is flushed at its real location.
++            for parent in _canonical(final.absolute()).parents:
+                 _fsync_path(parent, directory=True)
+         except BaseException:
+             shutil.rmtree(final, ignore_errors=True)
+diff --git a/tests/hermes_cli/test_kanban_scratch_gc_symlinked_home.py b/tests/hermes_cli/test_kanban_scratch_gc_symlinked_home.py
+new file mode 100644
+index 0000000000..028a9c2c0a
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_scratch_gc_symlinked_home.py
+@@ -0,0 +1,158 @@
++"""Aged scratch is archived when the kanban home is reached through a symlink. [daveey]
++
++mac-mini-1 (2026-11-13): ``~/.hermes`` is a symlink to ``.alternate-hermes`` and every board
++row spells its workspace through it. The archiver opened every path component
++``O_NOFOLLOW`` from ``/``, so each aged tree was refused with ``... is not a plain
++directory: NotADirectoryError(20, 'Not a directory')`` on every pass and done-card
++scratch stayed on disk past retention. The operator's own link to the home is
++resolved once; everything below the home is still opened without following links.
++"""
++import os
++from pathlib import Path
++
++import psutil
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_scratch_archive as sa
++from hermes_cli import kanban_scratch_backoff as bo
++from tests.hermes_cli import test_kanban_scratch_gc_archive as helpers
++from tests.hermes_cli.test_kanban_scratch_gc_archive import _archive, _events, _gc, _plain_task, _task
++
++
++@pytest.fixture
++def linked_home(tmp_path, monkeypatch):
++    """The mini's layout: the home is a relative symlink, and the process spells it through the link."""
++    monkeypatch.setattr(psutil, "process_iter", lambda *args, **kwargs: iter(()))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    real = tmp_path / "real-hermes"
++    real.mkdir()
++    link = tmp_path / "hermes"
++    link.symlink_to(real.name)
++    monkeypatch.setenv("HERMES_HOME", str(link))
++    for name in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_WORKSPACES_ROOT", "HERMES_KANBAN_HOME"):
++        monkeypatch.delenv(name, raising=False)
++    assert kb.kanban_home() == link and kb.workspaces_root().is_relative_to(link)
++    return link, real
++
++
++@pytest.fixture
++def remote(tmp_path):
++    return helpers._seed_remote(tmp_path)
++
++
++def _refusals():
++    try:
++        return bo.Refusals("default").entries
++    except OSError:
++        return {}
++
++
++def test_non_git_symlink_tree_under_a_symlinked_home_is_archived_then_removed(linked_home):
++    # The shape of three of the mini's trees: no repo, a venv's bin/python symlinks.
++    tid, path = _plain_task(lambda p: ((p / "venv" / "bin").mkdir(parents=True),
++                                       (p / "venv" / "bin" / "python").symlink_to("/usr/bin/python3")))
++    link, real = linked_home
++    assert path.is_relative_to(link) and not path.is_relative_to(real)  # spelled through the link, as on the mini
++
++    assert _gc() == 0
++
++    assert not path.exists()
++    assert _refusals() == {}
++    sa.verify_complete_archive(_archive(tid))
++    kinds = [kind for kind, _payload in _events(tid)]
++    assert "workspace_archived" in kinds
++
++
++def test_git_clone_under_a_symlinked_home_is_archived_then_removed(linked_home, remote):
++    tid, path = _task(remote=remote)
++
++    assert _gc() == 0
++
++    assert not path.exists()
++    assert _refusals() == {}
++    assert (_archive(tid) / "repo" / "meta.json").is_file()
++    sa.verify_complete_archive(_archive(tid))
++
++
++def test_workspaces_root_override_under_a_symlinked_parent_is_archived(linked_home, tmp_path, monkeypatch):
++    real_store = tmp_path / "real-store"
++    (real_store / "ws").mkdir(parents=True)
++    (tmp_path / "store").symlink_to(real_store.name)
++    monkeypatch.setenv("HERMES_KANBAN_WORKSPACES_ROOT", str(tmp_path / "store" / "ws"))
++    tid, path = _plain_task(lambda p: None)
++    assert path.is_relative_to(tmp_path / "store")
++
++    assert _gc() == 0
++
++    assert not path.exists()
++    sa.verify_complete_archive(_archive(tid))
++
++
++def test_links_below_the_home_are_still_refused(linked_home, tmp_path):
++    link, real = linked_home
++    root = kb.workspaces_root()
++    root.mkdir(parents=True, exist_ok=True)
++    outside = tmp_path / "outside"
++    (outside / "d").mkdir(parents=True)
++    (outside / "d" / "secret.txt").write_text("must not be read")
++
++    # A workspace swapped for a link, and a directory reached through one.
++    (root / "swapped").symlink_to(outside)
++    for bad in (root / "swapped", root / "swapped" / "d"):
++        with pytest.raises(sa.ArchiveRefused):
++            sa._scan(bad)
++
++    # A link back to the home from inside a workspace is no second way in: only the
++    # outermost spelling of the home is resolved, the rest is opened without following.
++    inside = root / "t_inside"
++    inside.mkdir()
++    (inside / "evil").symlink_to(link)
++    with pytest.raises(sa.ArchiveRefused):
++        sa._scan(inside / "evil" / "kanban" / "workspaces" / "t_inside")
++
++    # The managed components themselves are not resolved either.
++    relocated = tmp_path / "relocated-workspaces"
++    (relocated / "t_moved").mkdir(parents=True)
++    board_dir = real / "kanban" / "boards" / "other"
++    board_dir.mkdir(parents=True)
++    (board_dir / "workspaces").symlink_to(relocated)
++    with pytest.raises(sa.ArchiveRefused):
++        sa._scan(link / "kanban" / "boards" / "other" / "workspaces" / "t_moved")
++
++
++def test_a_link_that_is_not_the_home_is_still_refused(linked_home, tmp_path):
++    real_dir = tmp_path / "elsewhere"
++    (real_dir / "d").mkdir(parents=True)
++    (tmp_path / "alias").symlink_to(real_dir)
++    for bad in (tmp_path / "alias", tmp_path / "alias" / "d"):
++        with pytest.raises(sa.ArchiveRefused):
++            sa._scan(bad)
++    with pytest.raises(sa.ArchiveRefused):
++        sa._scan(real_dir / "d" / ".." / "d")  # parent traversal stays refused, never collapsed
++
++
++def test_canonical_resolves_only_the_home_prefix(linked_home, tmp_path):
++    link, real = linked_home
++    real = Path(os.path.realpath(real))
++    tail = Path("kanban") / "workspaces" / "t_x" / "deep"
++    assert sa._canonical(link / tail) == real / tail
++    assert sa._canonical(real / tail) == real / tail
++    assert sa._canonical(link) == real
++    # Not below the home: returned as spelled, so the no-follow walk still refuses any link in it.
++    (tmp_path / "elsewhere").mkdir()
++    (tmp_path / "alias").symlink_to(tmp_path / "elsewhere")
++    other = tmp_path / "alias" / "x"
++    assert sa._canonical(other) == other
++    assert sa._canonical(Path("relative") / "path") == Path("relative") / "path"
++
++
++def test_scan_reads_the_same_tree_through_either_spelling(linked_home):
++    link, real = linked_home
++    tree = link / "kanban" / "workspaces" / "t_same"
++    (tree / "sub").mkdir(parents=True)
++    (tree / "sub" / "f.txt").write_text("x")
++    through_link = sa._scan(tree)
++    through_real = sa._scan(real / "kanban" / "workspaces" / "t_same")
++    assert set(through_link) == {".", "sub", "sub/f.txt"} == set(through_real)
++    assert through_link["sub/f.txt"].st_ino == through_real["sub/f.txt"].st_ino
+-- 
+2.43.0
+

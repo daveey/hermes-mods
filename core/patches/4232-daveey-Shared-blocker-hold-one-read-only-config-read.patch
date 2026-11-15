@@ -1,0 +1,123 @@
+From bcf81994839947394a7391762271b3b457ee9620 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 17:19:17 +0000
+Subject: [PATCH] [daveey] Shared-blocker hold: one read-only config read per
+ decision
+
+`_shared_blocker_hold` called `registered_checks()` and
+`probe_interval_seconds()` with no config, so each held candidate paid two
+deepcopying `load_config()` calls (~2.3 ms each). Both only read the config.
+The hold now reads it once through `kanban_blocker_inputs.config()` (the
+pass snapshot inside an input pass, `load_config_readonly()` outside) and
+passes it to both. A failed read passes `None`, so each reader falls back to
+its own load and failure handling exactly as before.
+
+Measured (t_01a1db05f673844f, worker-3): cProfile of `blocker_states()` +
+one `shared_blocker_guard()` per candidate, 5 rounds, scratch copy of the
+worker-3 board with 3 open walls / 18 cards behind / 38 candidates:
+- before (main aeac57d2c9): total 2.97-3.06 s; all config loading
+  (`_load_config_impl` cum) 0.65-0.67 s = ~22%; `load_config()` 180 calls
+  0.42 s (registered_checks 90 / 0.21 s, probe_interval_seconds 90 / 0.21 s).
+- after: total 2.55-2.59 s; all config loading 0.26 s = ~10%; zero
+  `load_config()` calls on the guard path.
+Hold decisions for all 38 candidates at now/+600/+1800/+7200 s are
+byte-identical before and after.
+
+Tests: the existing seams that patch `hermes_cli.config.load_config`
+(livelock L53/L116, checks L217) are unmodified and green: L217 calls
+`registered_checks()` directly (unchanged default path), and the livelock
+tests' patched checks only matter for membership of the builtin
+github-rest-quota wall, which the read-only config also registers.
+New test_hold_decision_reads_config_once_without_deepcopy fails on main
+(probe interval received `None`, i.e. its own deepcopy load) and passes here.
+---
+ hermes_cli/kanban_shared_blockers.py          | 19 +++++++++++--
+ .../test_kanban_blocker_input_config.py       | 28 +++++++++++++++++++
+ 2 files changed, 45 insertions(+), 2 deletions(-)
+
+diff --git a/hermes_cli/kanban_shared_blockers.py b/hermes_cli/kanban_shared_blockers.py
+index e76f210412..e87309dda2 100644
+--- a/hermes_cli/kanban_shared_blockers.py
++++ b/hermes_cli/kanban_shared_blockers.py
+@@ -578,7 +578,8 @@ def _shared_blocker_hold(conn, task_id, *, now=None, interval=None) -> Optional[
+     if st is None or not st.is_open or not task_applies(conn, st, task_id):
+         return None
+     from hermes_cli.kanban_shared_blocker_checks import registered_checks
+-    if st.blocker_id in registered_checks() and _operator_released(conn, task_id, st.blocker_id):
++    cfg = _hold_config()
++    if st.blocker_id in registered_checks(cfg) and _operator_released(conn, task_id, st.blocker_id):
+         # This wall has an independent dispatcher probe. A peer's long run or
+         # reassertion cannot revoke the operator's explicit release of this card.
+         # The dispatcher's own releases earn no such exemption (_operator_released).
+@@ -594,7 +595,7 @@ def _shared_blocker_hold(conn, task_id, *, now=None, interval=None) -> Optional[
+     if _released_as_probe(conn, st, task_id):
+         return None
+     if interval is None:
+-        interval = probe_interval_seconds()
++        interval = probe_interval_seconds(cfg)
+     last = max(st.probe_starts.values(), default=min(st.behind.values()))
+     if now - last >= interval:
+         return None
+@@ -604,6 +605,20 @@ def _shared_blocker_hold(conn, task_id, *, now=None, interval=None) -> Optional[
+     return st.blocker_id, None, last + interval
+ 
+ 
++def _hold_config() -> Optional[dict]:
++    """One read-only config read per hold decision, shared by the checks lookup and the probe interval.
++
++    Both only read it; a deepcopying ``load_config()`` each cost ~2 ms per held candidate. ``None`` when the
++    backend is unavailable, so each reader falls back to its own load and handling as before; any other
++    error propagates, as it did from ``registered_checks()``'s own load. [daveey]"""
++    from hermes_cli.config_backend import ConfigBackendUnavailable
++    from hermes_cli.kanban_blocker_inputs import config
++    try:
++        return config()
++    except ConfigBackendUnavailable:
++        return None
++
++
+ def _released_as_probe(conn: sqlite3.Connection, st: BlockerState, task_id: str) -> bool:
+     """True when ``task_id`` was named the probe for ``st`` (a :data:`PROBE_RELEASED_EVENT` for it) at or after
+     the run that put it behind ``st``, and has not started a run since: the release is spent by one run. The CI
+diff --git a/tests/hermes_cli/test_kanban_blocker_input_config.py b/tests/hermes_cli/test_kanban_blocker_input_config.py
+index 15a02089ca..5348f790e6 100644
+--- a/tests/hermes_cli/test_kanban_blocker_input_config.py
++++ b/tests/hermes_cli/test_kanban_blocker_input_config.py
+@@ -101,6 +101,34 @@ def test_unavailable_config_is_not_retained(kanban_home, monkeypatch):
+     exercise()
+ 
+ 
++def test_hold_decision_reads_config_once_without_deepcopy(kanban_home, monkeypatch):
++    """The checks lookup and probe interval each deepcopied ``load_config()`` per held candidate (~14% of guard time)."""
++    from hermes_cli import config
++    deep = []
++    with kbc.connect_closing() as conn:
++        tids = [helpers._legacy_blocked_behind(conn, f'wall {i}', blocker_id='test-wall') for i in range(2)]
++        st = blockers.blocker_states(conn)['test-wall']
++        real_deep = config.load_config
++        monkeypatch.setattr(config, 'load_config', lambda: deep.append(1) or real_deep())
++        cfg = {'kanban': {'shared_blocker_checks': {'test-wall': 'exit 1'}}}
++        calls = _counting_config(monkeypatch, cfg)
++        seen = []   # the fixture pins the interval; record which config reached it
++        monkeypatch.setattr(blockers, 'probe_interval_seconds', lambda c=None: seen.append(c) or 777)
++        bid, sibling, due = blockers._shared_blocker_hold(conn, tids[1], now=min(st.behind.values()) + 1)
++        assert (bid, sibling, due) == ('test-wall', None, min(st.behind.values()) + 777)
++        assert seen == [cfg] and seen[0] is cfg and not deep
++        # The checks lookup saw the same read: a registered wall honours this card's own release
++        # even while a sibling's probe runs; an unregistered one keeps it behind that probe.
++        assert helpers.kb.unblock_task(conn, tids[0]) and helpers.kb.claim_task(conn, tids[0])
++        assert helpers.kb.unblock_task(conn, tids[1])
++        deep.clear()
++        later = min(st.behind.values()) + 2
++        assert blockers._shared_blocker_hold(conn, tids[1], now=later) is None
++        _counting_config(monkeypatch, {'kanban': {'shared_blocker_probe_seconds': 777}})
++        assert blockers._shared_blocker_hold(conn, tids[1], now=later) == ('test-wall', tids[0], 0)
++        assert not deep and calls
++
++
+ def test_non_mapping_kanban_section_does_not_crash_derivation(kanban_home, monkeypatch):
+     """A scalar/list ``kanban`` section is fail-closed config, not a crash in the identity read."""
+     for section in ('oops', [1, 2], 7):
+-- 
+2.43.0
+

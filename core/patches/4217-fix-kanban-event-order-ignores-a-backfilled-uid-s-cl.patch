@@ -1,0 +1,164 @@
+From 6b75e232c900c8c6aede9651fc8d276defa2ce54 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 17:00:46 +0000
+Subject: [PATCH] fix(kanban): event order ignores a backfilled uid's clock
+ [daveey]
+
+`kanban_sync_divergence._event_order` (also the terminal guard's
+`terminal_hold` order) ordered same-second events by any UUIDv7 uid's
+milliseconds. `kanban_db_sync` backfills uid-less rows with a v7 stamped
+at backfill time, so a backfilled row sorted last in its second instead
+of falling back to arrival (local id) order, and could misorder a
+terminal vs reopen event of that second.
+
+It now routes through `consistent_uid_milliseconds(uid, created_at)`
+(PR #3010): a uid is trusted only when its ms fall in the row's own
+second, else the ms key is created_at*1000 and the id decides, the same
+rule `kanban_shared_blockers._event_order` uses.
+
+Follow-up from review of PR #3010 (review 5905718508, nit 1);
+card t_01a1dad6b27ce69d.
+
+Proof:
+- RED on fa6ec16e2e: the new terminal_hold tests (backfilled uid on the
+  earlier-id completed/reopened event, both kinds) and the
+  _event_order unit tests fail (4 failed).
+- GREEN: every tests/hermes_cli file importing kanban_sync_divergence,
+  kanban_terminal_guard or kanban_shared_blocker*: 37 files, 930 passed.
+- Replay over this worker's real boards (798 DBs, read-only, 17,386
+  tasks): terminal_hold result changed for 0 tasks; 126,019 v7 uids sit
+  outside their row's second and are now ignored for ordering.
+- scripts/check --only health: ok.
+---
+ hermes_cli/kanban_sync_divergence.py          | 16 ++++------
+ hermes_cli/kanban_terminal_guard.py           |  6 ++--
+ .../test_kanban_stale_wake_terminal.py        | 32 +++++++++++++++++++
+ .../test_kanban_sync_running_heal.py          | 17 ++++++++--
+ 4 files changed, 57 insertions(+), 14 deletions(-)
+
+diff --git a/hermes_cli/kanban_sync_divergence.py b/hermes_cli/kanban_sync_divergence.py
+index 22ae5ca583..1760f9fe88 100644
+--- a/hermes_cli/kanban_sync_divergence.py
++++ b/hermes_cli/kanban_sync_divergence.py
+@@ -7,6 +7,7 @@ import sqlite3
+ import time
+ from pathlib import Path
+ from hermes_cli import kanban_db_sync as sync
++from hermes_cli.kanban_shared_blocker_fence import consistent_uid_milliseconds
+ 
+ _log = logging.getLogger(__name__)
+ _CHUNK = 500
+@@ -225,15 +226,12 @@ def _event_order(event: dict) -> tuple[int, int, int]:
+     The local id is arrival order: the Board can deliver an ``unblocked`` before the ``blocked`` it follows, and
+     both carry the same second. Every synced event's uid is a UUIDv7 minted at its insert on its own gateway, so
+     its 48-bit millisecond orders the two. A row with no uid (sync off, or written while the triggers were down)
+-    falls back to arrival order, and so does a uid that is not a v7 (its leading bits are random, not time)."""
+-    ms = 0
+-    uid = event.get("uid")
+-    if isinstance(uid, str) and len(uid) >= 15 and uid[14] == "7":
+-        try:
+-            ms = int(uid[:8] + uid[9:13], 16)
+-        except ValueError:
+-            ms = 0
+-    return int(event["created_at"] or 0), ms, int(event["id"])
++    falls back to arrival order, and so does a uid that is not a v7 (its leading bits are random, not time) or a
++    v7 outside the row's own second: ``kanban_db_sync`` backfills uid-less rows with a v7 stamped at backfill time.
++    """
++    second = int(event["created_at"] or 0)
++    ms = consistent_uid_milliseconds(event.get("uid"), second)
++    return second, second * 1000 if ms is None else ms, int(event["id"])
+ 
+ 
+ def _payload(event: dict) -> dict:
+diff --git a/hermes_cli/kanban_terminal_guard.py b/hermes_cli/kanban_terminal_guard.py
+index e8298fa988..8d9a48756e 100644
+--- a/hermes_cli/kanban_terminal_guard.py
++++ b/hermes_cli/kanban_terminal_guard.py
+@@ -2,9 +2,9 @@
+ 
+ Invariant: a card whose latest terminal event (``completed``, ``archived``, or a ``status``/``status_healed`` move
+ to ``done``/``archived``) has no reopen ordered after it (``reopened``, ``unblocked``, ``review_reopened``,
+-``promoted_manual``, or a ``status`` move to a live status), in origin order (``_event_order``: second, UUIDv7 ms,
+-then id), stays terminal. A wake (``continuation_woken``, ``condition_met``, ``promoted``, ``wake_check_*``) is
+-never a reopen, whatever order it was minted or delivered in.
++``promoted_manual``, or a ``status`` move to a live status), in origin order (``_event_order``: second, UUIDv7 ms
++when the uid was minted in that second, then id), stays terminal. A wake (``continuation_woken``,
++``condition_met``, ``promoted``, ``wake_check_*``) is never a reopen, whatever order it was minted or delivered in.
+ 
+ Why: a wake minted against a stale copy of the card carries ``status=ready``. Two producers made one in Nov 2026:
+ a MacBook whose pull was hours behind fired a clock wake for a card a worker had completed meanwhile (pushed 5 h
+diff --git a/tests/hermes_cli/test_kanban_stale_wake_terminal.py b/tests/hermes_cli/test_kanban_stale_wake_terminal.py
+index 79cd645d52..8dbeb2eed1 100644
+--- a/tests/hermes_cli/test_kanban_stale_wake_terminal.py
++++ b/tests/hermes_cli/test_kanban_stale_wake_terminal.py
+@@ -471,6 +471,38 @@ def test_terminal_hold_orders_by_origin_not_by_arrival():
+     assert ktg.terminal_hold(conn, "t")["id"] == 4
+ 
+ 
++def _v7_at(ms: int) -> str:
++    stamp = f"{ms:012x}"
++    return f"{stamp[:8]}-{stamp[8:]}-7abc-8def-0123456789ab"
++
++
++@pytest.mark.parametrize("first,second,held", [("completed", "reopened", None), ("reopened", "completed", 2)])
++def test_terminal_hold_does_not_trust_a_backfilled_uid_clock(first, second, held):
++    """``kanban_db_sync`` backfills a uid-less row with a v7 uid stamped at backfill time (here second 900 for a row
++    of second 500). Its milliseconds are not event time, so two events of one second fall back to arrival order."""
++    import sqlite3
++    conn = sqlite3.connect(":memory:")
++    conn.row_factory = sqlite3.Row
++    conn.execute("CREATE TABLE task_events (id INTEGER PRIMARY KEY, uid TEXT, task_id TEXT, kind TEXT, payload TEXT, "
++                 "created_at INTEGER)")
++    conn.execute("INSERT INTO task_events VALUES (1, ?, 't', ?, '{}', 500)", (_v7_at(900_123), first))
++    conn.execute("INSERT INTO task_events VALUES (2, NULL, 't', ?, '{}', 500)", (second,))
++    hold = ktg.terminal_hold(conn, "t")
++    assert (hold and hold["id"]) == held
++
++
++def test_terminal_hold_still_orders_one_second_by_a_consistent_uid_clock():
++    """A uid minted in the row's own second is event time: the later-minted reopen wins although it arrived first."""
++    import sqlite3
++    conn = sqlite3.connect(":memory:")
++    conn.row_factory = sqlite3.Row
++    conn.execute("CREATE TABLE task_events (id INTEGER PRIMARY KEY, uid TEXT, task_id TEXT, kind TEXT, payload TEXT, "
++                 "created_at INTEGER)")
++    conn.execute("INSERT INTO task_events VALUES (1, ?, 't', 'reopened', '{}', 500)", (_v7_at(500_700),))
++    conn.execute("INSERT INTO task_events VALUES (2, ?, 't', 'completed', '{}', 500)", (_v7_at(500_200),))
++    assert ktg.terminal_hold(conn, "t") is None
++
++
+ # --- unblock_task: ``unblocked`` is a reopen, and its automated callers act on the local row -----------------------
+ # PR #1958 review 5889419180 nit 1: a stale copy of a done card, auto-unblocked by the shared-blocker clear/probe,
+ # the quota release or a ``resolved_check``, went ``ready`` and wrote ``unblocked``, which both guards (here and
+diff --git a/tests/hermes_cli/test_kanban_sync_running_heal.py b/tests/hermes_cli/test_kanban_sync_running_heal.py
+index 89554eb453..d78e78859e 100644
+--- a/tests/hermes_cli/test_kanban_sync_running_heal.py
++++ b/tests/hermes_cli/test_kanban_sync_running_heal.py
+@@ -213,9 +213,22 @@ def test_a_restored_ask_with_a_resolved_check_gets_its_probe_row(live, kanban_ho
+ def test_a_non_v7_uid_does_not_reorder_same_second_events():
+     from hermes_cli.kanban_sync_divergence import _event_order
+     v4 = "f47ac10b-58cc-4372-a567-0e02b2c3d479"
+-    assert _event_order({"created_at": 100, "id": 5, "uid": v4}) == (100, 0, 5)
++    assert _event_order({"created_at": 100, "id": 5, "uid": v4}) == (100, 100_000, 5)
++    assert _event_order({"created_at": 100, "id": 5, "uid": None}) == (100, 100_000, 5)
+     v7 = "01a1cf86-8673-7c4f-883e-0f361585d8e4"
+-    assert _event_order({"created_at": 100, "id": 5, "uid": v7})[1] == 0x01a1cf868673
++    own_second = 0x01a1cf868673 // 1000
++    assert _event_order({"created_at": own_second, "id": 5, "uid": v7})[1] == 0x01a1cf868673
++
++
++def test_a_backfilled_v7_uid_does_not_reorder_same_second_events():
++    """``kanban_db_sync`` backfills uid-less rows with a v7 uid stamped at backfill time: a uid whose second is not
++    the row's own is not event time, so the earlier-arrived row stays first even though its uid is later."""
++    from hermes_cli.kanban_sync_divergence import _event_order
++    backfilled = "01a1cf86-8673-7c4f-883e-0f361585d8e4"  # minted in a later second than the row's 100
++    first = {"created_at": 100, "id": 5, "uid": backfilled}
++    second = {"created_at": 100, "id": 6, "uid": None}
++    assert _event_order(first) == (100, 100_000, 5)
++    assert max((first, second), key=_event_order) is second
+ 
+ 
+ @pytest.mark.parametrize("unblock_later_ms,expected", [(5, "todo"), (-5, "blocked")])
+-- 
+2.43.0
+

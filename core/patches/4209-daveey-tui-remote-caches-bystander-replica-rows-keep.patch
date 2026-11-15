@@ -1,0 +1,856 @@
+From 97006c3daa5f7d9af03b54f454ede48b6e45f478 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 16:27:49 +0000
+Subject: [PATCH] [daveey] tui remote caches: bystander replica rows keep no
+ cards
+
+On the mini the hub replica holds 18,635 task rows from 11 gateways, 87 MB of JSON. The serve retained a decoded
+projection of every row: the sweep projection `_rows`, `_sweep_memo`, the observation flights (`_retained`),
+`_memo` and `_known`. Together that was about 45 MB of the 890 MB replay footprint. Only a row linked to this
+gateway can produce a card, a notice or an observation that it reads.
+
+A row is held compact when all of the following are true: `hermes_cli.kanban_replica_relevance.is_bystander`
+(imported, not copied) says it is a bystander; `_linked_chats(task, me)` is empty, which also covers
+`withdrawal_recipients`; its seq is an int; its owner has no '/'; and it has a status. If in doubt (a duplicate
+ref, a hash collision, a malformed row), the row keeps its full form.
+
+- remote_sweep_projection: `_rows` is `{ref: "seq\0state" | (seq, cards, entry)}` and is mutated in place per
+  scope. `states` is one live `StatesView` Mapping per scope. It is updated by the rows that changed, and is not
+  rebuilt on every call. A compact row reads as `(state, CompactTask)`. A compact row whose legacy
+  `<board>/<id>` twin appears is read again in the same snapshot. Payload SQL is unchanged and paged in one
+  snapshot (#2409).
+- `_settle_stale_claims`: for a compact row it reads the sessions back with a seq-checked point read
+  (`CompactTask.load`). If the row moved, it waits one pass.
+- observations: compact rows live in per-flight sorted `array('q')` columns of hash/seq/state-hash
+  (kanban_remote_observation_compact). Their terminal states are still written to the ledger in the same
+  transaction, under main's `first_seen` rule. They never enter decoded, Observed, `_memo` or `_known`.
+  `_known` is pruned to the current cards' states. A second ledger path turns the lane off. A replaced ledger
+  file triggers a re-read.
+
+Proof: tests/tui_gateway/test_remote_projection_bystander_memory.py (5 tests).
+- On main, all 5 are RED. (a) retains 1,275 bytes per bystander row. (c) gets main's settlement (profile from
+  the read-back sessions) and fails only on its compact check.
+- On this branch, all 5 are GREEN: below 300 B/row, and no bystander payload text is reachable from the five
+  roots.
+- 49 test files that import the changed modules (every tui_gateway remote/replica suite, including
+  test_remote_index_projection_memory and test_replica_bounded_reads): 699 passed. No existing assertion was
+  edited.
+- `scripts/check --base origin/main` passes.
+---
+ ...test_remote_projection_bystander_memory.py | 219 ++++++++++++++++++
+ tui_gateway/kanban_remote_notices.py          |   9 +-
+ .../kanban_remote_observation_compact.py      | 128 ++++++++++
+ tui_gateway/kanban_remote_observations.py     |  56 +++--
+ tui_gateway/remote_sweep_projection.py        | 196 +++++++++++++---
+ 5 files changed, 562 insertions(+), 46 deletions(-)
+ create mode 100644 tests/tui_gateway/test_remote_projection_bystander_memory.py
+ create mode 100644 tui_gateway/kanban_remote_observation_compact.py
+
+diff --git a/tests/tui_gateway/test_remote_projection_bystander_memory.py b/tests/tui_gateway/test_remote_projection_bystander_memory.py
+new file mode 100644
+index 0000000000..6b43a05869
+--- /dev/null
++++ b/tests/tui_gateway/test_remote_projection_bystander_memory.py
+@@ -0,0 +1,219 @@
++"""Replica rows that cannot reach this gateway keep no cards in the serve's remote caches. [daveey]
++
++On the mini the hub replica held 18.6k task rows of 11 gateways (87 MB JSON). The sweep projection, the sweep memo
++and the observation flights retained a decoded projection for every row, though only rows linked to this gateway
++(``hermes_cli.kanban_replica_relevance.is_bystander`` false) can yield a card, notice or observation it reads.
++"""
++import contextlib
++import gc
++import json
++import sqlite3
++import tracemalloc
++from array import array
++
++from hermes_state import SessionDB
++from tests.tui_gateway.test_kanban_remote_arrival import _hub
++from tests.tui_gateway.test_kanban_remote_notices import CHAT, _card, _dead_pid, _ledger_row
++from tui_gateway import kanban_remote_notices as remote
++from tui_gateway import kanban_remote_observations as obs
++from tui_gateway import remote_sweep_projection as projection
++from tui_gateway.kanban_remote_notices import sweep_remote_notices
++
++NOW = 1_800_000_000.0
++BYSTANDERS = 2000
++RELEVANT = 20
++BODY = 20_000
++MARK = "BYSTANDER-PAYLOAD"
++
++
++def _bystander(i, status="done", at=NOW - 60):
++    card = _card(f"t_by_{i}", f"other_{i}", status=status, at=at, summary=f"{MARK} summary {i}")
++    card["task"]["sessions"][0]["gw"] = "elsewhere"  # linked to another gateway's chat only
++    card["task"]["body"] = f"{MARK} {i:06d} " + "x" * BODY
++    return card
++
++
++def _relevant(i):
++    card = _card(f"t_rel_{i}", CHAT, status="done", at=NOW - 60, summary=f"relevant {i}")
++    card["task"]["body"] = f"relevant {i:06d} " + "y" * BODY
++    return card
++
++
++def _opener(db):
++    @contextlib.contextmanager
++    def opener(profile, sid):
++        yield (db, db.get_compression_tip(sid) or sid) if sid == CHAT else (None, None)
++
++    return opener
++
++
++def _roots():
++    return {"_rows": projection._rows, "_sweep_memo": remote._sweep_memo, "_retained": obs._retained,
++            "_memo": obs._memo, "_known": obs._known}
++
++
++_OPAQUE = (type, type(json), type(_card), type(len), type(remote._lock), type(gc.collect))
++
++
++def _reachable(root):
++    """Every object reachable from ``root`` through data (no classes, modules, functions or locks)."""
++    seen, stack, out = set(), [root], []
++    while stack:
++        item = stack.pop()
++        if id(item) in seen or isinstance(item, _OPAQUE):
++            continue
++        seen.add(id(item))
++        out.append(item)
++        if isinstance(item, (str, bytes, int, float, bool)) or item is None:
++            continue
++        stack.extend(gc.get_referents(item))
++        for name in getattr(type(item), "__slots__", ()):
++            with contextlib.suppress(AttributeError):
++                stack.append(getattr(item, name))
++    return out
++
++
++def _retained_state(tmp_path, cards):
++    """Bytes the remote modules retain after a snapshot, an observe and a notices sweep of ``cards``."""
++    tmp_path.mkdir()
++    replica = _hub(tmp_path, cards)
++    ledger = tmp_path / "remote-notices.db"
++    with SessionDB(tmp_path / "state.db") as db:
++        db.create_session(CHAT, "desktop")
++        remote._reset_for_tests()
++        gc.collect()
++        tracemalloc.start()
++        try:
++            before = tracemalloc.get_traced_memory()[0]
++            remote._sweep_snapshot(replica, "macbook")
++            obs.observe(replica, ledger, NOW)
++            delivered = sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=_opener(db),
++                                             ledger=ledger, now=NOW)
++            gc.collect()
++            retained = tracemalloc.get_traced_memory()[0] - before
++        finally:
++            tracemalloc.stop()
++    return retained, delivered
++
++
++def test_bystander_rows_retain_no_cards_or_payload_text(tmp_path):
++    relevant = [_relevant(i) for i in range(RELEVANT)]
++    base, base_delivered = _retained_state(tmp_path / "relevant", relevant)
++    full, delivered = _retained_state(tmp_path / "fleet", relevant + [_bystander(i) for i in range(BYSTANDERS)])
++    per_row = (full - base) / BYSTANDERS
++    assert per_row < 300, f"{per_row:.0f} bytes retained per bystander row"
++    assert len(delivered) == len(base_delivered) == RELEVANT  # the relevant cards still notify their chat
++    assert len(projection._rows) == RELEVANT + BYSTANDERS
++    for name, root in _roots().items():
++        for item in _reachable(root):
++            if isinstance(item, str):
++                assert MARK not in item, f"bystander payload text reachable from {name}"
++            if isinstance(item, dict):
++                assert not str(item.get("id", "")).startswith("t_by_"), f"bystander card reachable from {name}"
++            if isinstance(item, (list, tuple)):
++                assert not any(isinstance(x, str) and x.startswith("default/default/t_by_") for x in item[1:2]), \
++                    f"bystander card reachable from {name}"
++
++
++def _decodes(monkeypatch):
++    decoded = []
++    original = json.loads
++
++    def loads(text, *args, **kwargs):
++        value = original(text, *args, **kwargs)
++        if isinstance(value, dict) and "status" in value:
++            decoded.append(value.get("id"))
++        return value
++
++    monkeypatch.setattr(json, "loads", loads)
++    return decoded
++
++
++def test_second_snapshot_decodes_only_the_changed_row_and_rebuilds_no_states(tmp_path, monkeypatch):
++    cards = [_relevant(i) for i in range(3)] + [_bystander(i) for i in range(200)]
++    replica = _hub(tmp_path, cards)
++    remote._reset_for_tests()
++    first_cards, first_states = remote._sweep_snapshot(replica, "macbook")
++    before = dict(projection._rows)
++    changed = _bystander(7, status="blocked", at=NOW)
++    with sqlite3.connect(replica) as conn:
++        conn.execute("UPDATE replica SET data=?, seq=seq+1000 WHERE key=?", (json.dumps(changed["task"]),
++                                                                              changed["key"]))
++    decoded = _decodes(monkeypatch)
++    cards_now, states = remote._sweep_snapshot(replica, "macbook")
++    assert set(decoded) == {"t_by_7"}  # one payload decoded (its cards and its state each parse it, as on main)
++    assert cards_now == first_cards
++    assert states is first_states  # one mapping updated in place, not a dict rebuilt over every row
++    assert states[f"hub/{changed['key']}"][0] == f"blocked@{int(NOW)}"
++    unchanged = [ref for ref in before if ref != f"hub/{changed['key']}"]
++    assert all(projection._rows[ref] is before[ref] for ref in unchanged)  # no per-row object for unchanged rows
++    assert sum(type(value) is str for value in projection._rows.values()) == 200  # bystanders keep "seq\0state"
++
++
++def test_dead_claim_on_a_now_terminal_bystander_settles_as_on_main(tmp_path):
++    claimed_at = NOW - 3600
++    state = f"blocked@{int(claimed_at)}"
++    card = _card("t_claimed", CHAT, status="done", at=NOW - 60)
++    # The card finished, and cleanup moved its link to another gateway: a terminal bystander here, whose
++    # session list still names the claimed chat under profile "work" (the swept row's profile comes from it).
++    card["task"]["sessions"] = [{"gw": "elsewhere", "profile": "work", "session": CHAT, "rel": "shepherd"}]
++    replica = _hub(tmp_path, [card, _relevant(0)])
++    ledger = tmp_path / "remote-notices.db"
++    ref = f"hub/{card['key']}"
++    notice_key = f"remote:hub:{card['key']}:{state}:default:{CHAT}"
++    remote._reset_for_tests()
++    conn = remote._ledger(ledger)
++    with conn:
++        conn.execute("INSERT INTO notices (session, ref, state, at, delivered, holder_pid, holder_start, notice_key, "
++                     "legacy_seen) VALUES (?,?,?,?,0,?,NULL,?,1)",
++                     (CHAT, ref, state, claimed_at + 5, _dead_pid(), notice_key))
++    conn.close()
++    with SessionDB(tmp_path / "state.db") as db:
++        db.create_session(CHAT, "desktop")
++        sweep_remote_notices(replica_path=replica, gateway="macbook", session_db=_opener(db), ledger=ledger, now=NOW)
++    row = _ledger_row(ledger, CHAT, ref)
++    assert (row["delivered"], row["holder_pid"], row["holder_start"], row.get("settled")) == (
++        remote.SETTLED, None, None, "stale")
++    with sqlite3.connect(ledger) as c:
++        swept = c.execute("SELECT replica, profile, session, notice_id, reason FROM swept WHERE reason='stale'")
++        assert swept.fetchall() == [(str(replica), "work", CHAT, notice_key, "stale")]
++    # The settlement above is main's (it passes there); here the row was held compact and its sessions read back.
++    assert type(projection._rows.get(ref)) is str
++
++
++def test_bystander_that_gains_a_legacy_alias_is_refetched_like_a_cold_read(tmp_path, monkeypatch):
++    target = _bystander(5)
++    replica = _hub(tmp_path, [_relevant(0), _relevant(1), target] + [_bystander(i) for i in range(6, 40)])
++    remote._reset_for_tests()
++    remote._sweep_snapshot(replica, "macbook")
++    ref = f"hub/{target['key']}"
++    assert type(projection._rows[ref]) is str
++    legacy = _card("t_by_5", CHAT, status="blocked", at=NOW - 7200)  # the pre-profile key, linked here
++    with sqlite3.connect(replica) as conn:
++        seq = conn.execute("SELECT max(seq) FROM replica").fetchone()[0] + 1
++        conn.execute("INSERT INTO replica VALUES (?,?,?,?,?)",
++                     ("hub", "tasks", legacy["key"].split("/", 1)[1], json.dumps(legacy["task"]), seq))
++    decoded = _decodes(monkeypatch)
++    warm_cards, warm_states = remote._sweep_snapshot(replica, "macbook")
++    assert set(decoded) == {"t_by_5"}  # the qualified row is read again although its seq did not move
++    assert type(projection._rows[ref]) is not str
++    monkeypatch.undo()
++    warm = (warm_cards, dict(warm_states))
++    remote._reset_for_tests()
++    cold_cards, cold_states = remote._sweep_snapshot(replica, "macbook")
++    assert warm == (cold_cards, dict(cold_states))
++    assert warm[1][ref] == (f"done@{int(NOW - 60)}", {"sessions": target["task"]["sessions"]})
++
++
++def test_observation_lane_keeps_bystanders_in_fixed_width_columns(tmp_path):
++    replica = _hub(tmp_path, [_relevant(0)] + [_bystander(i) for i in range(50)])
++    ledger = tmp_path / "remote-notices.db"
++    remote._reset_for_tests()
++    fresh = obs.observe(replica, ledger, NOW)
++    assert {key for (_gw, key, _state) in fresh} == {_relevant(0)["key"]}
++    (flight,) = obs._retained.values()
++    assert len(flight.decoded) == 1 and len(flight.lane.table) == 50
++    assert all(isinstance(column, array) for column in (flight.lane.table.hashes, flight.lane.table.seqs))
++    with sqlite3.connect(ledger) as conn:  # bystander terminal states still reach the ledger, as on main
++        refs = {ref for (ref,) in conn.execute("SELECT ref FROM observations")}
++    assert refs == {f"hub/{_relevant(0)['key']}"} | {f"hub/{_bystander(i)['key']}" for i in range(50)}
+diff --git a/tui_gateway/kanban_remote_notices.py b/tui_gateway/kanban_remote_notices.py
+index accf5134ec..0303d933d3 100644
+--- a/tui_gateway/kanban_remote_notices.py
++++ b/tui_gateway/kanban_remote_notices.py
+@@ -1065,6 +1065,8 @@ def _settle_stale_claims(states: dict, path, ledger) -> int:
+     swept reason=delivered after 9eb41135c6). A live holder, a card still in that state (the re-offer path owns
+     it) and a card missing from the replica (partial sync) are left alone. Never raises.
+     """
++    from tui_gateway.remote_sweep_projection import CompactTask
++
+     try:
+         conn = _ledger(ledger)
+         try:
+@@ -1078,7 +1080,12 @@ def _settle_stale_claims(states: dict, path, ledger) -> int:
+                     continue
+                 if _holder_is_me(row["holder_pid"]) or _holder_alive(row["holder_pid"], row["holder_start"]):
+                     continue
+-                profile, notice_id = _stale_notice_id(row, current[1])
++                task = current[1]
++                if isinstance(task, CompactTask):  # [daveey] a bystander row keeps no sessions: read them back
++                    task = task.load(path)
++                    if task is None:
++                        continue  # the row moved since this snapshot: the next sweep settles it from its own
++                profile, notice_id = _stale_notice_id(row, task)
+                 swept_key = (str(path), profile, str(row["session"]), notice_id)
+                 with conn:
+                     cur = conn.execute(
+diff --git a/tui_gateway/kanban_remote_observation_compact.py b/tui_gateway/kanban_remote_observation_compact.py
+new file mode 100644
+index 0000000000..b8fc238db9
+--- /dev/null
++++ b/tui_gateway/kanban_remote_observation_compact.py
+@@ -0,0 +1,128 @@
++"""Observation-side bookkeeping for replica rows that cannot reach this gateway. [daveey]
++
++``kanban_remote_observations`` keeps a decoded summary per replica row and an ``Observed`` entry per terminal
++row. A bystander (``remote_sweep_projection.compactable``) is never offered to a chat here, so its lane keeps only
++``(hash(owner, key), seq, hash(ref, state))`` in three sorted ``array('q')`` columns, ~24 bytes a row. Its terminal
++states still reach the observation ledger (a card linked later must keep main's ``first_seen``): a re-decoded
++row whose ``(ref, state)`` was not yet queued goes to ``Lane.pending``, which ``observe`` persists with the
++relevant cards. The table belongs to one ledger file; a second ledger path turns the lane off (full form, one
++cold re-read), a replaced ledger file re-reads so every terminal bystander is written to it.
++"""
++from __future__ import annotations
++
++import contextlib
++import json
++from array import array
++from bisect import bisect_left
++from itertools import pairwise
++
++_INT64 = range(-(1 << 63), 1 << 63)
++_MULTI = ("", None)  # identity sentinel: more than one ledger path observed this replica, every row in full form
++
++
++class Table:
++    """Sorted columns of compact rows; rebuilt (sorted once) from each read, so deleted rows drop out.
++    ``trusted`` False: the seqs may belong to a replaced replica file, only the state hashes still hold."""
++
++    __slots__ = ("hashes", "seqs", "states", "trusted")
++
++    def __init__(self, entries=()):
++        entries = sorted(entries)
++        self.hashes = array("q", [entry[0] for entry in entries])
++        self.seqs = array("q", [entry[1] for entry in entries])
++        self.states = array("q", [entry[2] for entry in entries])
++        self.trusted = True
++
++    def get(self, row_hash):
++        at = bisect_left(self.hashes, row_hash)
++        if at < len(self.hashes) and self.hashes[at] == row_hash:
++            return self.seqs[at], self.states[at]
++        return None
++
++    def __len__(self):
++        return len(self.hashes)
++
++
++class Lane:
++    """One replica flight's compact rows. Guarded by the flight's lock."""
++
++    def __init__(self):
++        self.table = Table()
++        self.home: tuple | None = None  # (ledger path, ledger file id) | _MULTI
++        self.pending: list[tuple] = []  # (owner, key, summary) not yet written to the home ledger
++
++    @property
++    def enabled(self) -> bool:
++        return self.home is not _MULTI
++
++    def adopt(self, path: str, file_id) -> bool:
++        """Bind to the ledger ``observe`` writes now. True when the flight must forget its decoded rows."""
++        home = self.home
++        if home is _MULTI:
++            return False
++        if home is None:
++            self.home = (path, file_id)
++            return False
++        if home[0] != path:
++            if len(self.table) or self.pending:
++                self.home, self.table, self.pending = _MULTI, Table(), []
++                return True
++            self.home = (path, file_id)
++            return False
++        if home[1] is not None and file_id != home[1] and len(self.table):
++            self.home, self.table = (path, file_id), Table()
++            return True  # a new ledger file: every terminal bystander is re-read and re-queued
++        self.home = (path, file_id if file_id is not None else home[1])
++        return False
++
++
++def _state_hash(owner, key, summary) -> int:
++    from tui_gateway.kanban_remote_notice_state import state
++
++    return hash((f"{owner}/{key}", state(summary))) or 1
++
++
++def scan(conn, rows, tag: str, me, decoded: dict, lane: Lane, summarize) -> list[tuple]:
++    """``_changed_rows_cards`` with a lane. ``rows`` is (canonical identity rows, legacy keys per owner read before
++    ``_canonical``). Relevant rows keep today's ``decoded`` entries and cards."""
++    from tui_gateway.remote_sweep_projection import compactable, has_twin
++
++    canonical, legacy = rows
++    hashes = [hash((owner, key)) for owner, key, _, _ in canonical]
++    ordered = sorted(hashes)
++    collide = {a for a, b in pairwise(ordered) if a == b}
++    del ordered
++    seen, cards, entries = set(), [], []
++    old = lane.table
++    for (owner, key, seq, _), row_hash in zip(canonical, hashes):
++        ident = (tag, owner, key)
++        seen.add(ident)
++        hit = decoded.get(ident)
++        if hit is None or hit[0] != seq:
++            eligible = row_hash not in collide and type(seq) is int and seq in _INT64
++            known = old.get(row_hash) if eligible else None
++            if known is not None and old.trusted and known[0] == seq and not has_twin(owner, key, legacy):
++                entries.append((row_hash, seq, known[1]))
++                continue
++            raw = conn.execute("SELECT data FROM replica WHERE gw = ? AND coll = 'tasks' AND key = ?",
++                               (owner, key)).fetchone()
++            task = summary = None
++            with contextlib.suppress(TypeError, ValueError):
++                task = json.loads(raw[0]) if raw else None
++                summary = summarize(task) if raw else None
++            if eligible and compactable(task, owner, key, seq, me, legacy):
++                decoded.pop(ident, None)
++                state = 0
++                if summary is not None:
++                    state = _state_hash(owner, key, summary)
++                    if known is None or known[1] != state:
++                        lane.pending.append((owner, key, summary))
++                entries.append((row_hash, seq, state))
++                continue
++            hit = decoded[ident] = (seq, summary)
++        if hit[1] is not None:
++            cards.append((owner, key, hit[1]))
++    for ident in [ident for ident in decoded if ident[0] == tag and ident not in seen]:
++        del decoded[ident]
++    lane.table = Table(entries)
++    return cards
+diff --git a/tui_gateway/kanban_remote_observations.py b/tui_gateway/kanban_remote_observations.py
+index 2ecb21a7e7..81cd4140ad 100644
+--- a/tui_gateway/kanban_remote_observations.py
++++ b/tui_gateway/kanban_remote_observations.py
+@@ -15,7 +15,7 @@ _memo: dict[tuple, tuple] = {}
+ _generation: dict[tuple, int] = {}  # observe key -> ledger writes started, so only the newest publishes its memo
+ 
+ 
+-def _snapshot(replica: Path, previous, decoded: dict) -> tuple[bool, list[tuple] | None, tuple | None]:
++def _snapshot(replica: Path, previous, decoded: dict, lane=None) -> tuple[bool, list[tuple] | None, tuple | None]:
+     """Read readiness and ALL canonical terminal states from the same SQLite snapshot.
+ 
+     The hub client sets gateway before pulling and commits each feed page. Until
+@@ -50,7 +50,7 @@ def _snapshot(replica: Path, previous, decoded: dict) -> tuple[bool, list[tuple]
+                     if isinstance(task, dict) and (task.get("status") in _TERMINAL or _withdrawal(task) is not None):
+                         cards.append((owner, key, task))
+             return ready, cards, signature
+-        cards = _changed_rows_cards(conn, replica, meta.get("gateway"), decoded)
++        cards = _changed_rows_cards(conn, replica, meta.get("gateway"), decoded, lane)
+     return ready, cards, signature
+ 
+ 
+@@ -80,7 +80,7 @@ def _terminal_states():
+     return _TERMINAL
+ 
+ 
+-def _changed_rows_cards(conn, replica: Path, me, decoded: dict) -> list[tuple]:
++def _changed_rows_cards(conn, replica: Path, me, decoded: dict, lane=None) -> list[tuple]:
+     """``decoded`` is the caller's (replica, owner, key) -> (seq, terminal summary or None) map.
+ 
+     The replica holds thousands of task rows (~30 MB of JSON on a busy fleet) and its signature moves whenever any
+@@ -94,7 +94,13 @@ def _changed_rows_cards(conn, replica: Path, me, decoded: dict) -> list[tuple]:
+     # payload point reads remain proportional to changes.
+     sql = "SELECT json_group_array(json_array(gw, key, seq, NULL)) FROM replica WHERE coll = 'tasks'"
+     row = conn.execute(sql + " AND gw != ?", (me,)).fetchone() if me else conn.execute(sql).fetchone()
+-    rows = _canonical([tuple(item) for item in json.loads(row[0])])
++    rows = [tuple(item) for item in json.loads(row[0])]
++    if lane is not None and lane.enabled:  # [daveey] bystanders keep no decoded entry (observation_compact)
++        from tui_gateway import kanban_remote_observation_compact as compact
++        from tui_gateway.remote_sweep_projection import legacy_keys
++
++        return compact.scan(conn, (_canonical(rows), legacy_keys(rows)), str(replica), me, decoded, lane, _summary)
++    rows = _canonical(rows)
+     tag = str(replica)
+     seen = set()
+     cards = []
+@@ -116,7 +122,7 @@ def _changed_rows_cards(conn, replica: Path, me, decoded: dict) -> list[tuple]:
+     return cards
+ 
+ 
+-def _persist(source: str, cards: list[tuple], ledger, now: float) -> dict[tuple, float | None]:
++def _persist(source: str, cards: list[tuple], ledger, now: float, extra=()) -> dict[tuple, float | None]:
+     """Seed retained history once; later current-key states receive one local window.
+ 
+     [daveey] ``observations`` rows are insert-only, so a ``(source, ref, state)`` already read from (or written to)
+@@ -124,6 +130,8 @@ def _persist(source: str, cards: list[tuple], ledger, now: float) -> dict[tuple,
+     seen yet touch SQLite. Re-reading every terminal card per replica change was most of the notice pollers' wait.
+     ``observe`` calls this without ``_lock``; concurrent callers serialize on the ledger's ``BEGIN IMMEDIATE`` and,
+     the rows being insert-only, agree on every ``first_seen``. Nothing enters ``_known`` before its commit.
++    ``extra`` (bystander terminal rows, ``kanban_remote_observation_compact``) is written by the same rule but is
++    neither answered nor remembered; ``_known`` keeps only the current cards' states.
+     """
+     from tui_gateway.kanban_remote_notices import FRESH_S, _fresh_at, _ledger
+ 
+@@ -139,9 +147,10 @@ def _persist(source: str, cards: list[tuple], ledger, now: float) -> dict[tuple,
+         at, state, ref = _fresh_at(task), _notice_state(task), f"{owner}/{key}"
+         states.append((owner, key, state, ref, at))
+         if known is None or (ref, state) not in known:
+-            missing.append((key, state, ref, at))
+-    if known is not None and not missing:  # an entry also proves the source's baseline is recorded
++            missing.append((key, state, ref, at, True))
++    if known is not None and not missing and not extra:  # an entry also proves the source's baseline is recorded
+         return _fresh_map(states, known)
++    missing += [(key, _notice_state(task), f"{owner}/{key}", _fresh_at(task), False) for owner, key, task in extra]
+     stats["transactions"] += 1
+     added = {}
+     with contextlib.closing(_ledger(ledger)) as conn:
+@@ -154,20 +163,22 @@ def _persist(source: str, cards: list[tuple], ledger, now: float) -> dict[tuple,
+             initial = conn.execute("SELECT 1 FROM observation_sources WHERE source=?", (source,)).fetchone() is None
+             if initial:
+                 conn.execute("INSERT INTO observation_sources VALUES (?)", (source,))
+-            for key, state, ref, at in missing:
++            for key, state, ref, at, answer in missing:
+                 # Unknown ages and frozen legacy keys cannot establish local freshness.
+                 seen = now if at is not None and key.count('/') >= 2 and (not initial or now - at <= FRESH_S) else None
+                 row = conn.execute("SELECT first_seen FROM observations WHERE source=? AND ref=? AND state=?",
+                                    (source, ref, state)).fetchone()
+                 if row is None:
+                     conn.execute("INSERT INTO observations VALUES (?,?,?,?)", (source, ref, state, seen))
+-                added[(ref, state)] = row[0] if row is not None else seen
++                if answer:
++                    added[(ref, state)] = row[0] if row is not None else seen
+             conn.commit()
+         except BaseException:
+             conn.rollback()
+             raise
+     after = _file_id(ledger)
+     merged = {**(known or {}), **added} if after == file_id else added
++    merged = {pair: merged[pair] for _owner, _key, state, ref, _at in states if (pair := (ref, state)) in merged}
+     if after is not None:
+         with _known_lock:  # a racing caller's entries may be dropped here: they are only re-read, never wrong
+             _known[slot] = (after, merged)
+@@ -223,9 +234,12 @@ def _file_id(path: Path) -> tuple | None:
+ 
+ class _ReplicaFlight:
+     def __init__(self):
++        from tui_gateway.kanban_remote_observation_compact import Lane
++
+         self.lock = threading.Lock()
+         self.decoded = {}
+         self.result = None
++        self.lane = Lane()  # [daveey] bystander rows: seq/state hashes and unwritten terminal states only
+ 
+     def read(self, replica, stamp, ident):
+         from tui_gateway.kanban_replica_observer import file_identity, fingerprint
+@@ -235,8 +249,9 @@ class _ReplicaFlight:
+             return previous
+         if ident is None or previous is None or previous[4] != ident:
+             self.decoded.clear()
++            self.lane.table.trusted = False  # its seqs may name another file; its state hashes still hold
+             previous = None
+-        ready, cards, signature = _snapshot(replica, previous[2] if previous else None, self.decoded)
++        ready, cards, signature = _snapshot(replica, previous[2] if previous else None, self.decoded, self.lane)
+         if cards is None:
+             cards = previous[1]
+         after = fingerprint(replica)
+@@ -307,22 +322,29 @@ def observe(replica: Path, ledger, now: float, _follow: bool = True) -> dict[tup
+         stamp = fingerprint(replica)
+         ident = file_identity(stamp)
+         ledger_id = _file_id(ledger)
++        if flight.lane.adopt(key[1], ledger_id):  # another ledger: bystanders re-read for it (or kept in full)
++            flight.result = None
++            flight.decoded.clear()
++            with _lock:
++                for stale in [memo for memo in _memo if memo[0] == key[0]]:
++                    del _memo[stale]
+         with _lock:
+             cached = _memo.get(key)
+             if cached is not None and (cached[2] != ledger_id or cached[4] != ident):
+                 _memo.pop(key)
+                 cached = None
+-            if cached is not None and stamp is not None and cached[3] == stamp:
++            if cached is not None and stamp is not None and cached[3] == stamp and not flight.lane.pending:
+                 return cached[1]
+         ready, cards, signature, stamp, ident = flight.read(replica, stamp, ident)
+         if not ready:
+             return {}
++        extra = flight.lane.pending
+         with _lock:
+             # Re-read: a leader may have published this snapshot's memo since the first look.
+             latest = _memo.get(key)
+             if latest is not None and (latest[2] != ledger_id or latest[4] != ident):
+                 latest = None
+-            if latest is not None and signature is not None and signature == latest[0]:
++            if latest is not None and signature is not None and signature == latest[0] and not extra:
+                 fresh = latest[1]
+                 _remember(key, (signature, fresh, ledger_id, stamp, ident))
+                 return fresh
+@@ -331,8 +353,9 @@ def observe(replica: Path, ledger, now: float, _follow: bool = True) -> dict[tup
+             leading: _Pending | None = None
+             generation = 0
+             if not (_follow and signature is not None and ident is not None and waiting is not None
+-                    and waiting.token == token and waiting.owner != threading.get_ident()):
++                    and waiting.token == token and waiting.owner != threading.get_ident() and not extra):
+                 waiting = None
++                flight.lane.pending = []  # this caller writes them; a failed write puts them back
+                 _generation[key] = generation = _generation.get(key, 0) + 1
+                 leading = _Pending(token) if signature is not None and ident is not None else None
+                 if leading is not None:
+@@ -346,7 +369,7 @@ def observe(replica: Path, ledger, now: float, _follow: bool = True) -> dict[tup
+     # poller's transaction. ``cards`` is this call's own snapshot, so the answer is the one it would have had under
+     # the lock; only the newest snapshot started for ``key`` publishes its memo, and only after its commit.
+     try:
+-        fresh = _persist(key[0], cards or [], ledger, now)
++        fresh = _persist(key[0], cards or [], ledger, now, extra) if extra else _persist(key[0], cards or [], ledger, now)
+         ledger_id = _file_id(ledger)
+         with _lock:
+             if leading is not None:
+@@ -354,6 +377,11 @@ def observe(replica: Path, ledger, now: float, _follow: bool = True) -> dict[tup
+             if _generation.get(key) == generation:
+                 _remember(key, (signature, fresh, ledger_id, stamp, ident))
+             return fresh
++    except BaseException:
++        if extra:
++            with flight.lock:
++                flight.lane.pending[:0] = extra
++        raise
+     finally:
+         if leading is not None:
+             with _lock:
+diff --git a/tui_gateway/remote_sweep_projection.py b/tui_gateway/remote_sweep_projection.py
+index 00d4f0ae56..782315f27a 100644
+--- a/tui_gateway/remote_sweep_projection.py
++++ b/tui_gateway/remote_sweep_projection.py
+@@ -3,21 +3,117 @@
+ The replica writer publishes a new seq for each changed row. Read identity rows
+ and changed payloads in one transaction; never cache time or claim decisions.
+ Only one replica/gateway generation is retained, with deleted rows discarded.
++
++[daveey] A row that cannot reach this gateway (``compactable``: a bystander by
++``hermes_cli.kanban_replica_relevance.is_bystander`` with no linked chat here) keeps
++only ``"<seq>\\0<state>"``, never its cards or sessions: on the hub replica (18.6k rows
++of 11 gateways) those were most of the serve's retained heap. ``states`` is one live
++view per scope, updated in place by changed rows rather than rebuilt per call.
+ """
+ from __future__ import annotations
+ 
++import contextlib
++import json
+ import threading
++from collections.abc import Mapping
+ 
+-_lock = threading.Lock()
++_lock = threading.RLock()
+ _identity = None
+-_rows: dict = {}
++_rows: dict = {}  # ref -> "seq\0state" (compact) | (seq, cards, (state, {"sessions": ...}) | None)
++_view = None
+ 
+ 
+ def reset() -> None:
+-    global _identity
++    global _identity, _rows, _view
+     with _lock:
+-        _identity = None
+-        _rows.clear()
++        _identity, _rows, _view = None, {}, None
++
++
++class CompactTask:
++    """Stands in for a compact row's task in ``states``; ``load`` reads it back when a stale claim needs it."""
++
++    __slots__ = ("key", "owner", "seq")
++
++    def __init__(self, owner, key, seq):
++        self.owner, self.key, self.seq = owner, key, seq
++
++    def __eq__(self, other):
++        if not isinstance(other, CompactTask):
++            return NotImplemented
++        return (self.owner, self.key, self.seq) == (other.owner, other.key, other.seq)
++
++    def __hash__(self):
++        return hash((self.owner, self.key, self.seq))
++
++    def __repr__(self):
++        return f"CompactTask({self.owner!r}, {self.key!r}, {self.seq!r})"
++
++    def load(self, path):
++        """The row's task while the replica still holds this seq, else None (the caller skips this pass)."""
++        from tui_gateway.kanban_remote_notices import _ro
++
++        with contextlib.closing(_ro(path)) as conn:
++            row = conn.execute("SELECT seq, data FROM replica WHERE coll='tasks' AND gw=? AND key=?",
++                               (self.owner, self.key)).fetchone()
++        if row is None or row[0] != self.seq:
++            return None
++        try:
++            task = json.loads(row[1])
++        except (TypeError, ValueError):
++            return None
++        return task if isinstance(task, dict) else None
++
++
++class StatesView(Mapping):
++    """``{ref: (state, {"sessions": ...})}`` over one scope's ``_rows`` (a compact row's second item is a
++    ``CompactTask``). It shows the newest snapshot of its scope; a new scope binds a new ``_rows``."""
++
++    def __init__(self, rows: dict):
++        self._data = rows
++
++    def __getitem__(self, ref):
++        with _lock:
++            value = self._data[ref]
++        if type(value) is str:
++            seq, _, state = value.partition("\0")
++            owner, _, key = ref.partition("/")
++            return state, CompactTask(owner, key, int(seq))
++        if value[2] is None:
++            raise KeyError(ref)
++        return value[2]
++
++    def __iter__(self):
++        with _lock:
++            refs = [ref for ref, value in self._data.items() if type(value) is str or value[2] is not None]
++        return iter(refs)
++
++    def __len__(self):
++        return sum(1 for _ in self)
++
++
++def legacy_keys(rows) -> dict:
++    """``{owner: {key}}`` of keys with fewer than two ``/`` (pre-profile rows), read before ``_canonical``."""
++    out: dict = {}
++    for owner, key, *_ in rows:
++        if str(key).count("/") < 2:
++            out.setdefault(owner, set()).add(key)
++    return out
++
++
++def compactable(task, owner, key, seq, me, legacy) -> bool:
++    """The row can affect no card, notice or observation of ``me`` beyond its state scalar."""
++    from hermes_cli.kanban_replica_relevance import is_bystander
++    from tui_gateway.kanban_remote_notices import _linked_chats
++
++    return (isinstance(task, dict) and bool(task.get("status")) and type(seq) is int
++            and isinstance(owner, str) and isinstance(key, str) and "/" not in owner
++            and is_bystander(task, key, me, legacy.get(owner, ())) and not _linked_chats(task, me))
++
++
++def has_twin(owner, key, legacy) -> bool:
++    """A legacy ``<board>/<id>`` row of the same owner exists: the qualified row is relevant again."""
++    keys = legacy.get(owner)
++    return bool(keys) and str(key).split("/", 1)[-1] in keys
+ 
+ 
+ def _project(rows, me, remote):
+@@ -27,37 +123,75 @@ def _project(rows, me, remote):
+     return cards, states
+ 
+ 
++def _value(row, me, legacy, remote):
++    owner, key, seq, _ = row
++    cards = list(remote._sweep_cards([row], me))
++    current = remote._current_states([row])
++    if not current:
++        return seq, cards, None
++    state, task = next(iter(current.values()))
++    if not cards and compactable(task, owner, key, seq, me, legacy):
++        return f"{seq}\0{state}"
++    return seq, cards, (state, {"sessions": task.get("sessions")})
++
++
++def _uncached(conn, me, remote):
++    global _identity, _rows, _view
++    _identity, _rows, _view = None, {}, None
++    return _project(remote._canonical(remote._task_rows(conn, me)), me, remote)
++
++
+ def snapshot(conn, identity, me):
+     """Caller owns a snapshot transaction; unknown identities/schemas do not memoize."""
+     from tui_gateway import kanban_remote_notices as remote
+ 
+-    global _identity, _rows
++    global _identity, _rows, _view
+     with _lock:
+         cols = {row[1] for row in conn.execute("PRAGMA table_info(replica)")}
+-        scope = (identity, me)
+         if identity is None or "seq" not in cols:
+-            _identity, _rows = None, {}
+-            return _project(remote._canonical(remote._task_rows(conn, me)), me, remote)
+-        previous = _rows if _identity == scope else {}
++            return _uncached(conn, me, remote)
++        scope = (identity, me)
++        if _identity != scope:
++            _identity, _rows, _view = None, {}, None
+         sql = "SELECT gw, key, seq, NULL FROM replica WHERE coll = 'tasks'"
+-        rows = remote._canonical(conn.execute(sql + " AND gw != ?", (me,)).fetchall()
+-                                 if me else conn.execute(sql).fetchall())
+-        # A cold pass reads payloads in one query, rather than thousands of seeks.
+-        cold = {(row[0], row[1]): row for row in remote._canonical(remote._task_rows(conn, me))} if not previous else {}
+-        updated = {}
+-        cards, states = [], {}
+-        for owner, key, seq, _ in rows:
+-            hit = previous.get((owner, key))
+-            if hit is None or hit[0] != seq:
+-                row = cold.get((owner, key))
+-                if row is None:
+-                    raw = conn.execute("SELECT data FROM replica WHERE coll='tasks' AND gw=? AND key=?",
+-                                       (owner, key)).fetchone()
+-                    row = (owner, key, seq, raw[0])
+-                projection = _project([row], me, remote)
+-                hit = (seq, projection)
+-            updated[(owner, key)] = hit
+-            cards.extend(hit[1][0])
+-            states.update(hit[1][1])
+-        _identity, _rows = scope, updated
+-        return cards, states
++        raw_rows = conn.execute(sql + " AND gw != ?", (me,)).fetchall() if me else conn.execute(sql).fetchall()
++        legacy = legacy_keys(raw_rows)
++        rows = remote._canonical(raw_rows)
++        del raw_rows
++        current = _rows
++        try:
++            # A cold pass reads payloads in one paged query, rather than thousands of seeks.
++            payloads = ({(row[0], row[1]): row for row in remote._canonical(remote._task_rows(conn, me))}
++                        if not current else {})
++            cards = []
++            for owner, key, seq, _ in rows:
++                ref = f"{owner}/{key}"
++                value = current.get(ref)
++                if type(value) is str:
++                    stale = value.partition("\0")[0] != str(seq) or has_twin(owner, key, legacy)
++                else:
++                    stale = value is None or value[0] != seq
++                if stale:
++                    row = payloads.get((owner, key))
++                    if row is None:
++                        raw = conn.execute("SELECT data FROM replica WHERE coll='tasks' AND gw=? AND key=?",
++                                           (owner, key)).fetchone()
++                        row = (owner, key, seq, raw[0])
++                    value = current[ref] = _value(row, me, legacy, remote)
++                if type(value) is not str:
++                    cards.extend(value[1])
++            del payloads
++            if len(current) != len(rows):  # deleted rows, or two rows sharing one ref
++                refs = {f"{owner}/{key}" for owner, key, _, _ in rows}
++                if len(refs) != len(rows):
++                    return _uncached(conn, me, remote)
++                for ref in [ref for ref in current if ref not in refs]:
++                    del current[ref]
++        except BaseException:
++            _identity, _rows, _view = None, {}, None
++            raise
++        _identity = scope
++        view = _view
++        if view is None or view._data is not current:
++            view = _view = StatesView(current)
++        return cards, view
+-- 
+2.43.0
+

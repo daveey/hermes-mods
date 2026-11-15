@@ -1,0 +1,254 @@
+From 0d00238be2f00061aa18bae1d1ac697a27e9e8d7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 17:52:52 +0000
+Subject: [PATCH] fix(kanban): event order trusts a uid minted just past
+ created_at's second [daveey]
+
+`consistent_uid_milliseconds(uid, seconds)` trusted a v7 uid's ms only
+inside the row's own created_at second. created_at is `int(time.time())`
+read in Python before the INSERT, while the uid is minted by the AFTER
+INSERT trigger, so a write straddling a second boundary carries a
+legitimate uid in second+1. Such an event fell back to second*1000 and
+sorted before consistent-uid events of the same second: in
+`kanban_sync_divergence._event_order` (the terminal guard's
+`terminal_hold` order) a straddled terminal could sort before an earlier
+same-second reopen and drop the hold (fail-open), or a straddled reopen
+before an earlier terminal and keep a hold that should drop. The same
+rule feeds `kanban_shared_blockers._event_order`.
+
+The window is now [seconds*1000, (seconds+1)*1000 + UID_STRADDLE_MS)
+with UID_STRADDLE_MS = 1000; a uid stamped further out (a backfill) is
+still distrusted and the local id decides. Non-int seconds return None.
+`_uid_before_check` is unaffected: a claim minted in second+1 is never
+before a check of second `started`, so it keeps its fallback.
+
+Evidence (read-only replay, 12 kanban DBs on worker-6: kanban.db,
+boards/*, sync-shadow/*; 957,626 v7 event uids), uid ms minus
+created_at*1000:
+- [0, 1000): 831,590; [1000, 2000): 296 (285 unique-ms singletons,
+  i.e. trigger-minted; overshoot p50 1 ms, p90 58, p99 579, max 760);
+- [2000, 60000): 78 (68 shared-ms backfill batches); >= 60 s: 125,355
+  (125,354 batches: backfills).
+
+Follow-up from review t_01a1db0f0278c8dc of PR #3045 (nit 1);
+card t_01a1db15eb8f8cb6.
+
+Proof:
+- RED on dda3fd767515 (old fence, new tests): 9 failed across
+  test_kanban_shared_blocker_uid_precision (window, shared-blocker
+  _event_order), test_kanban_stale_wake_terminal (straddled terminal
+  after same-second reopen, mirror) and test_kanban_sync_running_heal
+  (_event_order window).
+- GREEN: those 3 files pass; the backfill tests (uid >= second+2, incl.
+  the existing 900 s case) still fall back to id order. Every test file
+  importing kanban_sync_divergence, kanban_terminal_guard or
+  kanban_shared_blocker*: 37 files, 950 passed.
+- Mutants killed (5/5): lower bound < , upper bound <=, window 0, window
+  2000, dropped int guard.
+- Replay old vs new over the same 12 DBs: terminal_hold changed for 0
+  of 17,210 tasks; _unblocked_since_assertion changed for 0 of 204
+  task/blocker pairs.
+- scripts/check --only health: ok.
+---
+ hermes_cli/kanban_shared_blocker_fence.py     | 17 +++++++--
+ hermes_cli/kanban_shared_blockers.py          |  3 +-
+ hermes_cli/kanban_sync_divergence.py          |  2 ++
+ ...est_kanban_shared_blocker_uid_precision.py | 36 ++++++++++++++++++-
+ .../test_kanban_stale_wake_terminal.py        | 33 +++++++++++++++++
+ .../test_kanban_sync_running_heal.py          | 15 ++++++++
+ 6 files changed, 101 insertions(+), 5 deletions(-)
+
+diff --git a/hermes_cli/kanban_shared_blocker_fence.py b/hermes_cli/kanban_shared_blocker_fence.py
+index 1279e9e44a..b92e9fc0b6 100644
+--- a/hermes_cli/kanban_shared_blocker_fence.py
++++ b/hermes_cli/kanban_shared_blocker_fence.py
+@@ -29,14 +29,25 @@ def uid_milliseconds(identity):
+     return uid.int >> 80 if uid.version == 7 else None
+ 
+ 
++# created_at is read in Python before the INSERT and the uid is minted later by
++# the AFTER INSERT trigger, so a write straddling a second boundary carries a
++# legitimate uid just past created_at's second (replay of local boards: 296 of
++# 957,626 v7 event uids, 259 within 50 ms, max 760 ms). Backfilled uids sit
++# minutes to days out (125k at >= 60 s).
++UID_STRADDLE_MS = 1000
++
++
+ def consistent_uid_milliseconds(identity, seconds):
+-    """UUIDv7 milliseconds only when they fall in the row's own recorded second.
++    """UUIDv7 milliseconds only when they fall in the row's own recorded second,
++    or within :data:`UID_STRADDLE_MS` after it (a write straddling the boundary).
+ 
+     Sync backfills uid-less rows with a v7 uid stamped at backfill time, so a
+-    uid whose second disagrees with the row's seconds clock is not event time.
++    uid stamped later than that is not event time.
+     """
+     ms = uid_milliseconds(identity)
+-    return ms if ms is not None and ms // 1000 == seconds else None
++    if ms is None or type(seconds) is not int:
++        return None
++    return ms if seconds * 1000 <= ms < (seconds + 1) * 1000 + UID_STRADDLE_MS else None
+ 
+ 
+ def _uid_before_check(identity, started, payload):
+diff --git a/hermes_cli/kanban_shared_blockers.py b/hermes_cli/kanban_shared_blockers.py
+index 4be1adc4c6..ea9b489a52 100644
+--- a/hermes_cli/kanban_shared_blockers.py
++++ b/hermes_cli/kanban_shared_blockers.py
+@@ -499,7 +499,8 @@ def _event_order(row) -> tuple[int, int]:
+     from hermes_cli.kanban_shared_blocker_fence import consistent_uid_milliseconds
+ 
+     created = kb._to_epoch(row["created_at"]) or 0
+-    # A backfilled uid carries backfill time: trust it only inside created_at's second.
++    # A backfilled uid carries backfill time: trust it only inside created_at's second
++    # (or just past it, for a write straddling the boundary).
+     stamp = consistent_uid_milliseconds(row["uid"] if "uid" in row.keys() else None, created)
+     if stamp is None:
+         stamp = created * 1000
+diff --git a/hermes_cli/kanban_sync_divergence.py b/hermes_cli/kanban_sync_divergence.py
+index 1760f9fe88..17d110f36a 100644
+--- a/hermes_cli/kanban_sync_divergence.py
++++ b/hermes_cli/kanban_sync_divergence.py
+@@ -228,6 +228,8 @@ def _event_order(event: dict) -> tuple[int, int, int]:
+     its 48-bit millisecond orders the two. A row with no uid (sync off, or written while the triggers were down)
+     falls back to arrival order, and so does a uid that is not a v7 (its leading bits are random, not time) or a
+     v7 outside the row's own second: ``kanban_db_sync`` backfills uid-less rows with a v7 stamped at backfill time.
++    A uid up to ``UID_STRADDLE_MS`` past the second still counts (created_at is read before the INSERT, the uid at
++    it), and sorts last in its own second.
+     """
+     second = int(event["created_at"] or 0)
+     ms = consistent_uid_milliseconds(event.get("uid"), second)
+diff --git a/tests/hermes_cli/test_kanban_shared_blocker_uid_precision.py b/tests/hermes_cli/test_kanban_shared_blocker_uid_precision.py
+index c5c4298cce..b7a6740ff5 100644
+--- a/tests/hermes_cli/test_kanban_shared_blocker_uid_precision.py
++++ b/tests/hermes_cli/test_kanban_shared_blocker_uid_precision.py
+@@ -5,7 +5,7 @@ from pathlib import Path
+ import pytest
+ 
+ from hermes_cli import kanban_shared_blocker_checks as checks
+-from hermes_cli.kanban_shared_blocker_fence import _uid_before_check
++from hermes_cli.kanban_shared_blocker_fence import _uid_before_check, consistent_uid_milliseconds
+ 
+ 
+ def _claim_uid(milliseconds, *, version=7, suffix=0):
+@@ -60,6 +60,40 @@ def test_same_second_requires_strictly_earlier_milliseconds(claimed_ms, expected
+                              {'checked_at_ms': 1200}) is expected
+ 
+ 
++@pytest.mark.parametrize(('claimed_ms', 'seconds', 'expected'), [
++    pytest.param(1000, 1, 1000, id='first-millisecond-of-own-second'),
++    pytest.param(1999, 1, 1999, id='last-millisecond-of-own-second'),
++    pytest.param(2010, 1, 2010, id='straddle-10ms-into-next-second'),
++    pytest.param(2999, 1, 2999, id='last-straddle-millisecond'),
++    pytest.param(3000, 1, None, id='past-the-straddle-window'),
++    pytest.param(999, 1, None, id='before-own-second'),
++    pytest.param(1500, None, None, id='no-seconds'),
++    pytest.param(1500, 1.0, None, id='float-seconds'),
++    pytest.param(1500, True, None, id='bool-is-not-a-seconds-clock'),
++])
++def test_consistent_uid_milliseconds_window(claimed_ms, seconds, expected):
++    assert consistent_uid_milliseconds(_claim_uid(claimed_ms), seconds) == expected
++
++
++def test_a_straddled_claim_is_never_before_a_same_second_check():
++    # A claim uid minted in second+1 is after any check of second `started`: the fence keeps its fallback.
++    assert _uid_before_check(_claim_uid(2010), 1, {'checked_at_ms': 1999}) is False
++
++
++def test_shared_blocker_event_order_keeps_a_straddled_uid_after_its_second():
++    from hermes_cli.kanban_shared_blockers import _event_order
++    straddled = {'id': 1, 'created_at': 1, 'uid': _claim_uid(2010)}
++    in_second = {'id': 2, 'created_at': 1, 'uid': _claim_uid(1700)}
++    backfilled = {'id': 3, 'created_at': 1, 'uid': _claim_uid(3000)}
++    assert _event_order(_Row(straddled)) == (2010, 1)
++    assert _event_order(_Row(backfilled)) == (1000, 3)
++    assert _event_order(_Row(straddled)) > _event_order(_Row(in_second)) > _event_order(_Row(backfilled))
++
++
++class _Row(dict):
++    """sqlite3.Row stand-in: mapping access plus keys()."""
++
++
+ @pytest.mark.platforms('posix')
+ def test_default_registered_check_runs_nonexecutable_stub_in_profile_home_with_spaces(
+         tmp_path, monkeypatch):
+diff --git a/tests/hermes_cli/test_kanban_stale_wake_terminal.py b/tests/hermes_cli/test_kanban_stale_wake_terminal.py
+index 8dbeb2eed1..836366df36 100644
+--- a/tests/hermes_cli/test_kanban_stale_wake_terminal.py
++++ b/tests/hermes_cli/test_kanban_stale_wake_terminal.py
+@@ -503,6 +503,39 @@ def test_terminal_hold_still_orders_one_second_by_a_consistent_uid_clock():
+     assert ktg.terminal_hold(conn, "t") is None
+ 
+ 
++@pytest.mark.parametrize("straddler,other,held", [
++    pytest.param("completed", "reopened", 1, id="straddled-terminal-after-same-second-reopen"),
++    pytest.param("reopened", "completed", None, id="straddled-reopen-after-same-second-terminal"),
++])
++def test_terminal_hold_trusts_a_uid_minted_just_past_the_rows_second(straddler, other, held):
++    """created_at is read before the INSERT and the uid is minted by the AFTER INSERT trigger, so a write straddling
++    the boundary carries a uid ~10 ms into second+1. It is still event time: the straddler (arrived first, id 1) is
++    the later event of second 500, not sorted at 500.000 before the reopen/terminal minted at 500.700."""
++    import sqlite3
++    conn = sqlite3.connect(":memory:")
++    conn.row_factory = sqlite3.Row
++    conn.execute("CREATE TABLE task_events (id INTEGER PRIMARY KEY, uid TEXT, task_id TEXT, kind TEXT, payload TEXT, "
++                 "created_at INTEGER)")
++    conn.execute("INSERT INTO task_events VALUES (1, ?, 't', ?, '{}', 500)", (_v7_at(501_010), straddler))
++    conn.execute("INSERT INTO task_events VALUES (2, ?, 't', ?, '{}', 500)", (_v7_at(500_700), other))
++    hold = ktg.terminal_hold(conn, "t")
++    assert (hold and hold["id"]) == held
++
++
++@pytest.mark.parametrize("uid_ms", [502_000, 509_000, 900_123])
++def test_terminal_hold_distrusts_a_uid_past_the_straddle_window(uid_ms):
++    """A uid stamped a full second or more past created_at's second is a backfill, not event time: the terminal that
++    arrived first falls back to 500.000 and the in-second reopen (500.700) stays later, so there is no hold."""
++    import sqlite3
++    conn = sqlite3.connect(":memory:")
++    conn.row_factory = sqlite3.Row
++    conn.execute("CREATE TABLE task_events (id INTEGER PRIMARY KEY, uid TEXT, task_id TEXT, kind TEXT, payload TEXT, "
++                 "created_at INTEGER)")
++    conn.execute("INSERT INTO task_events VALUES (1, ?, 't', 'completed', '{}', 500)", (_v7_at(uid_ms),))
++    conn.execute("INSERT INTO task_events VALUES (2, ?, 't', 'reopened', '{}', 500)", (_v7_at(500_700),))
++    assert ktg.terminal_hold(conn, "t") is None
++
++
+ # --- unblock_task: ``unblocked`` is a reopen, and its automated callers act on the local row -----------------------
+ # PR #1958 review 5889419180 nit 1: a stale copy of a done card, auto-unblocked by the shared-blocker clear/probe,
+ # the quota release or a ``resolved_check``, went ``ready`` and wrote ``unblocked``, which both guards (here and
+diff --git a/tests/hermes_cli/test_kanban_sync_running_heal.py b/tests/hermes_cli/test_kanban_sync_running_heal.py
+index d78e78859e..3e35c65baf 100644
+--- a/tests/hermes_cli/test_kanban_sync_running_heal.py
++++ b/tests/hermes_cli/test_kanban_sync_running_heal.py
+@@ -8,6 +8,7 @@ import json
+ import logging
+ import sqlite3
+ import time
++import uuid
+ 
+ import pytest
+ 
+@@ -231,6 +232,20 @@ def test_a_backfilled_v7_uid_does_not_reorder_same_second_events():
+     assert max((first, second), key=_event_order) is second
+ 
+ 
++@pytest.mark.parametrize("uid_ms,key", [
++    pytest.param(101_010, 101_010, id="straddle-10ms-into-next-second"),
++    pytest.param(101_999, 101_999, id="last-straddle-millisecond"),
++    pytest.param(102_000, 100_000, id="past-the-straddle-window"),
++    pytest.param(99_999, 100_000, id="before-the-row-second"),
++])
++def test_event_order_straddle_window(uid_ms, key):
++    """A uid minted just past created_at's second (the trigger runs after created_at is read) still orders within
++    its own second, last; one a full second further out is a backfill and falls back to the id."""
++    from hermes_cli.kanban_sync_divergence import _event_order
++    uid = str(uuid.UUID(int=(uid_ms << 80) | (7 << 76) | (2 << 62)))
++    assert _event_order({"created_at": 100, "id": 5, "uid": uid}) == (100, key, 5)
++
++
+ @pytest.mark.parametrize("unblock_later_ms,expected", [(5, "todo"), (-5, "blocked")])
+ def test_same_second_events_are_ordered_by_their_origin_clock_not_arrival(live, kanban_home, svc,
+                                                                            unblock_later_ms, expected):
+-- 
+2.43.0
+

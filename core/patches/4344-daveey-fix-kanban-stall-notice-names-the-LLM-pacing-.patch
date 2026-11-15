@@ -1,0 +1,779 @@
+From b89aa40118e2f96cd26f1957ecfa883e04c52d17 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 22:09:23 +0000
+Subject: [PATCH] [daveey] fix(kanban): stall notice names the LLM pacing wall
+ for a pool card no worker imported
+
+A ready card this gateway cannot lease, with no dispatch verdict (only skips saying the recording machine cannot lease it, such as the hub's labels_mismatch), got 'admission reason unknown' and the re-place advice while the pacing governor held the whole pool (t_01a1db9d9538716b; live case t_01a1db51b7673da0, ranked 62 of 66 under the import window).
+
+- kanban_llm_pacing_dispatch.paced_pools: the stall notice's read-only view of the pace this home stored (llm_pacing.json, fresh within STALE_READ_INTERVALS read intervals). It judges the card as hold() does (shared _governed, lane 'ready'), makes no usage read, writes nothing and holds nothing. Only a paced/held read for every candidate provider is positive.
+- kanban_parent_unclaimed: on a positive read, admission = {reason: llm_pacing, status: held, providers: [{provider, state, until?}]}, worded like #3058's paced skip (earliest until), without the priority/re-place advice. An absent, stale, open, unknown or failing read keeps today's payload and words (fail open, BLE001 with reason).
+- kanban_dispatch_skip.recorder_cannot_lease: skipped_ineligible/claim_deferred with labels_mismatch, pinned_only, held or offline is no verdict on the machines that can lease the card (allowlist; any other skip's verdict stands).
+- Guard amendment per the amended card body: test_only_kanban_dispatch_consults_the_governor lists kanban_parent_unclaimed.py and pins (AST) what it takes from the governor to NOTICE_VIEW = paced_pools, admission, admission_skip; a parametrized test shows hold(), a usage read, passing the module on or a dotted import breaks the pin.
+
+Tests: tests/hermes_cli/test_kanban_notice_pacing_admission.py (61; 39 fail at 5f224d4d77e, 61 pass), mutation check 36/36 killed; test_kanban_llm_pacing.py 26; the 7 regression files the card names pass unmodified with its counts.
+---
+ hermes_cli/kanban_dispatch_skip.py            |  13 +
+ hermes_cli/kanban_llm_pacing_dispatch.py      |  87 +++-
+ hermes_cli/kanban_parent_unclaimed.py         |  47 +-
+ tests/hermes_cli/test_kanban_llm_pacing.py    |  57 ++-
+ .../test_kanban_notice_pacing_admission.py    | 444 ++++++++++++++++++
+ 5 files changed, 632 insertions(+), 16 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_notice_pacing_admission.py
+
+diff --git a/hermes_cli/kanban_dispatch_skip.py b/hermes_cli/kanban_dispatch_skip.py
+index dd8b84777e..99a7f675bb 100644
+--- a/hermes_cli/kanban_dispatch_skip.py
++++ b/hermes_cli/kanban_dispatch_skip.py
+@@ -340,6 +340,19 @@ def is_ordering(skip: Optional[dict[str, Any]]) -> bool:
+                            or skip.get("reason") == "per_profile_capped")
+ 
+ 
++# The details a skip carries when it says only that the machine which recorded it cannot lease the card: the Board's
++# eligibility refusals for that machine (``kanban_worker_node.eligible``) and its own unreachable Board. A tuple, not
++# a set: a synced payload's detail may be any JSON value.
++_RECORDER_ONLY = ("labels_mismatch", "pinned_only", "held", "offline")
++
++
++def recorder_cannot_lease(skip: dict[str, Any]) -> bool:
++    """True when ``skip`` says only that the machine which recorded it cannot lease the card. It is no verdict on
++    the machines that can, so a notice may still name what holds them (``kanban_parent_unclaimed``,
++    t_01a1db9d9538716b); any other skip came from a dispatcher able to lease the card, and its verdict stands."""
++    return skip.get("reason") in ("skipped_ineligible", "claim_deferred") and skip.get("detail") in _RECORDER_ONLY
++
++
+ def advice(skip: dict[str, Any], *, now: Optional[float] = None) -> str:
+     """What to do about a non-ordering skip; never a priority change. A quota wall whose ``until`` has passed by
+     ``now`` (default ``time.time()``) drops "starts on its own when that wall resets": :func:`pool_replace_helps`
+diff --git a/hermes_cli/kanban_llm_pacing_dispatch.py b/hermes_cli/kanban_llm_pacing_dispatch.py
+index 4eaacf188a..c23e4df88c 100644
+--- a/hermes_cli/kanban_llm_pacing_dispatch.py
++++ b/hermes_cli/kanban_llm_pacing_dispatch.py
+@@ -9,7 +9,9 @@ before any claim (:func:`hold`). Pool math and the incident are in ``kanban_llm_
+ * Each governed provider's OAuth pool is read (``/api/oauth/usage``, read-only) at most every
+   ``read_interval`` seconds per Hermes home; samples and this host's running count on the provider are kept in
+   ``<kanban home>/llm_pacing.json`` for burn rates and average concurrency.
+-* Only Kanban dispatch consults this module: chats, cron and notice delivery never do.
++* Only Kanban dispatch consults this module: chats, cron and notice delivery never do. The one reader outside the
++  claim path is :func:`paced_pools`, the stall notices' view of the pace this home stored: it reads usage never,
++  writes nothing and holds nothing.
+ * Any read or resolve fault starts the card (fail open, warned once per interval).
+ * ``kanban.llm_pacing.enabled: false`` restores the ungoverned behaviour.
+ """
+@@ -29,7 +31,11 @@ logger = logging.getLogger(__name__)
+ 
+ READ_DEADLINE_SECONDS = 10.0
+ EVENT_KIND = "llm_paced"
++ADMISSION_REASON = "llm_pacing"  # the ``admission.reason`` of a stall notice for a pool the governor holds
+ EVENT_REPEAT_SECONDS = 3600
++# A stored pace older than this many read intervals is no read: a dispatcher on this home replaces it every interval
++# while any governed card passes it, so a gap this long means nothing has judged the pool since.
++STALE_READ_INTERVALS = 3
+ _STATE_FILE = "llm_pacing.json"
+ _CACHE: dict[str, tuple[float, lp.PoolPace]] = {}
+ _CLASS_CACHE: dict[str, tuple[float, list[str]]] = {}
+@@ -261,19 +267,82 @@ def _record(conn: sqlite3.Connection, task_id: str, verdicts: list[dict], result
+         kb._append_event(conn, task_id, EVENT_KIND, {"providers": verdicts, "until": until})
+ 
+ 
++def _governed(conn: sqlite3.Connection, task_id: str, lane: str, cfg: lp.PacingConfig) -> Optional[tuple[Any, list[str]]]:
++    """``(task, providers)`` for a card the governor judges on ``lane``; None when it starts regardless: no such card,
++    a mandatory pin, an unknown route or a provider the governor does not govern."""
++    from hermes_cli import kanban_db as kb
++    task = kb.get_task(conn, task_id)
++    if task is None or int(getattr(task, "model_pin_mandatory", 0) or 0):
++        return None
++    providers = candidate_providers(conn, task, lane)
++    if not providers or any(p not in cfg.providers for p in providers):
++        return None
++    return task, providers
++
++
++def _stored_pace(entry: Any, now: float, cfg: lp.PacingConfig) -> Optional[lp.PoolPace]:
++    """The pace a dispatcher on this home stored for one provider; None when it is absent, malformed, stamped in the
++    future or older than :data:`STALE_READ_INTERVALS` read intervals."""
++    read_at = entry.get("read_at") if isinstance(entry, dict) else None
++    if not isinstance(read_at, (int, float)):
++        return None
++    return lp.PoolPace.from_dict(entry.get("pace")) if 0 <= now - read_at < STALE_READ_INTERVALS * cfg.read_interval else None
++
++
++def paced_pools(conn: sqlite3.Connection, task_id: str) -> Optional[list[lp.PoolPace]]:
++    """The pools holding ready card ``task_id``, for a stall notice: one :class:`~kanban_llm_pacing.PoolPace` per
++    candidate provider when EVERY candidate is stored as ``paced`` or ``held``; else None (no positive read).
++
++    A notice describes the hold, it never makes one: this reads the pace the dispatchers of this home stored
++    (``llm_pacing.json``; pool workers draw the same accounts from the hub's relay), makes no usage read and writes
++    nothing. It judges the card as :func:`hold` does (:func:`_governed`) and, like :func:`_verdicts`, finds no hold as
++    soon as one candidate is open, unknown or unread: the card may start there. The pool's state, not this host's slot
++    math: the hosts that would run the card keep their own concurrency, so a held pool admits nothing anywhere and a
++    paced pool limits every host. Faults propagate; the caller fails open."""
++    cfg = load_config()
++    judged = _governed(conn, task_id, "ready", cfg) if cfg.enabled else None
++    if judged is None:
++        return None
++    stored, now = _load_state(state_path()), time.time()
++    paces: list[lp.PoolPace] = []
++    for provider in judged[1]:
++        pace = _stored_pace(stored.get(provider), now, cfg)
++        if pace is None or pace.state not in (lp.PACED, lp.HELD):
++            return None
++        paces.append(pace)
++    return paces
++
++
++def admission(paces: list[lp.PoolPace]) -> dict[str, Any]:
++    """The ``admission`` a stall notice carries for :func:`paced_pools`: each pool's state, and ``until`` when known."""
++    return {"reason": ADMISSION_REASON, "status": "held", "providers": [
++        {"provider": p.provider, "state": p.state, **({"until": int(p.until)} if p.until else {})} for p in paces]}
++
++
++def admission_skip(stored: Any) -> Optional[dict[str, Any]]:
++    """The ``llm_paced`` skip a stored :func:`admission` stands for, so a notice words and advises it as the
++    dispatcher's own hold does (``kanban_dispatch_skip``): every pool, and the earliest ``until``. None for any other
++    admission and for a malformed one."""
++    if not isinstance(stored, dict) or stored.get("reason") != ADMISSION_REASON:
++        return None
++    listed = stored.get("providers")
++    pools = [p for p in listed if isinstance(p, dict) and p.get("provider") and p.get("state") in (lp.PACED, lp.HELD)
++             ] if isinstance(listed, list) else []
++    if not pools:
++        return None
++    until = [p["until"] for p in pools if isinstance(p.get("until"), (int, float)) and not isinstance(p["until"], bool)]
++    return {"reason": EVENT_KIND, "detail": ", ".join(f"{p['provider']} {p['state']}" for p in pools),
++            **({"until": min(until)} if until else {})}
++
++
+ def hold(conn: sqlite3.Connection, row: Any, lane: str, result: Any, *, dry_run: bool = False) -> bool:
+     """True when the card must wait for its provider's pool to come back to pace (recorded on ``result``)."""
+     try:
+         cfg = load_config()
+-        if not cfg.enabled:
+-            return False
+-        from hermes_cli import kanban_db as kb
+-        task = kb.get_task(conn, row["id"])
+-        if task is None or int(getattr(task, "model_pin_mandatory", 0) or 0):
+-            return False
+-        providers = candidate_providers(conn, task, lane)
+-        if not providers or any(p not in cfg.providers for p in providers):
++        judged = _governed(conn, row["id"], lane, cfg) if cfg.enabled else None
++        if judged is None:
+             return False
++        task, providers = judged
+         verdicts = _verdicts(conn, task, providers, lane, cfg)
+         if verdicts is None:
+             return False
+diff --git a/hermes_cli/kanban_parent_unclaimed.py b/hermes_cli/kanban_parent_unclaimed.py
+index a23ee769ca..d1ae4aec3f 100644
+--- a/hermes_cli/kanban_parent_unclaimed.py
++++ b/hermes_cli/kanban_parent_unclaimed.py
+@@ -97,22 +97,34 @@ def _pool_suffix(payload: dict[str, Any]) -> str:
+ 
+ def _observation(payload: dict[str, Any]) -> str:
+     """``board <b>, observed <HH:MM:SSZ>, admission reason <r | unknown>`` for the notice text (empty on an old
+-    payload without those fields)."""
++    payload without those fields). A pacing admission names the hold and its until time after the reason."""
+     if "observed_at" not in payload:
+         return ""
+-    stamp = time.strftime("%H:%M:%SZ", time.gmtime(int(payload["observed_at"])))
++    at = int(payload["observed_at"])
+     admission = payload.get("admission") if isinstance(payload.get("admission"), dict) else {}
+     reason = admission.get("reason") or "unknown"
+-    return f" [board {payload.get('board') or 'unknown'}, observed {stamp}, admission reason {reason}]"
++    from hermes_cli import kanban_llm_pacing_dispatch as pacing
++    held = pacing.admission_skip(admission)
++    if held:
++        from hermes_cli.kanban_dispatch_skip import words
++        reason = f"{reason}: {words(held, now=at)}"
++    return (f" [board {payload.get('board') or 'unknown'}, observed {time.strftime('%H:%M:%SZ', time.gmtime(at))}, "
++            f"admission reason {reason}]")
+ 
+ 
+ def _options(parent_id: str, evidence: Optional[dict[str, Any]] = None,
+              payload: Optional[dict[str, Any]] = None, now: Optional[float] = None) -> str:
+     """Capacity advice, or the recorded skip's (or the unrecorded skip's) advice without priority changes. A card
+-    whose matching machines claimed same-label cards during the wait is queued, so no re-place is offered."""
++    whose matching machines claimed same-label cards during the wait is queued, so no re-place is offered; one whose
++    pool the LLM pacing governor holds starts on its own, so neither is a priority change or a re-place."""
+     from hermes_cli import kanban_label_backlog as klb
+     if klb.busy((payload or {}).get("label_backlog")):
+         return f"Not a placement problem, do not re-place: {klb.ADVICE}"
++    from hermes_cli import kanban_llm_pacing_dispatch as pacing
++    from hermes_cli.kanban_dispatch_skip import advice as skip_advice
++    held = pacing.admission_skip((payload or {}).get("admission"))
++    if held:
++        return f"{NO_FIX}: " + skip_advice(held, now=now)
+     from hermes_cli.kanban_dispatch_skip import notice_advice
+     from hermes_cli.kanban_priority import advice
+     return f"{NO_FIX}: " + (notice_advice(payload or {}, now=now) or advice(parent_id, evidence))
+@@ -211,6 +223,30 @@ def _already_posted(conn, task_id: str, waiting_on: str, wait_key: Any, kind: st
+                                         (task_id, kind)))
+ 
+ 
++def _pacing_admission(conn, task_id: str, place: dict[str, Any], extra: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
++    """The ``admission`` for a card that only other machines can lease while this gateway's own LLM pacing governor
++    holds every provider it may run on (t_01a1db9d9538716b); None otherwise, so the notice keeps its words.
++
++    Workers import other gateways' cards in priority order, so a low-ranked card gets no verdict from any dispatcher
++    able to lease it, and its wait is the pool's pace (``kanban_llm_pacing_dispatch.paced_pools``: pool workers draw
++    the same accounts from this gateway's relay). A hold on every matching machine, a card the Board does not hold, a
++    verdict from a dispatcher able to lease the card and a read that fails or is not positive all leave it alone."""
++    if place.get("lane") != "machine" or (extra or {}).get("missing_shared_board"):
++        return None
++    if set(place.get("machines") or ()) <= {*(place.get("held") or ()), *(place.get("draining") or ())}:
++        return None  # every machine that could lease it is on hold or draining: that wait ends differently
++    try:
++        from hermes_cli import kanban_dispatch_skip as skips
++        from hermes_cli import kanban_llm_pacing_dispatch as pacing
++        if not all(skips.recorder_cannot_lease(skip) for skip in skips.episode_skips(conn, task_id)):
++            return None  # a dispatcher able to lease it recorded a verdict: the notice does not talk over it
++        paces = pacing.paced_pools(conn, task_id)
++        return pacing.admission(paces) if paces else None
++    except Exception:  # health: allow BLE001 -- the governor read is advisory; the notice still goes out as before
++        _log.debug("parent-unclaimed: pacing read unavailable for %s", task_id, exc_info=True)
++        return None
++
++
+ def post_notice(conn, task_id: str, waiting_on: str, *, wait_key: Any, waited_seconds: float,
+                 ready_seconds: float, parent_title: Optional[str] = None, kind: str = NOTICE_KIND,
+                 extra: Optional[dict[str, Any]] = None) -> bool:
+@@ -230,7 +266,8 @@ def post_notice(conn, task_id: str, waiting_on: str, *, wait_key: Any, waited_se
+     observed = {"board": place.get("board") or khc.board_of(conn), "observed_at": place.get("observed_at") or int(time.time()),
+                 "admission": ({"reason": "core_update_hold", "status": "held"} if (extra or {}).get("core_update_hold")
+                               else {"reason": klb.REASON, "status": "queued"} if busy
+-                              else {"reason": None, "status": "unknown"})}
++                              else _pacing_admission(conn, waiting_on, place, extra)
++                              or {"reason": None, "status": "unknown"})}
+     guard = place.get("reason") if place.get("lane") == "respawn_guard" else None
+     pool_hint = "" if guard else _pool_sentence(place, observed["observed_at"])  # outside the queue clause (#1821)
+     checkpoint = last_checkpoint.notice_fields(conn, waiting_on)  # same lookup supplies fields and evidence [daveey]
+diff --git a/tests/hermes_cli/test_kanban_llm_pacing.py b/tests/hermes_cli/test_kanban_llm_pacing.py
+index 7fb4a4a221..7c390439d9 100644
+--- a/tests/hermes_cli/test_kanban_llm_pacing.py
++++ b/tests/hermes_cli/test_kanban_llm_pacing.py
+@@ -1,6 +1,7 @@
+ """LLM quota pacing governor: pool math and Kanban dispatch admission (t_01a1d975f57bb7b8). [daveey]"""
+ from __future__ import annotations
+ 
++import ast
+ import pathlib
+ import time
+ from types import SimpleNamespace
+@@ -264,10 +265,62 @@ def test_ungoverned_provider_is_not_throttled(paced_board, monkeypatch):
+ 
+ 
+ def test_only_kanban_dispatch_consults_the_governor():
+-    """Chats, cron and notice delivery never import it: only the dispatcher's claim path does."""
++    """Chats, cron and notice delivery never hold a card on it, read usage through it or write its state: only the
++    dispatcher's claim path does. The one other reader is the stall notice (``kanban_parent_unclaimed``,
++    t_01a1db9d9538716b), and it may take only the read-only view of the stored pace (``NOTICE_VIEW``)."""
+     root = pathlib.Path(pd.__file__).resolve().parents[1]
+     users = sorted(str(p.relative_to(root)) for top in ("agent", "gateway", "cron", "hermes_cli", "tui_gateway")
+                    if (root / top).is_dir() for p in (root / top).rglob("*.py")
+                    if "kanban_llm_pacing" in p.read_text(encoding="utf-8", errors="ignore"))
+     assert users == ["hermes_cli/kanban_db_dispatch.py", "hermes_cli/kanban_llm_pacing.py",
+-                     "hermes_cli/kanban_llm_pacing_dispatch.py"]
++                     "hermes_cli/kanban_llm_pacing_dispatch.py", "hermes_cli/kanban_parent_unclaimed.py"]
++    assert _governor_names(root / "hermes_cli/kanban_parent_unclaimed.py") == NOTICE_VIEW
++
++
++# What the stall notice may take from the governor: no hold(), no usage read, no state write.
++NOTICE_VIEW = {"kanban_llm_pacing_dispatch": {"admission", "admission_skip", "paced_pools"}}
++
++
++def _governor_names(path: pathlib.Path) -> dict[str, set[str]]:
++    """Each governor module ``path`` imports, with every name it imports from it or reads off it as ``alias.name``.
++    A dotted ``import`` of one, or its alias used any other way (passed on, stored), is listed as such."""
++    tree = ast.parse(path.read_text(encoding="utf-8"))
++    parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
++    aliases: dict[str, str] = {}
++    names: dict[str, set[str]] = {}
++    for node in ast.walk(tree):
++        if isinstance(node, ast.Import):
++            for alias in node.names:
++                if "kanban_llm_pacing" in alias.name:
++                    names.setdefault(alias.name, set()).add("<module import>")
++        elif isinstance(node, ast.ImportFrom) and "kanban_llm_pacing" in (node.module or ""):
++            names.setdefault(node.module.rsplit(".", 1)[-1], set()).update(a.name for a in node.names)
++        elif isinstance(node, ast.ImportFrom):
++            for alias in node.names:
++                if "kanban_llm_pacing" in alias.name:
++                    aliases[alias.asname or alias.name] = alias.name
++                    names.setdefault(alias.name, set())
++    for node in ast.walk(tree):
++        if isinstance(node, ast.Name) and node.id in aliases and isinstance(node.ctx, ast.Load):
++            parent = parents.get(node)
++            names[aliases[node.id]].add(parent.attr if isinstance(parent, ast.Attribute) and parent.value is node
++                                        else "<bare module use>")
++    return names
++
++
++@pytest.mark.parametrize("source, seen", [
++    ("from hermes_cli import kanban_llm_pacing_dispatch as p\np.admission(p.paced_pools(c, t))\np.admission_skip(a)\n",
++     NOTICE_VIEW),
++    ("from hermes_cli import kanban_llm_pacing_dispatch as p\np.paced_pools(c, t)\np.hold(c, r, 'ready', x)\n",
++     {"kanban_llm_pacing_dispatch": {"paced_pools", "hold"}}),
++    ("from hermes_cli import kanban_llm_pacing_dispatch as p\nkeep(p)\n", {"kanban_llm_pacing_dispatch": {"<bare module use>"}}),
++    ("from hermes_cli.kanban_llm_pacing_dispatch import read_pool\n", {"kanban_llm_pacing_dispatch": {"read_pool"}}),
++    ("import hermes_cli.kanban_llm_pacing_dispatch\n", {"hermes_cli.kanban_llm_pacing_dispatch": {"<module import>"}}),
++    ("from hermes_cli import kanban_llm_pacing as lp\nlp.admit_limit(x)\n", {"kanban_llm_pacing": {"admit_limit"}}),
++])
++def test_the_notice_view_pin_sees_every_way_to_reach_the_governor(tmp_path, source, seen):
++    """The pin above holds only if ``_governor_names`` reports a hold(), a usage read, the module passed on or a
++    dotted import; anything beyond the allowed view must differ from ``NOTICE_VIEW``."""
++    module = tmp_path / "notice.py"
++    module.write_text(source, encoding="utf-8")
++    assert _governor_names(module) == seen
+diff --git a/tests/hermes_cli/test_kanban_notice_pacing_admission.py b/tests/hermes_cli/test_kanban_notice_pacing_admission.py
+new file mode 100644
+index 0000000000..85d81531aa
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_notice_pacing_admission.py
+@@ -0,0 +1,444 @@
++"""A stall notice for a pool card no worker imported names the LLM pacing hold this gateway reads. [daveey]
++
++Defect t_01a1db9d9538716b (hub, 2026-11-14): ``chat_wait_unclaimed`` for a ready ``pool:worker`` card said
++"admission reason unknown" and "re-place on a capable gateway" while every pool worker's dispatcher was held by the
++LLM pacing governor (anthropic paced, openai-codex held until 11-20 22:40Z). Workers import other gateways' cards in
++priority order and this one ranked 62 of 66, so no dispatcher able to lease it ever recorded a verdict; the only skip
++on it was the hub's own ``skipped_ineligible: labels_mismatch`` ("this machine cannot lease it"). The hub's own
++governor file (``llm_pacing.json``) covers the same accounts, because pool workers draw theirs from the hub's relay.
++
++Only a positive read of that file (every candidate provider paced or held) changes the notice. An absent, stale,
++unreadable, failing or OPEN read leaves today's payload and words, "admission reason unknown" included.
++"""
++from __future__ import annotations
++
++import copy
++import json
++import time
++
++import pytest
++
++from hermes_cli import kanban_chat_wait as cw
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_dispatch_skip as skips
++from hermes_cli import kanban_llm_pacing as lp
++from hermes_cli import kanban_llm_pacing_dispatch as pd
++from hermes_cli import kanban_parent_unclaimed as pu
++from hermes_cli import kanban_queue_position as kqp
++from hermes_cli import kanban_worker_node as wn
++from tests.hermes_cli import _placement_helpers as helpers
++from tests.hermes_cli import test_kanban_label_backlog_wait as pool_wait
++from tests.hermes_cli import test_kanban_model_tier as model_tier
++
++hub = pool_wait.hub  # a hub that cannot lease ``pool:worker`` cards: the Board registry names two pool workers
++board = model_tier.board  # one unsynced gateway: every card is its own to lease
++LABELS = pool_wait.LABELS
++OPUS = "claude-opus-5-5"
++DAY = 86400
++UNKNOWN = {"reason": None, "status": "unknown"}
++READ_INTERVAL = lp.PacingConfig().read_interval
++# Verdicts a dispatcher able to lease the card records: the notice never talks over them.
++CAPABLE_VERDICTS = [("claim_deferred", "worker_capacity_full"), ("claim_deferred", "lease_held"),
++                    ("skipped_ineligible", "waiting_for_worker_capacity"), ("llm_paced", "anthropic paced"),
++                    ("owner_down", "offline")]  # last: a reason outside the eligibility pair, with one of its details
++# Skips that only say the RECORDING machine cannot lease the card (its own eligibility check, or the Board's).
++CANNOT_LEASE = [(reason, detail) for reason in ("skipped_ineligible", "claim_deferred")
++                for detail in ("labels_mismatch", "pinned_only", "offline", "held")]
++
++
++def _store(*pools, age=0.0):
++    """This gateway's own governor file as its dispatcher leaves it: ``(provider, state[, until])`` per pool."""
++    now = time.time()
++    data = {}
++    for provider, state, *until in pools:
++        pace = lp.PoolPace(provider, state, 0.0299 if state == lp.PACED else 0.0, until[0] if until else None,
++                           "6 of 7 accounts at 100% on the 7-day window")
++        data[provider] = {"read_at": now - age, "pace": pace.as_dict(), "running": [], "samples": []}
++    pd.state_path().write_text(json.dumps(data), encoding="utf-8")
++
++
++def _pool_card(conn, *, age=40 * 60, labels=None, title="waits on the pool", **kw):
++    """A ready card pinned to the pool's labels and to anthropic, owned by a chat, ready for ``age`` seconds, with
++    two older same-label cards ahead of it."""
++    now = int(time.time())
++    for i in range(2):
++        pool_wait._card(conn, f"older {i}", now - 3600 + i)
++    kw.setdefault("model_override", OPUS)
++    kw.setdefault("provider_override", "anthropic")
++    tid = kb.create_task(conn, title=title, assignee="default", runs_on=list(labels or LABELS),
++                         session_id="owner-chat", **kw)
++    with kb.write_txn(conn):
++        conn.execute("UPDATE tasks SET created_at = ? WHERE id = ?", (now - age, tid))
++        conn.execute("UPDATE task_events SET created_at = ? WHERE task_id = ? AND kind = 'created'", (now - age, tid))
++    return tid
++
++
++def _events(conn, tid, kind):
++    return [json.loads(p) for (p,) in conn.execute(
++        "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? ORDER BY id", (tid, kind))]
++
++
++def _chat_wait(conn, tid):
++    """The ``chat_wait_unclaimed`` event the dispatcher tick's sweep appends for ``tid``, and its chat line."""
++    assert cw.sweep(conn) == 1
++    (payload,) = _events(conn, tid, cw.NOTICE_KIND)
++    return payload, cw.notice_text(payload)
++
++
++def _parent_unclaimed(conn, parent):
++    """The ``dependency_parent_unclaimed`` event the same tick appends to a chat-owned child of ``parent``."""
++    child = kb.create_task(conn, title="child", assignee="default", parents=[parent], session_id="owner-chat")
++    with kb.write_txn(conn):
++        conn.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'dependency_wait', "
++                     "'{}', ?)", (child, int(time.time()) - 40 * 60))
++    assert pu.sweep(conn) == 1
++    (payload,) = _events(conn, child, pu.NOTICE_KIND)
++    return payload, pu.notice_text(payload)
++
++
++NOTICES = {"chat_wait": _chat_wait, "parent_unclaimed": _parent_unclaimed}
++
++
++def _hub_card(conn):
++    """The live shape: only the hub's own ``skipped_ineligible: labels_mismatch``, written 5 s after creation."""
++    tid = _pool_card(conn)
++    assert skips.record(conn, tid, "skipped_ineligible", detail="labels_mismatch")
++    return tid
++
++
++def _post(conn, tid, **extra):
++    """One ``chat_wait_unclaimed`` notice for ``tid`` posted directly, with the sweep's ``extra`` fields."""
++    assert pu.post_notice(conn, tid, tid, wait_key="ready@1", waited_seconds=2400, ready_seconds=2400,
++                          kind=cw.NOTICE_KIND, extra=extra or None)
++    (payload,) = _events(conn, tid, cw.NOTICE_KIND)
++    return payload
++
++
++def _assert_names_no_re_placement(text):
++    assert "admission reason unknown" not in text and "re-place on a capable gateway" not in text, text
++    assert "re-place" not in text and "bump" not in text, text
++
++
++def _assert_queue_words_as_before(payload, text, render):
++    """Out of scope and pinned elsewhere: the queue count and the lease clause read exactly as the same notice with
++    today's "unknown" admission reads them."""
++    before = render({**payload, "admission": UNKNOWN})
++    assert text.split(" [board")[0] == before.split(" [board")[0], (text, before)
++    assert "this machine cannot lease it" in text, text
++
++
++# --- card cases 1 and 2: a paced pool is named, by both notices -----------------------------------------------------
++
++
++def test_chat_wait_notice_for_a_never_imported_pool_card_names_the_paced_pool(hub):
++    _store(("anthropic", lp.PACED))
++    tid = _hub_card(hub.conn)
++    payload, text = _chat_wait(hub.conn, tid)
++    assert payload["admission"] == {"reason": "llm_pacing", "status": "held",
++                                    "providers": [{"provider": "anthropic", "state": "paced"}]}, payload
++    assert "admission reason llm_pacing: held: LLM quota pacing (anthropic paced pool)" in text, text
++    assert "it starts on its own once its provider pool is back on pace" in text, text
++    _assert_names_no_re_placement(text)
++    _assert_queue_words_as_before(payload, text, cw.notice_text)
++    assert "2 card(s) with matching labels ahead of it" in text, text
++    # Not suppressed, and still once per ready episode.
++    assert cw.sweep(hub.conn) == 0 and len(_events(hub.conn, tid, cw.NOTICE_KIND)) == 1
++
++
++def test_parent_unclaimed_notice_for_a_never_imported_pool_card_names_the_paced_pool(hub):
++    _store(("anthropic", lp.PACED))
++    parent = _hub_card(hub.conn)
++    payload, text = _parent_unclaimed(hub.conn, parent)
++    assert payload["admission"] == {"reason": "llm_pacing", "status": "held",
++                                    "providers": [{"provider": "anthropic", "state": "paced"}]}, payload
++    assert "admission reason llm_pacing: held: LLM quota pacing (anthropic paced pool)" in text, text
++    assert "it starts on its own once its provider pool is back on pace" in text, text
++    _assert_names_no_re_placement(text)
++    _assert_queue_words_as_before(payload, text, pu.notice_text)
++    assert pu.sweep(hub.conn) == 0  # still once per wait
++
++
++# --- card case 3: a held pool carries its until time ----------------------------------------------------------------
++
++
++@pytest.mark.parametrize("path", sorted(NOTICES))
++def test_held_pool_notice_carries_the_until_time(hub, path):
++    until = int(time.time()) + 5 * DAY
++    _store(("anthropic", lp.HELD, until + 0.7))  # the governor stores a float; the notice carries whole seconds
++    tid = _hub_card(hub.conn)
++    payload, text = NOTICES[path](hub.conn, tid)
++    assert payload["admission"] == {"reason": "llm_pacing", "status": "held",
++                                    "providers": [{"provider": "anthropic", "state": "held", "until": until}]}, payload
++    stamp = time.strftime("%Y-%m-%d %H:%MZ", time.gmtime(until))
++    assert f"held: LLM quota pacing (anthropic held pool) until {stamp}" in text, text
++    _assert_names_no_re_placement(text)
++
++
++# --- card case 4: no positive read, today's payload and words -------------------------------------------------------
++
++
++@pytest.mark.parametrize("read", ["open", "unknown", "absent", "unreadable", "stale", "failing"])
++@pytest.mark.parametrize("path", sorted(NOTICES))
++def test_without_a_positive_governor_read_the_notice_is_as_before(hub, monkeypatch, path, read):
++    {"open": lambda: _store(("anthropic", lp.OPEN)),
++     "unknown": lambda: _store(("anthropic", lp.UNKNOWN)),
++     "absent": lambda: None,
++     "unreadable": lambda: pd.state_path().write_text("{not json", encoding="utf-8"),
++     "stale": lambda: _store(("anthropic", lp.PACED), age=10 * READ_INTERVAL),
++     "failing": lambda: _store(("anthropic", lp.PACED))}[read]()
++    asked, real = [], getattr(pd, "paced_pools", None)
++
++    def governor(conn, task_id, *args, **kw):
++        asked.append(task_id)
++        if read == "failing":
++            raise RuntimeError("governor read failed")
++        return real(conn, task_id, *args, **kw)
++
++    monkeypatch.setattr(pd, "paced_pools", governor, raising=False)
++    tid = _hub_card(hub.conn)
++    payload, text = NOTICES[path](hub.conn, tid)
++    assert asked == [tid], asked  # the emitting gateway asked its own governor, once, for this card
++    assert payload["admission"] == UNKNOWN, payload
++    assert "admission reason unknown" in text and "re-place on a capable gateway with free slots" in text, text
++    assert "pacing" not in json.dumps(payload) and "pacing" not in text, (payload, text)
++
++
++# --- every condition the rule adds ----------------------------------------------------------------------------------
++
++
++def test_a_card_this_gateway_can_lease_keeps_its_own_dispatchers_words(board):
++    _store(("anthropic", lp.PACED))
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="local", assignee="default", model_override=OPUS, provider_override="anthropic",
++                             session_id="owner-chat")
++        with kb.write_txn(conn):
++            conn.execute("UPDATE tasks SET created_at = ? WHERE id = ?", (int(time.time()) - 40 * 60, tid))
++            conn.execute("UPDATE task_events SET created_at = ? WHERE task_id = ?", (int(time.time()) - 40 * 60, tid))
++        payload, text = _chat_wait(conn, tid)
++    assert payload["admission"] == UNKNOWN and "LLM quota pacing" not in text, (payload, text)
++
++
++def test_an_unplaceable_card_keeps_the_re_place_advice(hub):
++    _store(("anthropic", lp.PACED))
++    tid = _pool_card(hub.conn)
++    with kb.write_txn(hub.conn):  # create_task refuses labels no machine carries; an old card can still hold them
++        hub.conn.execute("UPDATE tasks SET runs_on = ? WHERE id = ?",
++                         (json.dumps(["capability:no-machine-carries-this"]), tid))
++    payload, text = _chat_wait(hub.conn, tid)
++    assert payload["admission"] == UNKNOWN and "unplaceable: no machine can run it" in text, (payload, text)
++    assert "LLM quota pacing" not in text and "re-place on a capable gateway" in text, text
++
++
++def _machine_state(kind):
++    return {"held": {"hold": True}, "draining": {"metrics": {"at": int(time.time() * 1000), "drain_active": 1}}}[kind]
++
++
++def _set_registry(states):
++    """The pool registry with ``{worker: "held" | "draining"}`` applied (the hub fetches it fresh on every read)."""
++    machines = copy.deepcopy(pool_wait.POOL)
++    for name, kind in states.items():
++        machines[name].update(_machine_state(kind))
++    wn.set_registry_fetch(lambda: {"me": pool_wait.HUB, "machines": helpers.seen_now(machines.values())})
++
++
++@pytest.mark.parametrize("states", [("held", "held"), ("draining", "draining"), ("held", "draining")])
++def test_a_pool_whose_every_matching_machine_is_held_or_draining_keeps_that_explanation(hub, states):
++    """It starts when an operator releases the hold or the drain ends, not "once its provider pool is back on pace"."""
++    _store(("anthropic", lp.PACED))
++    _set_registry(dict(zip(("worker-3", "worker-4"), states)))
++    tid = _hub_card(hub.conn)
++    place = kqp.placement(hub.conn, tid)  # the registry says what it should, or this test proves nothing
++    assert place["lane"] == "machine" and sorted((place.get("held") or []) + (place.get("draining") or [])) == [
++        "worker-3", "worker-4"], place
++    payload, text = _chat_wait(hub.conn, tid)
++    assert payload["admission"] == UNKNOWN and "LLM quota pacing" not in text, (payload, text)
++
++
++@pytest.mark.parametrize("kind", ["held", "draining"])
++def test_one_machine_able_to_lease_it_is_enough_for_the_pacing_notice(hub, kind):
++    _store(("anthropic", lp.PACED))
++    _set_registry({"worker-3": kind})  # worker-4 is neither: the live case had 1 of 8 workers draining
++    tid = _hub_card(hub.conn)
++    place = kqp.placement(hub.conn, tid)
++    assert place["lane"] == "machine" and place.get(kind) == ["worker-3"], place
++    payload, text = _chat_wait(hub.conn, tid)
++    assert payload["admission"]["reason"] == "llm_pacing" and "LLM quota pacing" in text, (payload, text)
++
++
++@pytest.mark.parametrize("verdict", CAPABLE_VERDICTS)
++def test_a_verdict_recorded_by_a_dispatcher_able_to_lease_the_card_keeps_todays_notice(hub, verdict):
++    _store(("anthropic", lp.PACED))
++    tid = _hub_card(hub.conn)
++    assert skips.record(hub.conn, tid, verdict[0], detail=verdict[1])
++    payload, text = _chat_wait(hub.conn, tid)
++    assert payload["admission"] == UNKNOWN and "LLM quota pacing" not in text, (payload, text)
++
++
++@pytest.mark.parametrize("cannot_lease", CANNOT_LEASE)
++def test_a_skip_that_only_says_the_recording_gateway_cannot_lease_the_card_is_no_verdict(hub, cannot_lease):
++    _store(("anthropic", lp.PACED))
++    tid = _pool_card(hub.conn)
++    assert skips.record(hub.conn, tid, cannot_lease[0], detail=cannot_lease[1])
++    payload, text = _chat_wait(hub.conn, tid)
++    assert payload["admission"]["reason"] == "llm_pacing", payload
++    assert "held: LLM quota pacing (anthropic paced pool)" in text, text
++
++
++def test_a_card_without_any_skip_is_named_too(hub):
++    _store(("anthropic", lp.PACED))
++    payload, text = _chat_wait(hub.conn, _pool_card(hub.conn))
++    assert payload["admission"]["reason"] == "llm_pacing" and "LLM quota pacing" in text, (payload, text)
++
++
++def test_a_busy_pool_and_a_core_update_hold_still_come_first(hub):
++    _store(("anthropic", lp.PACED))
++    busy = _pool_card(hub.conn, title="behind three claims")
++    now = int(time.time())
++    for i in range(3):  # three same-label cards claimed by the pool within 30 min
++        claimed = pool_wait._card(hub.conn, f"claimed {i}", now - 4000 + i)
++        with kb.write_txn(hub.conn):
++            hub.conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (claimed,))
++            kb._append_event(hub.conn, claimed, "claimed", {"holder": f"worker-{3 + i % 2}", "run_uid": f"r{i}"})
++    payload = _post(hub.conn, busy)
++    assert payload["admission"] == {"reason": "matching_pool_busy", "status": "queued"}, payload
++    held = _pool_card(hub.conn, title="held for an update")
++    assert _post(hub.conn, held, core_update_hold=True)["admission"] == {"reason": "core_update_hold", "status": "held"}
++
++
++def test_a_card_missing_from_the_shared_board_is_not_a_pacing_wait(hub):
++    """No worker can import a card the Board does not hold: the sync repair is the advice, not the pool's pace."""
++    _store(("anthropic", lp.PACED))
++    tid = _hub_card(hub.conn)
++    assert _post(hub.conn, tid, missing_shared_board=True, sync_reject_reason="rejected")["admission"] == UNKNOWN
++
++
++def test_an_ungoverned_provider_and_a_mandatory_pin_always_start_so_they_are_not_named(hub):
++    _store(("anthropic", lp.PACED), ("zai", lp.PACED))
++    for kw in ({"model_override": "glm-5", "provider_override": "zai"}, {"pin_mandatory": True}):
++        assert _post(hub.conn, _pool_card(hub.conn, **kw))["admission"] == UNKNOWN, kw
++
++
++# --- the governor read itself ---------------------------------------------------------------------------------------
++
++
++@pytest.fixture
++def card(board):
++    with kbc.connect() as conn:
++        yield conn, kb.create_task(conn, title="pinned", assignee="default", model_override=OPUS,
++                                   provider_override="anthropic")
++
++
++def test_the_read_returns_every_candidate_pool_when_all_are_paced_or_held(card, monkeypatch):
++    conn, tid = card
++    until = time.time() + DAY
++    monkeypatch.setattr(pd, "candidate_providers", lambda *_a: ["anthropic", "openai-codex"])
++    _store(("anthropic", lp.PACED), ("openai-codex", lp.HELD, until))
++    paces = pd.paced_pools(conn, tid)
++    assert [(p.provider, p.state, p.until) for p in paces] == [("anthropic", lp.PACED, None),
++                                                              ("openai-codex", lp.HELD, until)]
++
++
++@pytest.mark.parametrize("other", [("openai-codex", lp.OPEN), ("openai-codex", lp.UNKNOWN), None])
++def test_one_candidate_pool_that_is_not_paced_or_held_means_no_positive_read(card, monkeypatch, other):
++    """The card may run there, so the governor does not hold it: ``_verdicts`` returns None at the first admitting pool."""
++    conn, tid = card
++    monkeypatch.setattr(pd, "candidate_providers", lambda *_a: ["anthropic", "openai-codex"])
++    _store(("anthropic", lp.PACED), *([other] if other else []))
++    assert pd.paced_pools(conn, tid) is None
++
++
++def test_no_candidate_provider_means_no_positive_read(card, monkeypatch):
++    conn, tid = card
++    _store(("anthropic", lp.PACED))
++    monkeypatch.setattr(pd, "candidate_providers", lambda *_a: [])
++    assert pd.paced_pools(conn, tid) is None
++
++
++@pytest.mark.parametrize("cfg", [lp.PacingConfig(enabled=False), lp.PacingConfig(providers=("openai-codex",))],
++                         ids=["disabled", "provider-not-governed"])
++def test_the_read_follows_the_governors_own_start_rules(card, monkeypatch, cfg):
++    conn, tid = card
++    _store(("anthropic", lp.PACED))
++    assert [p.state for p in pd.paced_pools(conn, tid)] == [lp.PACED]  # the control: the card is judged
++    monkeypatch.setattr(pd, "load_config", lambda: cfg)  # enabled: false restores ungoverned claims; others always start
++    assert pd.paced_pools(conn, tid) is None
++
++
++def test_a_card_that_is_not_on_the_board_is_no_positive_read(card):
++    conn, _tid = card
++    _store(("anthropic", lp.PACED))
++    assert pd.paced_pools(conn, "t_missing") is None
++
++
++def test_the_read_ages_out_a_stored_pace_after_a_few_read_intervals(card):
++    conn, tid = card
++    bound = pd.STALE_READ_INTERVALS * READ_INTERVAL
++    _store(("anthropic", lp.PACED), age=bound - 30)
++    assert [p.state for p in pd.paced_pools(conn, tid)] == [lp.PACED]
++    _store(("anthropic", lp.PACED), age=bound + 30)
++    assert pd.paced_pools(conn, tid) is None
++    _store(("anthropic", lp.PACED), age=-3600)  # stamped in the future: not a read this gateway can age
++    assert pd.paced_pools(conn, tid) is None
++    data = json.loads(pd.state_path().read_text(encoding="utf-8"))
++    data["anthropic"]["read_at"] = "yesterday"
++    pd.state_path().write_text(json.dumps(data), encoding="utf-8")
++    assert pd.paced_pools(conn, tid) is None
++
++
++def test_the_read_makes_no_usage_read_and_writes_no_state(card, monkeypatch):
++    conn, tid = card
++    _store(("anthropic", lp.PACED))
++    before = pd.state_path().read_bytes()
++
++    def refused(*_a, **_kw):
++        raise AssertionError("a notice must not read account usage")
++
++    monkeypatch.setattr(pd, "read_pool", refused)
++    monkeypatch.setattr(pd, "_snapshots", refused)
++    assert [p.state for p in pd.paced_pools(conn, tid)] == [lp.PACED]
++    assert pd.state_path().read_bytes() == before
++
++
++# --- wording from a stored payload ----------------------------------------------------------------------------------
++
++
++def _line(admission, render=cw.notice_text):
++    return render({"parent": "t_1", "observed_at": 1_800_000_000, "board": "default", "queue": "q",
++                   "admission": admission})
++
++
++def test_a_stored_pacing_admission_renders_with_the_earliest_until():
++    soon, late = 1_800_100_000, 1_800_400_000
++    held = {"reason": "llm_pacing", "status": "held", "providers": [
++        {"provider": "anthropic", "state": "held", "until": late}, {"provider": "openai-codex", "state": "held",
++                                                                   "until": soon}]}
++    stamp = time.strftime("%Y-%m-%d %H:%MZ", time.gmtime(soon))
++    for render in (cw.notice_text, pu.notice_text):
++        text = _line(held, render)
++        assert f"admission reason llm_pacing: held: LLM quota pacing (anthropic held, openai-codex held pool) until " \
++               f"{stamp}]" in text, text
++        assert "re-place" not in text and "bump" not in text, text
++    mixed = {**held, "providers": [{"provider": "anthropic", "state": "paced"}, held["providers"][1]]}
++    assert f"(anthropic paced, openai-codex held pool) until {stamp}]" in _line(mixed)
++
++
++@pytest.mark.parametrize("admission", [
++    {"reason": "llm_pacing"}, {"reason": "llm_pacing", "providers": "x"},
++    {"reason": "llm_pacing", "providers": [None, 3, {"provider": "anthropic"}]},
++    {"reason": "llm_pacing", "providers": [{"state": "held"}, {"provider": "", "state": "paced"}]},  # no pool named
++    {"reason": "llm_pacing", "providers": 5},  # not a list, and not iterable
++    {"reason": "other_reason", "providers": [{"provider": "anthropic", "state": "paced"}]}, "llm_pacing", None,
++    UNKNOWN])
++def test_a_malformed_or_foreign_admission_does_not_render_pacing_words(admission):
++    for render in (cw.notice_text, pu.notice_text):
++        line = _line(admission, render)
++        assert "admission reason " in line and "LLM quota pacing" not in line, (admission, line)
++        assert "re-place on a capable gateway" in line, line  # the generic advice stands
++
++
++def test_an_until_that_is_not_a_time_is_left_out_of_the_words():
++    bad = {"reason": "llm_pacing", "status": "held", "providers": [
++        {"provider": "anthropic", "state": "held", "until": "soon"}, {"provider": "x", "state": "held", "until": True}]}
++    line = _line(bad)
++    assert "admission reason llm_pacing: held: LLM quota pacing (anthropic held, x held pool)]" in line, line
+-- 
+2.43.0
+

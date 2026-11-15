@@ -1,0 +1,205 @@
+From 058e710f71bc315a36bf8d8ac1d3addbd0a86e8b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 04:11:19 +0000
+Subject: [PATCH] [daveey] Normalize dashboard history and honor P2 event
+ invalidation
+
+Stage one of card E live CPU follow-up: immutable keyed history rows avoid repeated column scans; trusted P2 changes invalidate in-place event edits while bookkeeping-only rows reuse events. Full diagnostics remain fresh. Proof: two ingestion/bookkeeping regressions RED then GREEN; event edit/replacement and heartbeat cases RED on original source; 73 focused tests passed. This is not full budget acceptance; history reductions and scale/replay/live P1 remain.
+---
+ plugins/kanban/dashboard/board_incremental.py |  3 +-
+ plugins/kanban/dashboard/board_read.py        | 30 +++---
+ tests/plugins/test_kanban_board_history.py    | 97 +++++++++++++++++++
+ 3 files changed, 117 insertions(+), 13 deletions(-)
+ create mode 100644 tests/plugins/test_kanban_board_history.py
+
+diff --git a/plugins/kanban/dashboard/board_incremental.py b/plugins/kanban/dashboard/board_incremental.py
+index 5ff56aa992..caefe30140 100644
+--- a/plugins/kanban/dashboard/board_incremental.py
++++ b/plugins/kanban/dashboard/board_incremental.py
+@@ -188,7 +188,8 @@ def _diagnostics(conn, cards, by_id, prev, affected, diagnostic_inputs, br):
+     graphs = {tid: old_graph[tid] for tid in ids if tid not in refresh}
+     if refresh:
+         graphs.update(kanban_db.task_graph_contexts(conn, refresh))
+-    return br._incremental_diag_inputs(conn, diag_rows, prev["_memo"]["diag"], diagnostic_inputs, graphs=graphs)
++    return br._incremental_diag_inputs(conn, diag_rows, prev["_memo"]["diag"], diagnostic_inputs,
++                                       graphs=graphs, event_changed=affected)
+ 
+ 
+ def _pickers(conn, prev, changed):
+diff --git a/plugins/kanban/dashboard/board_read.py b/plugins/kanban/dashboard/board_read.py
+index 04c739017d..b612c671f1 100644
+--- a/plugins/kanban/dashboard/board_read.py
++++ b/plugins/kanban/dashboard/board_read.py
+@@ -7,6 +7,7 @@ from __future__ import annotations
+ import sqlite3
+ import time
+ from dataclasses import asdict
++from types import MappingProxyType
+ from typing import Callable, Optional
+ 
+ from hermes_cli import kanban_db
+@@ -30,12 +31,12 @@ def _rows_by_task(conn: sqlite3.Connection, table: str, row_ids: list) -> dict[s
+     if row_ids:
+         for row in conn.execute(
+                 f"SELECT * FROM {table} WHERE task_id IN ({_placeholders(row_ids)}) ORDER BY id", tuple(row_ids)):
+-            by_task.setdefault(row["task_id"], []).append(row)
+-    return {tid: tuple(v) for tid, v in by_task.items()}  # sqlite3.Row is immutable
++            by_task.setdefault(row["task_id"], []).append(MappingProxyType(dict(row)))
++    return {tid: tuple(v) for tid, v in by_task.items()}  # immutable, O(1) field lookup
+ 
+ 
+ def _raw(rows) -> tuple:
+-    return tuple(tuple(r) for r in rows)
++    return tuple(tuple(r.values()) if isinstance(r, MappingProxyType) else tuple(r) for r in rows)
+ 
+ 
+ _NO_EVENTS = (0, None)  # _event_marks of a task without events
+@@ -163,17 +164,22 @@ def _diag_memo(rows, events_by_task, runs_by_task, marks) -> dict:
+                       events_by_task.get(r["id"], ())) for r in rows}
+ 
+ 
+-def _incremental_diag_inputs(conn, diag_rows: list, prev: dict, diagnostic_inputs: Callable, *, graphs=None) -> tuple:
+-    """``(diagnostic inputs, memo)`` re-reading events only for tasks whose row, runs or event
+-    count/max id moved. A heartbeat touches one task: its row (``last_heartbeat_at``), its run
+-    and one event, so a refresh re-reads that task's events, not the board's ~50k. Runs and the
+-    graph/wake contexts are read whole (cheap, and a parent's change moves a child's graph)."""
++def _incremental_diag_inputs(conn, diag_rows: list, prev: dict, diagnostic_inputs: Callable, *,
++                             graphs=None, event_changed=None) -> tuple:
++    """Retain event histories independently of task/run bookkeeping. ``event_changed``
++    is the trusted P2 invalidation set; updates/deletes of events always mark their task.
++    Count/max additionally catches excluded heartbeat inserts. Legacy callers without
++    a cursor retain the conservative row/run invalidation. Clock/config rules stay fresh.
++    """
+     ids = [r["id"] for r in diag_rows]
+     marks = _event_marks(conn, ids)
+     runs = _rows_by_task(conn, "task_runs", ids)
++    raw_runs = {tid: _raw(runs[tid]) for tid in ids}
+     changed = {tid for r, tid in zip(diag_rows, ids)
+-               if (old := prev.get(tid)) is None or old[2] is None or old[0] != tuple(r)
+-               or old[1] != _raw(runs[tid]) or old[2] != marks.get(tid, _NO_EVENTS)}
++               if (old := prev.get(tid)) is None or old[2] is None
++               or old[2] != marks.get(tid, _NO_EVENTS)
++               or (event_changed is not None and tid in event_changed)
++               or (event_changed is None and (old[0] != tuple(r) or old[1] != raw_runs[tid]))}
+     part = diagnostic_inputs(conn, task_ids=[tid for tid in ids if tid in changed]) if changed else None
+     fresh_events = part[1] if part is not None else {}
+     events = {}
+@@ -181,10 +187,10 @@ def _incremental_diag_inputs(conn, diag_rows: list, prev: dict, diagnostic_input
+     for r, tid in zip(diag_rows, ids):
+         if tid in fresh_events or tid not in changed:
+             events[tid] = fresh_events[tid] if tid in fresh_events else prev[tid][3]
+-            memo[tid] = (tuple(r), _raw(runs[tid]), marks.get(tid, _NO_EVENTS), events[tid])
++            memo[tid] = (tuple(r), raw_runs[tid], marks.get(tid, _NO_EVENTS), events[tid])
+         else:  # vanished between reads: no events held, so never vouch for a mark
+             events[tid] = ()
+-            memo[tid] = (tuple(r), _raw(runs[tid]), None, ())
++            memo[tid] = (tuple(r), raw_runs[tid], None, ())
+     if graphs is None:
+         graphs = kanban_db.task_graph_contexts(conn, ids)
+     inputs = (tuple(diag_rows), events, runs, graphs, _wake_states(conn, ids))
+diff --git a/tests/plugins/test_kanban_board_history.py b/tests/plugins/test_kanban_board_history.py
+new file mode 100644
+index 0000000000..7e54bcc72a
+--- /dev/null
++++ b/tests/plugins/test_kanban_board_history.py
+@@ -0,0 +1,97 @@
++"""History ingestion preserves SQLite values without per-field column scans."""
++import sqlite3
++
++import pytest
++
++from hermes_cli import kanban_diagnostics as kd
++from plugins.kanban.dashboard import board_read as br
++from hermes_cli import kanban_db_connect as kbc
++from tests.plugins import test_kanban_board_incremental as helpers
++
++board = helpers.board
++
++
++def test_history_rows_are_immutable_keyed_snapshots():
++    conn = sqlite3.connect(":memory:")
++    conn.row_factory = sqlite3.Row
++    conn.execute("CREATE TABLE task_events (id INTEGER, task_id TEXT, kind TEXT, payload TEXT, created_at INTEGER)")
++    conn.execute("INSERT INTO task_events VALUES (1, 't', 'heartbeat', NULL, 42)")
++    original = conn.execute("SELECT * FROM task_events").fetchone()
++    history = br._rows_by_task(conn, "task_events", ["t", "empty"])
++    row = history["t"][0]
++    assert not isinstance(row, sqlite3.Row), "normalize column lookup once, not at every diagnostic field read"
++    assert history["empty"] == ()
++    assert br._raw(history["t"]) == (tuple(original),)
++    for field in (*original.keys(), "absent"):
++        assert kd._task_field(row, field, "fallback") == kd._task_field(original, field, "fallback")
++    with pytest.raises(TypeError):
++        row["kind"] = "changed"
++    conn.execute("UPDATE task_events SET kind = 'changed'")
++    assert row["kind"] == "heartbeat"
++    assert br._rows_by_task(conn, "task_events", ["t"])["t"][0]["kind"] == "changed"
++    conn.close()
++
++
++def test_task_only_changes_do_not_reload_event_history(monkeypatch):
++    conn = sqlite3.connect(":memory:")
++    conn.row_factory = sqlite3.Row
++    conn.executescript("CREATE TABLE tasks (id TEXT, last_heartbeat_at INTEGER);"
++                       "CREATE TABLE task_events (id INTEGER, task_id TEXT, kind TEXT);"
++                       "CREATE TABLE task_runs (id INTEGER, task_id TEXT, outcome TEXT);"
++                       "INSERT INTO tasks VALUES ('t', 1);"
++                       "INSERT INTO task_events VALUES (1, 't', 'created');")
++    rows = conn.execute("SELECT * FROM tasks").fetchall()
++    events = br._rows_by_task(conn, "task_events", ["t"])
++    runs = br._rows_by_task(conn, "task_runs", ["t"])
++    prev = br._diag_memo(rows, events, runs, br._event_marks(conn, ["t"]))
++    monkeypatch.setattr(br, "_wake_states", lambda *_: {})
++    conn.execute("UPDATE tasks SET last_heartbeat_at = 2")
++    rows = conn.execute("SELECT * FROM tasks").fetchall()
++    def unexpected(*args, **kwargs):
++        pytest.fail("task bookkeeping must not reload unchanged event/run history")
++    inputs, _ = br._incremental_diag_inputs(conn, rows, prev, unexpected, graphs={}, event_changed=frozenset())
++    assert inputs[0][0]["last_heartbeat_at"] == 2
++    assert inputs[1]["t"] is events["t"]
++    conn.close()
++
++
++@pytest.mark.parametrize("mutation", ["event_update", "event_delete", "event_replace", "run_update", "heartbeat"])
++def test_history_mutations_match_cold_projection(board, monkeypatch, mutation):
++    from hermes_cli import kanban_db as kb
++    ids, run_id = helpers._seed()
++    tid = ids[0]
++    conn = kbc.connect()
++    try:
++        conn.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'completion_blocked_hallucination', ?, 100)",
++                     (tid, '{"phantom_cards":["t_missing"]}'))
++        conn.commit()
++        helpers._read(board)
++        # Observe actual history ingestion rather than the old all-input callback.
++        loaded = []
++        real = br._rows_by_task
++        def spy(c, table, row_ids):
++            loaded.append((table, tuple(row_ids)))
++            return real(c, table, row_ids)
++        monkeypatch.setattr(br, "_rows_by_task", spy)
++        event_id = conn.execute("SELECT MAX(id) FROM task_events WHERE task_id = ?", (tid,)).fetchone()[0]
++        mutations = {
++            "event_update": ("UPDATE task_events SET kind = 'edited' WHERE id = ?", (event_id,)),
++            "event_delete": ("DELETE FROM task_events WHERE id = ?", (event_id,)),
++            "event_replace": (
++                "INSERT OR REPLACE INTO task_events (id,task_id,kind,payload,created_at) VALUES (?,?,'edited','{}',100)",
++                (event_id, tid)),
++            "run_update": ("UPDATE task_runs SET outcome = 'failed', ended_at = 150 WHERE id = ?", (run_id,)),
++            "heartbeat": ("UPDATE tasks SET last_heartbeat_at = 12345 WHERE id = ?", (tid,)),
++        }
++        conn.execute(*mutations[mutation])
++        conn.commit()
++        warm = helpers._stable(helpers._read(board))
++        warm_loaded = list(loaded)
++        assert warm == helpers._cold(board)
++        if mutation == "heartbeat":
++            assert not [v for v in warm_loaded if v[0] == "task_events"]
++        else:
++            assert any(table == "task_events" and tid in touched for table, touched in warm_loaded)
++        assert kb.get_task(conn, tid) is not None
++    finally:
++        conn.close()
+-- 
+2.43.0
+

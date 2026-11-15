@@ -1,0 +1,152 @@
+From 0df90c0a2d2eb96c4043c47e8833c7bdd6068eb7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 14:37:20 +0000
+Subject: [PATCH] [daveey] kanban: one large scratch artifact under two
+ spellings no longer crashes completion
+
+Follow-up t_01a1da75a3adee08 from the exact-head review of PR #2992
+(t_01a1da701fe99096).
+
+Symptom: a managed-scratch file over KANBAN_ATTACHMENT_MAX_BYTES declared
+under two spellings that normalize to one path (`<ws>/x.bin` plus
+`<ws>/./x.bin`, or an artifact plus a `~/...` completion_receipt evidence
+ref) made complete_task / request_review raise
+`AttributeError: 'NoneType' object has no attribute 'rename'`. The card
+stayed running and every retry with the same metadata failed again. Base
+(350667116f) copied the file twice and completed.
+
+Why:
+1. record_files iterates raw declared strings; declared_files dedupes only
+   textually, so both spellings get a record.
+2. kanban_artifact_prestage keys its cache by the expanded path, so both
+   records `take()` the same entry.
+3. The first `_large` renamed the staged copy and set `temp = None`; the
+   second called `None.rename`.
+4. AttributeError is outside record_files' (OSError,
+   ArtifactPreservationError) handler, so it escaped unclassified.
+Second defect found by the same test: `_fill` read the file once per
+spelling and overwrote the cache entry, orphaning the first `.prestage-*`
+copy (never claimed, never unlinked) and doubling the pre-lock read.
+
+Fix:
+- `_large` records the claimed `retained_path` on the prestage entry; a
+  later record for the same entry reuses it (and its sha256). A managed
+  entry with neither a claim nor a staged copy now fails closed with
+  ArtifactPreservationError instead of AttributeError.
+- `_fill` skips a path already in the cache: one read, one copy.
+
+Proof (tests/hermes_cli/test_kanban_artifact_custody_bounds.py):
+- RED at bb425a47e5: test_large_scratch_file_named_under_two_spellings_
+  is_retained_once[artifact|evidence] and test_managed_large_file_without_
+  a_pre_lock_copy_fails_closed fail with the reported AttributeError.
+- With only the `_large` fix, both spelling cases fail on a leaked
+  `.prestage-*` file (kills removal of the `_fill` skip).
+- GREEN: 6 artifact/receipt/metadata test files, 60 passed.
+- scripts/check: 20 checks ok.
+---
+ hermes_cli/kanban_artifact_prestage.py        |  2 +
+ hermes_cli/kanban_artifact_receipt.py         | 21 ++++++----
+ .../test_kanban_artifact_custody_bounds.py    | 42 +++++++++++++++++++
+ 3 files changed, 58 insertions(+), 7 deletions(-)
+
+diff --git a/hermes_cli/kanban_artifact_prestage.py b/hermes_cli/kanban_artifact_prestage.py
+index dc3e2ba199..2554c04d06 100644
+--- a/hermes_cli/kanban_artifact_prestage.py
++++ b/hermes_cli/kanban_artifact_prestage.py
+@@ -57,6 +57,8 @@ def _fill(conn, task_id: str, metadata: dict, cache: dict) -> None:
+ 
+     for raw in declared_files(metadata):
+         source = Path(raw).expanduser()
++        if str(source) in cache:
++            continue  # Another spelling of a file already read; one copy serves both.
+         dest = None
+         try:
+             if not source.is_file() or validate_media_delivery_path(str(source)) is None:
+diff --git a/hermes_cli/kanban_artifact_receipt.py b/hermes_cli/kanban_artifact_receipt.py
+index bdae8f879d..5a0f1254e3 100644
+--- a/hermes_cli/kanban_artifact_receipt.py
++++ b/hermes_cli/kanban_artifact_receipt.py
+@@ -122,13 +122,20 @@ def _large(conn, task_id: str, source: Path, stat, record: dict, staged: list[Pa
+         record["warning"] = f"Over {kb.KANBAN_ATTACHMENT_MAX_BYTES} bytes and not hashed: {reason}"
+         return
+     if managed:
+-        # Large files cannot use blob sync, but must outlive scratch GC.
+-        directory = kb.task_attachments_dir(task_id, board=board) / "local-artifacts"
+-        dest = kb._unique_attachment_path(directory, source.name, set(staged))
+-        staged.append(dest)
+-        observed["temp"].rename(dest)
+-        observed["temp"] = None
+-        record["retained_path"] = str(dest)
++        # Large files cannot use blob sync, but must outlive scratch GC. One
++        # file declared under two spellings (``<ws>/x``, ``<ws>/./x``, ``~/…``)
++        # shares one pre-lock entry: later records reuse the first claim.
++        retained = observed.get("retained_path")
++        if retained is None:
++            if observed["temp"] is None:
++                raise kb.ArtifactPreservationError("no pre-lock copy was staged; retry")
++            directory = kb.task_attachments_dir(task_id, board=board) / "local-artifacts"
++            dest = kb._unique_attachment_path(directory, source.name, set(staged))
++            staged.append(dest)
++            observed["temp"].rename(dest)
++            observed["temp"] = None
++            observed["retained_path"] = retained = str(dest)
++        record["retained_path"] = retained
+     record["sha256"] = observed["sha256"]
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_artifact_custody_bounds.py b/tests/hermes_cli/test_kanban_artifact_custody_bounds.py
+index 1c60199744..3af9acb2ba 100644
+--- a/tests/hermes_cli/test_kanban_artifact_custody_bounds.py
++++ b/tests/hermes_cli/test_kanban_artifact_custody_bounds.py
+@@ -82,6 +82,48 @@ def test_large_file_changed_after_pre_lock_read_is_not_claimed(kanban_home, monk
+     assert "not hashed" in record["warning"]
+ 
+ 
++@pytest.mark.parametrize("second_as", ["artifact", "evidence"])
++def test_large_scratch_file_named_under_two_spellings_is_retained_once(kanban_home, monkeypatch, second_as):
++    # `<ws>/./x` and `<ws>/x` are distinct declared strings but one prestage
++    # entry: the second record must reuse the first claim, not crash on it.
++    monkeypatch.setattr(kb, "KANBAN_ATTACHMENT_MAX_BYTES", 4)
++    with kbc.connect_closing() as conn:
++        task, ws, run = helpers._scratch_card(conn)
++        (ws / "checkpoint.bin").write_bytes(BIG)
++        spellings = [str(ws / "checkpoint.bin"), f"{ws}/./checkpoint.bin"]
++        metadata = {"artifacts": spellings} if second_as == "artifact" else {
++            "artifacts": spellings[:1], "completion_receipt": receipt(spellings[1])}
++        assert kb.complete_task(conn, task, summary="Checkpoint", expected_run_id=run, metadata=metadata)
++        assert kb.get_task(conn, task).status == "done"
++        records = kb.latest_run(conn, task).metadata["artifact_receipt"]
++    assert [r["path"] for r in records] == spellings
++    assert {r["retained_path"] for r in records} == {records[0]["retained_path"]}
++    assert {r["sha256"] for r in records} == {hashlib.sha256(BIG).hexdigest()}
++    retained = Path(records[0]["retained_path"])
++    assert retained.read_bytes() == BIG
++    assert [p.name for p in retained.parent.iterdir()] == [retained.name]
++
++
++def test_managed_large_file_without_a_pre_lock_copy_fails_closed(kanban_home, monkeypatch):
++    from hermes_cli import kanban_artifact_prestage as prestage
++    from hermes_cli import kanban_artifact_receipt as custody
++
++    monkeypatch.setattr(kb, "KANBAN_ATTACHMENT_MAX_BYTES", 4)
++    with kbc.connect_closing() as conn:
++        task, ws, _ = helpers._scratch_card(conn)
++        source = ws / "checkpoint.bin"
++        source.write_bytes(BIG)
++        stat = source.stat()
++        # Prestage judged the file unmanaged (no copy); the lock-time check disagrees.
++        token = prestage._CACHE.set({str(source): {
++            "signature": prestage.signature(stat), "sha256": "0" * 64, "temp": None}})
++        try:
++            with pytest.raises(kb.ArtifactPreservationError, match="no pre-lock copy"):
++                custody._large(conn, task, source, stat, {}, [], kb.DEFAULT_BOARD)
++        finally:
++            prestage._CACHE.reset(token)
++
++
+ def test_evidence_refs_keep_custody_but_only_declared_artifacts_upload(kanban_home, tmp_path):
+     from hermes_cli import kanban_artifact_delivery as delivery
+     from hermes_cli.kanban_artifact_receipt import format_receipt
+-- 
+2.43.0
+

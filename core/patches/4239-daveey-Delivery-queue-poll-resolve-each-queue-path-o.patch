@@ -1,0 +1,133 @@
+From 30e94ce1c3586920167708f0019ffc98880f0cde Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 08:29:59 -0800
+Subject: [PATCH] [daveey] Delivery-queue poll: resolve each queue path once
+ per tick, not on every one-second look
+
+`DeliveryQueueWatch._stamp` called `cron.delivery_queue.queue_path(home)` for every served profile on
+each one-second look, and that realpaths the profile home (an lstat per path component). On the mini's
+gateway (kanban card t_01a1d889abf75d78, pid 85886, 60 s / 20 Hz profile, 01:38 PST 11-14) 46 of
+1,196 samples sat in posixpath.realpath under this poll: 1.07 CPU s per minute on the
+gateway-housekeeping thread, with nothing queued.
+
+Fix: keep the resolved path until the tick refreshes the served homes. The stat of the queue file
+and its WAL still runs on every look, and the cache key includes DELIVERY_DB, so an override set
+between looks is still followed.
+
+Why not caught: the watch tests checked what a look reports, never what a look costs.
+New tests: path resolutions counted (RED on the old code: 12 for 2 homes across 6 looks; GREEN: 2),
+a file written after the path was cached is still seen, and a DELIVERY_DB override is followed.
+---
+ gateway/run_delivery_queue_watch.py           | 17 +++++-
+ .../test_cron_delivery_housekeeping.py        | 59 +++++++++++++++++++
+ 2 files changed, 73 insertions(+), 3 deletions(-)
+
+diff --git a/gateway/run_delivery_queue_watch.py b/gateway/run_delivery_queue_watch.py
+index 55edd9b9dd..6c9cdde1ba 100644
+--- a/gateway/run_delivery_queue_watch.py
++++ b/gateway/run_delivery_queue_watch.py
+@@ -47,6 +47,7 @@ class DeliveryQueueWatch:
+         self._homes = homes
+         self.drain = drain
+         self._served: list = list(homes())
++        self._paths: dict = {}
+         self._seen = self._stamp()
+         self._seen_racy = self._is_racy(self._seen, first_sight=True)
+ 
+@@ -54,13 +55,23 @@ class DeliveryQueueWatch:
+         """Re-resolve the served profiles once per tick (a directory read under multiplex),
+         not on every poll; a profile that appears mid-interval is drained by the tick itself."""
+         self._served = list(self._homes())
++        self._paths = {}
+ 
+-    def _stamp(self) -> tuple:
+-        from cron.delivery_queue import queue_path
++    def _queue_path(self, home: Optional[Path]) -> Path:
++        """``queue_path(home)``, resolved once per tick: it realpaths the home (an lstat per path
++        component), which the one-second poll otherwise repeats for every served profile."""
++        from cron import delivery_queue
++
++        key = (home, delivery_queue.DELIVERY_DB)
++        path = self._paths.get(key)
++        if path is None:
++            path = self._paths[key] = delivery_queue.queue_path(home)
++        return path
+ 
++    def _stamp(self) -> tuple:
+         stamps = []
+         for home in self._served:
+-            path = queue_path(home)
++            path = self._queue_path(home)
+             for candidate in (path, path.with_name(path.name + "-wal")):
+                 try:
+                     info = os.stat(candidate)
+diff --git a/tests/gateway/test_cron_delivery_housekeeping.py b/tests/gateway/test_cron_delivery_housekeeping.py
+index f5042dd47a..825eef0510 100644
+--- a/tests/gateway/test_cron_delivery_housekeeping.py
++++ b/tests/gateway/test_cron_delivery_housekeeping.py
+@@ -428,3 +428,62 @@ def test_a_future_mtime_is_racy_once_then_settles(tmp_path, monkeypatch):
+     assert watch.changed() is True
+     assert watch.changed() is True, "the new future stamp was not racy on first sight"
+     assert watch.changed() is False
++
++
++def test_the_poll_resolves_each_queue_path_once_per_tick(tmp_path, monkeypatch):
++    """``queue_path`` realpaths the profile home (an lstat per path component). The one-second poll
++    must stat the queue files only; the path is re-resolved when the tick refreshes the homes."""
++    import os
++
++    from cron import delivery_queue
++    from gateway import run_delivery_queue_watch as queue_watch
++
++    homes = [tmp_path / "a", tmp_path / "b"]
++    for home in homes:
++        (home / "cron").mkdir(parents=True)
++    monkeypatch.setattr(delivery_queue, "DELIVERY_DB", None)
++    real = delivery_queue.queue_path
++    resolved = []
++
++    def counted(home=None):
++        resolved.append(home)
++        return real(home)
++
++    monkeypatch.setattr(delivery_queue, "queue_path", counted)
++    granule = queue_watch.MTIME_GRANULARITY_NS
++    now_ns = [100 * granule]
++    monkeypatch.setattr(queue_watch, "_now_ns", lambda: now_ns[0])
++    watch = queue_watch.DeliveryQueueWatch(lambda: list(homes), lambda: None)
++    assert [watch.changed() for _ in range(5)] == [False] * 5
++    assert resolved == homes, f"{len(resolved)} path resolutions for {len(homes)} homes across 6 looks"
++
++    # A queue file written after the path was cached is still seen: the stat is not cached.
++    queue = homes[1] / "cron" / "deliveries.db"
++    queue.write_bytes(b"pending!")
++    os.utime(queue, ns=(50 * granule, 50 * granule))
++    assert watch.changed() is True
++    assert watch.changed() is False
++    assert resolved == homes
++
++    watch.refresh_homes()
++    assert watch.changed() is False
++    assert resolved == homes * 2, "the tick did not re-resolve the served homes"
++
++
++def test_the_poll_follows_a_queue_override_set_between_looks(tmp_path, monkeypatch):
++    import os
++
++    from cron import delivery_queue
++    from gateway import run_delivery_queue_watch as queue_watch
++
++    granule = queue_watch.MTIME_GRANULARITY_NS
++    monkeypatch.setattr(queue_watch, "_now_ns", lambda: 100 * granule)
++    monkeypatch.setattr(delivery_queue, "DELIVERY_DB", None)
++    watch = queue_watch.DeliveryQueueWatch(lambda: [tmp_path], lambda: None)
++    assert watch.changed() is False
++
++    override = tmp_path / "elsewhere.db"
++    override.write_bytes(b"pending!")
++    os.utime(override, ns=(50 * granule, 50 * granule))
++    monkeypatch.setattr(delivery_queue, "DELIVERY_DB", override)
++    assert watch.changed() is True, "the cached path hid the override"
+-- 
+2.43.0
+

@@ -1,0 +1,1344 @@
+From 2e2817ca55556f81b67d62c0aeb21d6c9de0e3e0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 17:08:08 +0000
+Subject: [PATCH] [daveey] kanban move: refuse a machine: target with no
+ host_reason naming state on it
+
+t_01a1d95c41620e6c (acceptance 3 of t_01a1d3e177138cff, single queue). Over 24 h on the hub board
+(2026-11-13T07:57Z..11-14T07:57Z) seven `moved` events set runs_on to one machine. Three carried no
+host_reason and no target-side state: pickup-stall alarm moves through the operator call that pinned
+published, portable work from one full machine to another (ev 1207880 worker-7 -> worker-1, ev 1210619
+worker-7 -> worker-4, ev 1214908 worker-3 -> worker-8). Two of them stalled again on the new machine and
+needed a second alarm move to pool:worker.
+
+Why: kanban_move_pool required a host_reason only for a pin to a *pool* worker; any other machine:<x>
+passed bare, and the pickup-stall alarm scope (kanban_pickup_stall_repin) explicitly allowed
+["machine:<X>"] for "one other eligible machine" while the pool queue needed a free slot now. A capacity
+stall is a condition on the source machine, not state on the target, so a new single-machine pin just
+moves the stall.
+
+Change:
+- kanban_move_pool.check: every machine:<x> label needs a host_reason (host_reason_required); a host
+  reason that only cites capacity (free slots, N/N, eligible now, full, idle) is refused
+  (host_reason_capacity). The refusal points at runs_on ["pool:worker"] / `--pool`.
+- Pickup-stall alarm scope (tool and operator-call route): a machine:<X> target needs the same
+  host_reason; the pool queue no longer needs a free slot now (the card waits in the single queue);
+  alarm how-to text recommends only the pool.
+- Operator-call move accepts and forwards an optional host_reason; creator repin tool forwards it.
+- Exceptions that carry target state keep working with a recorded default host_reason: the origin
+  repin of a worker-first card and the stranded-label reroute.
+- kanban_move / operator-call schema text and `--host-reason` help updated.
+
+Tests: new tests/hermes_cli/test_kanban_move_machine_target_guard.py (every machine target refused bare,
+capacity-only refused, state reasons accepted, force does not waive); pickup-stall repin tests: alarm move
+to machine:X without host_reason refused (tool and operator call, the 11-13 reason verbatim), the same
+move to pool:worker accepted with no free slot, a host_reason move accepted. Existing move tests now pass
+an explicit host_reason for machine targets.
+---
+ hermes_cli/kanban_creator_repin.py            | 39 ++++++---
+ hermes_cli/kanban_move_pool.py                | 62 ++++++++++---
+ hermes_cli/kanban_operator_call.py            | 11 ++-
+ hermes_cli/kanban_parser.py                   |  5 +-
+ hermes_cli/kanban_pickup_stall_repin.py       | 74 ++++++++--------
+ tests/hermes_cli/test_kanban_move.py          | 41 +++++----
+ .../test_kanban_move_machine_target_guard.py  | 72 ++++++++++++++++
+ .../test_kanban_move_parent_evidence.py       |  5 +-
+ .../hermes_cli/test_kanban_move_pr_handoff.py | 17 ++--
+ tests/hermes_cli/test_kanban_move_unpushed.py | 21 +++--
+ .../test_kanban_move_unpushed_followups.py    | 11 ++-
+ .../hermes_cli/test_kanban_move_validation.py | 19 ++--
+ .../test_kanban_pickup_stall_repin.py         | 86 +++++++++++++++----
+ .../test_kanban_requires_placement.py         |  9 +-
+ ..._kanban_review_checkpoint_cross_machine.py |  5 +-
+ .../test_kanban_runs_on_pickup_guard.py       | 11 ++-
+ .../test_kanban_worker_move_request.py        |  7 +-
+ tools/kanban_tools_schemas.py                 | 22 +++--
+ 18 files changed, 371 insertions(+), 146 deletions(-)
+ create mode 100644 tests/hermes_cli/test_kanban_move_machine_target_guard.py
+
+diff --git a/hermes_cli/kanban_creator_repin.py b/hermes_cli/kanban_creator_repin.py
+index 754be8890c..674f4ddfdc 100644
+--- a/hermes_cli/kanban_creator_repin.py
++++ b/hermes_cli/kanban_creator_repin.py
+@@ -38,14 +38,15 @@ def tool_repin(args: dict, *, board: Callable, check: Callable, ok: Callable, re
+     reason = str(args.get("reason") or "").strip()
+     check(reason, "reason is required")
+     with board(args.get("board")) as (_kb, conn):
+-        res = creator_repin(conn, tid, env, runs_on=args.get("runs_on"), reason=reason)
++        res = creator_repin(conn, tid, env, runs_on=args.get("runs_on"), reason=reason,
++                            host_reason=args.get("host_reason"))
+     check(res.get("ok"), f"could not repin {tid}: {res.get('error')}")
+     return ok(**{k: v for k, v in res.items() if k not in ("ok", "task_id", "next")},
+               task_id=tid, next="Repinned another card; this run continues.")
+ 
+ 
+ def creator_repin(conn: sqlite3.Connection, task_id: str, env_task: str, *, runs_on: Any, reason: str,
+-                  hub: Any = None) -> dict[str, Any]:
++                  hub: Any = None, host_reason: str | None = None) -> dict[str, Any]:
+     """``move_queued``'s result, or ``{"ok": False, "reason_code", "error"}`` when this worker may not repin it."""
+     from hermes_cli import kanban_move as km
+     from hermes_cli import kanban_worker_repin as repin
+@@ -55,11 +56,13 @@ def creator_repin(conn: sqlite3.Connection, task_id: str, env_task: str, *, runs
+         if refusal is not None:
+             stranded = stranded_refusal(conn, task_id)
+             if stranded is None:
+-                return stranded_reroute(conn, task_id, env_task, runs_on=runs_on, reason=reason, hub=hub)
++                return stranded_reroute(conn, task_id, env_task, runs_on=runs_on, reason=reason, hub=hub,
++                                        host_reason=host_reason)
+             from hermes_cli import kanban_pickup_stall_repin as stall
+-            stalled = stall.refusal(conn, task_id, env_task, runs_on)
++            stalled = stall.refusal(conn, task_id, env_task, runs_on, host_reason=host_reason)
+             if stalled is None:
+-                return stall.move(conn, task_id, env_task, runs_on=runs_on, reason=reason, hub=hub)
++                return stall.move(conn, task_id, env_task, runs_on=runs_on, reason=reason, hub=hub,
++                                  host_reason=host_reason)
+             return {"ok": False, "reason_code": "not_creator_task",
+                     "error": f"worker is scoped to task {env_task}; it may move another card only to repin a "
+                              f"worker-first card its own task created (or, as its generated repin-owner "
+@@ -72,12 +75,23 @@ def creator_repin(conn: sqlite3.Connection, task_id: str, env_task: str, *, runs
+         # worker is open to it too.
+         stranded = stranded_refusal(conn, task_id)
+         if stranded is None:
+-            return stranded_reroute(conn, task_id, env_task, runs_on=runs_on, reason=reason, hub=hub)
++            return stranded_reroute(conn, task_id, env_task, runs_on=runs_on, reason=reason, hub=hub,
++                                    host_reason=host_reason)
+         return {"ok": False, "reason_code": "not_repinnable",
+                 "error": f"{task_id} is not an unstarted worker-first card (running, done, archived or no "
+                          f"placement policy) nor a ready card stranded on impossible runs_on ({stranded}); "
+                          "only the explicit origin repin or a stranded reroute is allowed here"}
+-    return km.move_queued(conn, task_id, runs_on=runs_on, reason=reason, hub=hub)
++    # The origin repin carries its own target state: the worker-first card goes back to the machine it was written
++    # for (kanban_move_pool.check needs a host_reason for any machine:<x>, t_01a1d95c41620e6c).
++    if _names_machine(runs_on) and not (host_reason or "").strip():
++        host_reason = ("origin repin of an unstarted worker-first card: the origin host holds the work it was "
++                       "created from")
++    return km.move_queued(conn, task_id, runs_on=runs_on, reason=reason, hub=hub, host_reason=host_reason)
++
++
++def _names_machine(runs_on: Any) -> bool:
++    """Whether ``runs_on`` pins one machine (``machine:<x>``), the target that needs a host reason."""
++    return isinstance(runs_on, list) and any(isinstance(x, str) and x.startswith("machine:") for x in runs_on)
+ 
+ 
+ REROUTE_AUTHOR = "kanban-reroute"
+@@ -126,14 +140,19 @@ def stranded_refusal(conn: sqlite3.Connection, task_id: str) -> str | None:
+ 
+ 
+ def stranded_reroute(conn: sqlite3.Connection, task_id: str, env_task: str, *, runs_on: Any, reason: str,
+-                     hub: Any = None) -> dict[str, Any]:
++                     hub: Any = None, host_reason: str | None = None) -> dict[str, Any]:
+     """Re-route a card :func:`stranded_refusal` cleared: ``move_queued`` (which refuses unsatisfiable new labels),
+-    then a comment keeping the old labels so the rewrite can be undone, and a note on any open ask that names it."""
++    then a comment keeping the old labels so the rewrite can be undone, and a note on any open ask that names it.
++    A ``machine:<x>`` target carries the stranded labels as its host reason (``kanban_move_pool.check``): the old
++    labels named the host the card was written for, which no enrolled machine carries under that name."""
+     from hermes_cli import kanban_db as kb
+     from hermes_cli import kanban_move as km
+     from hermes_cli import kanban_worker_node as wn
+     old = wn._parse(conn.execute("SELECT runs_on FROM tasks WHERE id = ?", (task_id,)).fetchone()[0])
+-    res = km.move_queued(conn, task_id, runs_on=runs_on, reason=reason, hub=hub,
++    if _names_machine(runs_on) and not (host_reason or "").strip():
++        host_reason = (f"stranded reroute: stored runs_on {old} names a host no enrolled machine carries; the new "
++                       "labels name the machine it meant")
++    res = km.move_queued(conn, task_id, runs_on=runs_on, reason=reason, hub=hub, host_reason=host_reason,
+                          event_extra={"rerouted_by": env_task, "stranded_runs_on": old})
+     if not res.get("ok"):
+         return res
+diff --git a/hermes_cli/kanban_move_pool.py b/hermes_cli/kanban_move_pool.py
+index 0247b31463..b3bb80de06 100644
+--- a/hermes_cli/kanban_move_pool.py
++++ b/hermes_cli/kanban_move_pool.py
+@@ -1,12 +1,17 @@
+-"""Moves onto one worker: the pool is the default, a single worker needs a host reason. [daveey]
++"""Moves onto one machine: the pool is the default, a single machine needs a host reason. [daveey]
+ 
+ Pinning a card to one worker for capacity froze the choice when capacity changed: on 11-12 ten ready cards waited
+ up to 261 min on ``machine:worker-2`` while it was drain-held and worker-1 and worker-4 had free slots. The queue
+ for any worker is ``runs_on: [pool:worker]`` (:data:`hermes_cli.kanban_placement.POOL_LABEL`, ``hermes kanban move
+-<id> --pool``). A move to ``machine:<x>`` where x carries the pool label is refused without ``host_reason`` (the
+-card works on that host, or holds unpushed state there). A pooled card re-pinned by hand to the machine it is on
+-must also hold unpushed state there when a tree of the card was found: a clean tree whose commits are on a remote
+-stays on the pool. The park itself pins on unpushed state (:mod:`hermes_cli.kanban_park_pin`).
++<id> --pool``). A move whose ``runs_on`` names any ``machine:<x>`` is refused without ``host_reason`` naming state on
++x (a worktree, a stamp, unpublished work, a live process, Mac-only or hub-only work): a capacity stall is a
++condition of the machine the card leaves, not state on x, and a new single-machine pin only moves the stall (11-13:
++three pickup-stall alarm moves pinned published work to machine:worker-1/-4/-8; two stalled again there). A
++``host_reason`` that only cites capacity is refused too (:func:`capacity_only`). The worker-first origin repin and
++the stranded-label reroute (:mod:`hermes_cli.kanban_creator_repin`) carry their own target state. A pooled card
++re-pinned by hand to the machine it is on must also hold unpushed state there when a tree of the card was found: a
++clean tree whose commits are on a remote stays on the pool. The park itself pins on unpushed state
++(:mod:`hermes_cli.kanban_park_pin`).
+ """
+ from __future__ import annotations
+ 
+@@ -19,6 +24,7 @@ from pathlib import Path
+ from typing import Any, Callable, Iterable, Mapping, Optional
+ 
+ HOST_REASON_REQUIRED = "host_reason_required"
++HOST_REASON_CAPACITY = "host_reason_capacity"
+ POOL_KEEPS_PUSHED = "pool_keeps_pushed"
+ 
+ _PATH = re.compile(r"(?<![\w.:/-])~?(?:/[\w.@+-]+){2,}")
+@@ -44,11 +50,40 @@ def cli_labels(args: Any) -> tuple[Optional[list[str]], dict[str, Any], str]:
+     return labels, {"host_reason": getattr(args, "host_reason", None)}, ""
+ 
+ 
++def machine_pins(labels: Iterable[str]) -> list[str]:
++    """Machines named by ``machine:<x>`` labels."""
++    return [lab.split(":", 1)[1] for lab in labels if isinstance(lab, str) and lab.startswith("machine:")]
++
++
+ def pool_pins(labels: list[str], machines: Mapping[str, Mapping[str, Any]]) -> list[str]:
+     """Machines named by ``machine:<x>`` labels that are pool workers (carry the pool label)."""
+     label = pool_label()
+-    names = [lab.split(":", 1)[1] for lab in labels if lab.startswith("machine:")]
+-    return [n for n in names if label in ((machines.get(n) or {}).get("labels") or [])]
++    return [n for n in machine_pins(labels) if label in ((machines.get(n) or {}).get("labels") or [])]
++
++
++# A host reason names state on the target; one that only cites capacity (free slots, 10/10, eligible now) does not.
++_CAPACITY = re.compile(r"free (?:card )?slots?|slots? free|\b\d+\s*/\s*\d+\b|capacity|budget_exhausted|"
++                       r"less loaded|eligible now|has room|\bidle\b|\bunheld\b|\bfull\b", re.IGNORECASE)
++_STATE = re.compile(r"worktree|\btrees?\b|stamp|unpushed|unpublished|uncommitted|dirty|\bpids?\b|process|"
++                    r"\blogs?\b|artifact|evidence|\bfiles?\b|checkout|workspace|fixture|\bmac\b|macos|"
++                    r"xcode|\bios\b|simulator|\bgpus?\b|hub-only|hub only|keychain|chrome|desktop|device|"
++                    r"database|signed-in|/home/|~/|\.json|\.log", re.IGNORECASE)
++
++
++def capacity_only(host_reason: str) -> bool:
++    """Whether ``host_reason`` cites capacity and names no state on a host (the refused alarm-move shape)."""
++    return bool(_CAPACITY.search(host_reason or "")) and not _STATE.search(host_reason or "")
++
++
++def host_reason_message(name: str, *, pooled: bool) -> str:
++    """The ``host_reason_required`` refusal for a move to ``machine:<name>``: queue on the pool instead."""
++    label = pool_label()
++    what = f"machine:{name} is a pool worker ({label})" if pooled else f"runs_on names one machine (machine:{name})"
++    return (f"{what}. Queue the card for any worker instead (runs_on [{label!r}], `hermes kanban move <id> --pool`): "
++            "it waits in the single queue until any worker has a free slot. A capacity stall is a condition of the "
++            f"machine the card leaves, not state on {name}; a new single-machine pin only moves the stall. Pin one "
++            f"machine only with host_reason naming state on {name}: a worktree, a stamp, unpublished work, a live "
++            "process, or Mac-only or hub-only work.")
+ 
+ 
+ def _is_tree(path: Path) -> bool:
+@@ -293,16 +328,19 @@ def check(labels: list[str], machines: Mapping[str, Mapping[str, Any]], *, me: s
+           previous: Optional[list[str]], workspace_path: Optional[str], host_reason: Optional[str],
+           force: bool, refused: type, task_id: Optional[str] = None) -> dict[str, Any]:
+     """Event fields for a move (``host_reason``, ``unpushed_state``), or raise ``refused(code, message)``."""
++    named = machine_pins(labels)
+     pins = pool_pins(labels, machines)
+     reason = (host_reason or "").strip()
+-    if not pins:
++    if not named:
+         return {"host_reason": reason[:500]} if reason else {}
+     label = pool_label()
+     if not reason:
+-        raise refused(HOST_REASON_REQUIRED, (
+-            f"machine:{pins[0]} is a pool worker ({label}). Queue the card for any worker instead (runs_on "
+-            f"[{label!r}], `hermes kanban move <id> --pool`), so whichever worker has a free slot claims it. Pin one "
+-            "worker only with host_reason: the card works on that host, or holds unpushed state there."))
++        raise refused(HOST_REASON_REQUIRED, host_reason_message((pins or named)[0], pooled=bool(pins)))
++    if capacity_only(reason):
++        raise refused(HOST_REASON_CAPACITY, (
++            f"host_reason {reason[:200]!r} cites capacity, not state on {named[0]}. Capacity is never a host reason: "
++            f"use runs_on [{label!r}] (`hermes kanban move <id> --pool`), or name the worktree, stamp, unpublished "
++            "work, live process, or Mac-only or hub-only work that holds the card there."))
+     out: dict[str, Any] = {"host_reason": reason[:500]}
+     if me in pins and not running and label in (previous or []):
+         trees, unpushed = card_trees_state(task_id, workspace_path)
+diff --git a/hermes_cli/kanban_operator_call.py b/hermes_cli/kanban_operator_call.py
+index 022a85b07d..eadc14002a 100644
+--- a/hermes_cli/kanban_operator_call.py
++++ b/hermes_cli/kanban_operator_call.py
+@@ -54,7 +54,7 @@ MAX_PER_TICK = 5
+ SCAN_BATCH = 500
+ SKEW_S = 120
+ AUTHOR = "kanban-operator-call"
+-_FIELDS = {"comment": {"text"}, "move": {"runs_on", "reason"}, "unblock": {"reason"},
++_FIELDS = {"comment": {"text"}, "move": {"runs_on", "reason", "host_reason"}, "unblock": {"reason"},
+            "creator_archive": {"reason"}}
+ _MARK: dict = {}  # (live db path, board) -> replica event id scanned up to, this process
+ _PERSISTED: dict = {}
+@@ -150,6 +150,10 @@ def normalize_op(i: int, op: dict) -> dict:
+         except ValueError as exc:
+             raise _err("invalid_ops", f"op {i}: {exc}") from None
+         out["runs_on"] = list(labels or [])
++        # A machine:<x> target needs host_reason naming state on x (kanban_move_pool.check): optional, carried.
++        host_reason = str(op.get("host_reason") or "").strip()
++        if host_reason:
++            out["host_reason"] = host_reason[:MAX_REASON]
+     return out
+ 
+ 
+@@ -342,7 +346,8 @@ def preflight_op(conn: sqlite3.Connection, requester: str, op: dict) -> dict:
+         return refuse("running", f"{target} is running; only its own run may move it (kanban_move)")
+     if alarm_scope is not None:
+         return refuse("pickup_stall_scope", f"a pickup-stall alarm moves only a card it lists, off the stalled "
+-                                            f"machine, to the pool or one machine eligible now: {alarm_scope}")
++                                            f"machine, to the pool queue (or one machine whose state a host_reason "
++                                            f"names): {alarm_scope}")
+     if op["action"] == "unblock":
+         if status != "blocked":
+             return refuse("not_blocked", f"{target} is {status}, not blocked")
+@@ -700,7 +705,7 @@ def _apply(conn: sqlite3.Connection, payload: dict, own: str) -> tuple[str, Opti
+         if _marker(conn, target, km.MOVED_EVENT, uid) or _marker(conn, target, MOVE_MARK, uid):
+             return "already_applied", None
+         out = km.move_queued(conn, target, runs_on=args.get("runs_on") or [], reason=str(args.get("reason") or ""),
+-                             event_extra=extra)
++                             host_reason=args.get("host_reason"), event_extra=extra)
+         if out.get("ok"):
+             if not _marker(conn, target, km.MOVED_EVENT, uid):
+                 # The worker-first Board repin path writes its own event without ``event_extra``: record the
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index ab7af770ed..99ee76bcca 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -403,8 +403,9 @@ _SPECS = [
+              help="Queue the card for any worker (= --runs-on pool:worker): the first worker with a free slot "
+                   "claims it"),
+         _arg("--host-reason", dest="host_reason", default=None,
+-             help="Required to pin one pool worker (machine:worker-N): the card works on that host, or holds "
+-                  "unpushed state there"),
++             help="Required for any machine:<name> label: the state on that host that holds the card there "
++                  "(a worktree, a stamp, unpublished work, a live process, Mac-only or hub-only work). Capacity "
++                  "is never one: use --pool"),
+         _arg("--reason", required=True, help="Why the card must move (logged as a `moved` event)"),
+         _arg("--checkpoint", default=None,
+              help="Resume notes (required when a card's own worker moves its running card)"),
+diff --git a/hermes_cli/kanban_pickup_stall_repin.py b/hermes_cli/kanban_pickup_stall_repin.py
+index ee0ee79a63..55d5252c62 100644
+--- a/hermes_cli/kanban_pickup_stall_repin.py
++++ b/hermes_cli/kanban_pickup_stall_repin.py
+@@ -7,21 +7,21 @@ task or its ``repin-owner`` supervisor, and the stalled cards were created by ot
+ re-placed them by hand.
+ 
+ The grant (:func:`refusal`) is the alarm's own run moving one target with ``kanban_move(task_id=<target>,
+-runs_on=["pool:worker"], reason=...)`` (or ``["machine:<X>"]``). Every condition must hold, each read on the board the
+-move would write:
++runs_on=["pool:worker"], reason=...)``. Every condition must hold, each read on the board the move would write:
+ 
+ * the caller is an open alarm the detector filed: ``created_by`` the detector, ``created_on`` M, idempotency key
+   ``pickup-stall:<M>:...`` (M is read from the key, never from the arguments);
+ * the target is one the alarm lists: the card its per-card key names, or a ``- <id> (`` line in its body or in a
+   detector comment (``_refresh_targets``);
+ * the target is still ready and unclaimed, with no current run, and still pinned ``machine:<M>`` (only off M);
+-* ``runs_on`` is exactly ``["machine:<X>"]``, X is not M, and X is eligible now by the alarm placement rules
+-  (active, unheld, copies cards, carries the target's ``capability:<requires>`` and ``profile:<assignee>``, not
+-  draining, seen recently, a free card slot); or exactly the pool queue ``[POOL_LABEL]``
+-  (:data:`hermes_cli.kanban_placement.POOL_LABEL`) while some pool machine other than M is eligible now by the same
+-  rules plus the target's ``skill:<skills>`` (the Board's ``requiredLabels``) (t_01a1d0214f3e63e8:
+-  ``machine:<pool worker>`` needs a ``host_reason`` (:mod:`hermes_cli.kanban_move_pool`)
+-  that no alarm path passes, so with every eligible machine a pool worker the alarm could re-place nothing).
++* ``runs_on`` is exactly the pool queue ``[POOL_LABEL]`` (:data:`hermes_cli.kanban_placement.POOL_LABEL`) while
++  some pool machine other than M can take the card (active, unheld, copies cards, carries the target's
++  ``capability:<requires>``, ``profile:<assignee>`` and ``skill:<skills>``, the Board's ``requiredLabels``). A free
++  slot is not required: the card waits in the single queue until any worker has one (t_01a1d95c41620e6c);
++* or exactly one ``["machine:<X>"]``, X is not M, X is eligible now by the alarm placement rules, and the move
++  carries a ``host_reason`` naming state on X (:mod:`hermes_cli.kanban_move_pool`). A capacity stall is a
++  condition on M, not state on X: on 11-13 three alarm moves pinned published work to machine:worker-1/-4/-8 with
++  no host reason, and two stalled again there.
+ 
+ The move itself is the ordinary queued move (``kanban_move.move_queued``) with its own guards. Nothing here reads
+ or writes a registry hold, so a hold is never lifted or shortened. A target another gateway created is moved through
+@@ -43,11 +43,11 @@ def howto(own: str) -> str:
+     pool = pool_label()
+     return (f"To re-place a listed card off {own}, call the kanban_move TOOL from this alarm's run (not the shell: "
+             f"`hermes kanban move` is fenced in worker shells): kanban_move(task_id=\"<listed card>\", "
+-            f"runs_on=[\"{pool}\"], reason=\"...\") queues it for any pool worker other than {own} with a free "
+-            "slot (granted while one is eligible now). Never pin one pool worker: that needs a host_reason, and "
+-            "capacity is none. Only when no pool worker is eligible, use runs_on=[\"machine:<X>\"] for another "
+-            "machine eligible now that is not a pool worker (active, unheld, free slot, the card's profile and "
+-            "capabilities). When the card was created on another gateway, kanban_move answers foreign_card: send "
++            f"runs_on=[\"{pool}\"], reason=\"...\") queues it for any pool worker other than {own}: it waits in the "
++            "single queue until one has a free slot. Never pin one machine for capacity: a stall is a condition on "
++            f"{own}, not state on another machine, so runs_on=[\"machine:<X>\"] is refused without a host_reason "
++            "naming state on X (a worktree, a stamp, unpublished work, a live process, Mac-only or hub-only work). "
++            "When the card was created on another gateway, kanban_move answers foreign_card: send "
+             "the same move as kanban_supervisor_request(ops=[{\"op\": \"operator\", \"action\": \"move\", "
+             f"\"task_id\": \"<listed card>\", \"runs_on\": [\"{pool}\"], \"reason\": \"...\"}}]). Only the cards "
+             f"this alarm lists, only while they are ready and pinned to {own}, and never back to {own}.")
+@@ -187,7 +187,8 @@ def eligible_now(name: str, own: str, machines: Optional[Mapping[str, Mapping[st
+ 
+ 
+ def scope_refusal(conn: sqlite3.Connection, alarm: Any, target: Any, runs_on: Any, *,
+-                  machines: Optional[Mapping[str, Mapping[str, Any]]], now_ms: int) -> Optional[str]:
++                  machines: Optional[Mapping[str, Mapping[str, Any]]], now_ms: int,
++                  host_reason: Optional[str] = None) -> Optional[str]:
+     """None when ``alarm``'s run may move ``target`` (rows, ``conn`` holds the alarm's comments) to ``runs_on``."""
+     from hermes_cli import kanban_worker_node as wn
+     own = alarm_own(alarm)
+@@ -221,6 +222,13 @@ def scope_refusal(conn: sqlite3.Connection, alarm: Any, target: Any, runs_on: An
+     name = labels[0].split(":", 1)[1]
+     if name == own:
+         return f"the card must leave {own}"
++    from hermes_cli import kanban_move_pool as kmp
++    reason = (host_reason or "").strip()
++    if not reason:
++        pooled = bool(kmp.pool_pins(labels, machines or {}))
++        return f"{kmp.host_reason_message(name, pooled=pooled)} For a stall on {own} that is the pool queue."
++    if kmp.capacity_only(reason):
++        return f"host_reason {reason[:200]!r} cites capacity, not state on {name}; use runs_on=[\"{pool_label()}\"]"
+     return eligible_now(name, own, machines, _need(target), now_ms)
+ 
+ 
+@@ -231,23 +239,21 @@ def pool_label() -> str:
+ 
+ def pool_refusal(own: str, machines: Optional[Mapping[str, Mapping[str, Any]]], need: set,
+                  now_ms: int) -> Optional[str]:
+-    """None when a pool machine other than ``own`` may take the card now (:func:`eligible_now`), else why not.
+-
+-    The pool queue is how an alarm re-places a card onto a pool worker: ``machine:<pool worker>`` needs a
+-    ``host_reason`` (:mod:`hermes_cli.kanban_move_pool`), which capacity never is, so no alarm path passes one."""
++    """None when a pool machine other than ``own`` can take the card (active, unheld, copies cards, carries
++    ``need``), else why not. A free slot now is not required: the card waits in the single queue until any worker
++    has one (t_01a1d95c41620e6c). Requiring one sent the alarm to ``machine:<X>`` pins that stalled again on X.
++    ``now_ms`` is kept for callers; eligibility here is structural."""
++    from hermes_cli import kanban_pickup_stall as kps
+     label = pool_label()
+     if machines is None:
+         return "the machine registry is unreadable"
+     pooled = sorted(n for n, e in machines.items() if n != own and label in ((e or {}).get("labels") or []))
+-    whys = []
+-    for name in pooled:
+-        why = eligible_now(name, own, machines, need, now_ms)
+-        if why is None:
+-            return None
+-        whys.append(why)
+-    return (f"no {label} machine other than {own} is eligible now"
+-            + (f": {'; '.join(whys)}" if whys else " (none carries the label)")
+-            + "; a machine outside the pool that is eligible now takes runs_on=[\"machine:<X>\"]")
++    if any(kps._takes_work(name, machines.get(name) or {}, own, need) for name in pooled):
++        return None
++    return (f"no {label} machine other than {own} can take it"
++            + (f" ({', '.join(pooled)}: retired, held, takes no pickup, or lacks {', '.join(sorted(need))})"
++               if pooled else " (none carries the label)")
++            + f"; the card stays on {own} until a pool worker carries those labels")
+ 
+ 
+ def _registry_machines() -> Optional[Mapping[str, Mapping[str, Any]]]:
+@@ -257,7 +263,7 @@ def _registry_machines() -> Optional[Mapping[str, Mapping[str, Any]]]:
+ 
+ 
+ def refusal(conn: sqlite3.Connection, task_id: str, env_task: str, runs_on: Any, *,
+-            machines: Any = False, now_ms: Optional[int] = None) -> Optional[str]:
++            machines: Any = False, now_ms: Optional[int] = None, host_reason: Optional[str] = None) -> Optional[str]:
+     """None when ``env_task`` (the caller's alarm) may move local card ``task_id`` to ``runs_on``; else why not."""
+     from hermes_cli import kanban_pickup_stall as kps
+     alarm = conn.execute("SELECT * FROM tasks WHERE id = ?", (env_task,)).fetchone()
+@@ -270,21 +276,21 @@ def refusal(conn: sqlite3.Connection, task_id: str, env_task: str, runs_on: Any,
+                 "kanban_supervisor_request(ops=[{op: 'operator', action: 'move', task_id, runs_on, reason}])")
+     return scope_refusal(conn, alarm, target, runs_on,
+                          machines=_registry_machines() if machines is False else machines,
+-                         now_ms=kps._now_ms() if now_ms is None else now_ms)
++                         now_ms=kps._now_ms() if now_ms is None else now_ms, host_reason=host_reason)
+ 
+ 
+ def move(conn: sqlite3.Connection, task_id: str, env_task: str, *, runs_on: Any, reason: str,
+-         machines: Any = False, hub: Any = None) -> dict[str, Any]:
++         machines: Any = False, hub: Any = None, host_reason: Optional[str] = None) -> dict[str, Any]:
+     """The granted move (``move_queued``'s result), re-checking the scope first."""
+     from hermes_cli import kanban_move as km
+     from hermes_cli import kanban_worker_node as wn
+     pool = _registry_machines() if machines is False else machines
+-    why = refusal(conn, task_id, env_task, runs_on, machines=pool)
++    why = refusal(conn, task_id, env_task, runs_on, machines=pool, host_reason=host_reason)
+     if why is not None:
+         return {"ok": False, "reason_code": "pickup_stall_scope", "error": why}
+     alarm = conn.execute("SELECT * FROM tasks WHERE id = ?", (env_task,)).fetchone()
+     return km.move_queued(conn, task_id, runs_on=list(wn.normalize_runs_on(runs_on) or []), reason=reason,
+-                          machines=pool, hub=hub,
++                          machines=pool, hub=hub, host_reason=host_reason,
+                           event_extra={"pickup_stall_alarm": env_task, "stalled_machine": alarm_own(alarm)})
+ 
+ 
+@@ -306,4 +312,4 @@ def operator_refusal(conn: sqlite3.Connection, rep: Optional[sqlite3.Connection]
+             target = None
+     return scope_refusal(conn, alarm, target, op.get("runs_on"),
+                          machines=_registry_machines() if machines is False else machines,
+-                         now_ms=kps._now_ms() if now_ms is None else now_ms)
++                         now_ms=kps._now_ms() if now_ms is None else now_ms, host_reason=op.get("host_reason"))
+diff --git a/tests/hermes_cli/test_kanban_move.py b/tests/hermes_cli/test_kanban_move.py
+index a79c1d3043..124b5807fd 100644
+--- a/tests/hermes_cli/test_kanban_move.py
++++ b/tests/hermes_cli/test_kanban_move.py
+@@ -19,6 +19,9 @@ from hermes_cli import kanban_worker_node as wn
+ from tests.hermes_cli.kanban_sync_fake_board import FakeService
+ from tests.hermes_cli.test_kanban_worker_node import BOARD, HUB, MACHINES, WORKER, Gateway, _runs
+ 
++# kanban_move_pool: a machine:<x> target needs a host_reason naming state on x (t_01a1d95c41620e6c).
++HR = "the card's worktree is on that host"
++
+ 
+ @pytest.fixture
+ def svc():
+@@ -59,7 +62,7 @@ def _events(conn, tid, kind=km.MOVED_EVENT):
+ def test_a_hub_card_moves_itself_to_the_worker_and_completes_there_once(gws, svc):
+     hub, worker = gws
+     tid, run_id = _running_hub_card(hub)
+-    res = km.move_task(hub.conn, tid, runs_on=["machine:worker-1"], reason="needs the worker's GPU",
++    res = km.move_task(hub.conn, tid, runs_on=["machine:worker-1"], host_reason=HR, reason="needs the worker's GPU",
+                        checkpoint="step 1 done (commit abc); next: run the bench", expected_run_id=run_id)
+     assert res["ok"] and res["matches"] == [WORKER] and res["move_no"] == 1 and res["status"] == "ready", res
+     t = hub.conn.execute("SELECT status, runs_on, claim_lock FROM tasks WHERE id = ?", (tid,)).fetchone()
+@@ -98,7 +101,7 @@ def test_move_refuses_unknown_held_and_self_only_targets(gws):
+         res = km.move_task(hub.conn, tid, runs_on=runs_on, reason="r", checkpoint="c", expected_run_id=run_id)
+         assert not res["ok"] and res["reason_code"] == "no_machine", (runs_on, res)
+     held = {**MACHINES, WORKER: {**MACHINES[WORKER], "hold": True}}
+-    res = km.move_task(hub.conn, tid, runs_on=["machine:worker-1"], reason="r", checkpoint="c",
++    res = km.move_task(hub.conn, tid, runs_on=["machine:worker-1"], host_reason=HR, reason="r", checkpoint="c",
+                        expected_run_id=run_id, machines=held)
+     assert res["reason_code"] == "no_machine"
+     assert kb.get_task(hub.conn, tid).status == "running"  # a refused move leaves the run alone
+@@ -107,9 +110,9 @@ def test_move_refuses_unknown_held_and_self_only_targets(gws):
+ def test_move_needs_a_reason_and_a_running_card(gws):
+     hub, _ = gws
+     tid, run_id = _running_hub_card(hub)
+-    assert km.move_task(hub.conn, tid, runs_on=["machine:worker-1"], reason=" ", checkpoint="c",
++    assert km.move_task(hub.conn, tid, runs_on=["machine:worker-1"], host_reason=HR, reason=" ", checkpoint="c",
+                         expected_run_id=run_id)["reason_code"] == "reason_required"
+-    assert km.move_task(hub.conn, tid, runs_on=["machine:worker-1"], reason="r", checkpoint="c",
++    assert km.move_task(hub.conn, tid, runs_on=["machine:worker-1"], host_reason=HR, reason="r", checkpoint="c",
+                         expected_run_id=run_id + 99)["ok"] is False  # not this run's card
+ 
+ 
+@@ -117,7 +120,7 @@ def test_workspace_bound_cards_never_move(gws):
+     hub, _ = gws
+     hub.enter()
+     tid = kb.create_task(hub.conn, title="wt", assignee="default", workspace_kind="dir", workspace_path="/tmp/x")
+-    res = km.move_queued(hub.conn, tid, runs_on=["machine:worker-1"], reason="r")
++    res = km.move_queued(hub.conn, tid, runs_on=["machine:worker-1"], host_reason=HR, reason="r")
+     assert res["reason_code"] == "workspace_bound"
+ 
+ 
+@@ -129,14 +132,14 @@ def test_max_moves_and_ping_pong(gws):
+     machines = {**MACHINES, HUB: {**MACHINES[HUB], "pickup": "explicit"},
+                 "w2": {"name": "w2", "state": "active", "labels": ["linux"], "hold": False, "pickup": "all"}}
+     # hub -> worker-1 -> w2: each move leaves a machine.
+-    assert km.move_queued(hub.conn, tid, runs_on=["machine:worker-1"], reason="1", machines=machines, me=HUB)["ok"]
+-    assert km.move_queued(hub.conn, tid, runs_on=["machine:w2"], reason="2", machines=machines, me=WORKER)["ok"]
++    assert km.move_queued(hub.conn, tid, runs_on=["machine:worker-1"], host_reason=HR, reason="1", machines=machines, me=HUB)["ok"]
++    assert km.move_queued(hub.conn, tid, runs_on=["machine:w2"], host_reason=HR, reason="2", machines=machines, me=WORKER)["ok"]
+     # w2 -> hub: the card already left the hub -> ping-pong, unless forced (and a forced move still counts).
+-    res = km.move_queued(hub.conn, tid, runs_on=["machine:hub"], reason="3", machines=machines, me="w2")
++    res = km.move_queued(hub.conn, tid, runs_on=["machine:hub"], host_reason=HR, reason="3", machines=machines, me="w2")
+     assert res["reason_code"] == "ping_pong"
+-    res = km.move_queued(hub.conn, tid, runs_on=["machine:hub"], reason="3", machines=machines, me="w2", force=True)
++    res = km.move_queued(hub.conn, tid, runs_on=["machine:hub"], host_reason=HR, reason="3", machines=machines, me="w2", force=True)
+     assert res["ok"] and res["move_no"] == 3 and _events(hub.conn, tid)[-1]["forced"] is True
+-    res = km.move_queued(hub.conn, tid, runs_on=["machine:worker-1"], reason="4", machines=machines, me=HUB,
++    res = km.move_queued(hub.conn, tid, runs_on=["machine:worker-1"], host_reason=HR, reason="4", machines=machines, me=HUB,
+                          force=True)
+     assert res["reason_code"] == "move_limit"  # default kanban.move.max_moves = 3
+     assert [e["reason"] for e in _events(hub.conn, tid)] == ["1", "2", "3"]  # the audit log
+@@ -148,7 +151,7 @@ def test_labels_matching_a_machine_it_never_left_are_not_ping_pong(gws):
+     hub.enter()
+     tid = kb.create_task(hub.conn, title="q", assignee="default")
+     machines = {**MACHINES, "w2": {"name": "w2", "state": "active", "labels": ["linux"], "hold": False}}
+-    assert km.move_queued(hub.conn, tid, runs_on=["machine:worker-1"], reason="1", machines=machines, me=HUB)["ok"]
++    assert km.move_queued(hub.conn, tid, runs_on=["machine:worker-1"], host_reason=HR, reason="1", machines=machines, me=HUB)["ok"]
+     # From worker-1, ["linux"] matches the hub (left) and w2 (never visited): allowed.
+     assert km.move_queued(hub.conn, tid, runs_on=["linux"], reason="2", machines=machines, me=WORKER)["ok"]
+ 
+@@ -161,14 +164,14 @@ def test_tool_kanban_move_moves_the_workers_own_card(gws, monkeypatch):
+     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+     from tools import kanban_tools as kt
+-    out = json.loads(kt._handle_move({"runs_on": ["machine:worker-1"], "reason": "needs linux box",
++    out = json.loads(kt._handle_move({"runs_on": ["machine:worker-1"], "host_reason": HR, "reason": "needs linux box",
+                                       "checkpoint": "done: A; next: B"}))
+     assert out.get("ok", True) and out["runs_on"] == ["machine:worker-1"] and out["matches"] == [WORKER], out
+     assert "End your turn" in out["next"]
+     assert json.loads(hub.conn.execute("SELECT runs_on FROM tasks WHERE id = ?", (tid,)).fetchone()[0]) == [
+         "machine:worker-1"]
+     assert _events(hub.conn, tid)[0]["reason"] == "needs linux box"
+-    out = json.loads(kt._handle_move({"runs_on": ["machine:worker-1"], "reason": "again", "checkpoint": "x"}))
++    out = json.loads(kt._handle_move({"runs_on": ["machine:worker-1"], "host_reason": HR, "reason": "again", "checkpoint": "x"}))
+     assert out.get("ok") is False or "error" in out  # the run is over: no second move from it
+ 
+ 
+@@ -204,10 +207,10 @@ def test_cli_move_relabels_a_queued_card(gws):
+     hub, _ = gws
+     hub.enter()
+     tid = kb.create_task(hub.conn, title="queued", assignee="default")
+-    out = json.loads(_cli(f'move {tid} --runs-on machine:worker-1 --reason "needs the worker" --json'))
++    out = json.loads(_cli(f'move {tid} --runs-on machine:worker-1 --host-reason worktree --reason "needs the worker" --json'))
+     assert out["ok"] and out["runs_on"] == ["machine:worker-1"], out
+     assert _events(hub.conn, tid)[0]["queued"] is True
+-    out = json.loads(_cli(f'move {tid} --runs-on machine:nowhere --reason x --json'))
++    out = json.loads(_cli(f'move {tid} --runs-on machine:nowhere --host-reason worktree --reason x --json'))
+     assert out["reason_code"] == "no_machine"
+ 
+ 
+@@ -218,9 +221,9 @@ def test_cli_move_of_a_running_card_needs_reclaim(gws, monkeypatch):
+     stopped = []
+     monkeypatch.setattr(kb, "_terminate_reclaimed_worker", lambda pid, lock, **kw: stopped.append(pid) or {
+         "prev_pid": pid, "host_local": True, "termination_attempted": True, "terminated": True, "sigkill": False})
+-    out = json.loads(_cli(f"move {tid} --runs-on machine:worker-1 --reason x --json"))
++    out = json.loads(_cli(f"move {tid} --runs-on machine:worker-1 --host-reason worktree --reason x --json"))
+     assert out["reason_code"] == "running" and kb.get_task(hub.conn, tid).status == "running"
+-    out = json.loads(_cli(f'move {tid} --runs-on machine:worker-1 --reason "stuck here" --reclaim --json'))
++    out = json.loads(_cli(f'move {tid} --runs-on machine:worker-1 --host-reason worktree --reason "stuck here" --reclaim --json'))
+     assert out["ok"], out
+     t = hub.conn.execute("SELECT status, runs_on, claim_lock FROM tasks WHERE id = ?", (tid,)).fetchone()
+     assert t["status"] != "running" and t["claim_lock"] is None and json.loads(t["runs_on"]) == ["machine:worker-1"]
+@@ -232,10 +235,10 @@ def test_cli_move_by_the_cards_own_worker_ends_its_run(gws, monkeypatch):
+     tid, run_id = _running_hub_card(hub)
+     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+-    out = json.loads(_cli(f'move {tid} --runs-on machine:worker-1 --reason "needs linux" --json'))
++    out = json.loads(_cli(f'move {tid} --runs-on machine:worker-1 --host-reason worktree --reason "needs linux" --json'))
+     assert out["reason_code"] == "checkpoint_required"  # refused before touching the card
+     assert kb.get_task(hub.conn, tid).status == "running"
+-    out = json.loads(_cli(f'move {tid} --runs-on machine:worker-1 --reason "needs linux" '
++    out = json.loads(_cli(f'move {tid} --runs-on machine:worker-1 --host-reason worktree --reason "needs linux" '
+                           f'--checkpoint "did A; next B" --json'))
+     assert out["ok"] and out["status"] == "ready", out
+     run = hub.conn.execute("SELECT outcome FROM task_runs WHERE id = ?", (run_id,)).fetchone()
+diff --git a/tests/hermes_cli/test_kanban_move_machine_target_guard.py b/tests/hermes_cli/test_kanban_move_machine_target_guard.py
+new file mode 100644
+index 0000000000..7223999846
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_move_machine_target_guard.py
+@@ -0,0 +1,72 @@
++"""A move onto any ``machine:<x>`` needs a host_reason naming state on x; capacity is never one. [daveey]
++
++t_01a1d95c41620e6c (hub board, 2026-11-13): three pickup-stall alarm moves pinned published, portable work from one
++full machine to another (worker-7 -> worker-1/-4, worker-3 -> worker-8) with no host_reason; two stalled again on the
++new machine. Before this change only a pool worker's pin needed a host reason, so ``machine:<non-pool>`` passed bare.
++"""
++from __future__ import annotations
++
++import pytest
++
++from hermes_cli import kanban_move_pool as kmp
++
++
++class Refused(Exception):
++    def __init__(self, code, message):
++        super().__init__(message)
++        self.code, self.message = code, message
++
++
++POOL = kmp.pool_label()
++MACHINES = {"worker-1": {"labels": ["linux", POOL]}, "worker-8": {"labels": ["linux"]}, "hub": {"labels": ["linux"]},
++            "macbook": {"labels": ["macos"]}}
++
++
++def _check(labels, host_reason=None, **kw):
++    return kmp.check(labels, MACHINES, me="hub", running=False, previous=["machine:worker-7"], workspace_path=None,
++                     host_reason=host_reason, force=kw.get("force", False), refused=Refused)
++
++
++@pytest.mark.parametrize("target", ["worker-1", "worker-8", "hub", "macbook", "not-enrolled"])
++def test_any_machine_target_without_a_host_reason_is_refused_pointing_at_the_pool(target):
++    with pytest.raises(Refused) as err:
++        _check([f"machine:{target}"])
++    assert err.value.code == kmp.HOST_REASON_REQUIRED
++    assert POOL in err.value.message and "--pool" in err.value.message and f"machine:{target}" in err.value.message
++
++
++def test_force_does_not_waive_the_host_reason():
++    with pytest.raises(Refused):
++        _check(["machine:worker-8"], force=True)
++
++
++@pytest.mark.parametrize("reason", [
++    "worker-7 10/10, no pool worker eligible now",  # the 11-13 alarm move, verbatim shape
++    "worker-8 has free slots", "free slot on worker-8", "capacity", "worker-7 is full", "worker-8 is idle",
++])
++def test_a_capacity_only_host_reason_is_refused(reason):
++    with pytest.raises(Refused) as err:
++        _check(["machine:worker-8"], host_reason=reason)
++    assert err.value.code == kmp.HOST_REASON_CAPACITY and POOL in err.value.message
++
++
++@pytest.mark.parametrize("reason", [
++    "the card's worktree ~/code/_wt/foo is on worker-8",
++    "unpushed commits on worker-8",
++    "suite PID 4242 and its logs are on worker-8",
++    "Mac-only work: needs Xcode",
++    "hub-only work: reads the hub DB",
++    "worker-7 is 10/10 but the card's worktree with unpublished work is on worker-8",  # state wins over capacity
++])
++def test_a_host_reason_naming_target_state_is_accepted_and_recorded(reason):
++    assert _check(["machine:worker-8"], host_reason=reason) == {"host_reason": reason}
++
++
++@pytest.mark.parametrize("labels", [[POOL], ["linux"], ["macos", "capability:xcode"]])
++def test_labels_that_name_no_machine_need_no_host_reason(labels):
++    assert _check(labels) == {}
++
++
++def test_machine_pins_reads_every_machine_label():
++    assert kmp.machine_pins(["linux", "machine:a", "machine:b"]) == ["a", "b"]
++    assert kmp.pool_pins(["machine:worker-1", "machine:worker-8"], MACHINES) == ["worker-1"]
+diff --git a/tests/hermes_cli/test_kanban_move_parent_evidence.py b/tests/hermes_cli/test_kanban_move_parent_evidence.py
+index 7f20f69157..02b6d7dd00 100644
+--- a/tests/hermes_cli/test_kanban_move_parent_evidence.py
++++ b/tests/hermes_cli/test_kanban_move_parent_evidence.py
+@@ -11,6 +11,9 @@ from hermes_cli import kanban_unused_grant
+ from tests.hermes_cli import test_kanban_dependency_pr_handoff as helpers
+ from tests.hermes_cli import test_kanban_move as moves
+ 
++# kanban_move_pool: a machine:<x> target needs a host_reason naming state on x (t_01a1d95c41620e6c).
++HR = "the card's worktree is on that host"
++
+ svc = moves.svc
+ gws = moves.gws
+ 
+@@ -22,7 +25,7 @@ def moved_parent(gws, monkeypatch):
+     task, _run, clock = helpers.park(hub.conn, monkeypatch)
+     parent = kb.parent_ids(hub.conn, task)[0]
+     clock[0] += 1
+-    assert km.move_queued(hub.conn, task, runs_on=["machine:worker-1"], reason="capacity",
++    assert km.move_queued(hub.conn, task, runs_on=["machine:worker-1"], host_reason=HR, reason="capacity",
+                           checkpoint="Resume existing PR")["ok"]
+     # Use the source's real evidence with an independent primary. No dispatch
+     # claim consumes the checkpoint before individual reader boundaries run.
+diff --git a/tests/hermes_cli/test_kanban_move_pr_handoff.py b/tests/hermes_cli/test_kanban_move_pr_handoff.py
+index b6cd6c57a4..22b2a20bdd 100644
+--- a/tests/hermes_cli/test_kanban_move_pr_handoff.py
++++ b/tests/hermes_cli/test_kanban_move_pr_handoff.py
+@@ -13,6 +13,9 @@ from hermes_cli import kanban_move as km
+ from tests.hermes_cli import test_kanban_dependency_pr_handoff as helpers
+ from tests.hermes_cli import test_kanban_move as moves
+ 
++# kanban_move_pool: a machine:<x> target needs a host_reason naming state on x (t_01a1d95c41620e6c).
++HR = "the card's worktree is on that host"
++
+ svc = moves.svc
+ gws = moves.gws
+ 
+@@ -30,10 +33,10 @@ def test_running_pr_owner_move(gws, monkeypatch, reclaim):
+         "prev_pid": pid, "host_local": True, "termination_attempted": True,
+         "terminated": True, "sigkill": False})
+     if reclaim:
+-        result = km.move_reclaim(hub.conn, task, runs_on=["machine:worker-1"], reason="operator reclaim")
++        result = km.move_reclaim(hub.conn, task, runs_on=["machine:worker-1"], host_reason=HR, reason="operator reclaim")
+         assert stopped
+     else:
+-        result = km.move_task(hub.conn, task, runs_on=["machine:worker-1"], reason="capacity",
++        result = km.move_task(hub.conn, task, runs_on=["machine:worker-1"], host_reason=HR, reason="capacity",
+                               checkpoint="Resume the existing PR", expected_run_id=run)
+     assert result["ok"], result
+     hub.round()
+@@ -53,7 +56,7 @@ def test_publication_after_park_is_not_authorized_by_move(gws, monkeypatch, publ
+     task, _, clock = helpers.park(hub.conn, monkeypatch)
+     clock[0] += 1
+     worker_comment(hub.conn, task, "dev", publication)
+-    assert km.move_queued(hub.conn, task, runs_on=["machine:worker-1"], reason="capacity",
++    assert km.move_queued(hub.conn, task, runs_on=["machine:worker-1"], host_reason=HR, reason="capacity",
+                           checkpoint="Resume PR")["ok"]
+     hub.round()
+     worker.round()
+@@ -74,7 +77,7 @@ def test_parent_result_refresh_wakes_without_status_change(gws, monkeypatch):
+         hub.conn.execute("UPDATE task_runs SET metadata = ? WHERE task_id = ?",
+                          (json.dumps({"verdict": "approve", "reviewed_sha": "short", "pr": helpers.PR}), parent))
+     clock[0] += 1
+-    assert km.move_queued(hub.conn, task, runs_on=["machine:worker-1"], reason="capacity",
++    assert km.move_queued(hub.conn, task, runs_on=["machine:worker-1"], host_reason=HR, reason="capacity",
+                           checkpoint="Resume PR")["ok"]
+     hub.round()
+     worker.round()
+@@ -100,7 +103,7 @@ def test_operator_cli_preserves_checkpoint(gws, monkeypatch):
+     hub.enter()
+     task = kb.create_task(hub.conn, title="move queued card", assignee="dev")
+     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+-    args = Namespace(task_id=task, runs_on="machine:worker-1", reason="capacity",
++    args = Namespace(task_id=task, runs_on="machine:worker-1", reason="capacity", host_reason=HR,
+                      checkpoint="Resume the existing PR, not a new implementation.",
+                      force=False, reclaim=False, json=True)
+     assert cli._cmd_move(args) == 0
+@@ -137,7 +140,7 @@ def test_operator_move_after_dependency_park(gws, monkeypatch, review, checkpoin
+     assert kb.complete_task(hub.conn, parent, summary="prerequisite finished", metadata=metadata)
+     kb.recompute_ready(hub.conn)
+     clock[0] += 1
+-    result = km.move_queued(hub.conn, task, runs_on=["machine:worker-1"], reason="continue on worker",
++    result = km.move_queued(hub.conn, task, runs_on=["machine:worker-1"], host_reason=HR, reason="continue on worker",
+                             checkpoint=checkpoint)
+     assert result["ok"], result
+     hub.round()
+@@ -162,7 +165,7 @@ def test_move_after_failed_run_stays_guarded(gws, monkeypatch, outcome):
+     with kb.write_txn(hub.conn):
+         hub.conn.execute("UPDATE task_runs SET outcome = ? WHERE id = ?", (outcome, run))
+         kb._append_event(hub.conn, task, outcome, {}, run_id=run)
+-    result = km.move_queued(hub.conn, task, runs_on=["machine:worker-1"], reason="continue on worker",
++    result = km.move_queued(hub.conn, task, runs_on=["machine:worker-1"], host_reason=HR, reason="continue on worker",
+                             checkpoint="Resume existing PR after dependency completion")
+     assert result["ok"], result
+     assert prs.active_pr_reason(hub.conn, task, int(time.time())) == "active_pr"
+diff --git a/tests/hermes_cli/test_kanban_move_unpushed.py b/tests/hermes_cli/test_kanban_move_unpushed.py
+index 61ac00696c..6d4132133b 100644
+--- a/tests/hermes_cli/test_kanban_move_unpushed.py
++++ b/tests/hermes_cli/test_kanban_move_unpushed.py
+@@ -23,6 +23,9 @@ from hermes_cli import kanban_worker_node as wn
+ from tests.hermes_cli.kanban_sync_fake_board import FakeService
+ from tests.hermes_cli.test_kanban_worker_node import HUB, MACHINES, WORKER, Gateway
+ 
++# kanban_move_pool: a machine:<x> target needs a host_reason naming state on x (t_01a1d95c41620e6c).
++HR = "the card's worktree is on that host"
++
+ TARGET = [f"machine:{WORKER}"]
+ 
+ 
+@@ -88,7 +91,7 @@ def test_an_owner_marked_tree_with_an_unpushed_commit_keeps_the_card_here(hub, t
+     tid = _card(hub)
+     tree = _worktree(tmp_path, "impl", owner=tid)
+     _commit(tree, "b.txt")  # on wt/impl only: no remote has it
+-    res = km.move_queued(hub.conn, tid, runs_on=TARGET, reason="worker-1 has slots")
++    res = km.move_queued(hub.conn, tid, runs_on=TARGET, host_reason=HR, reason="worker-1 has slots")
+     _refused(res, tree)
+     assert "unpushed commits" in res["error"]
+     assert _moved(hub.conn, tid) == [] and _runs_on(hub.conn, tid) != TARGET
+@@ -99,7 +102,7 @@ def test_a_dirty_owner_marked_tree_keeps_the_card_here(hub, tmp_path):
+     tree = _worktree(tmp_path, "dirty", owner=tid)
+     _git(tree, "push", "-q", "origin", "HEAD:refs/heads/wt/dirty")
+     (tree / "wip.txt").write_text("not committed\n")
+-    res = km.move_queued(hub.conn, tid, runs_on=TARGET, reason="worker-1 has slots")
++    res = km.move_queued(hub.conn, tid, runs_on=TARGET, host_reason=HR, reason="worker-1 has slots")
+     _refused(res, tree)
+     assert "dirty worktree" in res["error"]
+ 
+@@ -109,7 +112,7 @@ def test_a_clean_tree_whose_commits_are_pushed_moves(hub, tmp_path):
+     tree = _worktree(tmp_path, "pushed", owner=tid)
+     _commit(tree, "b.txt")
+     _git(tree, "push", "-q", "origin", "HEAD:refs/heads/wt/pushed")
+-    res = km.move_queued(hub.conn, tid, runs_on=TARGET, reason="worker-1 has slots")
++    res = km.move_queued(hub.conn, tid, runs_on=TARGET, host_reason=HR, reason="worker-1 has slots")
+     assert res["ok"], res
+     assert "left_unpushed_state" not in _moved(hub.conn, tid)[-1]
+ 
+@@ -120,7 +123,7 @@ def test_a_tree_named_only_in_the_newest_comment_keeps_the_card_here(hub, tmp_pa
+     _commit(tree, "b.txt")
+     kb.add_comment(hub.conn, tid, "default", "older note, no path")
+     kb.add_comment(hub.conn, tid, "default", f"Implementation is in {tree}, commit b not pushed yet.")
+-    _refused(km.move_queued(hub.conn, tid, runs_on=TARGET, reason="worker-1 has slots"), tree)
++    _refused(km.move_queued(hub.conn, tid, runs_on=TARGET, host_reason=HR, reason="worker-1 has slots"), tree)
+ 
+ 
+ def test_a_shared_main_checkout_the_body_mentions_is_not_the_cards_work(hub, tmp_path):
+@@ -129,14 +132,14 @@ def test_a_shared_main_checkout_the_body_mentions_is_not_the_cards_work(hub, tmp
+     _git(main, "init", "-q")
+     (main / "untracked.txt").write_text("someone else's\n")
+     tid = _card(hub, body=f"Fix the parser in {main}.")
+-    assert km.move_queued(hub.conn, tid, runs_on=TARGET, reason="worker-1 has slots")["ok"]
++    assert km.move_queued(hub.conn, tid, runs_on=TARGET, host_reason=HR, reason="worker-1 has slots")["ok"]
+ 
+ 
+ def test_force_leaves_the_state_and_the_event_records_it(hub, tmp_path):
+     tid = _card(hub)
+     tree = _worktree(tmp_path, "forced", owner=tid)
+     _commit(tree, "b.txt")
+-    res = km.move_queued(hub.conn, tid, runs_on=TARGET, reason="abandon the hub copy", force=True)
++    res = km.move_queued(hub.conn, tid, runs_on=TARGET, host_reason=HR, reason="abandon the hub copy", force=True)
+     assert res["ok"], res
+     ev = _moved(hub.conn, tid)[-1]
+     assert ev["left_unpushed_state"] == f"unpushed commits in {tree.resolve()}", ev
+@@ -159,7 +162,7 @@ def test_a_running_cards_own_move_is_refused_and_its_run_goes_on(hub, tmp_path):
+     assert kb.get_task(hub.conn, tid).status == "running"
+     tree = _worktree(tmp_path, "running", owner=tid)
+     _commit(tree, "b.txt")
+-    res = km.move_task(hub.conn, tid, runs_on=TARGET, reason="r", checkpoint="c", expected_run_id=run_id)
++    res = km.move_task(hub.conn, tid, runs_on=TARGET, host_reason=HR, reason="r", checkpoint="c", expected_run_id=run_id)
+     _refused(res, tree)
+     assert kb.get_task(hub.conn, tid).status == "running"
+ 
+@@ -169,7 +172,7 @@ def test_the_cli_prints_the_refusal_code(hub, tmp_path):
+     tid = _card(hub)
+     tree = _worktree(tmp_path, "cli", owner=tid)
+     _commit(tree, "b.txt")
+-    out = json.loads(kcli.run_slash(f'move {tid} --runs-on machine:{WORKER} --reason "slots" --json'))
++    out = json.loads(kcli.run_slash(f'move {tid} --runs-on machine:{WORKER} --host-reason worktree --reason "slots" --json'))
+     assert out["reason_code"] == "unpushed_state_here", out
+-    text = kcli.run_slash(f'move {tid} --runs-on machine:{WORKER} --reason "slots"')
++    text = kcli.run_slash(f'move {tid} --runs-on machine:{WORKER} --host-reason worktree --reason "slots"')
+     assert "[unpushed_state_here]" in text and "pass force to leave it" in text, text
+diff --git a/tests/hermes_cli/test_kanban_move_unpushed_followups.py b/tests/hermes_cli/test_kanban_move_unpushed_followups.py
+index 1e8285a186..c69f318e88 100644
+--- a/tests/hermes_cli/test_kanban_move_unpushed_followups.py
++++ b/tests/hermes_cli/test_kanban_move_unpushed_followups.py
+@@ -21,6 +21,9 @@ from tests.hermes_cli.test_kanban_move_unpushed import (
+     TARGET, _card, _commit, _git, _moved, _refused, _worktree, hub)
+ from tests.hermes_cli.test_kanban_worker_repin import NoCallHub, _acknowledged, _RecordHub
+ 
++# kanban_move_pool: a machine:<x> target needs a host_reason naming state on x (t_01a1d95c41620e6c).
++HR = "the card's worktree is on that host"
++
+ conn = db_fixtures.conn
+ __all__ = ["conn", "hub"]
+ 
+@@ -31,7 +34,7 @@ def test_a_tree_named_only_in_the_queued_moves_checkpoint_keeps_the_card_here(hu
+     tid = _card(hub)
+     tree = _worktree(tmp_path, "ckpt-queued")  # no owner marker, nothing stored names it
+     _commit(tree, "b.txt")
+-    res = km.move_queued(hub.conn, tid, runs_on=TARGET, reason="slots", checkpoint=f"WIP in {tree}, not pushed")
++    res = km.move_queued(hub.conn, tid, runs_on=TARGET, host_reason=HR, reason="slots", checkpoint=f"WIP in {tree}, not pushed")
+     _refused(res, tree)
+     assert _moved(hub.conn, tid) == []
+ 
+@@ -44,7 +47,7 @@ def test_a_tree_named_only_in_the_running_moves_checkpoint_keeps_the_card_here(h
+     run_id = hub.conn.execute("SELECT current_run_id FROM tasks WHERE id = ?", (tid,)).fetchone()[0]
+     tree = _worktree(tmp_path, "ckpt-running")
+     _commit(tree, "b.txt")
+-    res = km.move_task(hub.conn, tid, runs_on=TARGET, reason="r", checkpoint=f"Done: commit b in {tree}.",
++    res = km.move_task(hub.conn, tid, runs_on=TARGET, host_reason=HR, reason="r", checkpoint=f"Done: commit b in {tree}.",
+                        expected_run_id=run_id)
+     _refused(res, tree)
+     assert kb.get_task(hub.conn, tid).status == "running"
+@@ -57,8 +60,8 @@ def test_a_text_named_tree_owned_by_another_card_does_not_keep_this_card(hub, tm
+     tree = _worktree(tmp_path, "impl-owned", owner=impl)
+     _commit(tree, "b.txt")
+     review = _card(hub, title="reviewer", body=f"Review the implementer's tree at {tree} (head b).")
+-    assert km.move_queued(hub.conn, review, runs_on=TARGET, reason="slots")["ok"]
+-    _refused(km.move_queued(hub.conn, impl, runs_on=TARGET, reason="slots"), tree)  # still its owner's state
++    assert km.move_queued(hub.conn, review, runs_on=TARGET, host_reason=HR, reason="slots")["ok"]
++    _refused(km.move_queued(hub.conn, impl, runs_on=TARGET, host_reason=HR, reason="slots"), tree)  # still its owner's state
+ 
+ 
+ def test_a_text_named_tree_owned_by_the_card_itself_still_counts(hub, tmp_path):
+diff --git a/tests/hermes_cli/test_kanban_move_validation.py b/tests/hermes_cli/test_kanban_move_validation.py
+index c2168d0a36..70402843da 100644
+--- a/tests/hermes_cli/test_kanban_move_validation.py
++++ b/tests/hermes_cli/test_kanban_move_validation.py
+@@ -10,6 +10,9 @@ from hermes_cli import kanban_move as km
+ from hermes_cli import kanban_runs_on_capabilities as roc
+ from tests.hermes_cli import test_kanban_move as helpers
+ 
++# kanban_move_pool: a machine:<x> target needs a host_reason naming state on x (t_01a1d95c41620e6c).
++HR = "the card's worktree is on that host"
++
+ svc = helpers.svc
+ gws = helpers.gws
+ 
+@@ -30,7 +33,7 @@ def _machines(*labels):
+ def test_queued_move_can_target_self_without_pickup(gws):
+     hub, _ = gws
+     tid = _card(hub, requires=["terminal"])
+-    result = km.move_queued(hub.conn, tid, runs_on=["machine:hub"], reason="keep local",
++    result = km.move_queued(hub.conn, tid, runs_on=["machine:hub"], host_reason=HR, reason="keep local",
+                             machines={"hub": {"state": "active", "pickup": False}}, me="hub")
+     assert result["ok"] and result["matches"] == ["hub"], result
+     assert json.loads(hub.conn.execute("SELECT runs_on FROM tasks WHERE id = ?", (tid,)).fetchone()[0]) == ["machine:hub"]
+@@ -53,9 +56,9 @@ def test_move_refuses_missing_worker_labels_without_writes(gws, monkeypatch, nee
+         tid = _card(hub, requires=needs, skills=pins)
+     monkeypatch.setattr(roc, "_remote_tools", lambda name: None)
+     before = dict(hub.conn.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone())
+-    result = km.move_task(hub.conn, tid, runs_on=["machine:worker-1"], reason="move", checkpoint="saved",
++    result = km.move_task(hub.conn, tid, runs_on=["machine:worker-1"], host_reason=HR, reason="move", checkpoint="saved",
+                           machines=_machines("profile:default", "capability:terminal"), me="hub") if running else (
+-        km.move_queued(hub.conn, tid, runs_on=["machine:worker-1"], reason="move",
++        km.move_queued(hub.conn, tid, runs_on=["machine:worker-1"], host_reason=HR, reason="move",
+                        machines=_machines("profile:default", "capability:terminal"), me="hub"))
+     assert result.get("reason_code") == "capability_mismatch", result
+     assert missing in result["error"] and "worker-1" in result["error"]
+@@ -74,7 +77,7 @@ def test_move_requires_one_target_with_both_labels_and_profile_tools(gws, monkey
+                                                   for n, v in machines.items()}, me="hub")
+     assert exc.value.code == "capability_mismatch"
+     monkeypatch.setattr(roc, "_remote_tools", lambda name: {"default": ["terminal"]})
+-    result = km.move_queued(hub.conn, tid, runs_on=["machine:worker-1"], reason="capable target",
++    result = km.move_queued(hub.conn, tid, runs_on=["machine:worker-1"], host_reason=HR, reason="capable target",
+                             machines=machines, me="hub")
+     assert result["ok"] and result["matches"] == ["worker-1"], result
+ 
+@@ -83,7 +86,7 @@ def test_queued_self_still_checks_local_profile_tools(gws, monkeypatch):
+     hub, _ = gws
+     tid = _card(hub, requires=["terminal"])
+     monkeypatch.setattr(roc, "_local_tools", lambda assignee: set())
+-    result = km.move_queued(hub.conn, tid, runs_on=["machine:hub"], reason="local",
++    result = km.move_queued(hub.conn, tid, runs_on=["machine:hub"], host_reason=HR, reason="local",
+                             machines={"hub": {"state": "active"}}, me="hub")
+     assert result.get("reason_code") == "capability_mismatch", result
+ 
+@@ -95,7 +98,7 @@ def test_every_required_label_must_be_on_the_same_target(gws, monkeypatch, missi
+     labels = {"capability:host_repo", "skill:five-whys", "skill:plan"}
+     machines = _machines(*(labels - {missing}))
+     monkeypatch.setattr(roc, "_remote_tools", lambda name: None)
+-    result = km.move_queued(hub.conn, tid, runs_on=["machine:worker-1"], reason="partial",
++    result = km.move_queued(hub.conn, tid, runs_on=["machine:worker-1"], host_reason=HR, reason="partial",
+                             machines=machines, me="hub")
+     assert result.get("reason_code") == "capability_mismatch" and missing in result["error"], result
+     machines["capable"] = {"state": "active", "labels": sorted(labels)}
+@@ -109,7 +112,7 @@ def test_every_required_label_must_be_on_the_same_target(gws, monkeypatch, missi
+ def test_queued_self_must_still_be_active_and_unheld(gws, entry):
+     hub, _ = gws
+     tid = _card(hub)
+-    result = km.move_queued(hub.conn, tid, runs_on=["machine:hub"], reason="local",
++    result = km.move_queued(hub.conn, tid, runs_on=["machine:hub"], host_reason=HR, reason="local",
+                             machines={"hub": entry}, me="hub")
+     assert result.get("reason_code") == "no_machine", result
+ 
+@@ -123,7 +126,7 @@ def test_queued_return_uses_local_inventory_not_worker_labels(gws, monkeypatch,
+     monkeypatch.setattr(caps, '_profile_capabilities', lambda assignee: set() if missing == 'host_repo' else {'host_repo'})
+     monkeypatch.setattr(caps, '_profile_policy', lambda assignee: nullcontext())
+     monkeypatch.setattr(caps, '_skill_frontmatter', lambda pin: None if missing == 'skill' else {})
+-    result = km.move_queued(hub.conn, tid, runs_on=['machine:hub'], reason='return home',
++    result = km.move_queued(hub.conn, tid, runs_on=['machine:hub'], host_reason=HR, reason='return home',
+                             machines={'hub': {'state': 'active'}}, me='hub')
+     assert result['ok'] is (missing is None), result
+ 
+diff --git a/tests/hermes_cli/test_kanban_pickup_stall_repin.py b/tests/hermes_cli/test_kanban_pickup_stall_repin.py
+index 870774baa5..589c4a14ed 100644
+--- a/tests/hermes_cli/test_kanban_pickup_stall_repin.py
++++ b/tests/hermes_cli/test_kanban_pickup_stall_repin.py
+@@ -25,6 +25,8 @@ from tests.hermes_cli import test_kanban_worker_node as support
+ 
+ M, X = "worker-1", "worker-2"
+ NOW = 1_800_000_000_000
++# t_01a1d95c41620e6c: a move to one machine needs a host_reason naming state on it; capacity is never one.
++HR = "the card's worktree and suite logs are on worker-2"
+ svc = support.svc
+ fleet = oc.fleet
+ 
+@@ -70,9 +72,12 @@ class Board:
+             for col, value in cols.items():
+                 self.conn.execute(f"UPDATE tasks SET {col} = ? WHERE id = ?", (value, tid))
+ 
+-    def why(self, target=None, runs_on=(f"machine:{X}",), machines=None, alarm=None):
++    def why(self, target=None, runs_on=(f"machine:{X}",), machines=None, alarm=None, host_reason=None):
++        if host_reason is None and any(str(label).startswith("machine:") for label in runs_on):
++            host_reason = HR
+         return rp.refusal(self.conn, target or self.target, alarm or self.alarm, list(runs_on),
+-                          machines=_machines() if machines is None else machines, now_ms=NOW)
++                          machines=_machines() if machines is None else machines, now_ms=NOW,
++                          host_reason=host_reason or None)
+ 
+ 
+ @pytest.fixture
+@@ -194,16 +199,48 @@ def test_the_pool_queue_is_a_valid_target_when_another_pool_worker_is_eligible(b
+ @pytest.mark.parametrize("machines", [
+     lambda: _machines(),                                               # no machine carries the pool label
+     lambda: _pooled(worker_2={"hold": True}),                          # the only other pool worker is held
+-    lambda: _pooled(worker_2={"metrics": {"active_card_runs": 10}}),  # ... or has no free slot
+-    lambda: _pooled(worker_2={"last_seen": NOW - 301_000}),           # ... or was not seen recently
++    lambda: _pooled(worker_2={"state": "retired"}),                    # ... or retired
++    lambda: _pooled(worker_2={"pickup": None}),                        # ... or takes no pickup
+     lambda: _machines(worker_1={"hold": False, "labels": [*_worker(M)["labels"], POOL]}),  # only M is pooled
+     lambda: None,                                                      # the registry is unreadable
+ ])
+-def test_the_pool_queue_is_refused_when_no_other_pool_worker_is_eligible_now(board, machines):
++def test_the_pool_queue_is_refused_when_no_other_pool_worker_can_take_it(board, machines):
+     why = rp.refusal(board.conn, board.target, board.alarm, [POOL], machines=machines(), now_ms=NOW)
+     assert why is not None and (POOL in why or "unreadable" in why), why
+ 
+ 
++@pytest.mark.parametrize("change", [
++    {"metrics": {"active_card_runs": 10}},  # full now: the card waits in the single queue for a slot
++    {"metrics": {"active_card_runs": 0, "drain_active": 1}},
++])
++def test_the_pool_queue_does_not_need_a_free_slot_now(board, change):
++    """t_01a1d95c41620e6c: requiring a free pool slot sent the alarm to ``machine:<X>`` pins (worker-1/-4/-8 on 11-13)
++    that stalled again on X. The single queue waits for any worker's slot."""
++    assert board.why(runs_on=[POOL], machines=_pooled(worker_2=change)) is None
++
++
++# --- t_01a1d95c41620e6c: a machine:<X> target needs a host_reason naming state on X ---------------------------------
++
++def test_an_alarm_move_to_one_machine_without_a_host_reason_is_refused_pointing_at_the_pool(board):
++    why = board.why(host_reason="")
++    assert why is not None and "host_reason" in why and POOL in why, why
++
++
++@pytest.mark.parametrize("reason", ["worker-1 10/10, no pool worker eligible now", "worker-2 has free slots",
++                                    "capacity on worker-2", "worker-1 is full"])
++def test_an_alarm_move_to_one_machine_citing_capacity_is_refused(board, reason):
++    why = board.why(host_reason=reason)
++    assert why is not None and "capacity" in why and POOL in why, why
++
++
++def test_the_same_alarm_move_to_the_pool_is_accepted(board):
++    assert board.why(runs_on=[POOL], machines=_pooled(), host_reason="") is None
++
++
++def test_an_alarm_move_naming_state_on_the_machine_is_accepted(board):
++    assert board.why(host_reason="worker-2 holds the card's worktree ~/code/_wt/x with unpushed commits") is None
++
++
+ @pytest.mark.parametrize("runs_on", [[POOL, "linux"], [POOL, f"machine:{X}"], ["pool:gpu"]])
+ def test_the_pool_queue_is_exactly_the_pool_label(board, runs_on):
+     assert board.why(runs_on=runs_on, machines=_pooled(worker_2={
+@@ -332,7 +369,7 @@ def test_the_hub_lane_without_hub_write_is_a_valid_target(board):
+ 
+ def test_an_unreadable_registry_refuses(board):
+     assert "unreadable" in rp.refusal(board.conn, board.target, board.alarm, [f"machine:{X}"], machines=None,
+-                                      now_ms=NOW)
++                                      now_ms=NOW, host_reason=HR)
+ 
+ 
+ def test_a_card_not_on_this_board_or_only_a_pickup_copy_points_at_the_operator_call(board, monkeypatch):
+@@ -389,10 +426,12 @@ def held(tmp_path, monkeypatch, svc):
+         wn.set_registry_fetch(None)
+ 
+ 
+-def _move(task_id, runs_on):
++def _move(task_id, runs_on, host_reason=None):
+     from tools import kanban_tools as kt
+-    return json.loads(kt._handle_move({"task_id": task_id, "runs_on": runs_on, "reason": f"{M} is on hold",
+-                                       "checkpoint": "n/a"}))
++    args = {"task_id": task_id, "runs_on": runs_on, "reason": f"{M} is on hold", "checkpoint": "n/a"}
++    if host_reason:
++        args["host_reason"] = host_reason
++    return json.loads(kt._handle_move(args))
+ 
+ 
+ def test_the_alarms_run_re_places_each_listed_card_and_keeps_running(held):
+@@ -400,7 +439,10 @@ def test_the_alarms_run_re_places_each_listed_card_and_keeps_running(held):
+     body = kb.get_task(hub.conn, alarm).body
+     assert "kanban_move(task_id=" in body and "kanban_supervisor_request" in body  # the alarm names the command
+     for tid in cards:
+-        out = _move(tid, [f"machine:{X}"])
++        out = _move(tid, [f"machine:{X}"])  # t_01a1d95c41620e6c: a capacity stall is no state on X
++        assert out.get("ok") is not True and "host_reason" in out["error"], out
++        assert place._pin(hub.conn, tid) == [f"machine:{M}"]
++        out = _move(tid, [f"machine:{X}"], host_reason=HR)
+         assert out.get("ok") is True, out
+         assert place._pin(hub.conn, tid) == [f"machine:{X}"]
+         [moved] = [json.loads(e[0]) for e in hub.conn.execute(
+@@ -473,13 +515,13 @@ def test_the_alarms_run_leaves_a_card_whose_unpushed_tree_is_on_this_host(held,
+     gitdir = (tree / ".git").read_text().split(":", 1)[1].strip()
+     (Path(gitdir) / "hermes-owner.json").write_text(json.dumps({"task_id": a}))
+     subprocess.run([*git, "commit", "-q", "--allow-empty", "-m", "wip"], cwd=tree, check=True, capture_output=True)
+-    out = _move(a, [f"machine:{X}"])
++    out = _move(a, [f"machine:{X}"], host_reason=HR)
+     # The tool error carries move_queued's message, not its reason_code.
+     assert out.get("ok") is not True and "unpushed commits in" in out["error"], out
+     assert "another machine cannot resume it" in out["error"], out
+     assert place._pin(hub.conn, a) == [f"machine:{M}"]
+     assert not hub.conn.execute("SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'moved'", (a,)).fetchone()
+-    assert _move(b, [f"machine:{X}"]).get("ok") is True  # a card with no tree here still moves
++    assert _move(b, [f"machine:{X}"], host_reason=HR).get("ok") is True  # a card with no tree here still moves
+     assert kb.get_task(hub.conn, alarm).status == "running"
+ 
+ 
+@@ -507,19 +549,25 @@ def test_an_alarm_caller_gets_the_same_scope_on_an_operator_call_move(fleet, mon
+                      f.caller))
+     monkeypatch.setattr(rp, "_registry_machines", lambda: _machines())
+ 
+-    def ask(runs_on, target=None):
+-        out = ksr.submit(f.w, env_task=f.caller, env_run=str(f.run_id), dry_run=True, ops=[
+-            {"op": "operator", "action": "move", "task_id": target or f.target, "runs_on": runs_on,
+-             "reason": f"{M} is on hold"}])
++    def ask(runs_on, target=None, host_reason=None):
++        op = {"op": "operator", "action": "move", "task_id": target or f.target, "runs_on": runs_on,
++              "reason": f"{M} is on hold"}
++        if host_reason:
++            op["host_reason"] = host_reason
++        out = ksr.submit(f.w, env_task=f.caller, env_run=str(f.run_id), dry_run=True, ops=[op])
+         return out["ops"][0]
+ 
+-    assert ask([f"machine:{X}"])["verdict"] == "supervisor"
+-    assert ask([f"machine:{M}"]).get("code") == "pickup_stall_scope"
++    # t_01a1d95c41620e6c: the 11-13 alarm moves (worker-7 -> worker-1/-4, worker-3 -> worker-8) carried no host state.
++    assert ask([f"machine:{X}"]).get("code") == "pickup_stall_scope"
++    assert ask([f"machine:{X}"], host_reason="worker-7 10/10, no pool worker eligible now").get(
++        "code") == "pickup_stall_scope"
++    assert ask([f"machine:{X}"], host_reason=HR)["verdict"] == "supervisor"
++    assert ask([f"machine:{M}"], host_reason=HR).get("code") == "pickup_stall_scope"
+     other = f.card(f.h, "not listed")
+     with kb.write_txn(f.h):
+         f.h.execute("UPDATE tasks SET runs_on = ? WHERE id = ?", (json.dumps([f"machine:{M}"]), other))
+     f.board()
+-    assert ask([f"machine:{X}"], target=other).get("code") == "pickup_stall_scope"
++    assert ask([f"machine:{X}"], target=other, host_reason=HR).get("code") == "pickup_stall_scope"
+     # The pool queue: granted while another pool worker is eligible now, refused when none is.
+     assert ask([POOL]).get("code") == "pickup_stall_scope"
+     monkeypatch.setattr(rp, "_registry_machines", lambda: _pooled())
+diff --git a/tests/hermes_cli/test_kanban_requires_placement.py b/tests/hermes_cli/test_kanban_requires_placement.py
+index bb2623d110..08078871c2 100644
+--- a/tests/hermes_cli/test_kanban_requires_placement.py
++++ b/tests/hermes_cli/test_kanban_requires_placement.py
+@@ -25,6 +25,9 @@ from hermes_cli.kanban_capabilities import CapabilityMismatchError
+ from tests.hermes_cli.kanban_sync_fake_board import FakeService
+ from tests.hermes_cli.test_kanban_worker_node import BOARD, HUB, MACHINES, WORKER, Gateway
+ 
++# kanban_move_pool: a machine:<x> target needs a host_reason naming state on x (t_01a1d95c41620e6c).
++HR = "the card's worktree is on that host"
++
+ WITH_KANBAN = "platform_toolsets:\n  cli: [terminal, file, kanban]\n"
+ NEEDS = ["terminal", "file", "git", "kanban"]
+ NO_SHELL = "platform_toolsets:\n  cli: [file]\n"
+@@ -117,7 +120,7 @@ def test_move_to_a_machine_known_to_lack_a_tool_is_refused_naming_it(gws, monkey
+     _publish(monkeypatch, {})
+     tid, run_id = _running_hub_card(hub, requires=NEEDS)
+     _publish(monkeypatch, {WORKER: {"default": {"terminal", "file", "git"}}})
+-    res = km.move_task(hub.conn, tid, runs_on=["machine:worker-1"], reason="heavy", checkpoint="x",
++    res = km.move_task(hub.conn, tid, runs_on=["machine:worker-1"], host_reason=HR, reason="heavy", checkpoint="x",
+                        expected_run_id=run_id)
+     assert not res["ok"] and res["reason_code"] == "capability_mismatch", res
+     assert "worker-1" in res["error"] and "kanban" in res["error"]
+@@ -126,7 +129,7 @@ def test_move_to_a_machine_known_to_lack_a_tool_is_refused_naming_it(gws, monkey
+         hub.conn.execute("SELECT runs_on FROM tasks WHERE id = ?", (tid,)).fetchone()[0]) == ["machine:hub"]
+     # Control: the same move succeeds once the worker publishes the tool.
+     _publish(monkeypatch, {WORKER: {"default": {"terminal", "file", "kanban"}}})
+-    res = km.move_task(hub.conn, tid, runs_on=["machine:worker-1"], reason="heavy", checkpoint="x",
++    res = km.move_task(hub.conn, tid, runs_on=["machine:worker-1"], host_reason=HR, reason="heavy", checkpoint="x",
+                        expected_run_id=run_id)
+     assert res["ok"], res
+ 
+@@ -137,7 +140,7 @@ def test_queued_move_is_refused_too(gws, monkeypatch):
+     tid = kb.create_task(hub.conn, title="q", assignee="default", requires=NEEDS, runs_on=["machine:hub"],
+                          triage=True)
+     _publish(monkeypatch, {WORKER: {"default": {"terminal"}}})
+-    res = km.move_queued(hub.conn, tid, runs_on=["machine:worker-1"], reason="heavy")
++    res = km.move_queued(hub.conn, tid, runs_on=["machine:worker-1"], host_reason=HR, reason="heavy")
+     assert not res["ok"] and res["reason_code"] == "capability_mismatch" and "worker-1" in res["error"], res
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_review_checkpoint_cross_machine.py b/tests/hermes_cli/test_kanban_review_checkpoint_cross_machine.py
+index 92eaf952fc..1c84515b51 100644
+--- a/tests/hermes_cli/test_kanban_review_checkpoint_cross_machine.py
++++ b/tests/hermes_cli/test_kanban_review_checkpoint_cross_machine.py
+@@ -20,6 +20,9 @@ from hermes_cli import kanban_move as km
+ from tests.hermes_cli.kanban_guard_helpers import worker_comment
+ from tests.hermes_cli import test_kanban_move as moves
+ 
++# kanban_move_pool: a machine:<x> target needs a host_reason naming state on x (t_01a1d95c41620e6c).
++HR = "the card's worktree is on that host"
++
+ PR = "https://github.com/example/repo/pull/10"
+ HEAD = "a" * 40
+ gws = moves.gws
+@@ -35,7 +38,7 @@ def _park_on_worker_review(hub, worker, monkeypatch):
+     hub.enter()
+     task = kb.create_task(hub.conn, title="implement PR", assignee="default")
+     # Like production: a plain capacity move, no checkpoint text.
+-    assert km.move_queued(hub.conn, task, runs_on=["machine:worker-1"], reason="capacity")["ok"]
++    assert km.move_queued(hub.conn, task, runs_on=["machine:worker-1"], host_reason=HR, reason="capacity")["ok"]
+     hub.round()
+     worker.round()
+     worker.tick()
+diff --git a/tests/hermes_cli/test_kanban_runs_on_pickup_guard.py b/tests/hermes_cli/test_kanban_runs_on_pickup_guard.py
+index f8cadff3ff..1b02f93548 100644
+--- a/tests/hermes_cli/test_kanban_runs_on_pickup_guard.py
++++ b/tests/hermes_cli/test_kanban_runs_on_pickup_guard.py
+@@ -20,6 +20,9 @@ from hermes_cli import kanban_worker_node as wn
+ from tests.hermes_cli.kanban_sync_fake_board import FakeService
+ from tests.hermes_cli.test_kanban_worker_node import HUB, MACHINES, WORKER, Gateway
+ 
++# kanban_move_pool: a machine:<x> target needs a host_reason naming state on x (t_01a1d95c41620e6c).
++HR = "the card's worktree is on that host"
++
+ 
+ @pytest.fixture
+ def svc():
+@@ -131,13 +134,13 @@ def test_move_queued_to_a_machine_without_pickup_is_refused_and_accepted_with_it
+     hub, _ = gws
+     _registry(None)
+     tid = kb.create_task(hub.conn, title="queued", assignee="default", runs_on=["machine:hub"])
+-    res = km.move_queued(hub.conn, tid, runs_on=["machine:macbook"], reason="needs the mac")
++    res = km.move_queued(hub.conn, tid, runs_on=["machine:macbook"], host_reason=HR, reason="needs the mac")
+     assert res["ok"] is False and res["reason_code"] == "placement_unavailable", res
+     assert 'placement="macbook"' in res["error"]
+     assert json.loads(hub.conn.execute("SELECT runs_on FROM tasks WHERE id = ?", (tid,)).fetchone()[0]) == [
+         "machine:hub"]
+     _registry("all")
+-    res = km.move_queued(hub.conn, tid, runs_on=["machine:macbook"], reason="needs the mac")
++    res = km.move_queued(hub.conn, tid, runs_on=["machine:macbook"], host_reason=HR, reason="needs the mac")
+     assert res["ok"] and res["matches"] == ["macbook"], res
+ 
+ 
+@@ -146,11 +149,11 @@ def test_cli_move_gets_the_same_two_results(gws, capsys):
+     from hermes_cli import kanban as kcli
+     _registry(None)
+     tid = kb.create_task(hub.conn, title="queued", assignee="default", runs_on=["machine:hub"])
+-    out = kcli.run_slash(f'move {tid} --runs-on machine:macbook --reason "needs the mac" --json')
++    out = kcli.run_slash(f'move {tid} --runs-on machine:macbook --host-reason "Mac-only work" --reason "needs the mac" --json')
+     res = json.loads(out)
+     assert res["ok"] is False and res["reason_code"] == "placement_unavailable", res
+     _registry("explicit")
+-    res = json.loads(kcli.run_slash(f'move {tid} --runs-on machine:macbook --reason "needs the mac" --json'))
++    res = json.loads(kcli.run_slash(f'move {tid} --runs-on machine:macbook --host-reason "Mac-only work" --reason "needs the mac" --json'))
+     assert res["ok"] and res["runs_on"] == ["machine:macbook"], res
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_worker_move_request.py b/tests/hermes_cli/test_kanban_worker_move_request.py
+index a60c904ac8..7ccbfb60db 100644
+--- a/tests/hermes_cli/test_kanban_worker_move_request.py
++++ b/tests/hermes_cli/test_kanban_worker_move_request.py
+@@ -21,6 +21,9 @@ from tests.hermes_cli import test_kanban_worker_policy_db as db_fixtures
+ from tests.hermes_cli.test_kanban_worker_node import BOARD, HUB, WORKER
+ from tests.hermes_cli.test_kanban_worker_repin import RepinHub
+ 
++# kanban_move_pool: a machine:<x> target needs a host_reason naming state on x (t_01a1d95c41620e6c).
++HR = "the card's worktree is on that host"
++
+ conn = db_fixtures.conn
+ gws = node_fixtures.gws
+ svc = node_fixtures.svc
+@@ -73,7 +76,7 @@ def test_a_worker_move_back_to_the_origin_is_repinned_there_and_the_origin_runs_
+     tid, run_id = _worker_runs_policy_card(origin, worker, svc)
+ 
+     worker.enter()
+-    res = km.move_task(worker.conn, tid, runs_on=[f"machine:{HUB}"], reason="needs the hub's askeve runtime",
++    res = km.move_task(worker.conn, tid, runs_on=[f"machine:{HUB}"], host_reason=HR, reason="needs the hub's example runtime",
+                        checkpoint="draft f9f05dd6e; next: fix the red suites", expected_run_id=run_id, force=True)
+     assert res["ok"] and res["status"] == "ready", res
+     assert res.get("repin") == "requested", res  # the worker cannot write a Board-owned pin; the origin applies it
+@@ -115,7 +118,7 @@ def test_a_reclaimed_move_of_a_policy_card_is_a_request_too(gws, svc, monkeypatc
+         "prev_pid": pid, "host_local": True, "termination_attempted": True, "terminated": True, "sigkill": False})
+     worker.enter()
+     before = worker.conn.execute("SELECT runs_on FROM tasks WHERE id=?", (tid,)).fetchone()[0]
+-    res = km.move_reclaim(worker.conn, tid, runs_on=[f"machine:{HUB}"], reason="needs the hub", force=True)
++    res = km.move_reclaim(worker.conn, tid, runs_on=[f"machine:{HUB}"], host_reason=HR, reason="needs the hub", force=True)
+     assert res["ok"] and res.get("repin") == "requested", res
+     assert worker.conn.execute("SELECT runs_on FROM tasks WHERE id=?", (tid,)).fetchone()[0] == before
+     assert _moved(worker.conn, tid)[-1].get("repin_requested") is True
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index 6cfcfeab08..04a9f42001 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -549,22 +549,25 @@ KANBAN_MOVE_SCHEMA = _schema(
+         "gateway whose runs_on no enrolled machine carries (stranded: e.g. ['hermes-hub']) may be re-routed by any "
+         "worker to labels a machine does carry (e.g. ['machine:hub']); the old labels are kept in a comment. "
+         "Third: a pickup-stall alarm's run may move a ready card its alarm lists off the stalled machine to "
+-        "runs_on = [\"pool:worker\"] while another pool worker is eligible now (or [\"machine:<X>\"] for one other "
+-        "eligible machine outside the pool). "
+-        "Every other card is refused."
++        "runs_on = [\"pool:worker\"] while another pool worker can take it (a free slot now is not needed: the "
++        "card waits in the single queue until any worker has one). "
++        "Every other card is refused. Any runs_on naming a machine:<X> (this card, another card, an operator "
++        "move) is refused without host_reason naming state on X: capacity is a condition of the machine a card "
++        "leaves, not state on another one."
+     ),
+     {
+         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
+         "runs_on": {"type": "array", "items": {"type": "string"}, "description": (
+             "Labels the next machine must have, e.g. [\"pool:worker\"] (any worker with a free slot: the default "
+             "for portable work), [\"macos\"], [\"linux\"]. machine:<name> pins one registered machine that picks "
+-            "up this board (else refused); pinning one pool worker also needs host_reason."
++            "up this board (else refused) and always needs host_reason."
+         )},
+         "reason": _prop("string", "Why the card must move (what this machine lacks). Logged on the card."),
+         "host_reason": _prop("string", (
+-            "Required for runs_on naming one pool worker (machine:worker-N): the card works on that host, or "
+-            "holds unpushed state there. Capacity is never a host reason: use [\"pool:worker\"]. Also required "
+-            "when reason claims ship/landing custody: hermes-core-wt ship lands from every machine."
++            "Required for runs_on naming one machine (machine:<name>): the state on that host that holds the card "
++            "there: a worktree, a stamp, unpublished work, a live process, or Mac-only or hub-only work. Capacity "
++            "(free slots, a full machine) is never a host reason and is refused: use [\"pool:worker\"]. Also "
++            "required when reason claims ship/landing custody: hermes-core-wt ship lands from every machine."
+         )),
+         "checkpoint": _prop("string", (
+             "Everything the next run needs to resume on the other machine: what is done (commits, branches, "
+@@ -1160,7 +1163,8 @@ KANBAN_SUPERVISOR_REQUEST_SCHEMA = _schema(
+         "carries only archive ops. "
+         "Op operator {action, task_id, ...} is the scoped Board-operator call for ONE card ANOTHER gateway "
+         "created (the ones kanban_comment/kanban_move/kanban_unblock refuse as foreign_card): action "
+-        "comment {text}, move {runs_on, reason} (not while it runs) or unblock {reason} (an agent's block "
++        "comment {text}, move {runs_on, reason, host_reason?} (not while it runs; a machine:<X> target needs "
++        "host_reason naming state on X, else use [\"pool:worker\"]) or unblock {reason} (an agent's block "
+         "only, never one waiting on a human). That card's home gateway executes it; complete/archive/link/"
+         "unlink of a foreign card are refused (its owner's), one op per request, every call logged. "
+         "Action label_publish {machine, labels, proof: {kind: 'hub_probe'}} (no task_id) asks the hub to ADD "
+@@ -1189,6 +1193,8 @@ KANBAN_SUPERVISOR_REQUEST_SCHEMA = _schema(
+                                "description": "operator label_publish: skill:/capability: labels to add."},
+                     "proof": {"type": "object", "description": "operator label_publish: {kind: 'hub_probe'}."},
+                     "reason": {"type": "string", "description": "operator move/unblock: why (required)."},
++                    "host_reason": {"type": "string", "description": "operator move to machine:<X>: the state on "
++                                                                     "X that holds the card there (required for it)."},
+                     "parent_id": {"type": "string"},
+                     "child_id": {"type": "string"},
+                     "task_id": {"type": "string", "description": "reconcile_notify: the subscribed task; "
+-- 
+2.43.0
+

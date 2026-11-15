@@ -1,0 +1,160 @@
+From caf6a8a962b63f61900c60642462467b56e2d1f3 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 09:45:39 +0000
+Subject: [PATCH] fix(kanban): keep bound methods whose owner has no weakref
+ slot registered [daveey]
+
+PR #2844 made the reader-cache registry (`_ReaderCaches`) non-owning: `append`
+tries `weakref.WeakMethod`, then `weakref.ref`, then a strong reference. For a
+bound method of a `__slots__` instance (no `__weakref__`) or a builtin bound
+method (`list.append`), WeakMethod raises TypeError and `weakref.ref` then
+succeeds on the temporary method object itself, which dies when the caller's
+expression ends. The registration was dropped at once, silently; `recover()`
+then never calls that eviction, the reader keeps a deleted WAL generation open,
+and recover refuses the board's connects in that process.
+
+Fix: when WeakMethod raises TypeError and the callable is bound to a non-module
+owner (`__self__`), hold it strongly until unregistered. Builtin functions
+(`os.fstat`, `__self__` is the module) keep the weak reference. Lambdas,
+closures and functools.partial with no other owner stay non-owning (they cannot
+be told apart from a retired callback); the register_reader_cache docstring now
+says the caller must hold them and unregister the same object.
+
+No current registrant is affected (four module-level functions and one bound
+method of a plain module-held instance); this closes the trap for the next
+plugin author.
+
+Tests (tests/hermes_cli/test_kanban_generation_reader_cache_registry.py, new
+only, no existing assertion edited):
+- slotted-instance bound method: kept after gc, recover() calls it, unregister
+  removes it. RED on main ([] == [<bound method ...>]).
+- list.append with its list alive: kept after gc. RED on main.
+- four functions, drop the first, gc, unregister the third: True and order
+  [second, fourth]. Passes on main; kills the mutant `del self._entries[0]` in
+  `_ReaderCaches.discard`, which the five existing tests survive
+  (mutant run: 3 failed, 5 passed).
+
+GREEN: the registry file + test_kanban_ro_cache, test_kanban_kept_reader,
+test_kanban_reader_lifecycle, test_kanban_reader_close_isolation,
+tests/plugins/test_kanban_board_rows_cache: 62 passed. Every test file
+importing kanban_generation (21 files): 299 passed. scripts/check: ok.
+---
+ hermes_cli/kanban_generation.py               | 24 ++++++--
+ ...kanban_generation_reader_cache_registry.py | 55 +++++++++++++++++++
+ 2 files changed, 74 insertions(+), 5 deletions(-)
+
+diff --git a/hermes_cli/kanban_generation.py b/hermes_cli/kanban_generation.py
+index 107ae0a766..a0639aa3ef 100644
+--- a/hermes_cli/kanban_generation.py
++++ b/hermes_cli/kanban_generation.py
+@@ -11,6 +11,7 @@ import os
+ import sqlite3
+ import threading
+ import time
++import types
+ import weakref
+ from urllib.parse import unquote
+ 
+@@ -56,10 +57,16 @@ class _ReaderCaches:
+         try:
+             entry = weakref.WeakMethod(callback)
+         except TypeError:
+-            try:
+-                entry = weakref.ref(callback)
+-            except TypeError:
+-                entry = callback  # Some extension callables cannot be weakly referenced.
++            owner = getattr(callback, "__self__", None)
++            if owner is not None and not isinstance(owner, types.ModuleType):
++                # A bound method whose owner has no weakref slot (``__slots__``, ``list.append``): a weak
++                # reference to the method object itself would die with the caller's expression.
++                entry = callback
++            else:
++                try:
++                    entry = weakref.ref(callback)
++                except TypeError:
++                    entry = callback  # Some extension callables cannot be weakly referenced.
+         self._entries.append(entry)
+ 
+ 
+@@ -250,7 +257,14 @@ def forget(conn) -> None:
+ 
+ 
+ def register_reader_cache(evict) -> None:
+-    """A cache eviction must wait for its borrowers before closing its handles."""
++    """A cache eviction must wait for its borrowers before closing its handles.
++
++    Registration does not keep ``evict`` alive: a bound method lives as long as its instance, a function as long
++    as its module or other owner. A lambda, closure or ``functools.partial`` with no other owner is dropped at
++    once, so the caller holds it and passes the same object to ``unregister_reader_cache`` on unload. Bound
++    methods whose owner cannot be weakly referenced (``__slots__`` instances, builtin methods like
++    ``list.append``) and callables without weak-reference support are held strongly until unregistered.
++    """
+     with _lock:
+         if evict not in _reader_caches:
+             _reader_caches.append(evict)
+diff --git a/tests/hermes_cli/test_kanban_generation_reader_cache_registry.py b/tests/hermes_cli/test_kanban_generation_reader_cache_registry.py
+index 288469b4ea..bf2ef041fe 100644
+--- a/tests/hermes_cli/test_kanban_generation_reader_cache_registry.py
++++ b/tests/hermes_cli/test_kanban_generation_reader_cache_registry.py
+@@ -122,3 +122,58 @@ def test_non_weakrefable_callable_is_retained_until_unregistered(monkeypatch):
+     assert list(kg._reader_caches) == [callback]
+     assert kg.unregister_reader_cache(callback) is True
+     assert len(kg._reader_caches) == 0
++
++
++def test_slotted_instance_bound_method_stays_registered_while_owner_lives(tmp_path, monkeypatch):
++    from hermes_cli import kanban_lockguard
++
++    monkeypatch.setattr(kg, "_reader_caches", type(kg._reader_caches)())
++    monkeypatch.setattr(kg, "_connections", weakref.WeakSet())
++    monkeypatch.setattr(kg, "_poisoned", set())
++    path = str(tmp_path / "board.db")
++    calls = []
++    scans = iter([["retired-wal"], []])
++    monkeypatch.setattr(kanban_lockguard, "stranded_sidecars", lambda _: next(scans))
++
++    class SlottedCache:
++        __slots__ = ()  # no __weakref__: WeakMethod cannot reference the owner
++
++        def evict(self, board):
++            calls.append(board)
++
++    cache = SlottedCache()
++    kg.register_reader_cache(cache.evict)
++    gc.collect()
++    assert list(kg._reader_caches) == [cache.evict]
++    kg.recover(path)
++    assert calls == [path]
++    assert kg.unregister_reader_cache(cache.evict) is True
++    assert len(kg._reader_caches) == 0
++
++
++def test_builtin_bound_method_stays_registered_while_owner_lives(monkeypatch):
++    monkeypatch.setattr(kg, "_reader_caches", type(kg._reader_caches)())
++    evicted = []
++    kg.register_reader_cache(evicted.append)
++    gc.collect()
++    assert list(kg._reader_caches) == [evicted.append]
++    assert kg.unregister_reader_cache(evicted.append) is True
++    assert len(kg._reader_caches) == 0
++
++
++def test_unregister_after_pruned_entry_removes_the_matching_callback(monkeypatch):
++    monkeypatch.setattr(kg, "_reader_caches", type(kg._reader_caches)())
++
++    def make(name):
++        def callback(path):
++            pass
++        callback.__name__ = name
++        return callback
++
++    first, second, third, fourth = (make(n) for n in ("first", "second", "third", "fourth"))
++    for callback in (first, second, third, fourth):
++        kg.register_reader_cache(callback)
++    del first
++    gc.collect()
++    assert kg.unregister_reader_cache(third) is True
++    assert list(kg._reader_caches) == [second, fourth]
+-- 
+2.43.0
+
