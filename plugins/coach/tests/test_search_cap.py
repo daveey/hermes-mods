@@ -11,6 +11,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -49,6 +51,73 @@ INCIDENT_OUT = json.dumps({"output": (
     "== merged after that without the ship status (sync/upstream-* excluded):\ncount=0 upstream_syncs=7\n"
     "done_at=2026-11-14T22:52:01Z\n#3102 OPEN 6f1ebdf93270 merged=<no value>\n"
     "#3105 MERGED e60e455c0a32 merged=2026-11-14T22:49:30Z\n22:52:02Z"), "exit_code": 0, "error": None})
+
+
+def test_transform_hook_attaches_cap_to_this_result(tmp_path):
+    plugin = load("coach_plugin_test_search_cap", ROOT / "__init__.py")
+    _, hooks = plugin.build(store=core.Store(tmp_path / "coach"), checkout=tmp_path)
+    result = json.dumps({"output": "1000", "exit_code": 0})
+    # No observe/post_tool_call first: the transform must detect this result itself.
+    transformed = hooks["transform_tool_result"](
+        session_id="fresh", tool_name="terminal",
+        args={"command": "gh api search/issues"}, result=result,
+    )
+    assert transformed is not None
+    payload = json.loads(transformed)
+    assert payload["output"] == "1000"
+    assert "1000" in payload["coach_hint"] and "cap" in payload["coach_hint"]
+    assert hooks["transform_tool_result"](
+        session_id="fresh", tool_name="terminal",
+        args={"command": "echo done"}, result='{"output":"done","exit_code":0}',
+    ) is None
+
+
+def test_execute_code_error_is_not_a_successful_count():
+    assert rules.search_cap("execute_code", {"code": "gh"},
+                            {"status": "error", "output": "1000"}) is None
+
+
+def test_browser_output_is_not_a_supported_count_source():
+    assert rules.search_cap("browser_exec", {"code": "gh"},
+                            {"output": "1000", "exit_code": 0}) is None
+
+
+@pytest.mark.parametrize("output", ["n=10000", "n=1000.5"])
+def test_assignment_count_requires_whole_number(output):
+    assert rules.search_cap("terminal", {"command": "gh"},
+                            {"output": output, "exit_code": 0}) is None
+
+
+def test_gh_inside_another_word_is_not_a_github_command():
+    assert rules.search_cap("terminal", {"command": "echo high"},
+                            {"output": "1000", "exit_code": 0}) is None
+
+
+def test_bare_count_on_an_interior_line():
+    assert rules.search_cap("terminal", {"command": "gh"},
+                            {"output": "header\n1000\nfooter", "exit_code": 0}) == "1000"
+
+
+def test_empty_session_does_not_queue_a_hint(tmp_path):
+    c = coach(tmp_path)
+    c.check_search_cap("", "terminal", {"command": "gh"}, {"output": "1000", "exit_code": 0})
+    assert c.take("") is None
+
+
+def test_count_excerpt_is_bounded():
+    line = "n=1000 " + "x" * 120
+    assert rules.search_cap("terminal", {"command": "gh"},
+                            {"output": line, "exit_code": 0}) == line[:120]
+
+
+def test_hint_escapes_backticks_in_excerpt(tmp_path):
+    c = coach(tmp_path)
+    c.check_search_cap("quoted", "terminal", {"command": "gh"},
+                       {"output": "n=1000 `", "exit_code": 0})
+    hint = c.take("quoted")
+    assert hint is not None
+    assert "n=1000 '" in hint
+    assert "n=1000 `" not in hint
 
 
 def test_incident_replay_names_the_cap():
