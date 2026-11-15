@@ -71,11 +71,33 @@ def test_invalid_state_rejected(value):
     with pytest.raises(ValueError): h.api.restore_state({'@global-hourly-attempts': value})
 
 
-def test_old_state_supported_and_no_secrets_persisted():
+def test_old_state_fenced_for_first_hour_and_no_secrets_persisted(caplog):
     h = capped([response()])
-    h.api.restore_state({})
+    with caplog.at_level('INFO'):
+        h.api.restore_state({})
+    assert 'migration incomplete=true reset=4600' in caplog.text
+    assert not h.api.enumerate(scope()).complete
+    assert not h.calls
+    migrated = h.api.export_state()
+    h2 = capped([response()])
+    h2.now = 2000
+    h2.api.restore_state(migrated)
+    assert h2.api.export_state() == migrated  # restart does not extend the fence
+    assert not h2.api.enumerate(scope()).complete
+    h2.now = 4600
+    assert h2.api.enumerate(scope()).complete
+    assert 'fictional-test-token' not in repr(h2.saved)
+
+
+def test_migration_preserves_existing_quota():
+    h = Harness([response()])
     assert h.api.enumerate(scope()).complete
-    assert 'fictional-test-token' not in repr(h.saved)
+    old = h.api.export_state()
+    upgraded = capped([])
+    upgraded.api.restore_state(old)
+    state = upgraded.api.export_state()
+    assert {key: row for key, row in state.items() if key != '@global-hourly-attempts'} == old
+    assert state['@global-hourly-attempts']['timestamps'] == [1000, 1000]
 
 
 def test_reserved_credential_key_rejected_without_network():

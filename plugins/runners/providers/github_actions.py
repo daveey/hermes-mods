@@ -125,7 +125,15 @@ class GitHubActions:
             if type(state) is not dict:
                 raise ValueError('invalid_budget_state')
             state = dict(state)
-            attempts = state.pop('@global-hourly-attempts', {'timestamps': []})
+            if '@global-hourly-attempts' not in state and self.hourly_request_cap is not None:
+                # A pre-cap ledger has unknown recent consumption. Fence the
+                # first hour conservatively, preserving every existing quota.
+                now = self.clock()
+                attempts = {'timestamps': [now] * self.hourly_request_cap}
+                logging.getLogger(__name__).info(
+                    'inventory cap migration incomplete=true reset=%s', now + 3600)
+            else:
+                attempts = state.pop('@global-hourly-attempts', {'timestamps': []})
             if (type(attempts) is not dict or set(attempts) != {'timestamps'}
                     or type(attempts['timestamps']) is not list
                     or any(type(t) not in (int, float) or not math.isfinite(t) or t < 0
