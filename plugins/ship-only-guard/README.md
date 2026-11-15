@@ -46,6 +46,15 @@ Configuration is read on each check, not cached at plugin activation.
 
 ## Behavior
 
+Inspection uses a bounded nesting budget (depth 0–12). With any protected repo
+configured, exceeding it **fails closed** with an `inspection depth limit`
+refusal: simplify the shell/Python/tool-call wrappers and retry. This applies even
+to otherwise read-only commands when the guard cannot finish inspecting them;
+an explicitly empty repository set still disables the guard. Exec-wrapper
+fallbacks consume one step just like other recursive inspection paths.
+`tests_wrapper_unwrap.py` covers the public terminal boundary, a protected merge,
+a read-only control, and nested Python/tool-call exhaustion without running commands.
+
 The `pre_tool_call` hook checks `terminal`, `execute_code`, and nested `tool_call`
 (including qualified tool names). On a configured repository it refuses:
 
