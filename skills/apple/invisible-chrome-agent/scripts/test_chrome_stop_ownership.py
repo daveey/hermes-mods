@@ -14,7 +14,7 @@ from test_hermes_chrome_agent import hca
 from chrome_agent_lifecycle import Ledger, Lifecycle, Config
 from chrome_agent_daemons import exchange
 from chrome_agent_process import fingerprint
-from test_chrome_endpoint_ownership import free_port
+from test_chrome_endpoint_ownership import free_ports
 from chrome_test_fixtures import chrome_environment, require_real_linux_chrome, socket_directory
 
 
@@ -52,7 +52,7 @@ class SupervisorStopTests(unittest.TestCase):
     def exercise_stop(self, finish_requests, reloads=0):
         with socket_directory() as tmp, mock.patch.dict(os.environ, chrome_environment(tmp)):
             root = Path(tmp)
-            port, upstream = free_port(), free_port()
+            port, upstream = free_ports(2)
             self.assertNotEqual(port, upstream)
             wrapper = root / 'chrome'
             wrapper.write_text('#!/bin/sh\nexec /usr/bin/google-chrome --headless=new "$@"\n')
