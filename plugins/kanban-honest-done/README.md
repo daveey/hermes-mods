@@ -34,6 +34,25 @@ receipt on the retry. It never blocks; legacy completions stay valid. Each hint 
 `kanban-honest-done: receipt-hint <task> ok=<bool>`, the count of receipt-less delivery
 claims (self-heal agent-f82d813de9). `tests/test_receipt_hint.py`.
 
+## Body-only failure branches
+
+In any session, branch-looking comments are refused when their literal full step is
+not already among Gate G's `preregistered_branches(body)`. A comment registers nothing.
+The same case-insensitive, line-anchored parser is used for bodies and comments,
+including diagnostic bullets such as `- If it failed: ...`; use ordinary prose
+(`On failure, ...`) when not registering a disposition. Exact body citations and
+mid-sentence mentions remain allowed. Appending another sentence changes the step;
+there is no prefix or fuzzy match.
+
+`kanban_comment`, `cross_task action=comment`, and literal `hermes kanban comment`
+commands in `terminal` are checked, including deferred `tool_call` wrappers.
+The guard resolves the selected local board, not an arbitrary same-ID row on another
+board. Explicitly remote targets and unreadable bodies are allowed with the body-only
+hint appended to the result, never refused blind. This is static tool-hook feedback,
+not shell evaluation or a guard on human CLI/API writes. Tests:
+`tests/test_comment_branches.py` (entry matrix, real-pattern regressions, missing-body
+hint, CLI options, board selection, remote fallback, worker and non-worker hooks).
+
 ## What it does
 
 Inside a dispatcher-spawned worker (`HERMES_KANBAN_TASK` set), a `pre_tool_call` hook refuses (E and F: any session):

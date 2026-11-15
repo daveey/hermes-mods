@@ -58,6 +58,8 @@ try:
 except ImportError:  # same fallback as core
     consent_mod = core._load_sibling("consent")
 
+comment_branches = core._load_sibling("comment_branches")
+
 logger = logging.getLogger(__name__)
 
 SHELL_TOOLS = {"terminal", "process_manage", "process", "run_in_user_terminal"}
@@ -192,7 +194,8 @@ def _pre_tool_call(tool_name: str = "", args: Any = None, session_id: str = "", 
     try:
         worker = _in_worker()
         own = core.own_task_id() if worker else None
-        why = (classify_consent(tool_name, args, session_id or "", own)
+        why = (comment_branches.check(tool_name, args, core)[0]
+               or classify_consent(tool_name, args, session_id or "", own)
                or classify_create(tool_name, args) or classify_acceptance(tool_name, args, session_id or ""))
         if not why and own:
             why = classify(tool_name, args, own)
@@ -264,6 +267,9 @@ def receipt_hint(tool_name: str, args: Any, result: Any, env=None) -> Optional[s
 
 def _transform_tool_result(tool_name: str = "", args: Any = None, result: Any = None, **_: Any) -> Optional[str]:
     try:
+        _, hints = comment_branches.check(tool_name, args, core)
+        if hints and isinstance(result, str):
+            return result + "\n[kanban-honest-done] " + "\n".join(hints)
         if not _in_worker():
             return None
         return receipt_hint(tool_name, args, result)
