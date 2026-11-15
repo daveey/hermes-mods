@@ -682,7 +682,9 @@ def _kanban_verb(seg: list[str]) -> Optional[tuple[str, list[str]]]:
                 or (t == "kanban" and i > 0 and seg[i - 1].endswith("hermes_cli.main")):
             j = i + 1
             while j < len(seg) and seg[j].startswith("-"):
-                j += 2 if "=" not in seg[j] and seg[j] in ("--board", "-b") else 1
+                # argparse takes any unique prefix of --board (`--boa x`) as --board, so it consumes a value too.
+                takes_value = seg[j] == "-b" or (len(seg[j]) > 2 and "--board".startswith(seg[j]))
+                j += 2 if "=" not in seg[j] and takes_value else 1
             if j < len(seg):
                 return seg[j], seg[j + 1:]
     return None
