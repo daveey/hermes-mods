@@ -7,6 +7,8 @@ import importlib.util
 import logging
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location('silent_default_core', ROOT / 'core.py')
 core = importlib.util.module_from_spec(spec)
@@ -113,6 +115,34 @@ def test_blocking_asks_still_mint_on_both_paths():
         assert len(core.validate([step], reply, [])) == 1, sentence
         if regex_covers:
             assert len(core.regex_steps(reply)) >= 1, sentence
+
+
+@pytest.mark.parametrize('sentence', (
+    "Optional: I'll keep the old cap.",
+    "Optional: I’ll keep the old cap.",
+    "- Optional: I will keep the old cap.",
+))
+def test_optional_label_alone_suppresses_llm_candidate(sentence):
+    # No objection invitation: only the Optional-labelled default branch applies.
+    # This is an LLM candidate-validation case, not a regex-fallback extraction claim.
+    step = {'text': 'Approve the cap', 'kind': 'approve',
+            'verbatim_span': sentence, 'options': []}
+    dropped = []
+    assert core.validate([step], _offer_reply(sentence), [], dropped) == []
+    assert dropped and dropped[0].startswith('silent_default')
+
+
+@pytest.mark.parametrize('question', (
+    'Should I also cap retries?',
+    'Reply yes or no.',
+))
+def test_optional_label_default_with_blocking_ask_retains_llm_candidate(question):
+    sentence = f"Optional: I'll keep the old cap. {question}"
+    step = {'text': 'Approve the cap', 'kind': 'approve',
+            'verbatim_span': sentence, 'options': []}
+    kept = core.validate([step], _offer_reply(sentence), [])
+    assert len(kept) == 1
+    assert kept[0]['kind'] == 'approve'
 
 
 def test_optional_offer_with_explicit_question_still_mints():
