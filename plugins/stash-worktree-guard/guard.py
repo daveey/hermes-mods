@@ -241,6 +241,32 @@ def _expand_word(raw: str, variables: dict) -> Optional[str]:
     return None if quote else "".join(out)
 
 
+def _fixed_basename(raw: str) -> Optional[str]:
+    """Last path component of a command word whose directory part alone is unknown.
+
+    ``~/bin/tool`` (HOME unknown), ``~user/x`` and ``"$D"/bin/python3`` stay one word after
+    expansion (tilde and double-quoted expansions never split or glob), so the program is the
+    literal last component. None when that component is not a plain literal, or when the
+    directory part may split or glob (an unquoted ``$X``, ``*``, braces, a substitution).
+    """
+    match = re.fullmatch(r"(.+)/([A-Za-z0-9_.+-]+)", raw, re.S)
+    if not match or _splittable(match[1]):
+        return None
+    quote = None
+    i, prefix = 0, match[1]
+    while i < len(prefix):  # the directory part must close every quote it opens
+        c = prefix[i]
+        if c == "\\" and quote != "'":
+            i += 2
+            continue
+        if c in "\"'" and (quote is None or quote == c):
+            quote = c if quote is None else None
+        i += 1
+    if quote is not None or i > len(prefix):
+        return None
+    return match[2]
+
+
 def _config_runs(key: str) -> bool:
     """Git config keys whose value is a program Git runs (hooks, diff/merge drivers, ...)."""
     return (key in _GIT_EXEC_KEYS or key.startswith(("filter.", "credential", "gpg."))
@@ -1337,7 +1363,8 @@ _STASH_ARG_OPTS = {"-m", "--message", "--pathspec-from-file"}
 _DYNAMIC_OP = re.compile(
     r"\bstash(?:\s+(?:-m|--message|--pathspec-from-file)\s+[^\s;&|]+"
     r"|\s+-(?!(?:m|-message|-pathspec-from-file)(?:\s|$))[^\s;&|]*)*\s+[^\s;&|]*[$`{*?\[]")
-_DYNAMIC_SUB = re.compile(r"\bgit(?:\s+-C\s+[^\s;&|]+)*\s+[^\s;&|-][^\s;&|]*?[$`{*?\[]")
+# `git` as a command word: never an option (`diff --git`) or a path component (`.git`).
+_DYNAMIC_SUB = re.compile(r"(?<![\w.-])git(?:\s+-C\s+[^\s;&|]+)*\s+[^\s;&|-][^\s;&|]*?[$`{*?\[]")
 
 
 def _ansi_c_decode(body: str) -> str:
@@ -1426,6 +1453,8 @@ class _Analyzer:
         self.child_alias_source: Optional[str] = None
         self.config_repo = False  # a preceding write may rewire core.worktree
         self.child_alias = False  # inherited only while analyzing a Git runner child
+        # (node, stdin text or None) of the hypothetical suffix command shadow_argv analyzes
+        self.suffix: Optional[tuple] = None
 
     def record(self, repo, sub, args, note: Optional[str] = None):
         """``note``: the unresolved shell word that alone made this a possible restore."""
@@ -1457,7 +1486,7 @@ class _Analyzer:
 
     def shadow_argv(self, words: list, st: _State, depth: int, as_git: bool = False,
                     tail: bool = False, unknown_command: Optional[str] = None,
-                    git_assigns: Optional[list] = None):
+                    git_assigns: Optional[list] = None, redirs: Optional[list] = None):
         """Unsupported wrapper or unknown command name: any suffix may be the real command.
 
         Each suffix of the argv is analyzed as a command with unknown repo (and, for an
@@ -1470,21 +1499,49 @@ class _Analyzer:
         self.splitting = True
         self.shadow += 1
         extra = [_UNKNOWN_WORD] if tail else []
+        saved = self.suffix
         try:
             for k in range(1, len(words)):
-                self.simple(("simple", [], words[k:] + extra, []), st, depth, nested=True)
+                node = ("simple", [], words[k:] + extra, [])
+                # The suffix runs with the real command's stdin: earlier pipeline output and
+                # here-doc/here-string bodies are text it may read (`echo stash pop | xargs "$G"`).
+                # None: stdin is a file the guard does not read.
+                stdin = [self.pipe_text or ""]
+                for op, target, body, _quoted in redirs or ():
+                    if op in ("<<", "<<-"):
+                        stdin.append(body or "")
+                    elif op == "<<<":
+                        stdin.append(target)
+                    elif op in ("<", "<>", "<&"):
+                        stdin = None
+                        break
+                self.suffix = (node, None if stdin is None else " ".join(stdin))
+                self.simple(node, st, depth, nested=True)
+            self.suffix = saved
             if as_git:
                 self.simple(("simple", git_assigns or [], ["git", *words[1:]], []), st, depth, nested=True,
                             unknown_command=unknown_command)
         finally:
+            self.suffix = saved
             self.shadow -= 1
             self.splitting = False
+
+    def local_evidence(self, text: str):
+        """Restore/mutation evidence in ``text`` alone, without whole-command uncertainty.
+
+        For uncertainty confined to one argv whose boundaries the parser established: the
+        caller analyzed everything else, so only this text may hide a stash operation.
+        """
+        self._text_evidence(text, git_words=False)
 
     def fail_closed(self, text: str, git_words: bool = False):
         """Analysis gave up on ``text``: any restore it may contain runs in an unknown repo."""
         self.uncertain = True
         if not git_words:
             self.unanalyzed += 1
+        self._text_evidence(text, git_words)
+
+    def _text_evidence(self, text: str, git_words: bool):
         for op in _restore_evidence(text or ""):
             self.record(None, "stash", [op])
         # Mutation evidence is separate from restore/alias diagnostics. This is
@@ -1729,6 +1786,13 @@ class _Analyzer:
             # states (`A="$A x"` grows forever; HOME and cwd do not) and accept the widened
             # state only if one more iteration from it stays within it (a post-fixpoint).
             # Otherwise every value is lost, as before.
+            # First widen per value of the variables this loop leaves alone (an enclosing
+            # `for f in a b` value): joining states across them would make `$f` unknown,
+            # and an unknown command word reads as a possible `git stash pop`.
+            wides = self._partition_widen(pre, out, once)
+            if wides is not None:
+                out = _union(out, wides)
+                return out, out
             wide = _widen(out)
             if wide is not None:
                 exit3, after3 = once([wide])
@@ -1737,6 +1801,39 @@ class _Analyzer:
                     return out, out
             out = _union(out, [_unknown(out)])
         return out, out
+
+    @staticmethod
+    def _partition_widen(pre, out, once) -> Optional[list]:
+        """Widened states, one per value of the loop-invariant variables, or None.
+
+        A variable is loop-invariant when the states after the iterations hold exactly the
+        known values the entry states held. Each partition is widened on its own; the
+        result is accepted only as a post-fixpoint (one more iteration from the widened
+        states stays within them), so it never claims more than the plain join would.
+        """
+        names = set().union(*(s.vars for s in out))
+        stable = sorted(
+            n for n in names
+            if None not in {s.vars.get(n) for s in out}
+            and {s.vars.get(n) for s in out} == {s.vars.get(n) for s in pre}
+            and len({s.vars.get(n) for s in out}) > 1)
+        if not stable:
+            return None
+        parts: dict = {}
+        for st in out:
+            parts.setdefault(tuple(st.vars.get(n) for n in stable), []).append(st)
+        if len(parts) > MAX_STATES:
+            return None
+        wides = []
+        for group in parts.values():
+            wide = _widen(group)
+            if wide is None:
+                return None
+            wides.append(wide)
+        exit3, after3 = once(wides)
+        if all(any(_within(st, w) for w in wides) for st in _union(exit3, after3)):
+            return wides
+        return None
 
     @staticmethod
     def loop_values(keyword, var, words, st) -> list:
@@ -1854,7 +1951,7 @@ class _Analyzer:
         except _ParseError:
             # Expanded words carry scalar evidence that the raw text may only hold split.
             self.fail_closed(" ".join(words + wrapper_words))
-            self.shadow_argv(words, st, depth)
+            self.shadow_argv(words, st, depth, redirs=redirs)
             if os.path.basename(wrapper_words[0] or "") in EXTERNAL_WRAPPERS:
                 # A wrapper program runs its argv in a child process: only that argv is
                 # uncertain (analyzed above), never the caller's cwd, variables or functions.
@@ -1875,10 +1972,27 @@ class _Analyzer:
         if not lit:
             return [st], [st]
         name = _expand_word(raw[0], st.vars)
+        fixed = _fixed_basename(raw[0]) if name is None else None
+        if fixed is not None and not any(f.endswith("/" + fixed) for f in st.funcs):
+            # Only the directory is unknown (`~/bin/tool` with HOME unknown, `"$D"/python3`):
+            # the word cannot split, so it runs the program named by its last component
+            # (unless a slash-named function of that name may match the expanded word).
+            name = "/<unresolved>/" + fixed
         if name is None:
             # Unknown command name: it may be git itself, or a wrapper of a later word.
+            suffix = self.suffix if self.suffix and self.suffix[0] is node else None
+            if suffix and suffix[1] is not None and not _splittable(raw[0]):
+                # A hypothetical suffix of a known program's argv (`grep -- "$l" "$f"` read
+                # as if grep ran "$f"), headed by a word that stays one word: the uncertainty
+                # is this argv's alone, and the rest of the command was parsed and analyzed,
+                # so it never widens to whole-text evidence. Widening let git-looking data
+                # anywhere else (an awk regex `/^diff --git a\//`) become a phantom
+                # `stash pop` with no Git argv at command position. An unquoted unknown head
+                # may split into a whole command built elsewhere: that keeps failing closed.
+                self.local_evidence(" ".join(words) + "\n" + suffix[1])
+                return [st], [st]
             self.fail_closed(" ".join(words))
-            self.shadow_argv(raw, st, depth, as_git=True,
+            self.shadow_argv(raw, st, depth, as_git=True, redirs=redirs,
                              unknown_command=" ".join(assigns + raw), git_assigns=assigns)
             return [st], [st]
         cmd = os.path.basename(name)
@@ -1990,7 +2104,7 @@ class _Analyzer:
                     self.shadow -= 1
             return [st], [st]
         if cmd in RUNNERS:
-            self.shadow_argv(raw, st, depth, tail=cmd in _APPENDING_RUNNERS)
+            self.shadow_argv(raw, st, depth, tail=cmd in _APPENDING_RUNNERS, redirs=redirs)
             self.shadow += 1
             try:  # `su -c 'cmd'`, `watch 'cmd'`, `script -c 'cmd'` run a shell string
                 for word in raw[1:]:
@@ -2054,7 +2168,7 @@ class _Analyzer:
                 base = os.path.basename(word) if word is not None else None
                 if (base in SHELLS or (base is not None and re.fullmatch(r"git(?:-[\w-]+)?", base))
                         or (base is None and _command_unknown(w, st))):
-                    self.shadow_argv(raw, st, depth)
+                    self.shadow_argv(raw, st, depth, redirs=redirs)
                     break
             # A string argument may be shell code it runs (`tmux new 'git …'`,
             # `make --eval`, `vim -c '!…'`, `npx -c`).
@@ -2069,7 +2183,7 @@ class _Analyzer:
         # names. Use the expanded executable, not its basename: even when data text
         # triggered conservative remapping evidence, /usr/bin/python3 is not git.
         if _CMDS in st.exported and "/" not in name and cmd not in BUILTINS_NOT_HASHED:
-            self.shadow_argv(raw, st, depth, as_git=True)  # BASH_CMDS may map it to git
+            self.shadow_argv(raw, st, depth, as_git=True, redirs=redirs)  # BASH_CMDS may map it to git
         if ((re.sub(r"[\d.]+$", "", cmd) in _INTERPRETERS
              and (not is_awk or awk_runs_commands)) or (cmd == "sed" and any(
                 re.search(r"(?:^|[;\n{}])\s*e(?:\s|;|$)|^s(.).*\1.*\1[gpwIiMm0-9]*e", w)
