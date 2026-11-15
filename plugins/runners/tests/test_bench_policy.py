@@ -25,10 +25,20 @@ def test_required_absolute_never_skips(monkeypatch, tmp_path):
         getattr(bench, 'test_inventory_replay_absolute_budget', bench.test_inventory_replay_budget)(tmp_path, False)
 
 
-def test_relative_still_fails_on_actions(monkeypatch, tmp_path):
+@pytest.mark.parametrize('regression', ['decoded_bytes', 'projected_rows'])
+def test_relative_still_fails_on_actions(monkeypatch, tmp_path, regression):
     monkeypatch.setenv('GITHUB_ACTIONS', 'true')
-    monkeypatch.setattr(bench, 'replay', lambda *a, **kw: 1.0)
-    with pytest.raises(AssertionError):
+
+    def replay(*args, **kwargs):
+        work = dict(decoded_bytes=1000, projected_rows=1000)
+        if kwargs['card_l']:
+            work = dict(decoded_bytes=10, projected_rows=10)
+            work[regression] = 1000
+        kwargs['work'].update(work)
+        return 0.0  # A fast/noisy clock must not conceal a work regression.
+
+    monkeypatch.setattr(bench, 'replay', replay)
+    with pytest.raises(AssertionError, match=f'{regression} work budget'):
         bench.test_inventory_replay_budget(tmp_path, False)
 
 

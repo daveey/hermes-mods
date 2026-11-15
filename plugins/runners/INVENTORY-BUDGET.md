@@ -3,8 +3,14 @@
 The inventory budget is **0.1% of one deployment-host core**. There are two distinct
 replay checks in `tests/test_bench_inventory.py`:
 
-- Relative regression: historical P1 (0.8%) multiplied by replay new/old CPU must
-  be <=0.1%. This runs on every host, including GitHub Actions.
+- Deterministic work regression: historical P1 (0.8%) multiplied by new/old
+  decoded bytes **and**, independently, projected runner rows must each be <=0.1%.
+  These counters wrap real decoder/projection calls, excluding fixture creation;
+  both shapes run everywhere, including ten consecutive fresh-process replays per
+  Python (3.11/3.14) in the runners workflow. Substituting the legacy replay as new
+  must fail. This bounds the dominant work, not its CPU cost: slower decoders or
+  added work outside these operations still require the absolute hardware gate.
+  Shared-runner thread-CPU ratios are not an admission assertion.
 - Absolute replay: measured inventory thread CPU divided by the **simulated 600s**
   span must be <=0.1%. This runs by default outside GitHub Actions. On GitHub
   Actions (`GITHUB_ACTIONS=true` exactly), it visibly skips because hosted runner
