@@ -2626,6 +2626,30 @@ def deploy_read_lines(arg: str, cap: int = TURN_LOG_ARG_CAP) -> list[str]:
             break
     return out
 
+
+# agent-efa717f56e: a per-host config read (`hub-worker-exec all -- 'hermes config get <key>'`) also sits past the cut,
+# so reply_check.setting_claim gets `   <- SETTING read: ...` lines. Same pattern as reply_check._SC_READ_RE (a test
+# keeps them equal).
+SETTING_READ_RE = re.compile(
+    r"\bhermes\s+config\s+(?:get|show|list|set|check)\b|\bconfig\.ya?ml\b|\bshared-config\.json\b|<- SETTING read:",
+    re.I)
+
+
+def setting_read_lines(arg: str, cap: int = TURN_LOG_ARG_CAP) -> list[str]:
+    """`   <- SETTING read: <the read>` for each config read in `arg` that ends past the `->` line's `cap` chars."""
+    out: list[str] = []
+    if not isinstance(arg, str) or len(arg) <= cap:
+        return out
+    for m in SETTING_READ_RE.finditer(arg):
+        if m.end() <= cap:
+            continue
+        line = f"   <- SETTING read: {arg[m.start():m.start() + 160].split(chr(10), 1)[0]}"
+        if line not in out:
+            out.append(line)
+        if len(out) >= PR_READ_LINES_MAX:
+            break
+    return out
+
 # agent-521fd3b5d4: core resumes a turn the backend cut (planned update pause, crash) with a user-role note, so the
 # coach starts a new turn and, in a gateway that booted after the cut, has none of its calls in memory. turn_start then
 # rebuilds the cut turn's log from state.db (AgentCoach._rehydrate_resumed_turn). Same prefix and wrapper handling as
@@ -4555,7 +4579,7 @@ class AgentCoach:
         s["turn_log"].append(f"-> {tool}({arg[:TURN_LOG_ARG_CAP]})")
         s.setdefault("turn_rich", deque(maxlen=60)).append(rich_tool_line(tool, args, arg))
         if tool in ("terminal", "execute_code"):
-            for line in pr_read_lines(arg) + deploy_read_lines(arg):
+            for line in pr_read_lines(arg) + deploy_read_lines(arg) + setting_read_lines(arg):
                 s["turn_log"].append(line)
                 s["turn_rich"].append(line)
         if tool == "terminal" and "commit" in arg and "git" in arg:

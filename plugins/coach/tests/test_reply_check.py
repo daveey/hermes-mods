@@ -115,7 +115,7 @@ def test_settings_defaults(monkeypatch):
     assert cfg["rules"] == ["handoff", "confirm", "unwatched", "report_only", "status_only", "denied_ask",
                             "credit_ask", "laptop_job", "skipped_live", "merge_forecast", "pr_state_claim",
                             "future_clock", "claimed_mutation", "restart_scope_claim",
-                            "deploy_claim"] and cfg["threshold"] == 0.7
+                            "deploy_claim", "setting_claim"] and cfg["threshold"] == 0.7
     assert cfg["thresholds"] == {"report_only": 0.5, "report_only_screen": 0.85, "report_only_capped": 0.92}
 
 
