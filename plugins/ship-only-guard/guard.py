@@ -1308,8 +1308,113 @@ def _flat_executable(path):
     return bool(re.fullmatch(r"(?:home/bin|hosts/[^/]+/bin)/[^/]+", path))
 
 
-def _overlap(pr, base):
-    """Why the base-delta file `base` can change what the PR file `pr` was tested against, or ''."""
+# Support-module reach (t_01a1e103810098d4). A support .py module beside flat test modules overlapped EVERY one of
+# them, so state PR #3207 (tests/placement_support.py) was drifted, or held behind a land turn, by each unrelated
+# tests/test_*.py landing (#3331, #3323, fe13a4c3bb, f58b681393 on 2026-11-15; none imports placement_support) and
+# stayed unlanded > 8 h through three update-branch refreshes. With content, a support module overlaps a test module
+# only when the test module's text, or that of a support module it names (transitively, at the same tree), names
+# the support module's stem as a word: `import x`, `from x import`, `x.py` path strings alike. Package and pytest
+# machinery (__init__.py, conftest.py), non-.py data and support~support pairs stay shared; any read that fails,
+# overruns its bound or is missing keeps the pair shared (fail closed). Callers without content (effective-turn
+# ordering, drift start) keep the path-only rule, a superset.
+_ALWAYS_SHARED = {"__init__.py", "conftest.py"}
+_REACH_TESTS = 16            # test modules one decision may read; more keeps every pair shared
+_REACH_BLOBS = 12            # support modules read per test module closure
+_REACH_LISTING_CAP = 1000    # GitHub's contents API lists at most 1000 entries of a directory
+_WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _flat_test_module(path):
+    parts = path.split("/")
+    return len(parts) == 2 and parts[1].startswith("test_") and parts[1].endswith(".py")
+
+
+def _support_pair(pr, base):
+    """('pr'|'base', test module, support stem) when pr~base is a reachable support .py module beside a test
+    module (in either direction); the side names whose tree holds the test module. Else None."""
+    for side, test, support in (("base", base, pr), ("pr", pr, base)):
+        parts = support.split("/")
+        if (_flat_shared(support) and parts[1].endswith(".py") and parts[1] not in _ALWAYS_SHARED
+                and _flat_test_module(test) and test.split("/")[0] == parts[0]):
+            return side, test, parts[1][:-3]
+    return None
+
+
+def _support_listing(repo, ref, directory, cwd, env):
+    """{name: (blob sha, size)} of the files directly in `directory` at commit `ref`; _Unreadable if odd."""
+    try:
+        got = json.loads(_gh_text(f"repos/{repo}/contents/{directory}?ref={ref}", cwd, env))
+    except (ValueError, TypeError):
+        raise _Unreadable(f"the {directory}/ listing at {ref[:10]} is unreadable")
+    if not isinstance(got, list) or len(got) >= _REACH_LISTING_CAP:
+        raise _Unreadable(f"the {directory}/ listing at {ref[:10]} is missing or possibly capped")
+    out = {}
+    for e in got:
+        if (not isinstance(e, dict) or not isinstance(e.get("name"), str) or not isinstance(e.get("sha"), str)
+                or not _SHA.fullmatch(e["sha"]) or not isinstance(e.get("type"), str)):
+            raise _Unreadable(f"the {directory}/ listing at {ref[:10]} has an unreadable entry")
+        if e["type"] == "file":
+            out[e["name"]] = (e["sha"], e.get("size"))
+    return out
+
+
+def _support_reach(repo, ref, path, cwd, env, once):
+    """Support stems the test module `path` names at `ref`, transitively through the support modules it names."""
+    directory, name = path.split("/")
+    listing = once.get(("reach-dir", repo, ref, directory), _support_listing, repo, ref, directory, cwd, env)
+    if name not in listing:
+        raise _Unreadable(f"{path} is not in {directory}/ at {ref[:10]}")
+    supports = {n[:-3]: e for n, e in listing.items() if n.endswith(".py") and not n.startswith("test_")}
+    seen, todo = set(), [listing[name]]
+    for _ in range(_REACH_BLOBS + 1):
+        if not todo:
+            return frozenset(seen)
+        sha, size = todo.pop()
+        text = once.get(("reach-blob", sha), _blob, sha, size, repo, cwd, env).decode("utf-8", "replace")
+        for stem in supports.keys() & set(_WORD.findall(text)):
+            if stem not in seen:
+                seen.add(stem)
+                todo.append(supports[stem])
+    raise _Unreadable(f"{path} names more than {_REACH_BLOBS} support modules")
+
+
+def _read_reach(repo, needs, cwd, env):
+    """Read the reach of each (ref, test module) into the invocation cache, None where it cannot be shown."""
+    cache = _cache()
+    once = cache.setdefault("reach-once", _Once())
+    todo = sorted(n for n in needs if ("reach", repo) + n not in cache)
+    if not todo or len(needs) > _REACH_TESTS:
+        return
+
+    def one(ref, path):
+        try:
+            cache[("reach", repo, ref, path)] = _support_reach(repo, ref, path, cwd, env, once)
+        except _PreflightExpired:
+            raise
+        except Exception:                 # any failure keeps the pair shared
+            cache[("reach", repo, ref, path)] = None
+    _parallel([("support import reads", one, n) for n in todo])
+
+
+def _reach_for(repo, pr_ref, base_ref):
+    """`reach(side, test module)` over the cached reads: a frozenset of support stems, or None (unknown)."""
+    refs, cache = {"pr": pr_ref, "base": base_ref}, _cache()
+    return lambda side, path: cache.get(("reach", repo, refs[side], path))
+
+
+def _reach_needs(pairs, pr_ref, base_ref):
+    """(ref, test module) reads that could narrow a path-only `shared` overlap among `pairs` (pr, base)."""
+    refs, needs = {"pr": pr_ref, "base": base_ref}, set()
+    for pr, base in pairs:
+        pair = _overlap(pr, base) == "shared" and _support_pair(pr, base)
+        if pair and isinstance(refs[pair[0]], str) and _SHA.fullmatch(refs[pair[0]]):
+            needs.add((refs[pair[0]], pair[1]))
+    return needs
+
+
+def _overlap(pr, base, reach=None):
+    """Why the base-delta file `base` can change what the PR file `pr` was tested against, or ''.
+    `reach(side, test module)`: the support stems that module names at that side's tree, None when unknown."""
     if base.startswith(_WORKFLOWS) or _GLOBAL_FILE.fullmatch(base):
         return "ci"
     if _skill_prose(pr) and _skill_prose(base):
@@ -1319,7 +1424,10 @@ def _overlap(pr, base):
         return "area"
     if (pr.count("/") == base.count("/") == 1 and pr.split("/")[0] == base.split("/")[0]
             and (_flat_shared(pr) or _flat_shared(base))):
-        return "shared"
+        pair = _support_pair(pr, base)
+        known = reach(pair[0], pair[1]) if pair and reach is not None else None
+        if known is None or pair[2] in known:
+            return "shared"
     if _coupled(_test_key(pr), _code_stem(base)) or _coupled(_test_key(base), _code_stem(pr)):
         return "test-code"
     return ""
@@ -1330,7 +1438,8 @@ def _base_drift_refusal(number, repo, data, cwd, env, attribute=True, fresh=True
 
     Overlap (`_overlap`): a base-delta file and a PR file in the same top-3-segment directory; any base-delta
     .github/workflows/ file or root/flat-dir requirements*/run_ci.py; a non-test, non-markdown file directly in
-    a top-level dir (tests/sync_test_support.py) on either side with any file directly in that dir on the other;
+    a top-level dir (tests/sync_test_support.py) on either side with any file directly in that dir on the other,
+    narrowed for a support .py module vs a test module to the test modules that name it (`_support_reach`);
     or a test_<stem>*.py module on one side and a code file whose stem matches it on the other (tests/test_foo.py
     ~ home/scripts/foo.py, either direction). Churn elsewhere (hermes-sync `sync:` commits under other
     hosts/<host>/ or home/skills/...) never refuses. An unreadable, truncated or non-linear compare fails closed."""
@@ -1380,16 +1489,26 @@ def _base_drift_refusal(number, repo, data, cwd, env, attribute=True, fresh=True
         return closed("the compare lists a file or commit without a name")
     if not total:
         return None
-    hits = {}
-    for f in changed:
-        for name in (f["filename"], f.get("previous_filename")):
-            if not isinstance(name, str) or not name or name in hits:
-                continue
-            for pf in files:
-                why = _overlap(pf["path"], name)
-                if why:
-                    hits[name] = (why, pf["path"])
-                    break
+
+    def collect(reach=None):
+        hits = {}
+        for f in changed:
+            for name in (f["filename"], f.get("previous_filename")):
+                if not isinstance(name, str) or not name or name in hits:
+                    continue
+                for pf in files:
+                    why = _overlap(pf["path"], name, reach)
+                    if why:
+                        hits[name] = (why, pf["path"])
+                        break
+        return hits
+    hits = collect()
+    tip = commits[-1]["sha"]          # compare lists oldest first: the state commit `files` was computed at
+    needs = hits and _reach_needs([(pf["path"], name) for name in hits for pf in files], head, tip)
+    if needs:
+        # Narrowing is best effort under a sub-deadline: unread pairs stay shared, the verdict keeps its budget.
+        _best_effort(_read_reach, repo, needs, cwd, env)
+        hits = collect(_reach_for(repo, head, tip))
     if not hits:
         return None
 
@@ -1662,13 +1781,25 @@ def _live_turns(repo, cwd, env, own_number=None):
     return sorted(out, key=lambda item: _turn_order(item[1]))
 
 
-def turn_blocks(turn_files, files):
+def turn_blocks(turn_files, files, reach=None):
     """(holder file, other file) when landing `files` would drift a holder with `turn_files`, else None."""
     for hf in turn_files:
         for f in files:
-            if _overlap(hf, f):
+            if _overlap(hf, f, reach):
                 return hf, f
     return None
+
+
+def _turn_blocks_read(rec, files, data, repo, cwd, env):
+    """`turn_blocks` both ways with support-module reach read at the holder's recorded head and the waiter's
+    head (none for a direct push: its pairs stay shared). Called only once the path-only rule holds."""
+    mine = data.get("headRefOid") if isinstance(data, dict) else None
+    needs = (_reach_needs([(a, b) for a in rec["files"] for b in files], rec["head"], mine)
+             | _reach_needs([(b, a) for a in rec["files"] for b in files], mine, rec["head"]))
+    if needs:
+        _best_effort(_read_reach, repo, needs, cwd, env)
+    return (turn_blocks(rec["files"], files, _reach_for(repo, rec["head"], mine))
+            or turn_blocks(files, rec["files"], _reach_for(repo, mine, rec["head"])))
 
 
 def _turn_holder_data(number, repo, cwd, env):
@@ -2059,6 +2190,8 @@ def _turn_hold_refusal_scoped(number, data, repo, cwd, env):
         if rec["pr"] == int(number):
             return None
         hit = turn_blocks(rec["files"], files) or turn_blocks(files, rec["files"])
+        if hit:
+            hit = _turn_blocks_read(rec, files, data, repo, cwd, env)
         if hit:
             return (f"[ship-only-guard] Refused state merge of PR #{number}: PR #{rec['pr']} holds the state land "
                     f"turn until {_until(rec['expires'])} ({ref}); this PR waits behind that older turn "

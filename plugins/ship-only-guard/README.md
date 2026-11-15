@@ -258,7 +258,14 @@ that base overlaps a PR file:
   otherwise hold every PR);
 - a shared support file directly in a top-level dir: a name not starting with
   `test_` and not markdown (`tests/sync_test_support.py`, `tests/__init__.py`)
-  on either side overlaps any file directly in that dir on the other side;
+  on either side overlaps any file directly in that dir on the other side,
+  except that a support `.py` module (not `__init__.py`/`conftest.py`) and a
+  `test_*.py` module beside it overlap only when the test module, read at its
+  own side's head (or a support module it names, transitively), names the
+  support module's stem as a word (`import placement_support`, a
+  `placement_support.py` path string). A read that fails or overruns keeps the
+  pair overlapping. Land-turn holds use the same reads (holder's recorded head,
+  waiter's head; a direct push has no head and stays overlapping);
 - test and code: a `test_<stem>[_suffix].py` module anywhere on one side and a
   code file (`.py`, `.sh`, `.js`/`.mjs`/`.cjs`/`.ts`, `.swift` or no extension)
   on the other whose basename stem, with `-` read as `_`, equals the key or
