@@ -68,7 +68,10 @@ def load_runtime(path):
         if len(raw) > 1024 * 1024:
             raise ValueError()
         data = json.loads(raw, object_pairs_hook=_pairs)
-        if not {'credentials', 'probes'} <= set(data) or set(data) - {'credentials', 'probes', 'broker_executable', 'job_repositories'}:
+        if not {'credentials', 'probes'} <= set(data) or set(data) - {'credentials', 'probes', 'broker_executable', 'job_repositories', 'hourly_request_cap'}:
+            raise ValueError()
+        cap = data.get('hourly_request_cap')
+        if cap is not None and (type(cap) is not int or cap < 1):
             raise ValueError()
         executable = data.get('broker_executable')
         if executable is not None and (type(executable) is not str or not Path(executable).is_absolute() or any(ord(c) < 32 for c in executable)):
@@ -170,7 +173,8 @@ def run(config_path, runtime_path, identity, state_dir, *, stop=None, once=False
             broker_command=(private.get('broker_executable', 'token-broker'),))
         adapter = GitHubActions(transport=github.transport,
                                 credential_resolver=github, pace_requests=True, pacing_window=30,
-                                quota_reserve=QUOTA_RESERVE, max_hourly_requests=MAX_HOURLY_REQUESTS)
+                                quota_reserve=QUOTA_RESERVE, max_hourly_requests=MAX_HOURLY_REQUESTS,
+                                hourly_request_cap=private.get('hourly_request_cap'))
         scopes = {s['id']: s for s in config['scopes']}
         jobs = private.get('job_repositories', {})
         for sid, repositories in jobs.items():
