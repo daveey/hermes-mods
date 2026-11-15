@@ -53,6 +53,20 @@ test('a fresh replica labels its board status as reported, and failed reads cann
   assert.match(m.classify(chips.map(c => ({ ...c, stale: true })), opts).waiting[0].detail, /status unknown/)
 })
 
+test('board freshness expires even without execution observations or an SDK verdict', () => {
+  at(10)
+  for (const observations of [undefined, []]) {
+    const chips = tasks.sessionTaskChips([{ id: 't_x', title: 'Parked', status: 'scheduled', execution_observations: observations }])
+    for (const evidence of [c => m.chipObservation(c, Date.now() / 1000), () => null]) {
+      assert.match(m.classify(chips, { nowMs: Date.now(), evidence }).waiting[0].detail, /scheduled · board status/)
+      assert.match(m.classify(chips, { nowMs: Date.now() + 60_001, evidence }).waiting[0].detail, /status unknown/)
+      for (const boardStatus of [{ ...chips[0].boardStatus, readAt: NaN }, { ...chips[0].boardStatus, state: 'ready' }, { ...chips[0].boardStatus, readAt: Date.now() + 1 }]) {
+        assert.match(m.classify([{ ...chips[0], boardStatus }], { nowMs: Date.now(), evidence }).waiting[0].detail, /status unknown/)
+      }
+    }
+  }
+})
+
 test('needs-you shows the plain card title next to the action', async () => {
   bridges({ chips: [card('t_x', 'blocked', { label: 'Choose the release window', look: 'needs-you', humanRequest: { action: 'Choose A or B' } })] })
   await show(React.createElement(m.Panel, { key: 'ask-context' }))
