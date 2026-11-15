@@ -32,10 +32,10 @@ test('card question has lettered ordered rows, hidden details and unchanged choi
  const r = request(), calls = []
  const call = async (path, opts = {}) => { calls.push([path, opts]); return { request: r, operation: { operationId: 'op-fixed', dispatchState: 'pending' } } }
  await show(React.createElement(m.DecisionRow, { key: r.requestId, request: r, route, call, position: 2, total: 3 }))
- assert.ok(el().querySelector('h3') === null, 'compact question must not show a card-title heading')
+ assert.equal(el().querySelector('[data-action-card-title]')?.textContent, r.title, 'card context stays next to the question')
  assert.equal(el().querySelector('details').open, false)
  const visible = el().cloneNode(true); visible.querySelectorAll('details').forEach(n => n.remove())
- assert.doesNotMatch(visible.textContent, /Unblock =|archive =|No commands run from this panel|t_example/)
+ assert.doesNotMatch(visible.textContent, /Unblock =|archive =|No commands run from this panel/)
  assert.match(visible.textContent, /2\/3 — Which color should we use\?/)
  assert.match(visible.textContent, /Pick one/)
  assert.deepEqual([...el().querySelectorAll('[data-choice-letter]')].map(n => n.textContent), ['A','B','C','D','E'])
