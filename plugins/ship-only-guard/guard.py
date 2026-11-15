@@ -112,6 +112,28 @@ REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 ASSIGN = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=(.*)", re.S)
 
 
+def _policy_path(env):
+    home = Path(env.get("HERMES_HOME", str(Path.home() / ".hermes")))
+    policy = home / "ship-only-guard.json"
+    # A configured profile inherits the host policy when it has no override.
+    if not policy.exists() and home.parent.name == "profiles":
+        policy = home.parent.parent / "ship-only-guard.json"
+    return policy
+
+
+def load_reference_repos(env=None):
+    """Host policy `reference_repos`: local clones whose object stores a carry fetch may borrow
+    (`_CarryObjects._borrow`). Any unreadable or odd value yields []."""
+    env = os.environ if env is None else env
+    try:
+        data = json.loads(_policy_path(env).read_text()).get("reference_repos", [])
+    except (OSError, ValueError, AttributeError, TypeError):
+        return []
+    if not isinstance(data, list) or not all(isinstance(x, str) and x for x in data):
+        return []
+    return [os.path.expanduser(x) for x in data]
+
+
 def load_repos(env=None):
     env = os.environ if env is None else env
     try:
@@ -119,12 +141,7 @@ def load_repos(env=None):
         if override is not None:
             data = json.loads(override)
         else:
-            home = Path(env.get("HERMES_HOME", str(Path.home() / ".hermes")))
-            policy = home / "ship-only-guard.json"
-            # A configured profile inherits the host policy when it has no override.
-            if not policy.exists() and home.parent.name == "profiles":
-                policy = home.parent.parent / "ship-only-guard.json"
-            data = json.loads(policy.read_text())["repos"]
+            data = json.loads(_policy_path(env).read_text())["repos"]
         if not isinstance(data, list) or not all(isinstance(x, str) and REPO.fullmatch(x) for x in data):
             return set()
         return {x.lower() for x in data}
@@ -793,8 +810,10 @@ class _CarryObjects:
     least _FETCH_DEPTH of history below each of them, as a per-merge fetch had. Needing no chain, the fetch
     starts with the ancestry walk instead of after it."""
 
-    def __init__(self, repo, env, shas, chain=False):
+    def __init__(self, repo, env, shas, chain=False, cwd=None):
         self.repo, self.shas = repo, list(dict.fromkeys(shas))
+        # Candidate local object stores (t_01a1dfacf4785131): the command's cwd, then host policy.
+        self.references = [c for c in [cwd, *load_reference_repos(env)] if isinstance(c, str) and c]
         self.chain = chain                # shas = the carry head: the walk's merges sit within _CARRY_MERGES
         self.depth = _FETCH_DEPTH + (_CARRY_MERGES if chain else 0)
         run_env = {k: v for k, v in {**os.environ, **env}.items() if not k.startswith("GIT_")}
@@ -846,6 +865,7 @@ class _CarryObjects:
             return f"git cache could not complete ({type(e).__name__})"
         try:
             self.git("init", "--bare", "--template=", "-q")
+            self._borrow()
             # Fetch full blobs: avoids lazy fetch subprocesses inside merge-tree and
             # their separate auth/timeouts. Depth and wall time bound the attempt.
             self.git("fetch", "--quiet", "--no-tags", "--no-recurse-submodules", f"--depth={self.depth}",
@@ -853,6 +873,41 @@ class _CarryObjects:
         except _Unreadable as e:
             return str(e)
         return ""
+
+    def _borrow(self):
+        """Borrow validated local object stores as read-only `objects/info/alternates` (t_01a1dfacf4785131).
+
+        On a landing host the shallow full-blob fetch of a state PR head moved a ~20 MiB pack and took 16-44 s
+        (GitHub builds the shallow pack), so the carry ran out of the 18 s preflight. With the host's state clone
+        borrowed, the same fetch (same URL, shas and depth) negotiates with its refs and moves only the objects
+        that clone lacks (~6 s). Objects are content-addressed: a borrowed object is the object the fetch would
+        have downloaded, a missing one is still fetched, and a broken store makes git fail, which refuses. The
+        trust is the local `git` binary's. `GIT_*` stays stripped: only this explicit list is consulted. Each
+        candidate must be a non-shallow repository with an objects directory; anything else, including a
+        probe that fails or times out, is skipped (an expired deadline still raises on the next git call)."""
+        stores = []
+        for ref in self.references:
+            if not _maybe_repo(ref):    # no git child for a cwd that cannot be a repository
+                continue
+            try:
+                out = self.git("-C", ref, "rev-parse", "--path-format=absolute", "--git-common-dir",
+                               "--is-shallow-repository").split("\n")
+            except _Unreadable:
+                continue
+            if len(out) != 2 or out[1].strip() != "false":
+                continue
+            objects = os.path.join(out[0].strip(), "objects")
+            if not os.path.isabs(objects) or not os.path.isdir(objects) or objects in stores:
+                continue
+            stores.append(objects)
+        if not stores:
+            return
+        try:
+            info = Path(self.path, "objects", "info")
+            info.mkdir(parents=True, exist_ok=True)
+            (info / "alternates").write_text("".join(o + "\n" for o in stores))
+        except OSError:
+            pass                        # no alternates: the fetch downloads everything, as before
 
     def settle(self):
         """No fetch is coming (the authoritative proofs are done): release waiting prefilter reads."""
@@ -948,6 +1003,20 @@ class _CarryObjects:
             self._tmp.cleanup()
 
 
+def _maybe_repo(path):
+    """Cheap filter before `_CarryObjects._borrow`'s git probe: `path` is a bare repository or lies in a
+    work tree (a `.git` entry in it or an ancestor). git itself still decides; this only skips the child."""
+    try:
+        here = Path(path).resolve()
+        if not here.is_dir():
+            return False
+        if (here / "objects").is_dir() and (here / "HEAD").is_file():
+            return True
+        return any((d / ".git").exists() for d in (here, *here.parents))
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
 def _git_merge_tree_refusal(merge, ours, theirs, repo, cwd, env, objects=None):
     """Authoritative merge-tree check; a bounded shallow fetch may refuse, never guess. `objects` is the
     chain's shared fetch (`_CarryObjects`); without it this merge fetches its own three commits."""
@@ -956,7 +1025,7 @@ def _git_merge_tree_refusal(merge, ours, theirs, repo, cwd, env, objects=None):
         return "merge-tree inputs are unreadable"
     own = objects is None
     if own:
-        objects = _CarryObjects(repo, env, (merge, ours, theirs))
+        objects = _CarryObjects(repo, env, (merge, ours, theirs), cwd=cwd)
     try:
         return objects.fetch() or objects.verify(merge, ours, theirs)
     finally:
@@ -983,7 +1052,7 @@ def _carried_approval(head, data, repo, cwd, env):
     first = ""
     candidates = _earlier_approvals(data, head)
     # One fetch of the head serves every candidate: each earlier head is an ancestor of it (t_01a1dadbf711c31c).
-    objects = (_CarryObjects(repo, env, (head,), chain=True)
+    objects = (_CarryObjects(repo, env, (head,), chain=True, cwd=cwd)
                if _SHA.fullmatch(head) and any(not blocked for _, blocked in candidates) else None)
     try:
         for (_, h0), blocked in candidates:
@@ -1004,7 +1073,7 @@ def _carry_one(head, h0, blocked, repo, cwd, env, objects=None):
     if not _SHA.fullmatch(head):
         return False, f"{lead}: the head sha is unreadable"
     if objects is None:
-        objects = _CarryObjects(repo, env, (head,), chain=True)
+        objects = _CarryObjects(repo, env, (head,), chain=True, cwd=cwd)
         try:
             return _carry_one(head, h0, blocked, repo, cwd, env, objects)
         finally:

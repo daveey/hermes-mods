@@ -175,6 +175,22 @@ twice-updated state PR under the worker gh shim). Multiple merge bases, shallow 
 base, failed fetches, unsupported Git versions and odd output all refuse;
 the scratch repository is removed on exit. No carry is inferred from the
 path-wise approximation alone.
+**Local object stores for the carry fetch (t_01a1dfacf4785131).** On a landing
+host the full-blob `--depth=131` fetch of a state PR head moved a ~20 MiB pack
+and took 16-44 s, so every state-PR merge preflight ran out of the 18 s budget
+in the carry stages. The scratch repository now borrows local object stores
+through `objects/info/alternates`: the command's cwd and the host policy's
+optional `"reference_repos": ["~/code/hermes"]` list in
+`ship-only-guard.json`. Each candidate needs a `.git` entry (or a bare layout)
+and then one `git rev-parse --git-common-dir --is-shallow-repository` under the
+same stripped environment and deadline; only non-shallow repositories with an
+objects directory are used, anything else is skipped. The fetch URL, shas and
+depth are unchanged; it moves only the objects the store lacks (measured: 6357
+objects / 20.6 MiB without, 10 loose objects / 80 KiB with a state clone, same
+carry verdict). Objects are content-addressed, missing ones are fetched, and a
+broken store makes git fail, which refuses; the store is trusted like the local
+`git` binary. An expired deadline during the probe still fails closed.
+Tests: `tests_carry_reference.py`.
 Any failed or odd read refuses with the
 reason; a blocking verdict on H itself is never overridden. Base drift is
 checked separately and still applies. Why: #1812, #1837 and #2438 were refused
