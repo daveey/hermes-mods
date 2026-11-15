@@ -20,6 +20,9 @@ A macOS LaunchDaemon needs sudo on that host: run it through `run_in_user_termin
 
 - Change every `runs-on` to the new labels, push, and confirm with the run's jobs' `runner_name` before telling
   workers CI counts as a gate again. `gh workflow run` each scheduled workflow once instead of waiting for cron.
+- In the same commit, declare every new custom label in `.github/actionlint.yaml` under `self-hosted-runner: labels:`.
+  Otherwise actionlint (Workflow lint) fails with `label "<x>" is unknown`. Where that check isn't required, the PR
+  still merges on green required checks and leaves main red, so read actionlint's own result before asking for review.
 - Multi-GB repo: don't full-clone (outlasts the tool timeout):
   `git clone --depth 1 --filter=blob:none --no-checkout <url> d && git -C d sparse-checkout set --no-cone .github && git -C d checkout main`.
 - Steps that `sudo apt-get install` fail on a shared runner (no passwordless sudo). Branch on

@@ -141,10 +141,10 @@ How to run it from an agent:
   timeouts were exactly this). Run `--once`; if it exits 2, call `kanban_continue(checkpoint=<sha, what to
   check, next steps>, resume_after_seconds=600..1800)` and end the run. The card re-queues itself and the
   next run starts with `--once` again.
-- Before telling the user or a card that something is "waiting on CI/the release", run `--once` with the same
-  arguments. It has often shipped already, and a mistyped sha fails there at once (`Needed a single revision`); a
-  background run reports that only in its exit notice, after you have announced the wait. Copy shas from `git`/`gh`
-  output; never retype one.
+- Before telling anyone it is "waiting on CI/the release", run `--once` with the same arguments: it has often
+  shipped already, a mistyped sha fails at once (`Needed a single revision`), and an unmerged PR head exits 3
+  unless you pass `--branch <its head branch>`. A background run reports these only in its exit notice, after
+  you announced the wait.
 - On exit 1, investigate the printed run (`gh run view <id> -R OWNER/REPO --log-failed`). Empty failed-step logs do not prove that a job never started or lost its runner. Check the command's exit status/stderr, run attempts, paginated jobs, full logs and annotations via each job's `check_run_url`; missing evidence is not a diagnosis. See `references/workflow-history-audit.md`. Attribute an earlier breaking commit only after verifying its diff and ancestry. On a branch already red, "inherited" means the same failing test ids, not the same workflow: list them per run (`gh run view <id> -R O/R --log-failed | grep -oE '(FAIL|ERROR): [A-Za-z0-9_]+ \([^)]*\)|(FAILED|ERROR) [^ ]+::[^ ]+' | sort -u`) and `comm -13` the previous run's list against this one's. A new id is a new break hiding under the old red (the last run without it and the first with it bracket the commits) and needs its own owner; a landing gate that skips a known-red workflow must diff ids the same way.
 - If `gh run view --log` omits completed reusable-workflow jobs or `--job ID --log` returns empty with exit 0, fetch `gh api repos/OWNER/REPO/actions/jobs/ID/logs` directly before concluding logs are unavailable. A file-level all-pass summary plus the shard's `flaky_kanban: 0 flaky test id(s)` can prove first-attempt success when the runner does not print individual passing node IDs; verify the target exists in that run's source revision.
 - Don't cancel another session's queued run to get yours through: the queued run will contain your
