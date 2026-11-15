@@ -32,7 +32,8 @@ stops new claims on a provider while its pooled accounts burn faster than their 
    keeps claiming the cards pinned to it on the paced provider, and can spend the quota the governor is saving. On
    it, `git -C ~/.hermes/hermes-agent cat-file -e HEAD:hermes_cli/kanban_llm_pacing.py` fails and
    `~/.hermes/llm_pacing.json` is absent. Never re-place a held card onto such a machine to get it started.
-3. **Read the provider state** in a governed host's `~/.hermes/llm_pacing.json`: `paced` with a `factor`, or `held`
+3. **Read the provider state** in a governed host's `~/.hermes/llm_pacing.json`, under `<provider>.pace` (`state`,
+   `factor`, `until`, `detail`), not at the provider's top level: `paced` with a `factor`, or `held`
    until a time, plus the per-account usage behind it. At a factor near 0.03 the pool claimed nothing for hours.
    `hub-worker-exec <worker> -- <file>` runs the file as a shell script, so a `.py` file fails at `import`; pass a
    shell command or a shell wrapper around the Python.
