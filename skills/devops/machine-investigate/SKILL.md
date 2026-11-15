@@ -14,7 +14,8 @@ metadata:
 # Machine investigate
 
 You run ON the machine being investigated (the card was placed there). The card body has the panel's numbers
-at click time. Script: `scripts/collect.py` in this skill (stdlib only).
+at click time. Script: `scripts/collect.py` in this skill (stdlib only). From a chat on another host, pipe it in:
+`ssh <host> 'python3 - report --no-du' < <skill>/scripts/collect.py`.
 A hung job (results stopped, almost no CPU) doesn't show in load numbers: follow `references/stuck-jobs.md`.
 
 ## Procedure
@@ -41,7 +42,11 @@ A hung job (results stopped, almost no CPU) doesn't show in load numbers: follow
    `ps %cpu` snapshots. Re-measure the same PIDs (check identity/start time) the same way after a fix.
 4. A long-lived process is not a leftover just because it is old. Find its owner first: `OWNER.md` in its cwd
    or an ancestor process's cwd, `HERMES_OWNER_CARD` in its env, and open cards on every board and gateway
-   (MacBook, hub, mini in a three-host fleet) naming its label, script or directory. Read the owner card with
+   (MacBook, hub, pool workers, mini) naming its label, script or directory. Work a card started over ssh from
+   another host carries neither marker (`owner` empty): read the chain root's cwd (task scratch dirs are named
+   `t_<hex>-…`) and `SSH_CONNECTION` in `/proc/<root pid>/environ`, and name the source with `tailscale status`. A
+   `chain` of dozens of identical python parents is a test re-spawning itself until its outer timeout: attribute the
+   root (the chain's last entry), not the leaves. Read the owner card with
    `kanban_show`, not a shell board command. Follow the chain to the launchd job (`launchctl list`,
    `launchctl print gui/$UID/<label>` for its interval), systemd unit, or cron (`crontab -l`,
    `~/.hermes/cron/jobs.json`). Any ask to stop an owned service goes on its owner card, with measured cost.
