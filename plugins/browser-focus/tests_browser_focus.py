@@ -1,6 +1,9 @@
 import importlib.util
+import json
 import os
 import pathlib
+import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -26,6 +29,9 @@ class T(unittest.TestCase):
     def setUp(self):
         bf._browser_sessions.clear()
         bf._last_focus.clear()
+        p = mock.patch.object(bf, "_tab_ledger_dir", return_value=None)   # never touch a real tab ledger
+        p.start()
+        self.addCleanup(p.stop)
 
     def test_finds_only_main_process_under_home(self):
         with mock.patch("os.path.realpath", side_effect=lambda p: p):
@@ -336,6 +342,92 @@ class T(unittest.TestCase):
         self.assertTrue(bf._visible(0, False, False, "http://mac:9333"))      # another machine's Chrome
         self.assertFalse(bf._visible(0, False, False, "http://127.0.0.1:9333"))
         self.assertFalse(bf._visible(0, False, False, "http://localhost:9333"))
+
+
+# agent-7390286fc7 (2026-11-14): the agent opened a Google password page with browser_exec (so the tab sat in the
+# session's tab ledger), focused it and asked David to type the password through the noVNC view. Core's per-turn
+# cleanup (cleanup_browser -> close_agent_tabs) closed that tab 3 s after the reply: "i dont see a place for password".
+def _has_core():
+    try:
+        return importlib.util.find_spec("tools.browser_use_cli") is not None
+    except ImportError:
+        return False
+
+
+class HandoffHold(unittest.TestCase):
+    def _ledger(self, d, stem, tabs, last_used=1.0):
+        p = os.path.join(d, stem + ".json")
+        with open(p, "w") as f:
+            json.dump({"owner": stem, "last_used": last_used, "tabs": tabs}, f)
+        return p
+
+    def _focus_hub_tab(self, ledger_dir):
+        pwd = {"id": "T1", "type": "page", "title": "Sign in - Google Accounts",
+               "url": "https://accounts.google.com/v3/signin/challenge/pwd?TL=x"}
+        with mock.patch.object(bf, "_quiet", return_value=False), \
+                mock.patch.object(bf, "agent_chromes", return_value=[(693608, 9333)]), \
+                mock.patch.object(bf, "remote_cdp", return_value="http://127.0.0.1:9333"), \
+                mock.patch.object(bf, "_chrome_agent", return_value=False), \
+                mock.patch.object(bf, "_chrome_agent_cli", return_value=None), \
+                mock.patch.object(bf, "_get", side_effect=lambda u, timeout=3: [pwd] if u.endswith("/json/list") else "ok"), \
+                mock.patch.object(bf, "activate_app", return_value=False), \
+                mock.patch.object(bf, "_tab_ledger_dir", return_value=ledger_dir, create=True):
+            return bf.focus("accounts.google.com")
+
+    def test_focused_tab_leaves_the_session_ledger_for_a_handoff_ledger(self):
+        with tempfile.TemporaryDirectory() as d:
+            sess = "20261114_211106_38ee27"
+            self._ledger(d, sess, {"T1": {"created": 1, "bu_name": "default", "url": "u"},
+                                   "T2": {"created": 2, "bu_name": "default", "url": "v"}})
+            before = time.time()
+            r = self._focus_hub_tab(d)
+            self.assertTrue(r["focused"])
+            own = json.load(open(os.path.join(d, sess + ".json")))
+            self.assertEqual(set(own["tabs"]), {"T2"})            # turn-end cleanup no longer closes T1
+            held = json.load(open(os.path.join(d, "user-handoff." + sess + ".json")))
+            self.assertIn("T1", held["tabs"])
+            self.assertEqual(held["owner"], "user-handoff." + sess)
+            self.assertGreaterEqual(held["last_used"], before)   # idle reaper counts from the handoff
+            self.assertTrue(r.get("held_for_user"))
+
+    def test_handoff_stem_stays_a_valid_ledger_owner(self):
+        with tempfile.TemporaryDirectory() as d:
+            sess = "x" * 80
+            self._ledger(d, sess, {"T1": {"created": 1}})
+            stem = bf.hold_for_user("T1", ledger_dir=d)
+            self.assertLessEqual(len(stem), 80)                  # core's _safe_task_key truncates owners at 80
+            self.assertRegex(stem, r"^[A-Za-z0-9._-]+$")
+            self.assertTrue(os.path.exists(os.path.join(d, stem + ".json")))
+            self.assertEqual(bf.hold_for_user("T1", ledger_dir=d), stem)   # re-focus refreshes, never nests
+            self.assertIsNone(bf.hold_for_user("nope", ledger_dir=d))
+
+    def test_no_ledger_dir_is_a_no_op(self):
+        self.assertIsNone(bf.hold_for_user("T1", ledger_dir=None))
+        with tempfile.TemporaryDirectory() as d:
+            self.assertIsNone(bf.hold_for_user("T1", ledger_dir=os.path.join(d, "missing")))
+
+    @unittest.skipUnless(_has_core(), "needs Hermes core on sys.path")
+    def test_composed_with_core_turn_end_close_and_idle_reaper(self):
+        from tools import browser_use_cli as bu
+        with tempfile.TemporaryDirectory() as rt:
+            env = {"BH_RUNTIME_DIR": rt, "HOME": rt}
+            sess = "20261114_211106_38ee27"
+            path = bu._tab_ledger_path(env, sess)
+            path.parent.mkdir(parents=True)
+            self._ledger(str(path.parent), sess, {"T1": {"created": 1, "bu_name": "default", "url": "u"}},
+                         last_used=time.time())
+            self._focus_hub_tab(str(path.parent))
+            closed = []
+            fake = lambda cmd, e, name, ids: (closed.extend(ids), (True, list(ids)))[1]
+            with mock.patch.object(bu, "_find_cli", return_value=["bh"]), \
+                    mock.patch.object(bu, "_close_tabs_via_daemon", side_effect=fake), \
+                    mock.patch.object(bu, "_read_browser_cfg", return_value={"agent_tab_idle_s": 1800}):
+                bu.close_agent_tabs(sess, env)                        # the per-turn cleanup of that chat
+                self.assertNotIn("T1", closed)
+                bu._reap_idle_agent_tabs(env, time.time() + 60)       # still within the idle window
+                self.assertNotIn("T1", closed)
+                bu._reap_idle_agent_tabs(env, time.time() + 1801)     # abandoned handoff: reaped as before
+                self.assertIn("T1", closed)
 
 
 if __name__ == "__main__":
