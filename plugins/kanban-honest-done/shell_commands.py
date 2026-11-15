@@ -49,6 +49,39 @@ def command_start(words):
     return i
 
 
+def shell_input(argv):
+    """Return (inline script, reads stdin), stopping options at the script operand."""
+    start = command_start(argv)
+    if start >= len(argv) or os.path.basename(argv[start]) not in _SHELLS:
+        return None, False
+    i = start + 1
+    stdin = False
+    while i < len(argv):
+        arg = argv[i]
+        if arg == '--':
+            i += 1
+            break
+        if arg == '-' or not arg.startswith(('-', '+')):
+            break
+        if arg in {'--rcfile', '--init-file'}:
+            i += 2
+            continue
+        if arg.startswith('--'):
+            i += 1
+            continue
+        flags = arg[1:]
+        # -o/+o and -O/+O consume an option name (also in short clusters).
+        takes_name = any(flag in flags for flag in 'oO')
+        if arg.startswith('-') and 's' in flags:
+            stdin = True
+        i += 1
+        if takes_name:
+            i += 1
+        if arg.startswith('-') and 'c' in flags:
+            return (argv[i] if i < len(argv) else None), False
+    return None, stdin or i >= len(argv)
+
+
 def segments(text, depth=0, _stop=None):
     """Return argv lists, including explicit substitutions and shell -c scripts.
 
@@ -74,7 +107,7 @@ def segments(text, depth=0, _stop=None):
         if active:
             value = ''.join(word)
             if expect_doc is not None:
-                pending_docs.append((value, word_quoted, expect_doc))
+                pending_docs.append([value, word_quoted, expect_doc, None])
                 expect_doc = None
             elif expect_redirect:
                 expect_redirect = False
@@ -88,13 +121,17 @@ def segments(text, depth=0, _stop=None):
         if words:
             argv = words[:]
             result.append(argv)
-            start = command_start(argv)
-            if start < len(argv) and os.path.basename(argv[start]) in _SHELLS:
-                for j in range(start + 1, len(argv) - 1):
-                    if re.fullmatch(r'-[a-zA-Z]*c[a-zA-Z]*', argv[j]):
-                        result.extend(segments(argv[j + 1], depth + 1))
-                        break
+            script, shell_doc = shell_input(argv)
+            if script is not None:
+                result.extend(segments(script, depth + 1))
+            for doc in pending_docs:
+                if doc[3] is None:
+                    doc[3] = shell_doc
             words.clear()
+        else:
+            for doc in pending_docs:
+                if doc[3] is None:
+                    doc[3] = False
 
     while i < len(text):
         ch = text[i]
@@ -166,16 +203,11 @@ def segments(text, depth=0, _stop=None):
                 i += 1
                 continue
             if ch in ';|&()\n':
-                # Save the command consuming the pending heredoc before clearing it.
-                finish_word()
-                start = command_start(words)
-                shell_doc = (start < len(words) and os.path.basename(words[start]) in _SHELLS
-                             and not any(re.fullmatch(r'-[a-zA-Z]*c[a-zA-Z]*', arg)
-                                         for arg in words[start + 1:]))
+                # Each heredoc retains its consumer across separators/pipelines.
                 finish_command()
                 i += 1
                 if ch == '\n' and pending_docs:
-                    for delimiter, quoted, strip_tabs in pending_docs:
+                    for delimiter, quoted, strip_tabs, shell_doc in pending_docs:
                         body = []
                         while i < len(text):
                             end = text.find('\n', i)

@@ -100,8 +100,39 @@ def test_nested_data(command):
     assert hits(command) == []
 
 
+@pytest.mark.parametrize('suffix', [';', '; echo done', ' | cat', ' && echo done'])
+@pytest.mark.parametrize('consumer', ['bash', 'env A=1 bash', 'cat'])
+def test_heredoc_consumer_survives_separator(suffix, consumer):
+    command = f"{consumer} <<'EOF'{suffix}\nhermes kanban comment t_X hi\nEOF"
+    expected = [] if consumer == 'cat' else [('comment', ['t_X', 'hi'])]
+    assert hits(command) == expected
+
+
+@pytest.mark.parametrize('prefix', [
+    'bash /dev/null -c', 'bash -- /dev/null -c',
+    'bash -o posix /dev/null -c', 'bash --rcfile /dev/null /dev/null -c',
+    'bash -O extglob /dev/null -c',
+])
+def test_shell_script_arguments_are_data(prefix):
+    assert hits(prefix + " 'hermes kanban comment t_X hi'") == []
+
+
+@pytest.mark.parametrize('prefix', ['bash -o posix -c', 'bash --rcfile /dev/null -c',
+                                    'bash -O extglob -c', 'bash -lc'])
+def test_shell_options_before_command(prefix):
+    assert hits(prefix + " 'hermes kanban comment t_X hi'") == [('comment', ['t_X', 'hi'])]
+
+
+@pytest.mark.parametrize('consumer', ['bash /dev/null', 'bash -- /dev/null', 'cat'])
+def test_heredoc_with_script_operand_is_data(consumer):
+    assert hits(f"{consumer} <<'EOF';\nhermes kanban comment t_X hi\nEOF") == []
+
+
 @pytest.mark.parametrize('wrap', ['{cmd}', 'env A=1 {cmd}', 'timeout 30 {cmd}',
-                                 'echo $({cmd})', 'bash -c {quoted}'])
+                                 'echo $({cmd})', 'bash -c {quoted}',
+                                 "bash <<'EOF';\n{cmd}\nEOF",
+                                 "bash <<'EOF'; echo done\n{cmd}\nEOF",
+                                 "bash <<'EOF' | cat\n{cmd}\nEOF"])
 def test_comment_hook_still_refuses_real_calls(tmp_path, monkeypatch, wrap):
     from test_honest_done import make_board
     db = make_board(tmp_path, tasks=[(OWN, 'test', 'running')])
@@ -112,3 +143,5 @@ def test_comment_hook_still_refuses_real_calls(tmp_path, monkeypatch, wrap):
     command = wrap.format(cmd=cmd, quoted=shlex.quote(cmd))
     assert plugin._pre_tool_call('terminal', {'command': command})['action'] == 'block'
     assert plugin._pre_tool_call('terminal', {'command': 'echo ' + shlex.quote(command)}) is None
+    assert plugin._pre_tool_call('terminal', {
+        'command': 'bash /dev/null -c ' + shlex.quote(cmd)}) is None
