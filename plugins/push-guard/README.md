@@ -1,5 +1,23 @@
 # push-guard
 
+## Repository-aware PR-only policy
+
+The built-in policy covers `daveey/hermes-mods`. Add other repositories with a host
+`$HERMES_HOME/ship-only-guard.json` with a separate `"pr_landing_repos": ["example/service"]`
+key. Preserve the existing `repos` list: it selects the core-only ship path and is not
+extended by this policy. Existing fleet delivery of this file also delivers the new key.
+Profiles without their own file inherit the host file. Invalid/unreadable policy refuses
+merge admission, not an empty allowlist. Keep this file in private host configuration;
+it does not change `ship-only-guard` or select the core/state shipping path.
+
+For configured repos use `python3 plugins/push-guard/land.py --repo example/service --pr N --head SHA`.
+The helper refuses unconfigured repositories before any GitHub I/O; the default remains
+hermes-mods for existing callers. Repo is passed explicitly through every PR, CI, review
+validator, CAS merge and readback, not inferred from cwd or mutable global state.
+Configuration must be deployed on every agent host that may land these repos and
+push-guard must be enabled in that profile. Missing configuration protects only the
+built-in repo; external clients and missing/disabled hooks are outside this boundary.
+
 ## hermes-mods PR-only policy
 
 `daveey/hermes-mods` PRs use `python3 plugins/push-guard/land.py --pr N --head SHA`.
