@@ -228,6 +228,24 @@ def test_headingless_quote_region_stops_at_a_paragraph_naming_another_card():
     assert core.cited_cards('Reply here to submit it.', reply, [card_entry()]) == [card_entry()]
 
 
+@pytest.mark.parametrize('middle, target, expected', [
+    ('Its acceptance checks need history.', 'Reply here.', 'quoted'),
+    (f'Card {LOCAL_CARD} is separate.', 'Reply here.', 'both'),
+    ('Its acceptance checks need history.', f'Card {LOCAL_CARD}: reply here.', 'own'),
+    (f'Card {LOCAL_CARD} is separate.', f'Card {LOCAL_CARD}: reply here.', 'own'),
+], ids=['listed-quote-context', 'listed-quote-other-card-boundary',
+        'own-paragraph-id', 'own-paragraph-id-after-boundary'])
+def test_headingless_listed_quote_respects_card_id_boundary_and_own_citation(middle, target, expected):
+    # Unlike the unlisted-quote fixture above, the quote can narrow to a listed card.
+    # Crossing an intervening card ID must not apply that narrowing to "Reply here.".
+    quoted = card_entry(tid='t_0a0a0a0a', action=QUOTED_ASK)
+    own = card_entry()
+    cards = [quoted, own]
+    reply = f"> {quoted['text']}\n\n{middle}\n\n{target}"
+    wanted = {'quoted': [quoted], 'both': cards, 'own': [own]}
+    assert core.cited_cards(target, reply, cards) == wanted[expected]
+
+
 def test_headingless_quote_region_stops_at_a_paragraph_restating_another_listed_cards_ask():
     reply = "\n\n".join([f"> {QUOTED_ASK}", PARAPHRASE, "Reply here."])
     assert core.cited_cards('Reply here.', reply, [kitchen(), card_entry()]) == [kitchen(), card_entry()]
