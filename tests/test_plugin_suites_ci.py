@@ -123,21 +123,52 @@ class PluginSuitesWorkflow(unittest.TestCase):
         self.assertNotIn("continue-on-error", self.text)
 
 
+WORKFLOWS = ROOT / ".github" / "workflows"
+
+
+def _workflow_code(text):
+    """Workflow text without YAML comments (`#` at line start or after whitespace)."""
+    return "\n".join(re.sub(r"(^|\s)#.*$", "", line) for line in text.splitlines())
+
+
 class GitleaksHistoryScope(unittest.TestCase):
     def test_missing_binary_fails_in_ci(self):
         with patch.dict(os.environ, {"CI": "true"}), patch.object(shutil, "which", return_value=None):
-            with self.assertRaisesRegex(AssertionError, "CI must provision"):
+            try:
+                with self.assertRaisesRegex(AssertionError, "CI must provision"):
+                    self.test_checked_out_history_and_unignored_branch_controls()
+            except unittest.SkipTest as exc:
+                # SkipTest escapes assertRaisesRegex, so a fail->skip change would otherwise report OK (skipped=1).
+                self.fail(f"missing gitleaks under CI=true must fail, not skip: {exc}")
+
+    def test_missing_binary_skips_outside_ci(self):
+        with patch.dict(os.environ, {"CI": ""}), patch.object(shutil, "which", return_value=None):
+            with self.assertRaises(unittest.SkipTest):
                 self.test_checked_out_history_and_unignored_branch_controls()
 
-    def test_repo_guards_provisions_the_same_verified_archive(self):
-        scan = (ROOT / ".github/workflows/gitleaks.yml").read_text()
-        guards = (ROOT / ".github/workflows/repo-guards.yml").read_text()
-        for pattern in (r"https://github.com/gitleaks/[^\s]+", r'[0-9a-f]{64}  gitleaks.tar.gz'):
-            match = re.search(pattern, scan)
-            assert match, scan
-            self.assertIn(match.group(0), guards)
-        self.assertIn('sha256sum -c -', guards)
-        self.assertIn('>> "$GITHUB_PATH"', guards)
+    def test_every_workflow_running_tests_dir_provisions_the_verified_archive(self):
+        # tests/ runs in repo-guards.yml directly and in every workflow that runs scripts/test-all (it adds the
+        # repo-guards suite to each -k run). Each must put the archive gitleaks.yml pins on PATH before its tests.
+        scan = (WORKFLOWS / "gitleaks.yml").read_text()
+        version = re.search(r"/download/v([0-9.]+)/", scan)
+        digest = re.search(r"\b([0-9a-f]{64})  gitleaks\.tar\.gz", scan)
+        assert version and digest, scan
+        runners = {"repo-guards.yml"} | {path.name for path in WORKFLOWS.glob("*.yml")
+                                         if "scripts/test-all" in _workflow_code(path.read_text())}
+        self.assertLessEqual({"plugin-suites.yml", "repo-guards.yml", "skill-tests.yml"}, runners)
+        for name in sorted(runners):
+            with self.subTest(workflow=name):
+                code = _workflow_code((WORKFLOWS / name).read_text())
+                pinned = code.find(digest.group(1))
+                self.assertGreaterEqual(pinned, 0, f"{name} does not pin the gitleaks.yml archive sha256")
+                assigned = re.search(r"\bgl_version=([0-9.]+)", code)  # plugin-suites.yml's variable form
+                expanded = code.replace("${gl_version}", assigned.group(1)) if assigned else code
+                self.assertIn(f"/gitleaks/gitleaks/releases/download/v{version.group(1)}/", expanded)
+                self.assertIn("sha256sum -c -", code)
+                self.assertIn('>> "$GITHUB_PATH"', code)
+                runs = [i for i in (code.find("scripts/test-all"), code.find("unittest discover")) if i >= 0]
+                self.assertTrue(runs, f"{name} runs no tests")
+                self.assertLess(pinned, min(runs), f"{name} provisions gitleaks after its tests start")
 
     def test_checked_out_history_and_unignored_branch_controls(self):
         binary = shutil.which("gitleaks")
