@@ -75,7 +75,7 @@ def test_far_wall_refusal_stays_a_defect(hours):
     assert len(out) == 1 and out[0]["symptom"].startswith("SubscriptionQuotaUnavailable in resolve_class_runtime")
 
 
-@pytest.mark.parametrize("delta", [-1.0, -3600.0])
+@pytest.mark.parametrize("delta", [0.0, -1.0, -3600.0])
 def test_wall_already_past_its_reset_stays_a_defect(delta):
     # a refusal after the reset is a stale wall: a real defect
     assert len(sg.parse_errors(record(AT_EPOCH + delta))) == 1
@@ -112,7 +112,7 @@ def test_queued_short_wall_row_is_withdrawn_by_recheck():
     assert rc and rc["kind"] == "held_wall" and sg.recheck_exempts(rc).startswith("held wall: ")
 
 
-@pytest.mark.parametrize("left", [-60.0, 6 * 3600.0, 100 * 3600.0])
+@pytest.mark.parametrize("left", [0.0, -60.0, 6 * 3600.0, 100 * 3600.0])
 def test_queued_far_or_stale_wall_row_still_files(left):
     rc = sg.defect_recheck(queued_row(1794670255.0, 1794670255.0 + left))
     assert rc is None or sg.recheck_exempts(rc) is None
@@ -122,6 +122,39 @@ def test_queued_other_traceback_row_has_no_recheck():
     d = queued_row(1794670255.0, 1794672000.0)
     d["details"] = d["details"].replace("agent.model_routing_unavailable.SubscriptionQuotaUnavailable",
                                         "agent.model_routing.ModelRoutingError")
+    assert sg.defect_recheck(d) is None
+
+
+@pytest.mark.parametrize("suffix", [" unrelated text", "; another failure"])
+def test_reset_with_unrelated_suffix_stays_a_defect(suffix):
+    lines = record(AT_EPOCH + 3600)
+    lines[0] += suffix
+    lines[-1] += suffix
+    assert len(sg.parse_errors(lines)) == 1
+
+    d = queued_row(AT_EPOCH, AT_EPOCH + 3600)
+    d["details"] += suffix
+    rc = sg.defect_recheck(d)
+    assert rc is None or sg.recheck_exempts(rc) is None
+
+
+@pytest.mark.parametrize("suffix", ["", " ", "\t"])
+def test_reset_with_only_trailing_whitespace_still_holds(suffix):
+    lines = record(AT_EPOCH + 3600)
+    lines[0] += suffix
+    lines[-1] += suffix
+    assert sg.parse_errors(lines) == []
+
+    d = queued_row(AT_EPOCH, AT_EPOCH + 3600)
+    d["details"] += suffix
+    rc = sg.defect_recheck(d)
+    assert rc and sg.recheck_exempts(rc).startswith("held wall: ")
+
+
+@pytest.mark.parametrize("kind", ["hook", "cron", "reply_nudge", "", None])
+def test_non_error_row_with_short_wall_text_is_not_withdrawn(kind):
+    d = queued_row(AT_EPOCH, AT_EPOCH + 3600)
+    d["kind"] = kind
     assert sg.defect_recheck(d) is None
 
 
