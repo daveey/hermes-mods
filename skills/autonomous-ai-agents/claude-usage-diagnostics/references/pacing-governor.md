@@ -48,6 +48,8 @@ A paced provider has no start time. Claims resume when the pool's burn falls bel
 sustain; an account's weekly reset adds headroom but doesn't set a time. Quote that condition and the next resets,
 never one account's reset as the ETA. A `held` provider waits for its `until`.
 
+Paced is not stopped. While each worker's `limit` is 1 or more, freed slots keep going out in `DISPATCH_ORDER`: effective priority, then cards with waiters, then oldest first. A p0 card can sit behind dozens of higher-priority cards while the fleet claims every few minutes. Report its position among the ready cards a worker can take: evaluate `hermes_cli.kanban_db_dispatch_queries.DISPATCH_ORDER` against the replica with `~/.hermes/hermes-agent/.venv/bin/python` (the `hermes` launcher is a shell script, so its interpreter is not Python). Don't write "nothing claims". A low-urgency card that is waiting its turn needs no change. Bump it only under the lane-median rule.
+
 A paced fleet keeps many free slots, so the worker autoscaler (`free_slots` in its tick log) correctly launches
 nothing. More machines can't raise LLM throughput, so say that instead of re-placing cards or asking for scale-up.
 The capacity question already has owners: the `Model capacity: <provider> pool projected exhaustion (paced)` cards.
