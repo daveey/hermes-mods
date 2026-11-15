@@ -1,7 +1,7 @@
 """Observable contracts for mirror accounting, schema writes and read cleanup."""
 
 import sqlite3
-from contextlib import closing, contextmanager
+from contextlib import ExitStack, closing, contextmanager
 
 import pytest
 
@@ -30,9 +30,31 @@ def test_skip_is_reported_to_real_core_accounting(keyed):
         assert after[field] == before[field], field
 
 
-def test_schema_setup_is_one_real_write_transaction_per_store_inode(tmp_path, monkeypatch):
+def test_schema_setup_is_one_real_write_transaction_per_store_inode(tmp_path, monkeypatch, request):
     mod = load_module('mirror_schema_accounting', ROOT / 'kanban_mirror.py')
-    store = core.ActionStore(tmp_path / 'actions.sqlite3')
+    # Keep strong references so constructor handles cannot be cleaned up by GC
+    # at a lucky time. A sqlite connection context commits; it does not close.
+    connections = []
+    request.addfinalizer(lambda: [conn.close() for conn in connections])
+    real_connect = sqlite3.connect
+
+    def retained_connect(*args, **kwargs):
+        conn = real_connect(*args, **kwargs)
+        connections.append(conn)
+        return conn
+
+    monkeypatch.setattr(sqlite3, 'connect', retained_connect)
+
+    def new_store(path):
+        # Close constructor-owned handles before moving either database. Moving
+        # just the main file with live WAL/SHM is not an isolated inode test.
+        with ExitStack() as stack, monkeypatch.context() as patch:
+            def connect(*args, **kwargs):
+                return stack.enter_context(closing(retained_connect(*args, **kwargs)))
+            patch.setattr(sqlite3, 'connect', connect)
+            return core.ActionStore(path)
+
+    store = new_store(tmp_path / 'actions.sqlite3')
     statements = []
     transactions = []
     real_tx = store._tx
@@ -56,8 +78,19 @@ def test_schema_setup_is_one_real_write_transaction_per_store_inode(tmp_path, mo
         assert conn.execute('SELECT count(*) FROM kanban_projections').fetchone()[0] == 0
 
     # A new file at the same path must still initialize; a path-only cache is wrong.
-    replacement = core.ActionStore(tmp_path / 'replacement.sqlite3')
+    replacement = new_store(tmp_path / 'replacement.sqlite3')
+    old_inode = store.path.stat().st_ino
+    replacement_inode = replacement.path.stat().st_ino
+    assert replacement_inode != old_inode
+    for path in (store.path, replacement.path):
+        assert not path.with_name(path.name + '-wal').exists()
+        assert not path.with_name(path.name + '-shm').exists()
     replacement.path.replace(store.path)
+    assert store.path.stat().st_ino == replacement_inode
+    with store._read() as conn:
+        assert conn.execute(
+            "SELECT name FROM sqlite_master WHERE name='kanban_projections'"
+        ).fetchall() == []
     mod.Mirror(core, store, boards=[])
     assert transactions == ['begin', 'begin']
     assert sum('CREATE TABLE IF NOT EXISTS kanban_projections' in s for s in statements) == 2
