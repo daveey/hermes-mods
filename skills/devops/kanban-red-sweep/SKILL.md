@@ -117,6 +117,8 @@ Prevent acceptance-change surprises at card creation instead (slug `acceptance-w
 ## 3. Act
 
 - Unblock: `kanban_unblock` (or `hermes kanban unblock <id>` for triage/scheduled), always after a comment that says what changed.
+  A `triage` card with a `spend_budget_triaged` event needs `hermes kanban promote <id>` after a re-scope comment:
+  `unblock` prints "released", then the next tick silently re-triages it. Read back status a tick later.
   Any card comment (unblock, move, correction) cites only facts you checked this turn. Another card's "PR landed" is a
   self-report until `gh pr view <N> -R <repo> --json state,mergedAt` shows it merged, and the owner acts on your comment as fact.
 - A PR completion contract runs `pr_acceptance` with the **assignee profile's** `gh` login, not yours, so wrapping
@@ -270,9 +272,6 @@ and the final response.
   `cross_session send` that quotes the user's delegation and names the exact asks; it re-tests and withdraws. Read the reply.
 - The For-you list injected at turn start can lag a withdrawal. The `withdraw` result's `state`/`withdrawal.at` is the
   live answer; check it before re-withdrawing or telling the user something waits on him.
-- Priority-cap rollout (#1137): an upgraded host stores at most 1000 (`kanban edit --priority 60100` prints `Edited`
-  and stores 1000), while un-migrated lanes still hold old values up to 60000+. A capped card can't get ahead there:
-  move it to an idle machine (`kanban move --runs-on`); never raise it through an uncapped writer. Read back every edit.
 - `kanban_create`/`move` refuse a machine on Board hold (`machine_held`). `hermes-mail admin machine-audit <m>` on the
   hub shows the hold reason and release time. A hold is deliberate, so never clear it to place a card.
 - A sequential core rollout (one worker at a time) moves its hold to the next worker minutes after the last one
