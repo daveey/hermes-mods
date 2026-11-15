@@ -2237,6 +2237,92 @@ def setting_claim(reply: str, tool_log: Optional[list] = None) -> Optional[str]:
     return hit.strip(" -*\t")
 
 
+# ---- quota_claim: the reply says model quota is out or accounts are capped, but this turn read no quota state ------
+# (self-heal agent-f547b2a420: at 18:47Z a hub chat read the pool and rightly said OpenAI was out on all 3 accounts. By
+# 22:34Z two ChatGPT accounts had been added and a third cleared, so 3 of 5 had headroom; two turns whose only calls
+# were user-step receipts then told David "That leaves only waiting for the weekly quota to come back." David: "there
+# is chatgpt quota".) deploy_claim/setting_claim cover code and config; this is the sibling for provider capacity:
+# accounts are added, reset, cleared and re-enabled between turns, so an earlier read is not the live value.
+# Deterministic, before the judge: a sentence (outside code and quotes, not a question, condition, negation, forecast
+# or past tense) that says the fleet is waiting for quota/caps to come back or reset, has run out of quota, is out or
+# capped on all/every account, or whose own clause names model quota/accounts/a provider and says it is/stays out,
+# capped, exhausted, rate-limited, held or at its cap, or has hit its cap; while the turn's tool log has no quota read
+# (provider_walls.json, hermes-pool-llm, `hermes auth list`, llm_paced events, the kanban pacing log, account-usage,
+# oauth usage, auth.json, or agent_rules' `<- QUOTA read:` line for a read past the `->` cut; agent_rules.QUOTA_READ_RE
+# is kept equal by a test). GitHub/API-budget sentences are another rule's business.
+_QC_NOUN_RE = re.compile(
+    r"\b(?:quotas?|(?:weekly|daily|5-?h(?:our)?|usage|rate)[- ](?:caps?|limits?)|allowance|accounts?|subscriptions?|"
+    r"OpenAI|ChatGPT|Codex|Claude|Anthropic|GPT[-\w.]*|Opus|Sonnet|Gemini|providers?|model\s+capacity|pool)\b", re.I)
+_QC_STATE = (r"(?:out(?!\s+of\s+(?!quota|allowance|capacity))|capped|exhausted|used\s+up|rate[- ]limited|maxed(?:\s+out)?|"
+             r"walled|held|spent|out\s+of\s+(?:quota|allowance|capacity)|"
+             r"at\s+(?:the\s+|their\s+|its\s+)?(?:weekly\s+|5-?h(?:our)?\s+)?(?:caps?|limits?)|at\s+100\s*%)")
+_QC_CLAIM_RE = re.compile(
+    r"\bwaiting\s+(?:for|on)\s+(?:the\s+|their\s+|its\s+)?(?:[\w.@-]+\s+){0,2}?(?:quotas?|caps?|limits?|allowance|"
+    r"capacity|accounts?)\s+to\s+(?:come\s+back|reset|refill|return|recover|clear)\b"
+    r"|\b(?:has|have|is|are)\s+(?:all\s+)?(?:run|running)\s+out\s+of\s+(?:[\w-]+\s+){0,2}?(?:quota|allowance|capacity)\b"
+    r"|\b(?:out|capped|exhausted|used\s+up|rate[- ]limited|maxed(?:\s+out)?|walled)\s+on\s+(?:all|every|each|both)\b"
+    r"|\b(?:is|are|stays?|remains?)\s+(?:(?:still|now|all|currently|again)\s+)*" + _QC_STATE + r"(?=\s|[.,;:!)]|$)"
+    r"|\b(?:has|have)\s+(?:all\s+|now\s+)*hit\s+(?:the|their|its)\s+(?:weekly\s+|daily\s+|5-?h(?:our)?\s+)?"
+    r"(?:caps?|limits?|quotas?)\b"
+    r"|\bno\s+(?:[\w-]+\s+)?(?:quota|allowance|capacity)\s+(?:left|available|remaining)\b", re.I)
+# The noun is inside these claims already ("waiting for the weekly quota", "run out of quota", "out on all accounts").
+_QC_SELF_NOUN_RE = re.compile(r"^(?:waiting|has|have|is\s+run|are\s+run|no\s|out|capped|exhausted|used|rate|maxed|"
+                              r"walled)", re.I)
+_QC_OTHER_RE = re.compile(r"\b(?:GitHub|gh|installation|GraphQL|Slack|AWS|EC2|disk|GPU|spend(?:ing)?)\b", re.I)
+_QC_READ_RE = re.compile(
+    r"provider_walls|hermes-pool-llm|\bpool_llm\b|\bhermes\s+auth\s+(?:list|status)\b|\bllm_paced\b|kanban\s+pacing"
+    r"|\bdispatch_skipped\b|account[-_]usage|anthropic-pool-status|oauth/usage|\bauth\.json\b|<- QUOTA read:", re.I)
+_QC_META_RE = re.compile(r"\bquota_claim\b", re.I)
+# Relative clauses and hypotheticals describe a rule or a scenario, not the live pool ("cards pinned to a model whose
+# quota is out", "answered by Astra while Claude is exhausted", "Codex would run out ... and stay out").
+_QC_HEDGE_RE = re.compile(r"\b(?:whose|while|would|could|might|never)\b[^.;:!?]{0,80}$", re.I)
+QUOTA_CLAIM_NUDGE = (
+    "[coach] quota_claim: your reply says model quota is out or accounts are capped (\"{evidence}\"), but this turn "
+    "read no quota state. Accounts are added, reset, cleared and re-enabled between turns, and an earlier read or a "
+    "card's title is not the live value. Read it now (`hermes auth list`, `~/.hermes/plugins/pool-llm/bin/"
+    "hermes-pool-llm check`, `cat ~/.hermes/provider_walls.json`) and report which accounts have headroom, with the "
+    "time of the read.")
+
+
+def quota_claim(reply: str, tool_log: Optional[list] = None) -> Optional[str]:
+    """The sentence claiming model quota is out / accounts are capped / the fleet waits for quota to come back when
+    this turn's tool log shows no quota read, else None (code spans, quotes, `>` lines, questions, conditions,
+    negations, forecasts, past tense, sentences about cards or GitHub budgets and replies naming quota_claim are
+    ignored)."""
+    text = _CODE_QUOTE.sub(" ", reply or "")
+    text = _QUOTED_RE.sub(" ", text)
+    if _QC_META_RE.search(text):
+        return None
+    hit = None
+    for s in _SENTENCE_END.split(text):
+        if s.rstrip(" *_").endswith("?") or _QC_OTHER_RE.search(s):
+            continue
+        for m in _QC_CLAIM_RE.finditer(s):
+            pre = s[:m.start()]
+            if _PSC_HEDGE_RE.search(pre) or _DC_NEG_RE.search(pre) or _QC_HEDGE_RE.search(pre):
+                continue
+            clause = re.split(r"[:;,]", pre)[-1]
+            works = [w.end() for w in _DC_WORK_RE.finditer(clause)]
+            if _QC_SELF_NOUN_RE.match(m.group(0)):
+                # "The card that is waiting for the quota to come back" is about a card.
+                if works and re.match(r"\s*(?:that|which)\s*$", clause[max(works):]):
+                    continue
+            else:
+                # The quota noun must be the subject, nearer the claim than any card/run noun.
+                nouns = list(_QC_NOUN_RE.finditer(clause))
+                if not nouns or (works and max(works) > nouns[-1].end()):
+                    continue
+            hit = s
+            break
+        if hit:
+            break
+    if not hit:
+        return None
+    if any(_QC_READ_RE.search(l or "") for l in (tool_log or [])):
+        return None
+    return hit.strip(" -*\t")
+
+
 # ---- future_clock: a past-tense Pacific time stamp that has not happened yet -------------------------------------------
 # (self-heal agent-748d257889: at 20:59 PST a red-sweep report said "(Checked 21:05–21:40 PT.)" and card comments said
 # "Red sweep ~21:15 PST". The model subtracted 7 h from UTC tool stamps after DST had ended (UTC-8) and never read the
@@ -2630,18 +2716,18 @@ def restart_scope_claim_nudge(evidence: str, skew: Optional[tuple]) -> str:
 
 RULES = ("handoff", "confirm", "unverified", "unwatched", "report_only", "status_only", "denied_ask", "credit_ask",
          "laptop_job", "skipped_live", "merge_forecast", "pr_state_claim", "future_clock", "claimed_mutation",
-         "restart_scope_claim", "deploy_claim", "setting_claim")
+         "restart_scope_claim", "deploy_claim", "setting_claim", "quota_claim")
 # Every rule is classified by whether its check reads the user turn (agent-372c9408b8). A reply-only rule judges the
 # reply (and tool log or board) alone, so many holds under one user-turn opening say nothing about the rule firing on
 # a template: close-out turns are where chats report PR state. signals.template_holds skips these rules.
 # tests/test_signals.py fails CI for a rule in neither set, or a "reply-only" check that takes the ask.
 REPLY_ONLY_RULES = frozenset({"denied_ask", "credit_ask", "laptop_job", "skipped_live", "merge_forecast",
                               "pr_state_claim", "future_clock", "claimed_mutation", "restart_scope_claim",
-                              "deploy_claim", "setting_claim"})
+                              "deploy_claim", "setting_claim", "quota_claim"})
 USER_TURN_RULES = frozenset({"handoff", "confirm", "unverified", "unwatched", "report_only", "status_only"})
 DEFAULT_RULES = ("handoff", "confirm", "unwatched", "report_only", "status_only", "denied_ask", "credit_ask",
                  "laptop_job", "skipped_live", "merge_forecast", "pr_state_claim", "future_clock", "claimed_mutation",
-                 "restart_scope_claim", "deploy_claim", "setting_claim")
+                 "restart_scope_claim", "deploy_claim", "setting_claim", "quota_claim")
 # Per-rule judge thresholds (COACH_REPLY_THRESHOLDS overrides; other rules use COACH_REPLY_THRESHOLD).
 # report_only: tuned on the training split of the 2026-10-27 labeled set (README, "report_only").
 # report_only_capped: the screen alone when a second opinion was due but unavailable (daily cap hit, error); confirms
@@ -4210,7 +4296,7 @@ def handoff_outcome(reply: str, user_ask: str, tool_log: list[str], llm: Callabl
 STRONG_REPORT_ONLY_SRC = ("confirm", "closed_owner", "unverified_owner")
 
 
-NEW_CLAIM_RULES = ("merge_forecast", "pr_state_claim", "deploy_claim", "setting_claim")
+NEW_CLAIM_RULES = ("merge_forecast", "pr_state_claim", "deploy_claim", "setting_claim", "quota_claim")
 
 
 def outcome_error(exc: BaseException, judge_error: bool, judged: bool) -> dict:
@@ -4252,7 +4338,7 @@ def nudge_outcome(rule: str, reply: str, user_ask: str, tool_log: list[str], llm
                         confirm_floor=confirm_floor, human_confirm_floor=human_confirm_floor,
                         report_only_fallback=report_only_fallback)
     fns = {"merge_forecast": merge_forecast, "pr_state_claim": pr_state_claim, "deploy_claim": deploy_claim,
-           "setting_claim": setting_claim}
+           "setting_claim": setting_claim, "quota_claim": quota_claim}
     for r in (NEW_CLAIM_RULES if extra_rules is None else extra_rules):
         if r == rule or r not in fns:
             continue
@@ -4486,6 +4572,12 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
             return {"rule": "setting_claim", "p": 1.0, "evidence": phrase, "reason": "setting_claim",
                     "verdict": {"setting_claim": 1.0, "evidence": phrase},
                     "nudge": SETTING_CLAIM_NUDGE.format(evidence=phrase[:160])}
+    if not only or "quota_claim" in only:
+        phrase = quota_claim(reply, tool_log)
+        if phrase:  # deterministic: model quota claimed out/capped with no quota read this turn (agent-f547b2a420)
+            return {"rule": "quota_claim", "p": 1.0, "evidence": phrase, "reason": "quota_claim",
+                    "verdict": {"quota_claim": 1.0, "evidence": phrase},
+                    "nudge": QUOTA_CLAIM_NUDGE.format(evidence=phrase[:160])}
     if not only or "future_clock" in only:
         phrase = future_clock(reply, now=now)
         if phrase:  # deterministic: a past-tense Pacific stamp later than the real clock (agent-748d257889)
@@ -4790,6 +4882,7 @@ BACKTEST_RULES: dict = {"credit_ask": lambda r: credit_ask(r, []), "laptop_job":
                         "pr_state_claim": lambda r: pr_state_claim(r, []),
                         "deploy_claim": lambda r: deploy_claim(r, []),
                         "setting_claim": lambda r: setting_claim(r, []),
+                        "quota_claim": lambda r: quota_claim(r, []),
                         "future_clock": lambda r, at=None: future_clock(r, now=at),
                         "claimed_mutation": lambda r: (claimed_mutation(r, []) or {}).get("evidence"),
                         # wording only (an upper bound): a backtest can't know each reply's backend skew

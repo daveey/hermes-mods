@@ -2650,6 +2650,30 @@ def setting_read_lines(arg: str, cap: int = TURN_LOG_ARG_CAP) -> list[str]:
             break
     return out
 
+
+# agent-f547b2a420: a quota read (`hermes-pool-llm check`, `hermes auth list`, provider_walls.json) also sits behind a
+# `date; sqlite3 ...` preamble past the cut, so reply_check.quota_claim gets `   <- QUOTA read: ...` lines. Same pattern
+# as reply_check._QC_READ_RE (a test keeps them equal).
+QUOTA_READ_RE = re.compile(
+    r"provider_walls|hermes-pool-llm|\bpool_llm\b|\bhermes\s+auth\s+(?:list|status)\b|\bllm_paced\b|kanban\s+pacing"
+    r"|\bdispatch_skipped\b|account[-_]usage|anthropic-pool-status|oauth/usage|\bauth\.json\b|<- QUOTA read:", re.I)
+
+
+def quota_read_lines(arg: str, cap: int = TURN_LOG_ARG_CAP) -> list[str]:
+    """`   <- QUOTA read: <the read>` for each quota read in `arg` that ends past the `->` line's `cap` chars."""
+    out: list[str] = []
+    if not isinstance(arg, str) or len(arg) <= cap:
+        return out
+    for m in QUOTA_READ_RE.finditer(arg):
+        if m.end() <= cap:
+            continue
+        line = f"   <- QUOTA read: {arg[m.start():m.start() + 160].split(chr(10), 1)[0]}"
+        if line not in out:
+            out.append(line)
+        if len(out) >= PR_READ_LINES_MAX:
+            break
+    return out
+
 # agent-521fd3b5d4: core resumes a turn the backend cut (planned update pause, crash) with a user-role note, so the
 # coach starts a new turn and, in a gateway that booted after the cut, has none of its calls in memory. turn_start then
 # rebuilds the cut turn's log from state.db (AgentCoach._rehydrate_resumed_turn). Same prefix and wrapper handling as
@@ -4579,7 +4603,7 @@ class AgentCoach:
         s["turn_log"].append(f"-> {tool}({arg[:TURN_LOG_ARG_CAP]})")
         s.setdefault("turn_rich", deque(maxlen=60)).append(rich_tool_line(tool, args, arg))
         if tool in ("terminal", "execute_code"):
-            for line in pr_read_lines(arg) + deploy_read_lines(arg) + setting_read_lines(arg):
+            for line in pr_read_lines(arg) + deploy_read_lines(arg) + setting_read_lines(arg) + quota_read_lines(arg):
                 s["turn_log"].append(line)
                 s["turn_rich"].append(line)
         if tool == "terminal" and "commit" in arg and "git" in arg:
