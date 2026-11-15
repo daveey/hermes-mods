@@ -1,4 +1,5 @@
 """Command/data controls for every consumer of the shared shell classifier."""
+import re
 import shlex
 
 import pytest
@@ -207,14 +208,13 @@ def test_classifier_agrees_with_real_shells(tmp_path, shape):
     assert (hits(command) == [('comment', ['t_X', 'hi'])]) == ran, (command, ran)
 
 
-def test_real_shell_rows_never_run_the_host_hermes(tmp_path):
-    # The isolation itself: even a login shell, whose startup files may prepend
-    # ~/.local/bin, must not reach anything but the fake.
-    import subprocess
-    env = _isolated_env(tmp_path)
-    found = subprocess.run(['bash', '-lc', 'command -v hermes'], env=env, capture_output=True,
-                           text=True, timeout=30).stdout.strip()
-    assert found == str(tmp_path / 'bin' / 'hermes')
+def test_real_shell_rows_never_use_a_login_shell():
+    # A login shell reads /etc/profile and ~/.profile (macOS path_helper reorders PATH),
+    # which can put the host's real hermes ahead of the fake (review 5912225322). No row
+    # that runs may use one; `bash -lc` stays a classifier-only row above.
+    rows = _REAL_SHELL_SHAPES + [s for s, _ in _WRAPPED_CALLS] + _PRINTED_CALLS + _STILL_DATA
+    login = re.compile(r'\b(?:bash|sh|dash|zsh|ksh)\s+(?:[-+][A-Za-z]+\s+)*(?:-[A-Za-z]*l[A-Za-z]*|--login)\b')
+    assert [row for row in rows if login.search(row)] == []
 
 
 # Review 5912225322 finding 3: main refused each of these and the shells run each one. A
