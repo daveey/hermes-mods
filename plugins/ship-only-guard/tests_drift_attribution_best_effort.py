@@ -158,6 +158,9 @@ def test_once_waiter_expires_while_owner_is_in_flight(monkeypatch, owner_fails):
                 # An unbounded wait is itself the regression: refuse it rather
                 # than hanging the test process until an outer test timeout.
                 assert timeout is not None and timeout > 0, "waiter requested an unbounded wait"
+                assert len(waits) == 1, "waiter waited again after its budget expired"
+                remaining = g._PREFLIGHT_DEADLINE.get() - clock.now
+                assert timeout == pytest.approx(remaining), "waiter ignored its remaining budget"
                 assert not event.is_set() and not release.is_set()
                 clock.now += timeout
                 return event.wait(0)
