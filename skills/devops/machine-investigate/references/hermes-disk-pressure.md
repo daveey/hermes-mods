@@ -44,6 +44,10 @@ Read when a Hermes host (not a Mac) is low on disk, including the "Low disk · /
 - The producer-fix card t_01a1d342b83eb2cd lives on worker-2, and kanban_comment/cross_task refuse foreign cards from another worker. Relay evidence with `kanban_supervisor_request(ops=[{op:'operator', action:'comment', task_id, text}])`.
 - A repeating `prior_archive_evidence` task id plus `upload:recovery_intent` refusals means stale detach intents (see above). They also waste the oversize slot, so quarantine them first.
 
+## Cold-volume pressure
+
+Inventory cold manifests and migration ages before recursively sizing every archive. When all entries are younger than the expiry, an empty expiry report is expected, not proof of a broken collector; compare quarantine duration with volume capacity. Size only the top-level tiers first, and keep partial `du` output on timeouts. A shorter pressure TTL must preserve the existing source/repository/evidence guards, be tested at age and free-space boundaries, and pass independent review before live expiration. Verify actual filesystem reclaim separately from reported per-file bytes (hardlinks affect accounting).
+
 ## Producers the existing GC misses
 
 - **Fake-HOME test homes in running review/mutant cards.** These cards run `env -i HOME=<card>/home-<side> bash scripts/run_tests.sh`, one home per PR side (`home-new2571`, `home-old2571`, ...). Each home costs about 600 MiB of private `.hermes/installs/*/test-environment` venv plus its own uv cache. `pm.environments.account_home_root()` follows `$HOME`, so under a fake HOME it never shares the account's `cache/uv`. run_tests.sh's tool-store borrow does use `getent passwd`, but that covers only `tools/`. A 10-PR sweep holds about 7 GiB while it runs. The fix card is t_01a1d7027fa9e3b6. To find these homes, sample `/proc/<pid>/environ` HOME on the top writers.
