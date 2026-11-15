@@ -10,6 +10,8 @@ import importlib.util
 import json
 import os
 import re
+import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -119,6 +121,82 @@ class PluginSuitesWorkflow(unittest.TestCase):
         self.assertIn("scripts/ci-plugin-suites summary results.json", self.text)
         self.assertNotIn("--hermes-core", self.text)
         self.assertNotIn("continue-on-error", self.text)
+
+
+class GitleaksHistoryScope(unittest.TestCase):
+    def test_missing_binary_fails_in_ci(self):
+        with patch.dict(os.environ, {"CI": "true"}), patch.object(shutil, "which", return_value=None):
+            with self.assertRaisesRegex(AssertionError, "CI must provision"):
+                self.test_checked_out_history_and_unignored_branch_controls()
+
+    def test_repo_guards_provisions_the_same_verified_archive(self):
+        scan = (ROOT / ".github/workflows/gitleaks.yml").read_text()
+        guards = (ROOT / ".github/workflows/repo-guards.yml").read_text()
+        for pattern in (r"https://github.com/gitleaks/[^\s]+", r'[0-9a-f]{64}  gitleaks.tar.gz'):
+            match = re.search(pattern, scan)
+            assert match, scan
+            self.assertIn(match.group(0), guards)
+        self.assertIn('sha256sum -c -', guards)
+        self.assertIn('>> "$GITHUB_PATH"', guards)
+
+    def test_checked_out_history_and_unignored_branch_controls(self):
+        binary = shutil.which("gitleaks")
+        if binary is None:
+            if os.environ.get("CI", "").lower() == "true":
+                self.fail("CI must provision the workflow-pinned gitleaks binary")
+            self.skipTest("install the workflow-pinned gitleaks binary")
+        workflow = (ROOT / ".github/workflows/gitleaks.yml").read_text()
+        version_match = re.search(r"/download/v([0-9.]+)/", workflow)
+        assert version_match, workflow
+        version = version_match.group(1)
+        self.assertEqual(subprocess.check_output([binary, "version"], text=True).strip(), version)
+        command = re.findall(r"(?m)^\s+(\./gitleaks git .+)$", workflow)
+        self.assertEqual(len(command), 1)
+        argv = shlex.split(command[0])
+        # Run the workflow's exact argv, including its relative binary/config paths.
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+            env.update(GIT_AUTHOR_NAME="fixture", GIT_AUTHOR_EMAIL="fixture@example.com",
+                       GIT_COMMITTER_NAME="fixture", GIT_COMMITTER_EMAIL="fixture@example.com")
+
+            def git(*args):
+                return subprocess.check_output(["git", "-C", directory, *args],
+                                               env=env, stderr=subprocess.STDOUT, text=True).strip()
+
+            def commit(message):
+                git("add", ".")
+                git("-c", "core.hooksPath=/dev/null", "commit", "-qm", message)
+
+            def scan(expected):
+                result = subprocess.run(argv, cwd=repo, env=env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+
+            git("init", "-q", "-b", "main")
+            # Deterministic synthetic rule: no real credential or entropy-dependent fixture.
+            (repo / ".gitleaks.toml").write_text(
+                '[[rules]]\nid = "fixture"\ndescription = "scope fixture"\n'
+                'regex = "SCOPE_TEST_[A-Z]+"\n')
+            (repo / ".gitleaksignore").write_text("")
+            (repo / ".gitignore").write_text("gitleaks\n")
+            (repo / "gitleaks").symlink_to(binary)
+            commit("base")
+            git("branch", "branch-b")
+            (repo / "main.txt").write_text("SCOPE_TEST_MAIN\n")
+            # Path/rule/line fingerprints allow the ignore and finding in the same commit.
+            (repo / ".gitleaksignore").write_text("main.txt:fixture:1\n")
+            commit("main finding and matching ignore")
+            main = git("rev-parse", "HEAD")
+            scan(0)
+            git("checkout", "-q", "branch-b")
+            self.assertNotIn(main, git("rev-list", "HEAD").splitlines())
+            self.assertIn(main, git("rev-list", "--all").splitlines())
+            scan(0)  # RED with implicit --all: unrelated main finding, old ignore tree.
+            (repo / "branch.txt").write_text("SCOPE_TEST_BRANCH\n")
+            commit("unignored branch finding")
+            scan(1)  # push-shaped HEAD must still detect a real branch finding.
+            git("merge", "--no-ff", "-qm", "pull request merge", "main")
+            scan(1)  # merge-shaped PR HEAD must detect it too.
 
 
 class SuiteSelection(unittest.TestCase):
