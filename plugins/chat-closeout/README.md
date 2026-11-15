@@ -156,7 +156,13 @@ one close-out; a batch with cards still working waits for its own. The mention i
 close-out turn whose last assistant message is a successful final reply (text, no tool calls, `finish_reason`
 stop/end_turn, the transcript ack rule); a failed wake, or a briefed turn that failed, keeps it, and a failed turn
 retries after a shared 600 s backoff subject to the existing hourly wake cap; failure never acknowledges delivery. A found entry
-forgets its missing time (`tests/test_unlink.py`, `tests/test_contract_edges.py`).
+forgets its missing time (`tests/test_unlink.py`, `tests/test_contract_edges.py`). A successful close-out retires the
+entries it named (ledger `retired`): a card archived on its owner without completion is never republished, yet core
+keeps listing its last stale row among the chat's open cards, so a later turn end would put it back in the batch and
+start a new 24 h clock and a new close-out every day. A retired entry the chat still lists stays out while it is
+missing, stale, uncertain or finished without settling; a fresh, resolvable row (the owner published it again) is
+work again and rejoins; a tombstone the chat no longer lists is dropped. Any other card a turn hands work to joins
+the batch as before (`tests/test_unlink_retired.py`).
 
 A missing four-part `gateway/profile/board/id` additionally requires a fresh full Board shadow
 (`kanban/sync-shadow/<board>.db`, matching board identity and `pulled_at` within 120 seconds).
