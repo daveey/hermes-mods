@@ -22,7 +22,9 @@ stops new claims on a provider while its pooled accounts burn faster than their 
 
    For one waited-on card, read its own rows there (`select origin_gateway, kind, datetime(created_at,'unixepoch'),
    substr(payload,1,300) from task_events where task_id='<id>' order by created_at desc limit 8`): a worker can
-   record the skip as `dispatch_skipped` with reason `llm_paced` and `limit: 0`. The hub's `kanban show` cannot tell
+   record the skip as `dispatch_skipped` with reason `llm_paced` and `limit: 0`. A card logs that skip once per
+   reason, so its newest row can still say `paced` hours after the provider went `held`: take the provider's state
+   from step 3 on every notice, never from the card's last skip. The hub's `kanban show` cannot tell
    you this for a pool card: it reports only its own `labels_mismatch` (the hub never leases pool cards) and
    "admission reason unknown". The newest rows also show whether another chat already changed the card's model or
    placement, so you don't make a second change.
