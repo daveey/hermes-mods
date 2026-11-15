@@ -2323,6 +2323,59 @@ def quota_claim(reply: str, tool_log: Optional[list] = None) -> Optional[str]:
     return hit.strip(" -*\t")
 
 
+# ---- hold_lift_forecast: the reply says waiting cards start when a provider comes back / resets / its hold lifts -----
+# (self-heal agent-2f71681b0b: at 12:41Z a hub chat read anthropic `held` until 14:00Z (6:00 AM PT) with 7 of 8
+# accounts at 7d 100% and one 5-hour window due to reset, then told David three times that cards 9th-31st in line
+# "start when a Codex slot frees up or Claude comes back at 6:00 AM PT". The reset window ran 4 cards from the head of
+# the queue in a minute and anthropic re-held until 7:00.) A hold's `until` is when the hold ends, not when a given
+# card starts: the release admits only what the reset accounts' headroom sustains, in DISPATCH_ORDER. quota_claim
+# gates on a quota read; this turn had one, so this rule is wording-only. Deterministic, before the judge: a sentence
+# (outside code and quotes, not a question) naming a provider/quota/account that comes back, resets, resumes or whose
+# pause/hold ends or lifts, plus a start/run/claim verb and a when/once/after/at/from frame; hedged (may/might/could/if/
+# only N/headroom), negated or past-tense sentences pass. Backtest (hub, 7 days): 10 unique hits, 9 of them such
+# forecasts.
+_HL_PROV = (r"(?:Claude|Anthropic|Codex|OpenAI|ChatGPT|Grok|xAI|Gemini|Opus|Sonnet|GPT[-\w.]*|"
+            r"(?:the\s+)?(?:provider|quota|pool|account)s?)")
+_HL_LIFT = (r"(?:comes?\s+back|(?:is|are)\s+back|returns?|resumes?|recovers?|un-?pauses?|resets?|"
+            r"(?:pause|hold|cap|limit|wall)s?\s+(?:ends?|lifts?|expires?|clears?|is\s+over))")
+_HL_LIFT_RE = re.compile(r"\b" + _HL_PROV + r"(?:[\u2019']s)?\s+(?:[\w-]+\s+){0,2}?" + _HL_LIFT + r"\b", re.I)
+_HL_START_RE = re.compile(
+    r"\b(?:starts?|start\s+(?:running|work)|begins?|runs?|gets?\s+(?:a\s+)?(?:worker|slot|claimed|picked\s+up)|"
+    r"(?:is|are|gets?|get)\s+(?:claimed|picked\s+up)|picks?\s+(?:it|them|up)|claims?\s+(?:it|them)|moves?|"
+    r"(?:should|will|[\u2019']ll)\s+(?:start|run|begin|move|land|get|be\s+(?:claimed|picked))|can\s+(?:start|run))\b",
+    re.I)
+_HL_WHEN_RE = re.compile(r"\b(?:when|once|after|as\s+soon\s+as|by\s+the\s+time|at|around|from|whichever)\b", re.I)
+_HL_HEDGE_RE = re.compile(
+    r"\b(?:may|might|could|would|if|unless|possibly|probably|perhaps|headroom|won[\u2019']t|doesn[\u2019']t|"
+    r"didn[\u2019']t|wouldn[\u2019']t|can[\u2019']t|cannot|not|never|started|ran|was|were|no\s+start\s+time|"
+    r"only\s+(?:a\s+few|\d+|one|two|three|four))\b", re.I)
+_HL_META_RE = re.compile(r"\bhold_lift_forecast\b", re.I)
+HOLD_LIFT_FORECAST_NUDGE = (
+    "[coach] hold_lift_forecast: your reply says waiting cards start when a provider comes back, resets or lifts its "
+    "pacing hold (\"{evidence}\"). A held provider's `until` is when the hold ends, not when a given card starts: the "
+    "release admits only what the reset accounts' headroom sustains, in dispatch order (DISPATCH_ORDER), and it can "
+    "re-hold minutes later. Say which accounts reset at that time and how much weekly room they have left, and give "
+    "the card's position among the ready cards a worker can take. State the time the hold lifts, but don't promise a "
+    "start unless the card is within what that headroom admits (claude-usage-diagnostics, "
+    "references/pacing-governor.md, \"Report\").")
+
+
+def hold_lift_forecast(reply: str, tool_log: Optional[list] = None) -> Optional[str]:
+    """The sentence forecasting that cards start when a provider comes back / resets / its hold lifts, else None
+    (code spans, quotes, `>` lines, questions, hedged/negated/past-tense sentences and replies naming
+    hold_lift_forecast are ignored). `tool_log` is unused: a quota read does not make the forecast right."""
+    text = _CODE_QUOTE.sub(" ", reply or "")
+    text = _QUOTED_RE.sub(" ", text)
+    if _HL_META_RE.search(text):
+        return None
+    for s in _SENTENCE_END.split(text):
+        if s.rstrip(" *_").endswith("?"):
+            continue
+        if _HL_LIFT_RE.search(s) and _HL_START_RE.search(s) and _HL_WHEN_RE.search(s) and not _HL_HEDGE_RE.search(s):
+            return s.strip(" -*\t")
+    return None
+
+
 # ---- future_clock: a past-tense Pacific time stamp that has not happened yet -------------------------------------------
 # (self-heal agent-748d257889: at 20:59 PST a red-sweep report said "(Checked 21:05–21:40 PT.)" and card comments said
 # "Red sweep ~21:15 PST". The model subtracted 7 h from UTC tool stamps after DST had ended (UTC-8) and never read the
@@ -2716,18 +2769,19 @@ def restart_scope_claim_nudge(evidence: str, skew: Optional[tuple]) -> str:
 
 RULES = ("handoff", "confirm", "unverified", "unwatched", "report_only", "status_only", "denied_ask", "credit_ask",
          "laptop_job", "skipped_live", "merge_forecast", "pr_state_claim", "future_clock", "claimed_mutation",
-         "restart_scope_claim", "deploy_claim", "setting_claim", "quota_claim")
+         "restart_scope_claim", "deploy_claim", "setting_claim", "quota_claim",
+         "hold_lift_forecast")
 # Every rule is classified by whether its check reads the user turn (agent-372c9408b8). A reply-only rule judges the
 # reply (and tool log or board) alone, so many holds under one user-turn opening say nothing about the rule firing on
 # a template: close-out turns are where chats report PR state. signals.template_holds skips these rules.
 # tests/test_signals.py fails CI for a rule in neither set, or a "reply-only" check that takes the ask.
 REPLY_ONLY_RULES = frozenset({"denied_ask", "credit_ask", "laptop_job", "skipped_live", "merge_forecast",
                               "pr_state_claim", "future_clock", "claimed_mutation", "restart_scope_claim",
-                              "deploy_claim", "setting_claim", "quota_claim"})
+                              "deploy_claim", "setting_claim", "quota_claim", "hold_lift_forecast"})
 USER_TURN_RULES = frozenset({"handoff", "confirm", "unverified", "unwatched", "report_only", "status_only"})
 DEFAULT_RULES = ("handoff", "confirm", "unwatched", "report_only", "status_only", "denied_ask", "credit_ask",
                  "laptop_job", "skipped_live", "merge_forecast", "pr_state_claim", "future_clock", "claimed_mutation",
-                 "restart_scope_claim", "deploy_claim", "setting_claim", "quota_claim")
+                 "restart_scope_claim", "deploy_claim", "setting_claim", "quota_claim", "hold_lift_forecast")
 # Per-rule judge thresholds (COACH_REPLY_THRESHOLDS overrides; other rules use COACH_REPLY_THRESHOLD).
 # report_only: tuned on the training split of the 2026-10-27 labeled set (README, "report_only").
 # report_only_capped: the screen alone when a second opinion was due but unavailable (daily cap hit, error); confirms
@@ -4296,7 +4350,8 @@ def handoff_outcome(reply: str, user_ask: str, tool_log: list[str], llm: Callabl
 STRONG_REPORT_ONLY_SRC = ("confirm", "closed_owner", "unverified_owner")
 
 
-NEW_CLAIM_RULES = ("merge_forecast", "pr_state_claim", "deploy_claim", "setting_claim", "quota_claim")
+NEW_CLAIM_RULES = ("merge_forecast", "pr_state_claim", "deploy_claim", "setting_claim", "quota_claim",
+                   "hold_lift_forecast")
 
 
 def outcome_error(exc: BaseException, judge_error: bool, judged: bool) -> dict:
@@ -4338,7 +4393,7 @@ def nudge_outcome(rule: str, reply: str, user_ask: str, tool_log: list[str], llm
                         confirm_floor=confirm_floor, human_confirm_floor=human_confirm_floor,
                         report_only_fallback=report_only_fallback)
     fns = {"merge_forecast": merge_forecast, "pr_state_claim": pr_state_claim, "deploy_claim": deploy_claim,
-           "setting_claim": setting_claim, "quota_claim": quota_claim}
+           "setting_claim": setting_claim, "quota_claim": quota_claim, "hold_lift_forecast": hold_lift_forecast}
     for r in (NEW_CLAIM_RULES if extra_rules is None else extra_rules):
         if r == rule or r not in fns:
             continue
@@ -4578,6 +4633,12 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
             return {"rule": "quota_claim", "p": 1.0, "evidence": phrase, "reason": "quota_claim",
                     "verdict": {"quota_claim": 1.0, "evidence": phrase},
                     "nudge": QUOTA_CLAIM_NUDGE.format(evidence=phrase[:160])}
+    if not only or "hold_lift_forecast" in only:
+        phrase = hold_lift_forecast(reply, tool_log)
+        if phrase:  # deterministic: cards forecast to start when a provider's hold lifts / resets (agent-2f71681b0b)
+            return {"rule": "hold_lift_forecast", "p": 1.0, "evidence": phrase, "reason": "hold_lift_forecast",
+                    "verdict": {"hold_lift_forecast": 1.0, "evidence": phrase},
+                    "nudge": HOLD_LIFT_FORECAST_NUDGE.format(evidence=phrase[:160])}
     if not only or "future_clock" in only:
         phrase = future_clock(reply, now=now)
         if phrase:  # deterministic: a past-tense Pacific stamp later than the real clock (agent-748d257889)
@@ -4883,6 +4944,7 @@ BACKTEST_RULES: dict = {"credit_ask": lambda r: credit_ask(r, []), "laptop_job":
                         "deploy_claim": lambda r: deploy_claim(r, []),
                         "setting_claim": lambda r: setting_claim(r, []),
                         "quota_claim": lambda r: quota_claim(r, []),
+                        "hold_lift_forecast": lambda r: hold_lift_forecast(r, []),
                         "future_clock": lambda r, at=None: future_clock(r, now=at),
                         "claimed_mutation": lambda r: (claimed_mutation(r, []) or {}).get("evidence"),
                         # wording only (an upper bound): a backtest can't know each reply's backend skew
