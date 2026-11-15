@@ -673,24 +673,38 @@ def _opt(tokens: list[str], *names: str) -> Optional[str]:
 
 
 def _kanban_verb(seg: list[str]) -> Optional[tuple[str, list[str]]]:
-    """Recognize Hermes only at the executable position, never in another argv."""
-    i = _shell_commands().command_start(seg)
+    """``(verb, args after verb)`` for a ``hermes kanban <verb> ...`` call in this argv.
+
+    Exact at the executable position. Known data commands (echo, printf, grep ...) never
+    run their arguments. Any other command word may (nice, xargs, sudo, find -exec ...),
+    so it keeps the fail-closed rule: any ``hermes kanban`` token pair is a call.
+    """
+    shell = _shell_commands()
+    i = shell.command_start(seg)
     if i >= len(seg):
         return None
     name = os.path.basename(seg[i])
-    if re.fullmatch(r"python(?:\d+(?:\.\d+)?)?", name):
-        # Preserve the existing python -m hermes_cli.main invocation explicitly.
-        i += 1
-        while i < len(seg) and seg[i] in {"-I", "-B", "-u", "-E", "-s", "-S"}:
-            i += 1
-        if seg[i:i + 2] != ["-m", "hermes_cli.main"]:
-            return None
-        i += 2
-    elif name in {"hermes", "hermes.exe", "hermes_cli.main"}:
-        i += 1
-    else:
+    if name in shell.DATA_COMMANDS:
         return None
-    if i >= len(seg) or seg[i] != "kanban":
+    if name in {"hermes", "hermes.exe", "hermes_cli.main"}:
+        return _verb_after(seg, i + 1)
+    if re.fullmatch(r"python(?:\d+(?:\.\d+)?)?", name):
+        j = i + 1
+        while j < len(seg) and seg[j] in {"-I", "-B", "-u", "-E", "-s", "-S"}:
+            j += 1
+        if seg[j:j + 2] == ["-m", "hermes_cli.main"]:
+            return _verb_after(seg, j + 2)
+    for k in range(i + 1, len(seg)):
+        if (os.path.basename(seg[k]) == "kanban" and os.path.basename(seg[k - 1]) in ("hermes", "hermes.exe")
+                or seg[k] == "kanban" and seg[k - 1].endswith("hermes_cli.main")):
+            hit = _verb_after(seg, k)
+            if hit:
+                return hit
+    return None
+
+
+def _verb_after(seg: list[str], i: int) -> Optional[tuple[str, list[str]]]:
+    if i >= len(seg) or os.path.basename(seg[i]) != "kanban":
         return None
     j = i + 1
     while j < len(seg) and seg[j].startswith("-"):

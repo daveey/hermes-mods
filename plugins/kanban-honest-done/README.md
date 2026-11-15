@@ -167,15 +167,26 @@ unverified", scoping notes like "the other test files were not run").
 
 ## Tests
 
-Shell write classification is command-position based: assignments and the explicit
-`env`, `command`, `exec`, `nohup`, `timeout` and `time` wrappers do not hide a call,
-but arguments of `echo`, `printf`, `grep`, and `git commit -m` are data. Quoted
-punctuation and data heredocs cannot manufacture commands. Explicit shell `-c`,
-substitutions, shell-input heredocs, reserved words, and Python `-m hermes_cli.main`
-retain executable classification. Consent shell checks share this parser too.
-`tests/test_command_position.py` covers those boundaries, all shared consumers,
-and the real comment hook. This is static classification, not shell evaluation:
-aliases, dynamically constructed command names, and sourced scripts are not resolved.
+Shell write classification fails closed. Only the arguments and input of known data
+commands (`echo`, `printf`, `grep`, `egrep`, `fgrep`, `rg`, `cat`) are data, so
+`echo hermes kanban comment …` is text. At the executable position, after assignments
+and the `env`, `command`, `exec`, `nohup`, `timeout` and `time` wrappers,
+`hermes kanban <verb>` is parsed exactly. Any other command word (`nice`, `xargs`,
+`sudo`, `setsid`, `find -exec`, a function, …) may run its arguments, so a
+`hermes kanban` token pair anywhere in its argv is a call, and a shell named in its
+arguments has its `-c` script scanned. Printed text is code once it can reach anything
+that runs it: echo/printf arguments piped into a non-data command; a heredoc or
+here-string whose consumer is not a data command, or whose consumer's output is piped
+into one; an unquoted substitution at the executable position or in a non-data
+command's arguments; a piped subshell or brace group; a process substitution; `eval`.
+Shell options are parsed as bash and dash do: `c` and `s` count whatever their sign,
+every `o`/`O` letter takes one option name, and `-c` takes the first operand after all
+options. A quoted payload (`git commit -m '…'`, `grep '…'`) stays one word. Consent
+shell checks share this parser. `tests/test_command_position.py` covers these
+boundaries for every shared consumer and the real comment hook, and runs each runnable
+row in real bash and sh with a fake `hermes` (isolated HOME, never a login shell). This
+is static classification, not shell evaluation: aliases, variables holding commands and
+sourced files are not resolved.
 
 `tests/test_acceptance_provenance_real_shapes.py` replays real state.db shapes (msg 931890 notice, peer-mail, exact steer, relays, stale and wrong-chat rows); `tests/test_acceptance_authority.py` (gate F) replays the t_7e2ee45c 2026-11-10 shape: a prepared waiver body applied with `f=…; hermes kanban edit <id> --body "$(cat $f)"` from a chat with no user turn, quoting a real user message of another chat, is refused; so are uncited waivers, notices, assistant text, worker prompts, missing ids, a quote older than the current body, a delegated parent's turn, dropping the DONE sentence and an unknown session. A fresh user turn in the same chat or its compression ancestor passes, as do restoring the original over a waiver and edits that keep acceptance. Paths: terminal (quoted and unquoted substitution), `mcp__terminal`, execute_code, tool_call, and the registered `pre_tool_call` hook with the `session_id` kwarg.
 

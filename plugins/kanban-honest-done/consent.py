@@ -216,9 +216,15 @@ def shell_write_texts(command: str) -> list[str]:
         if parsed and _SHELL_WRITE_RE.search('kanban ' + parsed[0]):
             writes.append(' '.join(parsed[1]))
             continue
-        start = core._shell_commands().command_start(seg)
-        if start < len(seg) and os.path.basename(seg[start]) == 'hermes-hub':
-            text = ' '.join(seg[start:])
+        shell = core._shell_commands()
+        start = shell.command_start(seg)
+        if start >= len(seg) or os.path.basename(seg[start]) in shell.DATA_COMMANDS:
+            continue
+        # hermes-hub at the executable position, or in the arguments of another command
+        # that may run it (nice, sudo, xargs ...): fail closed.
+        hub = next((k for k in range(start, len(seg)) if os.path.basename(seg[k]) == 'hermes-hub'), None)
+        if hub is not None:
+            text = ' '.join(seg[hub:])
             if _SHELL_WRITE_RE.search(text):
                 writes.append(text)
     return writes
