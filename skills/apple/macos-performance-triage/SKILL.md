@@ -21,7 +21,13 @@ known wait leaves and omitting interpreter dispatch frames from displayed chains
 Percentages are shares of retained stack samples, not process CPU percentages.
 Retained leaves can still block (including file I/O); native wall-stack occupancy
 is not measured CPU time or cores. Confirm attribution with process/thread CPU
-counters. Do not blanket-exclude syscalls: SQLite `pread` chains identify useful
+counters. Do not distribute an accounting residual across selected native thread
+families as if it were measured caller CPU: named threads can include already
+accounted scopes, and excluded threads can contain unaccounted work. Keep PID,
+revision and measurement window aligned. Native interpreter frames do not identify
+the Python callback; a unique thread spawn proves its wrapper, not its initiating
+operation. Label any cross-window proportional allocation as a sensitivity scenario,
+not a basis for skipping real work. Do not blanket-exclude syscalls: SQLite `pread` chains identify useful
 candidate work even though they do not establish time actually on CPU.
 
 ## Wait classification and regression tests
