@@ -136,19 +136,20 @@ def _tests_dir_runs(code):
     # A literal step-local working-directory makes `pytest tests` plugin-local.
     # Preserve offsets while masking those steps; this is only the repository's text shape,
     # not general YAML job/defaults or shell-cd analysis.
-    steps = list(re.finditer(r"(?m)^ +- [\w-]+:", code))
     direct_code = code
-    for index, step in reversed(list(enumerate(steps))):
-        end = steps[index + 1].start() if index + 1 < len(steps) else len(code)
-        # Stop at a dedent out of the step list, including the next job's defaults.
-        indent = len(step.group()) - len(step.group().lstrip())
-        dedent = re.compile(r"(?m)^ {0," + str(indent - 1) + r"}\S").search(code, step.end(), end)
-        if dedent:
-            end = dedent.start()
-        block = code[step.start():end]
-        cwd = re.search(r"(?m)^\s+working-directory:\s*([^\n]+)", block)
+    position = 0
+    while step := re.compile(r"(?m)^( +)- [\w-]+:").search(code, position):
+        # A step ends at the next line indented no deeper than its dash: the next step, or a dedent out
+        # of the step list (including the next job's defaults). Deeper `- key:` items stay inside it.
+        indent = len(step.group(1))
+        boundary = re.compile(r"(?m)^ {0," + str(indent) + r"}\S").search(code, step.end())
+        end = boundary.start() if boundary else len(code)
+        position = end
+        # Only the step's own key: on the dash line or at its key column, not a nested input or list item.
+        cwd = re.search(r"(?m)^(?: {%d}- | {%d})working-directory:\s*([^\n]+)" % (indent, indent + 2),
+                        code[step.start():end])
         if cwd and cwd.group(1).strip().strip("\"'") not in (".", "./", "${{ github.workspace }}"):
-            direct_code = direct_code[:step.start()] + " " * len(block) + direct_code[end:]
+            direct_code = direct_code[:step.start()] + " " * (end - step.start()) + direct_code[end:]
     # Join shell continuation lines without changing offsets used by provisioning checks.
     direct_code = direct_code.replace("\\\n", "  ")
     return ([match.start() for match in re.finditer(r"scripts/test-all\b", code)] +
@@ -350,6 +351,36 @@ class GitleaksProvisionTripwireMutants(unittest.TestCase):
                 '          pytest -q ' + '\\\n' +
                 '            tests\n')
         self.assertEqual(_tests_dir_runs(code), [code.index('pytest')])
+
+    def test_nested_list_does_not_split_local_step(self):
+        local = ('      - name: Plugin tests\n'
+                 '        working-directory: plugins/example\n'
+                 '        with:\n'
+                 '          items:\n'
+                 '            - key: value\n'
+                 '        run: python -m pytest tests\n')
+        self.assertEqual(_tests_dir_runs(local), [])
+
+    def test_root_run_after_nested_list_is_consumer(self):
+        code = ('      - name: Root tests\n'
+                '        with:\n'
+                '          items:\n'
+                '            - key: value\n'
+                '            - working-directory: plugins/example\n'
+                '        run: python -m unittest discover -s tests\n')
+        self.assertEqual(_tests_dir_runs(code), [code.index('unittest discover')])
+
+    def test_working_directory_first_local_step(self):
+        local = ('      - working-directory: plugins/example\n'
+                 '        run: python -m pytest tests\n')
+        self.assertEqual(_tests_dir_runs(local), [])
+
+    def test_working_directory_first_root_step_is_consumer(self):
+        for cwd in (".", "./", "${{ github.workspace }}"):
+            code = (f'      - working-directory: "{cwd}"\n'
+                    '        run: python -m unittest discover -s tests\n')
+            with self.subTest(cwd=cwd):
+                self.assertEqual(_tests_dir_runs(code), [code.index('unittest discover')])
 
     def test_comments_and_other_test_directories_are_not_consumers(self):
         with tempfile.TemporaryDirectory() as directory:
