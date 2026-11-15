@@ -186,3 +186,4 @@ untouched.
   evidence) and leave caches such as `__pycache__/`. Run `git status` on the source after the review and record
   anything they created.
 - Refute negative search claims against the original records before treating them as missing authority; literal schema-key searches can miss legacy semantic limits. Use the Refutation rubric's native-record comparison.
+- Verify claimed compare-and-set ownership at the authoritative write, not a client read-check followed by an unconditional release. A helper named safe release may still erase a replacement hold. For expiring interruption authority, add the entire start delay, reclaim batch and apply budget before choosing its lifetime; per-action expiry can otherwise kill work and then forbid the update that justified the interruption.
