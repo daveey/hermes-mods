@@ -98,6 +98,10 @@ HINTS = {
     "metric_split": ("{where} reports {hits} with no split. Name the split and metric with every score (\"1.787 val "
                      "BPB\", \"test acc 91.3%\"), reading it from the source table or README, so the next reader "
                      "doesn't assume one and table a val score beside test baselines. {fix}"),
+    "card_claim": ("{where} states {hits} as fact. A fleet-wide claim needs a readback per host, compared with "
+                   "GitHub (`git ls-remote`), not a scratch clone's origin. An absence claim needs the trigger read "
+                   "first (a workflow's `on:` schedule, a cron's interval): a missing run may be expected. Cite the "
+                   "readback in the text or mark the clause unverified. {fix}"),
     "search_cap": ("This GitHub read printed a count of exactly 1000 (`{shown}`). GitHub search (REST search/*, "
                    "GraphQL `search`, `gh search`, `merged:` queries) and Actions run lists stop at 1000 results, and "
                    "`--paginate` ends there without an error, so the list is almost certainly truncated. Before any "
@@ -1647,6 +1651,40 @@ def metric_split_texts(tool: str, args: Any) -> list[str]:
     for name, a in calls:
         if isinstance(a, dict):
             out += [a[k] for k in METRIC_SPLIT_TOOLS.get(name, ()) if isinstance(a.get(k), str)]
+    return out
+
+
+# ---- card_claim (agent-2bdd943d68) ----------------------------------------------------------------------------------
+# A chat wrote on cards that a lane had "stopped reporting" (the workflow was cron/dispatch-only) and that "every host
+# had" the new PRs (compared against a scratch clone's lagging origin). A card text stating a fleet-wide state or an
+# absence as fact gets a hint naming the readback it needs, never a refusal. Plans, conditions and targets
+# (once/until/if/when/should/must/will/verify/next) and clauses marked unverified/hypothesis stay quiet.
+_CC_FLEET_NOUN = r"(?:hosts?|machines?|workers?|gateways?|boxes|nodes|macs|runners?)"
+CARD_FLEET_RE = re.compile(
+    rf"\b(?:every|each|all(?:\s+\d+)?(?:\s+of\s+the)?(?:\s+\d+)?)\s+(?:\w+\s+)?{_CC_FLEET_NOUN}\s+"
+    r"(?:has|have|had|is|are|was|were|runs|ran|shows?|showed|carr(?:y|ies|ied)|now\s+\w+)\b(?:\s+\w+){0,3}", re.I)
+CARD_ABSENCE_RE = re.compile(
+    r"\b(?:stopped\s+(?:reporting|running|firing|posting|publishing|syncing|sending)"
+    r"|went\s+(?:silent|quiet|dark)"
+    r"|(?:has|have)(?:n't|\s+not)\s+(?:reported|fired|posted|synced)\s+(?:since|in|for))\b", re.I)
+CARD_CLAIM_SKIP_RE = re.compile(
+    r"\b(?:once|until|if|when|whenever|should|must|will|would|could|might|verify|confirm|check|ensure|next|"
+    r"by\s+design|unverified|unconfirmed|hypothesis|not\s+verified|to\s+be)\b", re.I)
+
+
+def card_claims(text: Any) -> list[str]:
+    """Fleet-wide state or absence claims stated as fact in `text`, as written ("every host has the newer PRs")."""
+    if not isinstance(text, str) or not text:
+        return []
+    out: list[str] = []
+    for clause in METRIC_CLAUSE_RE.split(text):
+        if CARD_CLAIM_SKIP_RE.search(clause):
+            continue
+        for rx in (CARD_FLEET_RE, CARD_ABSENCE_RE):
+            for m in rx.finditer(clause):
+                shown = " ".join(m.group(0).split())
+                if shown not in out:
+                    out.append(shown)
     return out
 
 
@@ -4415,6 +4453,29 @@ class AgentCoach:
                                 "The card is closed: post a kanban_comment with the labelled numbers." if closed
                                 else "Post a corrected comment or edit before the next step.")
 
+    def check_card_claim(self, sid: str, tool: str, args: Any) -> None:
+        """card_claim rule (once per claim per session): a kanban_complete/comment/create text stating a fleet-wide
+        state or an absence as fact. Also run from transform_tool_result so the hint lands on the card call itself."""
+        if not sid:
+            return
+        hits = [h for t in metric_split_texts(tool, args) for h in card_claims(t)]
+        if not hits:
+            return
+        s = self._s(sid)
+        new = [h for h in dict.fromkeys(hits) if f"card_claim:{h.lower()}" not in s["fired"]]
+        if not new:
+            return
+        for h in new[1:]:
+            s["fired"].add(f"card_claim:{h.lower()}")
+        names = [(tool or "").rsplit("__", 1)[-1]]
+        if names[0] == "tool_call" and isinstance(args, dict):
+            names = [str(c.get("name") or "") for c in args.get("calls") or [] if isinstance(c, dict)]
+        fix = ("The card is closed: post a kanban_comment correcting or sourcing it." if
+               any(n.endswith("kanban_complete") for n in names) else
+               "Post a corrected comment before the next step.")
+        shown = ", ".join(f"\"{h}\"" for h in new[:3]).replace("{", "(").replace("}", ")")
+        self._fire(s, sid, "card_claim", new[0].lower(), where="This card text", hits=shown, fix=fix)
+
     def _fire_metric_split(self, sid: str, where: str, hits: list, fix: str) -> None:
         """One hint per new bare number: numbers already hinted this session stay quiet."""
         s = self._s(sid)
@@ -4556,6 +4617,7 @@ class AgentCoach:
         self.check_empty_wait(sid, tool, args, result)
         self.check_cleanup_sweeper(sid, tool, args, result, status)
         self.check_metric_split(sid, tool, args)
+        self.check_card_claim(sid, tool, args)
         self.check_search_cap(sid, tool, args, result)
         # plan_first (once per session). A clarify the user answered showed them the plan: that counts as a reply.
         if tool == "clarify":
