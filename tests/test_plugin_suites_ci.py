@@ -9,6 +9,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import posixpath
 import re
 import shlex
 import shutil
@@ -131,6 +132,15 @@ def _workflow_code(text):
     return "\n".join(re.sub(r"(^|\s)#.*$", "", line) for line in text.splitlines())
 
 
+def _is_root_working_directory(value):
+    """True unless a step working-directory literally names a directory below the repository root."""
+    value = value.strip()
+    if value[:1] in "|>":  # Block scalar: not resolved; over-report rather than mask a root test run.
+        return True
+    value = re.sub(r"^\$\{\{\s*github\.workspace\s*\}\}(?=/|$)", ".", value.strip("\"'"))
+    return posixpath.normpath(value or ".") == "."  # ".", "./", "./.", "${{ github.workspace }}/", empty
+
+
 def _tests_dir_runs(code):
     """Offsets for the supported runner spellings; deliberately not a YAML/shell parser."""
     # A literal step-local working-directory makes `pytest tests` plugin-local.
@@ -146,9 +156,10 @@ def _tests_dir_runs(code):
         end = boundary.start() if boundary else len(code)
         position = end
         # Only the step's own key: on the dash line or at its key column, not a nested input or list item.
-        cwd = re.search(r"(?m)^(?: {%d}- | {%d})working-directory:\s*([^\n]+)" % (indent, indent + 2),
+        # The value stays on the key's line: `[ \t]*`, not `\s*`, so an empty value never reads the next key.
+        cwd = re.search(r"(?m)^(?: {%d}- | {%d})working-directory:[ \t]*([^\n]*)" % (indent, indent + 2),
                         code[step.start():end])
-        if cwd and cwd.group(1).strip().strip("\"'") not in (".", "./", "${{ github.workspace }}"):
+        if cwd and not _is_root_working_directory(cwd.group(1)):
             direct_code = direct_code[:step.start()] + " " * (end - step.start()) + direct_code[end:]
     # Join shell continuation lines without changing offsets used by provisioning checks.
     direct_code = direct_code.replace("\\\n", "  ")
@@ -381,6 +392,40 @@ class GitleaksProvisionTripwireMutants(unittest.TestCase):
                     '        run: python -m unittest discover -s tests\n')
             with self.subTest(cwd=cwd):
                 self.assertEqual(_tests_dir_runs(code), [code.index('unittest discover')])
+
+    def test_action_input_working_directory_does_not_mask_root_step(self):
+        # `with: working-directory:` is an action input two columns below the step key, not the step's cwd.
+        # Pins the key-column match: widening it to "that column or deeper" would hide this root run.
+        code = ('      - name: Root tests\n'
+                '        with:\n'
+                '          working-directory: plugins/example\n'
+                '        run: python -m unittest discover -s tests\n')
+        self.assertEqual(_tests_dir_runs(code), [code.index('unittest discover')])
+
+    def test_root_equivalent_working_directory_is_consumer(self):
+        for cwd in ('./.', '"./."', "'./.'", './', '././', '"${{ github.workspace }}/"',
+                    '${{github.workspace}}', '"${{ github.workspace }}/."', '""', ''):
+            code = (f'      - name: Root tests\n        working-directory: {cwd}\n'
+                    '        run: python -m unittest discover -s tests\n')
+            with self.subTest(cwd=cwd):
+                self.assertEqual(_tests_dir_runs(code), [code.index('unittest discover')])
+
+    def test_block_scalar_working_directory_is_treated_as_root(self):
+        # Block scalars are not resolved here; over-report rather than mask a genuine root test run.
+        for indicator in ('>-', '|', '>', '|-', '|2'):
+            for value in ('.', 'plugins/example'):
+                code = (f'      - name: Root tests\n        working-directory: {indicator}\n'
+                        f'          {value}\n'
+                        '        run: python -m unittest discover -s tests\n')
+                with self.subTest(indicator=indicator, value=value):
+                    self.assertEqual(_tests_dir_runs(code), [code.index('unittest discover')])
+
+    def test_plugin_local_spellings_stay_masked(self):
+        for cwd in ('plugins/example', './plugins/example', '"${{ github.workspace }}/plugins/example"'):
+            local = (f'      - name: Plugin tests\n        working-directory: {cwd}\n'
+                     '        run: python -m pytest tests\n')
+            with self.subTest(cwd=cwd):
+                self.assertEqual(_tests_dir_runs(local), [])
 
     def test_comments_and_other_test_directories_are_not_consumers(self):
         with tempfile.TemporaryDirectory() as directory:
