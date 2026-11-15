@@ -222,6 +222,20 @@ def test_headingless_reply_one_context_paragraph_below_a_quote_is_not_booked_to_
     assert core.cited_cards('Reply here.', reply, [entry, quoted]) == [quoted]
 
 
+@pytest.mark.parametrize('context, quoted_only', [
+    ('A little context.\n\n', True),
+    ('', False),
+], ids=['distant-non-ask-quote', 'adjacent-non-ask-quote-control'])
+def test_headingless_non_ask_quote_only_yields_to_an_earlier_ask_when_distant(context, quoted_only):
+    quoted = card_entry(tid='t_0a0a0a0a', action=QUOTED_ASK, title='Landing fix acceptance')
+    other = card_entry()
+    reply = f"> {QUOTED_ASK}\n\n> The checks passed.\n\n{context}Reply here."
+    # A distant status quote must not hide the earlier complete ask and admit the unrelated card.
+    # Right next to the reply, however, a non-ask quote intentionally retains the old broad scope.
+    expected = [quoted] if quoted_only else [quoted, other]
+    assert core.cited_cards('Reply here.', reply, [quoted, other]) == expected
+
+
 def test_headingless_quote_region_stops_at_a_paragraph_naming_another_card():
     reply = "\n\n".join([f"> {QUOTED_ASK}", "Two of its acceptance checks need history that was never recorded.",
                          f"Card {LOCAL_CARD} is separate.", "Reply here to submit it."])
