@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 from tests_turn import (g, gh, pr, delta, seed_turn, merge, H2563, NOW,
-                        fl, BASE, sha, drift_world, chain_pushes, is_edge, push_event)
+                        fl, BASE, sha, drift_world, chain_pushes, is_edge, push_event, full_rule)
 
 
 @pytest.mark.parametrize("outer,eligibility,expected", [(100, 7, 7), (4, 7, 4)])
@@ -72,16 +72,16 @@ def test_holder_reads_finish_by_eligibility_without_acquisition(gh, monkeypatch)
     assert not writes
 
 
-@pytest.mark.parametrize("stage", ["_turn_yielded", "_turn_holder_data"])
+@pytest.mark.parametrize("stage", ["peer_eligibility", "_turn_holder_data"])
 def test_late_cached_holder_result_cannot_admit_waiter(gh, monkeypatch, stage):
     fake = gh({n: pr(n, H2563, ["hermes-sync"]) for n in (1, 2)})
-    seed_turn(fake, 1, NOW - 1800)
+    seed_turn(fake, 1, NOW - 60)
     clock = [0]
     monkeypatch.setattr(g, "time", SimpleNamespace(monotonic=lambda: clock[0]))
 
     def late(*a):
         clock[0] = 31
-        return True if stage == "_turn_yielded" else fake.prs[1]
+        return False if stage == "peer_eligibility" else fake.prs[1]
 
     monkeypatch.setattr(g, stage, late)
     why = merge(2, H2563)
@@ -118,7 +118,7 @@ def test_selector_joins_actual_inflight_reads_before_return(gh, monkeypatch, unr
                 state["finished"] += 1
 
     monkeypatch.setattr(g.subprocess, "run", read)
-    why = merge(2, H2563)
+    why = full_rule()                                 # #1's own drift walk (waiters never run it)
     assert why and ("snapshot unreadable" in why if unreadable else "now holds" in why)
     with lock:
         assert state["finished"] == state["started"]
