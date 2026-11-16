@@ -245,6 +245,11 @@ def test_three_merge_carry_decides_with_the_drift_check_in_budget(monkeypatch, o
     drift_reads = [c for c in shim.calls if c[2] == "drift check"]
     assert drift_reads and min(c[0] for c in drift_reads) >= max(
         c[1] for c in shim.calls if c[2].startswith("carry")), timeline
+    # The land-turn reads share the approval/carry wave. Run after it, they add their whole read (~2.7 s
+    # here) to every decision yet stay inside the bounds above (left after carry unchanged, ~15.4 of 16).
+    turn_reads = [c for c in shim.calls if c[2] == "land-turn reads"]
+    assert turn_reads and min(c[0] for c in turn_reads) < min(
+        c[0] for c in shim.calls if c[2].startswith("carry")), timeline
     if overlap:
         assert "state commit(s) landed since then" in result and "worker_parity.py" in result, result
         assert "--land-turn" in result, result     # the refusal names the out-of-hook turn record
