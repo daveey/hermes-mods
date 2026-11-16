@@ -260,12 +260,24 @@ that base overlaps a PR file:
   `test_` and not markdown (`tests/sync_test_support.py`, `tests/__init__.py`)
   on either side overlaps any file directly in that dir on the other side,
   except that a support `.py` module (not `__init__.py`/`conftest.py`) and a
-  `test_*.py` module beside it overlap only when the test module, read at its
-  own side's head (or a support module it names, transitively), names the
-  support module's stem as a word (`import placement_support`, a
-  `placement_support.py` path string). A read that fails or overruns keeps the
-  pair overlapping. Land-turn holds use the same reads (holder's recorded head,
-  waiter's head; a direct push has no head and stays overlapping);
+  `test_*.py` module beside it overlap only when the test module's closure,
+  read at its own side's head, names the support module's stem as a word
+  (`import placement_support`, a `placement_support.py` path string), whether
+  or not that file exists in that tree. The closure is the module, the
+  `__init__.py`/`conftest.py` beside it, the root `conftest.py` and pytest
+  config, each dynamic load target, and transitively every support module it
+  names and every test module it imports or loads. A dynamic load
+  (`import_module`, `spec_from_file_location`, `SourceFileLoader`, `runpy`,
+  `exec`, a `python` subprocess, `loadTestsFromName`) must resolve to literal
+  strings: constants and their concatenation, f-strings and path joins,
+  `__file__`, names bound only to such values, or a parameter of a plain helper
+  whose every call site passes one. A computed target (an environment value, a
+  test function or fixture argument, a callback), test discovery
+  (`discover`, `python -m pytest`/`unittest`), unparseable code, or a read that
+  fails or overruns keeps the pair overlapping. Not traced: a subprocess argv
+  that is not a literal list, `os.system` and `os.exec*`. Land-turn holds use
+  the same reads (holder's recorded head, waiter's head; a direct push has no
+  head and stays overlapping);
 - test and code: a `test_<stem>[_suffix].py` module anywhere on one side and a
   code file (`.py`, `.sh`, `.js`/`.mjs`/`.cjs`/`.ts`, `.swift` or no extension)
   on the other whose basename stem, with `-` read as `_`, equals the key or

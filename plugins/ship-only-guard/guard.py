@@ -1312,14 +1312,18 @@ def _flat_executable(path):
 # them, so state PR #3207 (tests/placement_support.py) was drifted, or held behind a land turn, by each unrelated
 # tests/test_*.py landing (#3331, #3323, fe13a4c3bb, f58b681393 on 2026-11-15; none imports placement_support) and
 # stayed unlanded > 8 h through three update-branch refreshes. With content, a support module overlaps a test module
-# only when the test module's text, or that of a support module it names (transitively, at the same tree), names
-# the support module's stem as a word: `import x`, `from x import`, `x.py` path strings alike. Package and pytest
-# machinery (__init__.py, conftest.py), non-.py data and support~support pairs stay shared; any read that fails,
-# overruns its bound or is missing keeps the pair shared (fail closed). Callers without content (effective-turn
+# only when the test module's closure (the module, the __init__.py/conftest.py beside it, the root conftest.py and
+# pytest config, each dynamic load target, and transitively each .py module beside it a closure text names, read
+# at the test's own tree) names the support module's stem as a word: `import x`, `from x import`, `x.py` path
+# strings alike, whether or not the named file exists in that tree. A closure with a dynamic load whose target
+# does not resolve to literals stays shared (`_dynamic_targets`). Changes to __init__.py, conftest.py, non-.py data and support~support pairs stay shared; any
+# read that fails, overruns its bound or is missing keeps the pair shared (fail closed). Callers without content (effective-turn
 # ordering, drift start) keep the path-only rule, a superset.
 _ALWAYS_SHARED = {"__init__.py", "conftest.py"}
+_DIR_SEEDS = ("__init__.py", "conftest.py")                                    # run with every test beside them
+_ROOT_SEEDS = ("conftest.py", "pytest.ini", "pyproject.toml", "setup.cfg", "tox.ini")   # pytest rootdir machinery
 _REACH_TESTS = 16            # test modules one decision may read; more keeps every pair shared
-_REACH_BLOBS = 12            # support modules read per test module closure
+_REACH_BLOBS = 20            # files read per test module closure (module, seeds, support modules)
 _REACH_LISTING_CAP = 1000    # GitHub's contents API lists at most 1000 entries of a directory
 _WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
@@ -1359,23 +1363,370 @@ def _support_listing(repo, ref, directory, cwd, env):
 
 
 def _support_reach(repo, ref, path, cwd, env, once):
-    """Support stems the test module `path` names at `ref`, transitively through the support modules it names."""
+    """Every word the closure of the test module `path` at `ref` names: the module itself, the package and pytest
+    machinery that runs with it (its directory's __init__.py/conftest.py, the root conftest.py and pytest config),
+    each literal-resolved dynamic load target (`_dynamic_targets`), and, transitively, each support module beside
+    it that a closure text names and each test module beside it that the closure imports or loads (`from test_base
+    import Case`, `loadTestsFromName("test_y.Case")`). Words count whether or not the named module exists in this
+    tree (the other side may add it). _Unreadable when the closure cannot
+    be shown: a failed read, a cap, unparseable Python, or a dynamic load whose target does not resolve."""
     directory, name = path.split("/")
-    listing = once.get(("reach-dir", repo, ref, directory), _support_listing, repo, ref, directory, cwd, env)
+    listing, root = _parallel([("support import reads", once.get,
+                                (("reach-dir", repo, ref, d), _support_listing, repo, ref, d, cwd, env))
+                               for d in (directory, "")])
     if name not in listing:
         raise _Unreadable(f"{path} is not in {directory}/ at {ref[:10]}")
-    supports = {n[:-3]: e for n, e in listing.items() if n.endswith(".py") and not n.startswith("test_")}
-    seen, todo = set(), [listing[name]]
-    for _ in range(_REACH_BLOBS + 1):
-        if not todo:
-            return frozenset(seen)
-        sha, size = todo.pop()
-        text = once.get(("reach-blob", sha), _blob, sha, size, repo, cwd, env).decode("utf-8", "replace")
-        for stem in supports.keys() & set(_WORD.findall(text)):
-            if stem not in seen:
-                seen.add(stem)
-                todo.append(supports[stem])
-    raise _Unreadable(f"{path} names more than {_REACH_BLOBS} support modules")
+    supports = {n[:-3]: n for n in listing if n.endswith(".py") and not n.startswith("test_")}
+    tests = {n[:-3]: n for n in listing if n.endswith(".py") and n.startswith("test_")}
+    wave = [(name, listing[name])] + [(n, listing[n]) for n in _DIR_SEEDS if n in listing]
+    wave += [("/" + n, root[n]) for n in _ROOT_SEEDS if n in root]
+    words, seen, trees = set(), set(), []
+    while wave:
+        while wave:
+            wave = [(n, e) for n, e in dict(wave).items() if n not in seen]
+            seen.update(n for n, _ in wave)
+            if len(seen) > _REACH_BLOBS:
+                raise _Unreadable(f"{path} reaches more than {_REACH_BLOBS} modules")
+            texts = _parallel([("support import reads", once.get,
+                                (("reach-blob", e[0]), _blob, e[0], e[1], repo, cwd, env)) for _, e in wave])
+            found, imported = set(), set()
+            for (n, _), data in zip(wave, texts):
+                text = data.decode("utf-8", "replace")
+                found |= set(_WORD.findall(text))
+                if n.endswith(".py"):
+                    try:
+                        tree = ast.parse(text)
+                    except (SyntaxError, ValueError):
+                        raise _Unreadable(f"{n} at {ref[:10]} does not parse")
+                    trees.append((n.lstrip("/") if n.startswith("/") else f"{directory}/{n}", tree))
+                    for node in ast.walk(tree):
+                        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                            found.update(_WORD.findall(node.value))     # "placement" "_support" is one constant
+                        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                            imported.update(_WORD.findall(" ".join([getattr(node, "module", None) or ""]
+                                                                   + [a.name for a in node.names])))
+            words |= found
+            wave = ([(supports[w], listing[supports[w]]) for w in found if w in supports]
+                    + [(tests[w], listing[tests[w]]) for w in imported if w in tests])
+        gap, loaded = _dynamic_targets(trees)
+        if gap:
+            raise _Unreadable(f"the closure of {path} at {ref[:10]}: {gap}")
+        words |= loaded
+        wave = [(m[w], listing[m[w]]) for m in (supports, tests) for w in loaded if w in m and m[w] not in seen]
+    return frozenset(words)
+
+
+# Dynamic loads (review t_01a1e1747162693f). The word rule proves non-reach only when every module the closure
+# loads is named by a word. A load target can be computed (`import_module("tests." + "placement_" + "support")`,
+# an f-string, a test-runner subprocess), so each load target must evaluate to a finite set of strings, whose
+# words then join the closure: constants and their concatenation/f-strings/path joins, `__file__`, names bound
+# only to such values, conditional values, and a function parameter (every call site's argument). Anything else
+# (a value read at run time, a directory scan, test discovery, a loader used as a value) keeps the pair shared.
+# Known limit: a subprocess argv that is not a literal list, os.system and os.exec* strings are not traced.
+_LOAD_ARG = {"import_module": 0, "__import__": 0, "run_module": 0, "run_path": 0, "spec_from_file_location": 1,
+             "SourceFileLoader": 1, "SourcelessFileLoader": 1, "ExtensionFileLoader": 1, "load_source": 1,
+             "load_compiled": 1, "load_dynamic": 1, "loadTestsFromName": 0, "loadTestsFromNames": 0}
+_LOAD_KEYWORDS = {"name", "path", "location", "pathname", "source", "path_name", "mod_name", "names"}
+_LOAD_BUILTIN = {"exec": 0, "eval": 0, "execfile": 0}       # bare-name calls only (`model.eval()` is no load)
+_LOAD_ALWAYS = {"discover"}                                 # unittest discovery imports whatever it finds
+_SUBPROCESS = {"run", "Popen", "call", "check_call", "check_output"}
+_PATH_SAME = {"str", "Path", "PurePath", "PosixPath", "PurePosixPath", "fspath", "abspath", "realpath", "normpath",
+              "expanduser", "dirname", "basename", "join", "resolve", "absolute", "with_name", "with_suffix",
+              "joinpath"}
+_PYTHON = re.compile(r"(?:.*/)?python[0-9.]*")
+_DYN_DEPTH = 40            # resolution steps; a name being resolved again (X = X / "a") is unresolved
+_DYN_VALUES = 64           # strings one target may evaluate to; more is unresolved
+
+
+def _dynamic_targets(closure):
+    """('', words of every value each load in `closure` ((label, module ast) pairs) can target) or (why a
+    target does not resolve, None)."""
+    trees, parents, nodes, labels = [], {}, {}, {}
+
+    def add(tree, label):                    # one traversal: the parent map and each tree's node list
+        trees.append(tree)
+        labels[id(tree)] = label
+        seen, todo = nodes.setdefault(id(tree), []), [tree]
+        while todo:
+            node = todo.pop()
+            seen.append(node)
+            for child in ast.iter_child_nodes(node):
+                parents[child] = (node, tree)
+                todo.append(child)
+
+    for label, tree in closure:
+        add(tree, label)
+    loaders = dict(_LOAD_ARG)
+
+    def name_of(f):
+        return f.id if isinstance(f, ast.Name) else f.attr if isinstance(f, ast.Attribute) else None
+
+    def called(node):
+        up = parents.get(node, (None,))[0]
+        return isinstance(up, ast.Call) and up.func is node
+
+    def enclosing(node):
+        while node in parents:
+            node, _ = parents[node]
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                yield node
+
+    def module_of(node):
+        while node in parents:
+            node, tree = parents[node]
+            if node is tree:
+                return tree
+        return node
+
+    def where(node):
+        return f"{labels.get(id(module_of(node)), '?')} line {node.lineno}"
+
+    def product(parts, join=""):
+        out = {""}
+        for p in parts:
+            if p is None:
+                return None
+            out = {a + (join if a and join else "") + b for a in out for b in p}
+            if len(out) > _DYN_VALUES:
+                return None
+        return out
+
+    def union(sets):
+        out = set()
+        for s in sets:
+            if s is None:
+                return None
+            out |= s
+        return out if len(out) <= _DYN_VALUES else None
+
+    active, memo = set(), {}
+
+    def values(node, depth=0, lit=False):
+        """The strings `node` can evaluate to, None when that is not a finite literal set. With `lit` (the
+        value is Python code) an f-string `{x!r}` evaluates to a placeholder name: x lands as a literal."""
+        if depth > _DYN_DEPTH or node is None:
+            return None
+        if isinstance(node, ast.Constant):
+            v = node.value
+            return {v.decode("utf-8", "replace") if isinstance(v, bytes) else str(v)}
+        if isinstance(node, ast.Name):
+            return {"__file__"} if node.id == "__file__" else bound(node, depth, lit)
+        if isinstance(node, ast.Attribute) and node.attr == "parent":
+            return values(node.value, depth + 1, lit)
+        if (isinstance(node, ast.Subscript) and isinstance(node.value, ast.Attribute)
+                and node.value.attr == "parents" and isinstance(node.slice, ast.Constant)):
+            return values(node.value.value, depth + 1, lit)
+        if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Div, ast.Add)):
+            return product([values(node.left, depth + 1, lit), values(node.right, depth + 1, lit)],
+                           "/" if isinstance(node.op, ast.Div) else "")
+        if isinstance(node, ast.IfExp):
+            return union([values(node.body, depth + 1, lit), values(node.orelse, depth + 1, lit)])
+        if isinstance(node, ast.JoinedStr):
+            parts = []
+            for p in node.values:
+                if isinstance(p, ast.FormattedValue):
+                    if p.format_spec is not None:
+                        return None
+                    if lit and p.conversion == ord("r"):
+                        parts.append({"__hermes_literal__"})
+                        continue
+                    got = values(p.value, depth + 1, lit)
+                    conv = {ord("r"): repr, ord("a"): ascii}.get(p.conversion, str)
+                    parts.append(None if got is None else {conv(s) for s in got})
+                else:
+                    parts.append(values(p, depth + 1, lit))
+            return product(parts)
+        if isinstance(node, (ast.List, ast.Tuple)):          # loadTestsFromNames([...]), argv pieces
+            return union([values(e, depth + 1, lit) for e in node.elts])
+        if isinstance(node, ast.Call) and name_of(node.func) in _PATH_SAME:
+            if any(isinstance(a, ast.Starred) for a in node.args) or node.keywords:
+                return None
+            method = isinstance(node.func, ast.Attribute) and node.func.attr in {
+                "resolve", "absolute", "with_name", "with_suffix", "joinpath"}
+            return product([values(a, depth + 1, lit) for a in ([node.func.value] if method else []) + node.args], "/")
+        return None
+
+    def bound(name, depth, lit):
+        for fn in enclosing(name):                      # a parameter: every call site's argument
+            if isinstance(fn, ast.Lambda):
+                if name.id in {a.arg for a in fn.args.posonlyargs + fn.args.args + fn.args.kwonlyargs}:
+                    return None
+                continue
+            params = [a.arg for a in fn.args.posonlyargs + fn.args.args]
+            if name.id in params:
+                return delegated(fn, params, name.id, depth, lit)
+            if name.id in {a.arg for a in fn.args.kwonlyargs} | {
+                    getattr(fn.args.vararg, "arg", None), getattr(fn.args.kwarg, "arg", None)}:
+                return None
+        key = (id(module_of(name)), name.id, lit)
+        if key in memo:
+            return memo[key]
+        if key in active:
+            return None
+        found = []
+        for node in nodes[id(module_of(name))]:         # every binding of the name in its module
+            target = (node.targets if isinstance(node, ast.Assign) else
+                      [node.target] if isinstance(node, (ast.AnnAssign, ast.AugAssign, ast.NamedExpr, ast.For,
+                                                         ast.AsyncFor, ast.comprehension)) else
+                      [node.optional_vars] if isinstance(node, ast.withitem) and node.optional_vars else [])
+            for t in target:
+                if any(isinstance(n, ast.Name) and n.id == name.id for n in ast.walk(t)):
+                    if not (isinstance(t, ast.Name) and isinstance(node, (ast.Assign, ast.AnnAssign))
+                            and node.value is not None):
+                        return None
+                    found.append(node.value)
+            if isinstance(node, (ast.Import, ast.ImportFrom)) and any(
+                    (a.asname or a.name.split(".")[0]) == name.id for a in node.names):
+                return None
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == name.id:
+                return None
+        active.add(key)
+        try:
+            memo[key] = union([values(v, depth + 1, lit) for v in found]) if found else None
+        finally:
+            active.discard(key)
+        return memo[key]
+
+    def delegated(fn, params, param, depth, lit):
+        key = (id(fn), param, lit)
+        if key in memo:
+            return memo[key]
+        if key in active:
+            return None
+        active.add(key)
+        try:
+            memo[key] = call_sites(fn, params, param, depth, lit)
+        finally:
+            active.discard(key)
+        return memo[key]
+
+    def call_sites(fn, params, param, depth, lit):
+        if fn.decorator_list or fn.name.startswith("test") or fn.name.startswith("__"):
+            return None                               # pytest/unittest/the data model supply the arguments
+        index = params.index(param)
+        method = bool(params) and params[0] in {"self", "cls"}
+        default = dict(zip(params[len(params) - len(fn.args.defaults):], fn.args.defaults))
+        out = [values(default[param], depth + 1, lit)] if param in default else []
+        for tree in trees:
+            for node in nodes[id(tree)]:
+                if name_of(node) == fn.name and isinstance(node, (ast.Name, ast.Attribute)) and not called(node):
+                    return None                           # passed around as a value: call sites unknown
+                if not isinstance(node, ast.Call) or name_of(node.func) != fn.name:
+                    continue
+                if any(isinstance(a, ast.Starred) for a in node.args) or any(k.arg is None for k in node.keywords):
+                    return None
+                kw = {k.arg: k.value for k in node.keywords}
+                pos = index - 1 if method and isinstance(node.func, ast.Attribute) else index
+                if param in kw:
+                    out.append(values(kw[param], depth + 1, lit))
+                elif 0 <= pos < len(node.args):
+                    out.append(values(node.args[pos], depth + 1, lit))
+        return union(out)
+
+    loaded = set()
+
+    def load(node, target, what):
+        got = values(target)
+        if got is None:
+            return f"{where(node)}: {what} loads a computed target"
+        for s in got:
+            loaded.update(_WORD.findall(s))
+        return ""
+
+    def code(node, target, what):
+        got = values(target, lit=True)
+        if got is None:
+            return f"{where(node)}: {what} runs computed code"
+        for s in got:
+            try:
+                tree = ast.parse(s)
+            except (SyntaxError, ValueError):
+                return f"{where(node)}: {what} runs unparseable code"
+            add(tree, f"code run at {where(node)}")
+            for n in ast.walk(tree):                      # the code's own literals and imports join the closure
+                if isinstance(n, ast.Constant) and isinstance(n.value, str):
+                    loaded.update(_WORD.findall(n.value))
+                elif isinstance(n, (ast.Import, ast.ImportFrom)):
+                    loaded.update(_WORD.findall(" ".join([getattr(n, "module", None) or ""]
+                                                         + [a.name for a in n.names])))
+        return ""
+
+    def argv_target(node, elts):
+        """python [options] (-c code | -m module | script) [program arguments]: everything up to and including
+        the target must resolve; the program's own arguments are not loads of this closure."""
+        k = 0
+        while k < len(elts) and not (isinstance(elts[k], ast.Attribute) and elts[k].attr == "executable"
+                                     or isinstance(elts[k], ast.Constant) and isinstance(elts[k].value, str)
+                                     and _PYTHON.fullmatch(elts[k].value)):
+            why = load(node, elts[k], "a python subprocess")          # env, nice, ... before the interpreter
+            if why:
+                return why
+            k += 1
+        k += 1
+        while k < len(elts):
+            e = elts[k]
+            got = None if isinstance(e, ast.Starred) else values(e)
+            if got is None or len(got) != 1 and any(v.startswith("-") for v in got):
+                return f"{where(node)}: a python subprocess has a computed option or target"
+            flag = next(iter(got)) if len(got) == 1 else ""
+            if flag in {"-c", "-m"}:
+                if k + 1 >= len(elts) or isinstance(elts[k + 1], ast.Starred):
+                    return f"{where(node)}: a python subprocess has a computed option or target"
+                nxt = elts[k + 1]
+                if flag == "-m" and (values(nxt) or set()) & {"pytest", "unittest"}:
+                    return f"{where(node)}: python -m runs a test discovery"
+                return (code if flag == "-c" else load)(node, nxt, "a python subprocess")
+            if flag in {"-W", "-X", "--check-hash-based-pycs"}:
+                k += 2
+                continue
+            if flag.startswith("-") and flag != "-":
+                k += 1
+                continue
+            if flag == "-":
+                return f"{where(node)}: a python subprocess runs code from stdin"
+            return load(node, e, "a python subprocess")             # the script
+        return f"{where(node)}: a python subprocess runs code from stdin"
+
+    i = 0
+    while i < len(trees):                    # grows with the literal code of exec() and `python -c`
+        i += 1
+        for node in nodes[id(trees[i - 1])]:  # `from importlib import import_module as im`
+            if isinstance(node, ast.ImportFrom):
+                loaders.update((a.asname, _LOAD_ARG[a.name]) for a in node.names if a.name in _LOAD_ARG and a.asname)
+        for node in nodes[id(trees[i - 1])]:
+            if isinstance(node, (ast.Name, ast.Attribute)) and name_of(node) in loaders and not called(node):
+                return f"{where(node)}: a loader ({name_of(node)}) is used as a value", None
+            if not isinstance(node, ast.Call):
+                continue
+            fname = name_of(node.func)
+            if fname == "getattr" and any(isinstance(a, ast.Constant) and a.value in set(loaders) | set(_LOAD_BUILTIN)
+                                          for a in node.args):
+                return f"{where(node)}: a loader is looked up by name", None
+            if fname in _LOAD_ALWAYS or (fname == "main" and isinstance(node.func, ast.Attribute)
+                                         and name_of(node.func.value) == "pytest"):
+                return f"{where(node)}: {fname}() runs a test discovery", None
+            builtin = isinstance(node.func, ast.Name) and fname in _LOAD_BUILTIN
+            if fname in loaders or builtin:
+                index = _LOAD_BUILTIN[fname] if builtin else loaders[fname]
+                if any(isinstance(a, ast.Starred) for a in node.args) or any(k.arg is None for k in node.keywords):
+                    return f"{where(node)}: {fname}() has unpacked arguments", None
+                target = node.args[index] if index < len(node.args) else next(
+                    (k.value for k in node.keywords if k.arg in _LOAD_KEYWORDS), None)
+                why = (code if builtin else load)(node, target, f"{fname}()")
+                if why:
+                    return why, None
+                continue
+            if fname in _SUBPROCESS:
+                argv = node.args[0] if node.args else next((k.value for k in node.keywords if k.arg == "args"), None)
+                if not isinstance(argv, (ast.List, ast.Tuple)) or not any(
+                        (isinstance(e, ast.Attribute) and e.attr == "executable")
+                        or (isinstance(e, ast.Constant) and isinstance(e.value, str) and _PYTHON.fullmatch(e.value))
+                        for e in argv.elts):
+                    continue
+                why = argv_target(node, argv.elts)
+                if why:
+                    return why, None
+    return "", loaded
 
 
 def _read_reach(repo, needs, cwd, env):
