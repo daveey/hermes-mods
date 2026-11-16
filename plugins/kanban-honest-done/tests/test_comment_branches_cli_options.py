@@ -139,6 +139,9 @@ def _options(parser):
     # the reader takes `-a` for the task id and fails open (review of PR #251).
     values, flags = set(), set()
     for action in parser._actions:
+        if action.option_strings:
+            # The reader consumes exactly one required value, not ?, *, + or a list-valued integer arity.
+            assert action.nargs is None or action.nargs == 0, (action.option_strings, action.nargs)
         (flags if action.nargs == 0 else values).update(action.option_strings)
     return values, flags
 
@@ -157,6 +160,25 @@ def test_static_lists_match_core_parser():
     help_flags = {*cb.COMMENT_FLAG_OPTIONS, "-h"}  # the reader handles `-h` by its exact token
     assert _options(_sub(kanban, "comment")) == (set(cb.COMMENT_VALUE_OPTIONS), help_flags)
     assert _options(kanban) == (set(cb.KANBAN_VALUE_OPTIONS), help_flags)
+
+
+@needs_core
+@pytest.mark.parametrize("nargs", ["?", "*", "+", 1, 2])
+def test_drift_check_rejects_changed_value_arity(monkeypatch, nargs):
+    """Core's option arity must not silently change how the static reader consumes tokens."""
+    root = _core_root()
+    parser = _sub(_sub(root, "kanban"), "comment")
+    action = parser._option_string_actions["--origin-gateway"]
+    action.nargs = nargs
+    if nargs == "?":
+        # The previously surviving mutant accepts this but the reader consumes --author as the origin value.
+        rest = ["--origin-gateway", "--author", "bob", OWN, BRANCH]
+        ns = root.parse_args(["kanban", "comment", *rest])
+        assert ns.task_id == OWN and ns.text == [BRANCH]
+        assert cb.comment_args(["hermes", "kanban", "comment", *rest], rest) != (OWN, BRANCH, ns.board)
+    monkeypatch.setitem(globals(), "_core_root", lambda: root)
+    with pytest.raises(AssertionError):
+        test_static_lists_match_core_parser()
 
 
 KANBAN_OPTS = [[], ["--board", "b1"], ["--boa", "b1"], ["--b=b1"]]
