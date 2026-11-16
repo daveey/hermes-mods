@@ -25,11 +25,13 @@ overlaps its fetch with the ancestry walk, and it leaves the drift check (and th
 `--land-turn` follow-up, e9f2ae5c) enough time. A turn that needs more than this is recorded by that follow-up
 under its own budget, never by a late hook.
 """
+import contextlib
 import hashlib
 import importlib.util
 import json
 from pathlib import Path
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -90,7 +92,47 @@ def pr_data():
 
 
 class Shim(lat.WallClockShim):
-    """The landing host's gh shim: LATENCY + shared METER per call, COMPARE_EXTRA for the ancestry compare."""
+    """The landing host's gh shim: LATENCY + shared METER per call, COMPARE_EXTRA for the ancestry compare.
+
+    Model clock (t_01a1e13f02725e97): the guard and this test read `clock()`, which advances only while a
+    modeled operation (a gh call or the fetch) is in flight. Spans with none in flight are this host's own cost:
+    local `git patch-id`/`git merge-file` children and thread hand-offs. They take milliseconds on any host, but
+    SCALE magnifies them tenfold, and on macOS (each Apple git child goes through the xcrun trampoline; short
+    sleeps overshoot) they ate 1-2.5 of the 7 modeled seconds left. A serialized carry or drift read is modeled
+    time, so it still spends the budget and fails the bound.
+    """
+
+    def __init__(self, g, overlap):
+        super().__init__(g, overlap)
+        self.inflight, self.mark, self.idle = 0, self.t0, 0.0
+        self.local = []                  # (seconds, modeled operations in flight at its end) per local child
+
+    def clock(self):
+        with self.lock:
+            now = time.monotonic()
+            return now - self.idle - (0 if self.inflight else now - self.mark)
+
+    @contextlib.contextmanager
+    def modeled(self):
+        with self.lock:
+            if not self.inflight:
+                self.idle += time.monotonic() - self.mark
+            self.inflight += 1
+        try:
+            yield
+        finally:
+            with self.lock:
+                self.inflight -= 1
+                if not self.inflight:
+                    self.mark = time.monotonic()
+
+    def local_run(self, argv, *args, **kwargs):
+        start = time.monotonic()
+        try:
+            return self.real_run(argv, *args, **kwargs)
+        finally:
+            with self.lock:
+                self.local.append((time.monotonic() - start, self.inflight))
 
     def answer(self, argv):
         words = [w for w in argv[2:] if not w.startswith("-") and not w.startswith("Accept:")]
@@ -118,17 +160,18 @@ class Shim(lat.WallClockShim):
     def run(self, argv, *args, **kwargs):
         argv = list(argv)
         if argv[0] != "gh":
-            return self.real_run(argv, *args, **kwargs)        # local git patch-id / merge-file
-        start = time.monotonic()
-        self.busy(work=METER)                                  # the shim's metering shares the host
-        time.sleep((LATENCY + (COMPARE_EXTRA if self.heavy(argv) else 0)) * SCALE)
-        timeout = kwargs.get("timeout")
-        if timeout is not None and time.monotonic() - start > timeout:
-            raise lat.subprocess.TimeoutExpired(argv, timeout)
-        out, rc = self.answer(argv)
+            return self.local_run(argv, *args, **kwargs)       # local git patch-id / merge-file
+        with self.modeled():
+            start = self.clock()
+            self.busy(work=METER)                              # the shim's metering shares the host
+            time.sleep((LATENCY + (COMPARE_EXTRA if self.heavy(argv) else 0)) * SCALE)
+            timeout = kwargs.get("timeout")
+            if timeout is not None and self.clock() - start > timeout:
+                raise lat.subprocess.TimeoutExpired(argv, timeout)
+            out, rc = self.answer(argv)
+            end = self.clock()
         with self.lock:
-            self.calls.append((start - self.t0, time.monotonic() - self.t0, self.g._PREFLIGHT_STAGE.get(),
-                               " ".join(argv[:4])))
+            self.calls.append((start - self.t0, end - self.t0, self.g._PREFLIGHT_STAGE.get(), " ".join(argv[:4])))
         return lat.subprocess.CompletedProcess(argv, rc, out, "")
 
     @staticmethod
@@ -140,13 +183,15 @@ def load(monkeypatch, overlap):
     g, _ = lat.load(monkeypatch, overlap, wall_clock=True)
     shim = Shim(g, overlap)
     monkeypatch.setattr(g.subprocess, "run", shim.run)
+    monkeypatch.setattr(g, "time", SimpleNamespace(**{**vars(time), "monotonic": shim.clock}))   # model clock
     fetches = []
 
     def fetch(objects):
-        fetches.append((time.monotonic() - shim.t0, list(objects.shas)))
-        g._remaining()
-        shim.busy(seconds=FETCH)                               # one fetch; index-pack shares the host
-        g._remaining()
+        with shim.modeled():
+            fetches.append((shim.clock() - shim.t0, list(objects.shas)))
+            g._remaining()
+            shim.busy(seconds=FETCH)                           # one fetch; index-pack shares the host
+            g._remaining()
         objects.path = "fetched"
         return ""
 
@@ -170,7 +215,7 @@ def load(monkeypatch, overlap):
 
     def timed_carry(*args, **kwargs):
         out = carry(*args, **kwargs)
-        left.append((g._PREFLIGHT_DEADLINE.get() - time.monotonic()) / SCALE)
+        left.append((g._PREFLIGHT_DEADLINE.get() - shim.clock()) / SCALE)
         return out
     monkeypatch.setattr(g, "_carry_one", timed_carry)
     return g, shim, fetches, left
@@ -181,12 +226,16 @@ def test_three_merge_carry_decides_with_the_drift_check_in_budget(monkeypatch, o
     g, shim, fetches, left = load(monkeypatch, overlap)
     assert g._CARRY_MERGES == 3 and len(MERGES) == g._CARRY_MERGES      # the longest admitted chain
     words = ["pr", "merge", str(NUMBER), "-R", R, "--rebase", "--match-head-commit", HEAD]
-    start = time.monotonic()
+    start, wall = shim.clock(), time.monotonic()
     result = g.bounded_preflight(g._state_merge, words, R, ".", {})
-    took = (time.monotonic() - start) / SCALE
+    took = (shim.clock() - start) / SCALE
     timeline = "\n".join(f"{s / SCALE:6.2f} {e / SCALE:6.2f} [{st}] {w}" for s, e, st, w in sorted(shim.calls))
     timeline += "\nfetches: " + ", ".join(f"{t / SCALE:.2f}" for t, _ in fetches)
     timeline += f"\nleft after carry: {left}"
+    # Host cost outside the model (credited back): reported so a slow host shows where it went.
+    timeline += (f"\nwall {(time.monotonic() - wall) / SCALE:.2f} shim-seconds, of which {shim.idle / SCALE:.2f} with "
+                 f"no modeled call in flight; local git children (s, modeled in flight): "
+                 + ", ".join(f"{d:.3f}/{n}" for d, n in shim.local))
     assert "deadline exceeded" not in str(result), f"{result} after {took:.1f} shim-seconds\n{timeline}"
     # Time left after the carry: pr view (1.8 s) + max(walk + membership compares, fetch) is ~11 s of 18, so
     # ~7 s remain for the drift compare and its refusal. origin/main (walk, then fetch) left ~2 s: the drift
