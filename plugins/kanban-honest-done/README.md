@@ -167,37 +167,42 @@ unverified", scoping notes like "the other test files were not run").
 
 ## Tests
 
-Shell write classification fails closed. Only the arguments and input of known data
-commands (`echo`, `printf`, `grep`, `egrep`, `fgrep`, `rg`, `cat`) are data, so
-`echo hermes kanban comment …` is text. A data command is data only by its bare name or
-from `/bin` or `/usr/bin` (`./cat` may be any program), and only while the input does
-not redefine that name: a function (`NAME() …`, `function NAME`), an alias, `hash`,
-`enable`, an imported `BASH_FUNC_NAME%%` or a PATH change, in any code the scanner
-reads, revokes it for the whole command, and its arguments are then scanned as the
-command it may run, both as words and joined. A definition that is only text
-(`echo 'echo() …'`, a quoted heredoc) revokes nothing. At the executable position,
-after assignments and the `env`, `command`, `exec`, `nohup`, `timeout` and `time`
-wrappers, `hermes kanban <verb>` is parsed exactly. Any other command word (`nice`,
-`xargs`, `sudo`, `setsid`, `find -exec`, a function, …) may run its arguments, so a
-`hermes kanban` token pair anywhere in its argv is a call, and a shell named in its
-arguments has its `-c` script scanned. Printed text is code once it can reach anything
-that runs it: echo/printf arguments piped into a non-data command; a heredoc or
-here-string whose consumer is not a data command, or whose consumer's output is piped
-into one; an unquoted substitution at the executable position or in a non-data
-command's arguments; a piped subshell or brace group; a process substitution; `eval`.
-An operator split by a backslash-newline (`$\⏎(`, `<\⏎<`, `|\⏎|`) is read joined, as
-the shell reads it. Shell options are read as bash reads them: `c` and `s` count
-whatever their sign, every `o`/`O` letter takes one option name, and `-c` takes the
-first operand after all options; where dash reads an option differently (`+s`), this
-reading scans the input as code. A quoted payload (`git commit -m '…'`, `grep '…'`)
-stays one word. Consent shell checks share this parser. `tests/test_command_position.py`
-covers these boundaries for every shared consumer and the real comment hook, and runs
-each runnable row in real bash and sh with a fake `hermes`. Every shell it starts, the
-availability probes included, gets an allowlisted environment (no host startup
-variables, never a login shell); a row this host cannot run is a recorded skip, and a
-runnable call row that does not run fails. This is static classification, not shell
-evaluation: variables holding commands, sourced files and the shell's startup state
-are not resolved.
+Shell write classification grants data exemptions only when the **whole input** is
+in the bounded grammar G in `shell_commands.py`:
+
+- Words: unquoted `[A-Za-z0-9_./:=@%+,-]`, single-quoted strings, or double-quoted
+  strings without dollar signs, backticks or backslashes.
+- Lists/pipelines: `;`, `&&`, `||`, `|`, newline; every command must qualify.
+- Redirection: `>`, `>>`, `<` with literal operands; `<<'D'` / `<<"D"` with a
+  verbatim body ending at a physical delimiter line, or an unquoted delimiter
+  whose body has no dollar sign, backtick or backslash. No fd prefixes/duplication,
+  here-strings, tab-stripping or mixed-quoted delimiters.
+- Commands: literal `hermes` (a call), `echo`, `printf`, `cat`, `grep`, `head`,
+  `tail`, `wc`, `cd`; or `git commit` with only `-m <word>`, `-a`, `--amend`,
+  `--allow-empty`, `-q`, `--no-edit`. No leading assignments or wrappers.
+- `printf` is output-only: optional `--`, then a non-option format using only
+  output conversions (`diouxXfFeEgGaAcbsq` or `%%`, with width/precision/flags).
+  `-v`, `%n`, unknown conversions, and decorated variable-writing conversions
+  are outside G. A command string containing both a redirection and `git commit`
+  is also outside G: the write could manufacture Git execution configuration.
+
+Inside G, other commands' arguments/input are data. Outside G, **no data exemption
+is possible**: the old any-position token scan applies to the entire string, with
+additional conservative nested-string and continuation readings preserving the
+previous nested-call detections. Unknown constructs never become an exemption.
+This deliberately flags even inert `bash /dev/null -c 'hermes kanban …'`, unrelated
+function definitions, `/bin/echo`, and printed substitutions. Plain echo/printf,
+grep, restricted Git messages and quoted heredoc bodies remain data.
+
+`tests/test_command_position.py` covers every consumer and the real comment hook,
+including prior nested execution controls. `tests/test_inert_grammar.py` adds the
+review redefinition/continuation/output-process repros and 200 distinct whole-input
+boundary strings with independently declared membership. Runnable controls use a
+fake `hermes` and allowlisted environment, including availability probes and the
+positive startup control (only the fixture's `BASH_ENV` is added). No login shells;
+unavailable tools are recorded skips. This is static hook feedback, not an OS
+sandbox: ambient executable definitions, PATH contents, Git hooks, sourced files
+and computed command values are not resolved.
 
 `tests/test_acceptance_provenance_real_shapes.py` replays real state.db shapes (msg 931890 notice, peer-mail, exact steer, relays, stale and wrong-chat rows); `tests/test_acceptance_authority.py` (gate F) replays the t_7e2ee45c 2026-11-10 shape: a prepared waiver body applied with `f=…; hermes kanban edit <id> --body "$(cat $f)"` from a chat with no user turn, quoting a real user message of another chat, is refused; so are uncited waivers, notices, assistant text, worker prompts, missing ids, a quote older than the current body, a delegated parent's turn, dropping the DONE sentence and an unknown session. A fresh user turn in the same chat or its compression ancestor passes, as do restoring the original over a waiver and edits that keep acceptance. Paths: terminal (quoted and unquoted substitution), `mcp__terminal`, execute_code, tool_call, and the registered `pre_tool_call` hook with the `session_id` kwarg.
 

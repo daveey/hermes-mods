@@ -187,8 +187,8 @@ def write_texts(tool_name: str, args: Any) -> list[str]:
     if name == "delegate_task":
         return [] if str(args.get("action") or "spawn").lower() in ("list", "stop") else [json.dumps(args, default=str)]
     if name in SHELL_TOOLS:
-        cmd = " ; ".join(str(args.get(k) or "") for k in ("command", "input", "data"))
-        return shell_write_texts(cmd)
+        return [text for key in ("command", "input", "data") if args.get(key)
+                for text in shell_write_texts(str(args[key]))]
     if name == "execute_code":
         code = str(args.get("code") or "")
         return [code] if _SHELL_WRITE_RE.search(code) or "kanban_" in code else []
@@ -217,12 +217,10 @@ def shell_write_texts(command: str) -> list[str]:
             writes.append(' '.join(parsed[1]))
             continue
         shell = core._shell_commands()
-        start = shell.command_start(seg)
-        if start >= len(seg) or shell.data_word(seg[start]):
+        if shell.within_inert_grammar(command) and shell.exempt_segment(seg):
             continue
-        # hermes-hub at the executable position, or in the arguments of another command
-        # that may run it (nice, sudo, xargs ...): fail closed.
-        hub = next((k for k in range(start, len(seg)) if os.path.basename(seg[k]) == 'hermes-hub'), None)
+        # Outside G every hub mention retains the any-position rule too.
+        hub = next((k for k in range(len(seg)) if os.path.basename(seg[k]) == 'hermes-hub'), None)
         if hub is not None:
             text = ' '.join(seg[hub:])
             if _SHELL_WRITE_RE.search(text):
