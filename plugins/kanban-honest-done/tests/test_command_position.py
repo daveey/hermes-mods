@@ -23,6 +23,9 @@ def hits(command):
     'echo "first\n{cmd}\nlast"',
     "echo 'literal ;' {cmd}",
     'cat <<"EOF"\n{cmd}\nEOF\necho done',
+    # A definition that is only text, and a function whose name is not a data command.
+    "echo 'echo() {{ \"$@\"; }}' {cmd}",
+    'myecho() {{ "$@"; }}; echo {cmd}',
 ])
 def test_data_is_not_a_write(verb, wrap):
     cmd = f'hermes kanban {verb} t_X "IF FAIL x: y"'
@@ -166,21 +169,26 @@ def _shape(shape, cmd=_CMD):
 def _isolated_env(tmp_path):
     """Env whose shells resolve `hermes` to a fake that only records its argv.
 
-    HOME, HERMES_HOME, BASH_ENV and ENV are isolated, and both shells must resolve the
-    fake before any row runs, so a test can never exec the host's real hermes.
+    Built from an allowlist, not from the host environment, so no BASH_ENV, ENV,
+    BASH_FUNC_*, SHELLOPTS, PS4 or other variable can run startup code (review
+    5914765330 finding 3). Both shells must resolve the fake before any row runs, so a
+    test can never exec the host's real hermes. Every shell these tests start, the
+    availability probes included, gets this env.
     """
     import os
     import subprocess
     bin_dir = tmp_path / 'bin'
-    bin_dir.mkdir()
     fake = bin_dir / 'hermes'
-    fake.write_text('#!/bin/sh\necho "$@" >> "$HERMES_FAKE_MARKER"\n')
-    fake.chmod(0o755)
     home = tmp_path / 'home'
-    home.mkdir()
-    env = {k: v for k, v in os.environ.items() if k not in {'BASH_ENV', 'ENV', 'CDPATH'}}
-    env.update(PATH=f'{bin_dir}{os.pathsep}{os.environ.get("PATH", "")}', HOME=str(home),
-               HERMES_HOME=str(home / '.hermes'), HERMES_FAKE_MARKER=str(tmp_path / 'ran'))
+    if not fake.exists():
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        # `command` skips functions: a row may export one named echo or printf.
+        fake.write_text('#!/bin/sh\ncommand printf \'%s\\n\' "$*" >> "$HERMES_FAKE_MARKER"\n')
+        fake.chmod(0o755)
+        home.mkdir(exist_ok=True)
+    env = {'PATH': f'{bin_dir}{os.pathsep}{os.environ.get("PATH") or os.defpath}', 'HOME': str(home),
+           'HERMES_HOME': str(home / '.hermes'), 'HERMES_FAKE_MARKER': str(tmp_path / 'ran'),
+           'LC_ALL': 'C'}
     for shell in ('bash', 'sh'):
         found = subprocess.run([shell, '-c', 'command -v hermes'], env=env, capture_output=True,
                                text=True, timeout=30).stdout.strip()
@@ -212,9 +220,51 @@ def test_real_shell_rows_never_use_a_login_shell():
     # A login shell reads /etc/profile and ~/.profile (macOS path_helper reorders PATH),
     # which can put the host's real hermes ahead of the fake (review 5912225322). No row
     # that runs may use one; `bash -lc` stays a classifier-only row above.
-    rows = _REAL_SHELL_SHAPES + [s for s, _ in _WRAPPED_CALLS] + _PRINTED_CALLS + _STILL_DATA
+    rows = (_REAL_SHELL_SHAPES + [s for s, _ in _WRAPPED_CALLS + _REDEFINED_CALLS] + _PRINTED_CALLS
+            + _CONTINUATION_CALLS + _STILL_DATA + _UNUSED_REDEFINITIONS)
     login = re.compile(r'\b(?:bash|sh|dash|zsh|ksh)\s+(?:[-+][A-Za-z]+\s+)*(?:-[A-Za-z]*l[A-Za-z]*|--login)\b')
     assert [row for row in rows if login.search(row)] == []
+
+
+def test_every_test_shell_gets_the_isolated_env():
+    # Review 5914765330 finding 3: the coproc probe ran bash with the host environment
+    # (BASH_ENV and the rest) before the isolation existed. Every subprocess call in this
+    # file must pass env=, and _isolated_env must build that env from an allowlist.
+    import ast
+    import inspect
+    from pathlib import Path
+    tree = ast.parse(Path(__file__).read_text())
+    calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+             and isinstance(node.func, ast.Attribute) and node.func.attr in {'run', 'Popen', 'call',
+                                                                              'check_call', 'check_output'}
+             and isinstance(node.func.value, ast.Name) and node.func.value.id == 'subprocess']
+    assert calls and [node.lineno for node in calls if not any(k.arg == 'env' for k in node.keywords)] == []
+    assert 'os.environ.items()' not in inspect.getsource(_isolated_env)
+
+
+def test_isolated_shells_run_no_host_startup_code(tmp_path, monkeypatch):
+    # The reviewer's repro as a test: startup code in the host environment must not run in
+    # any shell these tests start, availability probes included.
+    import subprocess
+    marker = tmp_path / 'startup-ran'
+    startup = tmp_path / 'startup.sh'
+    startup.write_text(f'printf STARTUP_RAN >> {shlex.quote(str(marker))}\n')
+    for name, value in [('BASH_ENV', str(startup)), ('ENV', str(startup)),
+                        ('BASH_FUNC_echo%%', f'() {{ printf STARTUP_RAN >> {shlex.quote(str(marker))}; }}'),
+                        ('PS4', f'$(printf STARTUP_RAN >> {shlex.quote(str(marker))})'),
+                        ('SHELLOPTS', 'xtrace')]:
+        monkeypatch.setenv(name, value)
+    # The vector is live on this host: a shell started with the host environment runs it.
+    subprocess.run(['bash', '-c', 'true'], env=dict(__import__('os').environ), timeout=30,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    assert marker.exists()
+    marker.unlink()
+    rows = tmp_path / 'rows'
+    env = _isolated_env(rows)
+    for tool in [*_PROBES, None, 'nice']:
+        _runnable(tool, env)
+    _shell_ran(rows, 'echo x; true')
+    assert not marker.exists()
 
 
 # Review 5912225322 finding 3: main refused each of these and the shells run each one. A
@@ -242,29 +292,84 @@ _PRINTED_CALLS = [
     '{{ echo {cmd}; }} | bash', 'bash <<< {quoted}', 'nice bash -c {quoted}',
     "nice bash <<'EOF'\n{cmd}\nEOF", "sudo -n bash <<'EOF'\n{cmd}\nEOF",
 ]
+# Rows a given shell cannot run: sudo is classifier only; bash 3.2 (macOS /bin/bash)
+# sources nothing from a process substitution.
+_PRINTED_TOOLS = {"sudo -n bash <<'EOF'\n{cmd}\nEOF": '', 'source <(echo {cmd})': 'bash4'}
+
+# Review 5914765330 finding 1: a data command the input redefines is not data. Main
+# refused each row (a `hermes kanban` pair in any argv) and the shells run each one.
+_REDEFINED_CALLS = [
+    ('echo() {{ "$@"; }}; echo {cmd}', None), ('cat() {{ "$@"; }}; cat {cmd}', None),
+    ('function echo {{ "$@"; }}; echo {cmd}', None), ('function cat {{ "$@"; }}; cat {cmd}', None),
+    ('function grep() {{ "$@"; }}; grep {cmd}', None), ('printf () {{ "$@"; }}; printf {cmd}', None),
+    # Names split by a backslash-newline, in the definition and in the call.
+    ('ec\\\nho() {{ "$@"; }}; echo {cmd}', None), ('echo() {{ "$@"; }}; ec\\\nho {cmd}', None),
+    ('function c\\\nat {{ "$@"; }}; cat {cmd}', None),
+    # Definitions in code the scanner reads: eval text, a -c script, a heredoc to a shell.
+    ("eval 'echo() {{ \"$@\"; }}'; echo {cmd}", None), ("bash -c 'echo() {{ \"$@\"; }}; echo {cmd}'", None),
+    ("bash <<'EOF'\necho() {{ \"$@\"; }}\necho {cmd}\nEOF", None),
+    ('echo() {{ eval "$*"; }}; echo {quoted}', None),
+    # Input the redefinition reads: heredoc, here-string, pipeline stages.
+    ("cat() {{ bash; }}; cat <<'EOF'\n{cmd}\nEOF", None), ('cat() {{ bash; }}; cat <<< {quoted}', None),
+    ('grep() {{ bash; }}; echo {cmd} | grep x', None), ("rg() {{ bash; }}; cat <<'EOF' | rg x\n{cmd}\nEOF", None),
+    # Other ways the input changes what a data command name runs.
+    ('shopt -s expand_aliases\nalias echo=env\necho {cmd}', None), ('hash -p /usr/bin/env cat; cat {cmd}', None),
+    ('mkdir -p d && ln -s /usr/bin/env d/cat && PATH="$PWD/d:$PATH" cat {cmd}', None),
+    ('mkdir -p d && ln -s /usr/bin/env d/cat && ./d/cat {cmd}', None),
+    ("env 'BASH_FUNC_echo%%=() {{ \"$@\"; }}' bash -c 'echo {cmd}'", 'bash_func'),
+]
+
+# Review 5914765330 finding 2: an operator split by a backslash-newline is the operator.
+_CONTINUATION_CALLS = [
+    '$\\\n(echo {cmd})', '$\\\n\\\n(echo {cmd})', 'nice $\\\n(echo {cmd})', 'echo "$\\\n({cmd})"',
+    'bash <\\\n(echo {cmd})', "bash <\\\n<'EOF'\n{cmd}\nEOF", "bash <\\\n<-'EOF'\n{cmd}\nEOF",
+    'bash <\\\n<< {quoted}', 'echo {cmd} \\\n| bash', "cat <<EOF > notes.txt\n$\\\n({cmd})\nEOF",
+    '# a comment does not continue \\\necho {cmd} | bash',
+]
+
+# Fail closed: a redefinition counts even where its body ignores the arguments.
+_UNUSED_REDEFINITIONS = ['echo() {{ :; }}; echo {cmd}', 'alias cat=true; cat {cmd}',
+                         'PATH=/usr/bin:/bin; echo {cmd} | grep x']
 
 
-def _runnable(tool):
+# Probes for rows that need more than plain bash, asked of the isolated shells only.
+_PROBES = {
+    'coproc': '[ "${BASH_VERSINFO[0]}" -ge 4 ]',  # coproc came with bash 4
+    'bash4': '[ "${BASH_VERSINFO[0]}" -ge 4 ]',
+    'bash_func': "[ \"$(env 'BASH_FUNC_f%%=() { echo ok; }' bash -c f 2>/dev/null)\" = ok ]",
+}
+
+
+def _runnable(tool, env):
     import shutil
     import subprocess
     if tool == '':
         return False
-    if tool == 'coproc':
-        out = subprocess.run(['bash', '-c', 'echo "${BASH_VERSINFO[0]}"'], capture_output=True, text=True)
-        return out.stdout.strip().isdigit() and int(out.stdout) >= 4
-    return tool is None or shutil.which(tool) is not None
+    if tool in _PROBES:
+        return subprocess.run(['bash', '-c', _PROBES[tool]], env=env, timeout=30, stdin=subprocess.DEVNULL,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+    return tool is None or shutil.which(tool, path=env['PATH']) is not None
 
 
-@pytest.mark.parametrize('shape,tool', _WRAPPED_CALLS + [(s, None if 'sudo' not in s else '') for s in _PRINTED_CALLS])
+@pytest.mark.parametrize('shape,tool', _WRAPPED_CALLS + _REDEFINED_CALLS
+                         + [(s, _PRINTED_TOOLS.get(s)) for s in _PRINTED_CALLS]
+                         + [(s, None) for s in _CONTINUATION_CALLS])
 def test_main_parity_calls_are_refused(tmp_path, shape, tool):
     command = _shape(shape)
     assert ('comment', ['t_X', 'hi']) in hits(command), command
     assert plugin.consent_mod.write_texts('terminal', {'command': command}) != []
-    if not _runnable(tool):
-        return
+    if tool == '':
+        return  # classifier only: sudo and the real hermes_cli never run here
+    if not _runnable(tool, _isolated_env(tmp_path)):
+        pytest.skip(f'{tool} is not available here; the classifier still refuses {command!r}')
     # The row is a real call: the shell runs it (the classifier must never be laxer).
-    if not _shell_ran(tmp_path, command):
-        pytest.skip(f'this host does not run {command!r}; the classifier still refuses it')
+    assert _shell_ran(tmp_path, command), command
+
+
+@pytest.mark.parametrize('shape', _UNUSED_REDEFINITIONS)
+def test_redefinitions_fail_closed(shape):
+    command = _shape(shape)
+    assert ('comment', ['t_X', 'hi']) in hits(command), command
 
 
 # The card's own bug must stay fixed: printed text that nothing runs is data.
@@ -274,6 +379,13 @@ _STILL_DATA = [
     'cat <<< {quoted}', 'echo "$(echo {cmd})"', "bash -c cat <<'EOF'\n{cmd}\nEOF",
     "bash /dev/null <<'EOF'\n{cmd}\nEOF", 'x=$(echo {cmd})', 'echo {cmd} || echo done',
     'echo {cmd} && echo done', "cat <<'EOF' > notes.txt\n{cmd}\nEOF",
+    # Unshadowed controls for review 5914765330: other names, definitions that are only
+    # text or a file's contents, and continuations inside single quotes or quoted heredocs.
+    'myecho() {{ "$@"; }}; echo {cmd}', 'function catalog {{ "$@"; }}; cat {quoted}',
+    "echo 'echo() {{ \"$@\"; }}'; echo {cmd}", "cat <<'EOF' > defs.sh\necho() {{ \"$@\"; }}\nEOF\necho {cmd}",
+    "bash -c 'myecho() {{ \"$@\"; }}; echo {cmd}'", 'grep -c "alias echo=env" notes.txt; echo {cmd}',
+    "echo '$\\\n(echo {cmd})'", "cat <<'EOF' > notes.txt\n$\\\n(echo {cmd})\nEOF",
+    '/bin/echo {cmd} | /usr/bin/grep kanban',
 ]
 
 
@@ -311,7 +423,10 @@ def test_consent_hub_writes_behind_wrappers():
                                  'stdbuf -oL {cmd}', 'function f {{ {cmd}; }}; f',
                                  ". /dev/stdin <<'EOF'\n{cmd}\nEOF",
                                  'echo {cmd} | bash', "cat <<'EOF' | bash\n{cmd}\nEOF",
-                                 '$(echo {cmd})'])
+                                 '$(echo {cmd})',
+                                 # Review 5914765330 findings 1-2, through the real hook.
+                                 'echo() {{ "$@"; }}; echo {cmd}', 'function cat {{ "$@"; }}; cat {cmd}',
+                                 'ec\\\nho() {{ "$@"; }}; echo {cmd}', '$\\\n(echo {cmd})'])
 def test_comment_hook_still_refuses_real_calls(tmp_path, monkeypatch, wrap):
     from test_honest_done import make_board
     db = make_board(tmp_path, tasks=[(OWN, 'test', 'running')])

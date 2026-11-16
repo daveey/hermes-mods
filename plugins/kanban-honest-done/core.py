@@ -675,16 +675,19 @@ def _opt(tokens: list[str], *names: str) -> Optional[str]:
 def _kanban_verb(seg: list[str]) -> Optional[tuple[str, list[str]]]:
     """``(verb, args after verb)`` for a ``hermes kanban <verb> ...`` call in this argv.
 
-    Exact at the executable position. Known data commands (echo, printf, grep ...) never
-    run their arguments. Any other command word may (nice, xargs, sudo, find -exec ...),
-    so it keeps the fail-closed rule: any ``hermes kanban`` token pair is a call.
+    Exact at the executable position. Known data commands (echo, printf, grep ...), by
+    bare name or from /bin or /usr/bin, never run their arguments; when the input
+    redefines one, the shell scanner also returns its arguments as the command it may
+    run, so that call is its own segment. Any other command word may run its arguments
+    (nice, xargs, sudo, find -exec, ./cat ...), so it keeps the fail-closed rule: any
+    ``hermes kanban`` token pair is a call.
     """
     shell = _shell_commands()
     i = shell.command_start(seg)
     if i >= len(seg):
         return None
     name = os.path.basename(seg[i])
-    if name in shell.DATA_COMMANDS:
+    if shell.data_word(seg[i]):
         return None
     if name in {"hermes", "hermes.exe", "hermes_cli.main"}:
         return _verb_after(seg, i + 1)
