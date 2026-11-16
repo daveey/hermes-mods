@@ -53,6 +53,12 @@ Before filing a physical, on-device or sign-in `human_request`:
    assume it. A report that the act was done retires the human step only, never the test's acceptance. The
    ask-gate guard refuses a mixed ask with `physical_ask_phases`.
 
+8. **A claim on a sleep-prone host is not progress.** A Mac in DarkWake can claim and spawn a card, then sleep
+   within seconds, while the hub replica keeps showing `running` from its last sync. For a "keep the Mac awake for
+   this run" ask, make `resolved_check` read the run's finish (the card has left `running`), never
+   `claimed`/`spawned`. Before closing the ask or telling the user the step is no longer needed, confirm that the host
+   answers ssh and that the run's newest heartbeat is under 5 min old.
+
 No rule here authorizes a protected Allow click, sign-in, consent, simulated evidence, auto-approval, or relaxed
 acceptance. A genuinely physical step with no machine-readable prerequisite still needs the person. Keep the
 remaining physical evidence explicit after prerequisite wake-up; do not close it based on install/file/waiter
