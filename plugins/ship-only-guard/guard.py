@@ -1632,16 +1632,21 @@ def _live_turns(repo, cwd, env, own_number=None):
             if f"t{i}" not in batch:
                 raise _Unreadable(f"{sha[:10]}: missing state land-turn object response")
             objects[sha] = batch[f"t{i}"]
-    out, now, cleaned = [], _now(), 0
-    for ref, sha in zip(refs, shas):
-        if time.monotonic() >= deadline:
-            raise _Unreadable("state land-turn record deadline exceeded; retry complete snapshot")
+    out, now, expired = [], _now(), []
+
+    def record(ref, sha):
         obj = objects[sha]
         # A missing object is null and a tree/blob target is {} in GraphQL, not an API error. Apply
         # the same owner-repair/closed-holder recovery as malformed messages.
         rec = parse_turn(obj.get("message")) if isinstance(obj, dict) else None
-        if rec is not None and rec["pr"] != _turn_number(ref):
-            rec = None
+        return rec if rec is not None and rec["pr"] == _turn_number(ref) else None
+    # Malformed peer records need their holder's state: read those concurrently, not one 3.7 s round each.
+    _prefetch_holders([_turn_number(ref) for ref, sha in zip(refs, shas)
+                       if record(ref, sha) is None and _turn_number(ref) != own_number], repo, cwd, env)
+    for ref, sha in zip(refs, shas):
+        if time.monotonic() >= deadline:
+            raise _Unreadable("state land-turn record deadline exceeded; retry complete snapshot")
+        rec = record(ref, sha)
         if _turn_number(ref) == own_number:
             cache[("own", own_number)] = (rec,)       # (None,) = malformed own record
         if rec is None:
@@ -1656,9 +1661,9 @@ def _live_turns(repo, cwd, env, own_number=None):
             raise _Unreadable(f"{ref['ref']}: malformed record; owner must retry acquisition or close its PR")
         if rec["expires"] > now:
             out.append((ref["ref"], rec))
-        elif rec["expires"] + _TURN_TTL <= now and cleaned < 2:
-            _turn_delete(ref['ref'], repo, cwd, env)
-            cleaned += 1
+        elif rec["expires"] + _TURN_TTL <= now and len(expired) < 2:
+            expired.append(ref["ref"])
+    _turn_delete_all(expired, repo, cwd, env)
     return sorted(out, key=lambda item: _turn_order(item[1]))
 
 
@@ -1971,11 +1976,14 @@ def _turn_hold_refusal(number, data, repo, cwd, env):
             _ELIGIBILITY_DEADLINE.reset(token)
 
 
+_HOLDER_BATCH = 8           # holder views read concurrently per round
+
+
 def _prefetch_holders(numbers, repo, cwd, env):
-    """Read the open-holder PRs concurrently (one thread each, at most 8) into the cache; a failure surfaces
-    later, and only if that holder turns out to matter."""
+    """Read the open-holder PRs concurrently (one thread each, at most _HOLDER_BATCH) into the cache; a failure
+    surfaces later, and only if that holder turns out to matter."""
     import threading
-    todo = [n for n in dict.fromkeys(numbers) if ("holder", n) not in _cache()][:8]
+    todo = [n for n in dict.fromkeys(numbers) if ("holder", n) not in _cache()][:_HOLDER_BATCH]
     if len(todo) < 2:
         return
 
@@ -1989,6 +1997,26 @@ def _prefetch_holders(numbers, repo, cwd, env):
         t.start()
     for t in threads:
         t.join()      # every call inside is capped by the shared deadline
+
+
+def _turn_delete_all(refs, repo, cwd, env):
+    """Best-effort cleanup of released refs, concurrently (one round, not one 3.7 s call each) and only after
+    the decision it serves; a spent budget skips it instead of turning a decided snapshot into a refusal."""
+    import threading
+    refs = list(dict.fromkeys(refs))
+    if not refs or _TURN_READ_ONLY.get():
+        return
+
+    def one(ref):
+        try:
+            _turn_delete(ref, repo, cwd, env)
+        except _Unreadable:
+            pass
+    threads = [threading.Thread(target=contextvars.copy_context().run, args=(one, r), daemon=True) for r in refs]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
 
 
 def effective_turns(turns, eligible, check):
@@ -2012,6 +2040,81 @@ def effective_turns(turns, eligible, check):
             yield ref, rec
 
 
+# Bounded peer eligibility (t_01a1e1107d705388). Deciding whether ANOTHER PR's ticket yielded used the full
+# `_turn_yielded`: a refreshed head's approval carry (`_carried_approval`: git fetch, compare/tree/blob/patch-id
+# reads) and, past the refresh grace, the drift-start walk (push activity plus one compare per push). At 3.7 s
+# per gh read (worker token vending) one such peer cost ~40 reads, past the 30 s eligibility allowance, and every
+# overlapping merge refused "snapshot unreadable" until that ticket expired (#3314 behind #3207, 2026-11-15).
+# A peer is now judged from its turn record and ONE holder view; a yield that needs a content walk is
+# undecided, and an undecided ticket blocks (as if it held) but never suppresses a younger one (as if it
+# yielded), so the guard never admits a merge the full rule refuses. The holder's OWN ticket keeps the full rule
+# (its data is in hand and its carry/drift reads are its own preflight's). Cost of the bound: a stale peer's
+# drift-yield or carry-yield no longer frees waiters early; they wait for it to merge, close, get an exact-head
+# verdict, or expire (_TURN_TTL).
+class _Undecided:
+    """Eligibility of a peer ticket that the bounded read cannot decide; deliberately has no truth value."""
+    __slots__ = ("reason",)
+
+    def __init__(self, reason):
+        self.reason = reason
+
+    def __bool__(self):
+        raise TypeError("undecided land-turn eligibility has no truth value")
+
+
+def peer_eligibility(rec, data):
+    """True (holds), False (yielded) or _Undecided for ANOTHER PR's live ticket `rec`, from its OPEN holder
+    view `data` alone (no read). Wherever it decides, it agrees with `not _turn_yielded(rec, data, ...)`."""
+    head = data.get("headRefOid")
+    if (not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head)
+            or not isinstance(data.get("reviews"), list) or not isinstance(data.get("comments"), list)
+            or len(data["reviews"]) >= 100 or len(data["comments"]) >= 100):
+        raise _Unreadable(f"cannot read complete verdict for turn #{rec['pr']}")
+    verdicts = _head_verdicts(data, head)
+    if any(t is None for t, _ in verdicts):
+        raise _Unreadable(f"cannot order verdicts for turn #{rec['pr']}")
+    if verdicts and sorted(verdicts)[-1][1] == "block":
+        return False
+    if head != rec.get("head") and not verdicts:
+        # `_carried_approval` refuses without any read when no unblocked earlier approval exists.
+        if not any(not blocked for _, blocked in _earlier_approvals(data, head)):
+            return False
+        return _Undecided(f"its refreshed head {head[:10]} has no exact-head verdict and whether an earlier "
+                          "approval carries to it needs the carry content walk")
+    if _now() - _turn_order(rec)[0] >= _TURN_REFRESH_GRACE:
+        return _Undecided("its ticket is past the refresh grace and whether drift on its areas went "
+                          "unrefreshed that long needs the drift-start walk")
+    return True
+
+
+def possible_turns(turns, eligible, check):
+    """Yield (ref, rec, why) for every ticket that is effective under SOME outcome of the undecided ones, without
+    IO; `why` is None when it is effective under every outcome, else why it may not be.
+
+    `eligible` returns True, False or an _Undecided. A ticket overlapping a definitely effective older one is
+    suppressed; one overlapping only possibly effective older ones stays possible. With boolean eligibility this
+    is exactly `effective_turns` (every `why` None). Exceptions propagate, as there."""
+    definite, maybe = [], []
+    for ref, rec in sorted(turns, key=lambda item: _turn_order(item[1])):
+        check()
+        if any(turn_blocks(r["files"], rec["files"]) or turn_blocks(rec["files"], r["files"]) for r in definite):
+            continue
+        active = eligible(ref, rec)
+        check()
+        if isinstance(active, _Undecided):
+            why = active.reason
+        elif active is True:
+            behind = next((r for r in maybe
+                           if turn_blocks(r["files"], rec["files"]) or turn_blocks(rec["files"], r["files"])), None)
+            why = None if behind is None else f"it waits behind PR #{behind['pr']}, whose turn is undecided"
+        elif active is False:
+            continue
+        else:
+            raise TypeError(f"land-turn eligibility must be True, False or undecided, not {active!r}")
+        (definite if why is None else maybe).append(rec)
+        yield ref, rec, why
+
+
 def _turn_hold_refusal_scoped(number, data, repo, cwd, env):
     deadline = _ELIGIBILITY_DEADLINE.get() or time.monotonic() + 30
     files = [f["path"] for f in data.get("files") or [] if isinstance(f, dict) and isinstance(f.get("path"), str)]
@@ -2030,41 +2133,60 @@ def _turn_hold_refusal_scoped(number, data, repo, cwd, env):
                 relevant.add(rec["pr"])
                 areas.append(rec["files"])
                 changed = True
-    # A live own ticket bounds the ordering search: younger eligibility cannot
-    # affect admission before we reach it. Keep the full connected component
-    # (including indirect older blockers), but do not spend its budget on younger
-    # speculative reads. If our ticket yields, the loop still reads later holders.
-    older = []
-    for _, rec in turns:
-        if rec["pr"] == int(number):
-            break
-        if rec["pr"] in relevant:
-            older.append(rec["pr"])
-    _prefetch_holders(older, repo, cwd, env)
+    # Peer holder views are read in concurrent batches, oldest first. A live own ticket bounds a batch:
+    # younger eligibility cannot affect admission before we reach it, so no batch spends the budget on
+    # younger speculative reads until our own ticket turned out not definitely effective.
+    order = [rec["pr"] for _, rec in turns if rec["pr"] in relevant]
+    own = order.index(int(number)) if int(number) in order else len(order)
+    released = []
+
     def check():
         if time.monotonic() >= deadline:
             raise _Unreadable("state land-turn eligibility deadline exceeded; retry complete snapshot")
         _elig_cap(1)
 
+    def holder_of(n):
+        if ("holder", n) not in _cache():
+            at = order.index(n)
+            batch = [m for m in order[at:own if at < own else len(order)] if m != int(number)]
+            _prefetch_holders(batch, repo, cwd, env)
+        return _turn_holder_data(n, repo, cwd, env)
+
     def eligible(ref, rec):
-        holder = data if rec["pr"] == int(number) else _turn_holder_data(rec["pr"], repo, cwd, env)
+        own_ticket = rec["pr"] == int(number)
+        holder = data if own_ticket else holder_of(rec["pr"])
         check()
         if holder.get("state") != "OPEN":
-            _turn_delete(ref, repo, cwd, env)
+            released.append(ref)
             return False
-        return not _turn_yielded(rec, holder, repo, cwd, env)
+        if own_ticket:
+            return not _turn_yielded(rec, holder, repo, cwd, env)     # our own ticket: the full rule
+        return peer_eligibility(rec, holder)                          # another PR's ticket: bounded
 
     selected = ((ref, rec) for ref, rec in turns if rec["pr"] in relevant)
-    for ref, rec in effective_turns(selected, eligible, check):
+    refusal = None
+    for ref, rec, why in possible_turns(selected, eligible, check):
         if rec["pr"] == int(number):
-            return None
+            if why is None:
+                break
+            continue
         hit = turn_blocks(rec["files"], files) or turn_blocks(files, rec["files"])
+        if hit and why is None:
+            refusal = (f"[ship-only-guard] Refused state merge of PR #{number}: PR #{rec['pr']} holds the state "
+                       f"land turn until {_until(rec['expires'])} ({ref}); this PR waits behind that older turn "
+                       f"({hit[1]} ~ {hit[0]}). Refresh now if drift is reported below; retry when the older "
+                       "holder merges, yields, or expires. Do not park on the hold instead of refreshing.")
+            break
         if hit:
-            return (f"[ship-only-guard] Refused state merge of PR #{number}: PR #{rec['pr']} holds the state land "
-                    f"turn until {_until(rec['expires'])} ({ref}); this PR waits behind that older turn "
-                    f"({hit[1]} ~ {hit[0]}). Refresh now if drift is reported below; retry when the older "
-                    "holder merges, yields, or expires. Do not park on the hold instead of refreshing.")
-    return None
+            refusal = (f"[ship-only-guard] Refused state merge of PR #{number}: PR #{rec['pr']} may still hold "
+                       f"the state land turn until {_until(rec['expires'])} ({ref}); this PR waits behind that "
+                       f"older turn ({hit[1]} ~ {hit[0]}). Undecided here because {why}: the bounded turn check "
+                       "never walks another PR's carry or drift history. Refresh now if drift is reported below; "
+                       f"retry when PR #{rec['pr']} merges, closes, gets an exact-head verdict, or its turn "
+                       "expires. Do not park on the hold instead of refreshing.")
+            break
+    _turn_delete_all(released, repo, cwd, env)
+    return refusal
 
 
 def _turn_acquire(number, data, repo, cwd, env, prechecked=False):

@@ -166,6 +166,45 @@ def seed_turn(fake, number, acquired, files=None):
     fake.refs[f"refs/land-turn/pr-{number}"] = sha
 
 
+def own_rule(fake=None, number=1):
+    """The full yield rule (`_turn_yielded`) for PR #number's ticket, as its OWN preflight and the urgency
+    observer apply it, under the same scope and 30 s eligibility allowance: 'holds', 'yields' or 'unreadable'.
+    Waiters judge ANOTHER PR's ticket with the bounded `peer_eligibility` (t_01a1e1107d705388), so the drift
+    and carry walks are exercised here rather than through a waiter's merge."""
+    try:
+        with g._scope():
+            outer = g._PREFLIGHT_DEADLINE.get()
+            deadline = g.time.monotonic() + 30
+            token = g._ELIGIBILITY_DEADLINE.set(min(deadline, outer) if outer is not None else deadline)
+            try:
+                rec = dict(g._live_turns(R, None, {}, 0))[f"refs/land-turn/pr-{number}"]
+                yielded = g._turn_yielded(rec, g._turn_holder_data(number, R, None, {}), R, None, {})
+            finally:
+                g._ELIGIBILITY_DEADLINE.reset(token)
+        return "yields" if yielded else "holds"
+    except (g._Unreadable, g._PreflightExpired):
+        return "unreadable"
+
+
+def full_rule(number=1):
+    """`own_rule` phrased like the waiter's merge outcome the drift tests were written against."""
+    return {"holds": f"PR #{number} holds", "yields": "PR #2 now holds the state land turn",
+            "unreadable": "land-turn snapshot unreadable"}[own_rule(None, number)]
+
+
+def bounded_waiter(fake, number=2, holder=1):
+    """A waiter behind a past-grace peer: refused as 'may still hold', with no drift/carry walk read at all."""
+    before = len(fake.calls)
+    why = merge(number, H2563)
+    walk = [c for c in fake.calls[before:] if any("/activity?" in a or "/compare/" in a and not a.endswith("...state")
+                                                   or "/git/trees" in a or "/git/blobs" in a for a in c)
+            or c[0] != "gh"]
+    assert f"PR #{holder} may still hold" in (why or ""), why
+    assert fake.turn(number) is None
+    assert not walk, walk
+    return why
+
+
 def test_three_overlapping_turns_have_one_oldest_winner(gh):
     fake = gh({n: pr(n, H2563, ["hermes-sync"]) for n in (2563, 2579, 2555)})
     for n, age in ((2563, 120), (2579, 60), (2555, 30)):
@@ -247,24 +286,26 @@ def test_unrefreshed_drifted_holder_yields_after_grace(gh, monkeypatch):
     fake = gh({n: pr(n, H2563, ["hermes-sync"]) for n in (2563, 2579)}, compare=delta(["hermes-sync"]))
     seed_turn(fake, 2563, NOW - 60)
     assert "PR #2563 holds" in merge(2579, H2563)
+    assert own_rule(fake, 2563) == "holds"
     monkeypatch.setattr(g, "_now", lambda: NOW + 901)
-    assert "PR #2563 holds" not in merge(2579, H2563)
+    assert own_rule(fake, 2563) == "yields"            # the full rule, as #2563's own preflight sees it
+    bounded_waiter(fake, 2579, 2563)                    # a waiter never walks the peer's drift history
 
 
 def test_old_ticket_is_not_expired_by_age_alone_refresh_keeps_it(gh, monkeypatch):
     """A refreshed old ticket keeps priority; later drift starts its own 900 s refresh grace."""
     fake = gh({n: pr(n, H2563, ["hermes-sync"]) for n in (1, 2)})      # compare=IDENTICAL: nothing landed since base
     seed_turn(fake, 1, NOW - 2 * g._TURN_REFRESH_GRACE)
-    fake.prs[1]["headRefOid"] = H2600
-    fake.prs[1]["reviews"] = []
+    fake.prs[1]["headRefOid"] = H2600                 # refreshed; the approval of H2563 is its carry candidate
     monkeypatch.setattr(g, "_carried_approval", lambda *a: (True, ""))
-    assert "PR #1 holds" in merge(2, H2563)           # refreshed, undrifted: keeps priority despite its age
+    assert own_rule(fake) == "holds"                  # refreshed, undrifted: keeps priority despite its age
+    bounded_waiter(fake)                              # waiters cannot run the carry: it may still hold
     fake.compare = delta(["hermes-sync"])             # state moved again under the old ticket
-    assert "PR #1 holds" in (merge(2, H2563) or "")   # NEW drift: a full refresh window, despite ticket age
+    assert own_rule(fake) == "holds"                  # NEW drift: a full refresh window, despite ticket age
     monkeypatch.setattr(g, "_now", lambda: NOW + 899)
-    assert "PR #1 holds" in merge(2, H2563)
+    assert own_rule(fake) == "holds"
     monkeypatch.setattr(g, "_now", lambda: NOW + 900)
-    assert "PR #1 holds" not in merge(2, H2563)
+    assert own_rule(fake) == "yields"
 
 
 @pytest.mark.parametrize("date", [None, "invalid", "2099-01-01T00:00:00Z"])
@@ -272,18 +313,20 @@ def test_drift_timestamp_unreadable_never_yields(gh, date):
     fake = gh({n: pr(n, H2563, ["hermes-sync"]) for n in (1, 2)}, compare=delta(["hermes-sync"]))
     seed_turn(fake, 1, NOW - 1800)
     fake.activity = [{**push_event(BASE, "c" * 40, NOW - 1000), "timestamp": date}]
-    why = merge(2, H2563)
-    assert why and "now holds" not in why
-    assert fake.turn(2) is None
+    assert own_rule(fake) == "unreadable"
+    why = bounded_waiter(fake)
+    assert "now holds" not in why
 
 
 def test_initial_stale_base_grace_starts_at_acquisition(gh, monkeypatch):
     fake = gh({n: pr(n, H2563, ["hermes-sync"]) for n in (1, 2)},
               compare=delta(["hermes-sync"], when=NOW - 5000))
     seed_turn(fake, 1, NOW - 899)
-    assert "PR #1 holds" in merge(2, H2563)
+    assert "PR #1 holds" in merge(2, H2563)           # inside the grace a waiter decides it without a walk
+    assert own_rule(fake) == "holds"
     monkeypatch.setattr(g, "_now", lambda: NOW + 1)
-    assert "PR #1 holds" not in merge(2, H2563)
+    assert own_rule(fake) == "yields"
+    bounded_waiter(fake)
 
 
 # ---- push-activity arrival attribution (v7: server-recorded before/after chain; no commit-clock heuristic) ----
@@ -369,11 +412,11 @@ def test_reverted_overlap_restarts_full_grace(gh, monkeypatch, last_file):
     fake.compare["files"] = fl(last_file)
     seed_turn(fake, 1, NOW - 3000, ["a.py", "b.py"])
     fake.edge_compare[f"{BASE}...{sha(2)}"] = {"status": "ahead", "behind_by": 0, "files": []}
-    assert "PR #1 holds" in merge(2, H2563)
+    assert "PR #1 holds" in full_rule()
     monkeypatch.setattr(g, "_now", lambda: NOW + 799)
-    assert "PR #1 holds" in merge(2, H2563)
+    assert "PR #1 holds" in full_rule()
     monkeypatch.setattr(g, "_now", lambda: NOW + 800)
-    assert "PR #1 holds" not in merge(2, H2563)
+    assert "PR #1 holds" not in full_rule()
 
 
 def test_arrival_time_is_the_server_event_not_the_committer_date(gh, monkeypatch):
@@ -381,11 +424,11 @@ def test_arrival_time_is_the_server_event_not_the_committer_date(gh, monkeypatch
     fake = gh({n: pr(n, H2563, ["hermes-sync"]) for n in (1, 2)}, compare=delta(["hermes-sync"], when=NOW - 7200))
     seed_turn(fake, 1, NOW - 1800)
     fake.activity = [push_event(BASE, "c" * 40, NOW - 10)]
-    assert "PR #1 holds" in merge(2, H2563)                              # not an early yield from the old date
+    assert "PR #1 holds" in full_rule()                              # not an early yield from the old date
     monkeypatch.setattr(g, "_now", lambda: NOW + 889)
-    assert "PR #1 holds" in merge(2, H2563)
+    assert "PR #1 holds" in full_rule()
     monkeypatch.setattr(g, "_now", lambda: NOW + 890)
-    assert "PR #1 holds" not in merge(2, H2563)
+    assert "PR #1 holds" not in full_rule()
 
 
 def test_sync_merge_with_reversed_parents_uses_push_chain_only(gh, monkeypatch):
@@ -395,9 +438,9 @@ def test_sync_merge_with_reversed_parents_uses_push_chain_only(gh, monkeypatch):
     m = node(2, [7, 1])
     fake = world(gh, [(BASE, 1, NOW - 3000, fl("home/skills/unrelated/SKILL.md")), (1, 2, NOW - 100, fl("hermes-sync"))],
                  commits=[d, local, m])
-    assert "PR #1 holds" in merge(2, H2563)
+    assert "PR #1 holds" in full_rule()
     monkeypatch.setattr(g, "_now", lambda: NOW + 800)
-    assert "PR #1 holds" not in merge(2, H2563)
+    assert "PR #1 holds" not in full_rule()
     assert not [c for c in fake.calls if any(f"repos/{R}/commits/" in a for a in c)]       # no commit clocks read
 
 
@@ -405,12 +448,12 @@ def test_events_newer_than_the_frozen_tip_are_ignored(gh, monkeypatch):
     newer = [push_event(2, 9, NOW - 5), push_event(9, 10, NOW - 3)]
     world(gh, [(BASE, 1, NOW - 3000, fl("home/skills/unrelated/SKILL.md")), (1, 2, NOW - 1000, fl("hermes-sync"))],
           newer=newer)
-    assert "PR #1 holds" not in merge(2, H2563)                          # started = 1000 s ago, not the newer pushes
+    assert "PR #1 holds" not in full_rule()                          # started = 1000 s ago, not the newer pushes
 
 
 def test_cursor_pagination_reaches_the_base(gh):
     fake = world(gh, chain_pushes(12, 1, NOW - 3001), page_size=5)
-    assert "PR #1 holds" not in merge(2, H2563)
+    assert "PR #1 holds" not in full_rule()
     calls = activity_calls(fake)
     assert len(calls) == 3 and all(c[-1] == "-i" for c in calls)
     assert not any("after=" in c[2] for c in calls[:1]) and "after=cur5" in calls[1][2] and "after=cur10" in calls[2][2]
@@ -451,7 +494,7 @@ def test_broken_or_missing_activity_refuses_never_yields(gh, monkeypatch, case):
         monkeypatch.setattr(g.subprocess, "run", lambda argv, **kw: (
             SimpleNamespace(returncode=1, stdout="", stderr="HTTP 403")
             if any("/activity?" in a for a in argv) else inner(argv, **kw)))
-    why = merge(2, H2563)
+    why = full_rule()
     assert why and "snapshot unreadable" in why and "PR #1 holds" not in why and "now holds" not in why, (case, why)
     assert fake.turn(2) is None
     assert len(activity_calls(fake)) <= g._ACTIVITY_PAGES
@@ -463,7 +506,7 @@ def test_push_straddling_the_ci_base_is_clipped_to_base(gh, monkeypatch):
     fake = world(gh, [(901, 2, NOW - 1000, fl("hermes-sync")), (2, 3, NOW - 50, fl("home/skills/unrelated/SKILL.md"))],
                  commits=commits)
     fake.edge_compare[f"{BASE}...{sha(2)}"] = fake.edge_compare.pop(f"{sha(901)}...{sha(2)}")
-    assert "PR #1 holds" not in merge(2, H2563)
+    assert "PR #1 holds" not in full_rule()
     assert f"repos/{R}/compare/{BASE}...{sha(2)}" in [a for c in fake.calls for a in c]
     assert not any(sha(901) in a for c in fake.calls for a in c if "/compare/" in a)
 
@@ -471,7 +514,7 @@ def test_push_straddling_the_ci_base_is_clipped_to_base(gh, monkeypatch):
 def test_earlier_unreadable_edge_blocks_later_overlap_decision(gh):
     fake = world(gh, [(BASE, 1, NOW - 3000, fl("home/skills/unrelated/SKILL.md")), (1, 2, NOW - 2000, fl("hermes-sync"))])
     fake.edge_compare[f"{BASE}...{sha(1)}"] = {"status": "diverged", "behind_by": 3, "files": []}   # earliest unreadable
-    why = merge(2, H2563)
+    why = full_rule()
     assert "PR #1 holds" not in (why or "") and why and "now holds" not in why
 
 
@@ -482,7 +525,7 @@ def _wide(gh, monkeypatch, last_when, per_call=1.7, n=49):
 
 def test_49_edges_with_late_first_overlap_fit_the_30s_eligibility(gh, monkeypatch):
     fake, sim = _wide(gh, monkeypatch, NOW - 901, per_call=0.5)
-    why = merge(2, H2563)
+    why = full_rule()
     assert "PR #1 holds" not in why and "now holds the state land turn" in why, why
     assert 1 <= len([c for c in fake.calls if is_edge(c)]) <= 48
     assert not any(f"{BASE}...{sha(49)}" in a for c in fake.calls for a in c)  # tip reused
@@ -510,20 +553,20 @@ def test_edge_reads_are_concurrent_but_never_more_than_eight(gh, monkeypatch):
             with lock:
                 state["now"] -= 1
     monkeypatch.setattr(g.subprocess, "run", slow)
-    assert "PR #1 holds" not in merge(2, H2563)
+    assert "PR #1 holds" not in full_rule()
     assert 2 <= state["max"] <= g._EDGE_WORKERS, state
 
 
 def test_exact_900s_boundary_from_arrival_time(gh, monkeypatch):
     fake, sim = _wide(gh, monkeypatch, NOW - 900)
-    assert "PR #1 holds" not in merge(2, H2563)                          # now - 900 >= 900 -> yields
+    assert "PR #1 holds" not in full_rule()                          # now - 900 >= 900 -> yields
     fake2, sim2 = _wide(gh, monkeypatch, NOW - 899)
-    assert "PR #1 holds" in merge(2, H2563)
+    assert "PR #1 holds" in full_rule()
 
 
 def test_slow_edge_reads_refuse_at_the_shared_deadline_without_late_allow(gh, monkeypatch):
     fake, sim = _wide(gh, monkeypatch, NOW - 2000, per_call=9.0)
-    why = merge(2, H2563)
+    why = full_rule()
     assert isinstance(why, str) and "now holds" not in why and "PR #1 holds" not in why, why
     assert fake.turn(2) is None
     assert all(t < 30 + 1e-9 for t, a, _ in sim.starts if is_edge(a)), max(t for t, *_ in sim.starts)
@@ -532,26 +575,26 @@ def test_slow_edge_reads_refuse_at_the_shared_deadline_without_late_allow(gh, mo
 def test_rename_and_truncated_edges(gh):
     world(gh, [(BASE, 1, NOW - 3000, fl("home/skills/unrelated/SKILL.md")),
                (1, 2, NOW - 1000, fl("somewhere/else.txt", prev="hermes-sync"))])
-    assert "PR #1 holds" not in merge(2, H2563)                          # rename source counts; 1000 s >= 900
+    assert "PR #1 holds" not in full_rule()                          # rename source counts; 1000 s >= 900
     big = fl(*[f"x/{i}.txt" for i in range(g._COMPARE_FILES_CAP)])
     fake = world(gh, [(BASE, 1, NOW - 3000, big), (1, 2, NOW - 1000, fl("hermes-sync"))])
-    why = merge(2, H2563)
+    why = full_rule()
     assert why and "PR #1 holds" not in why and "now holds" not in why, why   # truncated edge: unknown, refuse
     assert fake.turn(2) is None
 
 
 def test_future_arrival_time_never_yields(gh):
     fake = world(gh, [(BASE, 1, NOW - 3000, fl("home/skills/unrelated/SKILL.md")), (1, 2, NOW + 7200, fl("hermes-sync"))])
-    why = merge(2, H2563)
+    why = full_rule()
     assert why and "PR #1 holds" not in why and "now holds" not in why
     assert fake.turn(2) is None
 
 
 def test_only_overlapping_pushes_start_grace(gh, monkeypatch):
     fake = world(gh, [(BASE, 1, NOW - 1600, fl("home/skills/unrelated/SKILL.md")), (1, 2, NOW - 1, fl("hermes-sync"))])
-    assert "PR #1 holds" in merge(2, H2563)
+    assert "PR #1 holds" in full_rule()
     monkeypatch.setattr(g, "_now", lambda: NOW + 899)
-    assert "PR #1 holds" not in merge(2, H2563)
+    assert "PR #1 holds" not in full_rule()
 
 
 def test_standalone_scope_has_shared_canonical_deadline(monkeypatch):
@@ -746,15 +789,29 @@ def test_carry_eligible_refresh_keeps_the_ticket(gh, monkeypatch):
     """Round-2 B1: update-branch with a carried approval must not drop the holder mid-CI."""
     fake = gh({n: pr(n, H2563, ["hermes-sync"]) for n in (1, 2)})
     seed_turn(fake, 1, NOW - 120)
-    fake.prs[1]["headRefOid"] = H2600
-    fake.prs[1]["reviews"] = []                       # refreshed head, no exact-head verdict
+    fake.prs[1]["headRefOid"] = H2600                 # refreshed head, no exact-head verdict; H2563's approval may carry
     monkeypatch.setattr(g, "_carried_approval", lambda *a: (True, ""))
-    assert "PR #1 holds" in merge(2, H2563)           # the existing carry decision admits #1, so #1 keeps priority
+    assert own_rule(fake) == "holds"                  # the existing carry decision admits #1, so #1 keeps priority
+    bounded_waiter(fake)                              # a waiter never runs #1's carry: it may still hold
     monkeypatch.setattr(g, "_carried_approval", lambda *a: (False, "patch changed"))
-    assert merge(2, H2563) is None                    # unreviewed content change still yields
+    assert own_rule(fake) == "yields"                 # unreviewed content change still yields
     monkeypatch.setattr(g, "_carried_approval", lambda *a: (True, ""))
     fake.prs[1]["reviews"] = [{**pr(1, H2600, ["x"])["reviews"][0], "body": "Independent exact-head review: request changes"}]
-    assert merge(2, H2563) is None                    # a block on the new head always yields
+    assert own_rule(fake) == "yields"
+    assert merge(2, H2563) is None                    # a block on the new head always yields, decided without a walk
+
+
+def test_refreshed_head_without_any_approval_yields_to_waiters_without_a_carry_read(gh):
+    """No approval to carry: the full rule refuses without a read, so the bounded peer rule decides 'yielded'."""
+    fake = gh({n: pr(n, H2563, ["hermes-sync"]) for n in (1, 2)})
+    seed_turn(fake, 1, NOW - 120)
+    fake.prs[1]["headRefOid"] = H2600
+    fake.prs[1]["reviews"] = []
+    assert own_rule(fake) == "yields"
+    before = len(fake.calls)
+    assert merge(2, H2563) is None
+    assert not [c for c in fake.calls[before:] if c[0] != "gh" or any("/compare/" in a and not a.endswith("...state")
+                                                                     or "/git/trees" in a or "/git/blobs" in a for a in c)]
 
 
 def test_turn_errors_refuse(gh, monkeypatch):
@@ -816,13 +873,16 @@ def test_refreshed_head_requires_approval_to_regain_ticket(gh):
     fake = gh({n: pr(n, H2563, ["hermes-sync"]) for n in (1, 2)}, compare=delta(["hermes-sync"], when=NOW - 1000))
     seed_turn(fake, 1, NOW - 1000)
     seed_turn(fake, 2, NOW - 500)
-    assert g._turn_hold_refusal(2, fake.prs[2], R, None, {}) is None
+    assert own_rule(fake) == "yields"                 # drifted 1000 s, unrefreshed: #1's own rule yields
+    assert "PR #1 may still hold" in g._turn_hold_refusal(2, fake.prs[2], R, None, {})   # a waiter cannot tell
     fake.prs[1]["headRefOid"] = H2600
     fake.prs[1]["reviews"] = []
-    assert g._turn_hold_refusal(2, fake.prs[2], R, None, {}) is None
+    assert own_rule(fake) == "yields"
+    assert g._turn_hold_refusal(2, fake.prs[2], R, None, {}) is None    # nothing to carry: decided, no walk
     fake.prs[1]["reviews"] = pr(1, H2600, ["hermes-sync"])["reviews"]
     fake.compare = IDENTICAL
-    assert "PR #1 holds" in g._turn_hold_refusal(2, fake.prs[2], R, None, {})
+    assert own_rule(fake) == "holds"
+    assert "PR #1 may still hold" in g._turn_hold_refusal(2, fake.prs[2], R, None, {})
 
 
 def test_unrelated_unreadable_holder_does_not_block(gh):
