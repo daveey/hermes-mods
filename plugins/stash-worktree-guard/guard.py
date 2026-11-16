@@ -1458,6 +1458,12 @@ class _Analyzer:
         self.child_alias = False  # inherited only while analyzing a Git runner child
         # (node, stdin text or None) of the hypothetical suffix command shadow_argv analyzes
         self.suffix: Optional[tuple] = None
+        # Use the exact fallback classifier, including decoded shared mutations and
+        # ref writes. This is only a predicate for an unknown command-position argv;
+        # these text matches must not themselves become reported calls.
+        self._text_evidence(text, git_words=False)
+        self.restore_text = self.restore_text or bool(self.calls)
+        self.calls.clear()
 
     def record(self, repo, sub, args, note: Optional[str] = None):
         """``note``: the unresolved shell word that alone made this a possible restore."""
