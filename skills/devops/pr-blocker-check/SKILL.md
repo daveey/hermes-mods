@@ -71,7 +71,7 @@ is to give gate jobs `if: ${{ !cancelled() }}` and run them on a light runner la
 workflow file, so open PRs keep the old behavior until they rebase.
 
 Before asking the user anything, check live state again (the head may have changed, a rebase may have reset
-approval) and put the proof in the ask. Do not repeat an ask a restart already made.
+approval) and put the proof in the ask.
 
 ## Telling the user when it merges
 
@@ -84,6 +84,9 @@ which; read that before reporting a re-review), the merge queue or slot position
 (claimed and moving, or just ready). Give no clock time and no "merges once X" unless X is the only open step. CI is
 rarely the only one: a hub merge slot or the land lane can hold a green PR for hours. A parked landing card's reason names
 only the first blocker its run hit (the GitHub quota, say), so look for the rest yourself before promising "once X".
+When X is a guard fix or config change, deploy X and run the gate's own check read-only before you promise it. For a
+state carry, use the merge-proof probe in kanban-worker `references/state-pr-landing.md`. Reading the config back doesn't
+show the gate's verdict.
 
 Admin override: only with explicit per-PR user authorization. Before offering it, read
 `gh api repos/O/R/rulesets/<id> --jq .current_user_can_bypass`: `pull_requests_only` cannot skip a required
