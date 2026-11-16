@@ -53,11 +53,13 @@ Before filing a physical, on-device or sign-in `human_request`:
    assume it. A report that the act was done retires the human step only, never the test's acceptance. The
    ask-gate guard refuses a mixed ask with `physical_ask_phases`.
 
-8. **A claim on a sleep-prone host is not progress.** A Mac in DarkWake can claim and spawn a card, then sleep
-   within seconds, while the hub replica keeps showing `running` from its last sync. For a "keep the Mac awake for
-   this run" ask, make `resolved_check` read the run's finish (the card has left `running`), never
-   `claimed`/`spawned`. Before closing the ask or telling the user the step is no longer needed, confirm that the host
-   answers ssh and that the run's newest heartbeat is under 5 min old.
+8. **On a sleep-prone host, the hub replica can't tell you a run's state.** A Mac asleep on battery can run a
+   claimed card only in short maintenance DarkWakes, and its board events then reach the hub replica in a batch
+   minutes later. Until that gateway's newest replica event is under ~2 min old, `running`, `claimed` or a missing
+   heartbeat in the replica says nothing about the run. Read the Mac's own board over `tailnet_exec` when it answers;
+   otherwise report the run as unknown, not stalled. Heartbeats show the worker is alive, not how far it has got. For
+   a "keep the Mac awake for this run" ask, make `resolved_check` read the run's finish (the card has left
+   `running`), never `claimed`/`spawned`.
 
 No rule here authorizes a protected Allow click, sign-in, consent, simulated evidence, auto-approval, or relaxed
 acceptance. A genuinely physical step with no machine-readable prerequisite still needs the person. Keep the
