@@ -215,7 +215,7 @@ def test_cleanup_is_bounded(gh):
     assert merge(200, H2563) is None
     assert not [c for c in fake.calls if "DELETE" in c]  # speculative reader never writes
     assert g._turn_hold_refusal(200, fake.prs[200], R, None, {}) is None
-    assert len([c for c in fake.calls if "DELETE" in c]) == 2
+    assert not [c for c in fake.calls if "DELETE" in c]  # no unfenced cleanup; stale readers cannot erase rearm
 
 
 def test_acquire_checks_older_overlap_itself(gh):
@@ -603,11 +603,11 @@ def test_merged_holder_releases_without_manual_ref_cleanup(gh):
     merge(2563, H2563)
     fake.compare, fake.pr_state[2563] = IDENTICAL, "closed"
     assert merge(2600, H2600) is None
-    # Merge preflight is read-only while approval runs; non-speculative readers
-    # retain cleanup, rather than deleting a ref observed before approval.
+    # Semantic release needs no DELETE: retain the record to avoid stale cleanup
+    # erasing a newly rearmed admission on this same ref.
     assert "refs/land-turn/pr-2563" in fake.refs
     assert g._turn_hold_refusal("2600", pr(2600, H2600, ["hermes-sync"]), R, None, {}) is None
-    assert "refs/land-turn/pr-2563" not in fake.refs
+    assert "refs/land-turn/pr-2563" in fake.refs
 
 
 def test_expired_turn_is_ignored(gh, monkeypatch):
@@ -656,9 +656,9 @@ def test_readers_delete_cooled_turns(gh, monkeypatch):
     monkeypatch.setattr(g, "_now", lambda: NOW + 2 * g._TURN_TTL + 5)
     assert merge(2600, H2600) is None
     g._live_turns(R, None, {})
-    # Merge speculation is read-only; standalone readers retain bounded cleanup.
+    # Expiry releases the lane, but cleanup must not DELETE a concurrently rearmed ref.
     assert g._turn_hold_refusal(2600, fake.prs[2600], R, None, {}) is None
-    assert not fake.refs
+    assert set(fake.refs) == {"refs/land-turn/pr-2563"}
 
 
 class SimClock:

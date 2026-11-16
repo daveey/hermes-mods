@@ -1651,7 +1651,7 @@ def _live_turns(repo, cwd, env, own_number=None):
         if rec is not None and rec["pr"] != _turn_number(ref):
             rec = None
         if _turn_number(ref) == own_number:
-            cache[("own", own_number)] = (rec,)       # (None,) = malformed own record
+            cache[("own", own_number)] = (rec, sha)   # retain observed OID for non-force replacement
         if rec is None:
             # An invalid own ticket cannot hold its owner; ordinary acquisition
             # repairs it after checking all OTHER holders. Never edit a peer's
@@ -2105,8 +2105,10 @@ def _turn_acquire_scoped(number, data, repo, cwd, env, prechecked):
             _cache()["turn_missed"] = True     # the caller names the out-of-hook follow-up instead
         return missed
     seen = _cache().get(("own", int(number))) if prechecked else None
+    previous = None
     if seen is not None:
         rec = seen[0]                        # the hold snapshot's own ref (None: malformed, to be repaired)
+        previous = seen[1] if len(seen) > 1 else None
     elif prechecked and ("own", int(number)) in _cache():
         rec = None                           # complete listing had no ref of this PR
     else:
@@ -2114,6 +2116,7 @@ def _turn_acquire_scoped(number, data, repo, cwd, env, prechecked):
         rec = None
         if rc == 0 and isinstance(cur, dict):
             sha = cur.get("object", {}).get("sha") if isinstance(cur.get("object"), dict) else None
+            previous = sha if isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{40}", sha) else None
             rc2, obj = _gh_call([f"repos/{repo}/git/commits/{sha}"], cwd, env, timeout=_TURN_CALL_TIMEOUT) if sha else (-1, None)
             rec = parse_turn(obj.get("message")) if rc2 == 0 and isinstance(obj, dict) else None
             if rec and rec["pr"] != int(number):
@@ -2137,20 +2140,28 @@ def _turn_acquire_scoped(number, data, repo, cwd, env, prechecked):
            "expires": expires, "files": files, **_turn_owner(env)}
     rc, made = _gh_call([f"repos/{repo}/git/commits"], cwd, env, timeout=_TURN_CALL_TIMEOUT, payload={
         "message": f"{_TURN_SUBJECT}{int(number)}\n\n{json.dumps(rec, sort_keys=True)}\n",
-        "tree": tree, "parents": [head]})
+        "tree": tree, "parents": [previous or head]})
     sha = made.get("sha") if rc == 0 and isinstance(made, dict) else None
     if not isinstance(sha, str):
         _cache()["turn_missed"] = True
         return ""
     # Commits are immutable: the post-write re-list need not read back the record this call just wrote.
     _cache().setdefault("obj", {})[sha] = {"message": f"{_TURN_SUBJECT}{int(number)}\n\n{json.dumps(rec, sort_keys=True)}\n"}
-    rc, _ = _gh_call([f"repos/{repo}/git/refs"], cwd, env, timeout=_TURN_CALL_TIMEOUT, payload={"ref": f"refs/{ref}", "sha": sha})
+    if previous:
+        # Sibling generations share a sole parent: only one can fast-forward.
+        # This is not general REST CAS; never join histories or force updates.
+        rc, _ = _gh_call(["-X", "PATCH", f"repos/{repo}/git/refs/{ref}"], cwd, env,
+                         timeout=_TURN_CALL_TIMEOUT, payload={"sha": sha, "force": False})
+    else:
+        rc, _ = _gh_call([f"repos/{repo}/git/refs"], cwd, env, timeout=_TURN_CALL_TIMEOUT,
+                         payload={"ref": f"refs/{ref}", "sha": sha})
     if rc != 0:
-        rc, _ = _gh_call(["-X", "PATCH", f"repos/{repo}/git/refs/{ref}"], cwd, env, timeout=_TURN_CALL_TIMEOUT,
-                         payload={"sha": sha, "force": True})
-    if rc != 0:
+        # A failed create can mean another caller admitted this PR after our
+        # snapshot, or that GitHub accepted our write but lost the response.
+        # Never overwrite that winner with a younger order/deadline.
         _cache()["turn_missed"] = True
-        return ""
+        return ("[ship-only-guard] Refused state merge: land-turn publication conflicted or was unreadable; "
+                "retry a complete snapshot. No forced replacement was attempted; the write may have succeeded.")
     # Concurrent writers can publish records, but only the oldest is effective.
     try:
         return _turn_hold_refusal(number, data, repo, cwd, env) or _until(expires)
@@ -2180,8 +2191,10 @@ def _turn_safe(fn, *args):
 
 
 def _turn_delete(ref, repo, cwd, env):
-    if not _TURN_READ_ONLY.get():
-        _gh_call(["-X", "DELETE", f"repos/{repo}/git/{ref}"], cwd, env, timeout=_TURN_CALL_TIMEOUT)
+    # REST DELETE has no expected-OID fence. A reader's expired/closed snapshot
+    # may already have been replaced, so cleanup would erase a newer admission.
+    # Retain the bounded one-ref-per-PR history until a leased collector exists.
+    return None
 
 
 def _turn_hold_read_only(*args):
