@@ -184,15 +184,37 @@ def test_possible_turns_with_boolean_eligibility_is_effective_turns():
         assert [(ref, rec) for ref, rec, _ in got] == want and all(why is None for *_, why in got)
 
 
-def _bounded_admits(recs, elig, me, files):
-    for ref, rec, why in g.possible_turns(recs, lambda ref, rec: elig[rec["pr"]], lambda: None):
-        if rec["pr"] == me:
-            if why is None:
-                return True
-            continue
-        if g.turn_blocks(rec["files"], files) or g.turn_blocks(files, rec["files"]):
-            return False
-    return True
+def _bounded_admits(recs, elig, me, files, monkeypatch):
+    """Exercise the real scoped decision; mock only snapshot IO and eligibility."""
+    with monkeypatch.context() as m:
+        m.setattr(g, "_live_turns", lambda *a: recs)
+        m.setattr(g, "_prefetch_holders", lambda *a: None)
+        m.setattr(g, "_turn_holder_data", lambda n, *a: {"state": "OPEN", "number": n})
+        m.setattr(g, "peer_eligibility", lambda rec, holder: elig[rec["pr"]])
+        m.setattr(g, "_turn_yielded", lambda rec, *a: not elig[rec["pr"]])
+        data = {"state": "OPEN", "files": [{"path": f} for f in files]}
+        return g._turn_hold_refusal(me, data, R, None, {}) is None
+
+
+def test_chain_behind_undecided_ticket_does_not_suppress_later_blocker(gh):
+    fake = gh({1: pr(1, H2563, ["a"]), 2: pr(2, H2563, ["a", "b"]),
+               3: pr(3, H2563, ["b", "c"]), 4: pr(4, H2563, ["c"])})
+    seed_turn(fake, 1, NOW - 2000, ["a"])
+    seed_turn(fake, 2, NOW - 60, ["a", "b"])
+    seed_turn(fake, 3, NOW - 30, ["b", "c"])
+    why = g._turn_hold_refusal(4, fake.prs[4], R, None, {})
+    assert why and "PR #3 may still hold" in why, why
+
+
+def test_possible_own_ticket_with_changed_files_does_not_admit(gh):
+    fake = gh({1: pr(1, H2563, ["a"]), 2: pr(2, H2563, ["a", "b"]),
+               3: pr(3, H2563, ["b", "c"])})
+    seed_turn(fake, 1, NOW - 2000, ["a"])
+    seed_turn(fake, 2, NOW - 60, ["a", "b"])
+    seed_turn(fake, 3, NOW - 30, ["b", "c"])
+    fake.prs[2]["files"] = [{"path": "c"}]
+    why = g._turn_hold_refusal(2, fake.prs[2], R, None, {})
+    assert why and "PR #3 may still hold" in why, why
 
 
 def _full_admits(recs, elig, me, files):
@@ -204,7 +226,7 @@ def _full_admits(recs, elig, me, files):
     return True
 
 
-def test_bounded_selection_never_admits_what_any_outcome_refuses():
+def test_bounded_selection_never_admits_what_any_outcome_refuses(monkeypatch):
     rng = random.Random(11)
     areas = ["a/x", "a/y", "b/z", "a", "c"]
     checked = 0
@@ -212,12 +234,12 @@ def test_bounded_selection_never_admits_what_any_outcome_refuses():
         n = rng.randint(2, 6)
         recs = [(f"r{i}", _rec(i, rng.sample(areas, rng.randint(1, 2)))) for i in range(n)]
         me = rng.randrange(n + 1)                          # n: a waiter without a ticket of its own
-        files = recs[me][1]["files"] if me < n else rng.sample(areas, 2)
+        files = rng.sample(areas, rng.randint(1, 2))  # independent of the acquisition record
         bounded = {i: rng.choice([True, False, g._Undecided("walk")]) for i in range(n)}
         if me < n and isinstance(bounded[me], g._Undecided):
             bounded[me] = True                             # own ticket: always decided by the full rule
         open_ = [i for i in range(n) if isinstance(bounded[i], g._Undecided)]
-        if _bounded_admits(recs, bounded, me, files):
+        if _bounded_admits(recs, bounded, me, files, monkeypatch):
             for outcome in itertools.product([True, False], repeat=len(open_)):
                 full = {**bounded, **dict(zip(open_, outcome))}
                 assert _full_admits(recs, full, me, files), (recs, bounded, me, files, outcome)
