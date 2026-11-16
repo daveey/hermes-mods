@@ -1554,6 +1554,20 @@ def _dynamic_targets(closure):
                 continue
             params = [a.arg for a in fn.args.posonlyargs + fn.args.args]
             if name.id in params:
+                # Call arguments bound the entry value, not a parameter subsequently rebound.
+                # Reject all writes (including nested scopes) rather than pretend to model flow.
+                for node in ast.walk(fn):
+                    if (isinstance(node, ast.Name) and node.id == name.id
+                            and not isinstance(node.ctx, ast.Load)):
+                        return None
+                    if isinstance(node, ast.alias) and (node.asname or node.name.split('.')[0]) == name.id:
+                        return None
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == name.id:
+                        return None
+                    if type(node).__name__ in {"ExceptHandler", "MatchAs", "MatchStar"} and node.name == name.id:
+                        return None
+                    if type(node).__name__ == "MatchMapping" and node.rest == name.id:
+                        return None
                 return delegated(fn, params, name.id, depth, lit)
             if name.id in {a.arg for a in fn.args.kwonlyargs} | {
                     getattr(fn.args.vararg, "arg", None), getattr(fn.args.kwarg, "arg", None)}:
@@ -1609,6 +1623,10 @@ def _dynamic_targets(closure):
         out = [values(default[param], depth + 1, lit)] if param in default else []
         for tree in trees:
             for node in nodes[id(tree)]:
+                if isinstance(node, ast.ImportFrom) and any(
+                        a.name == "*" or (a.name == fn.name and a.asname and a.asname != fn.name)
+                        for a in node.names):
+                    return None                       # imported alias/star escapes name-based call discovery
                 if name_of(node) == fn.name and isinstance(node, (ast.Name, ast.Attribute)) and not called(node):
                     return None                           # passed around as a value: call sites unknown
                 if not isinstance(node, ast.Call) or name_of(node.func) != fn.name:

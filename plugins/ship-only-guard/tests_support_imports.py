@@ -450,6 +450,32 @@ def test_framework_or_callback_supplied_loader_argument_stays_shared(monkeypatch
     assert why and "shared ~ tests/placement_support.py" in why
 
 
+@pytest.mark.parametrize("binding", [
+    'name = "tests." + "placement_" + "support"',
+    'name += "placement_" + "support"',
+    'for name in ["tests." + "placement_" + "support"]: pass',
+    'name, other = "tests." + "placement_" + "support", 1',
+])
+def test_rebound_loader_parameter_stays_shared(monkeypatch, binding):
+    text = ('from importlib import import_module\ndef helper(name):\n'
+            f'    {binding}\n    return import_module(name)\nhelper("json")\n')
+    tip = {"tests/__init__.py": "", SUPPORT: "VALUE = 1\n", "tests/test_x.py": text}
+    why = changed(tip, monkeypatch)
+    assert why and "shared ~ tests/placement_support.py" in why
+
+
+@pytest.mark.parametrize("imports, call", [
+    ('from tests.bridge import helper as invoke', 'invoke'),
+    ('from tests.bridge import *', 'helper'),
+])
+def test_imported_helper_escape_stays_shared(monkeypatch, imports, call):
+    tip = {"tests/__init__.py": "", SUPPORT: "VALUE = 1\n",
+           "tests/bridge.py": 'from importlib import import_module\ndef helper(name):\n    return import_module(name)\n',
+           "tests/test_x.py": imports + '\n' + call + '("tests." + "placement_" + "support")\n'}
+    why = changed(tip, monkeypatch)
+    assert why and "shared ~ tests/placement_support.py" in why
+
+
 def test_uncalled_helper_loader_narrows(monkeypatch):
     # sync_test_support.require_module: a plain helper no closure module calls cannot load anything here.
     text = 'import importlib\ndef require_module(test, name, package=None):\n    return importlib.import_module(name)\n'
