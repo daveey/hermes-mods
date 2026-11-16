@@ -203,6 +203,9 @@ def _shell_ran(tmp_path, command):
         pytest.skip('needs bash and sh')
     env = _isolated_env(tmp_path)
     (tmp_path / 'script.sh').write_text('. /dev/stdin\n')  # a script that runs its input
+    run = tmp_path / 'run.sh'  # a program that runs its arguments, whatever it is called
+    run.write_text('#!/bin/sh\nexec "$@"\n')
+    run.chmod(0o755)
     subprocess.run(['bash', '-c', command], cwd=tmp_path, env=env, timeout=30,
                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     marker = tmp_path / 'ran'
@@ -313,9 +316,10 @@ _REDEFINED_CALLS = [
     ("cat() {{ bash; }}; cat <<'EOF'\n{cmd}\nEOF", None), ('cat() {{ bash; }}; cat <<< {quoted}', None),
     ('grep() {{ bash; }}; echo {cmd} | grep x', None), ("rg() {{ bash; }}; cat <<'EOF' | rg x\n{cmd}\nEOF", None),
     # Other ways the input changes what a data command name runs.
-    ('shopt -s expand_aliases\nalias echo=env\necho {cmd}', None), ('hash -p /usr/bin/env cat; cat {cmd}', None),
-    ('mkdir -p d && ln -s /usr/bin/env d/cat && PATH="$PWD/d:$PATH" cat {cmd}', None),
-    ('mkdir -p d && ln -s /usr/bin/env d/cat && ./d/cat {cmd}', None),
+    # run.sh is the test's own `exec "$@"` (a busybox env would act on its argv[0]).
+    ('shopt -s expand_aliases\nalias echo=env\necho {cmd}', None), ('hash -p "$PWD/run.sh" cat; cat {cmd}', None),
+    ('mkdir -p d && ln -s "$PWD/run.sh" d/cat && PATH="$PWD/d:$PATH" cat {cmd}', None),
+    ('mkdir -p d && ln -s "$PWD/run.sh" d/cat && ./d/cat {cmd}', None),
     ("env 'BASH_FUNC_echo%%=() {{ \"$@\"; }}' bash -c 'echo {cmd}'", 'bash_func'),
 ]
 
