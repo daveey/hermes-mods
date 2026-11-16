@@ -143,6 +143,7 @@ def test_c_the_quiet_period_ending_wakes_the_chat_as_before(world, spy, clock, m
         if not memo:
             plugin._state.pop('host_memo', None)
             plugin._state.pop('host_clock', None)
+            plugin._wi.pop('host_pre_rows', None)
             plugin._wi_get('host_rows', plugin.wi.RowCache).clear()
         tick(spy, typed_at)
         outcomes.append((clock.wall - T0, tuple(spy['woken'])))
@@ -191,6 +192,7 @@ def test_the_unlink_clock_is_written_every_tick_with_equal_output_and_nothing_el
         if not memo:
             plugin._state.pop('host_memo', None)
             plugin._state.pop('host_clock', None)
+            plugin._wi.pop('host_pre_rows', None)
         spy['reset']()
         before = counters()
         tick(spy, lambda: clock.wall - 10)
