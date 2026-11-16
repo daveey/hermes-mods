@@ -102,7 +102,35 @@ WRAPPED_GIT = {
     "wrapped-escaped-stash": "G=$(command -v git); S=$(printf '\\x73tash'); flock /tmp/l \"$G\" \"$S\" pop",
     "wrapped-split-quotes": "G=$(command -v git); S=$(printf st\"\"ash); O=$(printf pop); flock /tmp/l \"$G\" \"$S\" \"$O\"",
 }
+# Round 2: preserve every mutation fallback, not only pop/apply or raw stash text.
+WRAPPED_MUTATIONS = {
+    f"mutation-{encoding}-{op}": f'G=$(command -v git); S=$(printf {encoded}); flock /tmp/l "$G" "$S" {op}'
+    for encoding, encoded in [("quotes", 'st""ash'), ("escape", r"st\ash"),
+                              ("hex", r"'\x73tash'")]
+    for op in ("drop", "clear", "push", "save")
+}
+WRAPPED_MUTATIONS["mutation-reflog"] = (
+    'G=$(command -v git); C=$(printf reflog); echo "reflog expire --expire=now --all"; '
+    'flock /tmp/l "$G" "$C" expire --expire=now --all'
+)
 REFUSE.update(WRAPPED_GIT)
+REFUSE.update(WRAPPED_MUTATIONS)
+
+
+@pytest.mark.parametrize("name", [n for n in WRAPPED_MUTATIONS if n.endswith("-drop")])
+def test_refused_mutation_really_drops_shared_stash(wt, tmp_path, name):
+    import shutil
+    if not shutil.which("flock"):
+        pytest.skip("flock not installed")
+    main = wt.parent / "repo"
+    assert guard.refuse_reason(REFUSE[name], str(wt)) is not None
+    result = subprocess.run(
+        ["bash", "-c", REFUSE[name].replace("/tmp/l", str(tmp_path / "lock"))],
+        cwd=wt, capture_output=True, text=True, check=True)
+    assert "Dropped refs/stash@{0}" in result.stdout
+    assert subprocess.run(["git", "stash", "list"], cwd=main,
+                          capture_output=True, text=True, check=True).stdout == ""
+
 # Wrappers from util-linux/findutils run for real in the restore proof below (skipped if absent).
 _REAL_PROG = {"wrapped-flock": "flock", "wrapped-flock-cmdsub": "flock",
               "wrapped-xargs-herestring": "xargs", "wrapped-setsid": "setsid",
