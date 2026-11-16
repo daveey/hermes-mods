@@ -24,6 +24,29 @@ The mutable base-drift read stays **last**, after approval/hold checks, so the
 optimization does not widen the final base-read race. Optional turn acquisition
 starts only when its budget fits; lack of time never changes a refusal to allow.
 
+The merge-only speculative scan omits the merging PR's **own old-ticket drift
+history**, not its verdict validation or changed-head approval/carry policy.
+This provisional result is not stored as full eligibility. Admission still needs
+approval and the final **fresh** compare: for a clean final snapshot the omitted
+drift-yield predicate is false; an overlapping or unreadable final snapshot
+refuses regardless of turn selection. Earlier/indirect peers and nontransitive
+ordering are unchanged. This is not an unconditional own-ticket reservation.
+If final drift refuses and own eligibility was deferred, the hook directs the
+caller to `--land-turn` instead of speculatively resolving history/acquisition.
+Standalone readers, acquisition and `--land-turn` retain the full yield rule.
+
+`tests_own_ticket_budget.py` exercises the full command hook with six tickets:
+old own clean admission takes four causal subprocess rounds (14.8 seconds at
+3.7 seconds/read) within the unchanged deadline; old own overlap reports
+update-branch guidance. It covers admission equivalence, fresh own drift,
+standalone fairness, cache isolation, held-waiter drift, timeout/late-result
+refusal and no late writes. `tests_turn.SimClock` honors subprocess timeouts,
+starts nested children at their parent's dispatch time and propagates completion
+on join. A waiter needing five serial rounds at 3.7 seconds/read genuinely
+exhausts 18 seconds and must still fail closed; best-effort attribution cannot
+repair an already-exhausted canonical compare. `tests_final_drift_order.py`
+proves a state push during parallel work defeats an earlier cached clean compare.
+
 Preflights taking at least one second log elapsed time and allowed/refused status,
 without logging submitted commands. `tests_budget.py` and `tests_parallel.py`
 cover registration, clipping, nested context propagation, named real subprocess
