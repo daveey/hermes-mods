@@ -203,10 +203,11 @@ object (`git cat-file commit`, which the graft does not hide) exists as a
 commit (`git cat-file -e <parent>^{commit}`). `shallow` is rewritten
 atomically with the cuts that stay, or removed when none stay. A present
 parent came either from a store `_borrow` validated as non-shallow and
-non-partial (complete ancestry) or from the fetch within depth (its own
-ancestry present or still cut), and a missing ancestor makes git fail, which
-refuses. A cut with any absent parent stays, and a failed read, parent probe
-or rewrite leaves `shallow` unchanged, so the refusal stands. The fetch, the
+non-partial (expected complete ancestry) or from the fetch within depth (its
+own ancestry present or still cut). Missing needed ancestry makes git fail,
+which refuses. A cut with any absent parent or failed cut read/parent probe
+stays; independently validated cuts may still lift. A failed shallow-file
+read or rewrite leaves the whole file unchanged. The fetch, the
 merge-base rules and every refusal text are unchanged. Measured on PR #3381's
 refresh merge (its merge base 322 commits below the merged state tip): with
 `~/code/hermes` borrowed, the carry verdict went from the depth refusal to

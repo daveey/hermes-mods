@@ -5,10 +5,11 @@ file and grafts its parents away. When state moved more commits past a PR's merg
 `_CarryObjects._base` refused the carry ("fetch depth cuts history before the merge base"). It did so even
 when a borrowed store (the command's cwd clone or a policy `reference_repos` clone) held every commit below
 the cut, so each refresh of a long-lived state PR needed a fresh LLM review. A cut is now lifted only when
-every parent named in its raw commit is present. Any other cut stays, and a failed read, parent probe or
-rewrite leaves `shallow` as it was, so the refusal stands.
+every parent named in its raw commit is present. A failed cut read or parent probe keeps that cut;
+independently validated cuts can still lift. Failed shallow-file reads or rewrites keep the whole file.
 
-These tests use real git throughout. Only the network URL is replaced by the fixture repository.
+These tests use real git throughout, replacing the network URL with the fixture repository and injecting
+failures at the read, parent-probe and rewrite boundaries for the fail-closed cases.
 `seen["fetched"]` is the premise: what the fetch itself cut, read before any lift. `seen["kept"]` is what
 was still cut when the store closed.
 """
@@ -199,13 +200,16 @@ def _fail_lift_read(monkeypatch):
 
 
 def _fail_os(monkeypatch, name):
-    real = getattr(g.os, name)
+    # Python 3.9 caches os.unlink in pathlib's accessor: patch the invoked
+    # Path method, not os.unlink, so the failure is injected on every version.
+    target = Path if name == "unlink" else g.os
+    real = getattr(target, name)
 
     def failing(*args, **kwargs):
         if str(args[-1] if name == "replace" else args[0]).endswith(os.sep + "shallow"):
             raise PermissionError(13, f"injected: {name} refused", str(args[-1]))
         return real(*args, **kwargs)
-    monkeypatch.setattr(g.os, name, failing)
+    monkeypatch.setattr(target, name, failing)
 
 
 def _fail_parent_probes(monkeypatch):
