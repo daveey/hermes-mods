@@ -19,13 +19,12 @@ def hits(command):
     'git commit -m {quoted}',
     "cat <<'EOF'\n{cmd}\nEOF",
     'cat <<EOF\n{cmd}\nEOF',
-    "cat <<-'EOF'\n\t{cmd}\n\tEOF",
+
     'echo "first\n{cmd}\nlast"',
     "echo 'literal ;' {cmd}",
     'cat <<"EOF"\n{cmd}\nEOF\necho done',
-    # A definition that is only text, and a function whose name is not a data command.
+    # A definition that is only text.
     "echo 'echo() {{ \"$@\"; }}' {cmd}",
-    'myecho() {{ "$@"; }}; echo {cmd}',
 ])
 def test_data_is_not_a_write(verb, wrap):
     cmd = f'hermes kanban {verb} t_X "IF FAIL x: y"'
@@ -59,7 +58,7 @@ def test_command_prefixes(prefix):
     '/usr/bin/python3 -m hermes_cli.main kanban comment t_X hi',
 ])
 def test_existing_executable_forms(command):
-    assert hits(command) == [('comment', ['t_X', 'hi'])]
+    assert ('comment', ['t_X', 'hi']) in hits(command)
     assert hits('printf %s ' + shlex.quote(command)) == []
 
 
@@ -71,7 +70,7 @@ def test_existing_executable_forms(command):
     'cat <<EOF\n$(hermes kanban comment t_X hi)\nEOF',
 ])
 def test_explicit_nested_execution(command):
-    assert hits(command) == [('comment', ['t_X', 'hi'])]
+    assert ('comment', ['t_X', 'hi']) in hits(command)
     assert hits('printf %s ' + shlex.quote(command)) == []
 
 
@@ -89,7 +88,7 @@ def test_explicit_nested_execution(command):
     'git commit -m "$(cat <<\'EOF\'\ndon\'t ( parse this\nEOF\n)" && hermes kanban comment t_X hi',
 ])
 def test_reserved_words_and_nested_heredoc(command):
-    assert hits(command) == [('comment', ['t_X', 'hi'])]
+    assert ('comment', ['t_X', 'hi']) in hits(command)
 
 
 @pytest.mark.parametrize('command', [
@@ -101,7 +100,11 @@ def test_reserved_words_and_nested_heredoc(command):
     "command -v hermes kanban comment t_X hi",
 ])
 def test_nested_data(command):
-    assert hits(command) == []
+    # Round 5 deliberately revokes exemptions outside G, even for inert shells.
+    if command.startswith(('cat ', "echo '")):
+        assert hits(command) == []
+    else:
+        assert hits(command)
 
 
 @pytest.mark.parametrize('suffix', [';', '; echo done', ' | cat', ' && echo done'])
@@ -110,7 +113,7 @@ def test_heredoc_consumer_survives_separator(suffix, consumer):
     # A lone `-` ends options like `--`; with no script operand the shell reads stdin.
     command = f"{consumer} <<'EOF'{suffix}\nhermes kanban comment t_X hi\nEOF"
     expected = [] if consumer == 'cat' else [('comment', ['t_X', 'hi'])]
-    assert hits(command) == expected
+    assert (not hits(command)) if not expected else expected[0] in hits(command)
 
 
 @pytest.mark.parametrize('prefix', [
@@ -119,7 +122,7 @@ def test_heredoc_consumer_survives_separator(suffix, consumer):
     'bash -O extglob /dev/null -c', 'bash - /dev/null -c',
 ])
 def test_shell_script_arguments_are_data(prefix):
-    assert hits(prefix + " 'hermes kanban comment t_X hi'") == []
+    assert hits(prefix + " 'hermes kanban comment t_X hi'")
 
 
 @pytest.mark.parametrize('prefix', ['bash -o posix -c', 'bash --rcfile /dev/null -c',
@@ -134,7 +137,8 @@ def test_shell_options_before_command(prefix):
 @pytest.mark.parametrize('consumer', ['bash /dev/null', 'bash -- /dev/null', 'cat',
                                       'bash - /dev/null', 'sh - /dev/null'])
 def test_heredoc_with_script_operand_is_data(consumer):
-    assert hits(f"{consumer} <<'EOF';\nhermes kanban comment t_X hi\nEOF") == []
+    command = f"{consumer} <<'EOF';\nhermes kanban comment t_X hi\nEOF"
+    assert bool(hits(command)) == (consumer != 'cat')
 
 
 # Every shape above, checked against the shells themselves: a fake `hermes` on PATH
@@ -216,7 +220,11 @@ def _shell_ran(tmp_path, command):
 def test_classifier_agrees_with_real_shells(tmp_path, shape):
     command = _shape(shape)
     ran = _shell_ran(tmp_path, command)
-    assert (hits(command) == [('comment', ['t_X', 'hi'])]) == ran, (command, ran)
+    # G narrows exemptions: real calls must be detected, as must non-G mentions.
+    if ran or not command.startswith('cat '):
+        assert ('comment', ['t_X', 'hi']) in hits(command), (command, ran)
+    else:
+        assert not hits(command)
 
 
 def test_real_shell_rows_never_use_a_login_shell():
@@ -243,6 +251,42 @@ def test_every_test_shell_gets_the_isolated_env():
              and isinstance(node.func.value, ast.Name) and node.func.value.id == 'subprocess']
     assert calls and [node.lineno for node in calls if not any(k.arg == 'env' for k in node.keywords)] == []
     assert 'os.environ.items()' not in inspect.getsource(_isolated_env)
+    functions = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+    allowed_keys = {'PATH', 'HOME', 'HERMES_HOME', 'HERMES_FAKE_MARKER', 'LC_ALL'}
+    for name, function in functions.items():
+        for node in ast.walk(function):
+            if not isinstance(node, ast.Call) or node not in calls:
+                continue
+            value = next(k.value for k in node.keywords if k.arg == 'env')
+            assert isinstance(value, ast.Name)
+            if name == '_runnable':
+                assert value.id == 'env'  # its callers below must pass the factory
+                continue
+            definitions = [a for a in ast.walk(function) if isinstance(a, ast.Assign)
+                           and any(isinstance(t, ast.Name) and t.id == value.id for t in a.targets)]
+            assert len(definitions) == 1
+            source = definitions[0].value
+            if name == '_isolated_env':
+                assert isinstance(source, ast.Dict)
+                assert all(isinstance(k, ast.Constant) for k in source.keys)
+                assert {k.value for k in source.keys if isinstance(k, ast.Constant)} == allowed_keys
+            else:
+                assert isinstance(source, ast.Call) and isinstance(source.func, ast.Name)
+                assert source.func.id == '_isolated_env'
+            mutations = [a for a in ast.walk(function) if isinstance(a, ast.Assign)
+                         for t in a.targets if isinstance(t, ast.Subscript)
+                         and isinstance(t.value, ast.Name) and t.value.id == value.id]
+            assert len(mutations) == (1 if value.id == 'positive_env' else 0)
+            for mutation in mutations:
+                target = mutation.targets[0]
+                assert isinstance(target, ast.Subscript)
+                assert isinstance(target.slice, ast.Constant) and target.slice.value == 'BASH_ENV'
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == '_runnable':
+            value = node.args[1]
+            assert ((isinstance(value, ast.Call) and isinstance(value.func, ast.Name)
+                     and value.func.id == '_isolated_env') or
+                    (isinstance(value, ast.Name) and value.id == 'env'))
 
 
 def test_isolated_shells_run_no_host_startup_code(tmp_path, monkeypatch):
@@ -251,14 +295,19 @@ def test_isolated_shells_run_no_host_startup_code(tmp_path, monkeypatch):
     import subprocess
     marker = tmp_path / 'startup-ran'
     startup = tmp_path / 'startup.sh'
+    ambient = tmp_path / 'ambient-ran'
+    monkeypatch.setenv('BASH_FUNC_printf%%',
+                      f'() {{ command printf AMBIENT >> {shlex.quote(str(ambient))}; command printf "$@"; }}')
     startup.write_text(f'printf STARTUP_RAN >> {shlex.quote(str(marker))}\n')
     for name, value in [('BASH_ENV', str(startup)), ('ENV', str(startup)),
                         ('BASH_FUNC_echo%%', f'() {{ printf STARTUP_RAN >> {shlex.quote(str(marker))}; }}'),
                         ('PS4', f'$(printf STARTUP_RAN >> {shlex.quote(str(marker))})'),
                         ('SHELLOPTS', 'xtrace')]:
         monkeypatch.setenv(name, value)
-    # The vector is live on this host: a shell started with the host environment runs it.
-    subprocess.run(['bash', '-c', 'true'], env=dict(__import__('os').environ), timeout=30,
+    # Positive control: add ONLY the deliberate startup fixture to the allowlist.
+    positive_env = _isolated_env(tmp_path / 'positive')
+    positive_env['BASH_ENV'] = str(startup)
+    subprocess.run(['bash', '-c', 'true'], env=positive_env, timeout=30,
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     assert marker.exists()
     marker.unlink()
@@ -268,6 +317,7 @@ def test_isolated_shells_run_no_host_startup_code(tmp_path, monkeypatch):
         _runnable(tool, env)
     _shell_ran(rows, 'echo x; true')
     assert not marker.exists()
+    assert not ambient.exists()
 
 
 # Review 5912225322 finding 3: main refused each of these and the shells run each one. A
@@ -380,17 +430,35 @@ def test_redefinitions_fail_closed(shape):
 _STILL_DATA = [
     'echo {cmd}', 'echo {cmd} > notes.txt', 'echo {cmd} | grep kanban', 'echo {cmd} | cat',
     "cat <<'EOF' | grep hermes\n{cmd}\nEOF", 'printf %s {quoted}', 'grep -r {quoted} .',
-    'cat <<< {quoted}', 'echo "$(echo {cmd})"', "bash -c cat <<'EOF'\n{cmd}\nEOF",
-    "bash /dev/null <<'EOF'\n{cmd}\nEOF", 'x=$(echo {cmd})', 'echo {cmd} || echo done',
+    'echo {cmd} || echo done',
     'echo {cmd} && echo done', "cat <<'EOF' > notes.txt\n{cmd}\nEOF",
     # Unshadowed controls for review 5914765330: other names, definitions that are only
     # text or a file's contents, and continuations inside single quotes or quoted heredocs.
-    'myecho() {{ "$@"; }}; echo {cmd}', 'function catalog {{ "$@"; }}; cat {quoted}',
+
     "echo 'echo() {{ \"$@\"; }}'; echo {cmd}", "cat <<'EOF' > defs.sh\necho() {{ \"$@\"; }}\nEOF\necho {cmd}",
-    "bash -c 'myecho() {{ \"$@\"; }}; echo {cmd}'", 'grep -c "alias echo=env" notes.txt; echo {cmd}',
+    'grep -c "alias echo=env" notes.txt; echo {cmd}',
     "echo '$\\\n(echo {cmd})'", "cat <<'EOF' > notes.txt\n$\\\n(echo {cmd})\nEOF",
-    '/bin/echo {cmd} | /usr/bin/grep kanban',
 ]
+
+# Explicit contract narrowing, not deletion of controls. These remain inert in
+# real shells, but their syntax is outside G and therefore gets no exemption.
+_FORMER_DATA = [
+    'cat <<< {quoted}', 'echo "$(echo {cmd})"', "bash -c cat <<'EOF'\n{cmd}\nEOF",
+    "bash /dev/null <<'EOF'\n{cmd}\nEOF", 'x=$(echo {cmd})',
+    'myecho() {{ "$@"; }}; echo {cmd}', 'function catalog {{ "$@"; }}; cat {quoted}',
+    "bash -c 'myecho() {{ \"$@\"; }}; echo {cmd}'",
+    '/bin/echo {cmd} | /usr/bin/grep kanban',
+    "cat <<-'EOF'\n\t{cmd}\n\tEOF",
+]
+
+
+@pytest.mark.parametrize('shape', _FORMER_DATA)
+def test_former_data_outside_g_is_detected(tmp_path, shape):
+    command = _shape(shape)
+    assert not core._shell_commands().within_inert_grammar(command)
+    assert hits(command)
+    assert plugin.consent_mod.write_texts('terminal', {'command': command})
+    assert not _shell_ran(tmp_path, command)
 
 
 @pytest.mark.parametrize('shape', _STILL_DATA)
@@ -442,6 +510,6 @@ def test_comment_hook_still_refuses_real_calls(tmp_path, monkeypatch, wrap):
     assert plugin._pre_tool_call('terminal', {'command': command})['action'] == 'block'
     assert plugin._pre_tool_call('terminal', {'command': 'echo ' + shlex.quote(command)}) is None
     assert plugin._pre_tool_call('terminal', {
-        'command': 'bash /dev/null -c ' + shlex.quote(cmd)}) is None
+        'command': 'bash /dev/null -c ' + shlex.quote(cmd)})['action'] == 'block'
     # The card's original bug: unquoted echo of the call is text, not a call.
     assert plugin._pre_tool_call('terminal', {'command': 'echo ' + cmd}) is None

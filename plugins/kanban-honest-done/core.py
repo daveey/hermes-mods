@@ -673,31 +673,10 @@ def _opt(tokens: list[str], *names: str) -> Optional[str]:
 
 
 def _kanban_verb(seg: list[str]) -> Optional[tuple[str, list[str]]]:
-    """``(verb, args after verb)`` for a ``hermes kanban <verb> ...`` call in this argv.
-
-    Exact at the executable position. Known data commands (echo, printf, grep ...), by
-    bare name or from /bin or /usr/bin, never run their arguments; when the input
-    redefines one, the shell scanner also returns its arguments as the command it may
-    run, so that call is its own segment. Any other command word may run its arguments
-    (nice, xargs, sudo, find -exec, ./cat ...), so it keeps the fail-closed rule: any
-    ``hermes kanban`` token pair is a call.
-    """
-    shell = _shell_commands()
-    i = shell.command_start(seg)
-    if i >= len(seg):
+    """Any-position matching unless the WHOLE input proves a data exemption in G."""
+    if _shell_commands().exempt_segment(seg):
         return None
-    name = os.path.basename(seg[i])
-    if shell.data_word(seg[i]):
-        return None
-    if name in {"hermes", "hermes.exe", "hermes_cli.main"}:
-        return _verb_after(seg, i + 1)
-    if re.fullmatch(r"python(?:\d+(?:\.\d+)?)?", name):
-        j = i + 1
-        while j < len(seg) and seg[j] in {"-I", "-B", "-u", "-E", "-s", "-S"}:
-            j += 1
-        if seg[j:j + 2] == ["-m", "hermes_cli.main"]:
-            return _verb_after(seg, j + 2)
-    for k in range(i + 1, len(seg)):
+    for k in range(1, len(seg)):
         if (os.path.basename(seg[k]) == "kanban" and os.path.basename(seg[k - 1]) in ("hermes", "hermes.exe")
                 or seg[k] == "kanban" and seg[k - 1].endswith("hermes_cli.main")):
             hit = _verb_after(seg, k)
