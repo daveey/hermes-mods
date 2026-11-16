@@ -63,8 +63,8 @@ branch, check the pinned branch back out, and carry on in a worktree.
 ## Use the script
 
 `scripts/wait_for_ci.py` (in this skill's dir). Run it from inside the repo checkout; it needs `git` and an authenticated `gh`.
-From any other directory (e.g. `~`), `--gh-repo OWNER/NAME` makes it use that repo's `~/code/<name>` checkout (exact
-`origin` match); with no such checkout it exits 1 at once, before any git or gh call.
+From any other directory, `--gh-repo OWNER/NAME` uses that repo's `~/code/<name>` checkout (exact `origin` match) and exits 1 (`not a git checkout`) without one: pass
+`--repo <checkout>` too (hub state PRs: `~/.hermes/repos/hermes-state`; a bare clone fails the same), or pin the run (`--run-id RUN --head-sha SHA`).
 
 ```bash
 S=<this skill dir>/scripts/wait_for_ci.py
@@ -171,7 +171,7 @@ A user-approved batch through ONE full suite: acceptance is the batch's evidence
   shard counts vs timeouts) and known failure classes (JS fixture socket paths, Hermes E2E daemon leaks, Docker
   gha cache export, gitleaks on self-hosted runners): `references/ci-authoring-and-failure-fixes.md`.
 
-- On hermes-hub, bare `gh` is unauthenticated: a background `wait_for_ci.py` dies with `gh kept failing` ("gh auth login"). Wrap the whole script: `token-broker exec --scope user/github --reason '...' -- python3 -B $S <sha> ...`, and check it with `--once` first. The hub has no `~/code/hermes` checkout, so a sha wait with `--gh-repo` alone (or `--repo` on a bare clone) exits 1 (`not a git checkout`): add `--repo ~/.hermes/repos/hermes-state` (branch `state`), or pin the run (`--run-id RUN --head-sha SHA`), which needs no checkout.
+- On hermes-hub, bare `gh` is unauthenticated: a background `wait_for_ci.py` dies with `gh kept failing` ("gh auth login"). Wrap the whole script: `token-broker exec --scope user/github --reason '...' -- python3 -B $S <sha> ...`, and check it with `--once` first.
 - When `gh` is only reachable through a broker wrapper (`token-broker exec ... -- gh`), never put a `gh -> wrapper` symlink first on PATH for `wait_for_ci.py`: the wrapper's inner `gh` resolves to the symlink again and recurses (dozens of `github_quota.py` guards, ledger `database is locked`, every call exits 75 `TimeoutExpired`). Use a shim script that removes its own dir from PATH before exec'ing the wrapper.
 - A job cancelled with the check annotation `repository transferred` (`gh api repos/R/check-runs/<job>/annotations`) is the repo moving owner, not a flake or a code failure. Confirm with `gh api repos/OLD --jq .full_name`. After a transfer, self-hosted autoscalers bound to the old owner may stop registering runners, so a `rerun --failed` stays queued. Check `actions/runners` for online runners with the job's labels before waiting again, and file an owner card for the fleet.
 - Wrap the broker in a shell function (`g(){ token-broker exec --scope user/github --reason "..." -- gh "$@"; }`), not an unquoted `$TB` variable: word-splitting the reason makes the broker exec a word from it as the command.

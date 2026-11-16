@@ -55,7 +55,15 @@ that cache: core never publishes an older answer under the newer key.
 
 ## Host pass
 
-`wake_tick` (the host pass's wake step) computes the same inputs (whole rows) inside its proof pass.
+`wake_tick` (the host pass's wake step) computes host inputs (whole rows) inside its proof pass.
+Unlike the portable waiting-source key, host board/shadow keys use core's coverage-checked
+`kanban_task_change.changed_since` cursor to ignore changes positively attributed to tasks outside the pending
+batch tails. Batch-tail growth, a relevant task/link change, a file/schema replacement, revision regression,
+unknown/full changes, missing coverage or an older core all refresh the broad key. Shadow freshness is still
+judged on every tick. This memo is process-local; the waiting-source key is unchanged. Owner-wake retains the
+**global** board/shadow keys because parked cards need not occur in any batch. Wake and watchdog also key the
+unseen-notice map (subscriptions may name non-batch tasks), and wake's row cache keys it too: clearing unseen
+notices must reconsider an idle row immediately. These are input probes, not repeated verdict/proof work.
 - A row that was **quiet** under exactly its current key is not judged again. Quiet means: no close-out key, no ask
   key, no unlinked entry, no missing or stranded batch entry, nothing written.
 - A row with a close-out or ask key that was judged **not due** and wrote nothing is *idle* under its key until its
