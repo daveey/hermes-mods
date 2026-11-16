@@ -218,7 +218,7 @@ def shell_write_texts(command: str) -> list[str]:
             continue
         shell = core._shell_commands()
         start = shell.command_start(seg)
-        if start >= len(seg) or os.path.basename(seg[start]) in shell.DATA_COMMANDS:
+        if start >= len(seg) or shell.data_word(seg[start]):
             continue
         # hermes-hub at the executable position, or in the arguments of another command
         # that may run it (nice, sudo, xargs ...): fail closed.
