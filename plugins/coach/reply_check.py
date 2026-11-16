@@ -3161,6 +3161,13 @@ def report_only_guard(user_ask: str, reply: str, tool_log: Optional[list] = None
     "lifecycle_park"), else None. `now` dates the board read (replays)."""
     if scope_limited(user_ask):
         return "scope_limited"
+    # The dispatcher explicitly forbids a chat takeover during admission holds.
+    # Honor its closing instruction before deterministic queue/relay pressure too.
+    # Require a notice and its exact suffix: quoted policy or a new user request
+    # must not exempt unrelated work (agent-62d180590b).
+    if notice_turn(user_ask) and (user_ask or "").rstrip().endswith(
+            "Do not run its work outside the dispatcher."):
+        return "dispatcher_scope"
     if scheduled_wait_status(user_ask, reply):
         return "scheduled_wait"
     if continued_run(tool_log):
