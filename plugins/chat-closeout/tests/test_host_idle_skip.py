@@ -326,3 +326,135 @@ def test_a_waiting_card_going_stalled_is_judged_when_its_age_arrives(world, spy,
     _host_tick(spy, clock, typing)
     plugin.owner_wake_tick()
     assert len(reads) == 2
+
+
+def revision_board(world):
+    from hermes_cli import kanban_activity_revision as rev
+    with sqlite3.connect(world['board']) as conn:
+        rev.ensure_revision(conn, rev.LOCAL_TABLES)
+        conn.execute("INSERT INTO tasks VALUES ('other-task', 'not in a batch', 'running', NULL, NULL)")
+
+
+def test_unrelated_board_churn_does_not_defeat_host_skip(world, spy, clock):
+    revision_board(world)
+    typing = lambda: clock.wall - 10
+    tick(spy, typing)
+    tick(spy, typing)
+    spy['reset']()
+    before = counters()
+    with sqlite3.connect(world['board']) as conn:
+        conn.execute("UPDATE tasks SET title='changed elsewhere' WHERE id='other-task'")
+    clock.wall += 30
+    tick(spy, typing)
+    assert world['work'] == {'reconcile_done': [], 'read_cards': 0}
+    assert spy['writes'] == [] and spy['last_user'] == 0
+    assert counters()['skips'] == before['skips'] + 1
+
+
+def test_scoped_host_inputs_still_move_for_relevant_change_and_new_tails(world, spy, clock):
+    revision_board(world)
+    rows = plugin._pending_rows()
+    first = plugin._input_parts(rows, clock.wall, host=True)
+    with sqlite3.connect(world['board']) as conn:
+        conn.execute("UPDATE tasks SET status='blocked' WHERE id='other-task'")
+    assert plugin._input_parts(rows, clock.wall, host=True) == first
+    # New batch tails must not adopt a memo that ignored this task's prior changes.
+    added = [dict(r, batch=r['batch'] + ['other-task']) if r['session_id'] == 'c1' else r for r in rows]
+    grown = plugin._input_parts(added, clock.wall, host=True)
+    assert grown['boards'] != first['boards']
+    with sqlite3.connect(world['board']) as conn:
+        conn.execute("UPDATE tasks SET status='running' WHERE id='t_2'")
+    assert plugin._input_parts(added, clock.wall, host=True)['boards'] != grown['boards']
+
+
+def test_unseen_change_outside_batch_defeats_host_skip(world, spy, clock, monkeypatch):
+    revision_board(world)
+    unseen = {}
+    monkeypatch.setattr(plugin, '_unseen_counts', lambda: dict(unseen))
+    rows = plugin._pending_rows()
+    first = plugin._input_parts(rows, clock.wall, host=True)
+    unseen['c1'] = 1
+    assert plugin._input_parts(rows, clock.wall, host=True) != first
+
+
+def test_unseen_clearing_rejudges_warm_rows_and_wakes(world, spy, clock, monkeypatch):
+    unseen = {'c1': 1, 'c2': 1}
+    monkeypatch.setattr(plugin, '_unseen_counts', lambda: dict(unseen))
+    tick(spy)
+    tick(spy)
+    spy['reset']()
+    unseen.clear()
+    clock.wall += 30
+    tick(spy)
+    assert sorted(set(spy['woken'])) == ['c1', 'c2']
+
+
+@pytest.mark.parametrize('mutation', ['relevant-delete', 'drop-trigger', 'reinstall', 'replace-file'])
+def test_scoped_key_fails_closed_on_relevant_or_unvouched_change(world, spy, clock, mutation):
+    from hermes_cli import kanban_activity_revision as rev
+    revision_board(world)
+    path = world['board']
+    first, _ = plugin._host_board_key(path, {'t_1'})
+    if mutation == 'replace-file':
+        replacement = path.with_name('new-board.db')
+        with sqlite3.connect(path) as src, sqlite3.connect(replacement) as dst:
+            src.backup(dst)
+        replacement.replace(path)
+    else:
+        with sqlite3.connect(path) as conn:
+            if mutation == 'relevant-delete':
+                conn.execute("DELETE FROM tasks WHERE id='t_1'")
+            elif mutation == 'drop-trigger':
+                conn.execute('DROP TRIGGER kanban_activity_rev_tasks_update')
+                conn.execute("UPDATE tasks SET title='unvouched' WHERE id='t_1'")
+            else:
+                rev.drop_triggers(conn)
+                rev.ensure_revision(conn, rev.LOCAL_TABLES)
+    after, broad = plugin._host_board_key(path, {'t_1'})
+    assert after == broad and after != first
+
+
+def test_shadow_unrelated_changes_skip_but_freshness_and_batch_changes_do_not(world, spy, clock, monkeypatch):
+    from hermes_cli import kanban_activity_revision as rev
+    root = world['board'].parent
+    monkeypatch.setattr(plugin, '_kanban_root', lambda: root)
+    path = root / 'kanban' / 'sync-shadow' / 'example.db'
+    path.parent.mkdir(parents=True)
+    with sqlite3.connect(path) as conn:
+        conn.execute('CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT)')
+        rev.ensure_revision(conn, rev.SHADOW_TABLES)
+        conn.executemany('INSERT INTO tasks VALUES (?,?)', [('t_1', 'batch'), ('other', 'elsewhere')])
+    fresh = [True]
+    monkeypatch.setattr(plugin, '_read_shadow', lambda *a: (fresh[0], set()))
+    first = plugin._shadow_parts(clock.wall, host_tails={'t_1'})
+    globals_before, globals_after = [], []
+    plugin._shadow_parts(clock.wall, host_tails={'t_1'}, global_out=globals_before)
+    with sqlite3.connect(path) as conn:
+        conn.execute("UPDATE tasks SET title='changed' WHERE id='other'")
+    assert plugin._shadow_parts(clock.wall, host_tails={'t_1'}, global_out=globals_after) == first
+    assert globals_after != globals_before
+    fresh[0] = False
+    assert plugin._shadow_parts(clock.wall, host_tails={'t_1'}) != first
+    fresh[0] = True
+    with sqlite3.connect(path) as conn:
+        conn.execute("UPDATE tasks SET title='changed batch' WHERE id='t_1'")
+    assert plugin._shadow_parts(clock.wall, host_tails={'t_1'}) != first
+
+
+def test_owner_wake_keeps_global_key_on_unrelated_board_churn(world, spy, clock, monkeypatch):
+    revision_board(world)
+    reads = []
+    monkeypatch.setattr(plugin, '_parked_waits', lambda ksa, now: reads.append(1) or [])
+    typing = lambda: clock.wall - 10
+    _host_tick(spy, clock, typing)
+    plugin.owner_wake_tick()
+    clock.wall += 30
+    _host_tick(spy, clock, typing)
+    plugin.owner_wake_tick()
+    assert len(reads) == 1
+    with sqlite3.connect(world['board']) as conn:
+        conn.execute("UPDATE tasks SET status='blocked' WHERE id='other-task'")
+    clock.wall += 30
+    _host_tick(spy, clock, typing)
+    plugin.owner_wake_tick()
+    assert len(reads) == 2

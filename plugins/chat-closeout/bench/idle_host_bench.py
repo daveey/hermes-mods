@@ -48,6 +48,7 @@ def main() -> int:
     ap.add_argument("--tasks", type=int, default=600)
     ap.add_argument("--replica-rows", type=int, default=3000)
     ap.add_argument("--ticks", type=int, default=12)
+    ap.add_argument("--unrelated-churn", action="store_true", help="change a non-batch board task each tick")
     ap.add_argument("--json", type=Path)
     args = ap.parse_args()
     sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -77,6 +78,13 @@ def main() -> int:
         for i in range(args.working):
             batch = rng.sample(running, 2)
             led.write(next(sids), batch=batch, open=batch)
+        churn_id = None
+        if args.unrelated_churn:
+            from hermes_cli import kanban_activity_revision as rev
+            used = {k for r in led.pending() for k in r['batch']}
+            churn_id = next(t for t in tids if t not in used)
+            with sqlite3.connect(world['board']) as conn:
+                rev.ensure_revision(conn, rev.LOCAL_TABLES)
         plugin.ledger = lambda: led
         plugin.board_paths = lambda: [world["board"]]
         plugin.state_dbs = lambda: [home / "state.db"]
@@ -121,6 +129,9 @@ def main() -> int:
             clock.advance(TICK_S)
             with sqlite3.connect(world["hub"]) as conn:  # the hub syncs: last_ok moves, nothing else
                 conn.execute("INSERT OR REPLACE INTO meta VALUES ('last_ok', ?)", (str(clock.wall),))
+            if churn_id is not None:
+                with sqlite3.connect(world['board']) as conn:
+                    conn.execute('UPDATE tasks SET title=? WHERE id=?', (f'unrelated tick {clock.wall}', churn_id))
             c0 = time.thread_time()
             plugin._host_pass(False)
             totals.append((time.thread_time() - c0) * 1000.0)

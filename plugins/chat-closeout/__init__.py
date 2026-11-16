@@ -1814,7 +1814,43 @@ def _lineages_locked(sids: list[str]) -> Optional[dict[str, list]]:
     return {sid: wi.lineage_key(marks, ids_of(sid)) for sid in sids}
 
 
-def _shadow_parts(now: float) -> list:
+_host_board_lock = threading.Lock()
+
+
+def _host_board_key(path: Path, tails: set[str], tables=None) -> tuple[str, str]:
+    """Host-only scoped/global board keys. Ignore only changes positively attributed to non-batch tasks.
+
+    The core cursor vouches for trigger coverage, file/schema identity, regression and unknown/full changes.
+    Older cores and unvouched boards retain the broad key. Read the cursor BEFORE the fresh broad key: a write
+    between them is seen again next tick, never consumed behind an older key. Waiting-source keys stay portable
+    and unchanged; owner-wake keeps the global key because it reads parked cards outside every batch.
+    """
+    from hermes_cli import kanban_session_activity as ksa
+    with _host_board_lock:
+        cache = _wi.setdefault("host_boards", {})
+        ident = (str(path), tuple(tables) if tables is not None else None)
+        hit = cache.get(ident)
+        cursor = changed = None
+        full = True
+        try:
+            from hermes_cli import kanban_task_change as tc
+            with _ro(path) as conn:
+                changed, cursor = tc.changed_since(conn, hit[1] if hit else None, tables=tables)
+            full = changed is tc.FULL or cursor is None
+        except (ImportError, AttributeError, OSError, sqlite3.Error):
+            pass  # no trusted cursor: the old broad key remains the backstop, not a TTL
+        broad = wi.portable_digest(ksa._board_content_key(path, tables) if tables is not None
+                                   else ksa._board_content_key(path))
+        scoped = (hit[2] if hit is not None and hit[0] == frozenset(tails) and not full
+                  and not (set(changed) & tails) else broad)
+        if cursor is not None:
+            cache[ident] = (frozenset(tails), cursor, scoped)
+        else:
+            cache.pop(ident, None)
+        return scoped, broad
+
+
+def _shadow_parts(now: float, *, host_tails: Optional[set[str]] = None, global_out: Optional[list] = None) -> list:
     """Each sync shadow / link-only board ``_board_coverage`` may consult: its content key and its freshness at now."""
     from hermes_cli import kanban_session_activity as ksa
     kanban = _kanban_root() / "kanban"
@@ -1828,12 +1864,20 @@ def _shadow_parts(now: float) -> list:
         path = kanban / "sync-shadow" / f"{stem}.db"
         if not path.is_file():
             out.append([stem, None, False])
+            if global_out is not None:
+                global_out.append([stem, None, False])
             continue
         try:
             fresh, _found = _read_shadow(stem, set())
         except Exception:
             fresh = None
-        out.append([stem, wi.portable_digest(ksa._board_content_key(path, tables)), fresh])
+        if host_tails is None:
+            scoped = broad = wi.portable_digest(ksa._board_content_key(path, tables))
+        else:
+            scoped, broad = _host_board_key(path, host_tails, tables)
+        out.append([stem, scoped, fresh])
+        if global_out is not None:
+            global_out.append([stem, broad, fresh])
     return out
 
 
@@ -1866,19 +1910,37 @@ def _input_parts(rows: list[dict], now: float, *, host: bool = False) -> dict[st
     if lineages is None:
         raise LookupError("a state.db is unreadable")
     stale_after = float(getattr(ksa, "HUB_STALE_AFTER_S", wi.HUB_STALE_AFTER_S))
-    return {
+    boards, global_boards, global_shadows = [], [], []
+    for p in board_paths():
+        path = Path(p)
+        if host:
+            scoped, broad = _host_board_key(path, tails)
+        else:
+            scoped = broad = wi.portable_digest(ksa._board_content_key(path))
+        boards.append([str(p), scoped])
+        global_boards.append([str(p), broad])
+    shadows = (_shadow_parts(now, host_tails=tails, global_out=global_shadows) if host else _shadow_parts(now))
+    if host:
+        _state["host_globals"] = {"boards": global_boards, "shadows": global_shadows}
+    parts = {
         "v": [wi.VERSION, "host" if host else "waiting"],
         "scope": list(ksa._origin_scope()) if hasattr(ksa, "_origin_scope") else None,
         "ledger": str(ledger().path),
         "rows": [[r["session_id"], _host_row(r) if host else [[f, r.get(f)] for f in core.SETTLE_ROW_FIELDS]]
                  for r in rows],
         "origin": _origin_digest(),
-        "boards": [[str(p), wi.portable_digest(ksa._board_content_key(Path(p)))] for p in board_paths()],
-        "shadows": _shadow_parts(now),
+        "boards": boards,
+        "shadows": shadows,
         "replica": replica.key(now, stale_after),
         "lineage": [[s, lineages[s]] for s in sids],
         "floor": int(now // wi.FLOOR_S),
     }
+    if host:
+        unseen = _unseen_counts()
+        if unseen is None:
+            raise LookupError("unseen subscriptions unreadable")
+        parts["unseen"] = sorted(unseen.items())  # subscribed tasks need not be in any pending batch
+    return parts
 
 
 def waiting_inputs() -> Any:
@@ -2116,7 +2178,8 @@ def wake_tick(*, now: Optional[float] = None, wake: Optional[Callable[..., str]]
                 logger.debug("chat-closeout: host inputs unavailable; full pass", exc_info=True)
                 rows, parts = None, None
                 acct.fallback()
-            _state["host_inputs"] = ({"mono": time.monotonic(), "parts": parts, "rows": rows}
+            _state["host_inputs"] = ({"mono": time.monotonic(), "parts": parts, "rows": rows,
+                                      "globals": dict(_state.get("host_globals") or {})}
                                      if parts is not None else None)  # the tick's owner wake and watchdog reuse them
             memo = _state.get("host_memo")
             if (parts is not None and memo is not None and memo == parts
@@ -2193,12 +2256,16 @@ def _idle_until(row: dict, last_user_at: float, now: float) -> float:
     return until
 
 
-def _host_row_key(row: dict, cards: Any, lineages: Optional[dict[str, list]], now: float) -> Optional[str]:
+def _host_row_key(row: dict, cards: Any, lineages: Optional[dict[str, list]], now: float,
+                  unseen: Optional[dict[str, int]] = None) -> Optional[str]:
     """A host-pass row's inputs: the whole ledger row, its cards as read (full read), its lineage watermark and
     the floor bucket (a missed input is re-judged within ``FLOOR_S``)."""
     if lineages is None:
         return None
-    return wi.row_key(row, cards, lineages.get(row["session_id"]), extra=int(now // wi.FLOOR_S))
+    # Unseen notices may belong to subscribed cards outside the batch. A warm row must re-judge when delivery
+    # clears them, even when its own cards and transcript did not move (the host memo alone is not sufficient).
+    return wi.row_key(row, cards, lineages.get(row["session_id"]),
+                      extra=[int(now // wi.FLOOR_S), sorted((unseen or {}).items())])
 
 
 def _row_quiet(row: dict, cards: Any) -> bool:
@@ -2239,7 +2306,7 @@ def _wake_tick(*, now, wake, unseen, last_user, read, proof, mono=None, healthy=
     for row in pending:
         sid = row["session_id"]
         cards = core.canonical_view(read(row["batch"]))
-        hkey = _host_row_key(row, cards, lineages, now)
+        hkey = _host_row_key(row, cards, lineages, now, unseen)
         hit = quiet_rows.get(sid, hkey)
         if hit is not None:
             # Quiet under exactly these inputs last pass: the same reads decide the same nothing. An idle row
@@ -2630,7 +2697,7 @@ def owner_wake_tick(*, now: Optional[float] = None, cards: Optional[list[dict]] 
             and dependents is None and now is None):
         hi = _host_inputs()
         if hi is not None:
-            p = hi["parts"]
+            p = {**hi["parts"], **hi.get("globals", {})}  # owner wake reads parked cards outside every batch
             key = [[p.get(k) for k in ("scope", "origin", "boards", "shadows", "replica", "floor")],
                    bool(relay_refused), _server() is not None]
             memo = _state.get("owner_memo")
