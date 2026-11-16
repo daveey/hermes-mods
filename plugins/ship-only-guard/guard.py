@@ -858,8 +858,13 @@ class _CarryObjects:
             if self._tmp is None:       # a retry after an expired attempt reuses (and so still removes) it
                 cache = Path(self.env.get("HERMES_HOME", str(Path.home() / ".hermes"))) / "cache"
                 cache.mkdir(parents=True, exist_ok=True)
-                self._tmp = tempfile.TemporaryDirectory(prefix="ship-carry-", dir=cache,
-                                                        ignore_cleanup_errors=True)
+                # ignore_cleanup_errors exists only on Python 3.10+, and gh-shim can run the guard under
+                # Apple's /usr/bin/python3 3.9 (t_01a1e2f9c67ad78b); close() tolerates a failed cleanup anyway.
+                if sys.version_info >= (3, 10):
+                    self._tmp = tempfile.TemporaryDirectory(prefix="ship-carry-", dir=cache,
+                                                            ignore_cleanup_errors=True)
+                else:
+                    self._tmp = tempfile.TemporaryDirectory(prefix="ship-carry-", dir=cache)
                 self.path = self._tmp.name
         except OSError as e:
             return f"git cache could not complete ({type(e).__name__})"
@@ -1002,7 +1007,10 @@ class _CarryObjects:
     def close(self):
         self._settled.set()
         if self._tmp is not None:
-            self._tmp.cleanup()
+            try:
+                self._tmp.cleanup()
+            except OSError:
+                pass        # a leftover cache dir is harmless; never turn a finished check into a crash
 
 
 def _partial_clone(common_dir):
@@ -2406,7 +2414,9 @@ def _state_merge_scoped(words, repo, cwd, env):
     except _Unreadable as e:
         return failed(f"{e}; nothing was approved or written late")
     except (ValueError, TypeError) as e:
-        return failed(f"`gh pr view {number}` returned an unexpected shape ({type(e).__name__})")
+        # Every stage after the view (review replies, approval/carry, land turn, drift) can raise these: name
+        # the error instead of blaming the view's shape for it (t_01a1e2f9c67ad78b).
+        return failed(" ".join(f"preflight raised {type(e).__name__}: {e}".split())[:160])
 
 
 SYNC_REQUIRED_CHECK = "All required checks pass (v2)"
