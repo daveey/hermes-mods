@@ -106,10 +106,7 @@ dispatches every `--workflow` on the branch. Pass several shas to wait
 until one run or tag contains all of them.
 
 How to run it from an agent:
-- Start it with `terminal(background=true, notify=true)` and end the turn. Don't run a foreground sleep loop,
-  and bound every foreground ssh or wait with `timeout` well under the terminal's cap (420 s here; aim for ~200 s):
-  the call holds the chat's turn until it returns, and messages the user sends meanwhile are refused ("session turn
-  lease wait timed out"). Don't poll a background job either.
+- Start with `terminal(background=true, notify=true)` and end the turn; no foreground sleep loops or background polling. Bound foreground remote probes to ~200 s. Before wrapping a remote wait, read `references/remote-wait-deadlines.md` to budget both deadlines and verify replacement custody.
 - A Hermes update or backend restart stops the chat's background job; it does not survive. On a core with
   91f48a91a20 (and 549b7f1e71b for a turn in flight) the chat is told, except in the cases below. If your turn was running, the
   resumed turn lists the job. If the chat was idle (you started the wait and ended the turn), the next
