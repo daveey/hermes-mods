@@ -82,6 +82,32 @@ REFUSE = {
     "eval-then-pop": "eval \"$(x)\"; git stash pop",
 }
 
+# Review round 1 (PR #252 @64209eb2): a quoted unknown head of a wrapper's argv may be git itself.
+# Scoping its uncertainty must still read that argv as a Git argv, not as text alone.
+_GSO = "G=$(command -v git); S=$(printf stash); O=$(printf pop); "
+WRAPPED_GIT = {
+    "wrapped-flock": _GSO + 'flock /tmp/l "$G" "$S" "$O"',
+    "wrapped-flock-cmdsub": 'S=$(printf stash); O=$(printf pop); flock /tmp/l "$(command -v git)" "$S" "$O"',
+    "wrapped-xargs-herestring": 'G=$(printf git); S=$(printf stash); xargs "$G" "$S" <<< pop',
+    "wrapped-setsid": _GSO + 'setsid -w "$G" "$S" "$O"',
+    "wrapped-ionice": _GSO + 'ionice -c3 "$G" "$S" "$O"',
+    "wrapped-taskset": _GSO + 'taskset -c 0 "$G" "$S" "$O"',
+    "wrapped-strace": _GSO + 'strace -o /dev/null "$G" "$S" "$O"',
+    "wrapped-chronic": _GSO + 'chronic "$G" "$S" "$O"',
+    "wrapped-unbuffer": _GSO + 'unbuffer "$G" "$S" "$O"',
+    "wrapped-uv-run": _GSO + 'uv run "$G" "$S" "$O"',
+    "wrapped-systemd-run": _GSO + 'systemd-run --user --wait "$G" "$S" "$O"',
+    "wrapped-unknown-program": _GSO + 'foo "$G" "$S" "$O"',
+    "wrapped-parallel": _GSO + 'parallel "$G" ::: "$S"',
+    "wrapped-escaped-stash": "G=$(command -v git); S=$(printf '\\x73tash'); flock /tmp/l \"$G\" \"$S\" pop",
+    "wrapped-split-quotes": "G=$(command -v git); S=$(printf st\"\"ash); O=$(printf pop); flock /tmp/l \"$G\" \"$S\" \"$O\"",
+}
+REFUSE.update(WRAPPED_GIT)
+# Wrappers from util-linux/findutils run for real in the restore proof below (skipped if absent).
+_REAL_PROG = {"wrapped-flock": "flock", "wrapped-flock-cmdsub": "flock",
+              "wrapped-xargs-herestring": "xargs", "wrapped-setsid": "setsid",
+              "wrapped-ionice": "ionice", "wrapped-taskset": "taskset"}
+
 
 @pytest.fixture
 def wt(tmp_path, monkeypatch):
@@ -140,7 +166,8 @@ def _bash(cmd, cwd, path_prefix, home):
                    stdin=subprocess.DEVNULL)
 
 
-@pytest.mark.parametrize("name", ["split-head", "stdin-pipe", "stdin-heredoc", "stdin-file"])
+@pytest.mark.parametrize("name", ["split-head", "stdin-pipe", "stdin-heredoc", "stdin-file",
+                                  *_REAL_PROG])
 def test_refused_suffix_shapes_really_restore(wt, tmp_path, name):
     """The refusal is not conservatism alone: run in bash, these pop main's stash into the worktree."""
     fakebin = tmp_path / "fakebin"
@@ -148,8 +175,11 @@ def test_refused_suffix_shapes_really_restore(wt, tmp_path, name):
     (fakebin / "runit").write_text('#!/bin/sh\nexec "$@"\n')  # an unmodeled program that runs its argv
     (fakebin / "runit").chmod(0o755)
     main = wt.parent / "repo"
+    prog = _REAL_PROG.get(name)
+    if prog and not any(os.access(os.path.join(d, prog), os.X_OK) for d in ("/usr/bin", "/bin")):
+        pytest.skip(f"{prog} not installed")
     assert subprocess.run(["git", "stash", "list"], cwd=main, capture_output=True, text=True).stdout
-    _bash(REFUSE[name], wt, fakebin, tmp_path)
+    _bash(REFUSE[name].replace("/tmp/l", str(tmp_path / "lock")), wt, fakebin, tmp_path)
     assert subprocess.run(["git", "stash", "list"], cwd=main, capture_output=True, text=True).stdout == ""
     assert (wt / "f.txt").read_text() == "stashed\n"  # another worktree's change landed here
 
