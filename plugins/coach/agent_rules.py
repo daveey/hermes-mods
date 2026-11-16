@@ -26,6 +26,12 @@ from collections import deque
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+_pr_script_spec = importlib.util.spec_from_file_location(
+    '_coach_pr_script_reads', Path(__file__).with_name('pr_script_reads.py'))
+assert _pr_script_spec and _pr_script_spec.loader
+_pr_script_reads = importlib.util.module_from_spec(_pr_script_spec)
+_pr_script_spec.loader.exec_module(_pr_script_reads)
+
 REPEAT_FAILS = 3          # same command failing N times -> stop and debug
 POLL_WINDOW = 10          # last N tool calls ...
 POLL_HITS = 3             # ... with this many sleep/poll calls -> background + notify
@@ -4281,6 +4287,7 @@ class AgentCoach:
             s["plan_due"] = False
         s["turn_tools"] = 0
         s["turn_log"].clear()
+        s.pop("pr_read_scripts", None)
         s["turn_rich"].clear()
         s.pop("turn_commits", None)
         s.pop("turn_linked", None)
@@ -4606,6 +4613,9 @@ class AgentCoach:
             for line in pr_read_lines(arg) + deploy_read_lines(arg) + setting_read_lines(arg) + quota_read_lines(arg):
                 s["turn_log"].append(line)
                 s["turn_rich"].append(line)
+        for line in _pr_script_reads.observe(s, tool, args, result, not failed(tool, result, status)):
+            s["turn_log"].append(line)
+            s["turn_rich"].append(line)
         if tool == "terminal" and "commit" in arg and "git" in arg:
             s.setdefault("turn_commits", deque(maxlen=20)).append(f"-> terminal({arg[:8000]})")
         if failed(tool, result, status) and not wait_check_not_yet(tool, args, result):
