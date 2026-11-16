@@ -151,8 +151,15 @@ def _is_root_working_directory(value):
     value = value.strip()
     if value[:1] in "|>":  # Block scalar: not resolved; over-report rather than mask a root test run.
         return True
-    value = re.sub(r"^\$\{\{\s*github\.workspace\s*\}\}(?=/|$)", ".", value.strip("\"'"))
-    return posixpath.normpath(value or ".") == "."  # ".", "./", "./.", "${{ github.workspace }}/", empty
+    value = re.sub(r"^\$\{\{\s*github\.workspace\s*\}\}(?=/|$)", ".",
+                   value.strip("\"'"), flags=re.I)
+    # Only simple literal relative paths are understood. Unknown Actions expressions, YAML tags,
+    # anchors/aliases, shell variables and absolute runner paths cannot prove a plugin-local cwd.
+    # Deliberately over-report even quoted constructs rather than interpreting YAML or shell syntax.
+    if not re.fullmatch(r"[A-Za-z0-9_./-]*", value) or value.startswith('/'):
+        return True
+    normalized = posixpath.normpath(value or ".")
+    return normalized in (".", "..") or normalized.startswith('../')
 
 
 def _tests_dir_runs(code):
@@ -434,8 +441,34 @@ class GitleaksProvisionTripwireMutants(unittest.TestCase):
                 with self.subTest(indicator=indicator, value=value):
                     self.assertEqual(_tests_dir_runs(code), [code.index('unittest discover')])
 
+    def test_unresolved_or_nonrelative_directories_are_consumers(self):
+        # Do not evaluate YAML, Actions contexts, shell variables or runner-specific absolute paths.
+        for cwd in ('${{ GITHUB.WORKSPACE }}', '${{ GiThUb.WoRkSpAcE }}/.',
+                    '${{ env.ROOT }}', '${{ inputs.dir }}',
+                    'plugins/${{ inputs.dir }}', '${{ env.ROOT }}/plugins/example',
+                    '!!str .', '*root', '&root .', '!custom plugins/example',
+                    '/home/runner/work/example/example', '/home/runner/work/example/example/plugins/example',
+                    'C:\\actions\\example', '\\\\server\\share',
+                    '$GITHUB_WORKSPACE', '${GITHUB_WORKSPACE}/plugins/example',
+                    '$GITHUB_WORKSPACE/plugins/example', 'plugins/$SUBDIR',
+                    '../example', 'plugins/../../example'):
+            for quoted in (cwd, '"' + cwd + '"', "'" + cwd + "'"):
+                code = (f'      - working-directory: {quoted}\n'
+                        '        run: python -m pytest tests\n')
+                with self.subTest(cwd=quoted):
+                    self.assertEqual(_tests_dir_runs(code), [code.index('pytest')])
+
+    def test_live_consumer_inventory_is_exact(self):
+        self.assertEqual(
+            {path.name for pattern in ('*.yml', '*.yaml') for path in WORKFLOWS.glob(pattern)
+             if _tests_dir_runs(_workflow_code(path.read_text()))},
+            {'plugin-suites.yml', 'repo-guards.yml', 'skill-tests.yml'})
+
     def test_plugin_local_spellings_stay_masked(self):
-        for cwd in ('plugins/example', './plugins/example', '"${{ github.workspace }}/plugins/example"'):
+        for cwd in ('plugins/example', './plugins/example', 'plugins/example/../example',
+                    '"plugins/example"', "'plugins/example'",
+                    '"${{ github.workspace }}/plugins/example"',
+                    '"${{ GITHUB.WORKSPACE }}/plugins/example"'):
             local = (f'      - name: Plugin tests\n        working-directory: {cwd}\n'
                      '        run: python -m pytest tests\n')
             with self.subTest(cwd=cwd):
