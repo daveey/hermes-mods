@@ -214,6 +214,26 @@ carry verdict). Objects are content-addressed, missing ones are fetched, and a
 broken store makes git fail, which refuses; the store is trusted like the local
 `git` binary. An expired deadline during the probe still fails closed.
 Tests: `tests_carry_reference.py`.
+**Lifting shallow cuts whose parents are present (t_01a1e3427f6574fc).** The
+depth bound assumed each merge base sits within 128 commits of its merge's
+tips. State moves about 300 commits a day, so a state PR refreshed after
+sitting approved for most of a day had its carry refused ("fetch depth cuts
+history before the merge base") even when the borrowed store held every
+commit below the cut, and each refresh needed a fresh review. Right after the
+fetch, still under its lock and before any reader runs, each commit the fetch
+recorded in `shallow` is lifted only when every parent named in its raw
+object (`git cat-file commit`, which the graft does not hide) exists as a
+commit (`git cat-file -e <parent>^{commit}`). `shallow` is rewritten
+atomically with the cuts that stay, or removed when none stay. A present
+parent came either from a store `_borrow` validated as non-shallow and
+non-partial (complete ancestry) or from the fetch within depth (its own
+ancestry present or still cut), and a missing ancestor makes git fail, which
+refuses. A cut with any absent parent stays, and a failed read, parent probe
+or rewrite leaves `shallow` unchanged, so the refusal stands. The fetch, the
+merge-base rules and every refusal text are unchanged. Measured on PR #3381's
+refresh merge (its merge base 322 commits below the merged state tip): with
+`~/code/hermes` borrowed, the carry verdict went from the depth refusal to
+clean in 6.0 s. Tests: `tests_carry_lift.py`, `tests_carry_credentials.py`.
 Any failed or odd read refuses with the
 reason; a blocking verdict on H itself is never overridden. Base drift is
 checked separately and still applies. Why: #1812, #1837 and #2438 were refused

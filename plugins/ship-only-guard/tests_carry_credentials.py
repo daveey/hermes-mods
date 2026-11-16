@@ -13,7 +13,7 @@ spec.loader.exec_module(g)
 
 @pytest.mark.parametrize("shallow", [False, True])
 def test_native_carry_passes_ephemeral_credential_helper_to_every_git_process(tmp_path, monkeypatch, shallow):
-    merge, ours, theirs, base, tree = (digit * 40 for digit in "12345")
+    merge, ours, theirs, base, tree, below = (digit * 40 for digit in "123456")
     home = tmp_path / "home"
     home.mkdir()
     calls = []
@@ -23,6 +23,8 @@ def test_native_carry_passes_ephemeral_credential_helper_to_every_git_process(tm
         "init": "", "fetch": "", "show": f"{ours} {theirs}",
         "merge-base": base, "rev-list": f"{ours}\n{theirs}",
         "merge-tree": tree, "rev-parse": tree,
+        # The shallow-cut lift (t_01a1e3427f6574fc) reads the cut's raw parents, then probes each one.
+        "cat-file": f"tree {tree}\nparent {below}\n\ncut commit",
     }
 
     def run(argv, *, cwd, env, capture_output, text, timeout):
@@ -48,6 +50,8 @@ def test_native_carry_passes_ephemeral_credential_helper_to_every_git_process(tm
         assert command in outputs, f"unexpected process (including persistent config write): {argv!r}"
         calls.append(args)
         scratch_dirs.append(Path(cwd))
+        if args[:2] == ["cat-file", "-e"]:
+            return subprocess.CompletedProcess(argv, 1, "", "")    # parent absent: the cut stays
         if command == "fetch":
             assert args == ["fetch", "--quiet", "--no-tags", "--no-recurse-submodules", "--depth=128",
                             "https://github.com/example/protected.git", merge, ours, theirs]
@@ -62,10 +66,12 @@ def test_native_carry_passes_ephemeral_credential_helper_to_every_git_process(tm
         "GIT_CONFIG_VALUE_0": "store",
     })
     assert result == ""
-    expected = ["init", "fetch", "show", "merge-base"]
+    expected = ["init", "fetch"] + (["cat-file", "cat-file"] if shallow else []) + ["show", "merge-base"]
     if shallow:
         expected.append("rev-list")
     assert [args[0] for args in calls] == expected + ["merge-tree", "rev-parse"]
+    assert [args for args in calls if args[0] == "cat-file"] == (
+        [["cat-file", "commit", base], ["cat-file", "-e", below + "^{commit}"]] if shallow else [])
     assert len(set(scratch_dirs)) == 1
     assert not scratch_dirs[0].exists()
     # No helper/auth configuration or credentials are persisted under isolated HOME.
