@@ -1608,6 +1608,11 @@ def _live_turns(repo, cwd, env, own_number=None):
                          cwd, env, timeout=_TURN_CALL_TIMEOUT)
     if rc != 0 or not isinstance(pages, list) or not all(isinstance(p, list) for p in pages):
         raise _Unreadable("cannot list complete state land turns")
+    # Match the observer's full-inventory ceiling. Count retained/expired and
+    # nonnumeric rows too: truncating before selection can hide a live holder.
+    cache["turn_inventory_count"] = sum(len(page) for page in pages)
+    if cache["turn_inventory_count"] > 4096:
+        raise _Unreadable("state land-turn inventory exceeds 4096; leased maintenance required")
     refs = [r for page in pages for r in page if _turn_number(r) >= 0]
     cache.pop(("own", own_number), None)
     if own_number is not None:
@@ -2121,6 +2126,20 @@ def _turn_acquire_scoped(number, data, repo, cwd, env, prechecked):
             rec = parse_turn(obj.get("message")) if rc2 == 0 and isinstance(obj, dict) else None
             if rec and rec["pr"] != int(number):
                 rec = None
+    if not previous and _cache().get("turn_inventory_count", 0) >= 4096:
+        return ("[ship-only-guard] Refused state merge: land-turn inventory is full; "
+                "no new ref published. Leased maintenance required.")
+    if previous:
+        # A malformed message on a commit is repairable; a tree/blob/missing
+        # target cannot be the sole parent of a new ticket. Never fall back to
+        # the PR head, which would discard the concurrency fence.
+        obj = _cache().get("obj", {}).get(previous)
+        if obj is None or not isinstance(obj, dict) or not isinstance(obj.get("message"), str):
+            rc_old, obj = _gh_call([f"repos/{repo}/git/commits/{previous}"], cwd, env,
+                                   timeout=_TURN_CALL_TIMEOUT)
+            if rc_old != 0 or not isinstance(obj, dict) or not isinstance(obj.get("message"), str):
+                return ("[ship-only-guard] Refused state merge: existing land-turn target is not a readable commit; "
+                        "no replacement attempted. Repair requires fenced maintenance or close the owning PR.")
     if rec is not None:
         if rec and rec["expires"] > _now():
             if _turn_yielded(rec, data, repo, cwd, env):

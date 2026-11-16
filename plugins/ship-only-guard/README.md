@@ -19,7 +19,8 @@ its own copied context with the same deadline, and is joined before return.
 Independent carry patch reads, blob reads, and the two clean-merge checks run in
 parallel. Both the API tree/content prefilter and authoritative Git merge-tree
 must still pass. Approval and a **read-only** land-turn scan overlap; that scan
-never deletes refs speculatively. Non-speculative turn readers retain cleanup.
+never deletes refs speculatively. All turn readers retain physical refs to avoid
+stale-snapshot deletion of a newer admission.
 The mutable base-drift read stays **last**, after approval/hold checks, so the
 optimization does not widen the final base-read race. Optional turn acquisition
 starts only when its budget fits; lack of time never changes a refusal to allow.
@@ -403,10 +404,27 @@ not page number, for at most five pages of 100 events. GitHub does not document
 activity retention. A base outside the available chain/page bound fails closed;
 its holder cannot yield on drift age and may retain priority until ticket expiry.
 
-After expiry there is a further 90-minute cooldown before reacquisition. Cleanup
-is limited to two past-cooldown records per snapshot. A malformed open peer
-record names its ref and refuses; the owner can repair its own record through
-normal acquisition (after checking other holders), or close/merge its PR.
+After expiry there is a further 90-minute cooldown before reacquisition. Readers
+never delete refs: REST deletion has no expected-OID fence, and an expired
+snapshot can already have been replaced. Retention is one ref per participating
+PR, not globally bounded storage. A complete listing above 4096 rows fails closed
+before reading objects; at 4096, acquisition refuses to add another ref. Concurrent
+admissions can still cross this ceiling; the post-write complete read then refuses.
+This bounds accepted inventory, not `gh --slurp` response memory or server storage.
+Recovery needs maintenance with an exact-OID lease and retired old writers; do not
+substitute a GET followed by an unfenced DELETE. No automated collector is supplied.
+
+Create conflict never force-overwrites a winner. Rearm uses the observed ticket OID
+as its sole parent and non-force PATCH: sibling generations cannot fast-forward
+over each other. This relies on retiring old force-update/delete writers before
+rollout; it is not general REST compare-and-swap. An ambiguous write refuses and
+reports that publication may have succeeded; retry reads the original age/deadline.
+
+A malformed open peer record names its ref and refuses. The owner can repair a
+malformed message on a real commit through normal acquisition after checking other
+holders. Missing/tree/blob targets cannot become commit parents: acquisition refuses
+without replacing the ref. Close/merge the owning PR to release its semantic hold,
+or use fenced maintenance to repair the ref; never force-patch it as recovery.
 Malformed closed records do not block. No peer's live malformed ref is edited
 or deleted as recovery. State pre-push requires protocol 2 and invokes this same
 reader and selector for direct non-export pushes, instead of reconstructing
