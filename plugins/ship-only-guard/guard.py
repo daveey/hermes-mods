@@ -27,6 +27,9 @@ PREFLIGHT_TIMEOUT = 18.0
 _PREFLIGHT_DEADLINE: ContextVar[float | None] = ContextVar("ship_preflight_deadline", default=None)
 _PREFLIGHT_STAGE = ContextVar("ship_preflight_stage", default="command inspection")
 _TURN_READ_ONLY = ContextVar("ship_turn_read_only", default=False)
+# Provisional own eligibility is valid ONLY inside merge's speculative hold:
+# successful approval plus the final fresh drift read must still admit it.
+_MERGE_OWN_ELIGIBILITY = ContextVar("ship_merge_own_eligibility", default=False)
 
 
 
@@ -1707,7 +1710,7 @@ def _turn_yielded(rec, data, repo, cwd, env):
     return cache[key]
 
 
-def _turn_yielded_uncached(rec, data, repo, cwd, env):
+def _turn_yielded_uncached(rec, data, repo, cwd, env, *, defer_own_drift=False):
     head = data.get("headRefOid")
     if (not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head)
             or not isinstance(data.get("reviews"), list) or not isinstance(data.get("comments"), list)
@@ -1726,6 +1729,12 @@ def _turn_yielded_uncached(rec, data, repo, cwd, env):
         return True
     # Ticket age is not drift age: new drift gets a full refresh window even during long CI.
     if _now() - _turn_order(rec)[0] >= _TURN_REFRESH_GRACE:
+        if defer_own_drift:
+            # No yield-cache entry: acquisition/observers still need full fairness.
+            # If final drift refuses, resolve this only via --land-turn's budget,
+            # not speculative history work inside the 18-second hook.
+            _cache()[("deferred-own-drift", rec["pr"])] = True
+            return False
         drift = _base_drift_refusal(rec["pr"], repo, data, cwd, env, attribute=False, fresh=False)
         if drift:
             if "state commit(s) landed since then" not in drift:
@@ -2060,6 +2069,9 @@ def _turn_hold_refusal_scoped(number, data, repo, cwd, env):
         if holder.get("state") != "OPEN":
             _turn_delete(ref, repo, cwd, env)
             return False
+        if (rec["pr"] == int(number) and _MERGE_OWN_ELIGIBILITY.get()
+                and _now() - _turn_order(rec)[0] >= _TURN_REFRESH_GRACE):
+            return not _turn_yielded_uncached(rec, holder, repo, cwd, env, defer_own_drift=True)
         return not _turn_yielded(rec, holder, repo, cwd, env)
 
     selected = ((ref, rec) for ref, rec in turns if rec["pr"] in relevant)
@@ -2187,9 +2199,11 @@ def _turn_delete(ref, repo, cwd, env):
 def _turn_hold_read_only(*args):
     # Speculation must not delete refs before the approval gate has succeeded.
     token = _TURN_READ_ONLY.set(True)
+    own = _MERGE_OWN_ELIGIBILITY.set(_TURN_ONLY.get() is None)
     try:
         return _turn_safe(_turn_hold_refusal, *args)
     finally:
+        _MERGE_OWN_ELIGIBILITY.reset(own)
         _TURN_READ_ONLY.reset(token)
 
 
@@ -2203,10 +2217,12 @@ LAND_TURN_TIMEOUT = 60.0
 _TURN_ONLY: ContextVar[dict | None] = ContextVar("ship_turn_only", default=None)
 
 
-def _turn_follow_up(number, repo, sha):
+def _turn_follow_up(number, repo, sha, deferred=False):
     cmd = shlex.join(["python3", str(Path(__file__)), "--land-turn", str(int(number)), "--repo", repo,
                       "--match-head-commit", sha])
-    return (f"This check had no time left to record PR #{int(number)}'s land turn, so first run `{cmd}` "
+    reason = (f"This hook deferred PR #{int(number)}'s old-ticket drift eligibility to the acquisition budget"
+              if deferred else f"This check had no time left to record PR #{int(number)}'s land turn")
+    return (f"{reason}, so first run `{cmd}` "
             f"(it re-runs this preflight under its own {int(LAND_TURN_TIMEOUT)} s budget, records "
             f"refs/{_TURN_PREFIX}{int(number)} and never merges); without the turn the next state commit "
             "drifts this PR again.")
@@ -2388,7 +2404,8 @@ def _state_merge_scoped(words, repo, cwd, env):
             return hold + ("\nAlso: " + drift if drift else "")
         if drift and "state commit(s) landed since then" in drift:
             remaining = _remaining()
-            reached = remaining is None or remaining > _TURN_BUDGET
+            reached = ((remaining is None or remaining > _TURN_BUDGET)
+                       and not _cache().get(("deferred-own-drift", int(number))))
             until = (_stage("land-turn acquisition", _turn_safe, _turn_acquire,
                             number, data, repo, cwd, env, True)
                      if reached else _own_live_turn(number, data))
@@ -2400,7 +2417,8 @@ def _state_merge_scoped(words, repo, cwd, env):
             if not until and turn_only is None and (not reached or _cache().get("turn_missed")):
                 # The carried PRs that drift are exactly the ones whose turn the hook budget cannot reach
                 # (t_01a1da82d9dfdebd): name the bounded follow-up that records it, ahead of update-branch.
-                follow = _turn_follow_up(number, repo, sha)
+                follow = _turn_follow_up(number, repo, sha,
+                                         deferred=bool(_cache().get(("deferred-own-drift", int(number)))))
                 anchor = "Run `gh api -X PUT"
                 drift = (drift.replace(anchor, follow + "\nThen r" + anchor[1:], 1) if anchor in drift
                          else drift + "\n" + follow)

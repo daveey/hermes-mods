@@ -662,10 +662,11 @@ def test_readers_delete_cooled_turns(gh, monkeypatch):
 
 
 class SimClock:
-    """Simulated latency for the guard's own subprocess calls (module-local shims; no global patching).
+    """Simulated latency for guard subprocesses (fixture-scoped thread lifecycle).
 
-    Each gh/git call costs `per_call` seconds on the calling thread's clock. Worker threads start at the main
-    thread's time and `monotonic()` is the latest of all, so a concurrent batch costs one call, not N."""
+    Each gh/git call costs at most its supplied timeout. Child threads inherit their
+    dispatching parent's clock, and joins advance that parent to the child's finish.
+    This preserves nested causal rounds without summing concurrent siblings."""
 
     def __init__(self, monkeypatch, fake, per_call=2.0):
         import threading
@@ -674,13 +675,35 @@ class SimClock:
         self.per_call, self.main, self.lock = per_call, threading.current_thread(), threading.Lock()
         self.clock, self.starts = {self.main: 0.0}, []
         original = fake.run
+        start, join = threading.Thread.start, threading.Thread.join
+
+        def child_start(child, *a, **kw):
+            with self.lock:
+                self.clock[child] = self.clock[threading.current_thread()]
+            return start(child, *a, **kw)
+
+        def child_join(child, *a, **kw):
+            result = join(child, *a, **kw)
+            if not child.is_alive():
+                with self.lock:
+                    me = threading.current_thread()
+                    self.clock[me] = max(self.clock[me], self.clock.get(child, 0))
+            return result
+
+        # Thread lifecycle is patched only for this fixture; subprocess/time stay
+        # module-local. Nested prefetch and edge workers inherit the actual parent.
+        monkeypatch.setattr(threading.Thread, "start", child_start)
+        monkeypatch.setattr(threading.Thread, "join", child_join)
 
         def run(argv, **kw):
             me = threading.current_thread()
+            timeout = kw.get("timeout", float("inf"))
             with self.lock:
-                t = self.clock.setdefault(me, self.clock[self.main])
+                t = self.clock[me]
                 self.starts.append((t, list(argv), me))
-                self.clock[me] = t + self.per_call
+                self.clock[me] = t + min(self.per_call, timeout)
+            if self.per_call > timeout:
+                raise real_subprocess.TimeoutExpired(argv, timeout)
             return original(argv, **kw)
         monkeypatch.setattr(g, "subprocess", SimpleNamespace(**{**vars(real_subprocess), "run": run}))
         monkeypatch.setattr(g, "time", SimpleNamespace(**{**vars(real_time), "monotonic": self.monotonic}))
@@ -688,10 +711,7 @@ class SimClock:
     def monotonic(self):
         import threading
         with self.lock:
-            me = threading.current_thread()
-            if me == self.main:
-                self.clock[me] = max(self.clock.values())   # join: the main thread has waited for its workers
-            return self.clock.setdefault(me, self.clock[self.main])
+            return self.clock[threading.current_thread()]
 
     def writes(self):
         return [(t, a) for t, a, _ in self.starts if "-X" in a or "--input" in a and "graphql" not in a]
