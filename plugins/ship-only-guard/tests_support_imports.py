@@ -476,6 +476,35 @@ def test_imported_helper_escape_stays_shared(monkeypatch, imports, call):
     assert why and "shared ~ tests/placement_support.py" in why
 
 
+@pytest.mark.parametrize("local", [False, True])
+@pytest.mark.parametrize("binding", [
+    'match "placement_" + "support":\n    case name: pass',
+    'match ["placement_" + "support"]:\n    case [*name]: name = name[0]',
+    'match {"placement_" + "support": 1}:\n    case {**name}: name = next(iter(name))',
+])
+def test_pattern_rebound_nonparameter_stays_shared(monkeypatch, tmp_path, local, binding):
+    import subprocess
+    import sys
+    import textwrap
+
+    body = 'name = "json"\n' + binding + '\nassert import_module(name).VALUE == 1\n'
+    text = 'from importlib import import_module\n'
+    text += ('def load():\n' + textwrap.indent(body, '    ') + 'load()\n') if local else body
+    # Real interpreter oracle: the support edit breaks this otherwise unchanged test.
+    module = tmp_path / 'placement_support.py'
+    script = tmp_path / 'test_x.py'
+    script.write_text(text)
+    module.write_text('VALUE = 1\n')
+    before = subprocess.run([sys.executable, '-B', str(script)], capture_output=True, text=True)
+    module.write_text('VALUE = 2\n')
+    after = subprocess.run([sys.executable, '-B', str(script)], capture_output=True, text=True)
+    assert before.returncode == 0, before.stderr
+    assert after.returncode != 0 and 'AssertionError' in after.stderr
+    tip = {"tests/__init__.py": "", SUPPORT: "VALUE = 1\n", "tests/test_x.py": text}
+    why = changed(tip, monkeypatch)
+    assert why and "shared ~ tests/placement_support.py" in why
+
+
 def test_uncalled_helper_loader_narrows(monkeypatch):
     # sync_test_support.require_module: a plain helper no closure module calls cannot load anything here.
     text = 'import importlib\ndef require_module(test, name, package=None):\n    return importlib.import_module(name)\n'

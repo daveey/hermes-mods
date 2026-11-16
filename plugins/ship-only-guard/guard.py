@@ -1554,6 +1554,16 @@ def _dynamic_targets(closure):
             return product([values(a, depth + 1, lit) for a in ([node.func.value] if method else []) + node.args], "/")
         return None
 
+    def opaque_binding(node, identifier):
+        """Bindings not represented by assignment targets; shared by both resolution paths."""
+        if isinstance(node, ast.alias):
+            return (node.asname or node.name.split('.')[0]) == identifier
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            return node.name == identifier
+        if type(node).__name__ in {"ExceptHandler", "MatchAs", "MatchStar"}:
+            return node.name == identifier
+        return type(node).__name__ == "MatchMapping" and node.rest == identifier
+
     def bound(name, depth, lit):
         for fn in enclosing(name):                      # a parameter: every call site's argument
             if isinstance(fn, ast.Lambda):
@@ -1568,13 +1578,7 @@ def _dynamic_targets(closure):
                     if (isinstance(node, ast.Name) and node.id == name.id
                             and not isinstance(node.ctx, ast.Load)):
                         return None
-                    if isinstance(node, ast.alias) and (node.asname or node.name.split('.')[0]) == name.id:
-                        return None
-                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == name.id:
-                        return None
-                    if type(node).__name__ in {"ExceptHandler", "MatchAs", "MatchStar"} and node.name == name.id:
-                        return None
-                    if type(node).__name__ == "MatchMapping" and node.rest == name.id:
+                    if opaque_binding(node, name.id):
                         return None
                 return delegated(fn, params, name.id, depth, lit)
             if name.id in {a.arg for a in fn.args.kwonlyargs} | {
@@ -1597,10 +1601,7 @@ def _dynamic_targets(closure):
                             and node.value is not None):
                         return None
                     found.append(node.value)
-            if isinstance(node, (ast.Import, ast.ImportFrom)) and any(
-                    (a.asname or a.name.split(".")[0]) == name.id for a in node.names):
-                return None
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == name.id:
+            if opaque_binding(node, name.id):
                 return None
         active.add(key)
         try:
