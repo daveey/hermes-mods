@@ -1503,8 +1503,8 @@ _TURN_REFRESH_GRACE = 900    # refresh the drifted acquisition head within 15 mi
 _TURN_BUDGET = 10            # acquisition write budget; reads never silently truncate
 _TURN_CALL_TIMEOUT = 5
 _TURN_SUBJECT = "land-turn pr="
-# After a turn expires its PR cannot take another until a further _TURN_TTL has passed (the cooling ref is
-# kept for that and then deleted by the next reader), so a PR whose area keeps drifting through exports never
+# After a turn expires its PR cannot take another until a further _TURN_TTL has passed. The cooling ref
+# is retained for safe linear rearm, so a PR whose area keeps drifting through exports never
 # holds its area for more than half of the time.
 
 
@@ -1550,6 +1550,7 @@ def parse_turn(message):
               and isinstance(rec.get("head"), str) and re.fullmatch(r"[0-9a-f]{40}", rec["head"])
               and 0 < rec["expires"] < 4_102_444_800 and isinstance(rec.get("files"), list) and rec["files"]
               and all(isinstance(f, str) and f for f in rec["files"])
+              and ("waiting" not in rec or isinstance(rec["waiting"], bool))
               and ("acquired" not in rec or (isinstance(rec["acquired"], (int, float))
                    and not isinstance(rec["acquired"], bool) and 0 < rec["acquired"] < rec["expires"]
                    and rec["expires"] - rec["acquired"] <= _TURN_TTL)))
@@ -1650,8 +1651,8 @@ def _live_turns(repo, cwd, env, own_number=None):
         if time.monotonic() >= deadline:
             raise _Unreadable("state land-turn record deadline exceeded; retry complete snapshot")
         obj = objects[sha]
-        # A missing object is null and a tree/blob target is {} in GraphQL, not an API error. Apply
-        # the same owner-repair/closed-holder recovery as malformed messages.
+        # A missing object is null and a tree/blob target is {} in GraphQL, not an API error.
+        # Both release on PR closure; only a real commit can be rearmed by its owner.
         rec = parse_turn(obj.get("message")) if isinstance(obj, dict) else None
         if rec is not None and rec["pr"] != _turn_number(ref):
             rec = None
@@ -1706,7 +1707,8 @@ def _turn_holder_data(number, repo, cwd, env):
 
 def _turn_yielded(rec, data, repo, cwd, env):
     cache = _cache()
-    key = ("yield", rec["pr"], rec["head"], rec["expires"], rec.get("acquired"), data.get("headRefOid"))
+    key = ("yield", rec["pr"], rec["head"], rec["expires"], rec.get("acquired"),
+           rec.get("waiting", False), data.get("headRefOid"))
     if key not in cache:
         cache[key] = _turn_yielded_uncached(rec, data, repo, cwd, env)
     return cache[key]
@@ -1723,6 +1725,13 @@ def _turn_yielded_uncached(rec, data, repo, cwd, env):
         raise _Unreadable(f"cannot order verdicts for turn #{rec['pr']}")
     if verdicts and sorted(verdicts)[-1][1] == "block":
         return True
+    if rec.get("waiting") is True and head != rec["head"]:
+        # Queue age belongs to the admitted patch, not a newly approved rewrite.
+        # Reuse the authoritative update-branch identity proof from its original
+        # head even when the new head has a fresh exact approval.
+        identical, _ = _carry_one(head, rec["head"], False, repo, cwd, env)
+        if not identical:
+            return True
     # Retain the ticket, not an unconditional reservation. A refreshed head keeps its priority exactly when the
     # merge gate would still admit it: `_approval_refusal` (exact-head approval, or the existing patch-identical
     # update-branch carry; its policy is unchanged here). An unreviewed content change, or a head whose carry
@@ -2251,7 +2260,8 @@ def _own_live_turn(number, data):
     rec = seen[0] if seen else None
     if not rec or rec["expires"] <= _now():
         return None
-    key = ("yield", rec["pr"], rec["head"], rec["expires"], rec.get("acquired"), data.get("headRefOid"))
+    key = ("yield", rec["pr"], rec["head"], rec["expires"], rec.get("acquired"),
+           rec.get("waiting", False), data.get("headRefOid"))
     return _until(rec["expires"]) if _cache().get(key) is False else None
 
 
