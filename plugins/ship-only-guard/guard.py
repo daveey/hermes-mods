@@ -892,10 +892,11 @@ class _CarryObjects:
         base") even when a borrowed store held every commit below the cut, and each refresh needed a fresh
         review. Now a cut is lifted only when every parent named in its raw object (`cat-file commit`, which
         the graft does not touch) exists here as a commit; any other cut stays. That is sound: a present
-        parent either came from a store that `_borrow` validated as non-shallow and non-partial, so its
-        ancestry is complete, or the fetch brought it within depth, so its own ancestry is present or still
-        cut. If an ancestor is missing anyway, git fails, `_Unreadable` propagates and the carry refuses.
-        Any failed read, probe or rewrite leaves `shallow` as it was, so `_base` refuses as before. Runs
+        parent either came from a store that `_borrow` validated as non-shallow and non-partial (expected
+        complete ancestry), or the fetch brought it within depth, so its ancestry is present or still cut.
+        If needed ancestry is missing anyway, git fails, `_Unreadable` propagates and the carry refuses.
+        A failed cut read or parent probe keeps that cut; independently validated cuts may still lift.
+        A failed shallow-file read or rewrite leaves the whole file unchanged. Runs
         inside `fetch()`, under its lock and before `_settled`, so no reader sees a half-lifted store."""
         shallow = Path(self.path, "shallow")
         try:
