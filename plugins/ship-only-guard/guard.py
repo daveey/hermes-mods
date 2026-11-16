@@ -877,7 +877,65 @@ class _CarryObjects:
                      "https://github.com/" + self.repo + ".git", *self.shas)
         except _Unreadable as e:
             return str(e)
+        self._lift_cuts()
         return ""
+
+    def _lift_cuts(self):
+        """Un-cut each shallow boundary commit whose parents are all present (t_01a1e3427f6574fc).
+
+        The fetch stops `self.depth` commits below its tips, so git lists each boundary commit in `shallow`
+        and grafts its parents away. A state PR refreshed after state moved more commits past its merge base
+        than that depth then had its carry refused by `_base` ("fetch depth cuts history before the merge
+        base") even when a borrowed store held every commit below the cut, and each refresh needed a fresh
+        review. Now a cut is lifted only when every parent named in its raw object (`cat-file commit`, which
+        the graft does not touch) exists here as a commit; any other cut stays. That is sound: a present
+        parent either came from a store that `_borrow` validated as non-shallow and non-partial, so its
+        ancestry is complete, or the fetch brought it within depth, so its own ancestry is present or still
+        cut. If an ancestor is missing anyway, git fails, `_Unreadable` propagates and the carry refuses.
+        Any failed read, probe or rewrite leaves `shallow` as it was, so `_base` refuses as before. Runs
+        inside `fetch()`, under its lock and before `_settled`, so no reader sees a half-lifted store."""
+        shallow = Path(self.path, "shallow")
+        try:
+            if not shallow.exists():
+                return
+            cuts = shallow.read_text().split()
+        except (OSError, UnicodeError):
+            return
+        if not cuts or not all(_SHA.fullmatch(c) for c in cuts):
+            return
+        kept = [c for c in cuts if not self._parents_present(c)]
+        if len(kept) == len(cuts):
+            return
+        try:
+            if kept:
+                staged = Path(self.path, "shallow.lift")
+                staged.write_text("".join(c + "\n" for c in kept))
+                os.replace(staged, shallow)     # atomic: `shallow` is the old list or the new one
+            else:
+                shallow.unlink()
+        except OSError:
+            pass    # `shallow` is unchanged: every cut stands and `_base` refuses as before
+
+    def _parents_present(self, cut):
+        """True when every parent the raw commit `cut` names exists as a commit (fetched or borrowed)."""
+        try:
+            raw = self.git("cat-file", "commit", cut)
+        except _Unreadable:
+            return False                        # unreadable (or undecodable) counts as absent: the cut stays
+        parents = []
+        for line in raw.split("\n"):
+            if not line:
+                break                           # end of the header; the message follows
+            if line.startswith("parent "):
+                parents.append(line[len("parent "):])
+        if not all(_SHA.fullmatch(p) for p in parents):
+            return False
+        for parent in parents:
+            try:
+                self.git("cat-file", "-e", parent + "^{commit}")
+            except _Unreadable:
+                return False
+        return True
 
     def _borrow(self):
         """Borrow validated local object stores as read-only `objects/info/alternates` (t_01a1dfacf4785131).
