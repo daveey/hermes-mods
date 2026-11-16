@@ -1429,6 +1429,9 @@ class _Analyzer:
         self.alias_evidence = bool(_restore_evidence(text) or re.search(
             r"\b(?:stash|pop|apply)\b|\.git/config|git\s+config|alias\.|\[alias\]|include|GIT_CONFIG",
             text, re.IGNORECASE))
+        # Stash/restore text anywhere in the command: where an unknown Git subcommand may
+        # take its value from.
+        self.restore_text = bool(_restore_evidence(text) or re.search(r"\bstash\b", text, re.I))
         self.calls: list = []
         self.source = ""
         self.steps = 0
@@ -1989,7 +1992,32 @@ class _Analyzer:
                 # anywhere else (an awk regex `/^diff --git a\//`) become a phantom
                 # `stash pop` with no Git argv at command position. An unquoted unknown head
                 # may split into a whole command built elsewhere: that keeps failing closed.
+                # The head may still be git itself (`flock l "$G" "$S" "$O"`): this argv alone
+                # is analyzed as a Git argv. A literal subcommand there is decided as usual. An
+                # unknown one (`"$S"`) gets its value from somewhere in this command or from
+                # outside it; it is refused when the command anywhere holds stash/restore text
+                # (`S=$(printf stash)`), the same text evidence the whole-command fallback used,
+                # but no longer turned into a phantom call when no Git argv may run.
                 self.local_evidence(" ".join(words) + "\n" + suffix[1])
+                saved = self.suffix, self.splitting
+                self.suffix, self.splitting = None, True  # already a suffix: not split again
+                self.shadow += 1
+                mark = len(self.calls)
+                uncertain, unanalyzed = self.uncertain, self.unanalyzed
+                try:
+                    self.simple(("simple", assigns, ["git", *raw[1:]], []), st, depth, nested=True,
+                                unknown_command=" ".join(assigns + raw))
+                finally:
+                    self.shadow -= 1
+                    self.suffix, self.splitting = saved
+                if not self.restore_text:
+                    # No stash text anywhere: a stash call here could only be inferred from
+                    # unknown words of this hypothetical reading. Drop it, and the
+                    # whole-command uncertainty the reading's unknown words would set.
+                    self.calls[mark:] = [
+                        call for call in self.calls[mark:]
+                        if call[1] != "stash" or isinstance(call[3], _AliasUncertainty)]
+                    self.uncertain, self.unanalyzed = uncertain, unanalyzed
                 return [st], [st]
             self.fail_closed(" ".join(words))
             self.shadow_argv(raw, st, depth, as_git=True, redirs=redirs,
