@@ -2053,14 +2053,32 @@ def pr_state_claim(reply: str, tool_log: Optional[list] = None) -> Optional[str]
     text = _QUOTED_RE.sub(" ", text)
     if _PSC_META_RE.search(text) or not _MF_PR_RE.search(text):
         return None
+    # Script reads are authenticated by the observer and scoped to exact PR IDs.
+    # Never treat their output marker as a generic read of every PR in the reply.
+    script_reads = {(m[1], m[2]) for line in tool_log or []
+                    if (m := re.fullmatch(r"   <- PR state result: ([\w.-]+/[\w.-]+)#([1-9]\d*)", line or ""))}
+    script_ids = {n for _, n in script_reads}
     hit = None
+    context_ids = set()
+    context_repos = set()
     for s in _SENTENCE_END.split(text):
+        refs = {m[1] for m in re.finditer(r"(?:#|\bPR\s+|/pull/)([1-9]\d*)\b", s, re.I)}
+        if refs:
+            context_ids = refs
+            context_repos = {m[1].lower() for m in re.finditer(
+                r"https://github\.com/([\w.-]+/[\w.-]+)/pull/\d+", s)}
+            context_repos |= {m[1].lower() for m in re.finditer(
+                r"(?<![\w/:])([\w.-]+/[\w.-]+)(?=#|\s|[),.]|$)", s)}
         if s.rstrip(" *_").endswith("?"):
             continue
         m = _PSC_CLAIM_RE.search(s)
         if not m or _PSC_HEDGE_RE.search(s[:m.start()]):
             continue
         if _PSC_IT_RE.search(s) or (_MF_PR_RE.search(s) and not _psc_only_merged_refs(s)):
+            if (context_ids and context_ids <= script_ids
+                    and (not context_repos or all((repo, n) in script_reads
+                         for repo in context_repos for n in context_ids))):
+                continue
             hit = s
             break
     if not hit:
