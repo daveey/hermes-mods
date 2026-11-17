@@ -406,6 +406,205 @@ test('model request failure leaves gateway chip and session/card charts usable',
   } finally { await ui.close(); localStorage.clear() }
 })
 
+// Throttle fixture: 24-hour peak 20 tok/s (1200/m); level 75 % caps at 5 tok/s (300/m); the hub chart peaks at 600/m.
+const throttle = (over = {}) => ({
+  percent: 75, reference_per_s: 20, cap_per_s: 5, rate_per_s: 10, holding: true, scope: 'hub', now: END,
+  pools: [
+    { provider: 'openai-codex', accounts: 3, exhausted: 1, remaining_pct: 122, burn_pct_per_h: 6, runway_s: 73200, next_reset_at: END + 86400, read_at: END },
+    { provider: 'anthropic', accounts: 2, exhausted: 2, remaining_pct: 0, burn_pct_per_h: 0, runway_s: null, next_reset_at: null, read_at: END }
+  ],
+  ...over
+})
+
+test('throttle maths: cap per unit, live preview, burn scale, durations and labels (hand-computed)', () => {
+  assert.equal(P.capRate(throttle(), 's'), 5)
+  assert.equal(P.capRate(throttle(), 'm'), 300)
+  assert.equal(P.capRate(throttle({ cap_per_s: null }), 'm'), null)
+  assert.equal(P.capRate(null, 'm'), null)
+  assert.equal(P.capRate(throttle({ cap_per_s: 0 }), 'h'), 0)
+  // preview: 0 = no cap, 100 = zero, between = (1 - p) x the 24-hour peak; no peak = no cap
+  assert.equal(P.previewThrottle(throttle(), 0).cap_per_s, null)
+  assert.equal(P.previewThrottle(throttle(), 100).cap_per_s, 0)
+  assert.equal(P.previewThrottle(throttle(), 50).cap_per_s, 10)
+  assert.equal(P.previewThrottle(throttle({ reference_per_s: null }), 50).cap_per_s, null)
+  assert.equal(P.previewThrottle(throttle({ reference_per_s: null }), 100).cap_per_s, 0)
+  // burn scale: cap 5 under rate 10 halves the burn; a cap above the rate changes nothing; cap 0 pauses
+  assert.equal(P.burnScale(throttle()), 0.5)
+  assert.equal(P.burnScale(throttle({ cap_per_s: 50 })), 1)
+  assert.equal(P.burnScale(throttle({ cap_per_s: null })), 1)
+  assert.equal(P.burnScale(throttle({ cap_per_s: 0 })), 0)
+  assert.equal(P.burnScale(throttle({ rate_per_s: null })), 1)
+  assert.equal(P.fmtDuration(73200), '20.3 h')
+  assert.equal(P.fmtDuration(3 * 86400), '3.0 d')
+  assert.equal(P.fmtDuration(600), '10 min')
+  assert.equal(P.fmtDuration(null), '–')
+  assert.equal(P.throttleText(throttle({ percent: 0, cap_per_s: null }), 'm'), 'Throttle off')
+  assert.equal(P.throttleText(throttle(), 'm'), 'Throttle 75% · cap 300 tok/m · over the cap, pacing calls')
+  assert.equal(P.throttleText(throttle({ percent: 100, cap_per_s: 0 }), 'm'), 'Throttle 100% · cap 0 tok/m · holding every call')
+  assert.equal(P.throttleText(throttle({ holding: false }), 's'), 'Throttle 75% · cap 5.0 tok/s')
+  assert.match(P.throttleText(throttle({ cap_per_s: null }), 'm'), /no cap yet/)
+  const [gpt, claude] = throttle().pools
+  // uncapped: 73 200 s = 20.3 h; under the fixture's cap (half the rate) the same allowance lasts twice as long
+  assert.match(P.runwayText(gpt, throttle({ cap_per_s: null })), /^GPT: 122% left, empty in 20\.3 h at this rate, next reset /)
+  assert.match(P.runwayText(gpt, throttle()), /^GPT: 122% left, empty in 40\.7 h at the cap, next reset /)
+  assert.match(P.runwayText(gpt, throttle({ cap_per_s: 0 })), /^GPT: 122% left, paused by the throttle/)
+  assert.equal(P.runwayText(claude, throttle()), 'Claude: 0% left, not burning')
+  // the quota governor's verdict rides on the line: it limits card starts whatever the throttle level is
+  assert.equal(P.pacingText(gpt), '')
+  assert.equal(P.pacingText({ pacing: 'open' }), '')
+  assert.equal(P.runwayText({ ...claude, pacing: 'paced' }, throttle()), 'Claude: 0% left, not burning · quota pacing is limiting card starts')
+  assert.equal(P.pacingText({ pacing: 'held' }), ' · quota pacing holds card starts')
+  assert.match(P.runwayText({ ...gpt, pacing: 'held', pacing_until: 1794960000 }, throttle({ cap_per_s: null })), /at this rate, next reset .* · quota pacing holds card starts until \S+ \d\d:\d\d$/)
+})
+
+test('throttle scope: the fleet with an acknowledgement count, or this gateway alone without the hub link', () => {
+  const fleet = (over = {}) => throttle({
+    fleet: true, set_at: END - 60, set_by: null,
+    gateways: [{ name: 'hub', seen: true }, { name: 'mini', seen: false }, { name: 'worker-1', seen: true }], ...over
+  })
+  assert.equal(P.scopeText(fleet()), 'applies to all gateways · 2 of 3 have this level')
+  assert.match(P.scopeTitle(fleet()), /Not acknowledged yet: mini\.$/)
+  assert.match(P.scopeTitle(fleet({ set_by: 'macbook' })), /^Set on macbook\. /)
+  assert.equal(P.scopeText(fleet({ set_at: null })), 'applies to all gateways')  // never set: nothing to acknowledge
+  assert.doesNotMatch(P.scopeTitle(fleet({ set_at: null })), /Not acknowledged/)
+  assert.doesNotMatch(P.scopeTitle(fleet({ gateways: [{ name: 'hub', seen: true }] })), /Not acknowledged/)
+  assert.equal(P.scopeText(throttle()), 'applies to hub only')  // an older backend, or a host without the link
+  assert.match(P.scopeTitle(throttle()), /no hub link/)
+  assert.equal(P.scopeText(throttle({ fleet: false, scope: undefined })), '')
+  assert.equal(P.scopeText(null), '')
+})
+
+const withThrottle = (state) => (path) => (path === '/v1/throttle' ? state.value : forRange(path))
+const capLines = (chart) => [...document.querySelectorAll(`[data-chart="${chart}"] line[data-cap]`)]
+const setRange = async (ui, el, value) => {
+  Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(el, String(value))
+  await React.act(async () => el.dispatchEvent(new window.Event('input', { bubbles: true })))
+  await ui.flush()
+}
+
+test('panel: red cap line on Tokens only, slider at the level, runway per pool', async () => {
+  P.saveView(V())
+  const ctx = ctxWith(withThrottle({ value: throttle() }))
+  const ui = await mount(React.createElement(P.Throughput, { ctx }))
+  try {
+    assert.ok(!ctx.calls.some(([p]) => p === '/v1/throttle'), 'the throttle is not polled while the panel is closed')
+    await ui.click(button('Show throughput'))
+    const [line] = capLines('tokens')
+    assert.ok(line, 'cap line drawn')
+    assert.equal(line.dataset.cap, '300')
+    assert.equal(line.getAttribute('stroke'), P.THROTTLE_RED)
+    // Tokens chart: H 84, baseline 70, 66 px for the 600/m peak; 300/m sits half way = y 37
+    assert.equal(Number(line.getAttribute('y1')), 37)
+    assert.equal(Number(line.getAttribute('y2')), 37)
+    assert.match(document.querySelector('[data-chart="tokens"] .hermes-tp-capl').textContent, /^cap 300\/m$/)
+    assert.equal(capLines('sessions').length, 0)
+    assert.equal(capLines('cards').length, 0)
+    const slider = document.querySelector('[data-slot="throttle"] input[type=range]')
+    assert.equal(slider.value, '75')
+    assert.match(document.querySelector('[data-slot="throttle"]').textContent, /Throttle 75% · cap 300 tok\/m · over the cap, pacing calls/)
+    assert.match(document.querySelector('[data-slot="throttle"]').textContent, /applies to hub/)
+    assert.equal(document.querySelector('[data-scope]').dataset.scope, 'local')
+    assert.match(document.querySelector('[data-pool="openai-codex"]').textContent, /^GPT: 122% left, empty in 40\.7 h at the cap/)
+    assert.equal(document.querySelector('[data-pool="anthropic"]').textContent, 'Claude: 0% left, not burning')
+    // the line follows the unit switch: 5 tok/s on a 10 tok/s peak is still half way
+    await ui.click(button('/s'))
+    assert.equal(capLines('tokens')[0].dataset.cap, '5')
+    assert.equal(Number(capLines('tokens')[0].getAttribute('y1')), 37)
+    // +cache and a gateway filter draw something the in+out fleet cap cannot be compared with: no line
+    await ui.click(button('+cache'))
+    assert.equal(capLines('tokens').length, 0)
+    await ui.click(button('in+out'))
+    assert.equal(capLines('tokens').length, 1)
+    await ui.click(document.querySelector('.hermes-tp-legend [data-gw="hub"]'))
+    assert.equal(capLines('tokens').length, 0)
+  } finally {
+    await ui.close()
+  }
+})
+
+test('panel: a cap above the chart pins to the top with an arrow; 0 % draws no line; 100 % sits on the baseline', async () => {
+  P.saveView(V())
+  const state = { value: throttle({ percent: 10, cap_per_s: 18, holding: false }) }
+  const ctx = ctxWith(withThrottle(state))
+  const ui = await mount(React.createElement(P.Throughput, { ctx }))
+  try {
+    await ui.click(button('Show throughput'))
+    assert.equal(Number(capLines('tokens')[0].getAttribute('y1')), 4) // 1080/m is above the 600/m peak
+    assert.match(document.querySelector('[data-chart="tokens"] .hermes-tp-capl').textContent, /^cap 1\.1k\/m ↑$/)
+  } finally {
+    await ui.close()
+  }
+  for (const [value, y] of [[throttle({ percent: 0, cap_per_s: null, holding: false }), null], [throttle({ percent: 100, cap_per_s: 0 }), 70]]) {
+    const ui2 = await mount(React.createElement(P.Throughput, { ctx: ctxWith(withThrottle({ value })) }))
+    try {
+      await ui2.click(button('Show throughput'))
+      if (y == null) {
+        assert.equal(capLines('tokens').length, 0)
+        assert.match(document.querySelector('[data-slot="throttle"]').textContent, /Throttle off/)
+      } else assert.equal(Number(capLines('tokens')[0].getAttribute('y1')), y)
+    } finally {
+      await ui2.close()
+    }
+  }
+})
+
+test('slider: dragging previews the cap, releasing saves it with PUT, a refused save is shown', async () => {
+  P.saveView(V())
+  const state = { value: throttle(), fail: false }
+  const calls = []
+  const ctx = {
+    calls,
+    rest: async (path, opts) => {
+      calls.push([path, opts])
+      if (path !== '/v1/throttle') return forRange(path)
+      if (opts?.method === 'PUT') {
+        if (state.fail) throw Error('HTTP 400')
+        state.value = throttle({ percent: opts.body.percent, cap_per_s: (1 - opts.body.percent / 100) * 20, holding: false })
+      }
+      return state.value
+    }
+  }
+  const ui = await mount(React.createElement(P.Throughput, { ctx }))
+  const puts = () => calls.filter(([p, o]) => p === '/v1/throttle' && o?.method === 'PUT')
+  try {
+    await ui.click(button('Show throughput'))
+    const slider = () => document.querySelector('[data-slot="throttle"] input[type=range]')
+    await setRange(ui, slider(), 50)
+    assert.equal(puts().length, 0, 'nothing is saved while dragging')
+    assert.equal(capLines('tokens')[0].dataset.cap, '600') // preview: half of the 1200/m peak
+    assert.match(document.querySelector('[data-slot="throttle"]').textContent, /Throttle 50% · cap 600 tok\/m/)
+    await ui.event(slider(), 'pointerup')
+    assert.equal(puts().length, 1)
+    assert.deepEqual(puts()[0][1].body, { percent: 50 })
+    assert.equal(slider().value, '50')
+    assert.equal(capLines('tokens')[0].dataset.cap, '600')
+    await ui.event(slider(), 'pointerup')
+    assert.equal(puts().length, 1, 'releasing without a change saves nothing')
+    state.fail = true
+    await setRange(ui, slider(), 90)
+    await ui.event(slider(), 'pointerup')
+    assert.equal(puts().length, 2)
+    assert.match(document.querySelector('[data-slot="throttle"] [role=alert]').textContent, /Throttle not saved: HTTP 400/)
+    assert.equal(slider().value, '50', 'the slider returns to the saved level')
+  } finally {
+    await ui.close()
+  }
+})
+
+test('no throttle endpoint (older backend): the panel renders without slider or line', async () => {
+  P.saveView(V())
+  const ctx = ctxWith((path) => { if (path === '/v1/throttle') throw Error('HTTP 404'); return forRange(path) })
+  const ui = await mount(React.createElement(P.Throughput, { ctx }))
+  try {
+    await ui.click(button('Show throughput'))
+    assert.equal(document.querySelectorAll('[data-chart]').length, 3)
+    assert.equal(document.querySelector('[data-slot="throttle"]'), null)
+    assert.equal(capLines('tokens').length, 0)
+  } finally {
+    await ui.close()
+  }
+})
+
 test('register: chip right after Runners, palette entry, CSS removed on dispose', () => {
   const regs = []
   let dispose

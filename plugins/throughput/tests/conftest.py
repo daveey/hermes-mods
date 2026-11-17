@@ -11,3 +11,12 @@ if NAME not in sys.modules:
     mod = importlib.util.module_from_spec(spec)
     sys.modules[NAME] = mod
     spec.loader.exec_module(mod)
+
+
+import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _no_real_hub_link(tmp_path, monkeypatch):
+    """Never read this machine's hermes-hub replica: the throttle's fleet level comes from a test's own fixture."""
+    monkeypatch.setenv("HERMES_HUB_STATE", str(tmp_path / "no-hub-link"))

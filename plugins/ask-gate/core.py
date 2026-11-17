@@ -15,6 +15,7 @@ import sys
 import threading
 import time
 import types
+import unicodedata
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
@@ -1263,12 +1264,22 @@ def looks_like_answer(msg: str) -> bool:
 # Runtime and agent-written user turns: "[chat-closeout] ...", "[owner-wake] ...", "[Message from another Hermes
 # session ...]", "[System note: ...]", "⏸ [hub:default] ... blocked", "✔ [default] ... done". A prefix deny-list let
 # each new notice type through as "David answered" (89 false ledger rows on two hosts); a typed reply doesn't open
-# with "[" or "<" (user-steps' answer-evidence rule), so the shape is closed instead.
-_RUNTIME_NOTICE = re.compile(r"^\s*(?:[\[<]|[\u2714\u2716\u26a0\u23f8]\ufe0f?\s*\[)")
+# with "[" or "<" (user-steps' answer-evidence rule), so the shape is closed instead. The glyph before the "[" is
+# matched by kind, not listed: a list of four (✔✖⚠⏸) let core's "⏳ [default] ... ready 30 min with no worker" notice
+# through as David's answer to an open restart ask. Any pictograph (Unicode So, plus ℹ, which Unicode files as a
+# letter) followed by "[" is a notice; a typed "👍 yes" (no bracket) is still David's.
+_NOTICE_TAIL = re.compile(r"\ufe0f?\s*\[")
+
+
+def notice_glyph(ch: str) -> bool:
+    return unicodedata.category(ch) == "So" or ch == "\u2139"
 
 
 def runtime_notice(text: str | None) -> bool:
-    return bool(_RUNTIME_NOTICE.match(text or ""))
+    s = (text or "").lstrip()
+    if not s:
+        return False
+    return s[0] in "[<" or (notice_glyph(s[0]) and bool(_NOTICE_TAIL.match(s, 1)))
 
 
 def is_strong_dismissal(msg: str) -> bool:

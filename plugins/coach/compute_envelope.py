@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import os
 import re
+import unicodedata
 from decimal import Decimal
 from typing import Any, Optional
 
@@ -258,7 +259,15 @@ BRIEF_RE = re.compile(r"# Kanban task|\[IMPORTANT:|\[System|<system|task notific
 # people's figures ("[chat-closeout] ... Approve or decline $36 total", "⏸ [hub:default] ... blocked: approve $36");
 # a typed reply doesn't open with "[" or "<" (user-steps' answer-evidence rule). Steers arrive wrapped.
 STEER_RE = re.compile(r"\[OUT-OF-BAND USER MESSAGE[^\]]*\]\s*(.*?)\s*\[/OUT-OF-BAND USER MESSAGE\]", re.S)
-NOTICE_RE = re.compile(r"^\s*(?:[\[<]|[\u2714\u2716\u26a0\u23f8]\ufe0f?\s*\[)")
+NOTICE_RE = re.compile(r"^\s*[\[<]")
+_NOTICE_TAIL = re.compile(r"\ufe0f?\s*\[")
+
+
+def runtime_notice(text: str) -> bool:
+    """Closed envelope shape; a pictograph alone is still a human reply."""
+    s = (text or "").lstrip()
+    return bool(s) and (s[0] in "[<" or (
+        (unicodedata.category(s[0]) == "So" or s[0] == "ℹ") and bool(_NOTICE_TAIL.match(s, 1))))
 # A bare yes: every word is an affirmative ("approved", "yes, approved", "ok do it"). Anything else (a figure, a
 # condition, a question, "not", "but", "only") is not a bare yes and inherits nothing.
 AFFIRM_RE = re.compile(r"^(?:(?:yes|yep|yeah|yup|ok|okay|sure|approved?|i approve|go ahead|go|do it|ship it|lgtm|"
@@ -297,7 +306,7 @@ def typed_text(text: Any) -> Optional[str]:
         return None
     m = STEER_RE.search(text)
     s = (m.group(1) if m else text).strip()
-    return None if not s or NOTICE_RE.match(s) or BRIEF_RE.search(s) else s
+    return None if not s or runtime_notice(s) or BRIEF_RE.search(s) else s
 
 
 def _content(row: dict) -> str:

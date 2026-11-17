@@ -2680,6 +2680,28 @@ def quota_read_lines(arg: str, cap: int = TURN_LOG_ARG_CAP) -> list[str]:
             break
     return out
 
+
+# agent-823488ec97: a read whose command names no quota source can still return the quota state: a card's task_events
+# (`select ... from task_events where task_id=...`) or kanban_show carry the dispatcher's llm_paced rows with each
+# account's 5h/7d percentage. Only the data shapes count (an llm_paced row with its providers payload, or a
+# `<window> <pct>% +<rate>%/min` account reading), never a bare word, so a grep of code or docs naming llm_paced is not
+# a read. Successful calls only.
+QUOTA_RESULT_RE = re.compile(
+    r"\bllm_paced\b[^\n]{0,80}?\bproviders\b|\b(?:5h|7d)\s+\d{1,3}(?:\.\d+)?%\s*[+-]\d+(?:\.\d+)?%/min\b")
+QUOTA_RESULT_TOOLS = ("terminal", "execute_code", "kanban_show")
+
+
+def quota_result_lines(tool: str, result: Any) -> list[str]:
+    """One `   <- QUOTA read: result <excerpt>` line when a successful call's output shows provider pacing state."""
+    if tool not in QUOTA_RESULT_TOOLS or result is None:
+        return []
+    text = (result if isinstance(result, str) else json.dumps(result, default=str)).replace('\\"', '"')
+    m = QUOTA_RESULT_RE.search(text)  # (unescaped: terminal output arrives JSON-escaped)
+    if not m:
+        return []
+    excerpt = " ".join(text[m.start():m.start() + 140].split())
+    return [f"   <- QUOTA read: result {excerpt}"]
+
 # agent-521fd3b5d4: core resumes a turn the backend cut (planned update pause, crash) with a user-role note, so the
 # coach starts a new turn and, in a gateway that booted after the cut, has none of its calls in memory. turn_start then
 # rebuilds the cut turn's log from state.db (AgentCoach._rehydrate_resumed_turn). Same prefix and wrapper handling as
@@ -4651,6 +4673,13 @@ class AgentCoach:
             if waited:
                 s["turn_log"].append(waited)
                 s.setdefault("turn_rich", deque(maxlen=60)).append(waited)
+            try:  # quota state in the output of a read that names no quota source (agent-823488ec97)
+                quota = quota_result_lines(tool, result)
+            except Exception:
+                quota = []
+            for line in quota:
+                s["turn_log"].append(line)
+                s.setdefault("turn_rich", deque(maxlen=60)).append(line)
         try:  # which named cards a board write changed or was refused (reply_check.claimed_mutation)
             mut = mutation_result_line(tool, args, result, status)
         except Exception:

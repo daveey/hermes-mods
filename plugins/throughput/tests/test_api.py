@@ -106,3 +106,83 @@ def test_real_build_by_model_end_to_end(api, tmp_path, monkeypatch):
     m = c.get("/p/v1/series?range=1h&by=model").json()
     assert "by" not in g and g["series"]["tokens_io"]["hub"][-2] == 8.0
     assert m["by"] == "model" and m["models"] == ["m-a", "unreported"] and m["series"]["tokens_io"]["m-a"][-2] == 7.0
+
+
+def test_throttle_routes_end_to_end(api, tmp_path, monkeypatch):
+    """GET/PUT /v1/throttle on an isolated root: level round trip, cap from the stored peak, runway, validation."""
+    import importlib
+    import json
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(api, "_registry", lambda: {"me": "hub", "machines": {"hub": {}}})
+    monkeypatch.setattr(api, "_known_machines", lambda: None)
+    api._services()
+    store, root = api._state["store"], api._state["root"]
+    assert str(tmp_path) in str(store.path), store.path  # never the real series db
+    runway = importlib.import_module(api.pkg().__name__ + ".runway")
+    pacing = tmp_path / "llm_pacing.json"
+    monkeypatch.setattr(runway, "pacing_path", lambda _root: pacing)
+    importlib.import_module(api.pkg().__name__ + ".throttle")._reference_cache.clear()
+    now = time.time()
+    end = int(now // 60 * 60)
+    bucket = (end - 6 * 3600) // 900 * 900
+    store.put("hub", "tokens_io", [(bucket, 900_000.0), (end - 60, 48_000.0)])  # peak 1000/s, now 800/s
+    pacing.write_text(json.dumps({"openai-codex": {"samples": [
+        [now - 3000, "a@example.com", "seven_day", 70.0, now + 86400], [now, "a@example.com", "seven_day", 75.0, now + 86400]]}}))
+    app = FastAPI()
+    app.include_router(api.router, prefix="/p")
+    c = TestClient(app)
+
+    got = c.get("/p/v1/throttle").json()
+    assert got["percent"] == 0 and got["cap_per_s"] is None and got["holding"] is False and got["scope"] == "hub"
+    assert got["fleet"] is False and got["gateways"] == [{"name": "hub", "seen": False}]  # no hub link here
+    assert got["set_at"] is None and got["set_by"] is None
+    assert got["reference_per_s"] == pytest.approx(1000.0) and got["rate_per_s"] == pytest.approx(800.0)
+    (pool,) = got["pools"]
+    assert pool["provider"] == "openai-codex" and pool["remaining_pct"] == 25 and pool["runway_s"] == 15000
+    assert "example.com" not in json.dumps(got)
+
+    put = c.put("/p/v1/throttle", json={"percent": 30}).json()
+    assert put["percent"] == 30 and put["cap_per_s"] == pytest.approx(700.0) and put["holding"] is True
+    stored = json.loads((root / "cache" / "throughput" / "throttle.json").read_text())
+    assert stored["percent"] == 30 and stored["cap_per_s"] == pytest.approx(700.0)  # the cap is stored in tokens/s
+    assert put["set_at"] == stored["set_at"] and put["set_by"] is None
+    assert put["gateways"] == [{"name": "hub", "seen": True}]  # this gateway acknowledges at once
+    seen = json.loads((root / "cache" / "throughput" / "throttle-seen.json").read_text())
+    assert seen["set_at"] == stored["set_at"] and seen["percent"] == 30
+    store.put("hub", "tokens_io", [(bucket + 900, 1_800_000.0)])  # the peak doubles later: the stored cap stays
+    importlib.import_module(api.pkg().__name__ + ".throttle")._reference_cache.clear()
+    later = c.get("/p/v1/throttle").json()
+    assert later["reference_per_s"] == pytest.approx(2000.0) and later["cap_per_s"] == pytest.approx(700.0)
+    assert c.get("/p/v1/throttle").json()["percent"] == 30
+    assert c.put("/p/v1/throttle", json={"percent": 100}).json()["cap_per_s"] == 0
+    assert c.put("/p/v1/throttle", json={"percent": 0}).json()["holding"] is False
+    # a hub link on this host: the fleet, another gateway's acknowledgement, and a setter whose clock runs ahead
+    import sqlite3
+    hub_dir = tmp_path / "hublink"
+    hub_dir.mkdir()
+    monkeypatch.setenv("HERMES_HUB_STATE", str(hub_dir))
+    con = sqlite3.connect(hub_dir / "hub.db")
+    con.execute("CREATE TABLE replica (gw TEXT, coll TEXT, key TEXT, version INTEGER, seq INTEGER, data TEXT, "
+                "updated_at INTEGER, PRIMARY KEY (gw, coll, key))")
+    con.execute("CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT)")
+    ahead = time.time() + 120
+    con.execute("INSERT INTO replica VALUES ('mini', 'gateway', 'info', 1, 1, ?, ?)", (json.dumps(
+        {"throttle": {"percent": 100, "cap_per_s": 0.0, "set_at": ahead}}), int(time.time() * 1000)))
+    con.commit()
+    got = c.get("/p/v1/throttle").json()
+    assert got["fleet"] is True and got["percent"] == 100 and got["set_by"] == "mini" and got["holding"] is True
+    assert got["gateways"] == [{"name": "hub", "seen": False}, {"name": "mini", "seen": False}]
+    put = c.put("/p/v1/throttle", json={"percent": 0}).json()  # set here now: it must outrank mini's later stamp
+    assert put["percent"] == 0 and put["set_by"] is None and put["set_at"] > ahead and put["holding"] is False
+    con.execute("UPDATE replica SET data = ?", (json.dumps(
+        {"throttle": {"percent": 100, "cap_per_s": 0.0, "set_at": ahead, "seen_set_at": put["set_at"]}}),))
+    con.commit()
+    con.close()
+    assert c.get("/p/v1/throttle").json()["gateways"] == [{"name": "hub", "seen": True}, {"name": "mini", "seen": True}]
+    for bad in ({"percent": 101}, {"percent": -1}, {"percent": "50"}, {"percent": True}, {"percent": None}, {}):
+        assert c.put("/p/v1/throttle", json=bad).status_code == 400, bad
+    for not_an_object in (50, [50]):
+        assert c.put("/p/v1/throttle", json=not_an_object).status_code == 422, not_an_object
+    assert c.get("/p/v1/throttle").json()["percent"] == 0  # a refused write changes nothing

@@ -31,6 +31,7 @@ import json
 import math
 import os
 import re
+import unicodedata
 import time
 from typing import Any, Callable, Optional
 from pathlib import Path
@@ -1379,7 +1380,16 @@ def status_only(user_ask: str, reply: str, tool_log: Optional[list] = None) -> O
 # row, a cron run, a subagent or a Kanban worker) gets one advisory hint per turn. It never holds a reply.
 # Off switch: env COACH_STATUS_PLAIN=off, or config plugins.entries.coach.settings.status_plain: false.
 SYNTHETIC_USER_RE = re.compile(
-    r"^\s*(?:[\u2714\u2713\u2716\u2717\u23f8\u26a0\u2757]|\[(?!image|screenshot)[^\]\n]{1,80}[\]:])", re.I)
+    r"^\s*\[(?!image|screenshot|OUT-OF-BAND USER MESSAGE)[^\]\n]{1,80}[\]:]", re.I)
+
+
+def synthetic_user_turn(text: str) -> bool:
+    """Status exclusions include legacy unbracket receipts, but not a human warning."""
+    s = (text or "").lstrip()
+    return bool(notice_turn(s) or SYNTHETIC_USER_RE.match(s) or
+                re.match(r"^(?:[✔✓✖✗⏸❗]|⚠\ufe0f?\s+subagent\b)", s))
+
+
 PROBE_TAG_RE = re.compile(r"^\s*\[selfheal-probe\]\s*", re.I)
 STATUS_PLAIN_HINT = (
     "[coach] status_plain: the user asked about progress (\"{ask}\"). Open with the state of their original ask in "
@@ -1466,7 +1476,7 @@ def status_plain_hint(user_ask: str, platform: str = "", parent_session_id: str 
         return None
     # a `[selfheal-probe]` live test stands in for a person (self_heal._NOT_HERMES_TAGS); it is not a Hermes row
     ask = PROBE_TAG_RE.sub("", user_ask[:ASK_HEAD], count=1)
-    if automation_prompt(ask) or SYNTHETIC_USER_RE.match(ask) or not PLAIN_STATUS_ASK_RE.search(ask):
+    if automation_prompt(ask) or synthetic_user_turn(ask) or not PLAIN_STATUS_ASK_RE.search(ask):
         return None
     if not status_plain_enabled():
         return None
@@ -3185,6 +3195,13 @@ def report_only_guard(user_ask: str, reply: str, tool_log: Optional[list] = None
     "lifecycle_park"), else None. `now` dates the board read (replays)."""
     if scope_limited(user_ask):
         return "scope_limited"
+    # The dispatcher explicitly forbids a chat takeover during admission holds.
+    # Honor its closing instruction before deterministic queue/relay pressure too.
+    # Require a notice and its exact suffix: quoted policy or a new user request
+    # must not exempt unrelated work (agent-62d180590b).
+    if notice_turn(user_ask) and (user_ask or "").rstrip().endswith(
+            "Do not run its work outside the dispatcher."):
+        return "dispatcher_scope"
     if scheduled_wait_status(user_ask, reply):
         return "scheduled_wait"
     if continued_run(tool_log):
@@ -3734,7 +3751,16 @@ NOT_NOTICES = {
 
 def notice_turn(user_ask: str) -> bool:
     """Only anchored automation envelopes, never a human question mentioning a notice."""
-    return bool(NOTICE_RE.search(user_ask or ""))
+    s = (user_ask or "").lstrip()
+    # Preserve known human lookalikes of the runtime's IMPORTANT batch headers.
+    if re.match(r"^\[IMPORTANT: (?:Background processes\b|\d+ background processes\?)", s):
+        return False
+    return bool(NOTICE_RE.search(s) or _BRACKET_NOTICE.match(s) or (s and
+        (unicodedata.category(s[0]) == "So" or s[0] == "ℹ") and _NOTICE_TAIL.match(s, 1)))
+
+
+_NOTICE_TAIL = re.compile(r"\ufe0f?\s*\[")
+_BRACKET_NOTICE = re.compile(r'^\[(?:kanban\b|IMPORTANT:(?! The ["\u201c]| The user launched)|System note:|chat-closeout\b|owner-wake\b)', re.I)
 
 
 def automation_prompt(user_ask: str) -> bool:

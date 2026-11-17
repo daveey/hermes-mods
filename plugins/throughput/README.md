@@ -56,6 +56,84 @@ it as sampled. Decisions:
 Until every gateway's registry metrics carry the token/session counters, tokens and sessions cover the local
 gateway only; cards cover every gateway.
 
+## Throttle and runway
+
+`GET /v1/throttle` returns `{percent, reference_per_s, cap_per_s, rate_per_s, holding, set_at, set_by, scope, fleet,
+gateways, pools, now}`; `PUT /v1/throttle` with `{"percent": 0..100}` sets the level; any other `percent` is a 400
+and a body that is not a JSON object a 422, and neither changes anything.
+
+- **Level**: 0 = no cap, 100 = a cap of zero, between = `(1 - percent/100) x reference_per_s`, where the reference is
+  the peak fleet in+out token rate over the last 24 hours in 15-minute buckets, measured on the gateway that takes
+  the setting. The cap is stored in tokens/s with the level, so it stays where it was set while the peak moves, and
+  every gateway enforces the same number. Without any sampled minute there is no reference and a level between 1
+  and 99 caps nothing.
+- **Scope: the fleet.** The level is written to `cache/throughput/throttle.json` on the gateway whose panel set it.
+  The hermes-hub link (client 1.9.51 or newer) publishes that file in the gateway's `gateway/info` record and every
+  gateway keeps a replica of the others' records (`~/.local/state/hermes-hub/hub.db`), so each gateway reads every
+  published level and obeys the newest `set_at` (`set_by` names the gateway that set it; `null` = this one). Stamps are stored and compared at millisecond precision, the precision the link publishes. A level
+  stamped more than 5 minutes ahead of this gateway's clock is ignored until that time comes (gateways are
+  expected to keep NTP time; a level set under a badly wrong clock can outrank later ones). It arrives within the
+  link's sync periods: the setter's next full collect (up to 3 minutes) plus the receiver's next pull (about a
+  minute). Each gateway acknowledges the level it obeys in `throttle-seen.json` (once a minute, from
+  the sampler) and the link publishes that too: `gateways` lists this gateway and every gateway whose link record
+  is under 30 minutes old, with `seen` true once it acknowledged the current `set_at`. `fleet` is false on a host
+  without the link's replica: the level then applies to `scope`, this gateway, alone. A gateway that does not run
+  this plugin is not throttled and shows `seen: false`. A gateway with the plugin but an older link client obeys
+  published levels, but cannot publish a level set on it or its acknowledgement (`seen: false`). Only a gateway
+  whose server process runs the sampler acknowledges. A gateway that cannot read its replica obeys its own
+  stored level until it can; the fleet's level is the setter's `cache/throughput/throttle.json`, so clearing that
+  file drops the setting.
+- **Enforcement** (`throttle.py`): an `llm_execution` middleware that paces model calls. Each gateway takes a share
+  of the cap: a quarter split evenly between the gateways that sampled tokens in the last 15 minutes, the rest in
+  proportion to what each used (every gateway computes the same shares from the same series, so they sum to 1). It then spaces
+  its calls `tokens per call / (share x cap)` seconds apart, where tokens per call is its own measured in+out
+  tokens per model call over those 15 minutes (20k until it has measured any; every call is counted, throttled or
+  not). Calls on one gateway queue for slots in `cache/throughput/throttle-pace.json` under a file lock, across
+  all its Hermes processes: an idle gateway's first call starts at once, the rest follow one interval apart, and
+  unused time is not saved up. The spacing is capped at 10 minutes, so a gateway with a sliver of the cap still
+  makes progress. At 100 % (or a cap of zero) every call waits until the level is lowered; a waiting call re-reads
+  the level every 5 s. Shares and tokens per call are re-read every 30 s per process. This replaced a rule that
+  held every call while the fleet rate was over the cap and released them all when it dipped under, which
+  overshot in bursts (2026-11-17: cap 76k tokens/min, fleet average 116k, peaks of 794k). The fleet's rate now
+  follows the cap as closely as the tokens-per-call estimate holds; a gateway whose calls suddenly grow overshoots
+  until its 15-minute average catches up. `holding` in the payload still means "the measured fleet rate is above
+  the cap right now".
+- **Card starts** follow the same cap. On a core with the `kanban_start_gate` hook the dispatcher asks the plugin
+  before each claim, and a card stays ready (guard reason `start_gate:token_throttle`) while the fleet's measured
+  rate is over the cap, or the level is 100 %. The answer is cached for 15 s and fails open. Pacing alone only
+  slows the calls of running cards; without the gate the dispatcher keeps starting cards whose calls then queue,
+  filling worker slots with runs that wait. A core without the hook starts cards as before.
+- **A held turn stays alive.** Core gives middleware no activity API, so the gate finds the agent behind the call it
+  wraps (the closure of core's `_perform_api_call`) and stamps its activity clock every poll, as core's own offline
+  wait does: the gateway's idle watchdog and the turn liveness watchdog see a waiting turn, and a Kanban card's
+  claim is renewed. A stop request ends the wait at the next poll and hands the call to core's own interrupt
+  handling. On a core where that closure looks different the wait runs without those reports (a card still renews
+  its claim through `tools.kanban_tools`), and a long hold can then be reaped as stalled.
+- **Auxiliary calls** (titles, compression, vision ...) do not pass the execution middleware. In card runs and
+  other short-lived agent processes they wait in the `pre_auxiliary_call` hook. Core bounds a hook callback at
+  600 s, so a held auxiliary call goes ahead after 540 s at the latest, and core runs one bounded callback per turn
+  at a time, so parallel auxiliary calls of one turn pass while one waits: at 100 % auxiliary traffic there is
+  slowed, not stopped. In long-lived server processes (gateway, Desktop serve, dashboard) auxiliary calls are not
+  held at all: core fires the hook synchronously for async callers, and a hold would freeze the server's event
+  loop, including the route that lowers the level. The dispatcher's admission judge (`hub_admission`) is never
+  held, and neither is the max-iterations summary, which calls the provider directly.
+- **Fail open**: an unreadable level, a missing series db or replica, or a failed read never holds a call. A core
+  without `register_middleware` shows the slider but enforces nothing.
+- **Not covered by tests**: the middleware and the hook inside a live core agent loop (the tests call the registered
+  callbacks with a stand-in for core's call closure), and the hub link round trip between two real hosts.
+- **Runway** (`runway.py`): per subscription pool, from the usage samples core's Kanban pacing governor keeps in
+  `llm_pacing.json` (no usage request is made): `remaining_pct` (sum of `100 - used` over the accounts' weekly
+  windows), `burn_pct_per_h` (each account's slope over the last 10-60 minutes), `runway_s = remaining / burn`
+  (`null` when nothing burns) and `next_reset_at` (the earliest weekly reset). Resets are not folded into the
+  runway. Account names are not returned. A host without the governor's file reports no pools, and a provider
+  whose newest sample is over 30 minutes old is left out. `pacing` is the governor's own verdict for the pool
+  (`open`, `paced`, `held`; `pacing_until` for a hold's known end): with `paced` or `held`, Kanban starts fewer or
+  no cards on that pool whatever the throttle level is, and the panel says so on the pool's line.
+
+The Desktop panel shows the slider under Tokens ("applies to all gateways · 3 of 4 have this level"), the cap as a red line on the Tokens chart (hidden with `+cache` or
+a legend filter, which the in+out fleet cap cannot be compared with) and one runway line per pool, rescaled by
+`cap / rate` when the cap is under the measured rate.
+
 ## Sampler
 
 `register()` starts a sampler thread in long-lived server processes only (`hermes gateway`, `hermes serve`,

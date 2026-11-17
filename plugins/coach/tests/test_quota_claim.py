@@ -8,6 +8,7 @@ receipts then told David "That leaves only waiting for the weekly quota to come 
 INCIDENT_REPLY_1/2 are those replies with account names scrubbed.
 """
 import importlib.util
+import json
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parents[1]
@@ -119,3 +120,55 @@ def test_revision_that_keeps_the_claim_fails_the_outcome():
     out = rc.nudge_outcome("deploy_claim", INCIDENT_REPLY_2, "x", INCIDENT_LOG, _no_judge,
                            extra_rules=("quota_claim",))
     assert out.get("new_claim", {}).get("rule") == "quota_claim"
+
+
+# ---- self-heal agent-823488ec97: a quota read whose evidence is in the RESULT, not the command ------------------------
+# A Mac chat queried a card's task_events (`select ... from task_events where task_id='$id'`): the command names no quota
+# source, but the output carried the dispatcher's 04:26 `dispatch_skipped`/`llm_paced` rows with the per-account Codex
+# percentages. The reply cited them ("three of the six Codex accounts are at 100% of their weekly quota (as of 04:26
+# PST)") and quota_claim still held it as unread, because only tool arguments were scanned.
+EVENTS_CMD = ("TZ=America/Los_Angeles date \"+now %H:%M:%S %Z\"; L=~/.hermes/kanban.db; for id in t_a t_b; do "
+              "sqlite3 -readonly -separator ' | ' $L \"select datetime(created_at,'unixepoch','-8 hours'), kind, "
+              "substr(payload,1,190) from task_events where task_id='$id' order by id desc limit 3\"; done")
+EVENTS_OUT = json.dumps({"output": (
+    "now 05:28:25 PST\n== [.hermes/kanban.db] t_a | ready | 1000\n"
+    "2026-11-17 04:26:38 | dispatch_skipped | {\"reason\": \"llm_paced\", \"detail\": \"openai-codex paced\", "
+    "\"providers\": [{\"provider\": \"openai-codex\", \"state\": \"paced\", \"limit\": 1, \"running\": 1}]}\n"
+    "2026-11-17 04:26:38 | llm_paced | {\"providers\": [{\"provider\": \"openai-codex\", \"state\": \"paced\", "
+    "\"factor\": 0.6976, \"until\": null, \"detail\": \"a@example.com 7d 4% +0.00%/min; b@example.com 7d 100% "
+    "+0.00%/min; \n"), "exit_code": 0, "error": None})
+EVENTS_REPLY = ("Only the Codex quota limit holds it: one run at a time, because three of the six Codex accounts are "
+                "at 100% of their weekly quota (as of 04:26 PST).")
+
+
+def _turn_log(tool, args, result):
+    c = ar.AgentCoach()
+    c.turn_start("s1", "[kanban] Task t_a is ready with no worker claiming it.")
+    c.observe("s1", tool, args, result)
+    return c.turn_context("s1")[1]
+
+
+def test_quota_state_in_a_tool_result_counts_as_a_read():
+    log = _turn_log("terminal", {"command": EVENTS_CMD}, EVENTS_OUT)
+    assert any(l.startswith("   <- QUOTA read: ") for l in log), log
+    assert rc.quota_claim(EVENTS_REPLY, log) is None
+    out = rc.nudge_outcome("denied_ask", EVENTS_REPLY, "x", log, _no_judge, extra_rules=("quota_claim",))
+    assert "new_claim" not in out, out
+
+
+def test_kanban_show_pacing_events_count_as_a_read():
+    shown = json.dumps({"task": {"id": "t_a", "body": "Fix the remote notices. " * 40}, "events": [
+        {"kind": "llm_paced", "payload": {"providers": [{"provider": "openai-codex", "state": "paced", "detail": "a@example.com 7d 100% +0.00%/min"}]}}]})
+    log = _turn_log("kanban_show", {"task_id": "t_a"}, shown)
+    assert rc.quota_claim(EVENTS_REPLY, log) is None, log
+
+
+def test_results_that_only_mention_quota_words_are_not_reads():
+    for out in (json.dumps({"output": "plugins/coach/agent_rules.py:2657: QUOTA_READ_RE = ... llm_paced ..."}),
+                json.dumps({"output": "Codex accounts at 100% of weekly quota"}),
+                json.dumps({"output": "see provider_walls.json and auth.json"})):
+        log = _turn_log("terminal", {"command": "grep -n quota plugins/coach/agent_rules.py"}, out)
+        assert rc.quota_claim(EVENTS_REPLY, log) is not None, out
+    failed = json.dumps({"output": EVENTS_OUT, "exit_code": 1, "error": "boom"})
+    log = _turn_log("terminal", {"command": EVENTS_CMD}, failed)
+    assert rc.quota_claim(EVENTS_REPLY, log) is not None

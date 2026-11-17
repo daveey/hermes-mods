@@ -1,4 +1,6 @@
 """GET /api/plugins/throughput/v1/series?range=1h|6h|24h|7d[&by=gateway|model] (see ../series.py for the payload).
+GET / PUT /api/plugins/throughput/v1/throttle: the fleet's token throttle level (../throttle.py) and the
+subscription pools' runway (../runway.py). PUT body ``{"percent": 0..100}``.
 
 Loaded by path by the dashboard, outside its package: the plugin package is imported under a private name.
 Single-flight per (range, by) for 15 s; the slow work (sqlite reads, registry fetch) runs in a worker thread.
@@ -15,7 +17,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Body, HTTPException, Query
 
 router = APIRouter()
 CACHE_S = 15
@@ -112,3 +114,51 @@ async def get_series(range: str = Query("6h"), by: str = Query("gateway")) -> Di
     if by not in BYS:
         raise HTTPException(status_code=400, detail="by must be gateway or model")
     return await asyncio.to_thread(cached, range, by)
+
+
+def throttle_payload(now: float | None = None) -> Dict[str, Any]:
+    """Level, cap and measured rate (tokens/s, in+out) the fleet obeys, plus each pool's runway. ``fleet`` is false
+    on a host without the hermes-hub link (the level then applies to ``scope``, this gateway, alone);
+    ``gateways`` lists this and every running gateway with whether it has acknowledged the current level."""
+    sampler, _ = _services()
+    import importlib
+    throttle = importlib.import_module(pkg().__name__ + ".throttle")
+    runway = importlib.import_module(pkg().__name__ + ".runway")
+    root = _state["root"]
+    now = time.time() if now is None else now
+    hub_db = throttle.hub_db_path()
+    out = throttle.status(root, sampler.series_path(root), now, hub_db)
+    reg = _registry()
+    out["scope"] = (reg or {}).get("me") or _state["store"].get_meta("me") or "local"
+    out["fleet"] = hub_db.is_file()
+    out["gateways"] = throttle.gateways(root, hub_db, now, out["scope"])
+    out["pools"] = runway.pools(runway.pacing_path(root), now)
+    out["now"] = now
+    return out
+
+
+def set_throttle(percent: Any) -> Dict[str, Any]:
+    if isinstance(percent, bool) or not isinstance(percent, (int, float)) or not 0 <= percent <= 100:
+        raise ValueError("percent must be a number from 0 to 100")
+    sampler, _ = _services()
+    import importlib
+    throttle = importlib.import_module(pkg().__name__ + ".throttle")
+    root, hub_db, now = _state["root"], throttle.hub_db_path(), time.time()
+    # Stamp it after the level in force, so a gateway whose clock runs ahead cannot outrank this newer setting.
+    stamp = max(now, throttle.effective(root, hub_db, now)["set_at"] + 0.002)  # 2 ms: stamps round to 1 ms
+    throttle.write_level(root, percent, stamp, throttle.reference_rate(sampler.series_path(root), now))
+    throttle.note_seen(root, hub_db, stamp)
+    return throttle_payload()
+
+
+@router.get("/v1/throttle")
+async def get_throttle() -> Dict[str, Any]:
+    return await asyncio.to_thread(throttle_payload)
+
+
+@router.put("/v1/throttle")
+async def put_throttle(body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    try:
+        return await asyncio.to_thread(set_throttle, body.get("percent"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))

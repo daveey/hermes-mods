@@ -637,6 +637,11 @@ def _loop(stop: threading.Event, root: Path) -> None:
                 sampler.tick()
             except Exception:
                 log.exception("throughput: tick failed")
+            try:
+                from . import throttle
+                throttle.note_seen(root, throttle.hub_db_path())  # acknowledge the fleet level this gateway obeys
+            except Exception:
+                log.exception("throughput: throttle acknowledgement failed")
             now = time.time()
             if stop.wait(INTERVAL_S - (now % INTERVAL_S) + 2):  # just after each minute boundary
                 return
