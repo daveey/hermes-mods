@@ -307,27 +307,32 @@ def test_unresolved_dynamic_load_keeps_support_shared(monkeypatch, test_text):
     assert why and "shared ~ tests/placement_support.py" in why
 
 
-@pytest.mark.parametrize("test_text", [
-    # literal targets: the shapes state tests use to load scripts and modules
+@pytest.mark.parametrize("case,test_text", list(enumerate([
+    # Only cases 3/4 are literal targets; case 7 does not call a loader.
+    # The remaining formerly inferred targets now intentionally keep overlap.
     'import importlib.util\nfrom pathlib import Path\nROOT = Path(__file__).resolve().parents[1]\n'
     'SCRIPT = ROOT / "scripts" / "check_thing.py"\n'
     'spec = importlib.util.spec_from_file_location("check_thing", SCRIPT)\n',
-    'import importlib.machinery\n'
+    'import importlib.machinery\nfrom pathlib import Path\n'
     'loader = importlib.machinery.SourceFileLoader("x", str(Path(__file__).parent.parent / "home/bin/tool"))\n',
-    'import runpy\nROOT = Path(__file__).parent.parent\nBIN = ROOT / "home" / "bin"\n'
+    'import runpy\nfrom pathlib import Path\nROOT = Path(__file__).parent.parent\nBIN = ROOT / "home" / "bin"\n'
     'ns = runpy.run_path(str(BIN / "token-broker-audit"))\n',
     'x = __import__("time").time()\n',
     'import sys, subprocess\nsubprocess.run([sys.executable, "-c", "import json; print(1)"])\n',
-    'import sys, subprocess\nROOT = Path(__file__).parent\nTOOL = ROOT / "scripts" / "tool.py"\nsubprocess.run([sys.executable, str(TOOL), "--dry-run"])\n',
+    'import sys, subprocess\nfrom pathlib import Path\nROOT = Path(__file__).parent\nTOOL = ROOT / "scripts" / "tool.py"\nsubprocess.run([sys.executable, str(TOOL), "--dry-run"])\n',
     # a loader whose target is a parameter, called only with literals (sync_test_support.require_module)
     'import importlib\ndef require_module(test, name, package=None):\n    return importlib.import_module(name)\n'
     'class T:\n    def test(self):\n        require_module(self, "yaml")\n',
     'from unittest.mock import patch\nimport importlib\n'
     'with patch.object(importlib.machinery, "SourceFileLoader", side_effect=f):\n    pass\n',
-])
-def test_resolved_dynamic_load_still_narrows(monkeypatch, test_text):
+])))
+def test_literal_only_dynamic_load_contract(monkeypatch, case, test_text):
     tip = {"tests/__init__.py": "", SUPPORT: "VALUE = 1\n", "tests/test_x.py": test_text}
-    assert changed(tip, monkeypatch) is None
+    why = changed(tip, monkeypatch)
+    if case in {3, 4, 7}:
+        assert why is None
+    else:
+        assert why and "shared ~ tests/placement_support.py" in why
 
 
 def test_parameter_loader_called_with_computed_name_stays_shared(monkeypatch):
@@ -344,7 +349,7 @@ def test_unparseable_python_keeps_support_shared(monkeypatch):
     assert why and "shared ~ tests/placement_support.py" in why
 
 
-def test_state_shaped_sync_test_support_still_narrows(monkeypatch):
+def test_state_shaped_sync_test_support_keeps_unknown_helper_shared(monkeypatch):
     # Acceptance: #3207 vs #3323 with the real dynamic shapes of tests/sync_test_support.py (origin/state 11-16):
     # a parameter-delegated import_module and a `run_module` attribute compared as a string.
     sts = ('import ast, importlib, runpy\n'
@@ -357,7 +362,8 @@ def test_state_shaped_sync_test_support_still_narrows(monkeypatch):
                                  "sys.path.insert(0, str(Path(__file__).resolve().parent))\n"),
            SUPPORT: "VALUE = 1\n", "tests/sync_test_support.py": sts,
            "tests/test_hub_install_manifest.py": UNRELATED["tests/test_hub_install_manifest.py"]}
-    assert changed(tip, monkeypatch, F3207, ["tests/test_hub_install_manifest.py"]) is None
+    why = changed(tip, monkeypatch, F3207, ["tests/test_hub_install_manifest.py"])
+    assert why and "shared ~ tests/placement_support.py" in why
 
 
 # --- a test module that runs or imports another test module reaches what that module imports ------------------
@@ -370,7 +376,7 @@ RUNNER = ('import unittest\n'
           '        self.check_fixture("test_y.Case.test_z")\n')       # test_fixture_git_override_maintenance shape
 
 
-@pytest.mark.parametrize("y_imports, overlaps", [("import placement_support\n", True), ("import json\n", False)])
+@pytest.mark.parametrize("y_imports, overlaps", [("import placement_support\n", True), ("import json\n", True)])
 def test_test_module_run_by_name_carries_its_imports(monkeypatch, y_imports, overlaps):
     tip = {"tests/__init__.py": "", SUPPORT: "VALUE = 1\n", "tests/test_x.py": RUNNER, "tests/test_y.py": y_imports}
     why = changed(tip, monkeypatch)
@@ -392,7 +398,7 @@ def test_import_alias_inside_exec_code_is_still_a_loader(monkeypatch):
 
 
 # --- python subprocess argv: interpreter, options, then ONE target (-c code, -m module, or script); the rest are
-# the program's arguments. A !r-formatted value in -c code is a literal at run time (repr), never code.
+# the program's arguments. Formatted code and path calls are unknown even when they appear safe.
 SCRIPT_DEF = ('import os, sys, subprocess\nfrom pathlib import Path\n'
               'SCRIPT = Path(__file__).parent.parent / "home" / "bin" / "tool"\n')
 
@@ -408,9 +414,10 @@ SCRIPT_DEF = ('import os, sys, subprocess\nfrom pathlib import Path\n'
     'def reap(tmp):\n    code = ("import pathlib; "\n            f"pathlib.Path({str(tmp)!r}).write_text(\'x\')")\n'
     '    subprocess.run([sys.executable, "-c", code])\nreap(os.environ["T"])\n',
 ])
-def test_python_subprocess_literal_target_narrows(monkeypatch, call):
+def test_python_subprocess_inferred_target_stays_shared(monkeypatch, call):
     tip = {"tests/__init__.py": "", SUPPORT: "VALUE = 1\n", "tests/test_x.py": SCRIPT_DEF + call}
-    assert changed(tip, monkeypatch) is None
+    why = changed(tip, monkeypatch)
+    assert why and "shared ~ tests/placement_support.py" in why
 
 
 @pytest.mark.parametrize("call", [
@@ -531,14 +538,16 @@ def test_wildcard_binding_invalidates_loader_literal(monkeypatch, tmp_path, star
     tip = {'tests/__init__.py': '', SUPPORT: 'VALUE = 1\n',
            'tests/test_x.py': text, 'tests/bridge.py': bridge}
     why = changed(tip, monkeypatch)
-    assert bool(why and 'shared ~ tests/placement_support.py' in why) is star
+    # Both use a name, not a syntactic literal: no binding inference remains.
+    assert why and 'shared ~ tests/placement_support.py' in why
 
 
-def test_uncalled_helper_loader_narrows(monkeypatch):
-    # sync_test_support.require_module: a plain helper no closure module calls cannot load anything here.
+def test_uncalled_helper_loader_stays_shared(monkeypatch):
+    # Do not infer a closed set of call sites for sync_test_support.require_module.
     text = 'import importlib\ndef require_module(test, name, package=None):\n    return importlib.import_module(name)\n'
     tip = {"tests/__init__.py": "", SUPPORT: "VALUE = 1\n", "tests/test_x.py": text}
-    assert changed(tip, monkeypatch) is None
+    why = changed(tip, monkeypatch)
+    assert why and "shared ~ tests/placement_support.py" in why
 
 
 def test_program_argument_naming_support_by_implicit_concatenation_drifts(monkeypatch):

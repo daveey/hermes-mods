@@ -313,10 +313,13 @@ that base overlaps a PR file:
   names and every test module it imports or loads. A dynamic load
   (`import_module`, `spec_from_file_location`, `SourceFileLoader`, `runpy`,
   `exec`, a `python` subprocess, `loadTestsFromName`) must resolve to literal
-  strings: constants and their concatenation, f-strings and path joins,
-  `__file__`, names bound only to such values, or a parameter of a plain helper
-  whose every call site passes one. A computed target (an environment value, a
-  test function or fixture argument, a callback), test discovery
+  strings: syntactic string constants or literal string lists/tuples only.
+  All calls (even imported stdlib path calls), names, operators, f-strings,
+  attributes and helper parameters are unknown and keep the broad overlap.
+  There is deliberately no binding/dataflow inference or callable-basename
+  exemption. This sacrifices narrowing for real helper/path-loading tests:
+  FIFO turn ordering, not speculative evaluation, must handle those cases.
+  A computed target, test discovery
   (`discover`, `python -m pytest`/`unittest`), unparseable code, or a read that
   fails or overruns keeps the pair overlapping. Not traced: a subprocess argv
   that is not a literal list, `os.system` and `os.exec*`. Land-turn holds use

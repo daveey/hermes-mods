@@ -1489,9 +1489,9 @@ def _support_reach(repo, ref, path, cwd, env, once):
 # Dynamic loads (review t_01a1e1747162693f). The word rule proves non-reach only when every module the closure
 # loads is named by a word. A load target can be computed (`import_module("tests." + "placement_" + "support")`,
 # an f-string, a test-runner subprocess), so each load target must evaluate to a finite set of strings, whose
-# words then join the closure: constants and their concatenation/f-strings/path joins, `__file__`, names bound
-# only to such values, conditional values, and a function parameter (every call site's argument). Anything else
-# (a value read at run time, a directory scan, test discovery, a loader used as a value) keeps the pair shared.
+# words then join the closure. Only syntactic string literals and literal string collections are certified.
+# All computed expressions (including path calls and helper parameters), discovery and loader escapes
+# keep the pair shared. A partial binding/value interpreter is deliberately not an exemption.
 # Known limit: a subprocess argv that is not a literal list, os.system and os.exec* strings are not traced.
 _LOAD_ARG = {"import_module": 0, "__import__": 0, "run_module": 0, "run_path": 0, "spec_from_file_location": 1,
              "SourceFileLoader": 1, "SourcelessFileLoader": 1, "ExtensionFileLoader": 1, "load_source": 1,
@@ -1500,11 +1500,8 @@ _LOAD_KEYWORDS = {"name", "path", "location", "pathname", "source", "path_name",
 _LOAD_BUILTIN = {"exec": 0, "eval": 0, "execfile": 0}       # bare-name calls only (`model.eval()` is no load)
 _LOAD_ALWAYS = {"discover"}                                 # unittest discovery imports whatever it finds
 _SUBPROCESS = {"run", "Popen", "call", "check_call", "check_output"}
-_PATH_SAME = {"str", "Path", "PurePath", "PosixPath", "PurePosixPath", "fspath", "abspath", "realpath", "normpath",
-              "expanduser", "dirname", "basename", "join", "resolve", "absolute", "with_name", "with_suffix",
-              "joinpath"}
 _PYTHON = re.compile(r"(?:.*/)?python[0-9.]*")
-_DYN_DEPTH = 40            # resolution steps; a name being resolved again (X = X / "a") is unresolved
+_DYN_DEPTH = 40            # nested literal collection depth
 _DYN_VALUES = 64           # strings one target may evaluate to; more is unresolved
 
 
@@ -1535,12 +1532,6 @@ def _dynamic_targets(closure):
         up = parents.get(node, (None,))[0]
         return isinstance(up, ast.Call) and up.func is node
 
-    def enclosing(node):
-        while node in parents:
-            node, _ = parents[node]
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
-                yield node
-
     def module_of(node):
         while node in parents:
             node, tree = parents[node]
@@ -1551,16 +1542,6 @@ def _dynamic_targets(closure):
     def where(node):
         return f"{labels.get(id(module_of(node)), '?')} line {node.lineno}"
 
-    def product(parts, join=""):
-        out = {""}
-        for p in parts:
-            if p is None:
-                return None
-            out = {a + (join if a and join else "") + b for a in out for b in p}
-            if len(out) > _DYN_VALUES:
-                return None
-        return out
-
     def union(sets):
         out = set()
         for s in sets:
@@ -1569,149 +1550,22 @@ def _dynamic_targets(closure):
             out |= s
         return out if len(out) <= _DYN_VALUES else None
 
-    active, memo = set(), {}
 
-    def values(node, depth=0, lit=False):
-        """The strings `node` can evaluate to, None when that is not a finite literal set. With `lit` (the
-        value is Python code) an f-string `{x!r}` evaluates to a placeholder name: x lands as a literal."""
-        if depth > _DYN_DEPTH or node is None:
+    def values(node, depth=0):
+        """Only syntactic string literals are proof; no inferred Python semantics.
+
+        Calls (including stdlib path calls), names, attributes, operators and
+        formatting are unknown. A prior partial evaluator repeatedly certified
+        values it did not understand. Extending this grammar requires explicit
+        semantic proof, not another name-based exemption.
+        """
+        if depth > _DYN_DEPTH:
             return None
-        if isinstance(node, ast.Constant):
-            v = node.value
-            return {v.decode("utf-8", "replace") if isinstance(v, bytes) else str(v)}
-        if isinstance(node, ast.Name):
-            return {"__file__"} if node.id == "__file__" else bound(node, depth, lit)
-        if isinstance(node, ast.Attribute) and node.attr == "parent":
-            return values(node.value, depth + 1, lit)
-        if (isinstance(node, ast.Subscript) and isinstance(node.value, ast.Attribute)
-                and node.value.attr == "parents" and isinstance(node.slice, ast.Constant)):
-            return values(node.value.value, depth + 1, lit)
-        if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Div, ast.Add)):
-            return product([values(node.left, depth + 1, lit), values(node.right, depth + 1, lit)],
-                           "/" if isinstance(node.op, ast.Div) else "")
-        if isinstance(node, ast.IfExp):
-            return union([values(node.body, depth + 1, lit), values(node.orelse, depth + 1, lit)])
-        if isinstance(node, ast.JoinedStr):
-            parts = []
-            for p in node.values:
-                if isinstance(p, ast.FormattedValue):
-                    if p.format_spec is not None:
-                        return None
-                    if lit and p.conversion == ord("r"):
-                        parts.append({"__hermes_literal__"})
-                        continue
-                    got = values(p.value, depth + 1, lit)
-                    conv = {ord("r"): repr, ord("a"): ascii}.get(p.conversion, str)
-                    parts.append(None if got is None else {conv(s) for s in got})
-                else:
-                    parts.append(values(p, depth + 1, lit))
-            return product(parts)
-        if isinstance(node, (ast.List, ast.Tuple)):          # loadTestsFromNames([...]), argv pieces
-            return union([values(e, depth + 1, lit) for e in node.elts])
-        if isinstance(node, ast.Call) and name_of(node.func) in _PATH_SAME:
-            if any(isinstance(a, ast.Starred) for a in node.args) or node.keywords:
-                return None
-            method = isinstance(node.func, ast.Attribute) and node.func.attr in {
-                "resolve", "absolute", "with_name", "with_suffix", "joinpath"}
-            return product([values(a, depth + 1, lit) for a in ([node.func.value] if method else []) + node.args], "/")
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return {node.value}
+        if isinstance(node, (ast.List, ast.Tuple)):
+            return union([values(e, depth + 1) for e in node.elts])
         return None
-
-    def opaque_binding(node, identifier):
-        """Bindings not represented by assignment targets; shared by both resolution paths."""
-        if isinstance(node, ast.alias):
-            # Wildcard exports can overwrite any existing literal binding.
-            return node.name == "*" or (node.asname or node.name.split('.')[0]) == identifier
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            return node.name == identifier
-        if type(node).__name__ in {"ExceptHandler", "MatchAs", "MatchStar"}:
-            return node.name == identifier
-        return type(node).__name__ == "MatchMapping" and node.rest == identifier
-
-    def bound(name, depth, lit):
-        for fn in enclosing(name):                      # a parameter: every call site's argument
-            if isinstance(fn, ast.Lambda):
-                if name.id in {a.arg for a in fn.args.posonlyargs + fn.args.args + fn.args.kwonlyargs}:
-                    return None
-                continue
-            params = [a.arg for a in fn.args.posonlyargs + fn.args.args]
-            if name.id in params:
-                # Call arguments bound the entry value, not a parameter subsequently rebound.
-                # Reject all writes (including nested scopes) rather than pretend to model flow.
-                for node in ast.walk(fn):
-                    if (isinstance(node, ast.Name) and node.id == name.id
-                            and not isinstance(node.ctx, ast.Load)):
-                        return None
-                    if opaque_binding(node, name.id):
-                        return None
-                return delegated(fn, params, name.id, depth, lit)
-            if name.id in {a.arg for a in fn.args.kwonlyargs} | {
-                    getattr(fn.args.vararg, "arg", None), getattr(fn.args.kwarg, "arg", None)}:
-                return None
-        key = (id(module_of(name)), name.id, lit)
-        if key in memo:
-            return memo[key]
-        if key in active:
-            return None
-        found = []
-        for node in nodes[id(module_of(name))]:         # every binding of the name in its module
-            target = (node.targets if isinstance(node, ast.Assign) else
-                      [node.target] if isinstance(node, (ast.AnnAssign, ast.AugAssign, ast.NamedExpr, ast.For,
-                                                         ast.AsyncFor, ast.comprehension)) else
-                      [node.optional_vars] if isinstance(node, ast.withitem) and node.optional_vars else [])
-            for t in target:
-                if any(isinstance(n, ast.Name) and n.id == name.id for n in ast.walk(t)):
-                    if not (isinstance(t, ast.Name) and isinstance(node, (ast.Assign, ast.AnnAssign))
-                            and node.value is not None):
-                        return None
-                    found.append(node.value)
-            if opaque_binding(node, name.id):
-                return None
-        active.add(key)
-        try:
-            memo[key] = union([values(v, depth + 1, lit) for v in found]) if found else None
-        finally:
-            active.discard(key)
-        return memo[key]
-
-    def delegated(fn, params, param, depth, lit):
-        key = (id(fn), param, lit)
-        if key in memo:
-            return memo[key]
-        if key in active:
-            return None
-        active.add(key)
-        try:
-            memo[key] = call_sites(fn, params, param, depth, lit)
-        finally:
-            active.discard(key)
-        return memo[key]
-
-    def call_sites(fn, params, param, depth, lit):
-        if fn.decorator_list or fn.name.startswith("test") or fn.name.startswith("__"):
-            return None                               # pytest/unittest/the data model supply the arguments
-        index = params.index(param)
-        method = bool(params) and params[0] in {"self", "cls"}
-        default = dict(zip(params[len(params) - len(fn.args.defaults):], fn.args.defaults))
-        out = [values(default[param], depth + 1, lit)] if param in default else []
-        for tree in trees:
-            for node in nodes[id(tree)]:
-                if isinstance(node, ast.ImportFrom) and any(
-                        a.name == "*" or (a.name == fn.name and a.asname and a.asname != fn.name)
-                        for a in node.names):
-                    return None                       # imported alias/star escapes name-based call discovery
-                if name_of(node) == fn.name and isinstance(node, (ast.Name, ast.Attribute)) and not called(node):
-                    return None                           # passed around as a value: call sites unknown
-                if not isinstance(node, ast.Call) or name_of(node.func) != fn.name:
-                    continue
-                if any(isinstance(a, ast.Starred) for a in node.args) or any(k.arg is None for k in node.keywords):
-                    return None
-                kw = {k.arg: k.value for k in node.keywords}
-                pos = index - 1 if method and isinstance(node.func, ast.Attribute) else index
-                if param in kw:
-                    out.append(values(kw[param], depth + 1, lit))
-                elif 0 <= pos < len(node.args):
-                    out.append(values(node.args[pos], depth + 1, lit))
-        return union(out)
 
     loaded = set()
 
@@ -1724,7 +1578,7 @@ def _dynamic_targets(closure):
         return ""
 
     def code(node, target, what):
-        got = values(target, lit=True)
+        got = values(target)
         if got is None:
             return f"{where(node)}: {what} runs computed code"
         for s in got:
