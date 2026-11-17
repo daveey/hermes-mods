@@ -148,6 +148,7 @@ export function Panel({ snap, windowHours, onWindow, onApply, saving, error, onR
     h('div', { className: 'hermes-lanes-head' },
       h('strong', null, 'Lanes'),
       h('span', { className: 'hermes-lanes-dim' }, `${list.reduce((s, r) => s + r.running, 0)} running · ${list.reduce((s, r) => s + r.open, 0)} open · ${snap.scope === 'fleet' ? 'whole fleet' : 'this board'}`),
+      snap.shadow ? h('span', { className: 'hermes-lanes-warn', title: 'kanban.admission.lane_shadow is on: cards are classified and counted, but nothing is held, capped, reordered or paused' }, 'Shadow mode: reporting only') : null,
       h('span', { className: 'hermes-lanes-grow' }),
       onRunners ? h('button', { type: 'button', onClick: onRunners }, 'Runners') : null,
       h('div', { className: 'hermes-lanes-seg', role: 'group', 'aria-label': 'Window' },

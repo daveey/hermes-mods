@@ -67,6 +67,9 @@ test('unconfigured lanes show the server reason', async () => {
   const view = await mount(React.createElement(P.Panel, { snap: { configured: false, reason: 'no lanes are configured (kanban.admission.lanes)' }, windowHours: 6, onWindow() {}, onApply() {} }))
   assert.match(view.container.textContent, /no lanes are configured/)
   await view.close()
+  const shadow = await mount(React.createElement(P.Panel, { snap: snap({ shadow: true }), windowHours: 6, onWindow() {}, onApply() {} }))
+  assert.match(shadow.container.textContent, /Shadow mode: reporting only/)
+  await shadow.close()
 })
 
 test('slider and pause become one PUT per changed lane; Reset drops the draft', async () => {
