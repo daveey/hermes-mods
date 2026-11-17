@@ -40,6 +40,54 @@ class WeeklyNoise(unittest.TestCase):
             for changed in ({'hit_t': 1000}, {'quote': 'do it yourself'}, {'session_id': 'absent'}):
                 self.assertIsNone(g.still_flags(dict(row, **changed), homes=[], data=tmp))
 
+    def test_runtime_and_restart_notices_are_not_human(self):
+        for text in (
+            '[runtime] Your draft above was NOT shown to the user. Do it yourself.',
+            '⏳ [default] @default Kanban t_example: broken again',
+            '⚠ subagent Subagent: root cause was stopped by a restart before finishing',
+            '[System note: Your previous turn was interrupted mid-run. The paused request was:] broken again',
+            'Canonical user decision. Act only on the frozen revision below. root cause',
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self.collect('desktop', text), [])
+                self.assertIn('generated', g.still_flags({'quote': text}, homes=[], data='/absent') or '')
+
+    def test_canonical_suffix_cannot_supply_matching_words(self):
+        suffix = '\n[Canonical requests awaiting a user decision: root cause; do it yourself]'
+        self.assertEqual(self.collect('desktop', 'What is in this image?' + suffix), [])
+        self.assertTrue(self.collect('desktop', 'why are you asking me' + suffix))
+
+    def test_named_review_launcher_not_desktop(self):
+        text = '# Independent bounded review\nYou are independent mandated reviewer. Verify it yourself.'
+        self.assertEqual(self.collect('rollout-latency-method-review', text), [])
+        self.assertTrue(self.collect('desktop', text))
+
+    def test_erased_restart_wrapper_requires_exact_raw_evidence(self):
+        import sqlite3
+        from unittest.mock import patch
+        from session_digest import clean_user
+        raw = '[System note: Your previous turn was interrupted mid-run. The paused request was:] broken again'
+        text = clean_user(raw)
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            con = sqlite3.connect(home / 'state.db')
+            con.execute('create table messages(session_id text, role text, content text, timestamp real)')
+            con.execute('insert into messages values (?,?,?,?)', ('s', 'user', raw, 100))
+            con.commit()
+            row = {'session_id': 's', 'hit_t': 100, 'quote': text}
+            self.assertTrue(g.row_raw_generated(row, [home]))
+            self.assertIn('generated', g.still_flags(row, homes=[home], data=home) or '')
+            with patch.dict('os.environ', {'HERMES_HOME': str(home)}):
+                self.assertEqual(self.collect('desktop', text), [])
+            for changed in ({'hit_t': 200}, {'session_id': 'other'}, {'quote': 'why are you asking me'}):
+                self.assertFalse(g.row_raw_generated(dict(row, **changed), [home]))
+            self.assertFalse(g.row_raw_generated(row, []))
+            # A real matching turn in the window makes attribution ambiguous.
+            con.execute('insert into messages values (?,?,?,?)', ('s', 'user', text, 100))
+            con.commit()
+            self.assertFalse(g.row_raw_generated(row, [home]))
+            con.close()
+
     def test_warning_notice_not_fix(self):
         text = ('⚠ [default] @default Kanban t_example: No pool worker can run this card '
                 '(needs: skill:five-whys). It stays queued until its creator repins it.')
