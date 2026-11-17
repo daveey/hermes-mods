@@ -114,7 +114,9 @@ def execution_path(command):
     else:
         quoted = raw.startswith('"')
         raw = raw[1:-1] if quoted else raw
-        if quoted and raw.startswith('~'):
+        if (quoted and raw.startswith('~')) or (not quoted and re.search(r'[{}]', raw)):
+            # Bash expands unquoted brace paths before invoking the script.
+            # shlex does not, so accepting them would credit a different file.
             return ''
         path = path_key(raw)
     if not path or re.search(r'[$`\\*?\[\]]', path):
