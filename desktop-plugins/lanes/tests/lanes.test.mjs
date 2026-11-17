@@ -34,16 +34,17 @@ test('targets follow the draft, and a paused lane gets none', () => {
 })
 
 test('drift says why a lane is off target', () => {
-  const [bb, infra] = P.rows(snap())
-  assert.equal(P.drift(bb), 'under: nothing ready')
-  assert.equal(P.drift({ ...bb, ready: 4 }), 'under: waiting for slots')
+  const [product, infra] = P.rows(snap())
+  assert.equal(P.drift(product), 'under: nothing ready')
+  assert.equal(P.drift({ ...product, ready: 4 }), 'under: waiting for slots')
   assert.equal(P.drift(infra), 'over: using idle slots')
-  assert.equal(P.drift({ ...bb, actual: 0.45 }), '')
+  assert.equal(P.drift({ ...product, actual: 0.45 }), '')
+  assert.equal(P.drift({ ...infra, paused: true, target: 0 }), 'paused')
 })
 
 test('cost shows coverage, and a dash when nothing reported', () => {
-  const [bb, infra] = P.rows(snap())
-  assert.equal(P.cost(bb).text, '–')
+  const [product, infra] = P.rows(snap())
+  assert.equal(P.cost(product).text, '–')
   assert.equal(P.cost(infra).text, '$47.65')
   assert.match(P.cost(infra).title, /140 of 400 runs/)
 })
@@ -74,7 +75,7 @@ test('unconfigured lanes show the server reason', async () => {
 
 test('slider and pause become one PUT per changed lane; Reset drops the draft', async () => {
   const applied = []
-  const view = await mount(React.createElement(P.Panel, { snap: snap(), windowHours: 6, onWindow() {}, onApply: (p) => applied.push(p) }))
+  const view = await mount(React.createElement(P.Panel, { snap: snap(), windowHours: 6, onWindow() {}, onApply: (p) => { applied.push(p); return false } }))
   assert.match(view.container.textContent, /gated · 12\/50 admitted today/)
   assert.match(view.container.textContent, /120 ready · oldest 2h/)
   assert.match(view.container.textContent, /product: nothing ready/)
@@ -89,6 +90,7 @@ test('slider and pause become one PUT per changed lane; Reset drops the draft', 
   await view.click(view.container.querySelector('[data-lane="infra"] .hermes-lanes-volume button'))
   await view.click(button('Apply'))
   assert.deepEqual(applied, [[['product', { share: 90 }], ['infra', { paused: true }]]])
+  assert.equal(button('Apply').disabled, false, 'a failed or unconfirmed Apply keeps the draft')
   await view.click(button('Reset'))
   assert.equal(button('Apply').disabled, true)
   await view.close()
@@ -103,8 +105,14 @@ test('the event opens the panel, fetches the saved window, and Apply PUTs', asyn
   await React.act(async () => window.dispatchEvent(new window.Event('hermes-show-lanes')))
   await view.flush()
   await view.click(document.querySelector('[data-lane="product"] .hermes-lanes-volume button'))
+  // A poll that brings a new snapshot object must not drop the unsaved edit.
+  await React.act(async () => view.client.refetchQueries({ queryKey: ['lanes', 6] }))
+  await view.flush()
+  assert.equal(button('Apply').disabled, false, 'draft survives a poll')
   await view.click(button('Apply'))
-  assert.deepEqual(calls.at(-1), ['/v1/lanes/product', 'PUT', { paused: true }])
+  assert.deepEqual(calls.filter((c) => c[1] === 'PUT'), [['/v1/lanes/product', 'PUT', { paused: true }]])
+  assert.equal(calls.at(-1)[1], 'GET', 'a successful Apply refetches')
+  assert.equal(button('Apply').disabled, true, 'and clears the draft')
   await view.click(button('24h'))
   assert.equal(calls.at(-1)[0], '/v1/lanes?hours=24')
   await view.close()
@@ -118,4 +126,23 @@ test('without working lanes the runners chip is left alone', async () => {
   const broken = await mount(React.createElement(P.Lanes, { ctx: { rest: async () => { throw Error('404') } } }))
   assert.equal(window[P.LOADED_FLAG], undefined)
   await broken.close()
+})
+
+test('a failed PUT names the lane, keeps the draft and shows what was written', async () => {
+  const calls = []
+  const ctx = ctxWith(calls, (path, opts) => {
+    if (opts.method === 'PUT' && path.endsWith('/infra')) throw Error('unknown lane: infra')
+    return snap()
+  })
+  const view = await mount(React.createElement(P.Lanes, { ctx }))
+  await React.act(async () => window.dispatchEvent(new window.Event('hermes-show-lanes')))
+  await view.flush()
+  await view.click(document.querySelector('[data-lane="product"] .hermes-lanes-volume button'))
+  await view.click(document.querySelector('[data-lane="infra"] .hermes-lanes-volume button'))
+  await view.click(button('Apply'))
+  assert.deepEqual(calls.filter((c) => c[1] === 'PUT').map((c) => c[0]), ['/v1/lanes/product', '/v1/lanes/infra'])
+  assert.match(document.body.textContent, /infra: unknown lane: infra/)
+  assert.equal(calls.at(-1)[1], 'GET', 'refetched after the failure')
+  assert.equal(button('Apply').disabled, false, 'draft kept for a retry')
+  await view.close()
 })

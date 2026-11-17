@@ -10,9 +10,10 @@ REST API behind the Desktop lanes panel (`desktop-plugins/lanes`). All data and 
 | `GET /api/plugins/lanes/v1/held?lane=x` | Cards waiting at a lane gate |
 | `POST /api/plugins/lanes/v1/held/<card>/admit` | Release one, `{"reason": "..."}` |
 
-On a core without lanes support, or with no `kanban.admission.lanes`, reads answer
-`{"configured": false, "reason": ...}` and writes answer 409. Cost is an estimate from the runs whose workers
-reported usage; `usage_runs` against `runs` says how many that is.
+On a core without lanes support, or with no `kanban.admission.lanes`, `GET /v1/lanes` answers
+`{"configured": false, "reason": ...}` and every other route answers 409. The panel uses the lanes read and the
+share and pause writes; `admit_per_day` and the held routes are API-only for now. Cost is an estimate from the
+runs whose workers reported usage; `usage_runs` against `runs` says how many that is.
 
 Enable: `hermes plugins enable lanes`. Tests: `scripts/test-all -k plugins/lanes`,
 `node --test desktop-plugins/lanes/tests/lanes.test.mjs`.

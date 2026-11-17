@@ -23,13 +23,19 @@ class Core:
     def __init__(self):
         self.snapshots, self.sets, self.admits = 0, [], []
         self.configured = True
+        self.slow = None
 
     @contextlib.contextmanager
     def connect_closing(self):
         yield object()
 
+    def policy(self):
+        return object() if self.configured else None
+
     def snapshot(self, _conn, *, hours):
         self.snapshots += 1
+        if self.slow:
+            self.slow()
         if not self.configured:
             return {"configured": False}
         return {"configured": True, "window_hours": hours, "lanes": {"product": {"share": 35}}}
@@ -42,7 +48,8 @@ class Core:
     def held(self, _conn, lane):
         return [{"id": "t_1", "title": "infra", "tenant": lane or "infra", "created_at": 5}]
 
-    def admit(self, _conn, card, *, actor, reason):
+    def admit(self, _conn, card, *, actor, reason, budget):
+        assert budget is False  # a panel admit never spends the planner's daily budget
         self.admits.append((card, actor, reason))
         return card == "t_1"
 
@@ -66,6 +73,11 @@ def test_unconfigured_lanes_carry_a_reason(api, core):
     core.configured = False
     out = api.read(6.0)
     assert out["configured"] is False and "kanban.admission.lanes" in out["reason"]
+    for call in (lambda: api.change("product", {"share": 1}), lambda: api.held(None), lambda: api.admit("t_1", "x")):
+        with pytest.raises(fastapi.HTTPException) as err:
+            call()
+        assert err.value.status_code == 409
+    assert not core.sets and not core.admits
 
 
 def test_reads_are_cached_per_window_and_a_write_drops_the_cache(api, core):
@@ -97,3 +109,28 @@ def test_held_and_admit(api, core):
     assert api.admit("t_1", "needed") == {"admitted": True}
     assert api.admit("t_2", "needed") == {"admitted": False}
     assert core.admits[0] == ("t_1", "user (lanes panel)", "needed")
+
+
+def test_a_read_that_began_before_a_write_is_not_cached(api, core):
+    core.slow = lambda: (setattr(core, "slow", None), api.change("product", {"share": 50}))
+    stale = api.read(24.0, now=100)
+    assert stale["configured"] is True
+    before = core.snapshots
+    api.read(24.0, now=101)
+    assert core.snapshots == before + 1  # the pre-write snapshot was not kept
+
+
+def test_routes_over_http(api, core):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    app = FastAPI()
+    app.include_router(api.router)
+    client = TestClient(app)
+    assert client.get("/v1/lanes?hours=7").status_code == 400
+    assert client.get("/v1/lanes?hours=24").json()["window_hours"] == 24
+    assert client.put("/v1/lanes/nope", json={"share": 1}).status_code == 400
+    assert client.put("/v1/lanes/product", json={"weight": 1}).status_code == 400
+    assert client.put("/v1/lanes/product", json={"share": 40}).json()["configured"] is True
+    assert client.get("/v1/held?lane=infra").json()["cards"][0]["id"] == "t_1"
+    assert client.post("/v1/held/t_1/admit", json={"reason": "needed"}).json() == {"admitted": True}

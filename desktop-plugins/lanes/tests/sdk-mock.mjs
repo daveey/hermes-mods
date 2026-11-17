@@ -47,6 +47,7 @@ export async function mount(component, { gcTime = 0 } = {}) {
   await flush()
   return {
     container,
+    client,
     flush,
     async click(el, init = {}) {
       if (!el) throw Error('Missing element')

@@ -21,7 +21,7 @@ Everything goes through `hermes kanban lanes`. Never edit card priorities or `co
 
 ```sh
 hermes kanban lanes show --json          # target vs actual share, running, ready, held, open, done, cost per lane
-hermes kanban lanes show --hours 24      # a different window (1, 6, 24 or 168)
+hermes kanban lanes show --hours 24      # a different trailing window, in hours
 hermes kanban lanes held --json          # cards waiting at a gate
 hermes kanban lanes unclassified --json  # open cards nothing placed in a lane
 hermes kanban lanes explain <card>       # one card: its lane, where that came from, why it waits

@@ -3,8 +3,10 @@ the gate, open, done, tokens and estimated cost over the window (core ``kanban_l
 PUT /api/plugins/lanes/v1/lanes/{lane}: body ``{"share": n, "paused": bool, "admit_per_day": n}`` (any subset).
 GET /api/plugins/lanes/v1/held?lane=x: cards waiting at a lane gate. POST /api/plugins/lanes/v1/held/{card}/admit.
 
-Every route answers ``{"configured": false, "reason": ...}`` (or 409 for a write) on a core without lanes support
-or with no lanes configured, so the panel can say why it is empty. Reads are cached for 10 s per window.
+Without lanes: ``GET /v1/lanes`` answers ``{"configured": false, "reason": ...}`` on a core without lanes support or
+with no lanes configured, so the panel can say why it is empty; every other route answers 409 in both cases.
+Reads are cached for 10 s per window; a write starts a new cache generation, so a read that began before it
+cannot be stored after it.
 """
 from __future__ import annotations
 
@@ -20,6 +22,7 @@ CACHE_S = 10
 WINDOWS = (1.0, 6.0, 24.0, 168.0)
 _lock = threading.Lock()
 _cache: Dict[float, tuple] = {}
+_generation = 0
 
 
 def core():
@@ -40,6 +43,7 @@ def read(hours: float, now: Optional[float] = None) -> Dict[str, Any]:
         hit = _cache.get(hours)
         if hit and now - hit[0] < CACHE_S:
             return hit[1]
+        generation = _generation
     kbc, _lanes, cli = mods
     try:
         with kbc.connect_closing() as conn:
@@ -49,14 +53,29 @@ def read(hours: float, now: Optional[float] = None) -> Dict[str, Any]:
     if not snap.get("configured"):
         snap = {"configured": False, "reason": "no lanes are configured (kanban.admission.lanes)"}
     with _lock:
-        _cache[hours] = (now, snap)
+        if generation == _generation:
+            _cache[hours] = (now, snap)
     return snap
 
 
+def _written() -> None:
+    global _generation
+    with _lock:
+        _generation += 1
+        _cache.clear()
+
+
 def _need_core():
+    """Core's lanes modules, or 409 when this core has none or no lanes are configured."""
     mods = core()
     if mods is None:
         raise HTTPException(status_code=409, detail="this Hermes core has no lanes support yet")
+    try:
+        configured = mods[1].policy() is not None
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=f"lanes configuration is invalid: {exc}")
+    if not configured:
+        raise HTTPException(status_code=409, detail="no lanes are configured (kanban.admission.lanes)")
     return mods
 
 
@@ -68,8 +87,7 @@ def change(lane: str, body: Dict[str, Any]) -> Dict[str, Any]:
     if "paused" in body and type(body["paused"]) is not bool:
         raise ValueError("paused must be true or false")
     cli.set_lane(lane, share=body.get("share"), admit_per_day=body.get("admit_per_day"), paused=body.get("paused"))
-    with _lock:
-        _cache.clear()
+    _written()
     return read(6.0)
 
 
@@ -84,9 +102,8 @@ def held(lane: Optional[str]) -> Dict[str, Any]:
 def admit(card: str, reason: str) -> Dict[str, Any]:
     kbc, lanes, _cli = _need_core()
     with kbc.connect_closing() as conn:
-        done = lanes.admit(conn, card, actor="user (lanes panel)", reason=reason)
-    with _lock:
-        _cache.clear()
+        done = lanes.admit(conn, card, actor="user (lanes panel)", reason=reason, budget=False)  # the user's own admit
+    _written()
     return {"admitted": done}
 
 

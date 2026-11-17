@@ -2,8 +2,10 @@
 // Opens from the runners chip (which dispatches `hermes-show-lanes` where lanes are configured) and from the
 // palette. Data: GET /v1/lanes?hours=… on the local gateway (plugins/lanes): per lane target and actual share of
 // run-hours, running, ready, held at the gate, open, done, tokens and estimated cost. Controls: PUT /v1/lanes/<lane>
-// {share | paused | admit_per_day}. Shares are relative volumes: the target percentage is share / sum of shares.
-import { useQuery, useQueryClient, STATUSBAR_AREAS, PALETTE_AREA, Popover, PopoverTrigger, PopoverContent } from '@hermes/plugin-sdk'
+// {share | paused}; the API also takes admit_per_day and has /v1/held, which this panel does not use yet.
+// Shares are relative volumes: the target percentage is share / sum of shares. A draft survives polls; it is
+// dropped only by Reset or a successful Apply.
+import { useQuery, STATUSBAR_AREAS, PALETTE_AREA, Popover, PopoverTrigger, PopoverContent } from '@hermes/plugin-sdk'
 import { createElement as h, useState, useEffect } from 'react'
 
 export const POLL_MS = 15000
@@ -52,6 +54,7 @@ export function rows(snap, draft = {}) {
 
 /** Why a lane is off its target, in the user's terms; '' when it is within 10 points. */
 export function drift(row) {
+  if (row.paused) return 'paused'
   const gap = row.actual - row.target
   if (Math.abs(gap) <= 0.1) return ''
   if (gap > 0) return 'over: using idle slots'
@@ -136,7 +139,6 @@ function Row({ row, maxOpen, onShare, onPause }) {
 
 export function Panel({ snap, windowHours, onWindow, onApply, saving, error, onRunners }) {
   const [draft, setDraft] = useState({})
-  useEffect(() => { setDraft({}) }, [snap])
   if (!snap) return h('div', { className: 'hermes-lanes-note' }, error ? `Unavailable: ${error}` : 'Loading…')
   if (!snap.configured) return h('div', { className: 'hermes-lanes-note' }, snap.reason || 'No lanes are configured.')
   const list = rows(snap, draft)
@@ -164,7 +166,7 @@ export function Panel({ snap, windowHours, onWindow, onApply, saving, error, onR
           : h('span', { className: 'hermes-lanes-dim' }, 'No planner notes yet.')),
       error ? h('span', { className: 'hermes-lanes-warn' }, error) : null,
       h('button', { type: 'button', disabled: !pending.length || saving, onClick: () => setDraft({}) }, 'Reset'),
-      h('button', { type: 'button', className: 'is-primary', disabled: !pending.length || saving, onClick: () => onApply(pending) }, saving ? 'Applying…' : 'Apply')))
+      h('button', { type: 'button', className: 'is-primary', disabled: !pending.length || saving, onClick: async () => { if (await onApply(pending)) setDraft({}) } }, saving ? 'Applying…' : 'Apply')))
 }
 
 export function Lanes({ ctx }) {
@@ -172,8 +174,7 @@ export function Lanes({ ctx }) {
   const [windowHours, setWindowState] = useState(loadWindow)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
-  const client = useQueryClient()
-  const key = ['lanes', windowHours]
+    const key = ['lanes', windowHours]
   const query = useQuery({
     queryKey: key,
     queryFn: () => ctx.rest(`/v1/lanes?hours=${windowHours}`, { timeoutMs: REQUEST_TIMEOUT_MS }),
@@ -196,18 +197,27 @@ export function Lanes({ ctx }) {
     window[LOADED_FLAG] = true
     return () => { delete window[LOADED_FLAG] }
   }, [working])
+  // One PUT per changed lane, in order. On a failure the lanes already written stay written: refetch so the panel
+  // shows them, name the lane that failed, and keep the draft so the rest can be retried.
   const apply = async (pending) => {
     setSaving(true); setError('')
+    let at = ''
     try {
-      let last
-      for (const [name, body] of pending) last = await ctx.rest(`/v1/lanes/${encodeURIComponent(name)}`, { method: 'PUT', body, timeoutMs: REQUEST_TIMEOUT_MS })
-      if (last && windowHours === 6) client.setQueryData(key, last)
-      else await query.refetch()
-    } catch (e) { setError(String(e?.message || e).slice(0, 200)) } finally { setSaving(false) }
+      for (const [name, body] of pending) {
+        at = name
+        await ctx.rest(`/v1/lanes/${encodeURIComponent(name)}`, { method: 'PUT', body, timeoutMs: REQUEST_TIMEOUT_MS })
+      }
+      await query.refetch()
+      return true
+    } catch (e) {
+      setError(`${at}: ${String(e?.message || e).slice(0, 180)}`)
+      await query.refetch().catch(() => {})
+      return false
+    } finally { setSaving(false) }
   }
   return h(Popover, { open, onOpenChange: setOpen },
     h(PopoverTrigger, { asChild: true }, h('span', { className: 'hermes-lanes-anchor', 'data-slot': 'lanes-anchor', 'aria-hidden': 'true' })),
-    h(PopoverContent, { side: 'top', align: 'end', sticky: 'always', 'aria-label': 'Lanes', className: 'hermes-lanes-popover', style: { width: 'min(1040px, calc(100vw - 24px))', maxHeight: '76vh', overflow: 'auto' } },
+    h(PopoverContent, { side: 'top', align: 'end', sticky: 'always', 'aria-label': 'Lanes', className: 'hermes-lanes-popover', style: { width: 'min(1120px, calc(100vw - 24px))', maxHeight: '76vh', overflow: 'auto' } },
       h(Panel, {
         snap: query.data, windowHours, saving, error: error || (query.error ? String(query.error.message).slice(0, 200) : ''),
         onWindow: (v) => { setWindowState(v); saveWindow(v) }, onApply: apply,
