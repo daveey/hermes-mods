@@ -44,9 +44,11 @@ SKIP = re.compile(
     r"(?:Go|Chose|✓ Done):|\{\s*\"(?:person|kind)\"|Without any other tools:|[✔✖✘⏸⏱🔄]\ufe0f?\s+\[)", re.I)
 # Defense in depth for old digests: generated user-role rows are not human corrections.
 GENERATED = re.compile(
-    r'^\s*(?:# Kanban task t_|\[(?:kanban|owner-wake|coach|selfheal-probe)\]|'
+    r'^\s*(?:# Kanban task t_|\[(?:kanban|owner-wake|coach|selfheal-probe|runtime)\]|'
+    r'\[System note: Your previous turn was interrupted|'
+    r'Canonical user decision\. Act only on the frozen revision below\.|⚠\ufe0f?\s+subagent\s+Subagent:|'
     r'\{\s*"item"\s*:|New notes? on your kanban task from another agent session\b|'
-    r'Diagnosis only\. Inspect this runner/host|⚠\ufe0f?\s+\[[^\]\n]+\]\s+@\S+\s+Kanban\s+t_)'
+    r'Diagnosis only\. Inspect this runner/host|[⚠⏳]\ufe0f?\s+\[[^\]\n]+\]\s+@\S+\s+Kanban\s+t_)'
     r'|\(Roleplay test of our reply checker', re.I)
 # Same marker as plugins/coach/self_heal.py PROBE_RE: a session opener that marks a deliberate detector probe.
 PROBE = re.compile(r"^\s*(?:\[selfheal-probe\]|Live test of a detector\b)", re.I)
@@ -56,7 +58,12 @@ NOTE_HEADER = re.compile(r"^\s*New notes? on your kanban task from ", re.I)
 NOTE_LINE = re.compile(r"(?m)^- [^\n]*? at \d{1,2}:\d{2}(?: [A-Za-z0-9+\-]+)?: ")
 AGENT_STAMP = re.compile(r"^- (?:Subagent:|[^\n:(]*\([^)\n]*\bagent chat\b)")
 REVIEW_BRIEF = re.compile(
-    r"^\s*(?:You are (?:an?|the) independent\b[^\n]*\breviewer\b|Review the COMPLETE exact PR\d+\b)", re.I)
+    r"^\s*(?:#[^\n]*\breview\b[^\n]*\n\s*)?(?:You are (?:(?:an?|the) )?independent\b[^\n]*\breviewer\b|Review the COMPLETE exact PR\d+\b)", re.I)
+
+
+def review_opener(source, text):
+    # Only explicit launcher sources, never all local sessions or first turns.
+    return (source == "oneshot" or source == "rollout-latency-method-review") and bool(REVIEW_BRIEF.match(text))
 
 
 NOTE_PREFIX = 120  # chars of a note line's body matched against agents' kanban_comment tool calls
@@ -396,6 +403,7 @@ def clean(text, t=None):
             text = m.group(1)
     # Desktop appends these machine-owned sections to real user text. Their
     # quoted button labels are not new complaints from the user.
+    text = re.split(r"\s*\[Canonical requests awaiting a user decision:", text, maxsplit=1)[0]
     text = re.split(r"(?m)^\s*\[(?:(?:user-steps|chat-closeout)\]|System:)", text, maxsplit=1)[0]
     return drop_agent_notes(text.strip(), t).strip()
 
@@ -494,7 +502,7 @@ def collect(data, since_ts, until_ts, doit=None):
                 continue
             # Launcher-authored review instructions are not human corrections. Do not
             # suppress ordinary one-shot requests or interactive review requests.
-            if d.get("source") == "oneshot" and i == 0 and REVIEW_BRIEF.match(text):
+            if i == 0 and review_opener(d.get("source"), text):
                 continue
             # Provenance: the digest's `inbox_doit` flag (the Inbox store says Do it sent this prompt; the only proof
             # for a labelled card, whose prompt is not in prev), else the Inbox notice in prev.
@@ -523,6 +531,9 @@ def collect(data, since_ts, until_ts, doit=None):
                                   session_text(d)):
                     cls = BB_CLASS
             if not kind:
+                continue
+            if row_raw_generated({"session_id": d.get("id"), "hit_t": t, "quote": text}):
+                scanned[ws] -= 1
                 continue
             key = (d.get("id"), int(t), text[:80])
             if key in seen:
@@ -817,11 +828,11 @@ def row_is_review_brief(row, data=None):
         for f in base.glob(f"*/*/{glob.escape(s)}.json"):
             d = json.loads(f.read_text())
             turns = d.get("user_turns") or []
-            if d.get("source") != "oneshot" or not turns:
+            if not turns:
                 continue
             u = turns[0]
             text = clean(u.get("text") or "", u.get("t"))
-            if abs((u.get("t") or 0) - t) <= DOIT_NEAR and _ws(text).startswith(q) and REVIEW_BRIEF.match(text):
+            if abs((u.get("t") or 0) - t) <= DOIT_NEAR and _ws(text).startswith(q) and review_opener(d.get("source"), text):
                 return True
     return False
 
@@ -861,6 +872,41 @@ def row_is_agent_note(row, data=None):
     return False
 
 
+def row_raw_generated(row, homes=None):
+    """Recover erased restart provenance only with matching source content + time.
+
+    Old digests stripped the System-note wrapper. Absence of source evidence is
+    not evidence of automation. Never withdraw another turn in the same session.
+    """
+    from session_digest import SYNTHETIC, flatten, clean_user, clip_user_turn
+    s, t = row.get("session_id"), row_hit_t(row)
+    q = _ws(str(row.get("quote") or "")).rstrip("…").strip()
+    if not s or t is None or not q:
+        return False
+    for home in homes if homes is not None else [Path(os.environ.get("HERMES_HOME") or "~/.hermes").expanduser()]:
+        db = Path(home) / "state.db"
+        if not db.is_file():
+            continue
+        try:
+            con = _ro_connect(db)
+            try:
+                rows = con.execute("select content from messages where session_id=? and role='user' "
+                                   "and timestamp between ? and ? limit 32", (s, t - 2, t + 2)).fetchall()
+            finally:
+                con.close()
+            matched = []
+            for (content,) in rows:
+                raw = flatten(content or "")
+                cleaned = clean_user(raw)
+                if any(_ws(v).startswith(q) for v in (raw, cleaned, clip_user_turn(cleaned))):
+                    matched.append(bool(SYNTHETIC.match(raw)))
+            if matched and all(matched):
+                return True
+        except (OSError, sqlite3.Error):
+            continue
+    return False
+
+
 def still_flags(row, homes=None, data=None):
     """Why the ask-gate monitor no longer stands by a row it queued earlier, else None. The drain re-checks a queued
     row with today's full verdict, in route_hits' order, so any later rule fix retracts the rows it would not have
@@ -874,6 +920,10 @@ def still_flags(row, homes=None, data=None):
         qt = row_hit_t(row)
         if q and (generated(clean(q, qt)) or (NOTE_HEADER.match(q) and not clean(q, qt))):
             return "monitor no longer flags (ask-gate): quote is a generated prompt, not David"
+        if row_raw_generated(row, homes):
+            return "monitor no longer flags (ask-gate): original row is generated, wrapper erased by old digest"
+        if '[Canonical requests awaiting a user decision:' in q and not (classify(clean(q)) or classify_fix(clean(q))):
+            return "monitor no longer flags (ask-gate): matching words came only from generated canonical context"
         if row_is_agent_note(row, data):
             return "monitor no longer flags (ask-gate): card note written by an agent, not David"
         if row_is_review_brief(row, data):
