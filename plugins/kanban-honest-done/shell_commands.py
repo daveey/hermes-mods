@@ -109,7 +109,12 @@ def _inert_parse(text):
         if ch in ' \t':
             i += 1
             continue
-        if ch in '<>':
+        if ch == '>':
+            # A literal write can poison an executable/configuration used here
+            # or by a later invocation. No filesystem provenance is available,
+            # so output redirects never grant data exemptions (including >>).
+            return None
+        if ch == '<':
             had_redirection = True
             redirected = True
             op = ch
@@ -173,8 +178,8 @@ def _inert_parse(text):
         return None
     if words and not finish():
         return None
-    # A literal output write can create Git execution configuration before the
-    # commit, even within one simple command. Do not exempt that composition.
+    # Retain the conservative Git/input-redirection restriction: Git can invoke
+    # hooks and other consumers; input provenance is outside this tiny grammar.
     if had_redirection and any(argv[:2] == ('git', 'commit') for argv in commands):
         return None
     return tuple(commands)

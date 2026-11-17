@@ -173,7 +173,7 @@ in the bounded grammar G in `shell_commands.py`:
 - Words: unquoted `[A-Za-z0-9_./:=@%+,-]`, single-quoted strings, or double-quoted
   strings without dollar signs, backticks or backslashes.
 - Lists/pipelines: `;`, `&&`, `||`, `|`, newline; every command must qualify.
-- Redirection: `>`, `>>`, `<` with literal operands; `<<'D'` / `<<"D"` with a
+- Input redirection: `<` with a literal operand; `<<'D'` / `<<"D"` with a
   verbatim body ending at a physical delimiter line, or an unquoted delimiter
   whose body has no dollar sign, backtick or backslash. No fd prefixes/duplication,
   here-strings, tab-stripping or mixed-quoted delimiters.
@@ -183,8 +183,19 @@ in the bounded grammar G in `shell_commands.py`:
 - `printf` is output-only: optional `--`, then a non-option format using only
   output conversions (`diouxXfFeEgGaAcbsq` or `%%`, with width/precision/flags).
   `-v`, `%n`, unknown conversions, and decorated variable-writing conversions
-  are outside G. A command string containing both a redirection and `git commit`
-  is also outside G: the write could manufacture Git execution configuration.
+  are outside G. Any output redirection (`>` or `>>`) anywhere revokes G: even
+  an isolated write can poison a previously harmless executable for this or a
+  later invocation. This includes writes to apparent notes files; no pathname
+  allowlist or filesystem provenance is assumed. Output characters inside quoted
+  data or heredoc bodies are not operators. Input redirection combined with
+  `git commit` also remains outside G.
+
+`tests/test_output_poisoning.py` proves echo/printf/heredoc overwrite and append
+against initially harmless fixture executables, through real Bash and the actual
+hook. It also covers reversed-order and pipeline composition, isolated writes,
+and quoted-output-character controls. Four former output-to-notes/definitions
+controls now conservatively detect mentions, while plain quoted heredocs remain
+exempt.
 
 Inside G, other commands' arguments/input are data. Outside G, **no data exemption
 is possible**: the old any-position token scan applies to the entire string, with

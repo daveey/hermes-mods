@@ -428,16 +428,19 @@ def test_redefinitions_fail_closed(shape):
 
 # The card's own bug must stay fixed: printed text that nothing runs is data.
 _STILL_DATA = [
-    'echo {cmd}', 'echo {cmd} > notes.txt', 'echo {cmd} | grep kanban', 'echo {cmd} | cat',
+    'echo {cmd}', 'echo {cmd} | grep kanban', 'echo {cmd} | cat',
     "cat <<'EOF' | grep hermes\n{cmd}\nEOF", 'printf %s {quoted}', 'grep -r {quoted} .',
-    'echo {cmd} || echo done',
-    'echo {cmd} && echo done', "cat <<'EOF' > notes.txt\n{cmd}\nEOF",
-    # Unshadowed controls for review 5914765330: other names, definitions that are only
-    # text or a file's contents, and continuations inside single quotes or quoted heredocs.
-
-    "echo 'echo() {{ \"$@\"; }}'; echo {cmd}", "cat <<'EOF' > defs.sh\necho() {{ \"$@\"; }}\nEOF\necho {cmd}",
+    'echo {cmd} || echo done', 'echo {cmd} && echo done',
+    "echo 'echo() {{ \"$@\"; }}'; echo {cmd}",
     'grep -c "alias echo=env" notes.txt; echo {cmd}',
-    "echo '$\\\n(echo {cmd})'", "cat <<'EOF' > notes.txt\n$\\\n(echo {cmd})\nEOF",
+    "echo '$\\\n(echo {cmd})'",
+]
+
+# Output writes can change executable state, even across separate invocations.
+_OUTPUT_DATA = [
+    'echo {cmd} > notes.txt', "cat <<'EOF' > notes.txt\n{cmd}\nEOF",
+    "cat <<'EOF' > defs.sh\necho() {{ \"$@\"; }}\nEOF\necho {cmd}",
+    "cat <<'EOF' > notes.txt\n$\\\n(echo {cmd})\nEOF",
 ]
 
 # Explicit contract narrowing, not deletion of controls. These remain inert in
@@ -452,7 +455,7 @@ _FORMER_DATA = [
 ]
 
 
-@pytest.mark.parametrize('shape', _FORMER_DATA)
+@pytest.mark.parametrize('shape', _FORMER_DATA + _OUTPUT_DATA)
 def test_former_data_outside_g_is_detected(tmp_path, shape):
     command = _shape(shape)
     assert not core._shell_commands().within_inert_grammar(command)
