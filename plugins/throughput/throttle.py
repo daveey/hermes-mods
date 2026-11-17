@@ -87,7 +87,11 @@ def _fleet_minutes(series_db: Path, since: int, until: int) -> dict[int, float]:
     """Fleet in+out tokens per sampled minute in ``[since, until)`` (read-only; a missing db has no minutes)."""
     if not Path(series_db).is_file():
         return {}
-    c = sqlite3.connect(Path(series_db).resolve().as_uri() + "?mode=ro", uri=True, timeout=1)
+    from .sampler import ro_connect  # mode=rw + query_only: also opens a WAL db whose -wal/-shm are gone
+    try:
+        c = ro_connect(series_db)
+    except sqlite3.Error:
+        return {}
     try:
         rows = c.execute("SELECT minute, SUM(value) FROM minutes WHERE metric='tokens_io' AND minute>=? AND minute<? "
                          "AND value IS NOT NULL GROUP BY minute", (since, until)).fetchall()
