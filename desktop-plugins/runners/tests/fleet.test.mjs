@@ -420,6 +420,20 @@ test('draining: hover text carries the hold reason, holder and age; the row show
   await ui.close()
 })
 
+test('stopped: a held machine that is off is labelled stopped, not draining', async () => {
+  const body = fleet()
+  body.gateways.machines = [{ name: 'worker-5', state: 'stopped', reason: 'stopped: held, not seen for 500 min', labels: [], pinned_only: false, slots: 2, slots_source: 'registry', running: [], hold_reason: 'shutdown', hold_by: 'admin', hold_owner: 'session:s@hub', hold_at: NOW - 2 * 3600000 }]
+  const ui = await render(P.merge([{ route, body, at: NOW }], NOW))
+  try {
+    const row = ui.container.querySelector('[data-machine="worker-5"]')
+    assert.ok(row.classList.contains('is-stopped'))
+    assert.equal(row.querySelector('.hermes-fleet-drain-label')?.textContent, 'stopped')
+    assert.equal(row.querySelector('.hermes-fleet-drain-label').title, 'stopped: shutdown (held by session:s@hub, 2h ago); machine is off (stopped: held, not seen for 500 min)')
+    assert.equal(row.querySelectorAll('.hermes-fleet-slot.is-draining').length, 0)
+    assert.equal(row.querySelectorAll('.hermes-fleet-slot.is-unknown').length, 2)
+  } finally { await ui.close() }
+})
+
 test('draining: hover names the hold_owner card/session, falling back to hold_by', async () => {
   const body = fleet()
   const held = { state: 'draining', reason: 'draining', labels: [], pinned_only: false, slots: 2, slots_source: 'registry', running: [] }

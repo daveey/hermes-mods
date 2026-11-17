@@ -508,10 +508,13 @@ function GatewayRow({ m, now }) {
   const free = m.slots == null ? 0 : Math.max(0, m.slots - m.running.length)
   const freeState = m.state === 'active' ? 'idle' : m.state === 'draining' ? 'draining' : 'unknown'
   const v = loadParts(m.load, now)
-  const drainNote = m.state === 'draining'
+  // A held machine: 'draining' while it is still up or still holds a card, 'stopped' once it is off.
+  const held = m.state === 'draining' || m.state === 'stopped'
+  const holdTail = m.state === 'stopped' ? `machine is off (${text(m.reason)})` : 'finishes running cards, takes no new ones'
+  const drainNote = held
     ? m.hold_reason === undefined
-      ? 'draining: reason unavailable (dashboard older than hold metadata); finishes running cards, takes no new ones'
-      : `draining: ${m.hold_reason ? text(m.hold_reason) : 'no reason recorded'} (held by ${m.hold_owner ? text(m.hold_owner) : m.hold_by ? text(m.hold_by) : 'unknown'}, ${typeof m.hold_at === 'number' ? ago(now - m.hold_at) : 'time unknown'}); finishes running cards, takes no new ones`
+      ? `${m.state}: reason unavailable (dashboard older than hold metadata); ${holdTail}`
+      : `${m.state}: ${m.hold_reason ? text(m.hold_reason) : 'no reason recorded'} (held by ${m.hold_owner ? text(m.hold_owner) : m.hold_by ? text(m.hold_by) : 'unknown'}, ${typeof m.hold_at === 'number' ? ago(now - m.hold_at) : 'time unknown'}); ${holdTail}`
     : null
   const meta = [
     m.pinned_only ? 'pinned only' : null,
@@ -523,7 +526,7 @@ function GatewayRow({ m, now }) {
   // (native title tooltips do not show inside the Desktop popover).
   return h('div', { className: `hermes-fleet-row is-${m.state}`, 'data-machine': m.name },
     h('span', { className: 'hermes-fleet-name' }, h('span', { className: 'hermes-fleet-machine-name' }, text(m.name)),
-      drainNote ? h('span', { className: 'hermes-fleet-drain-label', title: drainNote }, 'draining') : null),
+      drainNote ? h('span', { className: 'hermes-fleet-drain-label', title: drainNote }, m.state) : null),
     h('span', { className: 'hermes-fleet-slots' },
       ...m.running.map((r) => h(Slot, {
         key: `${r.board}/${r.task}`, state: m.state === 'lost' ? 'lost' : 'busy',
@@ -858,7 +861,7 @@ button.hermes-fleet-slot{cursor:pointer}
 .hermes-fleet-slot.is-offline,.hermes-fleet-slot.is-unknown{border-style:dotted;opacity:.6}
 .hermes-fleet-slot.is-draining{background:repeating-linear-gradient(45deg,transparent 0 2px,var(--ui-text-tertiary) 2px 3px)}
 .hermes-fleet-slot.is-lost{background:#d64545;border-color:#d64545}
-.hermes-fleet-row.is-asleep .hermes-fleet-name,.hermes-fleet-row.is-unknown .hermes-fleet-name{color:var(--ui-text-tertiary)}
+.hermes-fleet-row.is-asleep .hermes-fleet-name,.hermes-fleet-row.is-stopped .hermes-fleet-name,.hermes-fleet-row.is-unknown .hermes-fleet-name{color:var(--ui-text-tertiary)}
 `
 
 export default {

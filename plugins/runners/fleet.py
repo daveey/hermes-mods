@@ -125,6 +125,8 @@ def gateway_workers(registry, leases, now_ms, *, local_cap=None, registry_age_s=
     REGISTRY_STALE_S keeps its slots and labels but says nothing about who is up.
     waiting: profile-filtered ``waiting_cards()``; counted once in the header.
     eligible: core ``kanban_worker_node.eligible`` (None means a card fits).
+    A held machine is ``draining`` while the Board still sees it or it still holds a card, and
+    ``stopped`` once it holds none and has been unseen for UNSEEN_MS.
     Per-row counts overlap for portable cards; a card the machine's pickup mode never copies
     (``_offered``) is ineligible there. Holds and liveness do not change
     placement fit: they are reported separately, as are slot/admission limits.
@@ -155,7 +157,12 @@ def gateway_workers(registry, leases, now_ms, *, local_cap=None, registry_age_s=
         elif entry is None:
             state, reason = 'unknown', 'not in the machine registry'
         elif entry.get('hold'):
-            state, reason = 'draining', 'draining'
+            # A held machine the Board no longer sees, holding no card, has finished draining: it is off
+            # (shut down on purpose). "draining" for hours hid that the shutdown had completed.
+            if isinstance(seen, (int, float)) and now_ms - seen > UNSEEN_MS and not running:
+                state, reason = 'stopped', f'stopped: held, not seen for {int((now_ms - seen) / 60000)} min'
+            else:
+                state, reason = 'draining', 'draining'
         elif not isinstance(seen, (int, float)):
             state, reason = 'unknown', 'never seen by the Board'
         elif now_ms - seen > UNSEEN_MS:
@@ -164,6 +171,7 @@ def gateway_workers(registry, leases, now_ms, *, local_cap=None, registry_age_s=
             reason = f'not seen for {int((now_ms - seen) / 60000)} min'
         else:
             state, reason = 'active', None
+        held = state in ('draining', 'stopped')
         fit = None
         if waiting is not None and eligible is not None and entry is not None:
             placement = dict(machines, **{name: dict(entry, hold=False)})
@@ -171,11 +179,11 @@ def gateway_workers(registry, leases, now_ms, *, local_cap=None, registry_age_s=
         rows.append(dict(
             name=name, me=name == me, state=state, reason=reason, last_seen=seen,
             # Registry hold metadata (ms epoch like last_seen); only a current hold reports it.
-            hold_reason=(entry.get('hold_reason') or None) if state == 'draining' else None,
-            hold_by=(entry.get('hold_by') or None) if state == 'draining' else None,
+            hold_reason=(entry.get('hold_reason') or None) if held else None,
+            hold_by=(entry.get('hold_by') or None) if held else None,
             # The card/session the holder declared (Board hold_owner); hold_by is the authenticated principal.
-            hold_owner=(entry.get('hold_owner') or None) if state == 'draining' else None,
-            hold_at=entry.get('hold_at') if state == 'draining' and isinstance(entry.get('hold_at'), (int, float)) else None,
+            hold_owner=(entry.get('hold_owner') or None) if held else None,
+            hold_at=entry.get('hold_at') if held and isinstance(entry.get('hold_at'), (int, float)) else None,
             labels=list(entry.get('labels') or []) if entry else [],
             pinned_only=bool(entry and entry.get('pinned_only')),
             slots=slots, slots_source=slots_source,
