@@ -48,8 +48,8 @@ def read(hours: float, now: Optional[float] = None) -> Dict[str, Any]:
     try:
         with kbc.connect_closing() as conn:
             snap = cli.snapshot(conn, hours=hours)
-    except ValueError as exc:
-        return {"configured": False, "reason": f"lanes configuration is invalid: {exc}"}
+    except Exception as exc:  # an unreadable or invalid config is a reason to show, not a 500
+        return {"configured": False, "reason": f"lanes configuration is unreadable or invalid: {exc}"}
     if not snap.get("configured"):
         snap = {"configured": False, "reason": "no lanes are configured (kanban.admission.lanes)"}
     with _lock:
@@ -72,8 +72,8 @@ def _need_core():
         raise HTTPException(status_code=409, detail="this Hermes core has no lanes support yet")
     try:
         configured = mods[1].policy() is not None
-    except ValueError as exc:
-        raise HTTPException(status_code=409, detail=f"lanes configuration is invalid: {exc}")
+    except Exception as exc:  # unreadable or invalid config: nothing to write to
+        raise HTTPException(status_code=409, detail=f"lanes configuration is unreadable or invalid: {exc}")
     if not configured:
         raise HTTPException(status_code=409, detail="no lanes are configured (kanban.admission.lanes)")
     return mods

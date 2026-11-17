@@ -2,9 +2,18 @@
 // (unconfigured reason, slider + pause produce the right PUTs, window switch refetches).
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { loadPlugin, mount, button, React } from './sdk-mock.mjs'
+import { loadPlugin, mount as rawMount, button, React } from './sdk-mock.mjs'
 
 const P = await loadPlugin()
+
+// Every mounted view is closed after its test, pass or fail: a leaked panel keeps its poll timer and its DOM.
+const open = []
+async function mount(...args) { const view = await rawMount(...args); open.push(view); return view }
+test.afterEach(async () => {
+  for (const view of open.splice(0)) await view.close().catch(() => {})
+  delete window[P.LOADED_FLAG]
+  localStorage.clear()
+})
 
 function lane(over = {}) {
   return { share: 10, paused: false, gated: false, admit_per_day: null, admitted_today: 0, describe: '', target: 0, actual: 0,
@@ -145,4 +154,20 @@ test('a failed PUT names the lane, keeps the draft and shows what was written', 
   assert.equal(calls.at(-1)[1], 'GET', 'refetched after the failure')
   assert.equal(button('Apply').disabled, false, 'draft kept for a retry')
   await view.close()
+})
+
+test('row controls are locked while an Apply is in flight', async () => {
+  let release
+  const ctx = ctxWith([], (path, opts) => (opts.method === 'PUT' ? new Promise((resolve) => { release = () => resolve(snap()) }) : snap()))
+  const view = await mount(React.createElement(P.Lanes, { ctx }))
+  await React.act(async () => window.dispatchEvent(new window.Event('hermes-show-lanes')))
+  await view.flush()
+  await view.click(document.querySelector('[data-lane="product"] .hermes-lanes-volume button'))
+  await view.click(button('Apply'))
+  const other = document.querySelector('[data-lane="infra"] .hermes-lanes-volume button')
+  assert.equal(other.disabled, true)
+  assert.equal(document.querySelector('[data-lane="infra"] input[type=range]').disabled, true)
+  await React.act(async () => release())
+  await view.flush()
+  assert.equal(document.querySelector('[data-lane="infra"] .hermes-lanes-volume button').disabled, false)
 })

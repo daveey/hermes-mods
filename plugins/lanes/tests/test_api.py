@@ -24,16 +24,21 @@ class Core:
         self.snapshots, self.sets, self.admits = 0, [], []
         self.configured = True
         self.slow = None
+        self.broken = None
 
     @contextlib.contextmanager
     def connect_closing(self):
         yield object()
 
     def policy(self):
+        if self.broken:
+            raise self.broken
         return object() if self.configured else None
 
     def snapshot(self, _conn, *, hours):
         self.snapshots += 1
+        if self.broken:
+            raise self.broken
         if self.slow:
             self.slow()
         if not self.configured:
@@ -134,3 +139,19 @@ def test_routes_over_http(api, core):
     assert client.put("/v1/lanes/product", json={"share": 40}).json()["configured"] is True
     assert client.get("/v1/held?lane=infra").json()["cards"][0]["id"] == "t_1"
     assert client.post("/v1/held/t_1/admit", json={"reason": "needed"}).json() == {"admitted": True}
+
+
+@pytest.mark.parametrize("error", [ValueError("lane name bad"), OSError("config.yaml unreadable")])
+def test_unreadable_or_invalid_config_is_a_reason_not_a_crash(api, core, error):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    core.broken = error
+    out = api.read(6.0)
+    assert out["configured"] is False and str(error) in out["reason"]
+    app = FastAPI()
+    app.include_router(api.router)
+    client = TestClient(app)
+    assert client.get("/v1/held").status_code == 409
+    assert client.put("/v1/lanes/product", json={"share": 1}).status_code == 409
+    assert client.post("/v1/held/t_1/admit", json={}).status_code == 409

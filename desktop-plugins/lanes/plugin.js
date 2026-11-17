@@ -3,8 +3,8 @@
 // palette. Data: GET /v1/lanes?hours=… on the local gateway (plugins/lanes): per lane target and actual share of
 // run-hours, running, ready, held at the gate, open, done, tokens and estimated cost. Controls: PUT /v1/lanes/<lane>
 // {share | paused}; the API also takes admit_per_day and has /v1/held, which this panel does not use yet.
-// Shares are relative volumes: the target percentage is share / sum of shares. A draft survives polls; it is
-// dropped only by Reset or a successful Apply.
+// Shares are relative volumes: the target percentage is share / sum of shares. A draft survives polls; Reset, a
+// successful Apply or closing the panel drops it, and the controls are locked while an Apply is in flight.
 import { useQuery, STATUSBAR_AREAS, PALETTE_AREA, Popover, PopoverTrigger, PopoverContent } from '@hermes/plugin-sdk'
 import { createElement as h, useState, useEffect } from 'react'
 
@@ -111,7 +111,7 @@ function Split({ label, list, field }) {
       list.map((r) => h('span', { key: r.name, title: `${r.name} ${pct(r[field])}`, style: { flex: `${Math.max(r[field], 0)} 1 0`, background: r.color } }))))
 }
 
-function Row({ row, maxOpen, onShare, onPause }) {
+function Row({ row, maxOpen, onShare, onPause, saving }) {
   const note = drift(row)
   const c = cost(row)
   return h('div', { className: 'hermes-lanes-row', 'data-lane': row.name },
@@ -122,8 +122,8 @@ function Row({ row, maxOpen, onShare, onPause }) {
         h('div', { className: 'hermes-lanes-sub', title: row.describe || undefined },
           row.gated ? `gated · ${row.admitted_today}${row.admit_per_day == null ? '' : `/${row.admit_per_day}`} admitted today` : (row.describe || '')))),
     h('div', { className: 'hermes-lanes-volume' },
-      h('input', { type: 'range', min: 0, max: 100, step: 5, value: row.share, 'aria-label': `${row.name} volume`, onChange: (e) => onShare(row.name, Number(e.target.value)) }),
-      h('button', { type: 'button', className: row.paused ? 'is-paused' : '', 'aria-pressed': row.paused, onClick: () => onPause(row.name, !row.paused) }, row.paused ? 'Paused' : 'Pause')),
+      h('input', { type: 'range', min: 0, max: 100, step: 5, value: row.share, 'aria-label': `${row.name} volume`, disabled: saving, onChange: (e) => onShare(row.name, Number(e.target.value)) }),
+      h('button', { type: 'button', className: row.paused ? 'is-paused' : '', 'aria-pressed': row.paused, disabled: saving, onClick: () => onPause(row.name, !row.paused) }, row.paused ? 'Paused' : 'Pause')),
     h('div', null,
       h('div', null, h('span', { className: 'hermes-lanes-big' }, pct(row.target)), h('span', { className: 'hermes-lanes-dim' }, ' target')),
       h('div', { className: note ? 'hermes-lanes-warn' : 'hermes-lanes-dim' }, `${pct(row.actual)} actual${note ? ` · ${note}` : ''}`)),
@@ -159,7 +159,7 @@ export function Panel({ snap, windowHours, onWindow, onApply, saving, error, onR
     h(Split, { label: 'Actual', list, field: 'actual' }),
     h('div', { className: 'hermes-lanes-row hermes-lanes-cols' },
       h('span', null, 'Lane'), h('span', null, 'Volume'), h('span', null, 'Share of run-hours'), h('span', null, 'Backed up'), h('span', null, 'Throughput'), h('span', { className: 'hermes-lanes-cost' }, 'Cost')),
-    list.map((row) => h(Row, { key: row.name, row, maxOpen, onShare: (name, share) => edit(name, { share }), onPause: (name, paused) => edit(name, { paused }) })),
+    list.map((row) => h(Row, { key: row.name, row, maxOpen, saving, onShare: (name, share) => edit(name, { share }), onPause: (name, paused) => edit(name, { paused }) })),
     h('div', { className: 'hermes-lanes-foot' },
       h('div', { className: 'hermes-lanes-notes' },
         notes.length ? notes.map((n, i) => h('div', { key: i }, h('strong', null, `${n.lane}: `), n.text))
@@ -174,7 +174,7 @@ export function Lanes({ ctx }) {
   const [windowHours, setWindowState] = useState(loadWindow)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
-    const key = ['lanes', windowHours]
+  const key = ['lanes', windowHours]
   const query = useQuery({
     queryKey: key,
     queryFn: () => ctx.rest(`/v1/lanes?hours=${windowHours}`, { timeoutMs: REQUEST_TIMEOUT_MS }),
