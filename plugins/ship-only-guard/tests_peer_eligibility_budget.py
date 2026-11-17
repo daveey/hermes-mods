@@ -75,16 +75,21 @@ def test_six_turns_at_3_7s_per_read_fit_the_budget_with_bounded_reads_per_turn(g
 
 
 @pytest.mark.parametrize("waiter,own_ticket", [(3331, False), (3314, True), (3314, False)])
-def test_hook_reaches_the_bounded_verdict_at_3_7s_per_read(gh, monkeypatch, waiter, own_ticket):
+@pytest.mark.parametrize("latency", [3.0, GH_READ])
+def test_hook_preserves_final_fresh_compare_and_deadline(gh, monkeypatch, waiter, own_ticket, latency):
     fake = expensive_world(gh, waiter, own_ticket)
-    # The waiter's OWN base-drift attribution (compare + per-commit reads) is not land-turn eligibility and does
-    # not fit the hook's 18 s at 3.7 s/read by itself; keep state undrifted so the hook reaches its verdict.
+    # View, listing, records, holders and final fresh compare are five serial rounds.
+    # At 3.7 s each they cannot fit the unchanged 18 s hook budget, even without drift.
     fake.compare = IDENTICAL
-    sim = SimClock(monkeypatch, fake, GH_READ)
+    sim = SimClock(monkeypatch, fake, latency)
     why = merge(waiter, H2563)
-    assert "PR #3207 may still hold" in why and "unreadable" not in why and "deadline" not in why, why
+    if latency == GH_READ:
+        assert "deadline exceeded during drift check" in why, why
+    else:
+        assert "PR #3207 may still hold" in why and "deadline" not in why, why
+        assert any("/compare/" in " ".join(c) for c in fake.calls)
     assert not walk_reads(fake.calls) and not sim.writes()
-    assert sim.monotonic() < g.PREFLIGHT_TIMEOUT
+    assert sim.monotonic() <= g.PREFLIGHT_TIMEOUT
 
 
 def test_standalone_land_turn_decides_the_incident_without_unreadable(gh, monkeypatch):
@@ -155,16 +160,24 @@ def test_waiter_never_runs_peer_carry_or_drift(gh, monkeypatch):
     assert called == []
 
 
-def test_own_ticket_keeps_the_full_rule(gh, monkeypatch):
-    """The PR being merged judges its OWN ticket with `_turn_yielded` (its data is in hand)."""
+def test_own_ticket_defers_drift_only_in_merge_scope(gh, monkeypatch):
+    """Merge defers own drift to the final compare; standalone retains the full rule."""
     fake = gh({n: pr(n, H2563, AREA) for n in (1, 2)}, compare=delta(AREA, when=NOW - 2000))
     seed_turn(fake, 1, NOW - 3000)
     seen = []
-    real = g._turn_yielded
-    monkeypatch.setattr(g, "_turn_yielded", lambda rec, *a: seen.append(rec["pr"]) or real(rec, *a))
-    merge(1, H2563)
-    assert set(seen) == {1}
+    real = g._turn_yielded_uncached
+
+    def traced(rec, *args, **kwargs):
+        seen.append((rec["pr"], kwargs.get("defer_own_drift", False)))
+        return real(rec, *args, **kwargs)
+
+    monkeypatch.setattr(g, "_turn_yielded_uncached", traced)
+    why = merge(1, H2563)
+    assert why, "final drift check must still refuse"
+    assert seen == [(1, True)]
+    seen.clear()
     assert own_rule(fake) == "yields"
+    assert seen == [(1, False)]
 
 
 # ---- pure selection: sound over-approximation of every outcome of the undecided tickets ----
