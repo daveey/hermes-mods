@@ -186,15 +186,25 @@ def test_register_adds_the_execution_middleware_and_the_auxiliary_hold(tmp_path,
                                     register_hook=lambda name, fn: hooks.append((name, fn))))
     assert [kind for kind, _ in registered] == ["llm_execution"]
     assert registered[0][1](next_call=lambda request: ("sent", request), request={"m": 1}) == ("sent", {"m": 1})
-    assert [name for name, _ in hooks] == ["pre_auxiliary_call"]
-    assert hooks[0][1].hermes_hook_timeout == T.AUX_HOOK_TIMEOUT_S  # core reads the budget off the callback
-    assert hooks[0][1](aux_task="title_generation", provider="p", model="m") is None  # off: returns at once
+    assert [name for name, _ in hooks] == ["kanban_start_gate", "pre_auxiliary_call"]
+    assert hooks[0][1](task_id="t_1", lane="ready", assignee="default", board=None) is None  # off: the card starts
+    assert hooks[1][1].hermes_hook_timeout == T.AUX_HOOK_TIMEOUT_S  # core reads the budget off the callback
+    assert hooks[1][1](aux_task="title_generation", provider="p", model="m") is None  # off: returns at once
     monkeypatch.setattr(sampler, "eligible_process", lambda *a, **k: True)  # a gateway / serve / dashboard process
     monkeypatch.setattr(sampler, "start", lambda *a, **k: False)
     registered.clear(), hooks.clear()
     plugin.register(SimpleNamespace(register_middleware=lambda kind, fn: registered.append((kind, fn)),
                                     register_hook=lambda name, fn: hooks.append((name, fn))))
-    assert [kind for kind, _ in registered] == ["llm_execution"] and hooks == []  # never block a server's event loop
+    assert [kind for kind, _ in registered] == ["llm_execution"]
+    assert [name for name, _ in hooks] == ["kanban_start_gate"]  # the dispatcher lives here; no auxiliary hold in
+    # a server process (never block its event loop)
+
+    def refuse(name, fn):
+        raise ValueError(f"unknown hook {name}")
+    registered.clear()
+    plugin.register(SimpleNamespace(register_middleware=lambda kind, fn: registered.append((kind, fn)),
+                                    register_hook=refuse))
+    assert [kind for kind, _ in registered] == ["llm_execution"]  # a core without the start gate still paces calls
     monkeypatch.setattr(sampler, "eligible_process", lambda *a, **k: False)
     registered.clear()
     plugin.register(SimpleNamespace(register_middleware=lambda kind, fn: registered.append((kind, fn))))
@@ -470,6 +480,34 @@ def test_calls_are_counted_while_the_throttle_is_off_so_the_first_paced_interval
     T.level_path(tmp_path).write_text(json.dumps({"percent": 50, "cap_per_s": 1000.0, "set_at": NOW - 1}))
     gate, _ = _gate(tmp_path, db)
     assert gate.plan(NOW) == ("pace", pytest.approx(3.0), NOW - 1)  # 90k tokens / 30 calls at 1000/s: 3 s, at once
+
+
+def test_start_gate_holds_card_starts_while_the_fleet_is_over_the_cap(tmp_path, monkeypatch):
+    card = dict(task_id="t_1", lane="ready", assignee="default", board=None)
+    # fleet rate 800/s in the last minute against a cap of 500/s: over
+    db = _paced(tmp_path, cap=500.0, rows=[("hub", END - 60, 30_000.0), ("worker-1", END - 60, 18_000.0)])
+    gate, clock = _gate(tmp_path, db)
+    assert gate.start_gate(**card) == {"hold": True, "reason": "token_throttle"}
+    reads = []
+    real = T.status
+    monkeypatch.setattr(T, "status", lambda *a, **k: reads.append(a) or real(*a, **k))
+    for _ in range(50):  # the dispatcher asks for every candidate card: one read per START_GATE_TTL_S
+        gate.start_gate(**card)
+    assert reads == []
+    Store(db).put("hub", "tokens_io", [(END - 60, 6_000.0)])  # the fleet drops to 400/s: under the cap
+    assert gate.start_gate(**card) == {"hold": True, "reason": "token_throttle"}  # still the cached answer
+    clock.t += T.START_GATE_TTL_S
+    assert gate.start_gate(**card) is None and len(reads) == 1  # re-read: cards start again
+    under = _paced(tmp_path / "u", cap=5000.0, rows=[("hub", END - 60, 30_000.0)])
+    assert _gate(tmp_path / "u", under)[0].start_gate(**card) is None  # under the cap: cards start
+    off = _paced(tmp_path / "o", percent=0, cap=None, rows=[("hub", END - 60, 9e9)])
+    assert _gate(tmp_path / "o", off)[0].start_gate(**card) is None  # off: never holds a start
+    full = _paced(tmp_path / "f", percent=100, cap=0.0, rows=[])
+    assert _gate(tmp_path / "f", full)[0].start_gate(**card) == {"hold": True, "reason": "token_throttle"}
+    quiet = _paced(tmp_path / "q", cap=500.0, rows=[])
+    assert _gate(tmp_path / "q", quiet)[0].start_gate(**card) is None  # no measured rate: fail open
+    monkeypatch.setattr(T, "status", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    assert _gate(tmp_path, db)[0].start_gate(**card) is None  # a broken read starts the card
 
 
 def test_a_waiting_call_follows_a_changed_level(tmp_path):

@@ -98,6 +98,11 @@ and a body that is not a JSON object a 422, and neither changes anything.
   follows the cap as closely as the tokens-per-call estimate holds; a gateway whose calls suddenly grow overshoots
   until its 15-minute average catches up. `holding` in the payload still means "the measured fleet rate is above
   the cap right now".
+- **Card starts** follow the same cap. On a core with the `kanban_start_gate` hook the dispatcher asks the plugin
+  before each claim, and a card stays ready (guard reason `start_gate:token_throttle`) while the fleet's measured
+  rate is over the cap, or the level is 100 %. The answer is cached for 15 s and fails open. Pacing alone only
+  slows the calls of running cards; without the gate the dispatcher keeps starting cards whose calls then queue,
+  filling worker slots with runs that wait. A core without the hook starts cards as before.
 - **A held turn stays alive.** Core gives middleware no activity API, so the gate finds the agent behind the call it
   wraps (the closure of core's `_perform_api_call`) and stamps its activity clock every poll, as core's own offline
   wait does: the gateway's idle watchdog and the turn liveness watchdog see a waiting turn, and a Kanban card's

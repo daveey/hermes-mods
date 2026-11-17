@@ -19,6 +19,9 @@
   for slots in ``throttle-pace.json`` (a file lock orders every Hermes process on the root), so nothing is
   released in a herd. An earlier version held every call while the fleet rate was over the cap and released
   them all when it dipped under: 2026-11-17, cap 76k tokens/min, the fleet averaged 116k with bursts to 794k.
+* Card starts follow the same cap: the dispatcher asks the ``kanban_start_gate`` hook before each claim
+  (``Gate.start_gate``) and a card stays ready while the fleet's measured rate is over the cap, so worker slots
+  are not filled with runs whose calls only queue. A core without that hook starts cards as before.
 * A waiting turn stays alive: core gives middleware no activity API, so the gate finds the agent behind the
   call it wraps (``agent_of``) and stamps its activity clock every poll, the way core's own offline wait does.
   That also renews a Kanban card's claim. A stop request from the user ends the wait at the next poll.
@@ -54,6 +57,8 @@ REFERENCE_WINDOW_S = 24 * 3600
 REFERENCE_BUCKET_S = 900
 RATE_MINUTES = 3  # the fleet rate is the mean of the sampled minutes among the last three
 POLL_S = 5.0
+START_GATE_TTL_S = 15.0  # the dispatcher asks per candidate card, every tick: answer from a cached read
+START_GATE_REASON = "token_throttle"
 PACE_FILE = "throttle-pace.json"
 SHARE_WINDOW_S = 15 * 60  # shares and tokens-per-call are measured over the last 15 minutes
 PLAN_TTL_S = 30.0  # a process re-reads its share and tokens-per-call this often
@@ -442,6 +447,7 @@ class Gate:
         self._lock = threading.Lock()
         self._pacer = Pacer(self.root)
         self._rate: Optional[tuple[float, float, float]] = None  # (taken at, share, tokens per call)
+        self._start: Optional[tuple[float, bool]] = None  # (taken at, holding card starts)
 
     def _share_and_tokens(self, now: float) -> tuple[float, float]:
         with self._lock:
@@ -531,6 +537,25 @@ class Gate:
         if announced:
             log.info("throughput throttle: released after %.0fs", waited)
         return waited
+
+    def start_gate(self, **_card) -> Optional[dict]:
+        """``kanban_start_gate``: hold a card start while the fleet's token rate is over the cap (or the level is
+        100 %). Pacing slows the model calls of running cards; without this the dispatcher keeps starting cards
+        whose calls then only queue, filling worker slots with runs that wait. Cached for ``START_GATE_TTL_S``;
+        any failed read starts the card."""
+        now = self._clock()
+        with self._lock:
+            hit = self._start
+        if hit is None or not 0 <= now - hit[0] < START_GATE_TTL_S:
+            try:
+                held = bool(status(self.root, self.series_db, now, self.hub_db)["holding"])
+            except Exception:  # fail open: a broken read must never stop the dispatcher starting cards
+                log.debug("throughput throttle: start gate read failed", exc_info=True)
+                held = False
+            hit = (now, held)
+            with self._lock:
+                self._start = hit
+        return {"hold": True, "reason": START_GATE_REASON} if hit[1] else None
 
     def middleware(self, *, next_call, request, **_context):
         try:
