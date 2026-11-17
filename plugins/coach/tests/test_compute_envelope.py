@@ -57,6 +57,41 @@ def test_permission_ask_meta_controls(text, flagged):
     assert bool(ce.classify(text)) is flagged
 
 
+@pytest.mark.parametrize("negation", ["can't", "can’t", "cannot", "can not", "won't", "won’t", "will not"])
+@pytest.mark.parametrize("verb", ["approve", "authorize", "authorise"])
+def test_negated_capability_is_not_an_ask(negation, verb):
+    spec = importlib.util.spec_from_file_location("ce_negated", HERE / "compute_envelope.py")
+    ce = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ce)
+    assert ce.classify(f"GPU status is unchanged. It {negation} {verb} spending.") is None
+    text = f"It {negation} {verb} spending, so may I rent one A100 for $12?"
+    assert ce.classify(text)["sentence"] == text
+
+
+@pytest.mark.parametrize("text,flagged", [
+    ("Same bug in other plugins: the coach's GPU-spend check still uses the old list. "
+     "In a direct test just now it read a ⏳ notice as something you typed. "
+     "That check only warns; it can't approve spending.", False),
+    ("May I rent one A100 for about $12 to run the eval?", True),
+    ("Can I rent a $20 GPU for this?", True),
+    ("It can't approve spending, so may I rent one A100 for $12?", True),
+    ("May I rent one A100 for $12; it cannot approve spending?", True),
+    ("It doesn't ask anyone to approve GPU spending.", False),
+    ("It cannot approve spending, authorize GPU rentals, or decide budgets.", False),
+    ("It can't approve spending, so can I rent a $20 GPU?", True),
+    ("Can I rent 2 GPUs for $20?", False),
+    ("Can I rent a $20 GPU and 2 A100s?", False),
+])
+def test_negated_capability_controls(text, flagged):
+    spec = importlib.util.spec_from_file_location("ce_negated_controls", HERE / "compute_envelope.py")
+    ce = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ce)
+    hit = ce.classify(text)
+    assert bool(hit) is flagged
+    if flagged:
+        assert hit["sentence"] == text
+
+
 REAL_BLOCK_REASON = (
     "Slurm is unavailable on metta1 (no config/slurmd; sinfo/squeue fail since at least 10-24), so the only existing "
     "compute is the idle RTX 4090 on metta1 itself. Decision: may I run the pilot and 12 confirmation arms directly on "
