@@ -2,6 +2,8 @@
 // Chip: 34 px token sparkline + "56k tok/m · 1.5 cards/m". Popover: three mirrored stacked charts
 // (inflow above the line, outflow below), stacked by gateway. Data: GET /v1/series?range=… on the
 // local gateway (plugins/throughput/series.py): per-bucket counts, null = gateway doesn't report.
+// Throttle: GET/PUT /v1/throttle (plugins/throughput/throttle.py). A slider under Tokens sets a 0-100 % level;
+// its cap is the red line on the Tokens chart, and each subscription pool's runway is listed beside it.
 import { useQuery, useQueryClient, STATUSBAR_AREAS, PALETTE_AREA, Popover, PopoverTrigger, PopoverContent } from '@hermes/plugin-sdk'
 import { createElement as h, useState, useEffect, useMemo, useRef } from 'react'
 
@@ -154,6 +156,58 @@ export function chipNumbers(payload, view) {
   return { tok, cards, spark: total.slice(-24) }
 }
 
+// ── throttle + runway (pure) ──────────────────────────────────────────────
+
+export const THROTTLE_RED = '#ef4444'
+const POOL_NAMES = { anthropic: 'Claude', 'openai-codex': 'GPT', 'xai-oauth': 'Grok' }
+
+// The cap as a rate in the chosen unit; null = no cap (0 %, or no 7-day peak to scale yet).
+export function capRate(throttle, unit) {
+  const c = throttle?.cap_per_s
+  return c == null || !Number.isFinite(c) ? null : c * UNIT_S[unit]
+}
+
+// What the level would cap at, before the server confirms it (the slider's live label and line while dragging).
+export function previewThrottle(throttle, percent) {
+  const ref = throttle?.reference_per_s
+  const cap_per_s = percent <= 0 ? null : percent >= 100 ? 0 : ref == null ? null : (1 - percent / 100) * ref
+  return { ...(throttle || {}), percent, cap_per_s }
+}
+
+export function fmtDuration(s) {
+  if (s == null || !Number.isFinite(s) || s < 0) return '\u2013'
+  if (s >= 2 * 86400) return (s / 86400).toFixed(1) + ' d'
+  if (s >= 2 * 3600) return (s / 3600).toFixed(1) + ' h'
+  return Math.max(1, Math.round(s / 60)) + ' min'
+}
+
+// The fleet's burn slows by cap/rate when the cap is under the measured rate; 0 = paused, 1 = unchanged.
+export function burnScale(throttle) {
+  const cap = throttle?.cap_per_s, rate = throttle?.rate_per_s
+  if (cap == null) return 1
+  if (cap <= 0) return 0
+  return rate != null && rate > cap ? cap / rate : 1
+}
+
+// "GPT: 122% left, empty in 20.3 h at this rate, next reset Fri 14:40". `left` is summed over the pool's accounts.
+export function runwayText(pool, throttle) {
+  const name = POOL_NAMES[pool.provider] || pool.provider
+  const left = `${fmt(pool.remaining_pct)}% left`
+  const reset = pool.next_reset_at ? `, next reset ${timeLabel(pool.next_reset_at, '7d')}` : ''
+  const scale = burnScale(throttle)
+  if (pool.runway_s == null) return `${name}: ${left}, not burning${reset}`
+  if (scale === 0) return `${name}: ${left}, paused by the throttle${reset}`
+  return `${name}: ${left}, empty in ${fmtDuration(pool.runway_s / scale)} at ${scale < 1 ? 'the cap' : 'this rate'}${reset}`
+}
+
+export function throttleText(throttle, unit) {
+  const p = Math.round(throttle?.percent ?? 0)
+  if (p <= 0) return 'Throttle off'
+  const cap = capRate(throttle, unit)
+  if (cap == null) return `Throttle ${p}% \u00b7 no cap yet (no 7-day peak to scale)`
+  return `Throttle ${p}% \u00b7 cap ${fmt(cap)} tok/${unit}${throttle?.holding ? ' \u00b7 holding calls' : ''}`
+}
+
 // ── components ────────────────────────────────────────────────────────────
 
 function Spark({ values, w = 34, h: H = 14 }) {
@@ -173,7 +227,7 @@ function Seg({ value, options, onPick, onHover, label, render = (o) => o }) {
 }
 
 const W = 620
-function Chart({ id, title, up, down, upLabel, downLabel, payload, view, gws, colors }) {
+function Chart({ id, title, up, down, upLabel, downLabel, payload, view, gws, colors, cap = null, children = null }) {
   const [hover, setHover] = useState(null)
   const U = layers(payload, up, gws, view)
   const D = down ? layers(payload, down, gws, view) : null
@@ -181,6 +235,8 @@ function Chart({ id, title, up, down, upLabel, downLabel, payload, view, gws, co
   const mid = down ? H * 0.55 : H - 14
   const len = Math.max(U.len, D?.len ?? 0, 2)
   const mx = Math.max(...U.total.map((x) => x || 0), ...(D ? D.total.map((x) => x || 0) : [0]), 1e-9)
+  // The throttle cap: a red line at its rate, pinned to the top edge (with an arrow) when it is above the chart.
+  const capY = cap == null ? null : mid - (Math.min(cap, mx) / mx) * (mid - 4)
   const x = (i) => (i / (len - 1)) * W
   const yu = (v) => mid - (v / mx) * (mid - 4)
   const yd = (v) => mid + (v / mx) * (H - mid - 14)
@@ -242,6 +298,8 @@ function Chart({ id, title, up, down, upLabel, downLabel, payload, view, gws, co
       h('svg', { viewBox: `0 0 ${W} ${H}`, preserveAspectRatio: 'none', height: H, width: '100%', role: 'img', 'aria-label': title },
         h('line', { x1: 0, x2: W, y1: mid, y2: mid, stroke: 'var(--ui-stroke-secondary, #2a2f39)' }),
         paths,
+        capY == null ? null : h('line', { 'data-cap': String(cap), x1: 0, x2: W, y1: capY, y2: capY, stroke: THROTTLE_RED, strokeWidth: 1.2, vectorEffect: 'non-scaling-stroke' }),
+        capY == null ? null : h('text', { x: W - 2, y: Math.max(capY - 3, 9), textAnchor: 'end', className: 'hermes-tp-axis hermes-tp-capl' }, `cap ${fmt(cap)}/${view.unit}${cap > mx ? ' \u2191' : ''}`),
         h('text', { x: 2, y: 11, className: 'hermes-tp-axis' }, `${upLabel} \u2191 peak ${peak(U.total)}`),
         D ? h('text', { x: 2, y: H - 16, className: 'hermes-tp-axis' }, `${downLabel} \u2193 peak ${peak(D.total)}`) : null,
         hover ? h('line', { x1: x(hover.i), x2: x(hover.i), y1: 0, y2: H - 12, stroke: 'var(--ui-text-secondary, #8a909c)', strokeWidth: 0.7 }) : null),
@@ -256,19 +314,46 @@ function Chart({ id, title, up, down, upLabel, downLabel, payload, view, gws, co
         h('div', { className: 'hermes-tp-tiptime' }, `${timeLabel(t0 + hover.i * bs, view.range)} \u00b7 per ${view.unit}`),
         h('div', { className: 'hermes-tp-tiphead' }, `${upLabel} ${fmt(U.total[hover.i])}`), tipRows(U, hover.i),
         D ? h('div', { className: 'hermes-tp-tiphead is-down' }, `${downLabel} ${fmt(D.total[hover.i])}`) : null,
-        D ? tipRows(D, hover.i) : null) : null))
+        D ? tipRows(D, hover.i) : null) : null),
+    children)
+}
+
+// Slider + runway under the Tokens chart. Dragging previews the cap locally; releasing saves it.
+export function ThrottleRow({ throttle, draft, setDraft, onCommit, unit, error }) {
+  const shown = draft == null ? throttle : previewThrottle(throttle, draft)
+  const percent = Math.round(shown?.percent ?? 0)
+  const commit = () => { if (draft != null) onCommit(draft) }
+  return h('div', { className: 'hermes-tp-throttle', 'data-slot': 'throttle' },
+    h('div', { className: 'hermes-tp-trow' },
+      h('input', {
+        type: 'range', min: 0, max: 100, step: 1, value: percent, 'aria-label': 'Token throttle percent',
+        onChange: (e) => setDraft(Number(e.target.value)), onPointerUp: commit, onKeyUp: commit, onBlur: commit
+      }),
+      h('span', { className: 'hermes-tp-ttext', 'data-throttle': String(percent) }, throttleText(shown, unit)),
+      throttle?.scope ? h('span', { className: 'hermes-tp-lbl', title: 'The level is stored on this gateway and holds model calls made by Hermes processes on it. Other machines do not receive it.' }, `applies to ${throttle.scope}`) : null),
+    error ? h('div', { className: 'hermes-tp-note', role: 'alert' }, `Throttle not saved: ${error}`) : null,
+    (throttle?.pools || []).map((p) => h('div', { key: p.provider, className: 'hermes-tp-runway', 'data-pool': p.provider }, runwayText(p, shown))))
 }
 
 // `payload` is the selected range's data, or null while it loads / after it failed (`status` says which); the
 // previous range's data is never drawn under the new range's label. `frame` (the last good payload, any range)
 // only supplies the gateway list for the legend, so the controls stay usable meanwhile.
-export function Panel({ payload, frame = payload, status = null, modelPayload = null, modelFrame = null, modelStatus = null, modelFilter = { solo: null, hidden: [] }, setModelFilter, view, setView, filter, setFilter, onHoverRange }) {
+export function Panel({ payload, frame = payload, status = null, modelPayload = null, modelFrame = null, modelStatus = null, modelFilter = { solo: null, hidden: [] }, setModelFilter, view, setView, filter, setFilter, onHoverRange, throttle = null, onThrottle = null, throttleError = null }) {
   const colors = useMemo(() => colorFor(frame.gateways), [frame.gateways])
   const gws = visibleGateways(frame.gateways, filter)
   const models = modelFrame?.models || []
   const modelColors = useMemo(() => colorFor(models), [modelFrame?.models])
   const modelGws = visibleGateways(models, modelFilter)
   const set = (k) => (v) => setView({ ...view, [k]: v })
+  const [draft, setDraft] = useState(null)
+  // The cap counts in+out tokens over every gateway: it is only comparable with the unfiltered in+out chart.
+  const shownThrottle = draft == null ? throttle : previewThrottle(throttle, draft)
+  const filtered = view.by === 'model' ? !!modelFilter.solo || modelFilter.hidden.length > 0 : !!filter.solo || filter.hidden.length > 0
+  const cap = view.cache || filtered ? null : capRate(shownThrottle, view.unit)
+  const throttleRow = throttle && onThrottle ? h(ThrottleRow, {
+    key: 'throttle', throttle, draft, setDraft, unit: view.unit, error: throttleError,
+    onCommit: (p) => { setDraft(null); if (p !== Math.round(throttle.percent ?? 0)) onThrottle(p) }
+  }) : null
   return h('div', { className: 'hermes-tp' },
     h('div', { className: 'hermes-tp-top' },
       h('h2', null, 'Throughput'),
@@ -293,9 +378,9 @@ export function Panel({ payload, frame = payload, status = null, modelPayload = 
           className: [modelFilter.hidden.includes(m) ? 'is-off' : '', modelFilter.solo === m ? 'is-solo' : ''].join(' ').trim(),
           onClick: (e) => setModelFilter(legendClick(modelFilter, m, e.shiftKey))
         }, h('span', { className: 'hermes-tp-sw', style: { background: modelColors[m] } }), m))),
-      modelPayload ? h(Chart, { key: 'tokens-model', id: 'tokens', title: 'Tokens by model', up: 'tokens', upLabel: view.cache ? 'in+out+cache' : 'in+out', payload: modelPayload, view, gws: modelGws, colors: modelColors })
+      modelPayload ? h(Chart, { key: 'tokens-model', id: 'tokens', title: 'Tokens by model', up: 'tokens', upLabel: view.cache ? 'in+out+cache' : 'in+out', payload: modelPayload, view, gws: modelGws, colors: modelColors, cap }, throttleRow)
         : h('div', { key: 'model-pending', className: 'hermes-tp-note hermes-tp-pending', role: 'status' }, modelStatus || `Loading models ${view.range}…`)
-    ] : [h(Chart, { key: 'tokens', id: 'tokens', title: 'Tokens', up: 'tokens', upLabel: view.cache ? 'in+out+cache' : 'in+out', payload, view, gws, colors })]),
+    ] : [h(Chart, { key: 'tokens', id: 'tokens', title: 'Tokens', up: 'tokens', upLabel: view.cache ? 'in+out+cache' : 'in+out', payload, view, gws, colors, cap }, throttleRow)]),
     h(Chart, { key: 'sessions', id: 'sessions', title: 'Sessions', up: 'sess_in', down: 'sess_out', upLabel: 'new', downLabel: 'ended', payload, view, gws, colors }),
     h(Chart, { key: 'cards', id: 'cards', title: 'Cards', up: 'cards_in', down: 'cards_out', upLabel: 'created', downLabel: 'done', payload, view, gws, colors }),
     h('div', { className: 'hermes-tp-foot', key: 'foot' }, `Big numbers = average over the last ${nowWindow(view.range)} min; buckets of ${payload.bucket_s / 60} min.`)
@@ -350,6 +435,25 @@ export function Throughput({ ctx }) {
     refetchIntervalInBackground: false, refetchOnWindowFocus: false, retry: false, staleTime: 10000,
     placeholderData: (prev) => prev
   })
+  const throttleQuery = useQuery({
+    queryKey: ['throughput', 'throttle'],
+    queryFn: async () => {
+      const body = await ctx.rest('/v1/throttle', { timeoutMs: REQUEST_TIMEOUT_MS })
+      if (!body || typeof body.percent !== 'number') throw Error('Invalid throttle response')
+      return body
+    },
+    enabled: open, refetchInterval: visible && open ? POLL_MS : false,
+    refetchIntervalInBackground: false, refetchOnWindowFocus: false, retry: false, staleTime: 5000
+  })
+  const [throttleError, setThrottleError] = useState(null)
+  const onThrottle = async (percent) => {
+    try {
+      const body = await ctx.rest('/v1/throttle', { method: 'PUT', body: { percent }, timeoutMs: REQUEST_TIMEOUT_MS })
+      if (!body || typeof body.percent !== 'number') throw Error('Invalid throttle response')
+      client.setQueryData(['throughput', 'throttle'], body)
+      setThrottleError(null)
+    } catch (e) { setThrottleError(String(e?.message || e).slice(0, 200)) }
+  }
   const lastModel = useRef(null)
   if (modelQuery.data) lastModel.current = modelQuery.data
   const modelPayload = modelQuery.data && !modelQuery.isPlaceholderData && modelQuery.data.range === view.range ? modelQuery.data : null
@@ -381,7 +485,7 @@ export function Throughput({ ctx }) {
       side: 'top', align: 'end', sticky: 'always', 'aria-label': 'Throughput', className: 'hermes-tp-popover',
       style: { width: 'min(680px, calc(100vw - 24px))', maxHeight: '80vh', overflowY: 'auto' }
     }, frame
-      ? h(Panel, { payload, frame, status, modelPayload, modelFrame: lastModel.current, modelStatus, modelFilter, setModelFilter, view, setView, filter, setFilter, onHoverRange: prefetch })
+      ? h(Panel, { payload, frame, status, modelPayload, modelFrame: lastModel.current, modelStatus, modelFilter, setModelFilter, view, setView, filter, setFilter, onHoverRange: prefetch, throttle: throttleQuery.data || null, onThrottle, throttleError })
       : h('div', { className: 'hermes-tp-note' }, query.error ? `Unavailable: ${String(query.error.message || query.error).slice(0, 200)}` : 'Loading\u2026')))
 }
 
@@ -424,6 +528,12 @@ export const CSS = `
 .hermes-tp-tiprow{display:flex;align-items:center;gap:5px}
 .hermes-tp-tiprow.is-missing{color:var(--ui-text-tertiary);align-items:flex-start}
 .hermes-tp-num{margin-left:auto;padding-left:12px;font-variant-numeric:tabular-nums}
+.hermes-tp-capl{fill:#ef4444}
+.hermes-tp-throttle{display:flex;flex-direction:column;gap:2px;margin-top:6px;font-size:11px}
+.hermes-tp-trow{display:flex;align-items:center;gap:8px}
+.hermes-tp-trow input[type=range]{width:160px;accent-color:#ef4444}
+.hermes-tp-ttext{font-variant-numeric:tabular-nums}
+.hermes-tp-runway{color:var(--ui-text-secondary);font-variant-numeric:tabular-nums}
 `
 
 export default {

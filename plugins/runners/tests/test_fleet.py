@@ -50,6 +50,20 @@ def test_held_machine_keeps_hold_metadata_from_registry():
     assert reg['machines']['spare']['hold_reason'] == 'disk cleanup'  # never mutate registry
 
 
+def test_held_machine_unseen_with_nothing_running_is_stopped_not_draining():
+    held = dict(hold=True, hold_reason='shutdown', hold_by='admin', hold_owner='session:s@hub', hold_at=NOW - 500 * MIN)
+    reg = _registry(hub={}, off=dict(held, last_seen=NOW - 500 * MIN), busy=dict(held, last_seen=NOW - 500 * MIN),
+                    recent=dict(held, last_seen=NOW - 5 * MIN), never=dict(held, last_seen=None))
+    lease = dict(holder='busy', board='default', task='t_a', title='Card A', started_at=100)
+    m = {r['name']: r for r in fleet.gateway_workers(reg, [lease], NOW)['machines']}
+    assert (m['off']['state'], m['off']['reason']) == ('stopped', 'stopped: held, not seen for 500 min')
+    # The hold metadata still explains why it is off.
+    assert (m['off']['hold_reason'], m['off']['hold_owner'], m['off']['hold_at']) == ('shutdown', 'session:s@hub', NOW - 500 * MIN)
+    assert m['busy']['state'] == 'draining'  # still holds a card: not finished
+    assert m['recent']['state'] == 'draining'  # still seen: not off yet
+    assert m['never']['state'] == 'draining'  # no liveness evidence: do not claim it is off
+
+
 def test_held_machine_reports_hold_owner_only_while_draining():
     reg = _registry(hub={}, spare=dict(hold=True, hold_reason='roll', hold_by='admin', hold_owner='card:t_01a1ce31e56561be',
                                        hold_at=NOW - MIN),

@@ -937,6 +937,12 @@ tells the agent to take the next step itself this turn or `delegate_task` with f
 card to the chat. Logged as `agent_hint` with `rule=relay_repeat` (`n` = repeat asks in the current run of relays).
 Cron, Kanban and subagent turns are skipped.
 
+**Dispatcher scope:** a watcher notice ending `Do not run its work outside the dispatcher.` is exempt from
+`report_only` and `status_only` pressure, including deterministic stalled-queue and repeated-relay branches.
+This extends the existing scope guard, not execution permissions: read-only status and owner handoff remain
+available, while quota/review gates remain unchanged. Quoted policy and a subsequent unrelated user request
+are not exempt. Regression: `test_report_only_owner_queue.py` covers held and unrestricted queue controls.
+
 Detection guard: the hook marks the turn (`relay_repeat_turn` in the loop state), and the reply check passes
 `relay_repeat=True` to `reply_check.check`: report_only joins the candidates (unless a scope limit excludes it), the
 second opinion runs whatever the screen scored, and `report_only_scored` records `relay_repeat: true`

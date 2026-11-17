@@ -17,6 +17,7 @@ import re
 import sqlite3
 import stat
 import time
+import unicodedata
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
@@ -940,14 +941,19 @@ LLM = Callable[[str, str], str]
 
 # A step text shorter than this is too generic to prove a restatement by substring ("Approve it?").
 _RESTATE_MIN_CHARS = 20
-# A turn the runtime started, not the user: Kanban notices (✔ done, ✖ failed, ⏸ blocked, [Kanban ...]), owner
-# wakes, system and chat-close notes. Such a "last message" answers nothing.
-_RUNTIME_MSG = re.compile(r"^\s*(?:[\u2714\u2716\u23f8\u26a0]\ufe0f?\s*\[|\[(?:owner-wake|System|chat-cl|Kanban|Automatic)\b)")
+# A turn the runtime started, not the user: Kanban notices (✔ done, ✖ failed, ⏸ blocked, ⏳ waiting, [Kanban ...]),
+# owner wakes, system and chat-close notes. Such a "last message" answers nothing. The glyph before the "[" is matched
+# by kind (any pictograph: Unicode So, plus ℹ), not listed: a four-glyph list missed core's ⏳ wait notice.
+_RUNTIME_MSG = re.compile(r"^\s*\[(?:owner-wake|System|chat-cl|Kanban|Automatic)\b")
+_NOTICE_TAIL = re.compile(r"\ufe0f?\s*\[")
 
 
 def _runtime_message(user_msg: str) -> bool:
     """The turn's last message is a runtime notice. An empty one is unknown (the hook missed it), not a notice."""
-    return bool(_RUNTIME_MSG.match(user_msg or ""))
+    if _RUNTIME_MSG.match(user_msg or ""):
+        return True
+    s = (user_msg or "").lstrip()
+    return bool(s) and (unicodedata.category(s[0]) == "So" or s[0] == "\u2139") and bool(_NOTICE_TAIL.match(s, 1))
 
 
 def _still_asked(step: dict, reply: str, repeats: list[dict], user_msg: str = "") -> bool:

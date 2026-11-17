@@ -1817,7 +1817,7 @@ def _lineages_locked(sids: list[str]) -> Optional[dict[str, list]]:
 _host_board_lock = threading.Lock()
 
 
-def _host_board_key(path: Path, tails: set[str], tables=None) -> tuple[str, str]:
+def _host_board_key(path: Path, tails: set[str], tables=None, *, tail_out=None) -> tuple[str, str]:
     """Host-only scoped/global board keys. Ignore only changes positively attributed to non-batch tasks.
 
     The core cursor vouches for trigger coverage, file/schema identity, regression and unknown/full changes.
@@ -1843,14 +1843,23 @@ def _host_board_key(path: Path, tails: set[str], tables=None) -> tuple[str, str]
                                    else ksa._board_content_key(path))
         scoped = (hit[2] if hit is not None and hit[0] == frozenset(tails) and not full
                   and not (set(changed) & tails) else broad)
+        # Copy tokens before advancing: previously published row snapshots must not mutate.
+        tokens = dict(hit[3]) if hit is not None and len(hit) > 3 and not full else {}
+        for tail in tails:
+            if tail not in tokens or full or tail in changed:
+                tokens[tail] = broad
+        tokens = {tail: tokens[tail] for tail in tails}
+        if tail_out is not None:
+            tail_out.update(tokens)
         if cursor is not None:
-            cache[ident] = (frozenset(tails), cursor, scoped)
+            cache[ident] = (frozenset(tails), cursor, scoped, tokens)
         else:
             cache.pop(ident, None)
         return scoped, broad
 
 
-def _shadow_parts(now: float, *, host_tails: Optional[set[str]] = None, global_out: Optional[list] = None) -> list:
+def _shadow_parts(now: float, *, host_tails: Optional[set[str]] = None, global_out: Optional[list] = None,
+                  tail_out: Optional[dict] = None) -> list:
     """Each sync shadow / link-only board ``_board_coverage`` may consult: its content key and its freshness at now."""
     from hermes_cli import kanban_session_activity as ksa
     kanban = _kanban_root() / "kanban"
@@ -1863,6 +1872,9 @@ def _shadow_parts(now: float, *, host_tails: Optional[set[str]] = None, global_o
     for stem in sorted(stems):
         path = kanban / "sync-shadow" / f"{stem}.db"
         if not path.is_file():
+            if tail_out is not None:
+                for tail in host_tails or ():
+                    tail_out.setdefault(tail, []).append([stem, None, False])
             out.append([stem, None, False])
             if global_out is not None:
                 global_out.append([stem, None, False])
@@ -1874,7 +1886,11 @@ def _shadow_parts(now: float, *, host_tails: Optional[set[str]] = None, global_o
         if host_tails is None:
             scoped = broad = wi.portable_digest(ksa._board_content_key(path, tables))
         else:
-            scoped, broad = _host_board_key(path, host_tails, tables)
+            tokens = {}
+            scoped, broad = _host_board_key(path, host_tails, tables, tail_out=tokens)
+            if tail_out is not None:
+                for tail in host_tails:
+                    tail_out.setdefault(tail, []).append([stem, tokens[tail], fresh])
         out.append([stem, scoped, fresh])
         if global_out is not None:
             global_out.append([stem, broad, fresh])
@@ -1911,15 +1927,20 @@ def _input_parts(rows: list[dict], now: float, *, host: bool = False) -> dict[st
         raise LookupError("a state.db is unreadable")
     stale_after = float(getattr(ksa, "HUB_STALE_AFTER_S", wi.HUB_STALE_AFTER_S))
     boards, global_boards, global_shadows = [], [], []
+    tail_boards, tail_shadows = {}, {}
     for p in board_paths():
         path = Path(p)
         if host:
-            scoped, broad = _host_board_key(path, tails)
+            tokens = {}
+            scoped, broad = _host_board_key(path, tails, tail_out=tokens)
+            for tail in tails:
+                tail_boards.setdefault(tail, []).append([str(p), tokens[tail]])
         else:
             scoped = broad = wi.portable_digest(ksa._board_content_key(path))
         boards.append([str(p), scoped])
         global_boards.append([str(p), broad])
-    shadows = (_shadow_parts(now, host_tails=tails, global_out=global_shadows) if host else _shadow_parts(now))
+    shadows = (_shadow_parts(now, host_tails=tails, global_out=global_shadows, tail_out=tail_shadows)
+               if host else _shadow_parts(now))
     if host:
         _state["host_globals"] = {"boards": global_boards, "shadows": global_shadows}
     parts = {
@@ -1939,7 +1960,23 @@ def _input_parts(rows: list[dict], now: float, *, host: bool = False) -> dict[st
         unseen = _unseen_counts()
         if unseen is None:
             raise LookupError("unseen subscriptions unreadable")
+        # Missing-clock observation health is inventory-wide, not batch-local: even an unrelated remote
+        # task can be the final fresh row in an otherwise stale inventory. Key the verdict, not its stamps.
+        linked = [r for r in remote_cards() if r.get("via") != "origin"]
+        parts["healthy"] = (not linked or any(r.get("stale") is False for r in linked)) and _hub_fresh()
         parts["unseen"] = sorted(unseen.items())  # subscribed tasks need not be in any pending batch
+        keys = {}
+        for row in rows:
+            sid = row["session_id"]
+            own_tails = {str(k).rsplit("/", 1)[-1] for k in row.get("batch") or []}
+            ids = [entry[0] for entry in lineages[sid]]
+            keys[sid] = wi.strict_digest([
+                _host_row(row), lineages[sid], sum(unseen.get(i, 0) for i in ids),
+                [[t, tail_boards.get(t), tail_shadows.get(t)] for t in sorted(own_tails)],
+                replica.key(now, stale_after, tails=own_tails),
+                parts["scope"], parts["ledger"], parts["origin"], parts["floor"], parts["healthy"],
+            ])
+        parts["row_inputs"] = keys
     return parts
 
 
@@ -2167,13 +2204,15 @@ def wake_tick(*, now: Optional[float] = None, wake: Optional[Callable[..., str]]
     with wi.accounting_pass("chat-closeout.wake_tick") as acct, _proof_pass():
         # Host keys (WAITING-INPUTS.md) only for a real full pass: injected readers/proofs/clocks (tests, the
         # residual pass's own rows) see no shortcut.
-        keyed = only is None and read is None and proof is None and now is None and unseen is None
+        keyed = (only is None and read is None and proof is None and now is None and unseen is None
+                 and healthy is None and mono is None)
         parts = memo = None
         if keyed:
             t0 = time.time()
             try:
                 rows = _pending_rows()
                 parts = _input_parts(rows, t0, host=True)
+                parts["live"] = sorted(live or ())
             except Exception:
                 logger.debug("chat-closeout: host inputs unavailable; full pass", exc_info=True)
                 rows, parts = None, None
@@ -2197,14 +2236,56 @@ def wake_tick(*, now: Optional[float] = None, wake: Optional[Callable[..., str]]
                         clk.rows(len(clock["cards"]))
                         clk.change(bool(wrote))
                     return []
-            if rows is not None:
-                read = _pass_reader(rows=rows)
+        pre_keys = None
+        pre_cache = None
+        if parts is not None:
+            pre_cache = _wi_get("host_pre_rows", dict)
+            all_rows = rows or []
+            keep = {r["session_id"] for r in all_rows}
+            for sid in set(pre_cache) - keep:
+                pre_cache.pop(sid)
+            pre_keys = {sid: wi.strict_digest([key, sid in (live or set())])
+                        for sid, key in parts["row_inputs"].items()}
+            candidates = []
+            clock_count = clock_writes = 0
+            for row in all_rows:
+                sid = row["session_id"]
+                hit = pre_cache.get(sid)
+                if hit is not None and hit[0] == pre_keys[sid] and t0 < hit[1]["until"]:
+                    fact = hit[1]
+                    if "cards" not in fact:
+                        continue
+                    wrote = _clock_tick({"cards": {sid: fact["cards"]}, "healthy": fact["healthy"]},
+                                        [row], t0, time.monotonic(), healthy)
+                    if wrote is not None:
+                        clock_count += 1
+                        clock_writes += wrote
+                        continue
+                pre_cache.pop(sid, None)
+                candidates.append(row)
+            if clock_count:
+                with wi.accounting_pass("chat-closeout.wake_tick_clock") as clk:
+                    clk.rows(clock_count)
+                    clk.change(bool(clock_writes))
+            if not candidates:
+                acct.skip()
+                return []
+            rows = candidates
+            read = _pass_reader(rows=rows)
+        elif keyed and rows is not None:
+            read = _pass_reader(rows=rows)
         stats: dict[str, Any] = {}
         done = _wake_tick(now=now, wake=wake, unseen=unseen, last_user=last_user, read=read, proof=proof,
                           mono=mono, healthy=healthy, rows=rows, live=only if only is not None else live,
-                          lineages=dict(parts["lineage"]) if parts is not None else None, stats=stats)
+                          lineages=dict(parts["lineage"]) if parts is not None else None, stats=stats,
+                          pre_keys=pre_keys)
+        if pre_cache is not None and stats.get("complete"):
+            for sid, fact in stats.get("facts", {}).items():
+                pre_cache[sid] = (pre_keys[sid], fact)
         acct.rows(stats.get("recomputed", 0))
         acct.change(bool(done) or bool(stats.get("wrote")))
+        if not keyed:
+            return done  # injected/residual passes never adopt or invalidate full-host memos
         clock_rows = stats.get("clock") or {}
         quiet = parts is not None and stats.get("complete") and not done \
             and stats.get("recomputed", 0) == stats.get("quiet", 0) + stats.get("idle", 0) + len(clock_rows) \
@@ -2215,6 +2296,19 @@ def wake_tick(*, now: Optional[float] = None, wake: Optional[Callable[..., str]]
         _state["host_clock"] = ({"parts": parts, "until": until, "cards": clock_rows,
                                  "healthy": bool(stats.get("healthy"))}
                                 if quiet and clock_rows else None)
+        if pre_cache is not None:
+            # The full-host shortcut must include skipped clock siblings too, not just this tick's candidates.
+            facts = {sid: pre_cache[sid][1] for sid in pre_keys
+                     if sid in pre_cache and pre_cache[sid][0] == pre_keys[sid]}
+            complete = len(facts) == len(pre_keys) and bool(stats.get("complete")) and not done
+            until = min((f["until"] for f in facts.values()), default=float("inf"))
+            clocks = {sid: f["cards"] for sid, f in facts.items() if "cards" in f}
+            health = {f["healthy"] for f in facts.values() if "cards" in f}
+            _state["host_memo"] = parts if complete and not clocks else None
+            _state["host_until"] = until
+            _state["host_clock"] = ({"parts": parts, "until": until, "cards": clocks,
+                                      "healthy": next(iter(health))}
+                                     if complete and clocks and len(health) == 1 else None)
         return done
 
 
@@ -2281,7 +2375,7 @@ def _row_quiet(row: dict, cards: Any) -> bool:
 
 
 def _wake_tick(*, now, wake, unseen, last_user, read, proof, mono=None, healthy=None, rows=None,
-               live=None, lineages=None, stats=None) -> list[dict]:
+               live=None, lineages=None, stats=None, pre_keys=None) -> list[dict]:
     now = time.time() if now is None else now
     mono = time.monotonic() if mono is None else mono
     stats = {} if stats is None else stats
@@ -2307,7 +2401,7 @@ def _wake_tick(*, now, wake, unseen, last_user, read, proof, mono=None, healthy=
         sid = row["session_id"]
         cards = core.canonical_view(read(row["batch"]))
         hkey = _host_row_key(row, cards, lineages, now, unseen)
-        hit = quiet_rows.get(sid, hkey)
+        hit = quiet_rows.get(sid, hkey) if pre_keys is None else None
         if hit is not None:
             # Quiet under exactly these inputs last pass: the same reads decide the same nothing. An idle row
             # (``hit[1]`` a deadline) decides nothing until its own clock says so.
@@ -2362,6 +2456,8 @@ def _wake_tick(*, now, wake, unseen, last_user, read, proof, mono=None, healthy=
         elif _row_quiet(row, cards):
             quiet_rows.put(sid, hkey, True)
             stats["quiet"] = stats.get("quiet", 0) + 1
+            if pre_keys is not None:
+                stats.setdefault("facts", {})[sid] = {"until": float("inf")}
             continue
         key = core.pending_key(row, cards)
         if key and key != row.get("settled_sig"):
@@ -2391,6 +2487,11 @@ def _wake_tick(*, now, wake, unseen, last_user, read, proof, mono=None, healthy=
                 else:
                     quiet_rows.put(sid, hkey, until)
                     stats["idle"] = stats.get("idle", 0) + 1
+                if pre_keys is not None:
+                    fact = {"until": until}
+                    if clock_only:
+                        fact.update(cards=cards, healthy=bool(healthy()))
+                    stats.setdefault("facts", {})[sid] = fact
             continue
         if not led.claim(sid, due, now, over_foreign_refusal=sid in live):
             continue

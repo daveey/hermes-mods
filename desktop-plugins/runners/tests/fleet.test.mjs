@@ -420,6 +420,29 @@ test('draining: hover text carries the hold reason, holder and age; the row show
   await ui.close()
 })
 
+test('stopped: a held machine that is off has no row and no slots, only a name in the off line', async () => {
+  const body = fleet()
+  const off = (name) => ({ name, state: 'stopped', reason: 'stopped: held, not seen for 500 min', labels: [], pinned_only: false, slots: 10, slots_source: 'registry', running: [], waiting: 8, ineligible: 3, load: { at: NOW - 500 * 60000, cpu_pct: 18 }, hold_reason: 'shutdown', hold_by: 'admin', hold_owner: 'session:s@hub', hold_at: NOW - 2 * 3600000 })
+  const up = { name: 'worker-1', state: 'active', reason: null, labels: [], pinned_only: false, slots: 10, slots_source: 'registry', running: [] }
+  body.gateways.machines = [up, off('worker-2'), off('worker-5')]
+  const view = P.merge([{ route, body, at: NOW }], NOW)
+  const s = P.summarize(view)
+  assert.equal(s.gSlots, 10)
+  assert.equal(s.workers.slots, 10)
+  const ui = await render(view)
+  try {
+    assert.equal(ui.container.querySelectorAll('.hermes-fleet-row[data-machine="worker-2"], .hermes-fleet-row[data-machine="worker-5"]').length, 0)
+    assert.ok(ui.container.querySelector('.hermes-fleet-row[data-machine="worker-1"]'))
+    const note = ui.container.querySelector('.hermes-fleet-stopped')
+    assert.equal(note.textContent, '2 off: worker-2, worker-5')
+    assert.equal(note.querySelector('[data-machine="worker-5"]').title, 'stopped: shutdown (held by session:s@hub, 2h ago); machine is off (stopped: held, not seen for 500 min)')
+    assert.equal(note.querySelectorAll('.hermes-fleet-slot').length, 0)
+  } finally { await ui.close() }
+  body.gateways.machines = [up]
+  const none = await render(P.merge([{ route, body, at: NOW }], NOW))
+  try { assert.equal(none.container.querySelector('.hermes-fleet-stopped'), null) } finally { await none.close() }
+})
+
 test('draining: hover names the hold_owner card/session, falling back to hold_by', async () => {
   const body = fleet()
   const held = { state: 'draining', reason: 'draining', labels: [], pinned_only: false, slots: 2, slots_source: 'registry', running: [] }

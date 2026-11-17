@@ -8,8 +8,22 @@ import logging
 log = logging.getLogger("hermes.plugins.throughput")
 
 
+def _register_throttle(ctx):
+    """Every Hermes process on this root holds its model calls while the throttle says so (throttle.py)."""
+    register_middleware = getattr(ctx, "register_middleware", None)
+    if not callable(register_middleware):
+        return  # an older core without middleware: the throttle is display-only there
+    from . import sampler, throttle
+    root = sampler.hermes_root()
+    register_middleware("llm_execution", throttle.Gate(root, sampler.series_path(root)).middleware)
+
+
 def register(ctx):
     from . import sampler
+    try:
+        _register_throttle(ctx)
+    except Exception:  # never break plugin loading
+        log.exception("throughput: throttle failed to register")
     if sampler.eligible_process():
         try:
             sampler.start()

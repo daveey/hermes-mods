@@ -710,8 +710,9 @@ JUDGE_SYSTEM = (
 # question ("what should I ask to vet X?" -> a list of questions) as "a question" and a report with caveats as
 # mid-task, and said NO on both.
 REQUEST_CHARS = 2000
-# Synthetic user rows (kanban done notices, auto-continue) are not the user's request.
-_SYNTHETIC_KINDS = ("kanban_notice", "auto_continue")
+# Process completion resumes the existing request; subprocess output is not new user intent.
+# In particular, it must not erase a draft-only request's explicit prohibition on posting.
+_SYNTHETIC_KINDS = ("kanban_notice", "auto_continue", "process_complete")
 # Recovery re-prompts (the false-stop monitor's and the old session babysitter's headless `chat --resume` turns) are
 # stored as plain user rows. They only replay the event above them, so the request is that event. Judged against the
 # re-prompt's own rules ("say so in one line", "cite an owner card only if you checked it"), a finished report got

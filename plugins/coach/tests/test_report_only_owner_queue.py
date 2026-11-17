@@ -138,6 +138,29 @@ YOUNG = [("created", int(T - 300)), ("commented", int(T - 9))]
 NAMED = REPLY.replace("post the result to the self-heal card", f"post the result to the self-heal card `{CARD}`")
 
 
+def test_dispatcher_prohibition_precedes_stalled_owner_and_repeat_pressure(tmp_path, monkeypatch):
+    _env(monkeypatch, _board(tmp_path / "kanban.db"))
+    ask = (f"⏳ [default] @default Kanban {CARD}: ready 30 min with no worker; "
+           "admission reason llm_pacing: held: LLM quota pacing. "
+           "Do not run its work outside the dispatcher.")
+    # This exact queue still fires without the scope restriction (non-vacuity).
+    assert _check(REPLY, LOG)["reason"] == "stalled_queue_owner"
+    for repeat in (False, True):
+        hit = rc.check(REPLY, ask, LOG, _judge_low, only=["report_only"],
+                       relay_repeat=repeat, card_status=lambda _c: None, now=T)
+        assert hit is None, hit
+
+
+def test_dispatcher_scope_does_not_hide_unrestricted_or_quoted_requests():
+    directive = "Do not run its work outside the dispatcher."
+    notice = f"⏳ [default] @default Kanban {CARD}: waiting. "
+    assert rc.report_only_guard(notice + directive + "\n", REPLY) == "dispatcher_scope"
+    for ask in (notice, "Explain the policy: " + directive,
+                notice + 'Checkpoint says "' + directive + '"',
+                notice + directive + "\nNow fix this unrelated export bug."):
+        assert rc.report_only_guard(ask, REPLY) is None, ask
+
+
 def test_young_card_deep_queue_is_held(tmp_path, monkeypatch):
     _env(monkeypatch, _board(tmp_path / "kanban.db", created=int(T - 300), events=YOUNG, ahead=55))
     seen = []

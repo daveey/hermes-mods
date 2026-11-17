@@ -46,20 +46,22 @@ there is no prefix or fuzzy match.
 
 `kanban_comment`, `cross_task action=comment`, and literal `hermes kanban comment`
 commands in `terminal` are checked, including deferred `tool_call` wrappers.
-A terminal command's arguments are read the way hermes reads them: with core's own
-`hermes kanban` parser when core imports (built once per process), otherwise with a
-static reader of the same grammar. Both accept argparse's unique prefixes (`--max 5`
-is `--max-len 5`, `--boa x` is `--board x`), `--opt=value`, and options after the text.
-Help and usage errors post nothing, so they are never refused.
+A terminal command's arguments are read the way hermes reads them, by a static reader
+of core's `hermes kanban comment` grammar. It accepts argparse's unique prefixes
+(`--max 5` is `--max-len 5`, `--boa x` is `--board x`), `--opt=value`, and options
+after the text. Help and ambiguous options post nothing, so they are never refused.
+The hook never builds core's parser, because the first build in a process costs
+63-107 ms. The reader doesn't check value types, so it still refuses a command
+hermes would reject anyway (`--max abc`).
 The guard resolves the selected local board, not an arbitrary same-ID row on another
 board. Explicitly remote targets and unreadable bodies are allowed with the body-only
 hint appended to the result, never refused blind. This is static tool-hook feedback,
 not shell evaluation or a guard on human CLI/API writes. Tests:
 `tests/test_comment_branches.py` (entry matrix, real-pattern regressions, missing-body
 hint, CLI options, board selection, remote fallback, worker and non-worker hooks) and
-`tests/test_comment_branches_cli_options.py` (abbreviated and reordered options through
-both readers, board prefixes, help, and a drift check of the static option lists
-against core's parser).
+`tests/test_comment_branches_cli_options.py` (abbreviated and reordered options, board
+prefixes, help, a check that the hook builds no parser, and, when core imports, a drift
+check of the static option lists and of the reader's results against core's parser).
 
 ## What it does
 
