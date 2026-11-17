@@ -63,7 +63,23 @@ ALLOW = {
                         "timeout 500 ~/.hermes/bin/hermes-core-wt test tests/x.py",
 }
 
+# These commands may run Git, but no stash/protected-ref mutation; unlike ALLOW they
+# are not inputs to the no-Git-execution proof below.
+WRAPPER_DATA = {
+    "suffix-wrapper-prose": r'''git commit -m "proof used \`git archive\`"; token-broker exec --scope user/github --reason push -- env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=credential.helper "GIT_CONFIG_VALUE_0=!gh auth git-credential" git push origin HEAD:topic''',
+    "suffix-wrapper-awk": r'''awk '/git archive`/' patch; token-broker exec --scope user/github --reason push -- env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=credential.helper "GIT_CONFIG_VALUE_0=!gh auth git-credential" git push origin HEAD:topic''',
+}
+
+
+@pytest.mark.parametrize("cmd", WRAPPER_DATA.values(), ids=WRAPPER_DATA.keys())
+def test_wrapper_resolution_uncertainty_is_local(wt, cmd):
+    assert guard.refuse_reason(cmd, str(wt)) is None
+    assert not _blocked(cmd, wt)
+
+
 REFUSE = {
+    "truncated-case-dynamic-op": 'echo "$(case a in a) git stash $OP;; esac)"',
+    "wrapper-dynamic-mutation": 'G=$(command -v git); S=$(printf st""ash); token-broker exec --scope user/github --reason test -- "$G" "$S" drop',
     # An unquoted unknown suffix head may split into a command built elsewhere.
     "split-head": "X=$(printf 'git stash pop'); runit $X",
     # A quoted unknown head reads stdin: pipe, here-doc and an unread file all stay covered.
@@ -160,6 +176,16 @@ def wt(tmp_path, monkeypatch):
     (main / "f.txt").write_text("stashed\n")
     git("stash", "push", "-q", "-m", "from-main")
     return tree
+
+
+def test_truncated_case_dynamic_operation_really_restores(wt):
+    cmd = REFUSE["truncated-case-dynamic-op"]
+    assert guard.refuse_reason(cmd, str(wt)) is not None
+    subprocess.run(["bash", "-c", cmd], cwd=wt, env={**os.environ, "OP": "pop"},
+                   check=True, capture_output=True, text=True)
+    assert (wt / "f.txt").read_text() == "stashed\n"
+    assert subprocess.run(["git", "stash", "list"], cwd=wt.parent / "repo",
+                          check=True, capture_output=True, text=True).stdout == ""
 
 
 def _blocked(cmd, cwd):
