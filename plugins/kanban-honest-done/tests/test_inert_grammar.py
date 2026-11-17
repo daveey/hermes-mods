@@ -43,7 +43,7 @@ def test_round5_review_repros(tmp_path, monkeypatch, shape):
 # when the unknown construct occurs AFTER the mention, or in a later pipeline.
 _DATA_SHAPES = [
     'echo {cmd}', 'printf %s {quoted}', 'grep {quoted} f', 'git commit -m {quoted}',
-    "cat <<'EOF'\n{cmd}\nEOF", 'echo {cmd} > f', 'echo {cmd} | cat',
+    "cat <<'EOF'\n{cmd}\nEOF", 'echo {cmd} < f', 'echo {cmd} | cat',
     'cd x; echo {cmd}', 'echo {cmd} && echo ok', 'echo {cmd} || echo ok',
 ]
 _OUTSIDE_SUFFIXES = [
