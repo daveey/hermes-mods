@@ -92,6 +92,9 @@ def test_incident_stop_demand_refuses_every_tool_call(chat):
     "stop", "STOP!", "please stop", "stop doing things", "Stop what you're doing and answer me",
     "just answer the question", "answer my question", "[Turn stopped by Desktop before it finished.]  " + STOP,
     "stop taking actions", "STOP. answer my fucking question",
+    # live probe (t_01a1e9a61bf16b6f): the noun "file" in the question is not new work
+    "STOP DOING THINGS, ANSWER MY QUESTION: what does the file ~/.hermes/coach/selfheal_lane.json contain?",
+    "stop. answer my question: what changed in the update?",
 ])
 def test_stop_demands(msg):
     af = _load("answer_first")
@@ -101,6 +104,8 @@ def test_stop_demands(msg):
 @pytest.mark.parametrize("msg", [
     "stop the gateway", "stop the worker-scaler service and restart it", "stop doing that and fix the scaler instead",
     "don't stop until the tests pass", "stop and revert that change", "fix it", "set up the ASG",
+    "stop doing things, answer my question: what is in the file? read it and tell me",
+    "stop doing things and run the tests instead",
     "✔ [default] @default Kanban t_01a1e24866912c07 done — Independent exact-head review answer my question",
 ])
 def test_not_stop_demands(msg):

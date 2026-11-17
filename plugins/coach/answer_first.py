@@ -49,11 +49,13 @@ _STOP = re.compile(
     r"\s+working|\s+acting)\b"
     r"|(?:just\s+)?answer\s+(?:my|the)\s+(?:\w+\s+)?questi\w*|just\s+answer\b)",
     re.I | re.M)
-# New work asked for in the same message: then it is a redirect, not a stop.
+# New work asked for in the same message: then it is a redirect, not a stop. An action verb in imperative position
+# only: "what does the file X contain?" names a file, "stop, then fix X" asks for work (live probe, t_01a1e9a61bf16b6f).
 _ACTION = re.compile(
-    r"\b(?:fix|deploy|ship|merge|restart|kill|create|file|implement|install|delete|remove|revert|roll\s*back|undo|"
+    r"\binstead\b|(?:^|[.!?;:,\n]\s*|\b(?:please|you|and|then|now|just|go|but)\s+)"
+    r"(?:fix|deploy|ship|merge|restart|kill|create|file|implement|install|delete|remove|revert|roll\s*back|undo|"
     r"retry|resume|continue|run|set\s+up|setup|build|launch|start|make|update|change|edit|push|land|go\s+ahead|"
-    r"do\s+it|instead|until)\b", re.I)
+    r"do\s+it|read|look|open|check|move|use|let'?s)\b", re.I)
 # The stop phrase's own words never count as an action ("stop doing things", "answer my question").
 _STOP_WORDS = re.compile(r"\b(?:stop|doing|things|stuff|working|acting|taking\s+actions?|making\s+changes|"
                          r"running\s+(?:tools|commands|things)|calling\s+(?:tools|commands|things))\b", re.I)
