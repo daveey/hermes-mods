@@ -22,6 +22,17 @@ NOTICES = [
     "[STILL IN PROGRESS \u2014 this is the active request, restated after the compaction boundary]\nyes, go ahead",
     "[OUT-OF-BAND USER MESSAGE \u2014 a direct message]\n\u2714 [default] @default Kanban t_1 done \u2014 ok\n"
     "[/OUT-OF-BAND USER MESSAGE]",
+    # Core's Kanban wait notice (display_kind internal_notification). With the glyph list stopping at the four
+    # symbols above, a live one was recorded as David's answer to an open "restart worker-2" ask.
+    "\u23f3 [default] @default Kanban t_1: t_1 (Review), which this chat waits on, has been ready 30 min with no "
+    "worker (waiting for worker-1). Not a placement problem: restart the workers, yes or no",
+    # The other watcher notice glyphs core writes (gateway.kanban.ping): ⏱ 🔄 👀 🛑 ⛔ ℹ️.
+    "\u23f1 [hub:default] @default Kanban t_1 timed out: approve the rerun, yes or no",
+    "\U0001f504 [default] @default Kanban t_1 status: approved",
+    "\U0001f440 [default] @default Kanban t_1 review: approve it, yes",
+    "\U0001f6d1 [default] @default Kanban t_1 changes requested: yes, rotate it",
+    "\u26d4 [default] @default Kanban t_1 gave up: done",
+    "\u2139\ufe0f [default] @default Kanban t_1: yes, go ahead",
 ]
 
 
@@ -46,7 +57,8 @@ def test_runtime_notice_text_is_not_recorded_as_an_answer(gate, notice):
     assert gate.LOG.users("s1") == []
 
 
-@pytest.mark.parametrize("kind", ["kanban_notice", "auto_continue"])
+@pytest.mark.parametrize("kind", ["kanban_notice", "auto_continue", "internal_notification", "process_complete",
+                                  "async_delegation_complete", "loop_tick"])
 def test_runtime_display_kind_turn_is_not_recorded_even_without_bracket_text(gate, kind):
     text = "Card t_1 is waiting on you: approve it, yes or no"
     gate.ledger().set_open_asks("s1", [ASK])
@@ -73,6 +85,30 @@ def test_typed_answer_is_still_recorded(gate, kind):
     assert text in gate.LOG.users("s1")
 
 
+@pytest.mark.parametrize("text", ["\U0001f44d yes, rotate it", "\u2705 yes, go ahead and rotate it",
+                                  "\u26a0 careful, but yes: rotate it"])
+def test_typed_answer_opening_with_a_symbol_is_still_recorded(gate, text):
+    """Only a glyph followed by "[" is a notice: David's own "👍 yes" is his answer."""
+    gate.ledger().set_open_asks("s1", [ASK])
+    _answering_model(gate)
+    hist = [{"role": "assistant", "content": ASK}, {"role": "user", "content": text}]
+    gate.pre_llm_call(session_id="s1", user_message=text, conversation_history=hist, platform="tui")
+    assert [a["answer"] for a in gate.ledger().recent(3600)] == [text]
+    assert text in gate.LOG.users("s1")
+
+
+def test_canonical_decision_relay_is_still_recorded(gate):
+    """internal_notification also relays David's own button choice; that row stays answer evidence."""
+    text = ("Canonical user decision. Act only on the frozen revision below.\n"
+            "{\"requestId\": \"r1\", \"choice\": \"yes, rotate it\"}")
+    gate.ledger().set_open_asks("s1", [ASK])
+    _answering_model(gate)
+    hist = [{"role": "assistant", "content": ASK},
+            {"role": "user", "content": text, "display_kind": "internal_notification"}]
+    gate.pre_llm_call(session_id="s1", user_message=text, conversation_history=hist, platform="tui")
+    assert [a["answer"] for a in gate.ledger().recent(3600)] == [text]
+
+
 def test_typed_answer_after_an_earlier_runtime_row_is_still_recorded(gate):
     text = "yes, rotate it"
     gate.ledger().set_open_asks("s1", [ASK])
@@ -96,11 +132,14 @@ def test_notice_rows_written_by_a_pre_fix_process_stay_invisible(gate):
     led = gate.ledger()
     led.add("Rerun the controls", "[chat-closeout] Work this chat started is now waiting on the user.", session="s1")
     led.add("Approve the spend", "\u23f8 [hub:default] @default Kanban t_1 blocked: approve", session="s1")
+    # A ⏳ wait notice an earlier build recorded (live ledger row, Nov 17) is hidden by the read-time check too.
+    led.add("Restart worker-2", "\u23f3 [default] @default Kanban t_1: ready 30 min with no worker", session="s1")
     led.add("Rotate the key", "yes, rotate it", session="s1")
     assert [r["answer"] for r in led.relevant("s1")] == ["yes, rotate it"]
     block = gate.core.l1_block("s1", led, db_paths=[])
     assert "Rotate the key" in block
     assert "Rerun the controls" not in block and "Approve the spend" not in block
+    assert "Restart worker-2" not in block
 
 
 def test_retired_notice_row_does_not_retire_the_ask(gate):
