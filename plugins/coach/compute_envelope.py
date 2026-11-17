@@ -54,7 +54,8 @@ META_RE = re.compile(
     r"\b(?:approval|authority|spend|compute)[- ](?:check|gate|rule|detector)s?\b", re.I)
 # A sentence that says it is not asking ("My report doesn't ask anyone to approve compute or spend").
 NOT_ASKING_RE = re.compile(r"\b(?:doesn['\u2019]t|does not|don['\u2019]t|do not|didn['\u2019]t|did not|isn['\u2019]t|"
-                           r"is not|no need to|nothing to)\s+(?:\w+\s+){0,2}(?:ask|approv|decid)\w*", re.I)
+                           r"is not|can['\u2019]t|cannot|can not|won['\u2019]t|will not|no need to|nothing to)"
+                           r"\s+(?:\w+\s+){0,2}(?:ask|approv|authori[sz]|decid)\w*", re.I)
 # A leading permission request is still an ask when its purpose names the guard.
 # Anchor after list markers/whitespace, not quotes or prose describing someone else's ask.
 PERMISSION_START_RE = re.compile(
@@ -231,11 +232,21 @@ def classify(text: str, envelope: Optional[float] = None) -> Optional[dict]:
         return None
     if any(v > cap for v in money) and not _small_topup(text, money, _baseline(text, cap)):
         return None
-    if MULTI_RE.search(GPU_HOURS_RE.sub("gpuhours", text)):
+    # A price immediately before GPU ("$20 GPU") is not a machine count.
+    count_text = MONEY_RE.sub("money", _money_text(text))
+    if MULTI_RE.search(GPU_HOURS_RE.sub("gpuhours", count_text)):
         return None
     for sent in SENTENCE_SPLIT_RE.split(unquoted(text)):
-        if (ASK_RE.search(sent) and COMPUTE_RE.search(sent) and not CREDENTIAL_RE.search(sent)
-                and not NOT_ASKING_RE.search(sent)
+        # A separate permission question survives negation. A comma alone is not
+        # enough: "cannot approve spending, authorize GPU rentals" is still negated.
+        asking = ASK_RE.search(sent) and COMPUTE_RE.search(sent)
+        if NOT_ASKING_RE.search(sent):
+            clauses = [re.sub(r"^\s*(?:(?:so|but|and|then)\s+)+", "", clause, flags=re.I)
+                       for clause in CLAUSE_BREAK_RE.split(sent)]
+            asking = any(PERMISSION_START_RE.match(clause) and ASK_RE.search(clause)
+                         and COMPUTE_RE.search(clause) and not NOT_ASKING_RE.search(clause)
+                         for clause in clauses)
+        if (asking and not CREDENTIAL_RE.search(sent)
                 and (not META_RE.search(sent) or PERMISSION_START_RE.match(sent))):
             return {"sentence": sent.strip()[:300], "usd": max(money) if money else None, "cap": cap}
     return None
