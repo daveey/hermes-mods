@@ -207,3 +207,12 @@ def test_disabled_by_env(chat, monkeypatch):
     monkeypatch.setenv("COACH_ANSWER_FIRST", "0")
     _turn(hooks, STOP)
     assert _call(hooks) is None
+
+
+def test_user_steps_reads_the_stop_block_text():
+    """user-steps' publication gate recognizes a stop turn by this block text (STOP_TURN_MARK): it must not drift."""
+    import re as _re
+    af = _load("answer_first")
+    src = (HERE.parent / "user-steps" / "__init__.py").read_text()
+    mark = _re.search(r"^STOP_TURN_MARK = '([^']+)'", src, _re.M)
+    assert mark and af.STOP_MESSAGE.startswith(mark.group(1))
