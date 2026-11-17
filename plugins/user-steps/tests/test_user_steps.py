@@ -298,6 +298,17 @@ def test_runtime_message_detection():
     assert not core._runtime_message("go") and not core._runtime_message("[link] see this")
 
 
+def test_runtime_message_detection_covers_every_notice_glyph():
+    """Core's ⏳ wait notice and the other watcher glyphs are notices; a typed reply opening with an emoji is not."""
+    for notice in ("\u23f3 [default] @default Kanban t_1: t_1 (Review) has been ready 30 min with no worker",
+                   "\u23f1 [hub:default] @default Kanban t_1 timed out", "\U0001f440 [default] @default Kanban t_1",
+                   "\U0001f6d1 [default] @default Kanban t_1", "\u26d4 [default] @default Kanban t_1 gave up",
+                   "\U0001f504 [default] @default Kanban t_1", "\u2139\ufe0f [default] @default Kanban t_1"):
+        assert core._runtime_message(notice), notice
+    for typed in ("\U0001f44d go", "\u2705 done, I pressed it", "\u26a0 careful, but go"):
+        assert not core._runtime_message(typed), typed
+
+
 def test_extract_prompt_says_notices_answer_nothing():
     assert "answers no step" in core.SYSTEM and "never resolved" in core.SYSTEM
 
