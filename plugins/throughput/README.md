@@ -84,8 +84,8 @@ and a body that is not a JSON object a 422, and neither changes anything.
   stored level until it can; the fleet's level is the setter's `cache/throughput/throttle.json`, so clearing that
   file drops the setting.
 - **Enforcement** (`throttle.py`): an `llm_execution` middleware that paces model calls. Each gateway takes a share
-  of the cap: half split evenly between the gateways that sampled tokens in the last 15 minutes, half in proportion
-  to what each used (every gateway computes the same shares from the same series, so they sum to 1). It then spaces
+  of the cap: a quarter split evenly between the gateways that sampled tokens in the last 15 minutes, the rest in
+  proportion to what each used (every gateway computes the same shares from the same series, so they sum to 1). It then spaces
   its calls `tokens per call / (share x cap)` seconds apart, where tokens per call is its own measured in+out
   tokens per model call over those 15 minutes (20k until it has measured any; every call is counted, throttled or
   not). Calls on one gateway queue for slots in `cache/throughput/throttle-pace.json` under a file lock, across

@@ -385,16 +385,16 @@ def test_status_and_gate_obey_another_gateways_level(tmp_path):
 
 # --- pacing ---------------------------------------------------------------------------------------------------
 
-def test_shares_are_half_even_half_by_use_and_sum_to_one():
+def test_shares_are_a_quarter_even_the_rest_by_use_and_sum_to_one():
     usage = {"hub": 300.0, "worker-1": 600.0, "mini": 100.0, "macbook": 0.0}
     shares = {g: T.local_share(usage, g) for g in usage}
-    assert shares == {"hub": pytest.approx(0.125 + 0.15), "worker-1": pytest.approx(0.125 + 0.30),
-                      "mini": pytest.approx(0.125 + 0.05), "macbook": pytest.approx(0.125)}
+    assert shares == {"hub": pytest.approx(0.0625 + 0.225), "worker-1": pytest.approx(0.0625 + 0.45),
+                      "mini": pytest.approx(0.0625 + 0.075), "macbook": pytest.approx(0.0625)}
     assert sum(shares.values()) == pytest.approx(1.0)
-    assert T.local_share(usage, "new-host") == pytest.approx(0.5 / 5)  # not in the series yet: its even half of five
+    assert T.local_share(usage, "new-host") == pytest.approx(0.25 / 5)  # not in the series yet: its even part of five
     assert T.local_share({"hub": 0.0, "mini": 0.0}, "hub") == pytest.approx(0.5)  # nobody used anything: even
     assert T.local_share({}, "hub") == 1.0 and T.local_share({}, None) == 1.0
-    assert T.local_share({"hub": 10.0}, None) == pytest.approx(0.5)  # an unnamed gateway: half of the even split
+    assert T.local_share({"hub": 10.0}, None) == pytest.approx(0.25)  # an unnamed gateway: the even part only
 
 
 def test_usage_and_local_name_come_from_the_series(tmp_path):
@@ -440,10 +440,10 @@ def _paced(tmp_path, percent=50, cap=1000.0, rows=(), me="hub"):
 
 
 def test_gate_spaces_calls_so_a_queue_drains_at_the_gateways_share_of_the_cap(tmp_path):
-    # worker-1 used all of the window's tokens and this gateway none: share = its even half of two = 0.25 of 1000/s
+    # worker-1 used all of the window's tokens and this gateway none: share = its even part of two = 0.125 of 1000/s
     db = _paced(tmp_path, cap=1000.0, rows=[("worker-1", END - 60, 60_000.0)])
     gate, clock = _gate(tmp_path, db)
-    interval = T.DEFAULT_CALL_TOKENS / (0.25 * 1000.0)  # no use measured here yet: 20k tokens a call -> 80 s
+    interval = T.DEFAULT_CALL_TOKENS / (0.125 * 1000.0)  # no use measured here yet: 20k tokens a call -> 160 s
     assert gate.plan(NOW) == ("pace", pytest.approx(interval), NOW - 100)
     starts = []
     for _ in range(4):  # four calls arrive at the same moment, in four processes

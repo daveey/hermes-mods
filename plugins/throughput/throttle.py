@@ -12,8 +12,8 @@
 * Each gateway acknowledges the level it obeys in ``throttle-seen.json`` (``note_seen``, once a minute from the
   sampler); the link publishes that too, so the panel can list which gateways have the current level.
 * Enforcement is an ``llm_execution`` middleware (``Gate.middleware``) that paces model calls. Each gateway takes
-  a share of the cap (``local_share``: half split evenly between the gateways that sampled tokens in the last
-  15 minutes, half in proportion to what each used) and spaces its calls ``call_tokens / (share x cap)`` seconds
+  a share of the cap (``local_share``: a quarter split evenly between the gateways that sampled tokens in the
+  last 15 minutes, the rest in proportion to what each used) and spaces its calls ``call_tokens / (share x cap)`` seconds
   apart, where ``call_tokens`` is this gateway's measured in+out tokens per model call (every call is counted,
   throttled or not, so the figure is ready when the slider moves). Calls on one gateway queue
   for slots in ``throttle-pace.json`` (a file lock orders every Hermes process on the root), so nothing is
@@ -60,6 +60,7 @@ POLL_S = 5.0
 START_GATE_TTL_S = 15.0  # the dispatcher asks per candidate card, every tick: answer from a cached read
 START_GATE_REASON = "token_throttle"
 PACE_FILE = "throttle-pace.json"
+EVEN_SHARE = 0.25  # this much of the cap is split evenly (so an idle gateway can start); the rest follows use
 SHARE_WINDOW_S = 15 * 60  # shares and tokens-per-call are measured over the last 15 minutes
 PLAN_TTL_S = 30.0  # a process re-reads its share and tokens-per-call this often
 DEFAULT_CALL_TOKENS = 20_000.0  # before this gateway has measured one paced call
@@ -362,8 +363,9 @@ def usage_by_gateway(series_db: Path, now: float) -> dict[str, float]:
 
 
 def local_share(usage: dict[str, float], me: Optional[str]) -> float:
-    """This gateway's share of the cap, 0..1: half split evenly between the gateways in ``usage`` (and this one),
-    half in proportion to use. Every gateway computes the same shares from the same series, so they sum to 1; a
+    """This gateway's share of the cap, 0..1: ``EVEN_SHARE`` of it split evenly between the gateways in ``usage``
+    (and this one), the rest in proportion to use (an even half left the fleet at half its cap on 2026-11-17: idle
+    gateways held shares they did not use). Every gateway computes the same shares from the same series, so they sum to 1; a
     gateway that used nothing keeps its even half, so it can start."""
     names = set(usage) | ({me} if me else set())
     if not names:
@@ -371,7 +373,7 @@ def local_share(usage: dict[str, float], me: Optional[str]) -> float:
     even = 1.0 / len(names)
     total = sum(usage.values())
     mine = usage.get(me, 0.0) if me else 0.0
-    return even if total <= 0 else 0.5 * even + 0.5 * mine / total
+    return even if total <= 0 else EVEN_SHARE * even + (1 - EVEN_SHARE) * mine / total
 
 
 class Pacer:
