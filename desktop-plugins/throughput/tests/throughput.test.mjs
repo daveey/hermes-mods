@@ -439,7 +439,8 @@ test('throttle maths: cap per unit, live preview, burn scale, durations and labe
   assert.equal(P.fmtDuration(600), '10 min')
   assert.equal(P.fmtDuration(null), '–')
   assert.equal(P.throttleText(throttle({ percent: 0, cap_per_s: null }), 'm'), 'Throttle off')
-  assert.equal(P.throttleText(throttle(), 'm'), 'Throttle 75% · cap 300 tok/m · holding calls')
+  assert.equal(P.throttleText(throttle(), 'm'), 'Throttle 75% · cap 300 tok/m · over the cap, pacing calls')
+  assert.equal(P.throttleText(throttle({ percent: 100, cap_per_s: 0 }), 'm'), 'Throttle 100% · cap 0 tok/m · holding every call')
   assert.equal(P.throttleText(throttle({ holding: false }), 's'), 'Throttle 75% · cap 5.0 tok/s')
   assert.match(P.throttleText(throttle({ cap_per_s: null }), 'm'), /no cap yet/)
   const [gpt, claude] = throttle().pools
@@ -500,7 +501,7 @@ test('panel: red cap line on Tokens only, slider at the level, runway per pool',
     assert.equal(capLines('cards').length, 0)
     const slider = document.querySelector('[data-slot="throttle"] input[type=range]')
     assert.equal(slider.value, '75')
-    assert.match(document.querySelector('[data-slot="throttle"]').textContent, /Throttle 75% · cap 300 tok\/m · holding calls/)
+    assert.match(document.querySelector('[data-slot="throttle"]').textContent, /Throttle 75% · cap 300 tok\/m · over the cap, pacing calls/)
     assert.match(document.querySelector('[data-slot="throttle"]').textContent, /applies to hub/)
     assert.equal(document.querySelector('[data-scope]').dataset.scope, 'local')
     assert.match(document.querySelector('[data-pool="openai-codex"]').textContent, /^GPT: 122% left, empty in 40\.7 h at the cap/)

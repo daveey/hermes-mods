@@ -231,7 +231,7 @@ export function throttleText(throttle, unit) {
   if (p <= 0) return 'Throttle off'
   const cap = capRate(throttle, unit)
   if (cap == null) return `Throttle ${p}% \u00b7 no cap yet (no 24-hour peak to scale)`
-  return `Throttle ${p}% \u00b7 cap ${fmt(cap)} tok/${unit}${throttle?.holding ? ' \u00b7 holding calls' : ''}`
+  return `Throttle ${p}% \u00b7 cap ${fmt(cap)} tok/${unit}${p >= 100 ? ' \u00b7 holding every call' : throttle?.holding ? ' \u00b7 over the cap, pacing calls' : ''}`
 }
 
 // ── components ────────────────────────────────────────────────────────────

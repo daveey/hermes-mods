@@ -83,11 +83,21 @@ and a body that is not a JSON object a 422, and neither changes anything.
   whose server process runs the sampler acknowledges. A gateway that cannot read its replica obeys its own
   stored level until it can; the fleet's level is the setter's `cache/throughput/throttle.json`, so clearing that
   file drops the setting.
-- **Enforcement** (`throttle.py`): an `llm_execution` middleware. While the fleet rate (mean of the sampled minutes
-  among the last three, from this gateway's own sampler) is above the cap, a model call waits and re-checks every
-  5 s; at 100 % every such call waits until the level is lowered. A gateway whose sampler has no minute yet holds
-  only at 100 %. The 24-hour reference is cached for 10 minutes per process. Rates are sampled once a minute, so
-  the control lags by about a minute and duty-cycles around the cap.
+- **Enforcement** (`throttle.py`): an `llm_execution` middleware that paces model calls. Each gateway takes a share
+  of the cap: half split evenly between the gateways that sampled tokens in the last 15 minutes, half in proportion
+  to what each used (every gateway computes the same shares from the same series, so they sum to 1). It then spaces
+  its calls `tokens per call / (share x cap)` seconds apart, where tokens per call is its own measured in+out
+  tokens per model call over those 15 minutes (20k until it has measured any; every call is counted, throttled or
+  not). Calls on one gateway queue for slots in `cache/throughput/throttle-pace.json` under a file lock, across
+  all its Hermes processes: an idle gateway's first call starts at once, the rest follow one interval apart, and
+  unused time is not saved up. The spacing is capped at 10 minutes, so a gateway with a sliver of the cap still
+  makes progress. At 100 % (or a cap of zero) every call waits until the level is lowered; a waiting call re-reads
+  the level every 5 s. Shares and tokens per call are re-read every 30 s per process. This replaced a rule that
+  held every call while the fleet rate was over the cap and released them all when it dipped under, which
+  overshot in bursts (2026-11-17: cap 76k tokens/min, fleet average 116k, peaks of 794k). The fleet's rate now
+  follows the cap as closely as the tokens-per-call estimate holds; a gateway whose calls suddenly grow overshoots
+  until its 15-minute average catches up. `holding` in the payload still means "the measured fleet rate is above
+  the cap right now".
 - **A held turn stays alive.** Core gives middleware no activity API, so the gate finds the agent behind the call it
   wraps (the closure of core's `_perform_api_call`) and stamps its activity clock every poll, as core's own offline
   wait does: the gateway's idle watchdog and the turn liveness watchdog see a waiting turn, and a Kanban card's

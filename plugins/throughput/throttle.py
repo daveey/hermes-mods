@@ -11,10 +11,14 @@
   (about a minute each way). A gateway without the link, or without this plugin, is not throttled.
 * Each gateway acknowledges the level it obeys in ``throttle-seen.json`` (``note_seen``, once a minute from the
   sampler); the link publishes that too, so the panel can list which gateways have the current level.
-* Enforcement is an ``llm_execution`` middleware (``Gate.middleware``): while the fleet rate measured by this
-  gateway's sampler is above the cap, a model call waits here and re-checks every ``POLL_S`` seconds. Rates are
-  sampled once a minute, so the control lags by about a minute and works as a duty cycle around the cap, not a
-  per-token limiter.
+* Enforcement is an ``llm_execution`` middleware (``Gate.middleware``) that paces model calls. Each gateway takes
+  a share of the cap (``local_share``: half split evenly between the gateways that sampled tokens in the last
+  15 minutes, half in proportion to what each used) and spaces its calls ``call_tokens / (share x cap)`` seconds
+  apart, where ``call_tokens`` is this gateway's measured in+out tokens per model call (every call is counted,
+  throttled or not, so the figure is ready when the slider moves). Calls on one gateway queue
+  for slots in ``throttle-pace.json`` (a file lock orders every Hermes process on the root), so nothing is
+  released in a herd. An earlier version held every call while the fleet rate was over the cap and released
+  them all when it dipped under: 2026-11-17, cap 76k tokens/min, the fleet averaged 116k with bursts to 794k.
 * A waiting turn stays alive: core gives middleware no activity API, so the gate finds the agent behind the
   call it wraps (``agent_of``) and stamps its activity clock every poll, the way core's own offline wait does.
   That also renews a Kanban card's claim. A stop request from the user ends the wait at the next poll.
@@ -50,7 +54,12 @@ REFERENCE_WINDOW_S = 24 * 3600
 REFERENCE_BUCKET_S = 900
 RATE_MINUTES = 3  # the fleet rate is the mean of the sampled minutes among the last three
 POLL_S = 5.0
-STATE_TTL_S = 10.0
+PACE_FILE = "throttle-pace.json"
+SHARE_WINDOW_S = 15 * 60  # shares and tokens-per-call are measured over the last 15 minutes
+PLAN_TTL_S = 30.0  # a process re-reads its share and tokens-per-call this often
+DEFAULT_CALL_TOKENS = 20_000.0  # before this gateway has measured one paced call
+MIN_CALL_TOKENS, MAX_CALL_TOKENS = 500.0, 2_000_000.0
+MAX_INTERVAL_S = 600.0  # a gateway with a sliver of the cap still gets one call every ten minutes
 AUX_HOOK_TIMEOUT_S = 600.0  # core's ceiling for one hook callback (``hermes_hook_timeout``)
 AUX_HOLD_MAX_S = 540.0  # return before that ceiling: a timed-out callback is suppressed for a minute
 AUX_NOT_HELD = frozenset({"hub_admission"})
@@ -305,8 +314,125 @@ def status(root: Path, series_db: Path, now: Optional[float] = None, hub_db: Opt
             "holding": holding, "set_at": level["set_at"] or None, "set_by": level["source"]}
 
 
+def pace_path(root: Path) -> Path:
+    return Path(root) / "cache" / "throughput" / PACE_FILE
+
+
+def local_name(series_db: Path) -> Optional[str]:
+    """The name this gateway's sampler stores its own minutes under (``meta.me``); None before it has run."""
+    if not Path(series_db).is_file():
+        return None
+    from .sampler import ro_connect
+    try:
+        c = ro_connect(series_db)
+    except sqlite3.Error:
+        return None
+    try:
+        row = c.execute("SELECT value FROM meta WHERE key='me'").fetchone()
+    except sqlite3.Error:
+        return None
+    finally:
+        c.close()
+    return str(row[0]) if row and row[0] else None
+
+
+def usage_by_gateway(series_db: Path, now: float) -> dict[str, float]:
+    """In+out tokens each gateway used in the last ``SHARE_WINDOW_S`` (gateways with a sampled minute only)."""
+    if not Path(series_db).is_file():
+        return {}
+    from .sampler import ro_connect
+    until = int(now) // 60 * 60
+    try:
+        c = ro_connect(series_db)
+    except sqlite3.Error:
+        return {}
+    try:
+        rows = c.execute("SELECT gateway, SUM(value) FROM minutes WHERE metric='tokens_io' AND minute>=? AND minute<? "
+                         "AND value IS NOT NULL GROUP BY gateway", (until - SHARE_WINDOW_S, until)).fetchall()
+    except sqlite3.Error:
+        return {}
+    finally:
+        c.close()
+    return {str(g): float(v or 0.0) for g, v in rows}
+
+
+def local_share(usage: dict[str, float], me: Optional[str]) -> float:
+    """This gateway's share of the cap, 0..1: half split evenly between the gateways in ``usage`` (and this one),
+    half in proportion to use. Every gateway computes the same shares from the same series, so they sum to 1; a
+    gateway that used nothing keeps its even half, so it can start."""
+    names = set(usage) | ({me} if me else set())
+    if not names:
+        return 1.0
+    even = 1.0 / len(names)
+    total = sum(usage.values())
+    mine = usage.get(me, 0.0) if me else 0.0
+    return even if total <= 0 else 0.5 * even + 0.5 * mine / total
+
+
+class Pacer:
+    """Slots for one gateway's model calls, shared by every Hermes process on the root through a locked file."""
+
+    def __init__(self, root: Path):
+        self.path = pace_path(root)
+
+    def _locked(self, fn):
+        import fcntl
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(self.path) + ".lock", os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            state = _read_json(self.path)
+            state = state if isinstance(state, dict) else {}
+            out = fn(state)
+            _write_json(self.path, state)
+            return out
+        finally:
+            os.close(fd)  # releases the lock
+
+    @staticmethod
+    def _count(state: dict, at: float, now: float) -> None:
+        """Count one call in the minute of ``at``; forget minutes older than the window."""
+        floor = int(now - SHARE_WINDOW_S) // 60
+        calls = {str(m): int(n) for m, n in (state.get("calls") or {}).items()
+                 if str(m).lstrip("-").isdigit() and int(m) >= floor and _number(n) is not None}
+        key = str(int(at) // 60)
+        calls[key] = calls.get(key, 0) + 1
+        state["calls"] = calls
+
+    def reserve(self, now: float, interval: float) -> float:
+        """The time this call may start: now if the gateway is idle, else ``interval`` after the previous slot."""
+        def take(state):
+            slot = max(_number(state.get("next_at")) or 0.0, now)
+            state["next_at"] = slot + max(0.0, interval)
+            self._count(state, slot, now)
+            return slot
+        return self._locked(take)
+
+    def note(self, now: float) -> None:
+        """Count a call that needed no slot (the throttle is off), so tokens-per-call is already known when the
+        throttle is engaged."""
+        self._locked(lambda state: self._count(state, now, now))
+
+    def passes(self, now: float) -> int:
+        """Calls counted in the minutes of the last ``SHARE_WINDOW_S`` up to now (reads without the lock)."""
+        state = _read_json(self.path)
+        calls = state.get("calls") if isinstance(state, dict) else None
+        if not isinstance(calls, dict):
+            return 0
+        first, last = int(now - SHARE_WINDOW_S) // 60, int(now) // 60
+        return sum(int(n) for m, n in calls.items()
+                   if str(m).lstrip("-").isdigit() and first <= int(m) <= last and _number(n) is not None)
+
+
+def call_tokens(local_usage: float, passes: int) -> float:
+    """Measured in+out tokens per model call on this gateway; a default until both numbers exist."""
+    if local_usage <= 0 or passes <= 0:
+        return DEFAULT_CALL_TOKENS
+    return min(MAX_CALL_TOKENS, max(MIN_CALL_TOKENS, local_usage / passes))
+
+
 class Gate:
-    """The per-process hold: ``wait()`` returns once the level allows a model call."""
+    """The per-process pacer: ``wait()`` returns when this gateway's next slot comes up."""
 
     def __init__(self, root: Path, series_db: Path, *, hub_db: Optional[Path] = None,
                  sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.time,
@@ -314,49 +440,97 @@ class Gate:
         self.root, self.series_db, self._sleep, self._clock = Path(root), Path(series_db), sleep, clock
         self.hub_db, self._beat = (None if hub_db is None else Path(hub_db)), beat
         self._lock = threading.Lock()
-        self._state: Optional[tuple[float, bool]] = None  # (taken at, holding)
+        self._pacer = Pacer(self.root)
+        self._rate: Optional[tuple[float, float, float]] = None  # (taken at, share, tokens per call)
+
+    def _share_and_tokens(self, now: float) -> tuple[float, float]:
+        with self._lock:
+            if self._rate is not None and 0 <= now - self._rate[0] < PLAN_TTL_S:
+                return self._rate[1], self._rate[2]
+        me = local_name(self.series_db)
+        usage = usage_by_gateway(self.series_db, now)
+        share = local_share(usage, me)
+        tokens = call_tokens(usage.get(me, 0.0) if me else 0.0, self._pacer.passes(now))
+        with self._lock:
+            self._rate = (now, share, tokens)
+        return share, tokens
+
+    def plan(self, now: float) -> tuple:
+        """``("pass",)``, ``("hold",)`` (100 %, or a cap of zero) or ``("pace", seconds between calls, set_at)``.
+        Off and fully on read only the level; a level in between reads the series. Any failed read passes."""
+        try:
+            level = effective(self.root, self.hub_db, now)
+            percent = level["percent"]
+            if percent <= 0:
+                return ("pass",)
+            if percent >= 100:
+                return ("hold",)
+            limit = limit_of(level, None if level.get("cap_per_s") is not None else reference_rate(self.series_db, now))
+            if limit is None:
+                return ("pass",)  # nothing to scale against yet
+            share, tokens = self._share_and_tokens(now)
+            allowed = share * limit
+            if allowed <= 0:
+                return ("hold",)
+            return ("pace", min(MAX_INTERVAL_S, tokens / allowed), level["set_at"])
+        except Exception:  # fail open: a broken read must never stall a model call
+            log.debug("throughput throttle: plan failed", exc_info=True)
+            return ("pass",)
 
     def holding(self) -> bool:
-        now = self._clock()
-        with self._lock:
-            if self._state is not None and 0 <= now - self._state[0] < STATE_TTL_S:
-                return self._state[1]
-        try:
-            percent = effective(self.root, self.hub_db, now)["percent"]
-            # Off and fully on need no rate: only a level in between reads the series db.
-            held = percent >= 100 or (percent > 0 and status(self.root, self.series_db, now, self.hub_db)["holding"])
-        except Exception:  # fail open: a broken read must never stall a model call
-            log.debug("throughput throttle: status read failed", exc_info=True)
-            held = False
-        with self._lock:
-            self._state = (now, held)
-        return held
+        """True while every call waits (100 %); a paced level is not a hold."""
+        return self.plan(self._clock())[0] == "hold"
 
     def wait(self, *, beat: Optional[Callable[[float], None]] = None,
              stop: Optional[Callable[[], bool]] = None, max_s: Optional[float] = None) -> float:
-        """Block while the throttle holds; returns the seconds waited. ``beat(waited)`` runs every poll (the
-        caller's liveness report), ``stop()`` true or ``max_s`` reached ends the wait early."""
-        if not self.holding():
-            return 0.0
+        """Block until this call's slot; returns the seconds waited. ``beat(waited)`` runs every poll (the caller's
+        liveness report), ``stop()`` true or ``max_s`` reached ends the wait early. A waiting call re-reads the
+        level every poll: lowering it releases the call, and a new level gets a new slot."""
         started = self._clock()
-        log.info("throughput throttle: holding a model call")
+        slot: Optional[float] = None
+        slot_for = None
+        announced = False
         while True:
+            now = self._clock()
+            plan = self.plan(now)
+            if plan[0] == "pass":
+                if not announced:
+                    try:
+                        self._pacer.note(now)
+                    except Exception:  # counting is best effort
+                        log.debug("throughput throttle: call count failed", exc_info=True)
+                break
+            if plan[0] == "pace":
+                if slot is None or slot_for != plan[2]:
+                    try:
+                        slot, slot_for = self._pacer.reserve(now, plan[1]), plan[2]
+                    except Exception:  # fail open: an unwritable pace file must never stall a model call
+                        log.debug("throughput throttle: slot reservation failed", exc_info=True)
+                        break
+                if now >= slot:
+                    break
+                nap = min(POLL_S, slot - now)
+            else:
+                slot, nap = None, POLL_S
+            if not announced:
+                announced = True
+                log.info("throughput throttle: holding a model call (%s)",
+                         "level 100%" if plan[0] == "hold" else "next slot in %.0fs" % (slot - now))
             for report in (beat, self._beat):
                 if report is not None:
                     try:
-                        report(self._clock() - started)  # tell the host this turn is waiting, not dead
+                        report(now - started)  # tell the host this turn is waiting, not dead
                     except Exception:  # a liveness report must never fail the call it protects
                         log.debug("throughput throttle: liveness report failed", exc_info=True)
-            self._sleep(POLL_S)
+            self._sleep(nap)
             waited = self._clock() - started
-            with self._lock:
-                self._state = None  # a waiting call re-reads every poll, so lowering the level releases it
-            if not self.holding():
-                log.info("throughput throttle: released after %.0fs", waited)
-                return waited
             if (max_s is not None and waited >= max_s) or (stop is not None and _true(stop)):
-                log.info("throughput throttle: wait ended after %.0fs while still holding", waited)
+                log.info("throughput throttle: wait ended after %.0fs before its slot", waited)
                 return waited
+        waited = self._clock() - started
+        if announced:
+            log.info("throughput throttle: released after %.0fs", waited)
+        return waited
 
     def middleware(self, *, next_call, request, **_context):
         try:
