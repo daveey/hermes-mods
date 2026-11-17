@@ -56,6 +56,25 @@ class DigestDedupe(unittest.TestCase):
         self.assertEqual(dg["signals"].get("screenshot"), 1)
         self.assertEqual(dg["msgs"], 3)
 
+    def test_raw_runtime_provenance_precedes_cleanup(self):
+        texts = [
+            '[System note: Your previous turn was interrupted mid-run. The paused request was:] broken again',
+            '[runtime] Your draft above was NOT shown to the user. Do it yourself.',
+            '⏳ [default] @default Kanban t_example: broken again',
+            '⚠ subagent Subagent: root cause was stopped by a restart before finishing',
+            'Canonical user decision. Act only on the frozen revision below. root cause',
+            'What is in this image?\n[Canonical requests awaiting a user decision: root cause]',
+            json.dumps([{'type': 'text', 'text': 'fix this broken UI'}, {'type': 'image_url'}]),
+        ]
+        with tempfile.TemporaryDirectory() as d:
+            db = Path(d) / 'state.db'
+            make_db(db, [('user', text, time.time() + i, 1, 0, None, None, str(i))
+                         for i, text in enumerate(texts)])
+            (dg,) = list(sd.digest_db('default', db, 'test', 0))
+        self.assertEqual([u['text'] for u in dg['user_turns']],
+                         ['What is in this image?', 'fix this broken UI\n[screenshot]'])
+        self.assertEqual(dg['user_turns_total'], 2)
+
     def test_legacy_schema_without_active_columns(self):
         with tempfile.TemporaryDirectory() as d:
             db = Path(d) / "state.db"
