@@ -56,6 +56,38 @@ it as sampled. Decisions:
 Until every gateway's registry metrics carry the token/session counters, tokens and sessions cover the local
 gateway only; cards cover every gateway.
 
+## Throttle and runway
+
+`GET /v1/throttle` returns `{percent, reference_per_s, cap_per_s, rate_per_s, holding, scope, pools, now}`;
+`PUT /v1/throttle` with `{"percent": 0..100}` sets the level; any other `percent` is a 400 and a body that is not
+a JSON object a 422, and neither changes anything.
+
+- **Level**: 0 = no cap, 100 = a cap of zero, between = `(1 - percent/100) x reference_per_s`, where the reference is
+  the peak fleet in+out token rate over the last 7 days in 15-minute buckets. Without any sampled minute there is no
+  reference and a level between 1 and 99 caps nothing.
+- **Scope**: the level is a file in this Hermes root (`cache/throughput/throttle.json`). It holds model calls made by
+  Hermes processes on that root only (`scope` names the gateway). It is not sent to other machines: the Board's
+  machine registry rejects fields it does not know, so a fleet-wide level needs a Board + core change.
+- **Enforcement** (`throttle.py`): an `llm_execution` middleware. While the fleet rate (mean of the sampled minutes
+  among the last three) is above the cap, a main-loop model call waits and re-checks every 5 s; at 100 % every such call waits until
+  the level is lowered. Auxiliary calls that bypass core's execution middleware (titles, compression ...) are not
+  held. The 7-day reference is cached for 10 minutes per process. Rates are sampled once a minute, so the control lags by about a minute and duty-cycles around
+  the cap. A wait is not interruptible and records no agent activity: a Kanban worker held for long can be reclaimed as
+  stalled, and a gateway turn held past `agent.gateway_timeout` is abandoned by the gateway's idle watchdog. Fail open:
+  an unreadable level, a missing series db or a failed read never holds a call. A core without `register_middleware`
+  shows the slider but enforces nothing. Untested: the middleware inside a live core agent loop (the tests call the
+  registered callback directly).
+- **Runway** (`runway.py`): per subscription pool, from the usage samples core's Kanban pacing governor keeps in
+  `llm_pacing.json` (no usage request is made): `remaining_pct` (sum of `100 - used` over the accounts' weekly
+  windows), `burn_pct_per_h` (each account's slope over the last 10-60 minutes), `runway_s = remaining / burn`
+  (`null` when nothing burns) and `next_reset_at` (the earliest weekly reset). Resets are not folded into the
+  runway. Account names are not returned. A host without the governor's file reports no pools, and a provider
+  whose newest sample is over 30 minutes old is left out.
+
+The Desktop panel shows the slider under Tokens, the cap as a red line on the Tokens chart (hidden with `+cache` or
+a legend filter, which the in+out fleet cap cannot be compared with) and one runway line per pool, rescaled by
+`cap / rate` when the cap is under the measured rate.
+
 ## Sampler
 
 `register()` starts a sampler thread in long-lived server processes only (`hermes gateway`, `hermes serve`,
