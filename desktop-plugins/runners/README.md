@@ -46,7 +46,7 @@ orange), "–" (hover: "load not reported") until the machine's core has the rep
 CI machines show load and free disk only when the runners collector probes their host (no RAM there); the
 others have no meter line.
 
-Slot styles: filled = busy, outline = free, dotted = offline/unknown, hatched = draining (registry `hold`; a held machine with nothing running that the Board has not seen for 10 min is labelled "stopped" instead, with dotted slots),
+Slot styles: filled = busy, outline = free, dotted = offline/unknown, hatched = draining (registry `hold`; a held machine with nothing running that the Board has not seen for 10 min is "stopped": it has no row and no slots in any total, only its name in the "N off: ..." line under the grid),
 red = lost (machine holds cards but the Board has not seen it for 10 min). An asleep machine with nothing
 running is grey with "not seen for N min". A section the gateway cannot read says Unknown/Stale with the reason.
 

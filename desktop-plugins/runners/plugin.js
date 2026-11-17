@@ -407,7 +407,8 @@ export function ago(ms) {
 const isHub = (m) => m.name === 'hub' || (m.labels || []).includes('machine:hub')
 
 export function summarize(view) {
-  const g = view.gateways.machines || [], c = view.ci.machines || []
+  // A stopped machine (held and off) has no capacity: it is left out of every slot total.
+  const g = (view.gateways.machines || []).filter((m) => m.state !== 'stopped'), c = view.ci.machines || []
   const gBusy = g.reduce((n, m) => n + m.running.length, 0)
   const gSlots = g.reduce((n, m) => n + (m.slots ?? m.running.length), 0)
   const slots = c.flatMap((m) => m.slots)
@@ -508,9 +509,9 @@ function GatewayRow({ m, now }) {
   const free = m.slots == null ? 0 : Math.max(0, m.slots - m.running.length)
   const freeState = m.state === 'active' ? 'idle' : m.state === 'draining' ? 'draining' : 'unknown'
   const v = loadParts(m.load, now)
-  // A held machine: 'draining' while it is still up or still holds a card, 'stopped' once it is off.
-  const held = m.state === 'draining' || m.state === 'stopped'
-  const holdTail = m.state === 'stopped' ? `machine is off (${text(m.reason)})` : 'finishes running cards, takes no new ones'
+  // A held machine that is still up or still holds a card. Once it is off ('stopped') it has no row: StoppedNote.
+  const held = m.state === 'draining'
+  const holdTail = 'finishes running cards, takes no new ones'
   const drainNote = held
     ? m.hold_reason === undefined
       ? `${m.state}: reason unavailable (dashboard older than hold metadata); ${holdTail}`
@@ -693,8 +694,21 @@ function SectionNote({ section }) {
   return h('div', { className: 'hermes-fleet-note', role: 'status' }, msg)
 }
 
+// Machines that were shut down on purpose get one line under the grid, not a row each: a row of
+// dotted slots and hours-old CPU/RAM numbers for a machine that is off reads as "still there".
+function StoppedNote({ machines, now }) {
+  if (!machines.length) return null
+  return h('div', { className: 'hermes-fleet-note hermes-fleet-stopped', 'data-stopped': machines.length },
+    `${machines.length} off: `,
+    ...machines.flatMap((m, i) => [i ? ', ' : null, h('span', {
+      key: m.name, 'data-machine': m.name,
+      title: `stopped: ${m.hold_reason ? text(m.hold_reason) : 'no reason recorded'} (held by ${m.hold_owner ? text(m.hold_owner) : m.hold_by ? text(m.hold_by) : 'unknown'}, ${typeof m.hold_at === 'number' ? ago(now - m.hold_at) : 'time unknown'}); machine is off (${text(m.reason)})`
+    }, text(m.name))]))
+}
+
 export function Panel({ view, now, repairClient }) {
   const s = summarize(view)
+  const stopped = view.gateways.machines.filter((m) => m.state === 'stopped')
   return h('div', { className: 'hermes-fleet' },
     h('div', { className: 'hermes-fleet-head' },
       h('span', null, 'Gateway workers'),
@@ -703,7 +717,8 @@ export function Panel({ view, now, repairClient }) {
     h(SectionNote, { section: view.gateways }),
     h('div', { className: 'hermes-fleet-gw' },
       h(GatewayHead),
-      ...view.gateways.machines.map((m) => h(GatewayRow, { key: m.name, m, now }))),
+      ...view.gateways.machines.filter((m) => m.state !== 'stopped').map((m) => h(GatewayRow, { key: m.name, m, now }))),
+    h(StoppedNote, { machines: stopped, now }),
     h('div', { className: 'hermes-fleet-head' },
       h('span', null, 'CI workers (GitHub Actions)'),
       h('span', null, `${s.cBusy} / ${s.cSlots} busy${s.cOffline ? ` · ${s.cOffline} offline` : ''}`)),
@@ -861,7 +876,7 @@ button.hermes-fleet-slot{cursor:pointer}
 .hermes-fleet-slot.is-offline,.hermes-fleet-slot.is-unknown{border-style:dotted;opacity:.6}
 .hermes-fleet-slot.is-draining{background:repeating-linear-gradient(45deg,transparent 0 2px,var(--ui-text-tertiary) 2px 3px)}
 .hermes-fleet-slot.is-lost{background:#d64545;border-color:#d64545}
-.hermes-fleet-row.is-asleep .hermes-fleet-name,.hermes-fleet-row.is-stopped .hermes-fleet-name,.hermes-fleet-row.is-unknown .hermes-fleet-name{color:var(--ui-text-tertiary)}
+.hermes-fleet-row.is-asleep .hermes-fleet-name,.hermes-fleet-row.is-unknown .hermes-fleet-name{color:var(--ui-text-tertiary)}
 `
 
 export default {
