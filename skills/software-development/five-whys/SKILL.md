@@ -42,7 +42,10 @@ two-line chain; an outage gets the full write-up.
 ### 0. Establish scope and the evidence gate
 
 **By default the analysis ends in a fix.** When the user has standing approval to fix and ship (David does), fixing what
-the chain finds is in scope (step 6). Never end on the diagnosis alone. Diagnosis-only applies only when the task or the
+the chain finds is in scope (step 6). Never end on the diagnosis alone. That default starts after the answer: a plain
+explain/status question in a live chat ("what is this session doing?", "why isn't it done?") gets its answer first,
+in text, from what you already know; investigation or fixing follows as a stated next step (the coach `answer_first`
+rule refuses further tool calls when the answer is overdue or the user says stop). Diagnosis-only applies only when the task or the
 user explicitly limits you to it ("analysis only", "diagnose, don't change anything", a read-only or diagnosis-only
 card). In that case, inspect and recheck independently, but don't change services, jobs, storage or credentials.
 A passing `--dry-run` does not clear the failing path, because dry-run branches usually return before the

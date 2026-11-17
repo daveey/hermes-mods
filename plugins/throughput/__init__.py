@@ -9,13 +9,22 @@ log = logging.getLogger("hermes.plugins.throughput")
 
 
 def _register_throttle(ctx):
-    """Every Hermes process on this root holds its model calls while the throttle says so (throttle.py)."""
+    """Every Hermes process on this root holds its model calls while the fleet's throttle says so (throttle.py)."""
     register_middleware = getattr(ctx, "register_middleware", None)
     if not callable(register_middleware):
         return  # an older core without middleware: the throttle is display-only there
     from . import sampler, throttle
     root = sampler.hermes_root()
-    register_middleware("llm_execution", throttle.Gate(root, sampler.series_path(root)).middleware)
+    gate = throttle.Gate(root, sampler.series_path(root), hub_db=throttle.hub_db_path())
+    register_middleware("llm_execution", gate.middleware)
+    register_hook = getattr(ctx, "register_hook", None)
+    # Not in a long-lived server process: core fires this hook synchronously for async callers too, so a hold
+    # there would freeze the server's event loop, and with it the panel route that lowers the level.
+    if callable(register_hook) and not sampler.eligible_process():
+        try:
+            register_hook("pre_auxiliary_call", gate.aux_hold)
+        except Exception:  # a core without that hook: auxiliary calls are not held there
+            log.info("throughput: this core has no pre_auxiliary_call hook; auxiliary calls are not throttled")
 
 
 def register(ctx):

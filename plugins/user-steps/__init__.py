@@ -522,6 +522,17 @@ def _publish_nudges(turn_messages: Any) -> int:
                and m.get('_pre_final_gate_synthetic') and PUBLISH_NUDGE in str(m.get('content') or ''))
 
 
+# coach answer_first refuses every tool of a turn whose user said "stop"/"answer my question" (self-heal
+# agent-e9ebbbb4cd). Such a turn cannot publish action_request: holding for it only delays the answer, and at the
+# budget NOT_READY replaced it outright (hub live probe, t_01a1e9a61bf16b6f).
+STOP_TURN_MARK = '[coach answer_first] The user told you to stop'
+
+
+def _tools_refused(turn_messages: Any) -> bool:
+    return any(isinstance(m, dict) and m.get('role') == 'tool' and STOP_TURN_MARK in str(m.get('content') or '')
+               for m in turn_messages or ())
+
+
 def open_ask_hold(session_id, final_response, open_asks, unmapped, relay, store, owner, attempt, hold_budget,
                   turn_messages, candidates=None):
     """Hold once only for asks publication would currently allow to mint new tiles."""
@@ -629,6 +640,9 @@ def publication_buffer(session_id='', platform='', final_response='', attempt=0,
 
     if all(covered(hit) for s, hit in hits if s.get('kind') == 'approve'):
         return held
+    if _tools_refused(turn_messages):
+        # The user said stop: no tool may run, so show the answer and say plainly that it requests nothing.
+        return {'append': NO_REQUEST_NOTE}
     if attempt >= hold_budget:
         if _publish_nudges(turn_messages) < hold_budget:
             # Core's exhaustion boundary reached without this hook spending its holds: the iteration cap's

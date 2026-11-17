@@ -58,33 +58,64 @@ gateway only; cards cover every gateway.
 
 ## Throttle and runway
 
-`GET /v1/throttle` returns `{percent, reference_per_s, cap_per_s, rate_per_s, holding, scope, pools, now}`;
-`PUT /v1/throttle` with `{"percent": 0..100}` sets the level; any other `percent` is a 400 and a body that is not
-a JSON object a 422, and neither changes anything.
+`GET /v1/throttle` returns `{percent, reference_per_s, cap_per_s, rate_per_s, holding, set_at, set_by, scope, fleet,
+gateways, pools, now}`; `PUT /v1/throttle` with `{"percent": 0..100}` sets the level; any other `percent` is a 400
+and a body that is not a JSON object a 422, and neither changes anything.
 
 - **Level**: 0 = no cap, 100 = a cap of zero, between = `(1 - percent/100) x reference_per_s`, where the reference is
-  the peak fleet in+out token rate over the last 7 days in 15-minute buckets. Without any sampled minute there is no
-  reference and a level between 1 and 99 caps nothing.
-- **Scope**: the level is a file in this Hermes root (`cache/throughput/throttle.json`). It holds model calls made by
-  Hermes processes on that root only (`scope` names the gateway). It is not sent to other machines: the Board's
-  machine registry rejects fields it does not know, so a fleet-wide level needs a Board + core change.
+  the peak fleet in+out token rate over the last 24 hours in 15-minute buckets, measured on the gateway that takes
+  the setting. The cap is stored in tokens/s with the level, so it stays where it was set while the peak moves, and
+  every gateway enforces the same number. Without any sampled minute there is no reference and a level between 1
+  and 99 caps nothing.
+- **Scope: the fleet.** The level is written to `cache/throughput/throttle.json` on the gateway whose panel set it.
+  The hermes-hub link (client 1.9.51 or newer) publishes that file in the gateway's `gateway/info` record and every
+  gateway keeps a replica of the others' records (`~/.local/state/hermes-hub/hub.db`), so each gateway reads every
+  published level and obeys the newest `set_at` (`set_by` names the gateway that set it; `null` = this one). Stamps are stored and compared at millisecond precision, the precision the link publishes. A level
+  stamped more than 5 minutes ahead of this gateway's clock is ignored until that time comes (gateways are
+  expected to keep NTP time; a level set under a badly wrong clock can outrank later ones). It arrives within the
+  link's sync periods: the setter's next full collect (up to 3 minutes) plus the receiver's next pull (about a
+  minute). Each gateway acknowledges the level it obeys in `throttle-seen.json` (once a minute, from
+  the sampler) and the link publishes that too: `gateways` lists this gateway and every gateway whose link record
+  is under 30 minutes old, with `seen` true once it acknowledged the current `set_at`. `fleet` is false on a host
+  without the link's replica: the level then applies to `scope`, this gateway, alone. A gateway that does not run
+  this plugin is not throttled and shows `seen: false`. A gateway with the plugin but an older link client obeys
+  published levels, but cannot publish a level set on it or its acknowledgement (`seen: false`). Only a gateway
+  whose server process runs the sampler acknowledges. A gateway that cannot read its replica obeys its own
+  stored level until it can; the fleet's level is the setter's `cache/throughput/throttle.json`, so clearing that
+  file drops the setting.
 - **Enforcement** (`throttle.py`): an `llm_execution` middleware. While the fleet rate (mean of the sampled minutes
-  among the last three) is above the cap, a main-loop model call waits and re-checks every 5 s; at 100 % every such call waits until
-  the level is lowered. Auxiliary calls that bypass core's execution middleware (titles, compression ...) are not
-  held. The 7-day reference is cached for 10 minutes per process. Rates are sampled once a minute, so the control lags by about a minute and duty-cycles around
-  the cap. A wait is not interruptible and records no agent activity: a Kanban worker held for long can be reclaimed as
-  stalled, and a gateway turn held past `agent.gateway_timeout` is abandoned by the gateway's idle watchdog. Fail open:
-  an unreadable level, a missing series db or a failed read never holds a call. A core without `register_middleware`
-  shows the slider but enforces nothing. Untested: the middleware inside a live core agent loop (the tests call the
-  registered callback directly).
+  among the last three, from this gateway's own sampler) is above the cap, a model call waits and re-checks every
+  5 s; at 100 % every such call waits until the level is lowered. A gateway whose sampler has no minute yet holds
+  only at 100 %. The 24-hour reference is cached for 10 minutes per process. Rates are sampled once a minute, so
+  the control lags by about a minute and duty-cycles around the cap.
+- **A held turn stays alive.** Core gives middleware no activity API, so the gate finds the agent behind the call it
+  wraps (the closure of core's `_perform_api_call`) and stamps its activity clock every poll, as core's own offline
+  wait does: the gateway's idle watchdog and the turn liveness watchdog see a waiting turn, and a Kanban card's
+  claim is renewed. A stop request ends the wait at the next poll and hands the call to core's own interrupt
+  handling. On a core where that closure looks different the wait runs without those reports (a card still renews
+  its claim through `tools.kanban_tools`), and a long hold can then be reaped as stalled.
+- **Auxiliary calls** (titles, compression, vision ...) do not pass the execution middleware. In card runs and
+  other short-lived agent processes they wait in the `pre_auxiliary_call` hook. Core bounds a hook callback at
+  600 s, so a held auxiliary call goes ahead after 540 s at the latest, and core runs one bounded callback per turn
+  at a time, so parallel auxiliary calls of one turn pass while one waits: at 100 % auxiliary traffic there is
+  slowed, not stopped. In long-lived server processes (gateway, Desktop serve, dashboard) auxiliary calls are not
+  held at all: core fires the hook synchronously for async callers, and a hold would freeze the server's event
+  loop, including the route that lowers the level. The dispatcher's admission judge (`hub_admission`) is never
+  held, and neither is the max-iterations summary, which calls the provider directly.
+- **Fail open**: an unreadable level, a missing series db or replica, or a failed read never holds a call. A core
+  without `register_middleware` shows the slider but enforces nothing.
+- **Not covered by tests**: the middleware and the hook inside a live core agent loop (the tests call the registered
+  callbacks with a stand-in for core's call closure), and the hub link round trip between two real hosts.
 - **Runway** (`runway.py`): per subscription pool, from the usage samples core's Kanban pacing governor keeps in
   `llm_pacing.json` (no usage request is made): `remaining_pct` (sum of `100 - used` over the accounts' weekly
   windows), `burn_pct_per_h` (each account's slope over the last 10-60 minutes), `runway_s = remaining / burn`
   (`null` when nothing burns) and `next_reset_at` (the earliest weekly reset). Resets are not folded into the
   runway. Account names are not returned. A host without the governor's file reports no pools, and a provider
-  whose newest sample is over 30 minutes old is left out.
+  whose newest sample is over 30 minutes old is left out. `pacing` is the governor's own verdict for the pool
+  (`open`, `paced`, `held`; `pacing_until` for a hold's known end): with `paced` or `held`, Kanban starts fewer or
+  no cards on that pool whatever the throttle level is, and the panel says so on the pool's line.
 
-The Desktop panel shows the slider under Tokens, the cap as a red line on the Tokens chart (hidden with `+cache` or
+The Desktop panel shows the slider under Tokens ("applies to all gateways · 3 of 4 have this level"), the cap as a red line on the Tokens chart (hidden with `+cache` or
 a legend filter, which the in+out fleet cap cannot be compared with) and one runway line per pool, rescaled by
 `cap / rate` when the cap is under the measured rate.
 

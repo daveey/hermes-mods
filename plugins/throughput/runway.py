@@ -14,6 +14,10 @@ Per provider, over the weekly (``seven_day``) windows of its accounts:
 * ``runway_s``: ``remaining / burn``; None when nothing is burning. It ignores resets: compare it with
   ``next_reset_at`` (the earliest weekly reset of any account) to see which comes first.
 
+* ``pacing``: the governor's own verdict for the pool (``open``, ``paced``, ``held``; None when it stored none).
+  ``paced`` and ``held`` mean Kanban is starting fewer (or no) cards on that pool whatever the throttle says, so
+  the panel can show why the fleet is idle with the throttle off. ``pacing_until`` is a hold's known end.
+
 Account names never leave this module.
 """
 from __future__ import annotations
@@ -29,6 +33,7 @@ RATE_WINDOW_S = 3600
 MIN_SPAN_S = 600
 SAME_RESET_S = 600
 EXHAUSTED_PCT = 99.0
+PACING_STATES = ("open", "paced", "held")
 
 
 def pacing_path(root: Path) -> Path:
@@ -62,6 +67,14 @@ def _burn(latest, history) -> float:
     return max(0.0, (used - oldest[3]) / (ts - oldest[0]))
 
 
+def _pacing(entry) -> dict:
+    pace = entry.get("pace") if isinstance(entry, dict) else None
+    state = pace.get("state") if isinstance(pace, dict) else None
+    until = pace.get("until") if isinstance(pace, dict) else None
+    known = isinstance(until, (int, float)) and not isinstance(until, bool)
+    return {"pacing": state if state in PACING_STATES else None, "pacing_until": float(until) if known else None}
+
+
 def provider_runway(provider: str, entry, now: float) -> Optional[dict]:
     rows = [r for r in _rows(entry) if r[2] == WEEKLY]
     if not rows:
@@ -85,6 +98,7 @@ def provider_runway(provider: str, entry, now: float) -> Optional[dict]:
         "runway_s": round(remaining / burn) if burn > 0 else None,
         "next_reset_at": min(resets) if resets else None,
         "read_at": newest,
+        **_pacing(entry),
     }
 
 

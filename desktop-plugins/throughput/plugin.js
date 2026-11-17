@@ -161,7 +161,7 @@ export function chipNumbers(payload, view) {
 export const THROTTLE_RED = '#ef4444'
 const POOL_NAMES = { anthropic: 'Claude', 'openai-codex': 'GPT', 'xai-oauth': 'Grok' }
 
-// The cap as a rate in the chosen unit; null = no cap (0 %, or no 7-day peak to scale yet).
+// The cap as a rate in the chosen unit; null = no cap (0 %, or no 24-hour peak to scale yet).
 export function capRate(throttle, unit) {
   const c = throttle?.cap_per_s
   return c == null || !Number.isFinite(c) ? null : c * UNIT_S[unit]
@@ -195,16 +195,42 @@ export function runwayText(pool, throttle) {
   const left = `${fmt(pool.remaining_pct)}% left`
   const reset = pool.next_reset_at ? `, next reset ${timeLabel(pool.next_reset_at, '7d')}` : ''
   const scale = burnScale(throttle)
-  if (pool.runway_s == null) return `${name}: ${left}, not burning${reset}`
-  if (scale === 0) return `${name}: ${left}, paused by the throttle${reset}`
-  return `${name}: ${left}, empty in ${fmtDuration(pool.runway_s / scale)} at ${scale < 1 ? 'the cap' : 'this rate'}${reset}`
+  const pacing = pacingText(pool)
+  if (pool.runway_s == null) return `${name}: ${left}, not burning${reset}${pacing}`
+  if (scale === 0) return `${name}: ${left}, paused by the throttle${reset}${pacing}`
+  return `${name}: ${left}, empty in ${fmtDuration(pool.runway_s / scale)} at ${scale < 1 ? 'the cap' : 'this rate'}${reset}${pacing}`
+}
+
+// The quota governor's own limit on the pool: it holds card starts whatever the throttle level is.
+export function pacingText(pool) {
+  if (pool?.pacing === 'paced') return ' \u00b7 quota pacing is limiting card starts'
+  if (pool?.pacing !== 'held') return ''
+  return ` \u00b7 quota pacing holds card starts${pool.pacing_until ? ` until ${timeLabel(pool.pacing_until, '7d')}` : ''}`
+}
+
+// Where the level applies: the whole fleet through the hub link (with how many running gateways have acknowledged
+// the current setting), or this gateway alone on a host without the link.
+export function scopeText(throttle) {
+  if (!throttle) return ''
+  if (!throttle.fleet) return throttle.scope ? `applies to ${throttle.scope} only` : ''
+  const all = throttle.gateways || []
+  if (throttle.set_at == null || !all.length) return 'applies to all gateways'
+  return `applies to all gateways \u00b7 ${all.filter((g) => g.seen).length} of ${all.length} have this level`
+}
+
+export function scopeTitle(throttle) {
+  if (!throttle?.fleet) return 'This host has no hub link, so the level stays on this gateway.'
+  const waiting = (throttle.gateways || []).filter((g) => !g.seen).map((g) => g.name)
+  const by = throttle.set_by ? `Set on ${throttle.set_by}. ` : ''
+  const lag = 'A new level reaches each gateway through the hub link within a few minutes.'
+  return `${by}${lag}${waiting.length && throttle.set_at != null ? ` Not acknowledged yet: ${waiting.join(', ')}.` : ''}`
 }
 
 export function throttleText(throttle, unit) {
   const p = Math.round(throttle?.percent ?? 0)
   if (p <= 0) return 'Throttle off'
   const cap = capRate(throttle, unit)
-  if (cap == null) return `Throttle ${p}% \u00b7 no cap yet (no 7-day peak to scale)`
+  if (cap == null) return `Throttle ${p}% \u00b7 no cap yet (no 24-hour peak to scale)`
   return `Throttle ${p}% \u00b7 cap ${fmt(cap)} tok/${unit}${throttle?.holding ? ' \u00b7 holding calls' : ''}`
 }
 
@@ -330,7 +356,7 @@ export function ThrottleRow({ throttle, draft, setDraft, onCommit, unit, error }
         onChange: (e) => setDraft(Number(e.target.value)), onPointerUp: commit, onKeyUp: commit, onBlur: commit
       }),
       h('span', { className: 'hermes-tp-ttext', 'data-throttle': String(percent) }, throttleText(shown, unit)),
-      throttle?.scope ? h('span', { className: 'hermes-tp-lbl', title: 'The level is stored on this gateway and holds model calls made by Hermes processes on it. Other machines do not receive it.' }, `applies to ${throttle.scope}`) : null),
+      scopeText(throttle) ? h('span', { className: 'hermes-tp-lbl', 'data-scope': throttle?.fleet ? 'fleet' : 'local', title: scopeTitle(throttle) }, scopeText(throttle)) : null),
     error ? h('div', { className: 'hermes-tp-note', role: 'alert' }, `Throttle not saved: ${error}`) : null,
     (throttle?.pools || []).map((p) => h('div', { key: p.provider, className: 'hermes-tp-runway', 'data-pool': p.provider }, runwayText(p, shown))))
 }

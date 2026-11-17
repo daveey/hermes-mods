@@ -1,5 +1,5 @@
 """GET /api/plugins/throughput/v1/series?range=1h|6h|24h|7d[&by=gateway|model] (see ../series.py for the payload).
-GET / PUT /api/plugins/throughput/v1/throttle: the token throttle level of this Hermes root (../throttle.py) and the
+GET / PUT /api/plugins/throughput/v1/throttle: the fleet's token throttle level (../throttle.py) and the
 subscription pools' runway (../runway.py). PUT body ``{"percent": 0..100}``.
 
 Loaded by path by the dashboard, outside its package: the plugin package is imported under a private name.
@@ -117,17 +117,21 @@ async def get_series(range: str = Query("6h"), by: str = Query("gateway")) -> Di
 
 
 def throttle_payload(now: float | None = None) -> Dict[str, Any]:
-    """Level, cap and measured rate (tokens/s, in+out) of this root, plus each pool's runway. ``scope`` names the
-    gateway the level applies to: it is not distributed to other machines."""
+    """Level, cap and measured rate (tokens/s, in+out) the fleet obeys, plus each pool's runway. ``fleet`` is false
+    on a host without the hermes-hub link (the level then applies to ``scope``, this gateway, alone);
+    ``gateways`` lists this and every running gateway with whether it has acknowledged the current level."""
     sampler, _ = _services()
     import importlib
     throttle = importlib.import_module(pkg().__name__ + ".throttle")
     runway = importlib.import_module(pkg().__name__ + ".runway")
     root = _state["root"]
     now = time.time() if now is None else now
-    out = throttle.status(root, sampler.series_path(root), now)
+    hub_db = throttle.hub_db_path()
+    out = throttle.status(root, sampler.series_path(root), now, hub_db)
     reg = _registry()
     out["scope"] = (reg or {}).get("me") or _state["store"].get_meta("me") or "local"
+    out["fleet"] = hub_db.is_file()
+    out["gateways"] = throttle.gateways(root, hub_db, now, out["scope"])
     out["pools"] = runway.pools(runway.pacing_path(root), now)
     out["now"] = now
     return out
@@ -136,9 +140,14 @@ def throttle_payload(now: float | None = None) -> Dict[str, Any]:
 def set_throttle(percent: Any) -> Dict[str, Any]:
     if isinstance(percent, bool) or not isinstance(percent, (int, float)) or not 0 <= percent <= 100:
         raise ValueError("percent must be a number from 0 to 100")
-    _services()
+    sampler, _ = _services()
     import importlib
-    importlib.import_module(pkg().__name__ + ".throttle").write_level(_state["root"], percent)
+    throttle = importlib.import_module(pkg().__name__ + ".throttle")
+    root, hub_db, now = _state["root"], throttle.hub_db_path(), time.time()
+    # Stamp it after the level in force, so a gateway whose clock runs ahead cannot outrank this newer setting.
+    stamp = max(now, throttle.effective(root, hub_db, now)["set_at"] + 0.002)  # 2 ms: stamps round to 1 ms
+    throttle.write_level(root, percent, stamp, throttle.reference_rate(sampler.series_path(root), now))
+    throttle.note_seen(root, hub_db, stamp)
     return throttle_payload()
 
 

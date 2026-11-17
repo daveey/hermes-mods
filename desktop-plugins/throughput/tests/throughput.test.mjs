@@ -406,7 +406,7 @@ test('model request failure leaves gateway chip and session/card charts usable',
   } finally { await ui.close(); localStorage.clear() }
 })
 
-// Throttle fixture: 7-day peak 20 tok/s (1200/m); level 75 % caps at 5 tok/s (300/m); the hub chart peaks at 600/m.
+// Throttle fixture: 24-hour peak 20 tok/s (1200/m); level 75 % caps at 5 tok/s (300/m); the hub chart peaks at 600/m.
 const throttle = (over = {}) => ({
   percent: 75, reference_per_s: 20, cap_per_s: 5, rate_per_s: 10, holding: true, scope: 'hub', now: END,
   pools: [
@@ -422,7 +422,7 @@ test('throttle maths: cap per unit, live preview, burn scale, durations and labe
   assert.equal(P.capRate(throttle({ cap_per_s: null }), 'm'), null)
   assert.equal(P.capRate(null, 'm'), null)
   assert.equal(P.capRate(throttle({ cap_per_s: 0 }), 'h'), 0)
-  // preview: 0 = no cap, 100 = zero, between = (1 - p) x the 7-day peak; no peak = no cap
+  // preview: 0 = no cap, 100 = zero, between = (1 - p) x the 24-hour peak; no peak = no cap
   assert.equal(P.previewThrottle(throttle(), 0).cap_per_s, null)
   assert.equal(P.previewThrottle(throttle(), 100).cap_per_s, 0)
   assert.equal(P.previewThrottle(throttle(), 50).cap_per_s, 10)
@@ -448,6 +448,29 @@ test('throttle maths: cap per unit, live preview, burn scale, durations and labe
   assert.match(P.runwayText(gpt, throttle()), /^GPT: 122% left, empty in 40\.7 h at the cap, next reset /)
   assert.match(P.runwayText(gpt, throttle({ cap_per_s: 0 })), /^GPT: 122% left, paused by the throttle/)
   assert.equal(P.runwayText(claude, throttle()), 'Claude: 0% left, not burning')
+  // the quota governor's verdict rides on the line: it limits card starts whatever the throttle level is
+  assert.equal(P.pacingText(gpt), '')
+  assert.equal(P.pacingText({ pacing: 'open' }), '')
+  assert.equal(P.runwayText({ ...claude, pacing: 'paced' }, throttle()), 'Claude: 0% left, not burning · quota pacing is limiting card starts')
+  assert.equal(P.pacingText({ pacing: 'held' }), ' · quota pacing holds card starts')
+  assert.match(P.runwayText({ ...gpt, pacing: 'held', pacing_until: 1794960000 }, throttle({ cap_per_s: null })), /at this rate, next reset .* · quota pacing holds card starts until \S+ \d\d:\d\d$/)
+})
+
+test('throttle scope: the fleet with an acknowledgement count, or this gateway alone without the hub link', () => {
+  const fleet = (over = {}) => throttle({
+    fleet: true, set_at: END - 60, set_by: null,
+    gateways: [{ name: 'hub', seen: true }, { name: 'mini', seen: false }, { name: 'worker-1', seen: true }], ...over
+  })
+  assert.equal(P.scopeText(fleet()), 'applies to all gateways · 2 of 3 have this level')
+  assert.match(P.scopeTitle(fleet()), /Not acknowledged yet: mini\.$/)
+  assert.match(P.scopeTitle(fleet({ set_by: 'macbook' })), /^Set on macbook\. /)
+  assert.equal(P.scopeText(fleet({ set_at: null })), 'applies to all gateways')  // never set: nothing to acknowledge
+  assert.doesNotMatch(P.scopeTitle(fleet({ set_at: null })), /Not acknowledged/)
+  assert.doesNotMatch(P.scopeTitle(fleet({ gateways: [{ name: 'hub', seen: true }] })), /Not acknowledged/)
+  assert.equal(P.scopeText(throttle()), 'applies to hub only')  // an older backend, or a host without the link
+  assert.match(P.scopeTitle(throttle()), /no hub link/)
+  assert.equal(P.scopeText(throttle({ fleet: false, scope: undefined })), '')
+  assert.equal(P.scopeText(null), '')
 })
 
 const withThrottle = (state) => (path) => (path === '/v1/throttle' ? state.value : forRange(path))
@@ -479,6 +502,7 @@ test('panel: red cap line on Tokens only, slider at the level, runway per pool',
     assert.equal(slider.value, '75')
     assert.match(document.querySelector('[data-slot="throttle"]').textContent, /Throttle 75% · cap 300 tok\/m · holding calls/)
     assert.match(document.querySelector('[data-slot="throttle"]').textContent, /applies to hub/)
+    assert.equal(document.querySelector('[data-scope]').dataset.scope, 'local')
     assert.match(document.querySelector('[data-pool="openai-codex"]').textContent, /^GPT: 122% left, empty in 40\.7 h at the cap/)
     assert.equal(document.querySelector('[data-pool="anthropic"]').textContent, 'Claude: 0% left, not burning')
     // the line follows the unit switch: 5 tok/s on a 10 tok/s peak is still half way

@@ -34,6 +34,21 @@ def test_pool_runway_hand_computed(tmp_path):
     assert pool["runway_s"] == round(122 / burn_per_s)  # 73 200 s = 20 h 20 min
     assert pool["next_reset_at"] == reset_c and pool["read_at"] == NOW
     assert "example.com" not in json.dumps(pool)  # account names never leave the module
+    assert pool["pacing"] is None and pool["pacing_until"] is None  # the governor stored no verdict
+
+
+def test_pool_carries_the_governors_verdict(tmp_path):
+    row = [NOW, "a@example.com", "seven_day", 90.0, NOW + 86400]
+    path = _write(tmp_path, {
+        "anthropic": {"samples": [row], "pace": {"state": "paced", "factor": 0.04, "until": None}},
+        "openai-codex": {"samples": [row], "pace": {"state": "held", "until": NOW + 7200}},
+        "xai-oauth": {"samples": [row], "pace": {"state": "open", "until": True}},  # a bool is not a time
+        "other": {"samples": [row], "pace": {"state": "nonsense"}},
+        "bare": {"samples": [row], "pace": "paced"},
+    })
+    got = {p["provider"]: (p["pacing"], p["pacing_until"]) for p in R.pools(path, NOW)}
+    assert got == {"anthropic": ("paced", None), "openai-codex": ("held", NOW + 7200), "xai-oauth": ("open", None),
+                   "other": (None, None), "bare": (None, None)}
 
 
 def test_no_burn_means_no_runway_and_resets_do_not_count_as_burn(tmp_path):

@@ -169,6 +169,20 @@ per turn itself, the repeat logged `live_chat_sleep_repeat`. Origin: self-heal a
 (one early interim line, ~25 tool calls, then a foreground `sleep 200; … ship` after a quota brake, and "why are you
 not answering me"). Tests: `tests/test_live_chat_sleep.py`.
 
+## Answer first (stop demand, plain question)
+
+`answer_first.py` classifies the live user's own message at `pre_llm_call` (notices, `[System note…]` and compaction
+rows are not his words; Desktop's `[Turn stopped…]` prefix is stripped):
+- **stop**: a demand to stop acting or just answer ("stop", "stop doing things", "answer my question", "just answer")
+  with no new action asked for ("stop the gateway", "stop and revert that" are actions). `pre_tool_call` refuses
+  every tool call of that turn (`agent_block rule=answer_first kind=stop`): reply in text from what you know.
+- **question**: an explain/why/what/status question with no action verb in imperative position ("i asked to set up
+  X" is narration; "can you set up X?" is a request). Reads are fine; after 6 calls or 120 s with no text to the user
+  the next call is refused once (`kind=question`), the repeat goes through (`answer_first_repeat`).
+Quiet for cron, Kanban workers, subagents; `COACH_ANSWER_FIRST=0` disables. Origin: self-heal agent-e9ebbbb4cd (an
+"explain what this session is doing" got 13 silent calls, and after "STOP DOING THINGS< ANSWER MY … QUESTION" two more,
+one filing an approval request). Tests: `tests/test_answer_first.py`.
+
 ## Traceback attribution
 
 Bug detection decodes JSON tool envelopes before inspecting frame paths and exception tails.

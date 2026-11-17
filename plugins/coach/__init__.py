@@ -489,6 +489,12 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
         except Exception as exc:
             wait_turns.pop(session_id, None)  # unknown turn: the rule stays quiet
             log.debug("coach long_wait turn: %s", exc)
+            return
+        try:  # stop/answer demand or plain question: answer before more tool work (answer_first.py)
+            _load("answer_first").arm(wait_turns, session_id, rules.request_text(user_message),
+                                      wait_turns[session_id]["live"])
+        except Exception as exc:
+            log.debug("coach answer_first turn: %s", exc)
 
     def on_interim_message(session_id="", text="", **_):
         coach.hint_report(session_id, text)
@@ -513,6 +519,14 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                 return {"action": "block", "message": steer.MESSAGE}
         except Exception as exc:
             log.debug("coach steer_receipt_guard: %s", exc)
+        try:  # the live user said stop/answer, or a question has waited too long (answer_first.py)
+            msg = _load("answer_first").check(wait_turns, session_id, tool_name, args, store.log,
+                                              persisted_reply=_load("long_wait").persisted_reply)
+        except Exception as exc:
+            log.debug("coach answer_first: %s", exc)
+            msg = None
+        if msg:
+            return {"action": "block", "message": msg}
         msg = _future_clock(session_id, tool_name, args)
         if msg:
             return {"action": "block", "message": msg}
