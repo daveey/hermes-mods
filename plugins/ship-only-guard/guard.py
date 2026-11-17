@@ -1557,7 +1557,8 @@ def _dynamic_targets(closure):
     def opaque_binding(node, identifier):
         """Bindings not represented by assignment targets; shared by both resolution paths."""
         if isinstance(node, ast.alias):
-            return (node.asname or node.name.split('.')[0]) == identifier
+            # Wildcard exports can overwrite any existing literal binding.
+            return node.name == "*" or (node.asname or node.name.split('.')[0]) == identifier
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             return node.name == identifier
         if type(node).__name__ in {"ExceptHandler", "MatchAs", "MatchStar"}:

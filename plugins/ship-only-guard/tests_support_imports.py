@@ -505,6 +505,35 @@ def test_pattern_rebound_nonparameter_stays_shared(monkeypatch, tmp_path, local,
     assert why and "shared ~ tests/placement_support.py" in why
 
 
+@pytest.mark.parametrize('star', [True, False])
+def test_wildcard_binding_invalidates_loader_literal(monkeypatch, tmp_path, star):
+    import subprocess
+    import sys
+
+    text = ('from importlib import import_module\nname = "json"\n'
+            + ('from bridge import *\n' if star else 'import bridge\n')
+            + ('assert import_module(name).VALUE == 1\n' if star else
+               'assert import_module(name).__name__ == "json"\n'))
+    bridge = 'name = "placement_" + "support"\n'
+    script = tmp_path / 'test_x.py'
+    script.write_text(text)
+    (tmp_path / 'bridge.py').write_text(bridge)
+    support = tmp_path / 'placement_support.py'
+    support.write_text('VALUE = 1\n')
+    before = subprocess.run([sys.executable, '-B', str(script)], capture_output=True, text=True)
+    support.write_text('VALUE = 2\n')
+    after = subprocess.run([sys.executable, '-B', str(script)], capture_output=True, text=True)
+    assert before.returncode == 0, before.stderr
+    if star:
+        assert after.returncode != 0 and 'AssertionError' in after.stderr
+    else:
+        assert after.returncode == 0, after.stderr
+    tip = {'tests/__init__.py': '', SUPPORT: 'VALUE = 1\n',
+           'tests/test_x.py': text, 'tests/bridge.py': bridge}
+    why = changed(tip, monkeypatch)
+    assert bool(why and 'shared ~ tests/placement_support.py' in why) is star
+
+
 def test_uncalled_helper_loader_narrows(monkeypatch):
     # sync_test_support.require_module: a plain helper no closure module calls cannot load anything here.
     text = 'import importlib\ndef require_module(test, name, package=None):\n    return importlib.import_module(name)\n'
