@@ -189,6 +189,83 @@ def test_merge_commit_cut_needs_every_parent(monkeypatch, tmp_path, git_history,
     assert seen["kept"] == [[] if side_held else [long[BOUNDARY]]]
 
 
+def test_resolvable_nonhex_parent_keeps_cut_and_refuses(tmp_path, git_history):
+    """Even a resolvable revision is not a valid raw parent object ID."""
+    repo, approved, theirs, tree = _start(git_history)
+    _git(repo, "update-ref", "refs/heads/lift-parent", approved)
+    raw = (f"tree {tree}\nparent refs/heads/lift-parent\n"
+           "author test <test@example.com> 1700000000 +0000\n"
+           "committer test <test@example.com> 1700000000 +0000\n\nmalformed parent\n")
+    source = tmp_path / "raw-commit"
+    source.write_text(raw)
+    cut = _git(repo, "hash-object", "-t", "commit", "-w", "--literally", str(source))
+    assert _git(repo, "cat-file", "commit", cut) == raw.strip()
+    assert _git(repo, "cat-file", "-e", "refs/heads/lift-parent^{commit}") == ""
+    # Git rejects a nonhex parent even while traversing a shallow commit. Keep
+    # that object off the traversed path, alongside a syntactically valid cut
+    # with an absent parent, to also exercise the real carry's exact refusal.
+    absent = "f" * 40
+    with pytest.raises(g.subprocess.CalledProcessError):
+        _git(repo, "cat-file", "-e", absent + "^{commit}")
+    source.write_text(raw.replace("refs/heads/lift-parent", absent))
+    relevant = _git(repo, "hash-object", "-t", "commit", "-w", "--literally", str(source))
+    shallow = Path(repo, ".git", "shallow")
+    cuts = cut + "\n" + relevant + "\n"
+    shallow.write_text(cuts)
+    # Seed the store directly: fetch/fsck rejects the malformed object before
+    # the defence-in-depth parent validator ever sees it.
+    merge, ours, theirs = _carry(repo, approved, theirs, [relevant])
+    objects = g._CarryObjects(R, _env(tmp_path), (merge, ours, theirs))
+    objects.path = str(shallow.parent)
+    try:
+        objects._lift_cuts()
+        assert shallow.exists(), "a nonhex parent must not lift the cut"
+        assert shallow.read_text() == cuts
+        assert objects.verify(merge, ours, theirs) == CUT
+    finally:
+        objects.close()
+
+
+def test_parent_line_in_message_does_not_keep_cut(tmp_path, git_history):
+    """Only header parents matter; a message can name an absent commit."""
+    repo, approved, theirs, tree = _start(git_history)
+    absent = "f" * 40
+    with pytest.raises(g.subprocess.CalledProcessError):
+        _git(repo, "cat-file", "-e", absent + "^{commit}")
+    cut = _git(repo, "commit-tree", tree, "-p", approved,
+               "-m", "message, not a header\n\nparent " + absent)
+    assert "\n\nmessage, not a header\n\nparent " + absent in _git(repo, "cat-file", "commit", cut)
+    assert _git(repo, "cat-file", "-e", approved + "^{commit}") == ""
+    merge, ours, theirs = _carry(repo, approved, theirs, [cut])
+    shallow = Path(repo, ".git", "shallow")
+    shallow.write_text(cut + "\n")
+    objects = g._CarryObjects(R, _env(tmp_path), (merge, ours, theirs))
+    objects.path = str(shallow.parent)
+    try:
+        assert objects.verify(merge, ours, theirs) == CUT
+        objects._lift_cuts()
+        assert not shallow.exists(), "message lines must not become parent requirements"
+        assert objects.verify(merge, ours, theirs) == ""
+    finally:
+        objects.close()
+
+
+def test_parentless_root_cut_is_lifted(tmp_path, git_history):
+    """A root has no missing parents, so its sole shallow entry is removed."""
+    repo, approved, theirs, tree = _start(git_history)
+    root = _git(repo, "commit-tree", tree, "-m", "parentless root")
+    assert _git(repo, "show", "-s", "--format=%P", root) == ""
+    shallow = Path(repo, ".git", "shallow")
+    shallow.write_text(root + "\n")
+    objects = g._CarryObjects(R, _env(tmp_path), (root,))
+    objects.path = str(shallow.parent)
+    try:
+        objects._lift_cuts()
+        assert not shallow.exists(), "a parentless root must not stay cut"
+    finally:
+        objects.close()
+
+
 def _fail_lift_read(monkeypatch):
     read = Path.read_text
 
