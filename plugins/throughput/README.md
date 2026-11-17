@@ -70,7 +70,7 @@ and a body that is not a JSON object a 422, and neither changes anything.
 - **Scope: the fleet.** The level is written to `cache/throughput/throttle.json` on the gateway whose panel set it.
   The hermes-hub link (client 1.9.51 or newer) publishes that file in the gateway's `gateway/info` record and every
   gateway keeps a replica of the others' records (`~/.local/state/hermes-hub/hub.db`), so each gateway reads every
-  published level and obeys the newest `set_at` (`set_by` names the gateway that set it; `null` = this one). A level
+  published level and obeys the newest `set_at` (`set_by` names the gateway that set it; `null` = this one). Stamps are stored and compared at millisecond precision, the precision the link publishes. A level
   stamped more than 5 minutes ahead of this gateway's clock is ignored until that time comes (gateways are
   expected to keep NTP time; a level set under a badly wrong clock can outrank later ones). It arrives within the
   link's sync periods: the setter's next full collect (up to 3 minutes) plus the receiver's next pull (about a

@@ -79,13 +79,21 @@ def _number(value) -> Optional[float]:
     return float(value)
 
 
+def stamp(value) -> float:
+    """A ``set_at`` at millisecond precision. The hub link publishes floats rounded to 3 decimals, so stamps are
+    stored, published and compared at that precision: a level and its acknowledgement then match on every
+    gateway, including the one that set it."""
+    number = _number(value)
+    return 0.0 if number is None else round(number, 3)
+
+
 def _record(data) -> Optional[dict]:
     """``{percent, cap_per_s, set_at}`` from a stored or published level; None when it is not one."""
     if not isinstance(data, dict) or _number(data.get("percent")) is None:
         return None
     limit = _number(data.get("cap_per_s"))
     return {"percent": clamp(data.get("percent")), "cap_per_s": None if limit is None else max(0.0, limit),
-            "set_at": _number(data.get("set_at")) or 0.0}
+            "set_at": stamp(data.get("set_at"))}
 
 
 def _read_json(path: Path):
@@ -115,7 +123,7 @@ def write_level(root: Path, percent, now: Optional[float] = None, reference: Opt
     """Store ``percent`` and the cap it means against ``reference`` right now (None = no cap can be scaled yet)."""
     value = clamp(percent)
     _write_json(level_path(root), {"percent": value, "cap_per_s": cap(value, reference),
-                                   "set_at": time.time() if now is None else now})
+                                   "set_at": stamp(time.time() if now is None else now)})
     return value
 
 
@@ -186,7 +194,7 @@ def note_seen(root: Path, hub_db: Optional[Path], now: Optional[float] = None) -
     level = effective(root, hub_db, now)
     want = {"percent": level["percent"], "set_at": level["set_at"]}
     have = _read_json(seen_path(root))
-    if not isinstance(have, dict) or {k: have.get(k) for k in want} != want:
+    if not isinstance(have, dict) or have.get("percent") != want["percent"] or stamp(have.get("set_at")) != want["set_at"]:
         _write_json(seen_path(root), {**want, "at": now})
     return level
 
@@ -197,12 +205,12 @@ def gateways(root: Path, hub_db: Optional[Path], now: float, me: Optional[str] =
     records = {} if hub_db is None else published(hub_db)
     level = effective(root, hub_db, now, records)
     own = _read_json(seen_path(root))
-    out = [{"name": me or "this gateway", "seen": isinstance(own, dict) and own.get("set_at") == level["set_at"]}]
+    out = [{"name": me or "this gateway", "seen": isinstance(own, dict) and stamp(own.get("set_at")) == level["set_at"]}]
     for gw, entry in sorted(records.items()):
         if gw == me or now - entry["updated_at"] > LIVE_S:
             continue
         block = entry.get("throttle") or {}
-        out.append({"name": gw, "seen": _number(block.get("seen_set_at")) == level["set_at"]})
+        out.append({"name": gw, "seen": block.get("seen_set_at") is not None and stamp(block["seen_set_at"]) == level["set_at"]})
     return out
 
 

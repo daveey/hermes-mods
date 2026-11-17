@@ -305,6 +305,29 @@ def test_effective_is_the_newest_level_any_gateway_published(tmp_path):
     assert T.effective(tmp_path, hub, NOW)["source"] == "worker-5"
 
 
+def test_stamps_match_at_millisecond_precision_on_the_setter_and_everywhere_else(tmp_path):
+    """The hub link rounds published floats to 3 decimals. Gateway A sets at a microsecond stamp; B reads the
+    rounded stamp, obeys it and acknowledges it; A's panel must list B as having the level."""
+    a_root, b_root = tmp_path / "a", tmp_path / "b"
+    T.write_level(a_root, 30, now=1794945300.123456, reference=1000.0)
+    assert T.read_record(a_root)["set_at"] == 1794945300.123  # stored as it will be published
+    published_a = {"throttle": {"percent": 30, "cap_per_s": 700, "set_at": 1794945300.123}}
+    now = 1794945360.0
+    hub_b = _hub_db(b_root.parent / "hb", {"A": (published_a, 5)}, now=now) if (b_root.parent / "hb").mkdir() is None else None
+    level = T.note_seen(b_root, hub_b, now)
+    assert level["source"] == "A" and level["set_at"] == 1794945300.123
+    seen_b = json.loads(T.seen_path(b_root).read_text())
+    (tmp_path / "ha").mkdir()
+    hub_a = _hub_db(tmp_path / "ha", {"B": ({"throttle": {"seen_percent": 30, "seen_set_at": seen_b["set_at"]}}, 5)}, now=now)
+    T.note_seen(a_root, hub_a, now)
+    assert T.gateways(a_root, hub_a, now, "A") == [{"name": "A", "seen": True}, {"name": "B", "seen": True}]
+    # a level file written before this fix (a microsecond stamp on disk) still matches its rounded acknowledgement
+    T.level_path(a_root).write_text(json.dumps({"percent": 30.0, "cap_per_s": 700.0, "set_at": 1794945300.123456}))
+    T.seen_path(a_root).write_text(json.dumps({"percent": 30.0, "set_at": 1794945300.123456, "at": now}))
+    assert T.gateways(a_root, hub_a, now, "A") == [{"name": "A", "seen": True}, {"name": "B", "seen": True}]
+    assert T.stamp(None) == 0.0 and T.stamp(True) == 0.0 and T.stamp("x") == 0.0
+
+
 def test_this_gateways_own_replica_row_is_not_a_second_opinion(tmp_path):
     """The link's replica also holds this gateway's own record, which can lag the local file."""
     T.write_level(tmp_path, 0, now=NOW - 10)
