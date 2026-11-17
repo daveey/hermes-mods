@@ -2039,7 +2039,13 @@ def pr_state_claim(reply: str, tool_log: Optional[list] = None) -> Optional[str]
     """The sentence claiming a PR's present state (unmerged/open, or approved/checks green/queued) when this turn
     read no PR state, else None (code
     spans, quotes, `>` lines, questions, conditions, reported speech and replies naming pr_state_claim are ignored)."""
-    text = _CODE_QUOTE.sub(" ", reply or "")
+    # Inline repository identifiers carry scope, not executable/quoted claims.
+    # Preserve only this narrow identifier grammar; still discard whole code
+    # claims, fenced examples and block quotes before classifying wording.
+    text = _CODE_QUOTE.sub(
+        lambda m: m[0][1:-1] if re.fullmatch(
+            r"`(?:https://github\.com/)?[\w.-]+/[\w.-]+(?:#[1-9]\d*|/pull/[1-9]\d*)?`", m[0]) else " ",
+        reply or "")
     text = _QUOTED_RE.sub(" ", text)
     if _PSC_META_RE.search(text) or not _MF_PR_RE.search(text):
         return None
@@ -2058,7 +2064,7 @@ def pr_state_claim(reply: str, tool_log: Optional[list] = None) -> Optional[str]
             context_repos = {m[1].lower() for m in re.finditer(
                 r"https://github\.com/([\w.-]+/[\w.-]+)/pull/\d+", s)}
             context_repos |= {m[1].lower() for m in re.finditer(
-                r"(?<![\w/:])([\w.-]+/[\w.-]+)(?=#|\s|[),.]|$)", s)}
+                r"(?<![\w/:])([\w.-]+/[\w.-]+)(?=#|\s|[)*\],.]|$)", s)}
         if s.rstrip(" *_").endswith("?"):
             continue
         m = _PSC_CLAIM_RE.search(s)

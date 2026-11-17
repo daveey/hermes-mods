@@ -144,6 +144,30 @@ def test_other_repository_does_not_exempt(tmp_path, monkeypatch, reply):
     assert check(hooks, reply)
 
 
+@pytest.mark.parametrize('repo', ['unrelated/repo', 'example/repo'])
+@pytest.mark.parametrize('formatting', ['`{repo}`', '**{repo}**', '[{repo}](https://github.com/{repo})'])
+def test_formatted_repository_scope(tmp_path, monkeypatch, repo, formatting):
+    hooks, _, _ = begin(tmp_path, monkeypatch)
+    replay(hooks, tmp_path / 'read.sh')
+    result = check(hooks, f'PR #3139 in {formatting.format(repo=repo)} is still open.')
+    assert bool(result) == (repo != 'example/repo')
+
+
+@pytest.mark.parametrize('quote', ['', "'", '"'])
+def test_brace_execution_provenance(tmp_path, monkeypatch, quote):
+    import subprocess
+    hooks, _, _ = begin(tmp_path, monkeypatch)
+    path = tmp_path / '{first,second}.sh'
+    # The literal file is verified; unquoted Bash invokes first.sh instead.
+    path.write_text("printf '%s\\n' '" + OUTPUT + "'\n")
+    (tmp_path / 'first.sh').write_text(path.read_text())
+    command = f'bash {quote}{path}{quote}'
+    result = subprocess.run(['bash', '-c', command], capture_output=True, text=True, check=True)
+    assert not result.stderr
+    replay(hooks, path, output=result.stdout, command=command)
+    assert bool(check(hooks)) == (not quote)
+
+
 def test_legacy_outcomes_require_explicit_verifier_retirement():
     from test_pr_read_outcome import load, ROOT
     sh = load('pr_script_retirement', ROOT / 'self_heal.py')
