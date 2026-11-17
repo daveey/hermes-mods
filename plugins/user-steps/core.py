@@ -944,7 +944,7 @@ _RESTATE_MIN_CHARS = 20
 # A turn the runtime started, not the user: Kanban notices (✔ done, ✖ failed, ⏸ blocked, ⏳ waiting, [Kanban ...]),
 # owner wakes, system and chat-close notes. Such a "last message" answers nothing. The glyph before the "[" is matched
 # by kind (any pictograph: Unicode So, plus ℹ), not listed: a four-glyph list missed core's ⏳ wait notice.
-_RUNTIME_MSG = re.compile(r"^\s*\[(?:owner-wake|System|chat-cl|Kanban|Automatic)\b")
+_RUNTIME_MSG = re.compile(r"^\s*\[(?:(?:owner-wake|System|chat-cl|chat-closeout|Kanban|Automatic)\b|IMPORTANT:)", re.I)
 _NOTICE_TAIL = re.compile(r"\ufe0f?\s*\[")
 
 

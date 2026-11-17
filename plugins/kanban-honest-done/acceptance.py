@@ -14,6 +14,7 @@ given to the chat making the edit.
 """
 
 from __future__ import annotations
+import unicodedata
 
 import os
 import re
@@ -38,7 +39,14 @@ MSG_RE = re.compile(r"\b(?:user\s+)?(?:message|msg)\s*#?\s*(\d{3,})\b", re.I)
 # stopped by a restart`` (no bracket after the symbol), ``[Message from another Hermes session ...]``,
 # ``[PEER MESSAGE from ...]``, ``David pressed Post on X ...`` (a UI button, not typed words).
 _RUNTIME_NOTICE = re.compile(
-    r"^\s*(?:[\[<]|[\u2714\u2716\u26a0\u23f8\u23f3\u25b6\u2757]\ufe0f?(?:\s|$)|David pressed\s)")
+    r"^\s*(?:[\[<]|⚠\ufe0f?\s+subagent\b|David pressed\s)")
+_NOTICE_TAIL = re.compile(r"\ufe0f?\s*\[")
+
+
+def runtime_notice(text: str) -> bool:
+    s = (text or "").lstrip()
+    return bool(_RUNTIME_NOTICE.match(s) or re.match(r"^[✔✖⏸⏳▶❗]\ufe0f?(?:\s|$)", s) or (s and
+        (unicodedata.category(s[0]) == "So" or s[0] == "ℹ") and _NOTICE_TAIL.match(s, 1)))
 # The only sources where a user-role row can be words David typed. Everything else (peer-mail, kanban,
 # subagent, cron, task-dispatch, review/audit lanes, future machine lanes) is refused by default.
 HUMAN_SOURCES = frozenset({"desktop", "tui", "cli", "local"})
@@ -154,7 +162,7 @@ def typed_text(content: str, display_kind: Optional[str]) -> Optional[str]:
     elif text.lstrip().startswith("[OUT-OF-BAND USER MESSAGE"):
         return None  # an envelope the runtime did not stamp as steering: not trusted as a typed turn
     text = text.strip()
-    if not text or _RUNTIME_NOTICE.match(text):
+    if not text or runtime_notice(text):
         return None
     return text
 

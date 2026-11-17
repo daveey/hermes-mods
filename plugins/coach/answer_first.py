@@ -22,6 +22,7 @@ from __future__ import annotations
 import os
 import re
 import time
+import unicodedata
 
 RULE = "answer_first"
 BUDGET_CALLS = 6
@@ -36,7 +37,15 @@ QUESTION_MESSAGE = ("[coach answer_first] The user asked a question and has had 
                     "call was not run.)")
 
 # Core and plugin notices that ride as user turns are not the user's words.
-_NOTICE = re.compile(r"^\s*(?:\[(?!Turn stopped)[^\]]*\]|[✔✖⏳⚠✅❌]|\[?CONTEXT COMPACTION)", re.I)
+_NOTICE = re.compile(r"^\s*(?:\[(?!Turn stopped)[^\]]*\]|\[?CONTEXT COMPACTION)", re.I)
+_NOTICE_TAIL = re.compile(r"\ufe0f?\s*\[")
+
+
+def runtime_notice(text: str) -> bool:
+    s = (text or "").lstrip()
+    return bool(_NOTICE.match(s) or re.match(r"^(?:[✔✖⏳❌]|⚠\ufe0f?\s+subagent\b)", s) or (s and
+        (unicodedata.category(s[0]) == "So" or s[0] == "ℹ") and _NOTICE_TAIL.match(s, 1)))
+
 _DESKTOP_STOP = re.compile(r"\[Turn stopped by Desktop before it finished\.\]\s*", re.I)
 
 # A stop/answer demand. Anchored to the start of a line (after "please"/"ok") or a whole-line "stop".
@@ -92,7 +101,7 @@ def _user_text(message) -> str:
 def classify(message) -> str | None:
     """"stop", "question" or None for the user's own message text."""
     text = _user_text(message)
-    if not text or _NOTICE.match(text) or len(text) > 600:
+    if not text or runtime_notice(text) or len(text) > 600:
         return None
     if _STOP.search(text):
         rest = _STOP_WORDS.sub(" ", _STOP.sub(" ", text))

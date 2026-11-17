@@ -15,6 +15,7 @@ Three failure points it watches (all seen in one real incident, see README):
 3. A send tool returned success but the readback shows nothing -> the result says delivery is NOT verified.
 """
 from __future__ import annotations
+import unicodedata
 
 import json
 import re
@@ -397,7 +398,17 @@ MISSED_ACTION_NOTE = (
 
 
 def is_missed_action_question(message: str) -> bool:
-    return bool(message and _MISSED_Q.search(message[:500]))
+    return bool(message and not runtime_notice(message) and _MISSED_Q.search(message[:500]))
+
+
+_NOTICE_TAIL = re.compile(r"\ufe0f?\s*\[")
+_BRACKET_NOTICE = re.compile(r"^\[(?:kanban\b|IMPORTANT:|System note:|chat-closeout\b|owner-wake\b)", re.I)
+
+
+def runtime_notice(text: str) -> bool:
+    s = (text or "").lstrip()
+    return bool(_BRACKET_NOTICE.match(s) or (s and
+        (unicodedata.category(s[0]) == "So" or s[0] == "ℹ") and _NOTICE_TAIL.match(s, 1)))
 
 
 # --- obligation steer at kanban_create / kanban_comment ----------------------------------------------------------
