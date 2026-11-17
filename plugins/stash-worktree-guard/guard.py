@@ -1959,11 +1959,17 @@ class _Analyzer:
             kept = _skip_wrappers(wrapper_words, external_time)
         except _ParseError:
             # Expanded words carry scalar evidence that the raw text may only hold split.
-            if self.suffix and self.suffix[0] is node:
+            if (self.suffix and self.suffix[0] is node and self.suffix[1] is not None
+                    and not any(os.path.basename(w or "") in _APPENDING_RUNNERS
+                                for w in wrapper_words)):
                 # The parser established this argv's boundaries. Failure to resolve a
                 # hypothetical wrapper suffix is local, not a failed shell parse: it
                 # cannot turn quoted data elsewhere into an executable Git operation.
-                self.local_evidence(" ".join(words + wrapper_words))
+                # Its stdin (pipe, here-doc, here-string text) is input it may run as
+                # Git words, so it is part of the local evidence. Unread stdin (`< file`)
+                # or an appending runner (xargs/parallel/find, which may also read
+                # `-a file`) takes words the guard never saw: that stays fail-closed.
+                self.local_evidence(" ".join(words + wrapper_words) + "\n" + self.suffix[1])
             else:
                 self.fail_closed(" ".join(words + wrapper_words))
             self.shadow_argv(words, st, depth, redirs=redirs)

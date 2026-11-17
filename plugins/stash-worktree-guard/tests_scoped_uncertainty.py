@@ -129,8 +129,22 @@ WRAPPED_MUTATIONS["mutation-reflog"] = (
     'G=$(command -v git); C=$(printf reflog); echo "reflog expire --expire=now --all"; '
     'flock /tmp/l "$G" "$C" expire --expire=now --all'
 )
+# Review round 4 (PR #252 @1dfbb5a9): a wrapper suffix whose resolution fails stays local, but its
+# stdin is part of that argv's input (an appending runner turns it into Git words), and unread
+# input (`< file`, `xargs -a file`) is never local evidence.
+WRAPPER_STDIN = {
+    "wrapper-stdin-pipe": "printf 'stash pop' | flock /tmp/l env A=1 xargs git",
+    "wrapper-stdin-nice": "printf 'stash pop' | flock /tmp/l nice -n 1 env A=1 xargs git",
+    "wrapper-stdin-heredoc": "flock /tmp/l env A=1 xargs git <<'EOF'\nstash pop\nEOF",
+    "wrapper-stdin-herestring": "flock /tmp/l env A=1 xargs git <<< 'stash pop'",
+    "wrapper-stdin-token-broker": "printf 'stash pop' | token-broker exec --scope user/github "
+                                  "--reason t -- env A=1 xargs git",
+    "wrapper-stdin-file": "printf 'stash pop' > args.txt; flock /tmp/l env A=1 xargs git < args.txt",
+    "wrapper-xargs-a-file": "printf 'stash pop' > args.txt; flock /tmp/l env A=1 xargs -a args.txt git",
+}
 REFUSE.update(WRAPPED_GIT)
 REFUSE.update(WRAPPED_MUTATIONS)
+REFUSE.update(WRAPPER_STDIN)
 
 
 @pytest.mark.parametrize("name", [n for n in WRAPPED_MUTATIONS if n.endswith("-drop")])
@@ -150,7 +164,8 @@ def test_refused_mutation_really_drops_shared_stash(wt, tmp_path, name):
 # Wrappers from util-linux/findutils run for real in the restore proof below (skipped if absent).
 _REAL_PROG = {"wrapped-flock": "flock", "wrapped-flock-cmdsub": "flock",
               "wrapped-xargs-herestring": "xargs", "wrapped-setsid": "setsid",
-              "wrapped-ionice": "ionice", "wrapped-taskset": "taskset"}
+              "wrapped-ionice": "ionice", "wrapped-taskset": "taskset",
+              **{n: "flock" for n in WRAPPER_STDIN if n != "wrapper-stdin-token-broker"}}
 
 
 @pytest.fixture
