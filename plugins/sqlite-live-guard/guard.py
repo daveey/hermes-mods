@@ -12,6 +12,11 @@ home (``~/.hermes``, ``$HERMES_HOME``), outside scratch, cache, archive and back
   refusal naming the ``hermes kanban`` verb that makes the change; and ``sqlite3`` writes into any other live
   file that was quarantined as corrupt in the last few hours (a ``<db>.corrupt.*.bak`` sibling). Reads,
   ``-readonly`` and ``mode=ro``/``immutable=1`` URIs pass.
+- Opening a live database at all (reads included) with a ``sqlite3`` CLI or a ``python -c`` / ``python -m sqlite3``
+  whose SQLite has the WAL-reset bug (3.7.0-3.51.2, https://sqlite.org/wal.html#walresetbug). Hermes holds these
+  files with SQLite 3.53.1; Ubuntu 24.04's ``/usr/bin/sqlite3`` and ``python3`` are 3.45.1 and Xcode's are 3.51.0.
+  The refusal names ``~/.hermes/bin/hermes-core-python -m sqlite3`` (managed SQLite), which the write and
+  maintenance rules above still judge like ``sqlite3``.
 - ``rm`` / ``mv`` / ``truncate`` of a live database's ``<db>.corrupt.*.bak`` quarantine: deleting it once
   switched the raw-write block off and destroyed the evidence a recovery reads (self-heal agent-6eb3a51e94).
 
@@ -30,6 +35,8 @@ import json
 import os
 import re
 import shlex
+import shutil
+import subprocess
 import time
 from pathlib import Path
 from typing import Iterable, Optional
@@ -59,6 +66,65 @@ _SQL_MAINT = re.compile(
 )
 _SQL_DML = re.compile(r"^\s*(?:insert|update|delete|replace|upsert|drop|create|alter|begin|with)\b", re.IGNORECASE)
 QUARANTINE_WINDOW_S = 2 * 3600
+
+# ---- SQLite build of the program that would open a live database
+WAL_RESET_MARK = "has the WAL-reset bug"
+MANAGED_SQLITE_CLI = "~/.hermes/bin/hermes-core-python -m sqlite3"
+_PROBE_TIMEOUT_S = 5
+_VERSION_CACHE: dict = {}
+
+
+def wal_reset_vulnerable(info) -> bool:
+    """Core's rule (hermes_cli.sqlite_runtime): 3.7.0..3.51.2, except the 3.50.7+ and 3.44.6+ backports."""
+    info = (tuple(int(x) for x in info) + (0, 0, 0))[:3]
+    return not (info < (3, 7, 0) or info >= (3, 51, 3) or (3, 50, 7) <= info < (3, 51, 0)
+                or (3, 44, 6) <= info < (3, 45, 0))
+
+
+def _resolve(word: str) -> Optional[str]:
+    if "/" in word:
+        path = _expand(word)
+        return path if os.path.isfile(path) else None
+    search = os.pathsep.join(p for p in (os.environ.get("PATH", ""), "/usr/local/bin:/usr/bin:/bin") if p)
+    return shutil.which(word, path=search)
+
+
+def program_sqlite_version(word: str, kind: str) -> Optional[tuple]:
+    """(major, minor, patch) of the SQLite that program ``word`` (``kind`` "cli" or "python") would use, asked by
+    running it once per binary file; None when it cannot be resolved or asked (the guard then does not block)."""
+    path = _resolve(word)
+    if not path:
+        return None
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    key = (os.path.realpath(path), st.st_mtime_ns, st.st_size, kind)
+    if key in _VERSION_CACHE:
+        return _VERSION_CACHE[key]
+    argv = [path, "--version"] if kind == "cli" else [path, "-I", "-c", "import sqlite3; print(sqlite3.sqlite_version)"]
+    version = None
+    try:
+        out = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                             timeout=_PROBE_TIMEOUT_S, stdin=subprocess.DEVNULL).stdout
+        m = re.match(r"\s*(\d+)\.(\d+)(?:\.(\d+))?", out or "")
+        if m:
+            version = tuple(int(g or 0) for g in m.groups())
+    except (OSError, subprocess.SubprocessError, ValueError):
+        version = None
+    _VERSION_CACHE[key] = version
+    return version
+
+
+def _unsafe_program(word: str, kind: str, db: str) -> Optional[str]:
+    if os.path.basename(word) == "hermes-core-python":
+        return None
+    version = program_sqlite_version(word, kind)
+    if version is None or not wal_reset_vulnerable(version):
+        return None
+    return (f"`{word}` uses SQLite {'.'.join(map(str, version))}, which {WAL_RESET_MARK} (3.7.0-3.51.2); it must not "
+            f"open live database {db}, which Hermes holds open with SQLite 3.53.1. Use `{MANAGED_SQLITE_CLI} {db} "
+            "\"<sql>\"` (managed SQLite)")
 
 
 def _statements(text: str) -> Iterable[str]:
@@ -1179,7 +1245,8 @@ def is_quarantine(path: str, in_home: bool = False) -> bool:
     return is_live(live, in_home)
 
 
-def _check_sqlite3(args: list[str], seg: list[str], in_home: bool) -> Optional[str]:
+def _check_sqlite3(args: list[str], seg: list[str], in_home: bool, program: Optional[tuple] = None) -> Optional[str]:
+    """``program``: (word, kind) of the binary that would open the database, for the WAL-reset check; None skips it."""
     readonly = any(a in ("-readonly", "--readonly", "-safe") for a in args)
     sql: list[str] = []
     db = None
@@ -1215,6 +1282,10 @@ def _check_sqlite3(args: list[str], seg: list[str], in_home: bool) -> Optional[s
             return f"`sqlite3 .backup/.save` would overwrite live database file {target}"
     if db is None or not is_live(db, in_home):
         return None
+    if program is not None:
+        why = _unsafe_program(program[0], program[1], db)
+        if why:
+            return why
     if readonly or re.search(r"[?&](?:mode=ro|immutable=1)", db):
         return None
     kind = _sql_kind(text) or ("write" if fed and not text else None)
@@ -1309,17 +1380,28 @@ def check_shell(cmd: str, cwd: str = "") -> Optional[str]:
             hit = next((o for o in ops if is_live(o, in_home)), None)
             if hit:
                 return f"`tee` would overwrite live database file {hit}"
-        elif re.fullmatch(r"python(?:3(?:\.\d+)?)?", word) and "-c" in args:
-            i = args.index("-c")
-            why = check_python(args[i + 1]) if i + 1 < len(args) else None
+        elif (re.fullmatch(r"python(?:3(?:\.\d+)?)?", word) or word == "hermes-core-python") and args[:2] == ["-m", "sqlite3"]:
+            # Python's sqlite3 CLI: `python -m sqlite3 DB SQL`. Same write/maintenance rules as the sqlite3 binary.
+            why = _check_sqlite3([a for a in args[2:] if a != "-v"], seg, in_home, (seg[0], "python"))
             if why:
                 return why
+        elif re.fullmatch(r"python(?:3(?:\.\d+)?)?", word) and "-c" in args:
+            i = args.index("-c")
+            code = args[i + 1] if i + 1 < len(args) else ""
+            why = check_python(code)
+            if why:
+                return why
+            if "sqlite3" in code:
+                live = next((m.group("s") for m in _PY_STR.finditer(code) if is_live(_expand(m.group("s")), in_home)), None)
+                why = _unsafe_program(seg[0], "python", live) if live else None
+                if why:
+                    return why
         elif word == "dd":
             hit = next((a[3:] for a in args if a.startswith("of=") and is_live(a[3:], in_home)), None)
             if hit:
                 return f"`dd` would overwrite live database file {hit}"
         elif word in ("sqlite3", "sqlite3.exe"):
-            why = _check_sqlite3(args, seg, in_home)
+            why = _check_sqlite3(args, seg, in_home, (seg[0], "cli"))
             if why:
                 return why
         elif word == "find" and "-delete" in args:
@@ -1536,6 +1618,10 @@ def recover_command(slug: str, db: Optional[Path] = None) -> str:
 
 
 def message(why: str) -> str:
+    if WAL_RESET_MARK in why:
+        return (f"SQLITE LIVE GUARD: blocked: {why}. Two SQLite builds on one WAL database can corrupt it when one "
+                "writes while another checkpoints (https://sqlite.org/wal.html#walresetbug); the hub's state.db search "
+                "index was damaged on 2026-11-18 with an affected build holding it. Do not work around this guard.")
     head = (
         f"SQLITE LIVE GUARD: blocked: {why}. Another process may have this database open; deleting its "
         "-wal/-shm or swapping the file under it splits writers across WAL views and corrupts the board on the "
