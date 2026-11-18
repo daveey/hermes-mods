@@ -88,7 +88,7 @@ def test_shell_fields_keep_main_whole_input_scope():
     texts = consent.write_texts('process_manage', args)
     assert 't_12345678' in '\n'.join(texts)
     assert 't_87654321' in '\n'.join(texts)
-    assert consent.write_texts('terminal', {'command': CONTROLS[0], 'data': CONTROLS[1]}) == []
+    assert consent.write_texts('terminal', {'command': CONTROLS[0], 'data': CONTROLS[1]})
 
 
 def test_raw_match_keeps_targets_even_when_segment_found_another_write():

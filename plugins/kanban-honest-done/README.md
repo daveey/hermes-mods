@@ -205,7 +205,12 @@ grep, restricted Git messages and quoted heredoc bodies remain data.
 
 Consent is different from the argv-based gates: outside G it retains main's raw
 `_SHELL_WRITE_RE` over joined command/input/data, including the full target text.
-It must not rely on nested segment discovery for hub requests. The regression
+It must not rely on nested segment discovery for hub requests. Consent also retains
+that raw detector inside G whenever any command starts with `hermes` (including chat
+prompts and heredoc stdin). Only command-only `terminal` / `run_in_user_terminal`
+inputs can receive inert-data exemptions: process input/data may feed an existing
+interpreter, so joined fields and process tools retain the raw main detector.
+`tests/test_consent_execution_scope.py` verifies these boundaries and stopped-target refusals. The regression
 `tests/test_consent_raw_parity.py` covers shell/eval wrappers, here-strings, pipes,
 substituted command names, and SSH (classification only), plus inert controls and
 an independent frozen-main-regex comparison across the test-source corpus.
