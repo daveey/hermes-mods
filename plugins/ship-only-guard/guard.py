@@ -27,6 +27,7 @@ PREFLIGHT_TIMEOUT = 18.0
 _PREFLIGHT_DEADLINE: ContextVar[float | None] = ContextVar("ship_preflight_deadline", default=None)
 _PREFLIGHT_STAGE = ContextVar("ship_preflight_stage", default="command inspection")
 _TURN_READ_ONLY = ContextVar("ship_turn_read_only", default=False)
+_WAITING_RECEIPT: ContextVar[dict | None] = ContextVar("ship_waiting_receipt", default=None)
 # Provisional own eligibility is valid ONLY inside merge's speculative hold:
 # successful approval plus the final fresh drift read must still admit it.
 _MERGE_OWN_ELIGIBILITY = ContextVar("ship_merge_own_eligibility", default=False)
@@ -53,14 +54,17 @@ def bounded_preflight(check, *args, **kwargs):
     parent = _PREFLIGHT_DEADLINE.get()
     deadline = time.monotonic() + PREFLIGHT_TIMEOUT
     token = _PREFLIGHT_DEADLINE.set(min(parent, deadline) if parent is not None else deadline)
+    receipt = _WAITING_RECEIPT.set({}) if _WAITING_RECEIPT.get() is None else None
     try:
         result = check(*args, **kwargs)
         _remaining()
         return result
     except _PreflightExpired as exc:
-        return str(exc)
+        return _with_waiting_receipt(str(exc))
     finally:
         _PREFLIGHT_DEADLINE.reset(token)
+        if receipt is not None:
+            _WAITING_RECEIPT.reset(receipt)
 
 
 def _stage(name, fn, *args):
@@ -1663,6 +1667,7 @@ def _live_turns(repo, cwd, env, own_number=None):
     """
     cache = _cache()
     objects = cache.setdefault("obj", {})          # commit sha -> {"message": ...} | None, immutable
+    cache.pop("turn_snapshot", None)
     deadline = time.monotonic() + 20
     eligibility = _ELIGIBILITY_DEADLINE.get()
     if eligibility is not None:
@@ -1681,6 +1686,7 @@ def _live_turns(repo, cwd, env, own_number=None):
     if own_number is not None:
         cache[("own", own_number)] = None            # complete listing: no ref of the owner unless seen below
     if not refs:
+        cache["turn_snapshot"] = []
         return []
     owner, name = repo.split("/", 1)
     shas = []
@@ -1740,7 +1746,8 @@ def _live_turns(repo, cwd, env, own_number=None):
         elif rec["expires"] + _TURN_TTL <= now and len(expired) < 2:
             expired.append(ref["ref"])
     _turn_delete_all(expired, repo, cwd, env)
-    return sorted(out, key=lambda item: _turn_order(item[1]))
+    cache["turn_snapshot"] = sorted(out, key=lambda item: _turn_order(item[1]))
+    return cache["turn_snapshot"]
 
 
 def turn_blocks(turn_files, files):
@@ -2328,6 +2335,27 @@ def _turn_wait(number, data, repo, cwd, env, hold):
         return _turn_acquire_scoped(number, data, repo, cwd, env, True, waiting_hold=hold)
 
 
+def _waiting_receipt(rec, retained=False):
+    state = "retained" if retained else "recorded"
+    timing = (f"expired at {_until(rec['expires'])}; cooling until {_until(rec['expires'] + _TURN_TTL)}"
+              if rec["expires"] <= _now() else f"until {_until(rec['expires'])}")
+    message = (f"PR #{rec['pr']} waiting place {state} {timing} (refs/{_TURN_PREFIX}{rec['pr']}); "
+               "this is not merge permission. Retry the full preflight; the fixed place expires "
+               "even if the older holder has not finished.")
+    receipt = _WAITING_RECEIPT.get()
+    if receipt is not None:
+        receipt["message"] = message
+    turn_only = _TURN_ONLY.get()
+    if turn_only is not None:
+        turn_only["waiting"] = message
+    return message
+
+
+def _with_waiting_receipt(result):
+    message = (_WAITING_RECEIPT.get() or {}).get("message")
+    return message + "\n" + str(result) if message and message not in str(result) else str(result)
+
+
 def _turn_acquire_scoped(number, data, repo, cwd, env, prechecked, waiting_hold=None):
     waiting = isinstance(waiting_hold, _DefiniteTurnHold)
     if waiting and (int(_now()), int(number)) <= _turn_order(waiting_hold.holder):
@@ -2381,9 +2409,12 @@ def _turn_acquire_scoped(number, data, repo, cwd, env, prechecked, waiting_hold=
             if rc_old != 0 or not isinstance(obj, dict) or not isinstance(obj.get("message"), str):
                 return ("[ship-only-guard] Refused state merge: existing land-turn target is not a readable commit; "
                         "no replacement attempted. Repair requires fenced maintenance or close the owning PR.")
+
+    if waiting and previous and rec is None:
+        return "[ship-only-guard] Waiting admission refused: existing own record is malformed; no replacement attempted."
     if rec is not None:
         if waiting and rec["expires"] + _TURN_TTL > _now():
-            return ""  # preserve any live/cooling generation, even if it has yielded
+            return _waiting_receipt(rec, retained=True) if rec.get("waiting") else ""
         if rec and rec["expires"] > _now():
             if _turn_yielded(rec, data, repo, cwd, env):
                 return ""
@@ -2404,6 +2435,12 @@ def _turn_acquire_scoped(number, data, repo, cwd, env, prechecked, waiting_hold=
         rec["waiting"] = True
         if _turn_order(rec) <= _turn_order(waiting_hold.holder):
             return ""  # clock moved backwards during the read
+        snapshot = _cache().get("turn_snapshot")
+        if snapshot is None or any(
+                other["pr"] != int(number) and _turn_order(rec) <= _turn_order(other)
+                and (turn_blocks(files, other["files"]) or turn_blocks(other["files"], files))
+                for _, other in snapshot):
+            return "[ship-only-guard] Waiting admission refused: cannot order after the published overlap snapshot; retry after clock convergence."
     rc, made = _gh_call([f"repos/{repo}/git/commits"], cwd, env, timeout=_TURN_CALL_TIMEOUT, payload={
         "message": f"{_TURN_SUBJECT}{int(number)}\n\n{json.dumps(rec, sort_keys=True)}\n",
         "tree": tree, "parents": [previous or head]})
@@ -2428,20 +2465,19 @@ def _turn_acquire_scoped(number, data, repo, cwd, env, prechecked, waiting_hold=
         _cache()["turn_missed"] = True
         return ("[ship-only-guard] Refused state merge: land-turn publication conflicted or was unreadable; "
                 "retry a complete snapshot. No forced replacement was attempted; the write may have succeeded.")
+    # Preserve publication evidence BEFORE any fallible post-write read.
+    message = _waiting_receipt(rec) if waiting else ""
     # Concurrent writers can publish records, but only the oldest is effective.
     try:
         post_hold = _turn_hold_refusal(number, data, repo, cwd, env)
         if waiting:
-            message = (f"PR #{number} waiting place recorded until {_until(expires)} (refs/{ref}); "
-                       "this is not merge permission. Retry the full preflight; the fixed place expires "
-                       "even if the older holder has not finished.")
-            turn_only = _TURN_ONLY.get()
-            if turn_only is not None:
-                turn_only["waiting"] = message
             return message + ("\n" + post_hold if post_hold else "")
         return post_hold or _until(expires)
     except Exception as exc:
         # The ref is already published: say so, so the agent does not believe no turn was recorded.
+        if waiting:
+            return message + (f"\nOrdering unreadable after writing ({type(exc).__name__}: {str(exc)[:240]}); "
+                              "no merge is permitted from partial reads.")
         return (f"[ship-only-guard] Refused state merge: land-turn snapshot unreadable after writing "
                 f"({type(exc).__name__}: {str(exc)[:240]}). PR #{int(number)}'s turn record was written "
                 f"(refs/{ref}) and may be in force until {_until(expires)}; the ordering check could not be "
@@ -2533,7 +2569,8 @@ def land_turn(number, repo, sha, cwd=None, env=None):
         _PREFLIGHT_DEADLINE.reset(deadline)
         _TURN_ONLY.reset(only)
     if out.get("waiting"):
-        return 1, str(result)
+        message = out["waiting"]
+        return 1, str(result) if message in str(result) else message + "\n" + str(result)
     until = out.get("until")
     if until and not until.startswith("[ship-only-guard]"):
         return 0, f"PR #{number} holds the state land turn until {until} (refs/{_TURN_PREFIX}{number}).\n{result}"
@@ -2549,6 +2586,7 @@ def _state_merge(words, repo, cwd, env):
     """One shared monotonic budget (`PREFLIGHT_TIMEOUT`, set by `bounded_preflight`) covers every
     read and write of the preflight; see `_state_merge_scoped` for the rules."""
     outer_deadline = _PREFLIGHT_DEADLINE.get()
+    receipt = _WAITING_RECEIPT.set({}) if _WAITING_RECEIPT.get() is None else None
     try:
         with _scope():
             return _state_merge_scoped(words, repo, cwd, env)
@@ -2556,8 +2594,11 @@ def _state_merge(words, repo, cwd, env):
         # A nested owner must see the original stage, not a late-result check
         # after _stage reset its context. Standalone public callers get a refusal.
         if outer_deadline is not None:
-            raise
-        return str(exc)
+            raise _PreflightExpired(_with_waiting_receipt(str(exc))) from exc
+        return _with_waiting_receipt(str(exc))
+    finally:
+        if receipt is not None:
+            _WAITING_RECEIPT.reset(receipt)
 
 
 def _state_merge_scoped(words, repo, cwd, env):
@@ -2685,6 +2726,8 @@ def _state_merge_scoped(words, repo, cwd, env):
                     and (not drift or "state commit(s) landed since then" in drift)):
                 queued = _stage("waiting-place admission", _turn_safe, _turn_wait,
                                 number, data, repo, cwd, env, hold)
+                if not queued and _cache().get("turn_missed"):
+                    queued = _turn_follow_up(number, repo, sha)
             return str(hold) + ("\n" + queued if queued else "") + ("\nAlso: " + drift if drift else "")
         if drift and "state commit(s) landed since then" in drift:
             remaining = _remaining()

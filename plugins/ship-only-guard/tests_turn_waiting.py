@@ -11,6 +11,11 @@ spec.loader.exec_module(f)
 g = f.g
 
 
+@pytest.fixture(autouse=True)
+def isolate_owner(monkeypatch):
+    monkeypatch.setattr(g, "_turn_owner", lambda env: {})
+
+
 def record(**changes):
     return {"pr": 1, "head": f.H2563, "files": ["hermes-sync"],
             "acquired": f.NOW - 60, "expires": f.NOW - 60 + g._TURN_TTL,
@@ -185,7 +190,8 @@ def test_waiting_admission_does_not_rewrite_live_or_cooling_generation(monkeypat
 
 
 @pytest.mark.parametrize("case", ["unreadable", "deadline", "existing"])
-def test_cli_retains_waiting_publication_evidence_on_retry_and_failure(monkeypatch, case):
+@pytest.mark.parametrize("entry", ["cli", "hook"])
+def test_cli_retains_waiting_publication_evidence_on_retry_and_failure(monkeypatch, case, entry):
     monkeypatch.setattr(g, "_now", lambda: f.NOW)
     monkeypatch.setattr(g, "_WAITING_WRITER_ENABLED", True)
     fake = f.FakeGitHub({n: f.pr(n, f.H2563, ["hermes-sync"]) for n in (1, 2)})
@@ -208,12 +214,37 @@ def test_cli_retains_waiting_publication_evidence_on_retry_and_failure(monkeypat
                 raise g._PreflightExpired("deadline exceeded during " + name)
             return result
         monkeypatch.setattr(g, "_stage", stage)
-    status, message = g.land_turn(2, f.R, f.H2563, env={})
+    if entry == "cli":
+        status, message = g.land_turn(2, f.R, f.H2563, env={})
+        assert status == 1
+    else:
+        message = g.bounded_preflight(f.merge, 2, f.H2563)
+        assert isinstance(message, str)
     assert fake.turn(2)
-    assert status == 1
     assert "refs/land-turn/pr-2" in message
     assert "not merge permission" in message
     assert "No land turn recorded" not in message
+
+
+@pytest.mark.parametrize("failure", ["malformed", "late", "older_waiter"])
+def test_waiting_unknown_or_budget_or_existing_order_never_overwrites(monkeypatch, failure):
+    monkeypatch.setattr(g, "_now", lambda: f.NOW)
+    monkeypatch.setattr(g, "_WAITING_WRITER_ENABLED", True)
+    fake = f.FakeGitHub({n: f.pr(n, f.H2563, ["hermes-sync"]) for n in (1, 2, 3)})
+    monkeypatch.setattr(g.subprocess, "run", fake.run)
+    f.seed_turn(fake, 1, f.NOW - 60)
+    if failure == "malformed":
+        fake.refs["refs/land-turn/pr-2"] = "e" * 40
+        fake.commits["e" * 40] = {"message": "unreadable waiting generation"}
+    elif failure == "late":
+        monkeypatch.setattr(g, "_left", lambda: 0.1)
+    else:
+        f.seed_turn(fake, 3, f.NOW + 1)
+    before = dict(fake.refs)
+    result = f.merge(2, f.H2563)
+    assert fake.refs == before
+    if failure == "late":
+        assert "--land-turn" in result
 
 
 def test_waiting_promotion_keeps_original_record_and_nontransitive_lanes():
