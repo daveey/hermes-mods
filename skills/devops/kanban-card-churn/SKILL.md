@@ -98,6 +98,8 @@ four of these at once.
 | Append-only state files | checkpoint and evidence logs in the hundreds of KB | freeze them; small overwritten state file | size cap written in the state file header |
 | Two cards hold the same state | integrator and slice both track the gates | name one owner of the gate table | one table, one owner |
 | Wait on a dead home | wake check never passes; producer homed on a held worker | decouple: do the step here or fix forward | body rule: never wait on a card homed on one worker |
+| Pinned to a gone machine | `runs_on` names `machine:<w>` and `<w>` is not in the worker registry (autoscaled away); dispatcher notes "nothing is watching" | `hermes kanban move <id> --pool --reason ...`, then park it on its real producer | never pin a card to one machine for state: state goes in an attachment |
+| Host-local state file | the card moved hosts and its `STATE.md`, checkpoints and prepared tests stayed on the old disk (scratch workspaces are per host) | rebuild it from the newest run comment, attach it to the card | state file is a card attachment, re-attached at run end |
 | Resurrecting a failed run | days spent making a sealed or poisoned run pass | keep it as failed evidence; start a fresh run | body rule: fix forward, fresh run |
 | Consumable authorization | "both sends used", then hours re-asking the user | quote the user's standing words in the state file | authorization and its scope in the body |
 | Single-route dependency | one reviewer or model route quota-walled for days | name a fallback | named fallback in the body; never silent |
@@ -121,6 +123,10 @@ overwrite it.
    gate table (gate, proof mode, status at this version, evidence link, what is left); root cause of the current
    failure; decisions; next action in order; standing authorization with the user's exact words, date and scope;
    reviewer or model routes with named fallbacks; never-replay list; where the frozen history is.
+   Then attach it: `hermes kanban attach <id> STATE.md --name STATE.md`. Scratch workspaces are per host, and a
+   card that moves to another worker (pool placement, a rehome, an autoscaled worker going away) does not take
+   its workspace along; attachments sync with the card. The body says to read the newest `STATE.md` attachment
+   and to re-attach the overwritten file at run end.
 2. **Gate table instead of new cards.** Split acceptance into rows. Keep the original gate text word for word.
    Mark each row `fixture` or `real`. Do not open a card per gate unless the user asks for cards.
 3. **Run the fixture now** if an isolated harness exists (often it was last run on an older version). Port it to
@@ -138,7 +144,10 @@ overwrite it.
    Without it, unlink parents that are done or archived and list their ids in the state file. Leave open
    parents linked either way.
 6. **Dead waits.** Do not unhold, restart or touch a held machine. Remove the dependency instead: record the
-   failed attempt as evidence and make the next action something this card can do.
+   failed attempt as evidence and make the next action something this card can do. Check every card in the
+   chain for a `machine:<w>` in `runs_on` against the worker registry (skill `hermes-workers`); a worker that is
+   gone means `hermes kanban move <id> --pool`. Two cards waiting on each other can both sit in triage: promote
+   the producer first, then park the consumer (`schedule --awaiting card:<producer>` refuses a triage producer).
 7. **Tell the thread once.** One comment: who you are, on whose instruction, what it supersedes, the files
    changed. Then read the status back. Promote or reschedule only a card that cannot start (triage, or a wake on
    a dead home). A card parked on a valid event wake with a backstop stays as it is.
@@ -216,6 +225,14 @@ ends by proposing, and normally building, at least one fix at the point of failu
 - `hermes kanban context` is what a worker sees; `show` is larger and misleads the size estimate.
 - `promote` refuses until you acknowledge recent foreign comments: run it with `--dry-run`, take the `--seen <id>`
   it prints, rerun.
+- `promote --seen <id>` can be refused forever with "Comment data unavailable ... --seen cannot acknowledge
+  missing data" for a legacy comment event days old; the form without `--seen` (foreign comments from the last
+  60 minutes) is not. A subagent whose CLI is fenced reproduces only the `--seen` form: run `--dry-run` both ways
+  yourself before calling a card unreleasable.
+- `edit --requires` replaces the capability list (`terminal,file,git`), not `runs_on`; placement is
+  `move --pool` / `move --runs-on`.
+- `wait-comment --contains` matches anywhere in a comment, so a note that quotes a grant/refuse token wakes the
+  card waiting on it. Paraphrase tokens in your own comments.
 - A card can move to `triage` under you (spend-budget hold). Check events before blaming your own edit.
 - Use the CLI, not the sqlite file; the board database is not where the directory listing suggests.
 - `unlink` takes several seconds per parent; run a long batch in the background.
