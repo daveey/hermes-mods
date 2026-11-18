@@ -281,15 +281,55 @@ def test_monitor_source_failed_line_matches_core():
     assert sg.MONITOR_SOURCE_FAILED_RE.match("Job '%s': monitor source failed: %s" % ("f58038cae3fb", "x"))
 
 
-def test_chained_exception_after_a_quoted_chain_files_the_outer_exception():
-    # Not the cron re-raise: our own RuntimeError quoting a child's chained traceback files as ours, at our frame.
-    rec = ([f"2026-11-17 18:00:00,000 ERROR gateway.run: helper failed",
-            "Traceback (most recent call last):",
-            f'  File "{_H}/hermes-agent/gateway/run.py", line 20, in run_helper',
-            "    raise RuntimeError(err)",
-            "RuntimeError: helper exited 1"] + CHAINED_SCRIPT_STDERR)
-    sigs = sg.parse_errors(rec)
-    assert len(sigs) == 1 and sigs[0]["symptom"].startswith("RuntimeError in run_helper (run.py)"), sigs
+def _quoted_then_outer(explicit: bool, chained_child: bool) -> list:
+    """Real CPython output: a RuntimeError quoting a child's formatted traceback, then caught and wrapped by an
+    outer LookupError (`raise .. from exc` or implicit context). PR 275 review: the outer one is the raised one."""
+    import traceback
+    try:
+        try:
+            try:
+                raise ValueError("child issue")
+            except ValueError as inner:
+                if not chained_child:
+                    raise
+                raise KeyError("child wrap") from inner
+        except Exception:
+            child = traceback.format_exc()
+        try:
+            raise RuntimeError("child failed\nstderr:\n" + child)
+        except RuntimeError as exc:
+            if explicit:
+                raise LookupError("actual final failure") from exc
+            raise LookupError("actual final failure")
+    except LookupError:
+        return traceback.format_exc().splitlines()
+
+
+@pytest.mark.parametrize("explicit", [True, False])
+@pytest.mark.parametrize("chained_child", [True, False])
+def test_real_outer_exception_after_a_quoted_traceback_files_the_outer_exception(explicit, chained_child):
+    lines = _quoted_then_outer(explicit, chained_child)
+    sigs = sg.parse_errors(["2026-11-17 18:00:00,000 ERROR gateway.run: helper failed"] + lines)
+    assert len(sigs) == 1 and sigs[0]["symptom"].startswith("LookupError in "), sigs
+    got = sg.parse_worker_crashes([f"[pid 54] {l}" for l in lines])
+    assert [(c["exc"], c["msg"]) for c in got] == [("LookupError", "actual final failure")]
+
+
+def _formatted_chained_child() -> list:
+    import traceback
+    try:
+        try:
+            raise ValueError("child issue")
+        except ValueError as inner:
+            raise KeyError("child wrap") from inner
+    except KeyError:
+        return traceback.format_exc().splitlines()
+
+
+def test_session_cron_rewrap_quoting_a_real_formatted_chain_files_nothing():
+    # Control: the cron re-raise quoting a real CPython-formatted chained child is still the cron lane's.
+    rec = SESSION_CRON_TB + ["RuntimeError: Script exited with code 1", "stderr:"] + _formatted_chained_child()
+    assert sg.parse_errors(rec) == []
 
 
 def test_chained_exception_files_the_last_exception_in_the_chain():
