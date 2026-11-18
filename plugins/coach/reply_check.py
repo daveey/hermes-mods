@@ -2049,12 +2049,14 @@ def pr_state_claim(reply: str, tool_log: Optional[list] = None) -> Optional[str]
     """The sentence claiming a PR's present state (unmerged/open, or approved/checks green/queued) when this turn
     read no PR state, else None (code
     spans, quotes, `>` lines, questions, conditions, reported speech and replies naming pr_state_claim are ignored)."""
-    # Inline repository identifiers carry scope, not executable/quoted claims.
-    # Preserve only this narrow identifier grammar; still discard whole code
-    # claims, fenced examples and block quotes before classifying wording.
+    # Inline repository and PR identifiers carry scope, not quoted claims.
+    # Keep complete identifier spans, including bare numbers in PR lists;
+    # still discard whole code claims, fenced examples and block quotes.
     text = _CODE_QUOTE.sub(
         lambda m: m[0][1:-1] if re.fullmatch(
-            r"`(?:https://github\.com/)?[\w.-]+/[\w.-]+(?:#[1-9]\d*|/pull/[1-9]\d*)?`", m[0]) else " ",
+            r"`(?:(?:https://github\.com/)?[\w.-]+/[\w.-]+(?:#[1-9]\d*|/pull/[1-9]\d*)?"
+            r"|\s*(?:(?:PRs?|pull\s+requests?)\s*(?:-\s*|number\s+)?)?#?\d+\s*)`",
+            m[0], re.I) else " ",
         reply or "")
     text = _QUOTED_RE.sub(" ", text)
     if _PSC_META_RE.search(text) or not _MF_PR_RE.search(text):

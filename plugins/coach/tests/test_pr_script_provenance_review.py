@@ -106,6 +106,23 @@ def test_short_and_emphasized_list_numbers_require_read(tmp_path, monkeypatch, p
     assert check(h, f'{prefix}3139 and {tail} are still open.')
 
 
+@pytest.mark.parametrize('prefix', ['PRs ', 'Pull requests ', 'PR number ', 'PR-', 'PR #', '#'])
+@pytest.mark.parametrize('tail', ['`3140`', '`#3140`', '`PR 3140`', '`7`', '`PR-3140`', '`PR number 3140`', '`Pull request 3140`'])
+def test_code_number_list_requires_read(tmp_path, monkeypatch, prefix, tail):
+    h = begin(tmp_path, monkeypatch)
+    write(h, tmp_path / 'r.sh')
+    run(h, tmp_path / 'r.sh')
+    assert check(h, f'{prefix}3139 and {tail} are still open.')
+
+
+@pytest.mark.parametrize('tail', ['`3189`', '`#3189`', '`PR 3189`'])
+def test_code_number_list_read_control(tmp_path, monkeypatch, tail):
+    h = begin(tmp_path, monkeypatch)
+    write(h, tmp_path / 'r.sh')
+    run(h, tmp_path / 'r.sh')
+    assert check(h, f'PRs 3139 and {tail} are still open.') is None
+
+
 @pytest.mark.parametrize('suffix', [' at 00:49Z', ' at 12:34:56Z',
                                   ' at 4c1f66ea9b', '; tests pass 134/134',
                                   ' with 3 checks pending'])
