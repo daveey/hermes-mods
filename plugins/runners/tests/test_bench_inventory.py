@@ -195,9 +195,15 @@ def test_inventory_replay_absolute_budget(tmp_path, scattered):
     # contract. The relative test above ALWAYS runs. Before landing, run
     # scripts/check_inventory_hardware.py on trusted deployment-class hardware.
     # Require mode takes precedence: that command must never silently skip.
-    if (os.environ.get('GITHUB_ACTIONS') == 'true'
-            and os.environ.get('RUNNERS_BENCH_REQUIRE_ABSOLUTE') != '1'):
-        pytest.skip('absolute 0.1% gate requires separate exact-head hardware evidence')
+    # The hermes-mods pre-push gate (scripts/pre-push-suites sets HERMES_MODS_PUSH_GATE=1) is the same case as a
+    # hosted runner: on hermes-hub at load 19 this measured 0.619 s and 0.688 s against the 0.600 s limit and
+    # refused two pushes that did not touch the inventory (2026-11-17). CPU time per operation rises on a
+    # contended host, so the number means nothing there.
+    hosted = os.environ.get('GITHUB_ACTIONS') == 'true'
+    push_gate = os.environ.get('HERMES_MODS_PUSH_GATE') == '1'
+    if (hosted or push_gate) and os.environ.get('RUNNERS_BENCH_REQUIRE_ABSOLUTE') != '1':
+        pytest.skip('absolute 0.1% gate requires separate exact-head hardware evidence'
+                    + ('' if hosted else ' (pre-push gate host is not quiet deployment hardware)'))
     assert RUNNERS == 1900, 'absolute acceptance requires 1900 runners'
     samples = [replay(tmp_path, card_l=True, run=n, scattered=scattered) for n in range(2)]
     new = min(samples)

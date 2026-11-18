@@ -15,6 +15,13 @@ replay checks in `tests/test_bench_inventory.py`:
   span must be <=0.1%. This runs by default outside GitHub Actions. On GitHub
   Actions (`GITHUB_ACTIONS=true` exactly), it visibly skips because hosted runner
   CPU speed is not deployment CPU speed. Generic `CI=true` does not skip it.
+  It also visibly skips in the hermes-mods pre-push gate (`scripts/pre-push-suites`
+  sets `HERMES_MODS_PUSH_GATE=1`): that gate runs on whichever machine pushes, at
+  whatever load. On hermes-hub at load 19 (2026-11-17) it measured 0.619 s and
+  0.688 s against the 0.600 s limit and refused two pushes that did not touch the
+  inventory. The relative work-regression check still runs there, and
+  `RUNNERS_BENCH_REQUIRE_ABSOLUTE=1` (the hardware proof below) overrides both skips.
+  A direct `scripts/test-all` run is not the gate and still runs it.
 
 ## Mandatory prelanding hardware proof
 
