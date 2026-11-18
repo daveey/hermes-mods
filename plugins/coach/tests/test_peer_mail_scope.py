@@ -99,6 +99,39 @@ def test_peer_mail_turn_needs_both_markers(tmp_path, monkeypatch):
     assert not rc.peer_mail_turn(None)
 
 
+# PR 282 review: core's resume preamble(s) wrap a resumed peer turn; the nudge record's ask_head is strip_preamble'd,
+# so the reply check must see through the same wrapper or it holds the reply while signals drops the defect.
+RESUME = "[System note: Your previous turn was interrupted mid-run. The interrupted request was:]\n\n"
+
+
+def test_resumed_peer_mail_turn_gets_no_report_only_nudge(tmp_path, monkeypatch):
+    for i, wrapped in enumerate((RESUME + ASK, RESUME + RESUME + ASK)):
+        hooks, home, logf, rc = _hooks(tmp_path / str(i), monkeypatch)
+        assert rc.strip_preamble(wrapped) == ASK
+        assert rc.peer_mail_turn(wrapped)
+        sid = f"local-resumed-peer-{i}"
+        _state_db(home, sid, "tool")
+        hooks["pre_llm_call"](session_id=sid, user_message=wrapped, platform="cli")
+        out = hooks["pre_verify"](session_id=sid, platform="cli", attempt=0, final_response=REPLY)
+        assert out is None, (i, out)
+        ev = _events(logf)
+        assert not any(r["event"] == "reply_nudge" and r.get("rule") in ("report_only", "status_only") for r in ev)
+        assert any(r["event"] == "reply_checked" and r.get("peer_mail") is True for r in ev)
+
+
+def test_resumed_user_turn_still_nudges(tmp_path, monkeypatch):
+    hooks, home, logf, rc = _hooks(tmp_path, monkeypatch)
+    sid = "20261118_020000_user02"
+    _state_db(home, sid, "desktop")
+    ask = RESUME + ASK.split("----- peer message ----- ", 1)[1].replace(" [END PEER MESSAGE]", "")
+    assert not rc.peer_mail_turn(ask)
+    assert not rc.peer_mail_turn(RESUME + ASK.replace(" [END PEER MESSAGE]", ""))
+    hooks["pre_llm_call"](session_id=sid, user_message=ask, platform="cli")
+    out = hooks["pre_verify"](session_id=sid, platform="cli", attempt=0, final_response=REPLY)
+    assert out and out["action"] == "continue"
+    assert any(r["event"] == "reply_nudge" and r["rule"] == "report_only" for r in _events(logf))
+
+
 # --- signals: a peer-mail nudge outcome never files a self-heal defect ------------------------------------------
 
 def _signals():
