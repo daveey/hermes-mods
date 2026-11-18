@@ -247,6 +247,28 @@ def test_waiting_unknown_or_budget_or_existing_order_never_overwrites(monkeypatc
         assert "--land-turn" in result
 
 
+@pytest.mark.parametrize("case", ["cooling", "late_cli"])
+def test_retained_record_is_not_a_liveness_promise(monkeypatch, case):
+    monkeypatch.setattr(g, "_now", lambda: f.NOW)
+    monkeypatch.setattr(g, "_WAITING_WRITER_ENABLED", True)
+    fake = f.FakeGitHub({n: f.pr(n, f.H2563, ["hermes-sync"]) for n in (1, 2)})
+    monkeypatch.setattr(g.subprocess, "run", fake.run)
+    f.seed_turn(fake, 1, f.NOW - 60)
+    if case == "cooling":
+        rec = record(pr=2, acquired=f.NOW - g._TURN_TTL - 30, expires=f.NOW - 30)
+        fake.refs["refs/land-turn/pr-2"] = "e" * 40
+        fake.commits["e" * 40] = {"message": "land-turn pr=2\n\n" + json.dumps(rec)}
+    else:
+        monkeypatch.setattr(g, "_left", lambda: 0.1)
+    status, message = g.land_turn(2, f.R, f.H2563, env={})
+    assert status == 1
+    if case == "cooling":
+        assert "waiting record retained" in message
+        assert "no active waiting place" in message
+    else:
+        assert "first run" not in message
+
+
 def test_waiting_promotion_keeps_original_record_and_nontransitive_lanes():
     a = record(pr=1, files=["x"], acquired=f.NOW - 90)
     b = record(pr=2, files=["x", "y"], acquired=f.NOW - 60)

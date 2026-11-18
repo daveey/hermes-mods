@@ -2336,12 +2336,15 @@ def _turn_wait(number, data, repo, cwd, env, hold):
 
 
 def _waiting_receipt(rec, retained=False):
-    state = "retained" if retained else "recorded"
+    state = "waiting record retained" if retained else "waiting place recorded"
     timing = (f"expired at {_until(rec['expires'])}; cooling until {_until(rec['expires'] + _TURN_TTL)}"
               if rec["expires"] <= _now() else f"until {_until(rec['expires'])}")
-    message = (f"PR #{rec['pr']} waiting place {state} {timing} (refs/{_TURN_PREFIX}{rec['pr']}); "
+    message = (f"PR #{rec['pr']} {state} {timing} (refs/{_TURN_PREFIX}{rec['pr']}); "
                "this is not merge permission. Retry the full preflight; the fixed place expires "
                "even if the older holder has not finished.")
+    if retained:
+        message += (" There is no active waiting place during cooldown." if rec["expires"] <= _now()
+                    else " The unchanged record alone does not establish eligibility or an effective place.")
     receipt = _WAITING_RECEIPT.get()
     if receipt is not None:
         receipt["message"] = message
@@ -2440,7 +2443,7 @@ def _turn_acquire_scoped(number, data, repo, cwd, env, prechecked, waiting_hold=
                 other["pr"] != int(number) and _turn_order(rec) <= _turn_order(other)
                 and (turn_blocks(files, other["files"]) or turn_blocks(other["files"], files))
                 for _, other in snapshot):
-            return "[ship-only-guard] Waiting admission refused: cannot order after the published overlap snapshot; retry after clock convergence."
+            return "[ship-only-guard] Waiting admission refused: cannot order after the published overlap snapshot (including possibly released records); retry a complete snapshot after clock convergence or record expiry."
     rc, made = _gh_call([f"repos/{repo}/git/commits"], cwd, env, timeout=_TURN_CALL_TIMEOUT, payload={
         "message": f"{_TURN_SUBJECT}{int(number)}\n\n{json.dumps(rec, sort_keys=True)}\n",
         "tree": tree, "parents": [previous or head]})
@@ -2727,7 +2730,8 @@ def _state_merge_scoped(words, repo, cwd, env):
                 queued = _stage("waiting-place admission", _turn_safe, _turn_wait,
                                 number, data, repo, cwd, env, hold)
                 if not queued and _cache().get("turn_missed"):
-                    queued = _turn_follow_up(number, repo, sha)
+                    queued = (_turn_follow_up(number, repo, sha) if _TURN_ONLY.get() is None else
+                              "Waiting admission exhausted its budget; no new waiting record was confirmed. Retry after network/CI recovery.")
             return str(hold) + ("\n" + queued if queued else "") + ("\nAlso: " + drift if drift else "")
         if drift and "state commit(s) landed since then" in drift:
             remaining = _remaining()
