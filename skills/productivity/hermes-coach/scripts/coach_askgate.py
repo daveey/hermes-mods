@@ -872,13 +872,28 @@ def row_is_agent_note(row, data=None):
     return False
 
 
+@functools.lru_cache(maxsize=None)
+def _session_digest():
+    """scripts/session_digest.py loaded by path. A bare `import session_digest` only resolves when this scripts
+    directory happens to be on sys.path (CLI runs; or a test that an earlier test in the same xdist worker made
+    import it), so under the plugin's self_heal drain every call raised ImportError that still_flags swallowed and
+    the row was filed instead of withdrawn (CI: 3 plugins/coach failures on Python 3.14)."""
+    import importlib.util
+    p = Path(__file__).resolve().parent / "session_digest.py"
+    spec = importlib.util.spec_from_file_location("_askgate_session_digest", p)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def row_raw_generated(row, homes=None):
     """Recover erased restart provenance only with matching source content + time.
 
     Old digests stripped the System-note wrapper. Absence of source evidence is
     not evidence of automation. Never withdraw another turn in the same session.
     """
-    from session_digest import SYNTHETIC, flatten, clean_user, clip_user_turn
+    sd = _session_digest()
+    SYNTHETIC, flatten, clean_user, clip_user_turn = sd.SYNTHETIC, sd.flatten, sd.clean_user, sd.clip_user_turn
     s, t = row.get("session_id"), row_hit_t(row)
     q = _ws(str(row.get("quote") or "")).rstrip("…").strip()
     if not s or t is None or not q:
