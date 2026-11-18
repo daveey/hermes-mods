@@ -62,9 +62,31 @@ def test_another_subject_never_inherits(tmp_path, monkeypatch, subject):
     assert check(h, f'I re-read #3139 at 00:49Z. {subject} is still open.')
 
 
+@pytest.mark.parametrize('prefix', ['PRs', 'Pull requests', 'PR-', 'PR number', 'PR', 'PRs #'])
+@pytest.mark.parametrize('separator', [' and ', ' & ', ', ', ' or ', '/', ', and '])
+@pytest.mark.parametrize('last', ['3140', '#3140', '3189 and 3140'])
+def test_numbered_lists_require_every_read(tmp_path, monkeypatch, prefix, separator, last):
+    h = begin(tmp_path, monkeypatch)
+    write(h, tmp_path / 'r.sh')
+    run(h, tmp_path / 'r.sh')
+    assert check(h, f'{prefix} 3139{separator}{last} are still open.')
+
+
+@pytest.mark.parametrize('separator', [' and ', ' & ', ', ', ' or ', '/', ', and '])
+def test_numbered_lists_all_read(tmp_path, monkeypatch, separator):
+    h = begin(tmp_path, monkeypatch)
+    write(h, tmp_path / 'r.sh')
+    run(h, tmp_path / 'r.sh')
+    # Slash syntax also looks like a repository and conservatively nudges.
+    if separator != '/':
+        assert check(h, f'PRs 3139{separator}3189 are still open.') is None
+    else:
+        assert check(h, 'PRs 3139/3189 are still open.')
+
+
 # An explicit inventory makes expansion of the trust boundary reviewable.
 READERS = ('read_file', 'search_files', 'skill_view', 'skills_list',
-           'tool_describe', 'hermes_tool_search')
+           'tool_describe', 'tool_search')
 
 
 @pytest.mark.parametrize('reader', READERS)
