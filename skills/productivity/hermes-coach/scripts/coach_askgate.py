@@ -883,6 +883,10 @@ def row_raw_generated(row, homes=None):
     q = _ws(str(row.get("quote") or "")).rstrip("…").strip()
     if not s or t is None or not q:
         return False
+    exact_t = row.get("hit_t")
+    precise = isinstance(exact_t, (int, float)) and not isinstance(exact_t, bool)
+    start, end = (t - 2, t + 2) if precise else (t, t + 60)
+    matched = []
     for home in homes if homes is not None else [Path(os.environ.get("HERMES_HOME") or "~/.hermes").expanduser()]:
         db = Path(home) / "state.db"
         if not db.is_file():
@@ -891,20 +895,23 @@ def row_raw_generated(row, homes=None):
             con = _ro_connect(db)
             try:
                 rows = con.execute("select content from messages where session_id=? and role='user' "
-                                   "and timestamp between ? and ? limit 32", (s, t - 2, t + 2)).fetchall()
+                                   "and timestamp >= ? and timestamp " + ("<= ?" if precise else "< ?") +
+                                   " limit 33", (s, start, end)).fetchall()
             finally:
                 con.close()
-            matched = []
+            # An incomplete result could hide a matching human turn. Retain the
+            # candidate rather than infer provenance from a truncated sample.
+            if len(rows) > 32:
+                return False
             for (content,) in rows:
                 raw = flatten(content or "")
                 cleaned = clean_user(raw)
                 if any(_ws(v).startswith(q) for v in (raw, cleaned, clip_user_turn(cleaned))):
                     matched.append(bool(SYNTHETIC.match(raw)))
-            if matched and all(matched):
-                return True
         except (OSError, sqlite3.Error):
-            continue
-    return False
+            return False
+    # Another applicable home can hold a human copy with the same identity.
+    return bool(matched) and all(matched)
 
 
 def still_flags(row, homes=None, data=None):
