@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import sys
 import unittest
+import unicodedata
 
 ROOT = Path(__file__).resolve().parents[1]
 GLYPHS = '⏳⏱🔄👀🛑⛔ℹ✔✖⚠⏸'
@@ -121,6 +122,12 @@ def private_glyph_lists(source, relative):
             # already have decoded them. Decode only Unicode escapes, not \b.
             value = re.sub(r'\\u([0-9a-fA-F]{4})|\\U([0-9a-fA-F]{8})',
                            lambda m: chr(int(m.group(1) or m.group(2), 16)), node.value)
+            def named_escape(match):
+                try:
+                    return unicodedata.lookup(match.group(1))
+                except KeyError:
+                    return match.group()  # Not a valid regex Unicode name.
+            value = re.sub(r'\\N\{([^}]+)\}', named_escape, value)
             for match in re.finditer(r'(?<!\\)\[(?:\\.|[^\]\\])*\]', value):
                 if len(WATCHED.intersection(match.group())) >= 2:
                     failures.append((relative, node.lineno, self.function, match.group()))
@@ -174,6 +181,13 @@ class RuntimeNoticeContract(unittest.TestCase):
                 continue
             failures.extend(private_glyph_lists(path.read_text(), path.relative_to(ROOT).as_posix()))
         self.assertEqual([], failures)
+
+    def test_lint_named_unicode_escapes(self):
+        pattern = r'[\N{HEAVY CHECK MARK}\N{HOURGLASS WITH FLOWING SAND}]'
+        self.assertIsNotNone(re.fullmatch(pattern, '✔'))
+        self.assertIsNotNone(re.fullmatch(pattern, '⏳'))
+        source = 'PRIVATE = ' + repr(pattern)
+        self.assertTrue(private_glyph_lists(source, 'plugins/new/core.py'))
 
     def test_lint_literal_and_escaped_mutants(self):
         for source in ('PRIVATE = r"[✔⏳]"', 'PRIVATE = r"[\\u2714\\u23f3]"',
