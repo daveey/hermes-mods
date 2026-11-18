@@ -3259,6 +3259,19 @@ def _ro_connect(path, timeout=10):
 # as report_only/status_only pushes the child outside its brief and files defects for a handoff the brief asked for.
 SUBAGENT_EXEMPT_RULES = ("report_only", "status_only")
 
+# agent-df378b15af: hermes-mail runs a peer agent's prompt as a one-shot with `-t file,web,skills,inbox,todo --source
+# tool` (no terminal, Kanban, cross_session or delegation), wrapped in this envelope. Its final answer is the mailbox
+# reply to the requesting agent, which holds those tools and is judged on its own gateway: the subagent shape, so the
+# same rules are exempt. Keyed on the envelope (what the turn is), not the source tag, which other tools share.
+PEER_MAIL_OPEN = "[PEER MESSAGE from "
+PEER_MAIL_CLOSE = "[END PEER MESSAGE]"
+
+
+def peer_mail_turn(user_ask) -> bool:
+    """True when the turn's ask is a hermes-mail peer envelope: it opens with PEER_MAIL_OPEN and carries the close."""
+    text = str(user_ask or "").lstrip()
+    return text.startswith(PEER_MAIL_OPEN) and PEER_MAIL_CLOSE in text
+
 
 def is_subagent(session_id: str) -> bool:
     """True when state.db records this session as a delegate_task child (sessions.source = 'subagent'). Uses source,

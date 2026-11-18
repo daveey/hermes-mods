@@ -21,7 +21,7 @@ log = logging.getLogger("coach")
 # Nudge record events (see build(): one delivery and one outcome record per reply_nudge, by nudge_id).
 _DELIVERY_EVENTS = ("reply_nudge_delivered", "reply_nudge_undelivered", "reply_nudge_abandoned")
 _OUTCOME_EVENTS = ("reply_nudge_outcome", "nudge_outcome_lost", "nudge_outcome_subagent", "nudge_outcome_untracked",
-                   "nudge_outcome_missing")
+                   "nudge_outcome_missing", "nudge_outcome_peer_mail")
 # signals.collect_coach may close a nudge from HANDOFF_GRACE_S (15 min) on; an in-process close of a nudge older than
 # this first checks the log for that record, so a nudge never gets two.
 _NUDGE_LATE_S = 14 * 60
@@ -1141,7 +1141,9 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             only = list(cfg["rules"]) + (["unverified"] if repos and "unverified" not in cfg["rules"] else [])
             # agent-ee1b1162bc: a subagent reports to its parent agent, whose own final reply is judged; report_only
             # (incl. unverified_owner) and status_only don't hold the child. Its other rules still run.
-            sub = platform == "subagent" or rc.is_subagent(session_id)
+            # agent-df378b15af: a hermes-mail peer turn's reply goes back to the requesting agent the same way.
+            peer = rc.peer_mail_turn(ask)
+            sub = platform == "subagent" or rc.is_subagent(session_id) or peer
             if sub:
                 only = [r for r in only if r not in rc.SUBAGENT_EXEMPT_RULES]
             if not only:
@@ -1218,7 +1220,8 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                 store.log({"event": "reply_checked", "session_id": session_id, "platform": platform,
                            "candidates": rc.prefilter(final_response, log_lines), "ask_len": len(ask or ""),
                            **({"elapsed_s": _el} if _el is not None else {}),
-                           **({"guard": guard} if guard else {}), **({"subagent": True} if sub else {}),
+                           **({"guard": guard} if guard else {}),
+                           **({"peer_mail": True} if peer else {"subagent": True} if sub else {}),
                            **({"park": _park} if guard == "lifecycle_park" and (_park := rc.run_end_tool(log_lines))
                               else {})})
                 return None
