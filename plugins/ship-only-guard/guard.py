@@ -1496,7 +1496,6 @@ def _support_reach(repo, ref, path, cwd, env, once):
 _LOAD_ARG = {"import_module": 0, "__import__": 0, "run_module": 0, "run_path": 0, "spec_from_file_location": 1,
              "SourceFileLoader": 1, "SourcelessFileLoader": 1, "ExtensionFileLoader": 1, "load_source": 1,
              "load_compiled": 1, "load_dynamic": 1, "loadTestsFromName": 0, "loadTestsFromNames": 0}
-_LOAD_KEYWORDS = {"name", "path", "location", "pathname", "source", "path_name", "mod_name", "names"}
 _LOAD_BUILTIN = {"exec": 0, "eval": 0, "execfile": 0}       # bare-name calls only (`model.eval()` is no load)
 _LOAD_ALWAYS = {"discover"}                                 # unittest discovery imports whatever it finds
 _SUBPROCESS = {"run", "Popen", "call", "check_call", "check_output"}
@@ -1654,8 +1653,12 @@ def _dynamic_targets(closure):
                 index = _LOAD_BUILTIN[fname] if builtin else loaders[fname]
                 if any(isinstance(a, ast.Starred) for a in node.args) or any(k.arg is None for k in node.keywords):
                     return f"{where(node)}: {fname}() has unpacked arguments", None
-                target = node.args[index] if index < len(node.args) else next(
-                    (k.value for k in node.keywords if k.arg in _LOAD_KEYWORDS), None)
+                # A shared keyword-name list cannot prove a callable's signature:
+                # spec_from_file_location's name is not its location. Unknown
+                # routing stays broad, regardless of keyword order or literals.
+                if node.keywords:
+                    return f"{where(node)}: {fname}() has unproven keyword routing", None
+                target = node.args[index] if index < len(node.args) else None
                 why = (code if builtin else load)(node, target, f"{fname}()")
                 if why:
                     return why, None

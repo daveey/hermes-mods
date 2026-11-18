@@ -542,6 +542,51 @@ def test_wildcard_binding_invalidates_loader_literal(monkeypatch, tmp_path, star
     assert why and 'shared ~ tests/placement_support.py' in why
 
 
+@pytest.mark.parametrize('arguments', [
+    "name='subject', location='placement_' + 'support.py'",
+    "location='placement_' + 'support.py', name='subject'",
+    "'subject', location='placement_' + 'support.py'",
+])
+def test_keyword_loader_target_stays_shared(monkeypatch, tmp_path, arguments):
+    import subprocess
+    import sys
+
+    text = ('from importlib.util import spec_from_file_location, module_from_spec\n'
+            f'spec = spec_from_file_location({arguments})\n'
+            'subject = module_from_spec(spec)\n'
+            'spec.loader.exec_module(subject)\nassert subject.VALUE == 1\n')
+    script = tmp_path / 'test_x.py'
+    script.write_text(text)
+    support = tmp_path / 'placement_support.py'
+    support.write_text('VALUE = 1\n')
+    before = subprocess.run([sys.executable, '-B', str(script)], cwd=tmp_path,
+                            capture_output=True, text=True)
+    support.write_text('VALUE = 2\n')
+    after = subprocess.run([sys.executable, '-B', str(script)], cwd=tmp_path,
+                           capture_output=True, text=True)
+    assert before.returncode == 0, before.stderr
+    assert after.returncode != 0 and 'AssertionError' in after.stderr
+    tip = {'tests/__init__.py': '', SUPPORT: 'VALUE = 1\n', 'tests/test_x.py': text}
+    why = changed(tip, monkeypatch)
+    assert why and 'shared ~ tests/placement_support.py' in why
+
+
+@pytest.mark.parametrize('loader', sorted(set(g._LOAD_ARG) | set(g._LOAD_BUILTIN)))
+@pytest.mark.parametrize('arguments', [
+    "name='subject', location='other.py'",
+    "location='other.py', name='subject'",
+    "'subject', location='other.py'",
+    "'subject', 'other.py', unknown='literal'",
+])
+def test_loader_keyword_routing_is_unknown_by_default(monkeypatch, loader, arguments):
+    # This is a classifier contract, not an assertion that every signature accepts
+    # these arguments: no keyword-bearing call is certified by a generic name list.
+    text = f'{loader}({arguments})\n'
+    tip = {'tests/__init__.py': '', SUPPORT: 'VALUE = 1\n', 'tests/test_x.py': text}
+    why = changed(tip, monkeypatch)
+    assert why and 'shared ~ tests/placement_support.py' in why
+
+
 def test_uncalled_helper_loader_stays_shared(monkeypatch):
     # Do not infer a closed set of call sites for sync_test_support.require_module.
     text = 'import importlib\ndef require_module(test, name, package=None):\n    return importlib.import_module(name)\n'
