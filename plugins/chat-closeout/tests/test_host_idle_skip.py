@@ -460,3 +460,34 @@ def test_owner_wake_keeps_global_key_on_unrelated_board_churn(world, spy, clock,
     _host_tick(spy, clock, typing)
     plugin.owner_wake_tick()
     assert len(reads) == 2
+
+
+# per-section watchdog accounting (behavior-neutral attribution of the live watchdog_tick CPU) --------------------------
+_WD_SECTIONS = ('inputs', 'reader', 'unseen_counts', 'ledger_reads', 'unseen', 'closeout', 'ask',
+                'stuck_cards', 'stuck_ledger', 'handoffs', 'flags')
+
+
+def _wd_runs():
+    return {s: dict(la.counters().get(f'chat-closeout.watchdog.{s}') or {'runs': 0}).get('runs', 0)
+            for s in _WD_SECTIONS}
+
+
+def test_the_watchdog_counts_each_section_and_changes_no_outcome(world, spy, clock):  # noqa: F811
+    world['led'].write('c1', batch=[], open=[])
+    world['led'].write('c2', batch=[], open=[])
+    typing = lambda: clock.wall - 10  # noqa: E731
+    _host_tick(spy, clock, typing)
+    ledger_before = {r['session_id']: r for r in world['led'].pending()}
+    base = _wd_runs()
+    assert plugin.watchdog_tick() == []  # first keyed run: judges everything
+    full = {s: n - base[s] for s, n in _wd_runs().items()}
+    assert all(n == 1 for n in full.values()), full
+    assert {r['session_id']: r for r in world['led'].pending()} == ledger_before  # nothing written
+    clock.wall += 30
+    _host_tick(spy, clock, typing)
+    plugin._state.pop('pass_skip', None)
+    base = _wd_runs()
+    assert plugin.watchdog_tick() == []
+    assert plugin._state.pop('pass_skip', None) == 'watchdog_tick'  # skipped as before
+    skipped = {s: n - base[s] for s, n in _wd_runs().items()}
+    assert skipped['inputs'] == 1 and sum(skipped.values()) == 1, skipped  # only the key build ran

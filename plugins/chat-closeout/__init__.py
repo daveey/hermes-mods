@@ -3125,6 +3125,18 @@ def _watch_unchanged(hi: dict) -> bool:
     return not led.flags() and not routing.stalled(led, now, 0)
 
 
+def _wd_scope(section: str):
+    """A permanent per-section accounting scope inside ``watchdog_tick`` (``chat-closeout.watchdog.<section>``):
+    attributes the tick's CPU to its parts in the live loop-accounting read. Behavior-neutral (no outcome, clock or
+    threshold depends on it); its CPU is also inside ``chat-closeout.watchdog_tick``."""
+    return wi.accounting_pass(f"chat-closeout.watchdog.{section}")
+
+
+def _wd_session_gone(sid: str) -> bool:
+    with _wd_scope("session_gone"):
+        return _session_gone(sid)
+
+
 def watchdog_tick(*, now: Optional[float] = None, mono: Optional[float] = None,
                   unseen: Optional[dict[str, int]] = None, post: Optional[Callable[[str, str, str], Any]] = None,
                   force: bool = False, read: Optional[Callable[[list[str]], dict]] = None) -> list[str]:
@@ -3147,147 +3159,158 @@ def watchdog_tick(*, now: Optional[float] = None, mono: Optional[float] = None,
         except Exception:
             logger.warning("chat-closeout: relinking open watchdog cards failed; retrying next tick", exc_info=True)
     keyed = (post is None and now is None and mono is None and unseen is None and read is None and not force)
-    hi = _host_inputs() if keyed else None
-    if hi is not None and _watch_unchanged(hi):
-        _state["pass_skip"] = "watchdog_tick"
-        return []
+    with _wd_scope("inputs"):
+        hi = _host_inputs() if keyed else None
+        if hi is not None and _watch_unchanged(hi):
+            _state["pass_skip"] = "watchdog_tick"
+            return []
     post = post or file_card
     now = time.time() if now is None else now
     mono = time.monotonic() if mono is None else mono
-    read = read or _pass_reader()
-    _upgraded(read)
+    with _wd_scope("reader"):
+        read = read or _pass_reader()
+        _upgraded(read)
     led = ledger()
-    unseen = _unseen_counts() if unseen is None else unseen
+    with _wd_scope("unseen_counts"):
+        unseen = _unseen_counts() if unseen is None else unseen
     if unseen is None:
         return []
     seen_mono: dict[str, float] = _state.setdefault("mono_seen", {})
     candidates: list[tuple[str, str, str]] = []
     observed: set[str] = set()  # detection predicates, before sleep-safe age gates
     uncertain: set[str] = set()
-    flagged = set(led.flags())
-    pending = led.pending()  # one ledger read for every check below (none of them writes the waiting rows)
-    for sid, since in led.unseen_since({s: n for s, n in unseen.items() if n > 0}, now).items():
-        key = f"chat-closeout:unseen:{sid}:{int(since)}"
-        if now - since >= core.STALE_S and _session_gone(sid):
-            continue  # a deleted chat: no route can ever hand it these notices (checked only once stale: cheap idle)
-        observed.add(key)
-        first = seen_mono.setdefault(key, mono)
-        if now - since < core.STALE_S or mono - first < core.STALE_S:
-            continue
-        msg = (f"Chat {sid} has had {unseen[sid]} kanban result(s) nobody handed to it for "
-               f"{int((now - since) / 60)} min.")
-        candidates.append((key, f"Kanban results stuck for chat {sid}", msg + " Check the "
-                           "unloaded-session sweeper in gui.log and deliver the notices via an agent route."))
-    for row in pending:
-        sig, at = row.get("settled_sig"), row.get("settled_at")
-        if not sig or not at or sig == row.get("done_sig"):
-            continue
-        key = f"chat-closeout:no-closeout:{row['session_id']}:{sig}"
-        cards = read(row["batch"])
-        if any(core.is_unknown(cards.get(t)) for t in row['batch']):
-            uncertain.add(key)
-            continue  # a failed inventory read cannot prove the incident cleared
-        if row.get("closing") is None and core.closeout_key(row, cards) != sig:
-            continue  # reported since, or the batch moved on (a woken turn still in flight stays watched)
-        if now - float(at) >= core.STALE_S and _session_gone(row["session_id"]):
-            continue  # positive deletion evidence wins even during a quota clock wait
-        if _quota_wait(row, now):
-            seen_mono.setdefault(key, mono)
-            uncertain.add(key)
-            continue  # paused, not cleared: retain the incident and its observation age
-        observed.add(key)
-        first = seen_mono.setdefault(key, mono)
-        if now - float(at) < core.STALE_S or mono - first < core.STALE_S:
-            continue
-        msg = (f"Chat {row['session_id']}: its {len(row['batch'])} card(s) ({', '.join(row['batch'][:6])}) "
-               f"settled {int((now - float(at)) / 60)} min ago and no close-out turn ran "
-               f"(last wake: {row.get('wake_result') or 'none'}).")
-        candidates.append((key, f"No close-out for chat {row['session_id']}", msg))
-    for row in pending:
-        since = row.get("failure_since")
-        if since is None:
-            continue
-        sig = core.ask_relay_key(row, read(row["batch"]))
-        if not sig:
-            continue
-        key = f"chat-closeout:ask-failed:{row['session_id']}:{int(since)}"
-        if _quota_wait(row, now):
-            seen_mono.setdefault(key, mono)
-            uncertain.add(key)
-            continue  # paused, not cleared
-        observed.add(key)
-        first = seen_mono.setdefault(key, mono)
-        if now - since >= core.STALE_S and mono - first >= core.STALE_S:
-            candidates.append((key, f"Ask relay stuck for chat {row['session_id']}",
-                               f"Chat {row['session_id']}: ask relay has not been delivered for "
-                               f"{int((now-since)/60)} min (last result: {row.get('wake_result')})."))
-    # A row pending for a day with nothing found still working and something nobody can resolve (missing, or an
-    # unknown/stale remote row): no close-out can ever run for it. One card per row episode (key = the persisted
-    # first-seen time). Wall age >= STUCK_S plus STALE_S of this process's monotonic observation, so a lid sleep
-    # alone never files it; a full day of uptime is not required (a backend restart would never let it fire).
-    # An entry whose unlink clock (``core.track_unlinked``) is still advancing is owned by the automatic unlink: that
-    # clock counts only healthy observed time, so on a sleeping laptop wall time passes STUCK_S first, and filing
-    # then would report a row the unlink resolves on its own. A clock that stopped advancing (unhealthy inventory,
-    # an uncertain entry, or none at all) still counts.
+    with _wd_scope("ledger_reads"):
+        flagged = set(led.flags())
+        pending = led.pending()  # one ledger read for every check below (none of them writes the waiting rows)
+    with _wd_scope("unseen"):
+        for sid, since in led.unseen_since({s: n for s, n in unseen.items() if n > 0}, now).items():
+            key = f"chat-closeout:unseen:{sid}:{int(since)}"
+            if now - since >= core.STALE_S and _wd_session_gone(sid):
+                continue  # a deleted chat: no route can ever hand it these notices (checked only once stale: cheap idle)
+            observed.add(key)
+            first = seen_mono.setdefault(key, mono)
+            if now - since < core.STALE_S or mono - first < core.STALE_S:
+                continue
+            msg = (f"Chat {sid} has had {unseen[sid]} kanban result(s) nobody handed to it for "
+                   f"{int((now - since) / 60)} min.")
+            candidates.append((key, f"Kanban results stuck for chat {sid}", msg + " Check the "
+                               "unloaded-session sweeper in gui.log and deliver the notices via an agent route."))
+    with _wd_scope("closeout"):
+        for row in pending:
+            sig, at = row.get("settled_sig"), row.get("settled_at")
+            if not sig or not at or sig == row.get("done_sig"):
+                continue
+            key = f"chat-closeout:no-closeout:{row['session_id']}:{sig}"
+            cards = read(row["batch"])
+            if any(core.is_unknown(cards.get(t)) for t in row['batch']):
+                uncertain.add(key)
+                continue  # a failed inventory read cannot prove the incident cleared
+            if row.get("closing") is None and core.closeout_key(row, cards) != sig:
+                continue  # reported since, or the batch moved on (a woken turn still in flight stays watched)
+            if now - float(at) >= core.STALE_S and _wd_session_gone(row["session_id"]):
+                continue  # positive deletion evidence wins even during a quota clock wait
+            if _quota_wait(row, now):
+                seen_mono.setdefault(key, mono)
+                uncertain.add(key)
+                continue  # paused, not cleared: retain the incident and its observation age
+            observed.add(key)
+            first = seen_mono.setdefault(key, mono)
+            if now - float(at) < core.STALE_S or mono - first < core.STALE_S:
+                continue
+            msg = (f"Chat {row['session_id']}: its {len(row['batch'])} card(s) ({', '.join(row['batch'][:6])}) "
+                   f"settled {int((now - float(at)) / 60)} min ago and no close-out turn ran "
+                   f"(last wake: {row.get('wake_result') or 'none'}).")
+            candidates.append((key, f"No close-out for chat {row['session_id']}", msg))
+    with _wd_scope("ask"):
+        for row in pending:
+            since = row.get("failure_since")
+            if since is None:
+                continue
+            sig = core.ask_relay_key(row, read(row["batch"]))
+            if not sig:
+                continue
+            key = f"chat-closeout:ask-failed:{row['session_id']}:{int(since)}"
+            if _quota_wait(row, now):
+                seen_mono.setdefault(key, mono)
+                uncertain.add(key)
+                continue  # paused, not cleared
+            observed.add(key)
+            first = seen_mono.setdefault(key, mono)
+            if now - since >= core.STALE_S and mono - first >= core.STALE_S:
+                candidates.append((key, f"Ask relay stuck for chat {row['session_id']}",
+                                   f"Chat {row['session_id']}: ask relay has not been delivered for "
+                                   f"{int((now-since)/60)} min (last result: {row.get('wake_result')})."))
+        # A row pending for a day with nothing found still working and something nobody can resolve (missing, or an
+        # unknown/stale remote row): no close-out can ever run for it. One card per row episode (key = the persisted
+        # first-seen time). Wall age >= STUCK_S plus STALE_S of this process's monotonic observation, so a lid sleep
+        # alone never files it; a full day of uptime is not required (a backend restart would never let it fire).
+        # An entry whose unlink clock (``core.track_unlinked``) is still advancing is owned by the automatic unlink: that
+        # clock counts only healthy observed time, so on a sleeping laptop wall time passes STUCK_S first, and filing
+        # then would report a row the unlink resolves on its own. A clock that stopped advancing (unhealthy inventory,
+        # an uncertain entry, or none at all) still counts.
     stuck: dict[str, list[str]] = {}
     guard: dict[str, list[str]] = {}  # entries held out of ``stuck`` only because their unlink clock still advances
-    for row in pending:
-        cards = read(row["batch"])
-        clocks = row.get("unlinked") or {}
-        unresolved = [t for t in row["batch"] if core.is_unresolved(cards.get(t))]
-        unknown = [t for t in unresolved if not core.unlink_clock_active(clocks.get(t), now)]
-        working = [t for t in row["batch"] if core.is_working(cards.get(t))]
-        if unknown and not working:
-            stuck[row["session_id"]] = unknown
-        elif len(unknown) < len(unresolved) and not working:
-            guard[row["session_id"]] = [t for t in unresolved if t not in unknown]
-    for sid, since in led.stuck_since(stuck, now).items():
-        key = f"chat-closeout:stuck:{sid}:{int(since)}"
-        observed.add(key)
-        first = seen_mono.setdefault(key, mono)
-        if now - since < core.STUCK_S or mono - first < core.STALE_S:
-            continue
-        candidates.append((key, f"Chat {sid} waits on cards nothing can find",
-                           f"Chat {sid} has waited {int((now - since) / 3600)} h on card(s) that no board or remote "
-                           f"inventory resolves or settles ({', '.join(stuck[sid][:6])}: missing, stale, or done "
-                           "without owner evidence such as an origin binding) and nothing it waits on is still "
-                           "working, so no close-out can run. Check whether these cards moved, were deleted, "
-                           "are on a gateway this one no longer syncs, or lack their owner's release; reconcile the "
-                           "ledger row or restore the "
-                           "link. Entries missing, or found but stranded (a row the fresh replica no longer publishes, or done "
-                           "without owner evidence), through 24 h of healthy inventory reads are unlinked "
-                           "automatically."))
-    for handoff in routing.stalled(led, now, 0):
-        key = f"chat-closeout:handoff:{handoff['id']}"
-        observed.add(key)
-        first = seen_mono.setdefault(key, mono)
-        if now - handoff['created_at'] < core.STALE_S or mono - first < core.STALE_S:
-            continue
-        candidates.append((key, f"Ask handoff unconfirmed for chat {handoff['session_id']}",
-                           f"Courier request {handoff['id']} for chat {handoff['session_id']} has no "
-                           "successful delivery receipt. Inspect the target before retrying; do not resend "
-                           "an uncertain send automatically."))
+    with _wd_scope("stuck_cards"):
+        for row in pending:
+            cards = read(row["batch"])
+            clocks = row.get("unlinked") or {}
+            unresolved = [t for t in row["batch"] if core.is_unresolved(cards.get(t))]
+            unknown = [t for t in unresolved if not core.unlink_clock_active(clocks.get(t), now)]
+            working = [t for t in row["batch"] if core.is_working(cards.get(t))]
+            if unknown and not working:
+                stuck[row["session_id"]] = unknown
+            elif len(unknown) < len(unresolved) and not working:
+                guard[row["session_id"]] = [t for t in unresolved if t not in unknown]
+    with _wd_scope("stuck_ledger"):
+        for sid, since in led.stuck_since(stuck, now).items():
+            key = f"chat-closeout:stuck:{sid}:{int(since)}"
+            observed.add(key)
+            first = seen_mono.setdefault(key, mono)
+            if now - since < core.STUCK_S or mono - first < core.STALE_S:
+                continue
+            candidates.append((key, f"Chat {sid} waits on cards nothing can find",
+                               f"Chat {sid} has waited {int((now - since) / 3600)} h on card(s) that no board or remote "
+                               f"inventory resolves or settles ({', '.join(stuck[sid][:6])}: missing, stale, or done "
+                               "without owner evidence such as an origin binding) and nothing it waits on is still "
+                               "working, so no close-out can run. Check whether these cards moved, were deleted, "
+                               "are on a gateway this one no longer syncs, or lack their owner's release; reconcile the "
+                               "ledger row or restore the "
+                               "link. Entries missing, or found but stranded (a row the fresh replica no longer publishes, or done "
+                               "without owner evidence), through 24 h of healthy inventory reads are unlinked "
+                               "automatically."))
+    with _wd_scope("handoffs"):
+        for handoff in routing.stalled(led, now, 0):
+            key = f"chat-closeout:handoff:{handoff['id']}"
+            observed.add(key)
+            first = seen_mono.setdefault(key, mono)
+            if now - handoff['created_at'] < core.STALE_S or mono - first < core.STALE_S:
+                continue
+            candidates.append((key, f"Ask handoff unconfirmed for chat {handoff['session_id']}",
+                               f"Courier request {handoff['id']} for chat {handoff['session_id']} has no "
+                               "successful delivery receipt. Inspect the target before retrying; do not resend "
+                               "an uncertain send automatically."))
     failures: dict[str, int] = _state.setdefault("post_failures", {})
     for k in [k for k in seen_mono if k not in observed and k not in uncertain]:
         seen_mono.pop(k, None)
         failures.pop(k, None)
-    for key in flagged:
-        if key in uncertain or not _WATCHDOG_KEY.match(key):
-            continue  # only this watchdog's own well-formed incidents are reconciled
-        if key in observed:
-            led.reset_resolution(key)
-            continue
-        try:
-            evidence = _cleared_evidence(key, unseen, led)
-            if evidence is None:
-                led.reset_resolution(key)  # discard a prior, no-longer-valid positive observation
+    with _wd_scope("flags"):
+        for key in flagged:
+            if key in uncertain or not _WATCHDOG_KEY.match(key):
+                continue  # only this watchdog's own well-formed incidents are reconciled
+            if key in observed:
+                led.reset_resolution(key)
                 continue
-            resolution = led.resolution(key, now, evidence)
-            if resolve_card(key, resolution):
-                led.clear_flag(key)
-        except Exception:
-            logger.warning("chat-closeout: resolving watchdog incident %s failed; retrying next tick", key,
-                           exc_info=True)
+            try:
+                evidence = _cleared_evidence(key, unseen, led)
+                if evidence is None:
+                    led.reset_resolution(key)  # discard a prior, no-longer-valid positive observation
+                    continue
+                resolution = led.resolution(key, now, evidence)
+                if resolve_card(key, resolution):
+                    led.clear_flag(key)
+            except Exception:
+                logger.warning("chat-closeout: resolving watchdog incident %s failed; retrying next tick", key,
+                               exc_info=True)
     candidates = [c for c in candidates if not led.has_flag(c[0]) and failures.get(c[0], 0) < MAX_POST_ATTEMPTS]
     if (keyed and hi is not None and not observed and not uncertain and not flagged and not candidates
             and not stuck):

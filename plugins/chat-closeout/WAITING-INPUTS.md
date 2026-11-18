@@ -118,3 +118,12 @@ budget is `waiting + waiting_inputs`, not the sum of all four spans. Read the co
 windows), then reports each loop's CPU as a percentage of one core. Wall/monotonic clocks advance coherently
 for all production readers, including floor and freshness deadlines; CPU timers remain real. Budget overruns
 exit 1 (use `--diagnostic` only for explicitly non-acceptance comparisons). See the PR for before/after numbers.
+
+## Watchdog section accounting
+
+`watchdog_tick` runs its parts inside permanent, behavior-neutral accounting scopes, so a live
+`~/.hermes/run/loop-accounting/<pid>.json` read attributes its CPU: `chat-closeout.watchdog.<section>` with sections
+`inputs` (key build and skip check), `reader`, `unseen_counts`, `ledger_reads`, `unseen`, `closeout`, `ask`,
+`stuck_cards`, `stuck_ledger`, `handoffs`, `flags`, and `session_gone` (the deleted-chat probes, nested in the loop
+sections). Their CPU is also inside `chat-closeout.watchdog_tick`; sections nest, so do not add `session_gone` to its
+parent. No threshold, clock, TTL or outcome depends on them.
