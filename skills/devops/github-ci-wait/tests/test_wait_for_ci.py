@@ -206,6 +206,42 @@ class ResolveRepoTests(unittest.TestCase):
         self.assertEqual(git.call_args_list[0].args[0], self.repo)
         self.assertEqual(git.call_args_list[0].args[1], "fetch")
 
+    def test_bare_clone_is_a_usable_repo(self):
+        # agent-7861ec636f: a scratch `git clone --bare` (cheap, no working tree, never contends a live checkout)
+        # was refused as "not a git checkout", so the CI wait exited 1 although every git call it makes (fetch with
+        # an explicit refspec, rev-parse, merge-base, tag, remote get-url) works in a bare repository.
+        bare = self._bare_clone()
+        self.assertEqual(w.resolve_repo(bare, "me/proj"), bare)
+        self.assertEqual(w.resolve_repo(bare), bare)
+
+    def test_cli_waits_from_a_bare_clone_end_to_end(self):
+        # The real path: real git in a bare clone (fetch, rev-parse, containment); only the gh listing is faked.
+        from unittest import mock
+        bare = self._bare_clone()
+        sha = self._upstream_head
+        green = {"databaseId": 7, "headSha": sha, "status": "completed", "conclusion": "success",
+                 "workflowName": "tests", "url": "https://example.com/r/7", "event": "push"}
+        with mock.patch.object(w, "list_runs", return_value=[green]):
+            rc = w.main([sha, "--repo", str(bare), "--gh-repo", "me/proj", "--branch", "state", "--once"])
+        self.assertEqual(rc, 0)
+
+    def _bare_clone(self) -> Path:
+        import subprocess
+        up = self.home / "upstream"
+        up.mkdir()
+        env = dict(GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.com", GIT_COMMITTER_NAME="t",
+                   GIT_COMMITTER_EMAIL="t@example.com")
+        import os
+        env = {**os.environ, **env}
+        subprocess.run(["git", "init", "-q", "-b", "state", str(up)], check=True)
+        subprocess.run(["git", "-C", str(up), "commit", "-q", "--allow-empty", "-m", "c1"], check=True, env=env)
+        self._upstream_head = subprocess.run(["git", "-C", str(up), "rev-parse", "HEAD"], check=True,
+                                             capture_output=True, text=True).stdout.strip()
+        bare = self.home / "scratch" / "proj.git"
+        subprocess.run(["git", "clone", "-q", "--bare", "--single-branch", "--branch", "state", str(up), str(bare)],
+                       check=True)
+        return bare
+
     def test_cli_from_a_plain_cwd_without_a_checkout_exits_before_any_git_call(self):
         git, err = self._main_in_plain_cwd(["abc1234", "--gh-repo", "someone/proj", "--once"])
         self.assertIsInstance(err, SystemExit)

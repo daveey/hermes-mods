@@ -361,8 +361,15 @@ def list_runs(repo: Path, branch: str, workflows: list[str], slug: str | None = 
 
 
 def is_checkout(path: Path) -> bool:
-    out = subprocess.run(["git", "-C", str(path), "rev-parse", "--is-inside-work-tree"], capture_output=True, text=True)
-    return out.returncode == 0 and out.stdout.strip() == "true"
+    """A git repository the wait can run in: a working tree, or a bare repository (agent-7861ec636f).
+
+    Every git call of the wait (fetch with an explicit refspec, rev-parse, merge-base, tag, remote get-url) works in
+    a bare repository, and a scratch `git clone --bare` is the cheap way to wait without touching a live checkout.
+    Refusing it made a correct wait exit 1 ("not a git checkout"), or with --gh-repo silently swapped in another
+    checkout. The inside of a `.git` directory is still refused: `--is-bare-repository` is false there."""
+    out = subprocess.run(["git", "-C", str(path), "rev-parse", "--is-inside-work-tree", "--is-bare-repository"],
+                         capture_output=True, text=True)
+    return out.returncode == 0 and "true" in out.stdout.split()
 
 
 def durable_checkout(path: Path) -> Path:
