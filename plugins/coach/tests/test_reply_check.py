@@ -421,6 +421,25 @@ def test_parse_confirm_counts_a_vague_offer_on_a_fixable_problem():
     assert rc.parse_confirm('{"outcome": "proposed", "agent_fixable": true}')[0] == 0.1
 
 
+# agent-7abafd6255 (2026-11-18, Desktop): asked "what's going on with this session?", the reply diagnosed a scale-down
+# interruption, said "The next meaningful step is to reconcile ... fix it if still present ... That is agent work, not
+# another approval needed from you." and stopped. Screen p 0.9; the second opinion labelled it "proposed" in 2 of 3
+# live replays (0.1, no nudge) and the user had to ask "so are you doing it?". A next step nobody has to approve is
+# "planned", which nudges.
+ASG_REPLY_TAIL = ("The next meaningful step is to reconcile the deployed scale-down behavior with that interruption, "
+                  "fix it if still present, and close the satisfied requirements\u2014not launch another generic test "
+                  "or add another watcher. That is agent work, not another approval needed from you.")
+
+
+def test_parse_confirm_counts_an_unstarted_plan_that_needs_no_go():
+    raw = json.dumps({"problem": True, "agent_fixable": True, "outcome": "planned", "user_wanted_action": False,
+                      "quote": ASG_REPLY_TAIL[:120]})
+    assert rc.parse_confirm(raw)[0] == 0.9
+    assert rc.parse_confirm('{"outcome": "planned", "agent_fixable": false}')[0] == 0.1
+    # the rubric tells the judge that a plan nobody has to approve is not "proposed"
+    assert '"planned"' in rc.CONFIRM_SYS and "waits on the user's go" in rc.CONFIRM_SYS
+
+
 def test_every_confirm_outcome_label_is_classified():
     """A label CONFIRM_SYS offers the model must be classified on purpose: one that falls through to 0.1 by default is
     how "offered" silently vetoed every vague-offer stall (agent-fdfab26745)."""

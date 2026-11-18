@@ -3699,7 +3699,8 @@ Return ONLY one JSON object:
 - outcome (pick the best fit for the unresolved problem the reply is mainly about):
   "fixed": the agent itself fixed or changed the thing during this turn (edited code/config, ran the command that resolves it), even if final verification is pending.
   "started": the agent started a concrete fix that is now in progress and says so (spawned/assigned a worker, card, subagent or background job specifically to fix it, opened a PR). A Kanban worker that checkpointed its own card with kanban_continue this turn has started the leftovers that checkpoint carries to the card's next run. """ + STALLED_OWNER + """ Such a card (failed start attempts, parked on quota or "No eligible deep routes", "starts by itself" after a reset) is "report_only", not "started", unless the agent did the work this turn or re-placed it on a gateway that can run it. A Kanban worker's own kanban_block(kind=dependency) behind such a card is not a started fix either. """ + UNLINKED_WAIT + """
-  "proposed": no fix yet, but the reply proposes a concrete solution or plan (what would change and how), possibly asking for a go-ahead.
+  "proposed": no fix yet, but the reply proposes a concrete solution or plan (what would change and how) that genuinely waits on the user's go: it asks for a go-ahead or a choice, and the step is new scope, a change to acceptance/safety/permissions/budget, spend, or otherwise a decision only the user can make.
+  "planned": no fix yet, and the reply names the concrete next step the agent itself should take, but no go-ahead is needed (the reply says it is agent work / needs nothing from the user / "the next step is ...", or it is a fix inside work the user already approved), and the turn ended without doing or starting it. A plan nobody has to approve is not a proposal.
   "offered": only a vague offer ("want me to fix it?", "I can look into it") with no concrete solution.
   "report_only": the reply describes or diagnoses the problem, or says it is not fixed / can be ignored / is owned by an existing task / was relayed to someone, WITHOUT fixing it, starting a new fix, or proposing a concrete solution.
   "na": no unresolved problem in the reply (a pure answer, finished work, chit-chat).
@@ -3983,7 +3984,7 @@ def prev_turn_section(prev_turn: Optional[dict], tool_log: list[str]) -> str:
             f"PREVIOUS TURN'S FINAL MESSAGE (head):\n{head}\n\n")
 
 
-CONFIRM_POSITIVE = ("report_only", "offered")
+CONFIRM_POSITIVE = ("report_only", "offered", "planned")
 CONFIRM_NEGATIVE = ("fixed", "started", "proposed", "na")
 
 
@@ -3992,7 +3993,10 @@ def parse_confirm(raw: str) -> Optional[tuple]:
 
     "offered" counts (agent-fdfab26745): a vague "I can run a deeper live check next" on a fixable leftover is the
     report_only stall the screen rule names ("a vague 'want me to look into it?' is not a proposal"). Scored 0.1 it
-    vetoed a 0.99 screen and the user had to type "resume" two days later. Every label CONFIRM_SYS offers is in
+    vetoed a 0.99 screen and the user had to type "resume" two days later. "planned" counts for the same reason
+    (agent-7abafd6255): "The next meaningful step is to reconcile ... fix it if still present ... That is agent work,
+    not another approval needed from you." was labelled "proposed" 2 of 3 replays, vetoing a 0.9 screen, and the user
+    had to ask "so are you doing it?". "proposed" now means a plan that waits on the user's go. Every label CONFIRM_SYS offers is in
     CONFIRM_POSITIVE or CONFIRM_NEGATIVE (test_every_confirm_outcome_label_is_classified)."""
     m = re.search(r"\{.*\}", raw or "", re.S)
     if not m:
