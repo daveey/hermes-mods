@@ -188,7 +188,11 @@ def write_texts(tool_name: str, args: Any) -> list[str]:
         return [] if str(args.get("action") or "spawn").lower() in ("list", "stop") else [json.dumps(args, default=str)]
     if name in SHELL_TOOLS:
         command = " ; ".join(str(args[key]) for key in ("command", "input", "data") if args.get(key))
-        return shell_write_texts(command)
+        # Process input is interpreted by an existing consumer, not necessarily
+        # a fresh shell. Only a terminal's command-only field can prove inertness.
+        if name in {'terminal', 'run_in_user_terminal'} and not any(args.get(k) for k in ('input', 'data')):
+            return shell_write_texts(command)
+        return [command] if _SHELL_WRITE_RE.search(command) else []
     if name == "execute_code":
         code = str(args.get("code") or "")
         return [code] if _SHELL_WRITE_RE.search(code) or "kanban_" in code else []
@@ -216,12 +220,11 @@ def shell_write_texts(command: str) -> list[str]:
         # Preserve its entire text (including all targets), even when one parsed
         # segment already exposes another write. Only whole-input G may exempt.
         return [command] if _SHELL_WRITE_RE.search(command) else []
-    writes = []
-    for seg in core._segments(command):
-        parsed = core._kanban_verb(seg)
-        if parsed and _SHELL_WRITE_RE.search('kanban ' + parsed[0]):
-            writes.append(' '.join(parsed[1]))
-    return writes
+    # A literal hermes command is executable, including chat prompts and stdin.
+    # Preserve main's raw match and all targets rather than narrowing to a verb.
+    if any(seg and seg[0] == 'hermes' for seg in core._segments(command)):
+        return [command] if _SHELL_WRITE_RE.search(command) else []
+    return []
 
 
 def check_relay(tool_name: str, args: Any, sessions: Iterable[str], env=None,
