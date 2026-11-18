@@ -333,19 +333,31 @@ def _glob_bracket(raw: str, i: int) -> bool:
 _DEFERRING = RUNNERS | _INTERPRETERS | {"source", ".", "eval"}
 
 
-def _defers_unseen(words) -> bool:
+def _defers_unseen(words, st=None) -> bool:
     """True if a word of ``words`` may name a program that runs input the guard cannot see.
 
     Inside a hypothetical argv suffix the guard does not split again, so a nested runner
     (``xargs -a FILE git``, ``parallel``, ``flock M …``) or an interpreter reading a script
     file never has its own argv suffixes, appended words or file analyzed. Scoping the
     uncertainty of such an argv locally would drop exactly the evidence it hides.
+
+    With ``st`` each word is classified by the value command dispatch would see, expanded
+    through the same scalar state (``X=xargs; … "$X" -a args git``), not only by its literal
+    spelling. A word naming a shell function counts too: its body is not analyzed at this
+    depth. A word whose value is unknown is not classified here; the caller's Git reading of
+    the argv handles an unknown command or subcommand position.
     """
     for w in words:
-        lit = _literal(w) or ""
-        base = re.sub(r"[\d.]+$", "", os.path.basename(lit)) or os.path.basename(lit)
-        if base in _DEFERRING or os.path.basename(lit) in _DEFERRING:
-            return True
+        values = {_literal(w) or ""}
+        if st is not None:
+            values.add(_expand_word(w, st.vars) or "")
+        for value in values:
+            name = os.path.basename(value)
+            base = re.sub(r"[\d.]+$", "", name) or name
+            if base in _DEFERRING or name in _DEFERRING:
+                return True
+            if st is not None and value and value in st.funcs:
+                return True
     return False
 
 
@@ -1979,7 +1991,7 @@ class _Analyzer:
         except _ParseError:
             # Expanded words carry scalar evidence that the raw text may only hold split.
             if (self.suffix and self.suffix[0] is node and self.suffix[1] is not None
-                    and not _defers_unseen(wrapper_words)):
+                    and not _defers_unseen(words, st)):
                 # The parser established this argv's boundaries. Failure to resolve a
                 # hypothetical wrapper suffix is local, not a failed shell parse: it
                 # cannot turn quoted data elsewhere into an executable Git operation.
@@ -2022,7 +2034,7 @@ class _Analyzer:
             # Unknown command name: it may be git itself, or a wrapper of a later word.
             suffix = self.suffix if self.suffix and self.suffix[0] is node else None
             if (suffix and suffix[1] is not None and not _splittable(raw[0])
-                    and not _defers_unseen(raw[1:])):
+                    and not _defers_unseen(raw[1:], st)):
                 # A hypothetical suffix of a known program's argv (`grep -- "$l" "$f"` read
                 # as if grep ran "$f"), headed by a word that stays one word: the uncertainty
                 # is this argv's alone, and the rest of the command was parsed and analyzed,

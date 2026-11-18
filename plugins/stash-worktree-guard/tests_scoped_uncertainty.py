@@ -163,8 +163,32 @@ WRAPPER_DEFERRED = {
     "deferred-env-assign-parallel": "A=$(printf A=1); " + _ARGS + 'flock /tmp/l env "$A" parallel -a args.txt git',
     "deferred-env-assign-python": "A=$(printf A=1); printf 'import os; os.system(\"git stash pop\")' > s.py; "
                                   'flock /tmp/l env "$A" python3 s.py',
+    # The runner or interpreter named through a known variable: classified by the value
+    # dispatch sees, not by its literal spelling (round-6 review 5948911889).
+    "deferred-known-var-xargs": "X=xargs; A=$(printf A=1); " + _ARGS + 'flock /tmp/l env "$A" "$X" -a args.txt git',
+    "deferred-known-var-xargs-braced": "X=xargs; A=$(printf A=1); " + _ARGS
+                                       + 'flock /tmp/l env "$A" "${X}" -a args.txt git',
+    "deferred-known-var-xargs-unquoted": "X=xargs; A=$(printf A=1); " + _ARGS
+                                         + 'flock /tmp/l env "$A" $X -a args.txt git',
+    "deferred-known-var-xargs-path": "X=/usr/bin/xargs; A=$(printf A=1); " + _ARGS
+                                     + 'flock /tmp/l env "$A" "$X" -a args.txt git',
+    "deferred-known-var-xargs-after-nice": "X=xargs; A=$(printf A=1); " + _ARGS
+                                           + 'flock /tmp/l env "$A" nice "$X" -a args.txt git',
+    "deferred-known-var-python": "X=python3; A=$(printf A=1); "
+                                 "printf 'import os; os.system(\"git stash pop\")' > s.py; "
+                                 'flock /tmp/l env "$A" "$X" s.py',
+    "deferred-known-var-flock-head": "X=xargs; A=$(printf env); " + _ARGS
+                                     + 'flock /tmp/l "$A" "$X" -a args.txt git',
 }
 REFUSE.update(WRAPPER_DEFERRED)
+# A word naming a shell function defers too: its body is not analyzed at this depth.
+# (Conservative only: env cannot run a function, so there is no real-bash proof.)
+REFUSE["deferred-function-name"] = ("x() { xargs \"$@\"; }; A=$(printf A=1); " + _ARGS
+                                    + 'flock /tmp/l env "$A" x -a args.txt git')
+ALLOW["deferred-control-known-var-grep"] = ("X=grep; A=$(printf A=1); " + _ARGS
+                                            + 'flock lock env "$A" "$X" -c pop args.txt')
+ALLOW["deferred-control-known-var-cat"] = ("X=cat; A=$(printf A=1); " + _ARGS
+                                           + 'flock lock env "$A" "$X" args.txt')
 # Controls: the same consumed head before a program that runs nothing stays allowed.
 ALLOW["deferred-control-grep"] = "A=$(printf A=1); " + _ARGS + 'flock lock env "$A" grep -c pop args.txt'
 ALLOW["deferred-control-cat"] = "A=$(printf A=1); " + _ARGS + 'flock lock env "$A" cat args.txt'
