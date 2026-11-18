@@ -164,19 +164,26 @@ def collect(request: dict) -> dict:
 def payload(root: Path, series_db: Path, cap_per_s: Optional[float], cards=None,
             now: Optional[float] = None, replicas: Optional[Iterable[Path]] = None) -> Optional[dict]:
     """Return only a fresh advisory snapshot; cold/expired/failed data is unavailable."""
+    explicit_now = now
     now = time.time() if now is None else now
+    requested_at = time.monotonic()
     until = int(now) // 60 * 60
 
     def fresh(hit):
         return (hit is not None and 0 <= time.monotonic() - hit[0] < CACHE_S
                 and 0 <= now - hit[1]["observed_at"] < CACHE_S and hit[1]["window_until"] == until)
 
-    attribution = cards.advisory_snapshot() if cards is not None else None
-    request = {"root": str(root), "series_db": str(series_db), "now": now,
-               "replicas": None if replicas is None else [str(p) for p in replicas],
-               "boot_map": (attribution or {}).get("boot_map", {}),
-               "known": (attribution or {}).get("known")}
-    hit = advisory.read(root, request, fresh)
+    paths = None if replicas is None else [str(p) for p in replicas]
+
+    def prepare(initial=False):
+        attribution = cards.advisory_snapshot() if cards is not None else None
+        return {"root": str(root), "series_db": str(series_db),
+                "now": (time.time() if explicit_now is None else
+                        now if initial else now + time.monotonic() - requested_at),
+                "replicas": paths, "boot_map": (attribution or {}).get("boot_map", {}),
+                "known": (attribution or {}).get("known")}
+
+    hit = advisory.read(root, prepare(initial=True), fresh, prepare)
     if not fresh(hit):
         return None
     data = hit[1]
