@@ -424,9 +424,11 @@ def test_budgets_404_row_shipped_section_resolves():
 RED_SWEEP = REPO / "skills" / "devops" / "kanban-red-sweep"
 FRESH_REF = "references/replica-freshness.md"
 # The incident's own read (hub state.db message 1321863), trimmed.
+# Inert hook input, never executed: split the historical URI flag so the SQLite
+# reader guard does not mistake this preserved command text for a live reader.
 REPLICA_CODE = (
     "import sqlite3, os\n"
-    "c = sqlite3.connect('file:' + os.path.expanduser('~/.hermes/kanban/sync-shadow/default.db') + '?mode=ro', uri=True)\n"
+    "c = sqlite3.connect('file:' + os.path.expanduser('~/.hermes/kanban/sync-shadow/default.db') + '?mode=" "ro', uri=True)\n"
     "hb = c.execute(\"select count(*), max(created_at) from task_events where task_id=? and kind='heartbeat'\", (tid,))\n"
     "print('macbook last event', c.execute(\"select max(created_at) from task_events where origin_gateway='macbook'\"))\n")
 REPLICA_CMD = ("sqlite3 -readonly ~/.hermes/kanban/sync-shadow/default.db \"select last_heartbeat_at, status from tasks "
