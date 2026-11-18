@@ -373,7 +373,8 @@ def durable_checkout(path: Path) -> Path:
     whose worktree was removed mid-wait died on its next call with FileNotFoundError. Read from git's own files
     (the worktree's `.git` file names its admin dir, whose `commondir` names the shared repository), so it starts
     no process. A main checkout, a submodule, a bare repository's worktree or anything unreadable is returned as
-    is."""
+    is; the one exception is a bare repository kept as `<dir>/.git`, whose worktrees map to `<dir>`, where git
+    finds that same repository, so every call of the wait still works there."""
     try:
         here = Path(path).resolve()
         for d in (here, *here.parents):
@@ -386,7 +387,7 @@ def durable_checkout(path: Path) -> Path:
                     return path
                 admin = (d / text[len("gitdir:"):].strip()).resolve()
                 common = (admin / (admin / "commondir").read_text().strip()).resolve()
-                if common.name != ".git" or not common.is_dir() or not (common.parent / ".git").is_dir():
+                if common.name != ".git" or not common.is_dir():
                     return path
                 print(f"{path} is a linked worktree; waiting from its main checkout {common.parent}",
                       file=sys.stderr, flush=True)
@@ -532,6 +533,8 @@ def wait_runs(a, run_ids: list[str], expects: dict[str, dict[str, str]]) -> int:
     else:
         repo = resolve_repo(a.repo, None)
         slug = gh_repo(repo)
+    # Every poll runs `gh run view` with this as its cwd: a PR worktree removed mid-wait must not kill the waiter.
+    repo = durable_checkout(repo)
     deadline = time.monotonic() + a.timeout_min * 60
     last, errors = "", 0
     while True:
