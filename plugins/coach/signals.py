@@ -200,6 +200,15 @@ AUTH_EXC_RE = re.compile(r"(?:^|\.)(AuthenticationError|PermissionDeniedError)$"
 STATUS_RE = re.compile(r"Error code: (\d{3})\b")
 PROVIDER_MSG_RE = re.compile(r"""['"]message['"]:\s*['"]([^'"]*)['"]""")
 AUTH_STORM_N, AUTH_STORM_S = 3, 600
+# A hub-minted (relay) row's token is revoked by every hub refresh; core's relay re-pull (credential_relay_repull.py)
+# answers that 401 by pulling and adopting the pushed token, logged at INFO in agent.log (agent-f9f6ed4f38, 2026-11-18:
+# a MacBook woke 55 min after its last pull and 3 resuming sessions each took one, all designed recovery). So a
+# revoked 401 counts toward the storm only once RELAY_SETTLE_S (core's 120 s repull_wait_s plus the pull) has passed
+# with no adoption in its own session. A re-pull that found no token is the real ~2 min stall: its WARNING files.
+RELAY_LOGGER = "run_agent"
+RELAY_ADOPTED_RE = re.compile(r"^OAuth relay: adopted the pushed token for pool entry \S+ after [\d.]+s$")
+RELAY_STALL_RE = re.compile(r"^OAuth relay: no new token for pool entry \S+ within (\d+)s of a revoked 401$")
+RELAY_SETTLE_S = 150
 # The guard warnings core commit e0a5909348 added around 401 recovery. They carry no traceback, so the traceback
 # path never saw them; "persists after N refreshes" and "moved off pool entry" are the detection-level signal that
 # the pinned-account 401 loop came back. Pool entry ids are left out of the fingerprint (one defect, any entry).
@@ -519,6 +528,14 @@ def parse_errors(lines: List[str], reconnects: Optional[list] = None, auth: Opti
                         "details": home_tilde(r["msg"])[:1500],
                         "fp": fp("plugin", "hook", hook, cb, re.sub(r"\d+", "N", exc))})
             continue
+        stall = RELAY_STALL_RE.match(r["msg"]) if r["logger"] == RELAY_LOGGER else None
+        if stall:
+            out.append({"kind": "errors", "component": "agent", "at": r["at"], "session_id": r["sid"],
+                        "symptom": f"relay re-pull found no new token on {host or 'this host'}: a revoked "
+                                   f"hub-minted row stalled the turn {stall.group(1)}s",
+                        "details": home_tilde(f"{r['level']} {r['logger']}: {r['msg']}")[:1500],
+                        "fp": fp("agent", "relay-repull-stall")})
+            continue
         guard = next(((k, m) for k, rx in GUARD_RES for m in [rx.search(r["msg"])] if m), None)
         if guard:
             gkind, gm = guard
@@ -666,44 +683,73 @@ def reconnect_storms(cur: dict, prof: str, recs: List[dict], now: float, host: s
     return out
 
 
-def auth_storms(cur: dict, recs: List[dict], now: float, host: str) -> List[dict]:
+def _relay_pending(e: dict) -> bool:
+    return e.get("reason") == "revoked" and e.get("status") == "401"
+
+
+def auth_storms(cur: dict, recs: List[dict], now: float, host: str,
+                adopted: Optional[List[dict]] = None) -> List[dict]:
     """Keep this host's recent stream 401/403s in the cursor (a storm spans passes); AUTH_STORM_N of them within
     AUTH_STORM_S files one auth-failure storm. The fingerprint carries provider, status and reason classes, so a
-    revoked-token storm and an expired-token storm are different defects."""
+    revoked-token storm and an expired-token storm are different defects. A revoked 401 that core's relay re-pull
+    answered (an `adopted` record in the same session within RELAY_SETTLE_S) is recovered and never counts; one with
+    no adoption yet counts only after RELAY_SETTLE_S, so the adoption may land in a later pass."""
     st = cur.get("auth") or {}
-    evs = [e for e in st.get("ev") or [] if e.get("at", 0) >= now - BACKFILL_S]
     filed = float(st.get("filed") or 0)
-    out = []
-    for r in sorted((r for r in recs if r["at"] >= now - BACKFILL_S), key=lambda r: r["at"]):
-        evs = [e for e in evs if e["at"] > r["at"] - AUTH_STORM_S] + [
-            {k: r[k] for k in ("at", "sid", "status", "reason", "provider")}]
-        if len(evs) >= AUTH_STORM_N and filed <= r["at"] - AUTH_STORM_S:
-            filed = r["at"]
-            reasons = ",".join(sorted({e["reason"] for e in evs}))
-            statuses = ",".join(sorted({e["status"] for e in evs}))
-            provs = ",".join(sorted({e["provider"] for e in evs}))
-            sids = ", ".join(sorted({e["sid"] for e in evs if e["sid"]}))
-            out.append({"kind": "errors", "component": "agent", "at": r["at"], "session_id": r["sid"],
-                        "profile": r.get("profile") or "default",
-                        "symptom": f"auth-failure storm on {host or 'this host'}: {len(evs)} {provs} {statuses} "
+    keep = now - AUTH_STORM_S - RELAY_SETTLE_S
+    ad = [a for a in (st.get("adopt") or []) + list(adopted or []) if a.get("at", 0) > keep and a.get("sid")]
+    evs = [e for e in st.get("ev") or [] if e.get("at", 0) >= now - BACKFILL_S]
+    evs += [{k: r.get(k) for k in ("at", "sid", "status", "reason", "provider", "profile", "details")}
+            for r in recs if r["at"] >= now - BACKFILL_S]
+    evs = [e for e in evs if e["at"] > filed and not (
+        _relay_pending(e) and e.get("sid")
+        and any(a["sid"] == e["sid"] and e["at"] <= a["at"] <= e["at"] + RELAY_SETTLE_S for a in ad))]
+    evs.sort(key=lambda e: e["at"])
+    out, win = [], []
+    for e in evs:
+        if _relay_pending(e) and now < e["at"] + RELAY_SETTLE_S:
+            continue  # its re-pull may still adopt; judged on a later pass
+        win = [x for x in win if x["at"] > e["at"] - AUTH_STORM_S] + [e]
+        if len(win) >= AUTH_STORM_N and filed <= e["at"] - AUTH_STORM_S:
+            filed = e["at"]
+            reasons = ",".join(sorted({x["reason"] for x in win}))
+            statuses = ",".join(sorted({x["status"] for x in win}))
+            provs = ",".join(sorted({x["provider"] for x in win}))
+            sids = ", ".join(sorted({x["sid"] for x in win if x["sid"]}))
+            out.append({"kind": "errors", "component": "agent", "at": e["at"], "session_id": e["sid"],
+                        "profile": e.get("profile") or "default",
+                        "symptom": f"auth-failure storm on {host or 'this host'}: {len(win)} {provs} {statuses} "
                                    f"({reasons}) stream errors in {AUTH_STORM_S // 60} min",
-                        "details": (f"{len(evs)} provider {statuses} errors ({reasons}) logged as 'Streaming failed "
+                        "details": (f"{len(win)} provider {statuses} errors ({reasons}) logged as 'Streaming failed "
                                     f"before delivery' within {AUTH_STORM_S // 60} min; one alone is handled by the "
                                     f"retry loop's refresh/rotation. Sessions: {sids}\nLatest:\n"
-                                    f"{r['details']}")[:1500],
+                                    f"{e.get('details') or ''}")[:1500],
                         "fp": fp("agent", "auth-storm", provs, statuses, reasons)})
-            evs = []
-    evs = [e for e in evs if e["at"] > now - AUTH_STORM_S]
+            win = []
+    evs = [e for e in evs if e["at"] > max(filed, keep)]
     if evs or filed > now - AUTH_STORM_S:
-        cur["auth"] = {"ev": evs, "filed": filed}
+        cur["auth"] = {"ev": evs, "filed": filed, **({"adopt": ad} if ad else {})}
     else:
         cur.pop("auth", None)
+    return out
+
+
+def relay_adoptions(lines: List[str]) -> List[dict]:
+    """core's `OAuth relay: adopted the pushed token ...` INFO records (agent.log) -> [{"at", "sid"}]."""
+    out = []
+    for ln in lines:
+        if "OAuth relay: adopted" not in ln:
+            continue
+        m = REC_RE.match(ln)
+        if m and m.group(3) and m.group(4) == RELAY_LOGGER and RELAY_ADOPTED_RE.match(m.group(5)):
+            out.append({"at": _ts(m.group(1)), "sid": m.group(3)})
     return out
 
 
 def collect_errors(home: Path, cur: dict, now: float, host: str = "") -> List[dict]:
     out = []
     auth: List[dict] = []
+    adopted: List[dict] = []
     for prof, h in homes(home):
         lines = read_new(h / "logs" / "errors.log", cur, f"errors:{prof}", now)
         recs: List[dict] = []
@@ -713,8 +759,9 @@ def collect_errors(home: Path, cur: dict, now: float, host: str = "") -> List[di
                 s["profile"] = prof
                 out.append(s)
         auth += [dict(a, profile=prof) for a in prof_auth]
+        adopted += relay_adoptions(read_new(h / "logs" / "agent.log", cur, f"relay:{prof}", now))
         out += reconnect_storms(cur, prof, recs, now, host)
-    out += auth_storms(cur, auth, now, host)
+    out += auth_storms(cur, auth, now, host, adopted)
     return out
 
 

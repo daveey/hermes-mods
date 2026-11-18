@@ -1713,6 +1713,93 @@ def test_each_e0a5909348_guard_warning_files_a_signal(tmp_path):
     assert len([s for s in sg.collect(h, {}, "macbook", _ts("2026-10-28 13:25:00")) if s["kind"] == "errors"]) == 3
 
 
+# ── agent-f9f6ed4f38 (came back): a Mac waking after a hub refresh; core's relay re-pull recovers each 401 ────────
+# 2026-11-18 02:04:39-:51Z the MacBook woke after 55 min with no pull (hub sshd); the hub had refreshed 3 accounts
+# meanwhile, so 3 resuming sessions each took one revoked 401, which core's relay re-pull (credential_relay_repull.py)
+# answers by pulling and adopting the pushed token. Those are recovered, not a storm. A re-pull that finds no new
+# token is the real stall (the 4-min chat stalls of the first occurrence) and files on its own.
+RELAY_SIDS = ("20261026_170127_f07c32", "20261027_134353_5ab65c", "local-e58d06dba8f0d490")
+
+
+def adopted_line(ts, sid, entry="d1076b", after="4.2"):
+    return (f"{ts},500 INFO [{sid}] run_agent: OAuth relay: adopted the pushed token for pool entry {entry} "
+            f"after {after}s")
+
+
+def _relay_home(tmp_path, err_lines, agent_lines):
+    h = _auth_home(tmp_path, err_lines)
+    (h / "logs" / "agent.log").write_text("\n".join(agent_lines) + ("\n" if agent_lines else ""))
+    return h
+
+
+def _wake_401s():
+    return (auth_rec("2026-11-18 02:04:39", "revoked", RELAY_SIDS[0])
+            + auth_rec("2026-11-18 02:04:45", "revoked", RELAY_SIDS[1])
+            + auth_rec("2026-11-18 02:04:51", "revoked", RELAY_SIDS[2]))
+
+
+def _errs(sigs):
+    return [s for s in sigs if s["kind"] == "errors"]
+
+
+def test_relay_recovered_revoked_401s_after_wake_are_not_a_storm(tmp_path):
+    adopted = [adopted_line("2026-11-18 02:04:44", RELAY_SIDS[0]), adopted_line("2026-11-18 02:04:49", RELAY_SIDS[1]),
+               adopted_line("2026-11-18 02:04:56", RELAY_SIDS[2], "df70c1")]
+    h = _relay_home(tmp_path, _wake_401s(), adopted)
+    assert _errs(sg.collect(h, {}, "macbook", _ts("2026-11-18 02:10:00"))) == []
+
+
+def test_revoked_401_counts_unless_its_own_session_adopted(tmp_path):
+    """Adoption in another session, or long after the 401, does not excuse it: still one storm."""
+    adopted = [adopted_line("2026-11-18 02:04:44", RELAY_SIDS[0]), adopted_line("2026-11-18 02:04:50", "other_sid"),
+               adopted_line("2026-11-18 02:09:30", RELAY_SIDS[2])]
+    h = _relay_home(tmp_path, _wake_401s() + auth_rec("2026-11-18 02:05:30", "revoked", "fourth_sid"), adopted)
+    sigs = _errs(sg.collect(h, {}, "macbook", _ts("2026-11-18 02:12:00")))
+    assert len(sigs) == 1 and "3 anthropic 401 (revoked)" in sigs[0]["symptom"]
+    assert sigs[0]["fp"] == sg.fp("agent", "auth-storm", "anthropic", "401", "revoked")
+
+
+def test_revoked_401_waits_for_the_relay_repull_across_passes(tmp_path):
+    """The adoption line lands seconds after the 401, often in the next sweep pass: a revoked 401 counts only once
+    the re-pull window has passed without an adoption in its session."""
+    h = _relay_home(tmp_path, _wake_401s(), [])
+    agent = h / "logs" / "agent.log"
+    cur = {}
+    assert _errs(sg.collect(h, cur, "macbook", _ts("2026-11-18 02:04:55"))) == []
+    agent.write_text("\n".join(adopted_line("2026-11-18 02:04:5%d" % (6 + i), s) for i, s in enumerate(RELAY_SIDS))
+                     + "\n")
+    assert _errs(sg.collect(h, cur, "macbook", _ts("2026-11-18 02:05:30"))) == []
+    assert _errs(sg.collect(h, cur, "macbook", _ts("2026-11-18 02:12:00"))) == []
+    # the same three with no adoption: one storm once the window passed, not before
+    h2 = _relay_home(tmp_path / "b", _wake_401s(), [])
+    cur2 = {}
+    assert _errs(sg.collect(h2, cur2, "macbook", _ts("2026-11-18 02:05:00"))) == []
+    late = _errs(sg.collect(h2, cur2, "macbook", _ts("2026-11-18 02:08:00")))
+    assert len(late) == 1 and "auth-failure storm" in late[0]["symptom"]
+    assert _errs(sg.collect(h2, cur2, "macbook", _ts("2026-11-18 02:09:00"))) == []
+
+
+NO_NEW_TOKEN = ("2026-11-12 23:36:21,004 WARNING [20261026_170127_f07c32] run_agent: OAuth relay: no new token for "
+                "pool entry d88ec8 within 121s of a revoked 401")
+
+
+def test_relay_repull_with_no_new_token_files_a_stall_signal(tmp_path):
+    """Detection guard for the first agent-f9f6ed4f38 cause (dead/duplicate hub rows): the re-pull waited out its
+    budget, a chat stalled ~2 min. Files every time, one fingerprint per provider-free defect (entry ids left out)."""
+    rows = sg.parse_errors([NO_NEW_TOKEN])
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["component"] == "agent" and r["session_id"] == "20261026_170127_f07c32"
+    assert "no new token" in r["symptom"] and "121s" in r["symptom"]
+    assert r["fp"] == sg.parse_errors([NO_NEW_TOKEN.replace("d88ec8", "765d1c")])[0]["fp"]
+    # through the real collector, from errors.log; a line that only quotes the phrase (another logger) does not file
+    quoted = ("2026-11-12 23:40:00,000 WARNING [x] agent.tool_executor: Tool terminal returned error: grep "
+              "'OAuth relay: no new token for pool entry'")
+    h = _auth_home(tmp_path, [NO_NEW_TOKEN, quoted])
+    sigs = _errs(sg.collect(h, {}, "macbook", _ts("2026-11-12 23:45:00")))
+    assert len(sigs) == 1 and "macbook" in sigs[0]["symptom"]
+
+
 LEFT_POOL = ("2026-10-28 13:19:40,500 WARNING [20261028_130956_a12ab0] agent.client_lifecycle: Anthropic pool entry "
              "acct-b left the pool; re-resolving the session's credential")
 
