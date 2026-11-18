@@ -183,7 +183,7 @@ def test_own_ticket_defers_drift_only_in_merge_scope(gh, monkeypatch):
 # ---- pure selection: sound over-approximation of every outcome of the undecided tickets ----
 
 def _rec(n, files):
-    return {"pr": n, "acquired": NOW - 1000 + n, "expires": NOW + 1000, "files": files}
+    return {"pr": n, "head": "a" * 40, "acquired": NOW - 1000 + n, "expires": NOW + 1000, "files": files}
 
 
 def test_possible_turns_with_boolean_eligibility_is_effective_turns():

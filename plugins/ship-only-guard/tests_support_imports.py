@@ -200,13 +200,14 @@ def test_path_only_overlap_is_unchanged():
 # --- land turn: #3323 waited behind #3207's turn on the same rule (17:19Z refusal) -----------------------------
 def test_turn_holder_with_support_change_does_not_hold_unrelated_test_pr(monkeypatch):
     holder_head, waiter_head = "d" * 40, "e" * 40
+    monkeypatch.setattr(g, "_now", lambda: 1)
     rec = {"pr": 3207, "head": holder_head, "acquired": 1, "expires": 2, "files": F3207}
     waiter = payload(["hosts/hermes-hub/bin/hub-core-update", "tests/test_hub_install_manifest.py"], waiter_head)
     trees = {holder_head: {**SUPPORT_TEXT, **UNRELATED}, waiter_head: {**SUPPORT_TEXT, **UNRELATED}}
     f = Fake(waiter, delta([]), trees)
     monkeypatch.setattr(g.subprocess, "run", f.run)
     monkeypatch.setattr(g, "_live_turns", lambda *a: [("refs/land-turn/pr-3207", rec)])
-    monkeypatch.setattr(g, "_turn_holder_data", lambda n, *a: {"state": "OPEN"})
+    monkeypatch.setattr(g, "_turn_holder_data", lambda n, *a: payload(F3207, holder_head))
     monkeypatch.setattr(g, "_turn_yielded", lambda *a: False)
     assert g._turn_hold_refusal(3323, waiter, R, None, {}) is None
     # The same waiter is held when its test module does import the holder's support module.
