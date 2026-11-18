@@ -15,8 +15,9 @@ On a core without lanes support, or with no `kanban.admission.lanes`, `GET /v1/l
 share and pause writes; `admit_per_day` and the held routes are API-only for now. Cost is an estimate from the
 runs whose workers reported usage; `usage_runs` against `runs` says how many that is.
 
-Lanes are configured on one gateway (the one that holds the board). The Desktop panel asks its own gateway
-first, then one profile per other connection, and reads and writes on the first that answers `configured: true`,
+Lanes are configured on one gateway (the one that holds the board). The Desktop panel asks the gateway it is
+attached to first, then every other connection (answered by that connection's default profile), and reads and
+writes on the first that answers `configured: true`,
 so the plugin must be enabled on that gateway.
 
 Enable: add `lanes` to the private repo's `home/plugins-enabled.txt` (a core-only host enables it as the

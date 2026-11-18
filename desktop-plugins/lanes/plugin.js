@@ -19,55 +19,68 @@ const COLORS = ['#f0a43a', '#8fb0ff', '#5fd4e6', '#d982f0', '#b4bac6', '#3ddc97'
 
 // ── which gateway to talk to ──────────────────────────────────────────────
 // Lanes are configured on one gateway (the one that holds the board and runs the dispatcher), which is often
-// not the gateway this Desktop is attached to. The source asks this gateway first, then one profile per other
-// connection (`default` when it has one), and settles on the first that answers `configured: true`; reads and
-// writes then go to that one. It re-discovers when the chosen gateway stops answering or stops being configured,
-// and every DISCOVERY_MS while nothing is configured anywhere.
-export const DISCOVERY_MS = 300000
+// not the gateway this Desktop is attached to. The source asks the attached gateway first, then every other
+// connection once (a request with a connectionId and no profile is answered by that connection's default
+// profile), and settles on the first that answers `configured: true`; reads and writes then go to that one.
+// A settled gateway is kept through failures: one failed read is an error to show and retry (gateways restart
+// several times a day), and only FAILURES_BEFORE_REDISCOVERY in a row, or an answer that says lanes are no
+// longer configured there, starts a new search. While no gateway has lanes the search repeats every
+// UNCONFIGURED_MS, and the reason shown names any gateway that could not be reached.
+export const UNCONFIGURED_MS = 60000
+export const FAILURES_BEFORE_REDISCOVERY = 3
 const validRoute = (r) => r && ['connectionId', 'targetProfile'].every((k) => typeof r[k] === 'string' && r[k].trim())
 
 export function createSource(ctx, hostRef = host, clock = () => Date.now()) {
-  let chosen // { connectionId } | { connectionId: null } (this gateway) | undefined (not found yet)
+  let chosen // { connectionId } | { connectionId: null } (the attached gateway) | undefined (not found yet)
+  let failures = 0
   let sweptAt = -Infinity
-  let unconfigured // the first unconfigured answer, shown while no gateway has lanes
+  let unconfigured // the answer shown while no gateway has lanes
   const opts = (target, extra = {}) => ({ ...extra, timeoutMs: REQUEST_TIMEOUT_MS, ...(target.connectionId ? { connectionId: target.connectionId } : {}) })
   async function candidates() {
     let list = []
     try { list = ((await hostRef.profileRoutes()) || []).filter(validRoute) } catch { list = [] }
-    const leads = new Map()
-    for (const r of list) if (!leads.has(r.connectionId) || r.targetProfile === 'default') leads.set(r.connectionId, r)
-    return [{ connectionId: null }, ...[...leads.values()].map((r) => ({ connectionId: r.connectionId }))]
+    // The attached connection is asked without an id; its own routes are marked primary.
+    const others = new Set(list.filter((r) => !r.primary).map((r) => r.connectionId))
+    for (const r of list) if (r.primary) others.delete(r.connectionId)
+    return [{ connectionId: null }, ...[...others].map((connectionId) => ({ connectionId }))]
   }
   async function discover(path) {
     sweptAt = clock()
-    let failure
-    unconfigured = undefined
+    failures = 0
+    let first
+    const unreachable = []
     for (const target of await candidates()) {
       try {
         const body = await ctx.rest(path, opts(target))
-        if (body?.configured === true) { chosen = target; return body }
-        unconfigured ??= body
-      } catch (e) { failure ??= e }
+        if (body?.configured === true) { chosen = target; unconfigured = undefined; return body }
+        first ??= body
+      } catch (e) { unreachable.push(String(e?.message || e).slice(0, 80)) }
     }
     chosen = undefined
-    if (unconfigured) return unconfigured
-    throw failure || Error('No gateway answered')
+    if (!first) throw Error(unreachable[0] || 'No gateway answered')
+    const missed = unreachable.length ? `; ${unreachable.length} other gateway(s) could not be reached (${unreachable[0]})` : ''
+    unconfigured = { ...first, configured: false, reason: `${first?.reason || 'No lanes are configured.'}${missed}` }
+    return unconfigured
   }
   async function read(hours) {
     const path = `/v1/lanes?hours=${hours}`
-    if (chosen) {
-      try {
-        const body = await ctx.rest(path, opts(chosen))
-        if (body?.configured === true) return body
-      } catch {} // fall through: look for another gateway
+    if (!chosen) return unconfigured && clock() - sweptAt < UNCONFIGURED_MS ? unconfigured : discover(path)
+    let body
+    try {
+      body = await ctx.rest(path, opts(chosen))
+    } catch (e) {
+      failures += 1
+      if (failures < FAILURES_BEFORE_REDISCOVERY) throw e // keep the gateway and the last data; the next poll retries
       return discover(path)
     }
-    if (unconfigured && clock() - sweptAt < DISCOVERY_MS) return unconfigured
-    return discover(path)
+    failures = 0
+    return body?.configured === true ? body : discover(path)
   }
-  async function write(lane, body) {
-    if (!chosen) throw Error('No gateway with lanes configured')
-    return ctx.rest(`/v1/lanes/${encodeURIComponent(lane)}`, opts(chosen, { method: 'PUT', body }))
+  // `target` is the gateway a draft was made against: an Apply sends every lane there even if a poll
+  // re-discovers meanwhile.
+  async function write(lane, body, target = chosen) {
+    if (!target) throw Error('No gateway with lanes configured')
+    return ctx.rest(`/v1/lanes/${encodeURIComponent(lane)}`, opts(target, { method: 'PUT', body }))
   }
   return { read, write, target: () => chosen }
 }
@@ -267,10 +280,11 @@ export function Lanes({ ctx }) {
   const apply = async (pending) => {
     setSaving(true); setError('')
     let at = ''
+    const target = source.target()
     try {
       for (const [name, body] of pending) {
         at = name
-        await source.write(name, body)
+        await source.write(name, body, target)
       }
       await query.refetch()
       return true
