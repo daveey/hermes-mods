@@ -2107,13 +2107,15 @@ def pr_state_claim(reply: str, tool_log: Optional[list] = None) -> Optional[str]
                     end += number.end()
             if number:
                 refs.add(number[1])
-                # A plural/list claim requires evidence for every item, not
-                # just the number immediately attached to the PR mention.
-                while listed := re.match(
-                        r"\s*(?:,\s*(?:(?:and|or)\s+)?|(?:and|or)\s+|[&/])"
-                        r"\s*#?([1-9]\d*)\b", s[end:], re.I):
-                    refs.add(listed[1])
-                    end += listed.end()
+                # Natural-language list connectors are open-ended. Fail closed
+                # on subsequent standalone multi-digit integers, irrespective
+                # of connective, instead of crediting only a parsed prefix.
+                # Preserve narrowly typed read timestamps and test counters;
+                # word boundaries already exclude mixed alphanumeric SHAs.
+                rest = re.sub(r"\b\d{1,2}:\d{2}(?::\d{2})?Z?\b", "TIME", s[end:])
+                rest = re.sub(r"(\btests?\s+pass(?:ed)?\s+)\d+/\d+\b",
+                              r"\1COUNT", rest, flags=re.I)
+                refs.update(re.findall(r"(?<!\w)\d{2,}(?!\w)", rest))
             elif not re.search(r"\b(?:this|that|the)\s+$", s[:mention.start()], re.I):
                 unresolved = True
         if refs:
