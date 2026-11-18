@@ -3729,7 +3729,11 @@ def notice_turn(user_ask: str) -> bool:
     """Only anchored automation envelopes, never a human question mentioning a notice."""
     s = (user_ask or "").lstrip()
     # Preserve known human lookalikes of the runtime's IMPORTANT batch headers.
-    if re.match(r"^\[IMPORTANT: (?:Background processes\b|\d+ background processes\?)", s):
+    if re.match(r"^\[IMPORTANT: (?:Background processes\b|\d+ (?:background processes|Kanban task updates)\?)", s):
+        return False
+    # Resume wrappers carry the human's interrupted request, not a job result.
+    # Keep them out of the generic bracket fallback so strip_preamble can unwrap them.
+    if s.startswith(("[System note: Your previous turn", "[System note: The previous turn")):
         return False
     return bool(NOTICE_RE.search(s) or _BRACKET_NOTICE.match(s) or (s and
         (unicodedata.category(s[0]) == "So" or s[0] == "ℹ") and _NOTICE_TAIL.match(s, 1)))
