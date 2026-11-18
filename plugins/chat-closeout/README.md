@@ -35,6 +35,9 @@ floor bucket. Quiet/not-due rows reuse their verdict only until their own deadli
 only the existing durable observation-clock update; a removal or other non-clock fix re-reads that row.
 Whole-host shortcuts include those clock siblings even when another row needed judgment. Injected and
 residual passes neither adopt nor invalidate full-host memos. No threshold or clock representation changes.
+Replica input keys for the full host and its rows share one tick-local snapshot: scope freshness and metadata
+verdicts are evaluated once, while each row retains its own task/owner digest. The portable key values, freshness
+boundaries and invalidation rules are unchanged; this does not introduce a cross-tick cache or TTL.
 
 `tests/test_host_siblings.py` exercises sibling card/transcript/ledger/unseen changes, individual deadlines,
 shared inventory-health transitions and residual isolation. `bench/idle_host_bench.py --sibling-churn`

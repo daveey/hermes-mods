@@ -360,15 +360,22 @@ class ReplicaWatch:
 
     def key(self, now: float, stale_after: float = HUB_STALE_AFTER_S, *, tails: Optional[set[str]] = None) -> Any:
         """The batch rows' substantive digests and every clock verdict at ``now``. Raises when unreadable."""
+        return self.keys(now, stale_after, tail_sets=[tails])[0]
+
+    def keys(self, now: float, stale_after: float = HUB_STALE_AFTER_S, *,
+             tail_sets: Iterable[Optional[set[str]]]) -> list[Any]:
+        """Keys for one tick's row groups from one snapshot; shared scope clocks are judged and hashed once.
+
+        The individual keys retain ``key``'s exact shape and values. Nothing survives this call: freshness still
+        uses this tick's time, and refresh/unknown/identity invalidation is unchanged.
+        """
+        groups = list(tail_sets)
         with self.lock:
             if not self.ok:
                 raise LookupError("replica unreadable")
             if self.path is None:
-                return ["no-replica"]
-            own = {k: v for k, v in self.rows.items() if tails is None or v[0] in tails}
-            rows = sorted([gw, key, d] for (gw, key), (_t, d, _o, _r) in own.items())
-            owners = sorted([gw, key, _fresh(o, now, REPLICA_FRESH_S)]
-                            for (gw, key), (_t, _d, o, _r) in own.items() if o is not None)
+                return [["no-replica"] for _ in groups]
+            snapshot = list(self.rows.items())
             scopes = sorted([gw, s, _fresh(at, now, w)] for gw, lst in self.gateways.items() for s, at, w in lst)
             meta = dict(self.meta or {})
         raw = meta.get("last_ok")
@@ -379,7 +386,15 @@ class ReplicaWatch:
         lo = last_ok or 0.0
         verdict = [meta.get("offline_since") or None, last_ok is None, 0 <= now - lo, now - lo <= REPLICA_FRESH_S,
                    last_ok is not None and now - last_ok > stale_after]
-        return [digest(rows), digest(owners), digest(scopes), verdict]
+        scope_digest = digest(scopes)
+        out = []
+        for tails in groups:
+            own = [(k, v) for k, v in snapshot if tails is None or v[0] in tails]
+            rows = sorted([gw, key, d] for (gw, key), (_t, d, _o, _r) in own)
+            owners = sorted([gw, key, _fresh(o, now, REPLICA_FRESH_S)]
+                            for (gw, key), (_t, _d, o, _r) in own if o is not None)
+            out.append([digest(rows), digest(owners), scope_digest, list(verdict)])
+        return out
 
 
 # ---- state.db transcripts ---------------------------------------------------------------------------------------

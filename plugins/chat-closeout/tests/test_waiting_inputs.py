@@ -58,6 +58,66 @@ def world(tmp_path, monkeypatch):
     getattr(plugin, '_wi_reset', lambda: None)()
 
 
+def test_host_replica_scope_digest_built_once_per_snapshot(world, monkeypatch):
+    watch = plugin.wi.ReplicaWatch()
+    watch.ok = True
+    watch.path = 'fixture-replica'
+    watch.gateways = {'gw': [('default', 1000.0, 300.0)]}
+    watch.meta = {'last_ok': 1000.0}
+    monkeypatch.setattr(watch, 'refresh', lambda *a, **kw: None)
+    plugin._wi['replica'] = watch
+    calls = []
+    digest = plugin.wi.digest
+
+    def counted(value):
+        if value == [['gw', 'default', True]]:
+            calls.append(value)
+        return digest(value)
+
+    monkeypatch.setattr(plugin.wi, 'digest', counted)
+    parts = plugin._input_parts(world['led'].pending(), 1100.0, host=True)
+    assert len(parts['row_inputs']) == 3
+    assert len(calls) == 1  # shared scope freshness is identical for every row in this snapshot
+
+
+@pytest.mark.parametrize('now', [999.0, 1000.0, 1300.0, 1901.0])
+def test_replica_grouped_keys_equal_existing_values_and_clock_boundaries(now):
+    wi = plugin.wi
+    watch = wi.ReplicaWatch()
+    watch.ok, watch.path = True, 'fixture-replica'
+    watch.rows = {('gw', 'a'): ('t_1', 'one', 1000.0, 'raw'),
+                  ('gw', 'b'): ('t_2', 'two', None, 'raw')}
+    watch.gateways = {'gw': [('default', 1000.0, 300.0)]}
+    watch.meta = {'last_ok': '1000', 'offline_since': ''}
+    groups = [None, {'t_1'}, {'t_2'}, set()]
+    expected = []
+    # Independent pre-change oracle: preserve the exact portable key shape and freshness boundaries.
+    for tails in groups:
+        own = {k: v for k, v in watch.rows.items() if tails is None or v[0] in tails}
+        expected.append([
+            wi.digest(sorted([gw, key, d] for (gw, key), (_t, d, _o, _r) in own.items())),
+            wi.digest(sorted([gw, key, wi._fresh(o, now, wi.REPLICA_FRESH_S)]
+                             for (gw, key), (_t, _d, o, _r) in own.items() if o is not None)),
+            wi.digest([['gw', 'default', wi._fresh(1000.0, now, 300.0)]]),
+            [None, False, 0 <= now - 1000.0, now - 1000.0 <= wi.REPLICA_FRESH_S,
+             now - 1000.0 > wi.HUB_STALE_AFTER_S],
+        ])
+    actual = watch.keys(now, tail_sets=groups)
+    assert actual == expected
+    watch.rows[('gw', 'a')] = ('t_1', 'changed', 1000.0, 'raw')
+    assert actual == expected  # published snapshot is not a view of mutable watch state
+    changed = watch.keys(now, tail_sets=groups)
+    assert changed[0] != actual[0] and changed[1] != actual[1]
+    assert changed[2:] == actual[2:]
+    actual[0][3][0] = 'caller mutation'
+    assert actual[1][3][0] is None  # sibling verdict lists are not shared
+    watch.path = None
+    assert watch.keys(now, tail_sets=groups) == [['no-replica']] * len(groups)
+    watch.ok = False
+    with pytest.raises(LookupError):
+        watch.keys(now, tail_sets=groups)
+
+
 def poll():
     """One sidebar poll past the 3 s answer cache."""
     plugin._state.pop('waiting_cache', None)

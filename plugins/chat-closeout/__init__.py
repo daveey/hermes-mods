@@ -1943,6 +1943,8 @@ def _input_parts(rows: list[dict], now: float, *, host: bool = False) -> dict[st
                if host else _shadow_parts(now))
     if host:
         _state["host_globals"] = {"boards": global_boards, "shadows": global_shadows}
+    own_tail_sets = [{str(k).rsplit("/", 1)[-1] for k in row.get("batch") or []} for row in rows] if host else []
+    replica_keys = replica.keys(now, stale_after, tail_sets=[None, *own_tail_sets])
     parts = {
         "v": [wi.VERSION, "host" if host else "waiting"],
         "scope": list(ksa._origin_scope()) if hasattr(ksa, "_origin_scope") else None,
@@ -1952,7 +1954,7 @@ def _input_parts(rows: list[dict], now: float, *, host: bool = False) -> dict[st
         "origin": _origin_digest(),
         "boards": boards,
         "shadows": shadows,
-        "replica": replica.key(now, stale_after),
+        "replica": replica_keys[0],
         "lineage": [[s, lineages[s]] for s in sids],
         "floor": int(now // wi.FLOOR_S),
     }
@@ -1966,14 +1968,13 @@ def _input_parts(rows: list[dict], now: float, *, host: bool = False) -> dict[st
         parts["healthy"] = (not linked or any(r.get("stale") is False for r in linked)) and _hub_fresh()
         parts["unseen"] = sorted(unseen.items())  # subscribed tasks need not be in any pending batch
         keys = {}
-        for row in rows:
+        for row, own_tails, replica_key in zip(rows, own_tail_sets, replica_keys[1:]):
             sid = row["session_id"]
-            own_tails = {str(k).rsplit("/", 1)[-1] for k in row.get("batch") or []}
             ids = [entry[0] for entry in lineages[sid]]
             keys[sid] = wi.strict_digest([
                 _host_row(row), lineages[sid], sum(unseen.get(i, 0) for i in ids),
                 [[t, tail_boards.get(t), tail_shadows.get(t)] for t in sorted(own_tails)],
-                replica.key(now, stale_after, tails=own_tails),
+                replica_key,
                 parts["scope"], parts["ledger"], parts["origin"], parts["floor"], parts["healthy"],
             ])
         parts["row_inputs"] = keys
