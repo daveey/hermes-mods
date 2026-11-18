@@ -303,7 +303,7 @@ and the final response.
   --human-request "$(cat hr.json)" --metadata-only` (prints `Classified ... (metadata only; remains parked)`). Read the
   current human_request and block reason first (tasks row or last block event payload), so only the action changes.
 - Before saying an ask is still blocked, re-read it: the user may have answered on another surface since the last read.
-- Re-read each card's status, and its events since your inventory read, inside the script that writes to it, and skip the card on any change. Another live chat may be settling the same card with the user, and a write made from a read taken minutes earlier archives over its answer, with a wrong comment that then needs a correction.
+- Re-read each card's status and new events inside the script that writes to it; skip it if another chat changed it.
 
 ## Done means
 - [ ] Scope matched his words (step 0): a not-ready/Todo/Scheduled ask got the `waiting` audit at the top of the reply, not a red sweep?
