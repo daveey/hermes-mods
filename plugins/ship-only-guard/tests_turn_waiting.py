@@ -84,6 +84,106 @@ def test_only_definite_hold_has_structured_admission_evidence(monkeypatch, uncer
         assert "may still hold" in hold
 
 
+def test_changed_waiter_without_any_approval_yields_before_uncertainty(monkeypatch):
+    monkeypatch.setattr(g, "_now", lambda: f.NOW)
+    data = f.pr(1, f.H2600, ["hermes-sync"])
+    data.update(reviews=[], comments=[])
+    assert g.peer_eligibility(record(), data) is False
+
+
+def test_changed_waiter_hold_does_not_offer_exact_approval_as_patch_proof(monkeypatch):
+    monkeypatch.setattr(g, "_now", lambda: f.NOW)
+    fake = f.FakeGitHub({n: f.pr(n, f.H2600, ["hermes-sync"]) for n in (1, 2)})
+    monkeypatch.setattr(g.subprocess, "run", fake.run)
+    rec = record()
+    oid = "e" * 40
+    fake.refs["refs/land-turn/pr-1"] = oid
+    fake.commits[oid] = {"message": "land-turn pr=1\n\n" + json.dumps(rec)}
+    hold = g._turn_hold_refusal(2, fake.prs[2], f.R, None, {})
+    assert "may still hold" in hold
+    assert "gets an exact-head verdict" not in hold
+    assert "original admitted patch" in hold
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_denied_green_entrant_records_waiting_place_and_cannot_be_overtaken(monkeypatch, enabled):
+    monkeypatch.setattr(g, "_now", lambda: f.NOW)
+    monkeypatch.setattr(g, "_WAITING_WRITER_ENABLED", enabled, raising=False)
+    fake = f.FakeGitHub({n: f.pr(n, f.H2563, ["hermes-sync"]) for n in (1, 2, 3)})
+    monkeypatch.setattr(g.subprocess, "run", fake.run)
+    f.seed_turn(fake, 1, f.NOW - 60)
+    result = f.merge(2, f.H2563)
+    assert "PR #1 holds" in result
+    if not enabled:
+        assert fake.turn(2) is None
+        return
+    waiting = fake.turn(2)
+    assert waiting is not None
+    assert waiting["waiting"] is True
+    assert "waiting place recorded" in result
+    assert "PR #2 now holds" not in result
+    original = dict(waiting)
+    fake.pr_state[1] = "closed"
+    assert "PR #2 holds" in f.merge(3, f.H2563)
+    assert f.merge(2, f.H2563) is None  # public hook allows with no refusal
+    assert fake.turn(2) == original
+
+
+@pytest.mark.parametrize("holder_time", [f.NOW, f.NOW + 1])
+def test_waiter_does_not_jump_lower_number_same_second_or_clock_skew(monkeypatch, holder_time):
+    monkeypatch.setattr(g, "_now", lambda: f.NOW)
+    monkeypatch.setattr(g, "_WAITING_WRITER_ENABLED", True, raising=False)
+    fake = f.FakeGitHub({n: f.pr(n, f.H2563, ["hermes-sync"]) for n in (1, 2)})
+    monkeypatch.setattr(g.subprocess, "run", fake.run)
+    f.seed_turn(fake, 2, holder_time)
+    assert "PR #2 holds" in f.merge(1, f.H2563)
+    assert fake.turn(1) is None
+
+
+def test_waiting_cli_reports_record_not_effective_owner(monkeypatch):
+    monkeypatch.setattr(g, "_now", lambda: f.NOW)
+    monkeypatch.setattr(g, "_WAITING_WRITER_ENABLED", True)
+    fake = f.FakeGitHub({n: f.pr(n, f.H2563, ["hermes-sync"]) for n in (1, 2)})
+    monkeypatch.setattr(g.subprocess, "run", fake.run)
+    f.seed_turn(fake, 1, f.NOW - 60)
+    status, message = g.land_turn(2, f.R, f.H2563, env={})
+    assert status == 1  # only an effective owner returns zero
+    assert "waiting place recorded" in message
+    assert "No land turn recorded" not in message
+    assert "PR #2 holds" not in message
+
+
+@pytest.mark.parametrize("failure", ["ci", "approval", "unknown", "unreadable"])
+def test_waiting_admission_never_writes_without_complete_eligible_hold(monkeypatch, failure):
+    monkeypatch.setattr(g, "_now", lambda: f.NOW)
+    monkeypatch.setattr(g, "_WAITING_WRITER_ENABLED", True)
+    fake = f.FakeGitHub({n: f.pr(n, f.H2563, ["hermes-sync"]) for n in (1, 2)})
+    monkeypatch.setattr(g.subprocess, "run", fake.run)
+    age = g._TURN_REFRESH_GRACE + 1 if failure == "unknown" else 60
+    f.seed_turn(fake, 1, f.NOW - age)
+    if failure == "ci":
+        fake.prs[2]["statusCheckRollup"][0]["conclusion"] = "FAILURE"
+    if failure == "approval":
+        fake.prs[2]["reviews"] = []
+    if failure == "unreadable":
+        fake.refs_fail = True
+    assert isinstance(f.merge(2, f.H2563), str)
+    assert fake.turn(2) is None
+
+
+@pytest.mark.parametrize("age", [30, g._TURN_TTL + 30])
+def test_waiting_admission_does_not_rewrite_live_or_cooling_generation(monkeypatch, age):
+    monkeypatch.setattr(g, "_now", lambda: f.NOW)
+    monkeypatch.setattr(g, "_WAITING_WRITER_ENABLED", True)
+    fake = f.FakeGitHub({n: f.pr(n, f.H2563, ["hermes-sync"]) for n in (1, 2)})
+    monkeypatch.setattr(g.subprocess, "run", fake.run)
+    f.seed_turn(fake, 1, f.NOW - 60)
+    f.seed_turn(fake, 2, f.NOW - age)
+    original = dict(fake.refs)
+    assert isinstance(f.merge(2, f.H2563), str)
+    assert fake.refs == original
+
+
 def test_waiting_promotion_keeps_original_record_and_nontransitive_lanes():
     a = record(pr=1, files=["x"], acquired=f.NOW - 90)
     b = record(pr=2, files=["x", "y"], acquired=f.NOW - 60)
