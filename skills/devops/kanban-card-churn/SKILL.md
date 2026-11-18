@@ -1,7 +1,7 @@
 ---
 name: kanban-card-churn
 description: "Use when one Kanban card has many runs, comments or a huge context and still isn't done."
-version: 1.2.0
+version: 1.3.0
 author: daveey
 license: MIT
 triggers:
@@ -9,6 +9,7 @@ triggers:
     - "why is this card taking so long and has so much context?"
     - "this card has 20 runs and 90 comments, clean it up"
     - "what can we learn from this card, and stop it happening again"
+    - "how will we avoid this failure mode in the future"
   not_for: "many red cards at once (use kanban-red-sweep); one failed run with a clear error (use five-whys)"
 metadata:
   hermes:
@@ -20,8 +21,9 @@ metadata:
 
 A churned card is old, has many short runs, a long comment thread and a growing pile of files every run must
 read, and its acceptance is still unmet. The card is rarely slow; it is waiting, re-reading and re-parking. This
-skill has three parts and all three are required: **measure**, **clean up the card**, **change the producer** so
-the next card does not end up the same way.
+skill has four parts and all four are required: **measure**, **clean up the card**, **change the producer** so
+the next card from the same recipe does not end up the same way, and **fix the root cause in the platform** so
+no recipe has to remember the rule.
 
 Answer the user's "why" in text as soon as step 2 is done, before any change. Then carry on.
 
@@ -153,6 +155,43 @@ and change that in the same session:
 
 Verify the prevention the same way as the cleanup: read the edited skill text back from where agents load it.
 
+## 5. Root-cause fix: move the rule from prose into the mechanism
+
+Steps 3 and 4 fix one card and one recipe, in prose. Prose holds only when an agent loads that skill and follows
+it; every card already open, and every recipe you did not find, still has the problem. So each run of this skill
+ends by proposing, and normally building, at least one fix at the point of failure.
+
+1. **For every cause you named in step 2, ask where a machine could have stopped it.** Write one line per cause:
+   the moment it happens (a comment is posted, a card is parked, a parent is linked, a worker is held, a run ends
+   unchanged) and the check that moment could run. Typical answers:
+
+   | Cause | Point of failure | Mechanism |
+   |---|---|---|
+   | Handshake phrase mismatch | a comment is posted on a parked card | the comment command tells the sender the card will not wake; wait on the sending card, not on a phrase |
+   | Finished parents fill the context | the context is built | cap the section, name the rest |
+   | Noise comments force narrow matchers | a wake probe counts comments | filter by the sending card |
+   | Poll-and-repark | a run ends parked with an unchanged summary | the spend-budget hold fires earlier and names this skill |
+   | Wait on a dead home | a worker is held or stopped | the hold rehomes its open cards |
+   | Nobody noticed | no detector | the step-0 query on a schedule, commenting on the owner card |
+
+2. **Search before you build.** Grep core, the plugins and open cards on every board for the mechanism. If it
+   exists, the next why is why it did not act (threshold, not deployed on that host, not reached by that path);
+   fix that. If a card already owns it, add one comment there with your evidence, do not build a second one.
+3. **Rank and pick.** Prefer a change that removes a whole class for every card over one that adds a new
+   watcher or a new kind of card. A fix that creates cards or runs on a timer is the last resort: the platform
+   working on itself is the cost you are trying to cut.
+4. **Tell the user what you will build, then build it.** State the picks in the reply. If the user has asked for
+   root-cause fixes, or has standing approval for platform fixes, start in the same turn; otherwise ask once.
+   Use the repo's own landing route (worktree, tests, independent review, required CI), never a direct push
+   around it. A neutral review prompt: "trace this logic and report what you observe".
+5. **Each mechanism gets a regression test that replays this card's failure** (the real phrase, the real parent
+   count), a test per entry path (CLI and agent tool are two), and a stated limit where it does not reach.
+6. **After it lands, replay the trigger on the live board**: post the comment that was missed, build the context
+   of the card that was bloated, and quote the output. Then remove the prose rule from step 4 that the mechanism
+   made unnecessary, or shorten it to "the platform now does X; verify with Y". Rules that stay in two places
+   drift.
+7. **What you did not build is listed in the reply** with its cause and the card or issue that owns it, if any.
+
 ## Limits
 
 - Do not waive or reword acceptance. Where a fixture predicate is stricter than the gate text, record your
@@ -188,4 +227,7 @@ Verify the prevention the same way as the cleanup: read the edited skill text ba
 - [ ] Old body saved; unlinked parents listed; `kanban context` size measured before and after?
 - [ ] The card is in a status that can start (not triage, not waiting on a dead home), read back after the change?
 - [ ] At least one producer (skill, template, recipe) was edited, or the reply says exactly why none could be?
+- [ ] Every cause has a point-of-failure line, and at least one mechanism was built (or an existing one fixed) with
+      a regression test replaying this card, or the reply says why none was possible?
+- [ ] Mechanisms not built are listed with their owner?
 - [ ] Anything not done (a fix not written, an environment not built) is listed as not done?
