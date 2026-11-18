@@ -1,7 +1,7 @@
 ---
 name: kanban-card-churn
 description: "Use when one Kanban card has many runs, comments or a huge context and still isn't done."
-version: 1.3.0
+version: 1.4.0
 author: daveey
 license: MIT
 triggers:
@@ -77,6 +77,10 @@ Write down these numbers; the reply leads with them:
   home.
   If the bottom is a decision waiting on the user, read its `human_request` and put the exact choices at the top
   of your reply: that one answer is worth more than any cleanup.
+  A chain can also end at a decision an agent took for the user under a standing default ("keep paused"), with
+  no ask outstanding and an archived prerequisite. Runs in the last 7 days = 0 on an old card is the sign. Then
+  the card needs no cleanup: report what was paused, by whom, on what evidence, what resuming costs, and ask the
+  user resume or stop. Do not restructure a paused graph.
 - **App or version churn:** how many times the thing under test was redeployed during the card's life.
 
 ## 2. Classify the causes
@@ -101,6 +105,9 @@ four of these at once.
 | Other cards park on this one | consumer cards post a recheck comment every wake | state file rule: no recheck comments | fix the consumers' skill; check first whether it already says so |
 | Workspace litter | hundreds of numbered scripts, several full checkouts | note it; delete only your own files | body rule: reuse one checkout, remove one-off scripts at run end |
 | Handshake phrase mismatch | two cards wake on each other's comments; a request sits unanswered until a backstop | post one pointer that matches the waiting card's wake phrase; never fake the answer | fixed tokens (`X-REQUEST <id>@<sha>`, `X-GRANT`, `X-REFUSE`) in both bodies; wake checks match the token only; the sender reads the receiver's wake check after posting |
+| Self-continuation loop | dozens of `continued` runs in a few days, then `continuation_exhausted` and a split into slices | none needed once split; check the slices are not parked on the same wall | body: acceptance in slices from the start, each with its own done rule |
+| Infeasible acceptance found late | a hard cap (time, memory, budget) the work cannot meet, discovered after 100 runs | record the measured gap and the options in the state file | first run of any card with a hard cap is a feasibility probe that reports the margin before building |
+| Paused graph left open | every card `todo`/`scheduled` behind a pause someone applied by default; clock-only wakes weeks out | put the exact resume-or-stop decision to the user; archive the graph on stop | a pause names who applied it, the user's words or the default used, and the one sentence that resumes it |
 | Poll-and-repark | runs that only reread state and reschedule | wake on the real producer event only | spend budget; wake checks on events, not timers |
 
 ## 3. Clean up the card
