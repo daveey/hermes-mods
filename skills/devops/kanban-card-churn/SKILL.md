@@ -115,9 +115,9 @@ four of these at once.
 
 ## 3. Clean up the card
 
-Before the first write, re-read the card's newest events and comments. Another chat or a budget gate may have
-changed it while you were measuring; if their decision conflicts with yours, say so in a comment, do not silently
-overwrite it.
+Before editing and again before promotion, re-read the newest body, budget events and comments. When concurrent
+orchestrators have changed the same card's scope or run allowance, reconcile to one scope, one budget and one
+promoting owner rather than adding overlapping allowances or overwriting a competing decision.
 
 1. **State file.** Write `<workspace>/STATE.md` (under 8 KB, overwritten, never appended). Sections: live version;
    gate table (gate, proof mode, status at this version, evidence link, what is left); root cause of the current
@@ -226,10 +226,10 @@ budget recovery into another platform project merely to satisfy this checklist.
 - `hermes kanban context` is what a worker sees; `show` is larger and misleads the size estimate.
 - `promote` refuses until you acknowledge recent foreign comments: run it with `--dry-run`, take the `--seen <id>`
   it prints, rerun.
-- `promote --seen <id>` can be refused forever with "Comment data unavailable ... --seen cannot acknowledge
-  missing data" for a legacy comment event days old; the form without `--seen` (foreign comments from the last
-  60 minutes) is not. A subagent whose CLI is fenced reproduces only the `--seen` form: run `--dry-run` both ways
-  yourself before calling a card unreleasable.
+- For missing historical comment data, compare `promote --dry-run` with and without `--seen` once. Omitting
+  `--seen` is not a guaranteed recovery: recent foreign comments can still require acknowledgment. If both
+  refuse, stop alternating the commands; locate the existing comment-readback repair owner and verify its
+  live run before handing off recovery. Reading comments alone does not prove acknowledgment succeeded.
 - `edit --requires` replaces the capability list (`terminal,file,git`), not `runs_on`; placement is
   `move --pool` / `move --runs-on`.
 - `wait-comment --contains` matches anywhere in a comment, so a note that quotes a grant/refuse token wakes the
