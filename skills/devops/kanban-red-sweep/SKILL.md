@@ -127,7 +127,7 @@ Prevent acceptance-change surprises at card creation instead (slug `acceptance-w
 - `complete` is also checked against the card's acceptance. When it's refused because the acceptance still has open
   steps (live checks, a PR on a moved repo), comment the corrected premise and unblock so the owner finishes. Don't force it.
 - A child can't complete before its blocked parent. When you've done the parent's work yourself, complete the parent first.
-- Cards whose dependents wait on them: unblocking or completing promotes the children. Check them, queue position
+- Cards whose dependents wait on them: unblocking, completing or archiving promotes the children. When you drop a parent and its waiting child together, archive the child first: a pool worker claims a promoted card within seconds, and the archive then waits on its live lease. Check them, queue position
   included: a promoted card keeps its old low priority and sits behind the queue you just cleared for its parent.
   A child that is paused by decision and was only parked behind this card as a makeshift hold would restart: give
   it its own hold first (`hermes kanban schedule <child> --wake-check 'test -f <approval marker>' --check-every 3600
@@ -315,6 +315,7 @@ and the final response.
   --human-request "$(cat hr.json)" --metadata-only` (prints `Classified ... (metadata only; remains parked)`). Read the
   current human_request and block reason first (tasks row or last block event payload), so only the action changes.
 - Before saying an ask is still blocked, re-read it: the user may have answered on another surface since the last read.
+- Re-read each card's status, and its events since your inventory read, inside the script that writes to it, and skip the card on any change. Another live chat may be settling the same card with the user, and a write made from a read taken minutes earlier archives over its answer, with a wrong comment that then needs a correction.
 
 ## Done means
 - [ ] Scope matched his words (step 0): a not-ready/Todo/Scheduled ask got the `waiting` audit at the top of the reply, not a red sweep?
