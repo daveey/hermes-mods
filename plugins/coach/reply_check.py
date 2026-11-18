@@ -3268,8 +3268,10 @@ PEER_MAIL_CLOSE = "[END PEER MESSAGE]"
 
 
 def peer_mail_turn(user_ask) -> bool:
-    """True when the turn's ask is a hermes-mail peer envelope: it opens with PEER_MAIL_OPEN and carries the close."""
-    text = str(user_ask or "").lstrip()
+    """True when the turn's ask is a hermes-mail peer envelope: it opens with PEER_MAIL_OPEN and carries the close.
+    Core's resume preamble(s) are stripped first (strip_preamble), as the nudge record's ask_head is: a resumed peer
+    turn is still one (PR 282 review)."""
+    text = strip_preamble(str(user_ask or "").lstrip()).lstrip()
     return text.startswith(PEER_MAIL_OPEN) and PEER_MAIL_CLOSE in text
 
 
