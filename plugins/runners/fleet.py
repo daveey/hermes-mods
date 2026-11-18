@@ -4,6 +4,7 @@ Gateway workers come from the Board machine registry plus live Board leases in
 the local sync-shadow replicas; CI workers come from the collector inventory,
 grouped into machines by runner name. Pure functions; callers do the I/O.
 """
+import os
 import re
 import sqlite3
 from pathlib import Path
@@ -44,6 +45,60 @@ def _ro_connect(path, timeout=5):
         con = sqlite3.connect(f"file:{uri}?mode=rw", uri=True, timeout=timeout)
         con.execute("PRAGMA query_only=ON")
         return con
+
+
+# Worker lifecycle events (the autoscaler's ledger): what the panel's timeline draws.
+EVENT_KINDS = ('launched', 'ready', 'draining', 'removed')
+EVENTS_WINDOW_S = 24 * 3600
+EVENTS_LIMIT = 500
+# Per sqlite wait. A locked ledger costs two waits at most (mode=ro, then the mode=rw fallback).
+_EVENTS_TIMEOUT_S = 0.4
+
+
+def scaler_ledger_path(env=None):
+    """The autoscaler's ledger: ``HERMES_WORKER_SCALER_LEDGER``, else ``~/.hermes/state/worker-scaler.db``."""
+    override = (os.environ if env is None else env).get('HERMES_WORKER_SCALER_LEDGER')
+    return Path(override) if override else Path.home() / '.hermes' / 'state' / 'worker-scaler.db'
+
+
+def worker_events(ledger_path, since_s, now_s, limit=EVENTS_LIMIT):
+    """Lifecycle events with ``since_s <= at <= now_s``, oldest first: ``[{at, worker, kind, reason, instance}]``.
+
+    Read-only: never creates or writes the ledger. Only EVENT_KINDS are returned; of more than
+    ``limit`` the newest are kept. A row that is not a well-formed event is left out. A host
+    without the ledger or its ``events`` table (every host but the autoscaler's), a locked or
+    unreadable database, or any other failure reads as no events: ``[]``, never an exception.
+    """
+    try:
+        limit = int(limit)
+        path = Path(ledger_path)
+        if limit <= 0 or not path.is_file():
+            return []
+        db = _ro_connect(path, timeout=_EVENTS_TIMEOUT_S)
+        try:
+            rows = db.execute(
+                'SELECT at, slot, iid, kind, reason FROM events WHERE at >= ? AND at <= ? '
+                f"AND kind IN ({', '.join('?' * len(EVENT_KINDS))}) ORDER BY at DESC, id DESC LIMIT ?",
+                (float(since_s), float(now_s), *EVENT_KINDS, limit)).fetchall()
+        finally:
+            db.close()
+    except Exception:  # sqlite3.Error, OSError, a bad argument: the view goes on without a timeline
+        return []
+    out = []
+    for at, slot, iid, kind, reason in reversed(rows):
+        # sqlite columns are untyped: a text ``at`` sorts above every number and is dropped by the range.
+        if (isinstance(at, bool) or not isinstance(at, (int, float)) or not isinstance(slot, str)
+                or not slot.strip() or not isinstance(reason, str)):
+            continue
+        out.append(dict(at=float(at), worker=slot, kind=kind, reason=reason,
+                        instance=iid if isinstance(iid, str) and iid else None))
+    return out
+
+
+def with_worker_events(section, ledger_path, now_s):
+    """The gateway section plus ``events`` (last EVENTS_WINDOW_S) and ``events_since`` (epoch seconds)."""
+    since = now_s - EVENTS_WINDOW_S
+    return dict(section, events=worker_events(ledger_path, since, now_s), events_since=since)
 
 
 def live_leases(shadow_dir, now_ms):

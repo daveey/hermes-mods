@@ -76,6 +76,34 @@ Tests (`tests/throttle.test.mjs`): the limit maths, a rendered panel with a toke
 throttle data, the slider's preview and single commit, and the chip summary. **Not tested**: the request to the
 throughput API from a live Desktop (the tests pass the payload in), and the X drawing itself (CSS).
 
+## Worker lifecycle timeline
+
+Under the gateway machine grid (above the "N off" line) a one-row timeline shows what the worker autoscaler did
+in the last 24 hours: the axis ends now (left is older) with local hour labels every 6 h, and each event is one
+tick at its time: yellow = launched, green = ready for scheduling, blue = draining, red = removed, with a legend
+under the axis. Hovering a tick shows `worker · what happened · reason · local time`, for example
+`worker-3 · draining · consolidating spare capacity (4 cards finishing) · 03:41`; the same text is the tick's
+accessible label, so the kind never depends on colour alone.
+
+A worker keeps one lane (of up to 4) for the whole window, so its life reads left to right. Workers are placed in
+order of their first event, then name, each in the lane where fewest of its ticks would land within ~5 px of a
+tick already there: workers acting at the same moment stack instead of covering each other. Ticks of one lane
+that are still closer than that (a worker launched and ready within minutes, or more simultaneous workers than
+lanes) are drawn that far apart, later ones moved right (pulled back from the right edge), so every tick keeps
+its own hover target; a nudged tick's hover text still carries the true time. The result depends only on the
+events, not on their order.
+
+Data: `gateways.events` in the fleet response, `[{at, worker, kind, reason, instance}]` oldest first (`at` in
+epoch seconds, `kind` one of `launched`, `ready`, `draining`, `removed`, `instance` a string or null), plus
+`gateways.events_since`, the window start in epoch seconds (now − 24 h). The gateway reads them read-only from the
+autoscaler's sqlite ledger (`~/.hermes/state/worker-scaler.db`, or `HERMES_WORKER_SCALER_LEDGER`; table
+`events(id, at, slot, iid, kind, reason)`): at most the newest 500 of the window, unknown kinds and malformed
+rows left out. A host without that file or table, or with the ledger locked or unreadable, answers `events: []`
+(the read waits under a second and never creates or writes the file). Only the autoscaler's host has events, so
+the panel takes them from whichever connected gateway has any, independent of which one leads the section. No
+events in the window, or a gateway older than the field: no timeline at all. It redraws with the panel's normal
+refresh; there is no extra request.
+
 ## Data and load
 
 `GET /api/plugins/runners/v1/fleet` (plugins/runners/dashboard/plugin_api.py, logic in plugins/runners/fleet.py).
@@ -125,6 +153,15 @@ python -m pytest plugins/runners/tests/test_fleet.py plugins/runners/tests/test_
 
 - CI groups: categories + counts + health, collapsed by default, expand/remember/collapse: `groups.test.mjs`,
   `test_fleet.py` `test_ci_machine_categories_for_the_panel_groups`
+- worker lifecycle timeline: `fleet.test.mjs` "timeline: …" (four kinds/colours and accessible labels; position
+  proportional to time and out-of-window events dropped; hover text; lanes, spacing and determinism; nothing drawn
+  without events or the field, legend with them; events taken from the gateway that has them); ledger read
+  (window, order, known kinds, limit, missing file/table, malformed rows, locked database, never created or
+  modified, failed `mode=ro` open): `test_fleet.py` `test_worker_events_*`, `test_gateway_section_carries_events_and_the_window_start`,
+  `test_scaler_ledger_path_env_override_else_home_state`; REST path: `test_api.py`
+  `test_fleet_route_gateway_section_carries_worker_events_from_the_scaler_ledger`. **Not tested**: the autoscaler
+  writing the ledger (not part of this plugin), a ledger in WAL mode under a live writer, and the tick colours as
+  drawn in the Desktop's light and dark themes (CSS).
 - gateway rows are single grid lines under one column header (bare numbers, units in the header; flags and load age as hover text on an (i) marker only), no Investigate control: "gateway rows: one grid line", "waiting: header counts", "load meters"
 
 Not covered: native Desktop rendering (checked by hand after hermes-sync).

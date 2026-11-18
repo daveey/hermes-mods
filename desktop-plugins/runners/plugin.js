@@ -381,7 +381,17 @@ export function merge(sources, now = Date.now()) {
     if (best.error) return { ...best, state: 'stale', reason: `last update ${ago(now - best.at)} · ${best.error}` }
     return best
   }
-  return { gateways: withOwnCaps(pick('gateways'), sources), ci: pick('ci'), at: now }
+  return { gateways: withEvents(withOwnCaps(pick('gateways'), sources), sources), ci: pick('ci'), at: now }
+}
+
+// Only the gateway on the autoscaler's host has lifecycle events; every other one answers []. Take them from
+// the freshest route that has any, so the timeline does not come and go with whichever gateway answered last.
+function withEvents(section, sources) {
+  const has = (g) => Array.isArray(g?.events) && g.events.length > 0
+  if (has(section)) return section
+  const from = sources.filter((s) => has(s.body?.gateways)).sort((a, b) => (b.at || 0) - (a.at || 0))[0]
+  if (!from) return section
+  return { ...section, events: from.body.gateways.events, events_since: from.body.gateways.events_since }
 }
 
 // A gateway knows its own dispatcher cap; others only see the registry. Take each machine's
@@ -770,6 +780,110 @@ function SectionNote({ section }) {
   return h('div', { className: 'hermes-fleet-note', role: 'status' }, msg)
 }
 
+// ── worker lifecycle timeline ────────────────────────────────────────────────────────────────────────────
+// `gateways.events` (plugins/runners fleet.worker_events: the autoscaler's ledger, last 24 h, `at` in epoch
+// seconds). One tick per event on a 24 h axis ending now. Absent (older gateway) or empty: nothing is drawn.
+export const TIMELINE_WINDOW_MS = 24 * 3600 * 1000
+export const TIMELINE_LANES = 4
+// Closest two ticks of one lane may sit, as a share of the axis: ~5 px of the 680 px minimum panel.
+export const TIMELINE_GAP = 0.008
+export const EVENT_WORDS = { launched: 'launched', ready: 'ready for scheduling', draining: 'draining', removed: 'removed' }
+const LANE_PX = 10
+
+// Share of the axis (0 = window start, 1 = now), or null outside the window.
+export function timelineX(atMs, now, windowMs = TIMELINE_WINDOW_MS) {
+  const x = (atMs - (now - windowMs)) / windowMs
+  return Number.isFinite(x) && x >= 0 && x <= 1 ? x : null
+}
+
+// Local wall-clock HH:MM.
+export function clockTime(ms) {
+  const d = new Date(ms)
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+}
+
+// "worker-3 · draining · consolidating spare capacity · 03:41"
+export function eventTip(e) {
+  return [text(e.worker), EVENT_WORDS[e.kind] || text(e.kind), text(e.reason).trim(), clockTime(e.at * 1000)].filter(Boolean).join(' · ')
+}
+
+// Events -> ticks `{key, worker, kind, at, x, pos, lane, tip}`, oldest first. `x` is the event's time on the
+// axis; `pos` is where the tick is drawn. A worker keeps one lane for the whole window, so its life reads left
+// to right. Workers are placed in order of their first event (then name), each in the lane where fewest of its
+// ticks land within `gap` of a tick already there (lowest lane on a tie): workers acting at the same moment
+// stack instead of covering each other. Ticks still closer than `gap` in one lane (one worker launched and
+// ready within minutes, or more busy workers than lanes) are drawn `gap` apart, later ones moved right, so
+// every tick keeps its own hover target. Same input, same output.
+export function timelineTicks(events, now, { windowMs = TIMELINE_WINDOW_MS, lanes = TIMELINE_LANES, gap = TIMELINE_GAP } = {}) {
+  if (!Array.isArray(events)) return []
+  const ticks = []
+  events.forEach((e, i) => {
+    if (!e || typeof e.at !== 'number' || typeof e.worker !== 'string' || !e.worker.trim() || !(e.kind in EVENT_WORDS)) return
+    const x = timelineX(e.at * 1000, now, windowMs)
+    if (x == null) return
+    ticks.push({ key: `${e.at}:${e.worker}:${e.kind}:${i}`, worker: e.worker, kind: e.kind, at: e.at, x, pos: x, lane: 0, tip: eventTip(e), i })
+  })
+  ticks.sort((a, b) => a.at - b.at || a.i - b.i)
+  const byWorker = new Map()
+  for (const t of ticks) byWorker.set(t.worker, [...(byWorker.get(t.worker) || []), t])
+  const order = [...byWorker.keys()].sort((a, b) => byWorker.get(a)[0].at - byWorker.get(b)[0].at || (a < b ? -1 : a > b ? 1 : 0))
+  const placed = Array.from({ length: Math.max(1, lanes) }, () => [])
+  for (const worker of order) {
+    const mine = byWorker.get(worker)
+    const clashes = placed.map((xs) => mine.filter((t) => xs.some((x) => Math.abs(x - t.x) < gap)).length)
+    const lane = clashes.indexOf(Math.min(...clashes))
+    for (const t of mine) t.lane = lane
+    placed[lane].push(...mine.map((t) => t.x))
+  }
+  for (let lane = 0; lane < placed.length; lane++) {
+    const row = ticks.filter((t) => t.lane === lane)
+    for (let i = 1; i < row.length; i++) row[i].pos = Math.max(row[i].x, row[i - 1].pos + gap)
+    // Pushed past "now": pull the tail back from the right edge instead.
+    if (row.length && row[row.length - 1].pos > 1) {
+      row[row.length - 1].pos = 1
+      for (let i = row.length - 2; i >= 0; i--) row[i].pos = Math.max(0, Math.min(row[i].pos, row[i + 1].pos - gap))
+    }
+  }
+  return ticks.map(({ i, ...t }) => t)
+}
+
+// Hour labels at local round hours, every `stepHours`: [{x, label}].
+export function timelineAxis(now, windowMs = TIMELINE_WINDOW_MS, stepHours = 6) {
+  const start = now - windowMs, d = new Date(start), out = []
+  d.setMinutes(0, 0, 0)
+  if (d.getTime() < start) d.setHours(d.getHours() + 1)
+  for (let guard = 0; d.getHours() % stepHours && guard < 24; guard++) d.setHours(d.getHours() + 1)
+  for (let guard = 0; d.getTime() <= now && guard < 48; guard++, d.setHours(d.getHours() + stepHours))
+    out.push({ x: timelineX(d.getTime(), now, windowMs), label: clockTime(d.getTime()) })
+  return out.filter((a) => a.x != null)
+}
+
+const pct = (x) => `${(x * 100).toFixed(3)}%`
+
+export function Timeline({ events, now }) {
+  const ticks = timelineTicks(events, now)
+  if (!ticks.length) return null
+  const lanes = Math.max(...ticks.map((t) => t.lane)) + 1
+  const axis = timelineAxis(now)
+  return h('div', {
+    className: 'hermes-fleet-timeline', 'data-timeline': ticks.length, role: 'group',
+    'aria-label': `Worker lifecycle, last 24 hours: ${ticks.length} event${ticks.length === 1 ? '' : 's'}`
+  },
+    h('div', { className: 'hermes-fleet-tl-track', 'data-lanes': lanes, style: { height: `${lanes * LANE_PX}px` } },
+      ...axis.map((a) => h('i', { key: `g${a.x}`, className: 'hermes-fleet-tl-grid', 'aria-hidden': 'true', style: { left: pct(a.x) } })),
+      ...ticks.map((t) => h('span', {
+        key: t.key, className: `hermes-fleet-tl-tick is-${t.kind}`, role: 'img', title: t.tip, 'aria-label': t.tip,
+        'data-kind': t.kind, 'data-worker': t.worker, 'data-lane': t.lane,
+        style: { left: pct(t.pos), top: `${t.lane * LANE_PX + 1}px` }
+      }))),
+    // The label slides from left-aligned at the window start to right-aligned at now, so none is cut off.
+    h('div', { className: 'hermes-fleet-tl-axis', 'aria-hidden': 'true' },
+      ...axis.map((a) => h('span', { key: `l${a.x}`, style: { left: pct(a.x), transform: `translateX(-${pct(a.x)})` } }, a.label))),
+    h('div', { className: 'hermes-fleet-tl-legend', 'data-legend': 'worker-events' },
+      ...Object.keys(EVENT_WORDS).map((k) => h('span', { key: k, 'data-kind': k },
+        h('i', { className: `hermes-fleet-tl-key is-${k}`, 'aria-hidden': 'true' }), EVENT_WORDS[k]))))
+}
+
 // Machines that were shut down on purpose get one line under the grid, not a row each: a row of
 // dotted slots and hours-old CPU/RAM numbers for a machine that is off reads as "still there".
 function StoppedNote({ machines, now }) {
@@ -795,6 +909,7 @@ export function Panel({ view, now, repairClient, throttle = null, onThrottle, th
     h('div', { className: 'hermes-fleet-gw' },
       h(GatewayHead),
       ...view.gateways.machines.filter((m) => m.state !== 'stopped').map((m) => h(GatewayRow, { key: m.name, m, now, limit: limitRow(throttle, m.name) }))),
+    h(Timeline, { events: view.gateways.events, now }),
     h(StoppedNote, { machines: stopped, now }),
     h('div', { className: 'hermes-fleet-head' },
       h('span', null, 'CI workers (GitHub Actions)'),
@@ -992,6 +1107,20 @@ button.hermes-fleet-slot{cursor:pointer}
 .hermes-fleet-slot.is-draining{background:repeating-linear-gradient(45deg,transparent 0 2px,var(--ui-text-tertiary) 2px 3px)}
 .hermes-fleet-slot.is-lost{background:#d64545;border-color:#d64545}
 .hermes-fleet-row.is-asleep .hermes-fleet-name,.hermes-fleet-row.is-unknown .hermes-fleet-name{color:var(--ui-text-tertiary)}
+.hermes-fleet-timeline{margin-top:6px;font-size:10px;color:var(--ui-text-tertiary)}
+.hermes-fleet-tl-track{position:relative;margin:0 2px;border-bottom:1px solid var(--ui-stroke-secondary)}
+.hermes-fleet-tl-grid{position:absolute;top:0;bottom:0;border-left:1px dotted var(--ui-stroke-secondary)}
+.hermes-fleet-tl-tick{position:absolute;width:4px;height:8px;margin-left:-2px;border-radius:1px;cursor:help}
+.hermes-fleet-tl-tick:hover{z-index:1;outline:1px solid var(--ui-text-primary,currentColor);outline-offset:1px}
+.hermes-fleet-timeline .is-launched{background:#d4a72c}
+.hermes-fleet-timeline .is-ready{background:#2ea043}
+.hermes-fleet-timeline .is-draining{background:#388bfd}
+.hermes-fleet-timeline .is-removed{background:#d64545}
+.hermes-fleet-tl-axis{position:relative;height:13px;margin:1px 2px 0;font-variant-numeric:tabular-nums}
+.hermes-fleet-tl-axis>span{position:absolute;top:0;white-space:nowrap}
+.hermes-fleet-tl-legend{display:flex;justify-content:flex-end;flex-wrap:wrap;gap:2px 10px}
+.hermes-fleet-tl-legend>span{display:inline-flex;align-items:center;gap:4px;white-space:nowrap}
+.hermes-fleet-tl-key{display:inline-block;width:4px;height:8px;border-radius:1px}
 `
 
 export default {
