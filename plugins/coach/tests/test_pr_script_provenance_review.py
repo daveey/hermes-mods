@@ -84,6 +84,29 @@ def test_numbered_lists_all_read(tmp_path, monkeypatch, separator):
         assert check(h, 'PRs 3139/3189 are still open.')
 
 
+@pytest.mark.parametrize('separator', [
+    '-', ' - ', ' – ', ' to ', ' through ', ' as well as ', ' plus ',
+    ' + ', ' and also ', ' and then ', ' (and ', ' (', ' ; ',
+    ', then ', ' and number ', ' and the ', ' and 0',
+])
+@pytest.mark.parametrize('prefix', ['PRs ', 'PR #', '#'])
+def test_unbounded_connectives_fail_closed(tmp_path, monkeypatch, separator, prefix):
+    h = begin(tmp_path, monkeypatch)
+    write(h, tmp_path / 'r.sh')
+    run(h, tmp_path / 'r.sh')
+    assert check(h, f'{prefix}3139{separator}3140 are still open.')
+
+
+@pytest.mark.parametrize('suffix', [' at 00:49Z', ' at 12:34:56Z',
+                                  ' at 4c1f66ea9b', '; tests pass 134/134',
+                                  ' with 3 checks pending'])
+def test_numeric_metadata_not_pr_list(tmp_path, monkeypatch, suffix):
+    h = begin(tmp_path, monkeypatch)
+    write(h, tmp_path / 'r.sh')
+    run(h, tmp_path / 'r.sh')
+    assert check(h, f'PR #3139 is still open{suffix}.') is None
+
+
 # An explicit inventory makes expansion of the trust boundary reviewable.
 READERS = ('read_file', 'search_files', 'skill_view', 'skills_list',
            'tool_describe', 'tool_search')
