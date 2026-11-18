@@ -483,6 +483,28 @@ class PluginStartedOpener(unittest.TestCase):
         self.assertEqual([(h['session'], h['t']) for h in hits], [('b', 120)])
         self.assertEqual(sum(scanned.values()), 1)
 
+    def test_row_raw_generated_needs_no_scripts_dir_on_sys_path(self):
+        # self_heal's drain loads coach_askgate by file path, so `import session_digest` only worked when an
+        # earlier test in the same process had put scripts/ on sys.path; the ImportError was swallowed by
+        # still_flags and rows were filed instead of withdrawn (3 plugins/coach failures in PR264 CI, py3.14).
+        import subprocess
+        import sys
+        from pathlib import Path
+        script = Path(g.__file__).resolve()
+        code = (
+            "import importlib.util, sys\n"
+            f"p = {str(script)!r}\n"
+            "sys.path[:] = [x for x in sys.path if x not in ('', {parent!r})]\n"
+            "spec = importlib.util.spec_from_file_location('_selfheal_askgate', p)\n"
+            "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
+            "assert 'session_digest' not in sys.modules\n"
+            "row = {{'session_id': 's', 'quote': 'x', 'hit_t': 100.0}}\n"
+            "assert m.row_raw_generated(row, homes=[]) is False\n"
+            "print('ok')\n"
+        ).format(parent=str(script.parent))
+        r = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True, timeout=60)
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, "ok"), r.stdout + r.stderr)
+
 
 if __name__ == '__main__':
     unittest.main()
