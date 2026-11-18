@@ -153,6 +153,31 @@ def test_formatted_repository_scope(tmp_path, monkeypatch, repo, formatting):
     assert bool(result) == (repo != 'example/repo')
 
 
+@pytest.mark.parametrize('repo', ['unrelated/repo', 'example/repo'])
+@pytest.mark.parametrize('form', [
+    "PR #3139 in {repo}'s queue is still open.",
+    "PR #3139 in {repo}’s queue is still open.",
+    "PR #3139 in `{repo}`'s queue is still open.",
+    'In {repo}: PR #3139 is still open.',
+    'PR #3139 in {repo}! It is still open.',
+    'PR #3139 in {repo}/ is still open.',
+    'PR github.com/{repo}/pull/3139 is still open.',
+    'PR #3139 in https://github.com/{repo} is still open.',
+    'PR #3139 in "{repo}" is still open.',
+    'PR #3139 in “{repo}” is still open.',
+])
+def test_raw_repository_scope(tmp_path, monkeypatch, repo, form):
+    hooks, _, _ = begin(tmp_path, monkeypatch)
+    replay(hooks, tmp_path / 'read.sh')
+    assert bool(check(hooks, form.format(repo=repo))) == (repo != 'example/repo')
+
+
+def test_short_repository_scope_is_ambiguous(tmp_path, monkeypatch):
+    hooks, _, _ = begin(tmp_path, monkeypatch)
+    replay(hooks, tmp_path / 'read.sh')
+    assert check(hooks, 'PR repo#3139 is still open.')
+
+
 @pytest.mark.parametrize('quote', ['', "'", '"'])
 def test_brace_execution_provenance(tmp_path, monkeypatch, quote):
     import subprocess
