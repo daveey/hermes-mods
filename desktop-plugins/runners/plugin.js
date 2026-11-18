@@ -1012,13 +1012,7 @@ export function Runners({ ctx }) {
   const title = s
     ? `Hub ${s.hub.busy}/${s.hub.slots} slots scheduled · Workers ${s.workers.busy}/${s.workers.slots}${typeof s.workers.usable === 'number' && s.workers.usable < s.workers.slots ? ` (${s.workers.slots - s.workers.usable} throttled)` : ''} · CI ${s.cBusy}/${s.cSlots} busy${s.gWaiting ? ` · ${s.gWaiting} waiting` : ''}${s.lost ? ` · ${s.lost} machine lost` : ''}`
     : 'Loading runners'
-  // With the lanes plugin loaded, the chip opens the lanes panel (it has a Runners button back to this one);
-  // `hermes-show-runners` still opens this popover directly.
-  const onOpenChange = (next) => {
-    if (next && window.__hermesLanesPanel) window.dispatchEvent(new window.Event('hermes-show-lanes'))
-    else setOpen(next)
-  }
-  return h(Popover, { open, onOpenChange },
+  return h(Popover, { open, onOpenChange: setOpen },
     h(PopoverTrigger, { asChild: true },
       h('button', { type: 'button', className: BAR, 'data-slot': 'runners-chip', 'aria-label': `Show runners: ${label}`, title },
         s && (s.tone === 'bad' || s.tone === 'warn') ? h(StatusDot, { tone: s.tone }) : null,
