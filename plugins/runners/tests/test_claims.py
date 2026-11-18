@@ -391,12 +391,20 @@ def test_stalled_http_clients_are_dropped(tmp_path, key):
         # Slots were released after the per-connection timeout: a fresh request is served.
         with urllib.request.urlopen('http://127.0.0.1:%d/v1/health' % port, timeout=5) as r:
             assert json.loads(r.read())['ok']
-        req = urllib.request.Request('http://127.0.0.1:%d/v1/claims' % port, data=b'{}', method='POST',
-                                     headers={'Transfer-Encoding': 'chunked', 'Authorization': 'Bearer a.b.c'})
-        try:
-            urllib.request.urlopen(req, timeout=5)
-        except urllib.error.HTTPError as e:
-            assert e.code == 400
+        # A chunked body is refused from its headers alone: the server answers 400 and closes without reading
+        # a body. A client still writing one then gets EPIPE or ECONNRESET instead of the reply (through
+        # urllib a URLError, about 1 request in 8 on loopback), which failed this test now and then
+        # (hermes-hub pre-push gate, 2026-11-17). Send the headers only and read the status line.
+        with socket.create_connection(('127.0.0.1', port), timeout=5) as s:
+            s.sendall(b'POST /v1/claims HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n'
+                      b'Authorization: Bearer a.b.c\r\n\r\n')
+            reply = b''
+            while b'\r\n' not in reply:
+                part = s.recv(4096)
+                if not part:
+                    break
+                reply += part
+        assert reply.split(b'\r\n', 1)[0].split()[1:2] == [b'400'], reply[:120]
     finally:
         http.shutdown()
 
