@@ -1326,8 +1326,71 @@ def _command_lookup_only(args: list[str]) -> bool:
     return lookup
 
 
+def _env_split(text: str) -> list[str]:
+    """Bounded literal GNU env -S grammar (not shell syntax or shlex).
+
+    Parameter expansion needs the child's environment and is deliberately unsupported.
+    Decoded words must be shell-quoted before entering the shell analyzer again.
+    """
+    if len(text) > 16384:
+        raise _ParseError("env split-string budget")
+    out, word = [], []
+    quote, started, i = "", False, 0
+    escapes = {"f": "\f", "n": "\n", "r": "\r", "t": "\t", "v": "\v",
+               "#": "#", "$": "$", "\\": "\\", "'": "'", '"': '"'}
+    while i < len(text):
+        ch = text[i]
+        i += 1
+        if ch == "\\" and (quote != "'" or
+                i < len(text) and text[i] in "\\'"):
+            if i == len(text):
+                raise _ParseError("trailing env escape")
+            ch = text[i]
+            i += 1
+            if ch == "c" and not quote:
+                break
+            if ch == "_":
+                if quote:
+                    word.append(" ")
+                    started = True
+                elif started:
+                    out.append("".join(word))
+                    word, started = [], False
+                continue
+            if ch not in escapes:
+                raise _ParseError("unsupported env escape")
+            word.append(escapes[ch])
+            started = True
+        elif ch == "$" and quote != "'":
+            raise _ParseError("dynamic env split-string")
+        elif ch in "\"'" and (not quote or quote == ch):
+            quote = "" if quote else ch
+            started = True
+        elif not quote and ch in " \t\n\r\v\f":
+            if started:
+                out.append("".join(word))
+                word, started = [], False
+        elif not quote and ch == "#" and not started:
+            break
+        else:
+            word.append(ch)
+            started = True
+    if quote:
+        raise _ParseError("unclosed env quote")
+    if started:
+        out.append("".join(word))
+    return out
+
+
+def _env_split_option(word: str) -> bool:
+    return word in {"-S", "--split-string"} or word.startswith(("-S", "--split-string="))
+
+
 def _skip_wrappers(words: list[str], external_time: Optional[list] = None) -> list[str]:
     while words:
+        if (os.path.basename(words[0]) == "env" and len(words) > 1
+                and _env_split_option(words[1])):
+            return words  # simple() owns this argv-changing grammar boundary
         if os.path.basename(words[0]) == "time":
             # This is the external program; the shell keyword was parsed as a pipeline.
             if external_time is not None:
@@ -2086,6 +2149,25 @@ class _Analyzer:
                              unknown_command=" ".join(assigns + raw), git_assigns=assigns)
             return [st], [st]
         cmd = os.path.basename(name)
+        if cmd == "env" and len(raw) > 1 and _env_split_option(wrapper_words[-len(raw) + 1]):
+            option = _expand_word(raw[1], st.vars) or _literal(raw[1])
+            separate = option in {"-S", "--split-string"}
+            value = (_expand_word(raw[2], st.vars) if len(raw) > 2 else None) if separate else (
+                option.split("=", 1)[1] if option.startswith("--") else option[2:])
+            try:
+                if value is None or depth >= MAX_DEPTH:
+                    raise _ParseError("unresolved env split-string")
+                decoded = _env_split(value)
+            except _ParseError:
+                self.fail_closed(" ".join(raw))
+                self.shadow_argv(raw, st, depth, redirs=redirs)
+            else:
+                # env executes a child, not shell code. Re-quote each decoded word:
+                # literal $, semicolons, quotes and spaces cannot become shell syntax.
+                child_words = ["env", *map(shlex.quote, decoded), *raw[3 if separate else 2:]]
+                self.simple(("simple", assigns, child_words, redirs), st.copy(), depth + 1,
+                            nested=True)
+            return [st], [st]
         if cmd == "alias":
             for word in raw[1:]:
                 value = _expand_word(word, st.vars)
@@ -2253,10 +2335,13 @@ class _Analyzer:
             # command it runs (`prlimit git …`, `nix develop -c git …`, `busybox sh -c …`).
             # An unknown word counts when this command made it unknown (a substitution, a
             # variable it assigned, a positional); inherited terminal state is out of scope.
-            for w in raw[1:]:
+            for index, w in enumerate(raw[1:], 1):
                 word = _expand_word(w, st.vars)
                 base = os.path.basename(word) if word is not None else None
-                if (base in SHELLS or (base is not None and re.fullmatch(r"git(?:-[\w-]+)?", base))
+                env_split = (base == "env" and index + 1 < len(raw)
+                             and _env_split_option(_expand_word(raw[index + 1], st.vars) or ""))
+                if (base in SHELLS or env_split
+                        or (base is not None and re.fullmatch(r"git(?:-[\w-]+)?", base))
                         or (base is None and _command_unknown(w, st))):
                     self.shadow_argv(raw, st, depth, redirs=redirs)
                     break
