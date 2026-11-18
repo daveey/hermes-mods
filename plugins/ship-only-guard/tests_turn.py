@@ -104,6 +104,10 @@ class FakeGitHub:
             rows = [{"ref": r, "object": {"sha": s}} for r, s in sorted(self.refs.items())]
             return ok([rows[:4], rows[4:]] if "--slurp" in args else rows)
         if path.endswith("/git/commits") and method == "POST":
+            parents = [self.commits.get(parent) for parent in body["parents"]]
+            if any(not isinstance(parent, dict) or not isinstance(parent.get("message"), str)
+                   for parent in parents):
+                return fail  # Git commits require commit parents, not missing/tree/blob objects.
             sha = hashlib.sha1(json.dumps(body, sort_keys=True).encode()).hexdigest()
             self.commits[sha] = {"sha": sha, "tree": {"sha": body["tree"]}, "message": body["message"],
                                  "parents": body["parents"]}
@@ -229,11 +233,22 @@ def test_large_paginated_snapshot_keeps_oldest(gh):
     assert len([c for c in fake.calls if c[1:3] == ["api", "graphql"]]) == 2
 
 
-@pytest.mark.parametrize("object_value", [{"message": "broken"}, {}, None])
-def test_malformed_record_names_owner_and_recovers_without_peer_writes(gh, object_value):
-    fake = gh({n: pr(n, H2563, ["hermes-sync"]) for n in (1, 2)})
+@pytest.mark.parametrize("object_value", [{}, None])
+def test_noncommit_owner_cannot_rearm_or_change_ref(gh, object_value):
+    fake = gh({1: pr(1, H2563, ["hermes-sync"])})
     seed_turn(fake, 1, NOW - 60)
     fake.commits[fake.refs["refs/land-turn/pr-1"]] = object_value
+    before = dict(fake.refs)
+    result = g._turn_acquire(1, fake.prs[1], R, None, {})
+    assert "not a readable commit" in result
+    assert fake.refs == before
+    assert not any("PATCH" in call for call in fake.calls)
+
+
+def test_malformed_record_names_owner_and_recovers_without_peer_writes(gh):
+    fake = gh({n: pr(n, H2563, ["hermes-sync"]) for n in (1, 2)})
+    seed_turn(fake, 1, NOW - 60)
+    fake.commits[fake.refs["refs/land-turn/pr-1"]]["message"] = "broken"
     assert "refs/land-turn/pr-1: malformed record" in merge(2, H2563)
     before = dict(fake.refs)
     assert merge(1, H2563) is None
@@ -254,7 +269,7 @@ def test_cleanup_is_bounded(gh):
     assert merge(200, H2563) is None
     assert not [c for c in fake.calls if "DELETE" in c]  # speculative reader never writes
     assert g._turn_hold_refusal(200, fake.prs[200], R, None, {}) is None
-    assert len([c for c in fake.calls if "DELETE" in c]) == 2
+    assert not [c for c in fake.calls if "DELETE" in c]  # no unfenced cleanup; stale readers cannot erase rearm
 
 
 def test_acquire_checks_older_overlap_itself(gh):
@@ -642,11 +657,11 @@ def test_merged_holder_releases_without_manual_ref_cleanup(gh):
     merge(2563, H2563)
     fake.compare, fake.pr_state[2563] = IDENTICAL, "closed"
     assert merge(2600, H2600) is None
-    # Merge preflight is read-only while approval runs; non-speculative readers
-    # retain cleanup, rather than deleting a ref observed before approval.
+    # Semantic release needs no DELETE: retain the record to avoid stale cleanup
+    # erasing a newly rearmed admission on this same ref.
     assert "refs/land-turn/pr-2563" in fake.refs
     assert g._turn_hold_refusal("2600", pr(2600, H2600, ["hermes-sync"]), R, None, {}) is None
-    assert "refs/land-turn/pr-2563" not in fake.refs
+    assert "refs/land-turn/pr-2563" in fake.refs
 
 
 def test_expired_turn_is_ignored(gh, monkeypatch):
@@ -695,9 +710,9 @@ def test_readers_delete_cooled_turns(gh, monkeypatch):
     monkeypatch.setattr(g, "_now", lambda: NOW + 2 * g._TURN_TTL + 5)
     assert merge(2600, H2600) is None
     g._live_turns(R, None, {})
-    # Merge speculation is read-only; standalone readers retain bounded cleanup.
+    # Expiry releases the lane, but cleanup must not DELETE a concurrently rearmed ref.
     assert g._turn_hold_refusal(2600, fake.prs[2600], R, None, {}) is None
-    assert not fake.refs
+    assert set(fake.refs) == {"refs/land-turn/pr-2563"}
 
 
 class SimClock:
