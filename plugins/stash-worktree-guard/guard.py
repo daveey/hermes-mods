@@ -2000,7 +2000,14 @@ class _Analyzer:
                 # or a later word naming a program that runs input the guard never sees at
                 # this depth (xargs/parallel/find appending words, perhaps from `-a file`; a
                 # nested runner; an interpreter's script file), stays fail-closed.
-                self.local_evidence(" ".join(words + wrapper_words) + "\n" + self.suffix[1])
+                expanded = [_expand_word(w, st.vars) for w in words]
+                # Every literal, single-token suffix is analyzed by shadow_argv's
+                # outer loop. Bag-of-words evidence must not invent `stash push`
+                # from `git push ... HEAD:fix/stash-topic`. Keep text fallback for
+                # unknown expansions, code strings and stdin the suffix may run.
+                if (self.suffix[1] or any(w is None or re.search(r"\s", w)
+                                          for w in expanded)):
+                    self.local_evidence(" ".join(words + wrapper_words) + "\n" + self.suffix[1])
             else:
                 self.fail_closed(" ".join(words + wrapper_words))
             self.shadow_argv(words, st, depth, redirs=redirs)

@@ -66,6 +66,9 @@ ALLOW = {
 # These commands may run Git, but no stash/protected-ref mutation; unlike ALLOW they
 # are not inputs to the no-Git-execution proof below.
 WRAPPER_DATA = {
+    "broker-refspec": "token-broker exec --scope user/github --reason x -- git push origin HEAD:fix/stash-guard-scoped-uncertainty",
+    "broker-colon-refspec": "token-broker exec --scope user/github --reason x -- git push origin HEAD:stash-topic",
+    "unknown-wrapper-refspec": "launcher exec --unknown -- git push origin HEAD:fix/stash-topic",
     "suffix-wrapper-prose": r'''git commit -m "proof used \`git archive\`"; token-broker exec --scope user/github --reason push -- env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=credential.helper "GIT_CONFIG_VALUE_0=!gh auth git-credential" git push origin HEAD:topic''',
     "suffix-wrapper-awk": r'''awk '/git archive`/' patch; token-broker exec --scope user/github --reason push -- env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=credential.helper "GIT_CONFIG_VALUE_0=!gh auth git-credential" git push origin HEAD:topic''',
 }
@@ -78,6 +81,15 @@ def test_wrapper_resolution_uncertainty_is_local(wt, cmd):
 
 
 REFUSE = {
+    "broker-literal-pop": 'token-broker exec --scope user/github --reason x -- git stash pop',
+    "broker-literal-push": 'token-broker exec --scope user/github --reason x -- git stash push',
+    "broker-joined-stash": 'token-broker exec --scope user/github --reason x -- git st""ash drop',
+    "broker-ansi-stash": r"token-broker exec --scope user/github --reason x -- git $'\x73tash' pop",
+    "broker-parameter-stash": 'S=refs/stash; token-broker exec --scope user/github --reason x -- git "${S#refs/}" pop',
+    "broker-env-string": "token-broker exec --scope user/github --reason x -- env -S 'git stash pop'",
+    "broker-dashed-stash": 'token-broker exec --scope user/github --reason x -- /usr/lib/git-core/git-stash pop',
+    "broker-alias": "token-broker exec --scope user/github --reason x -- git -c alias.undo='stash pop' undo",
+    "broker-protected-ref": 'token-broker exec --scope user/github --reason x -- git push origin HEAD:refs/stash',
     "truncated-case-dynamic-op": 'echo "$(case a in a) git stash $OP;; esac)"',
     "wrapper-dynamic-mutation": 'G=$(command -v git); S=$(printf st""ash); token-broker exec --scope user/github --reason test -- "$G" "$S" drop',
     # An unquoted unknown suffix head may split into a command built elsewhere.
