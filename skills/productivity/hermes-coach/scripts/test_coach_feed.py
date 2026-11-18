@@ -28,7 +28,9 @@ class ConflictTest(unittest.TestCase):
         g(repo, "checkout", "-q", "main")
         f.write_text('{"a":1}\n{"c":3}\n{"d":4}\n')
         g(repo, "commit", "-qam", "main")
-        subprocess.run(["git", "-C", str(repo), "merge", "other"], capture_output=True)
+        # per-call identity: FQDN-less pool workers have no derivable committer
+        subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t", "-c", "user.name=t", "merge", "other"],
+                       capture_output=True)
         return repo, f
 
     def test_jsonl_union_dedupe(self):
