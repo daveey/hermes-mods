@@ -420,6 +420,13 @@ def _provider_of(exc_type: str, msg: str = "") -> str:
 # looked like the earlier offline case "came back"). Matched on the innermost frame AND that source line, so any
 # other exception raised inside execute still files.
 SESSION_CRON_REWRAP_SRC = "raise RuntimeError(result[3]"
+# cron/scheduler.py `_apply_monitor_gate` logs a failed monitor source as one ERROR with no exc_info; the message is
+# the script's output, so a traceback in it is the monitor script's (a sleeping laptop's DNS failure, a 502), quoted.
+# The same tick is re-logged by the gateway (SESSION_CRON_REWRAP_SRC) and booked on the job (last_error_kind="gate"),
+# so the cron lane files it once its failure streak holds (agent-95944cb790: both records filed one daily alarm).
+# MONITOR_SOURCE_FAILED_SRC is core's exact call; test_monitor_source_failed_line_matches_core pins it.
+MONITOR_SOURCE_FAILED_SRC = "logger.error(\"Job '%s': monitor source failed: %s\", job_id, _mon.error)"
+MONITOR_SOURCE_FAILED_RE = re.compile(r"^Job '[^']+': monitor source failed: ")
 
 
 def _session_cron_rewrap(block: List[str], frames: list, exc_type: str) -> bool:
@@ -594,6 +601,8 @@ def parse_errors(lines: List[str], reconnects: Optional[list] = None, auth: Opti
             continue
         if not any(l.startswith("Traceback (most recent call last)") for l in r["cont"]):
             continue
+        if r["logger"] == "cron.scheduler" and MONITOR_SOURCE_FAILED_RE.match(r["msg"]):
+            continue  # the cron job's own source failure, its stderr quoted: the cron lane files a failing streak
         # the last exception of the printed chain; a traceback quoted inside a message is message text
         start = _chain_heads(r["cont"])[-1]
         block = r["cont"][start:]
@@ -929,7 +938,10 @@ def _chain_heads(blk: List[str], skip=()) -> List[int]:
     the first header, and each one whose nearest non-blank line above is CPython's chain separator. Any other
     header sits inside an exception message (a child's stderr quoted by `RuntimeError(stderr)`), so it is message
     text, not the exception that was raised (agent-2dc9a44cfa: a cron script's HTTPError quoted in the gateway's
-    re-raise defeated _session_cron_rewrap). Headers at indexes in `skip` are ignored."""
+    re-raise defeated _session_cron_rewrap). Once a quoted header is seen, every later header is quoted text too: a
+    quoted stderr can hold its own chain, separators included (agent-95944cb790: google-auth's `raise new_exc from
+    caught_exc` inside a cron monitor's stderr filed as "TransportError in __call__"). Headers at indexes in `skip`
+    are ignored."""
     heads = []
     for i, l in enumerate(blk):
         if i in skip or not l.startswith("Traceback (most recent call last)"):
@@ -937,6 +949,8 @@ def _chain_heads(blk: List[str], skip=()) -> List[int]:
         prev = next((blk[k] for k in range(i - 1, -1, -1) if blk[k].strip()), "")
         if not heads or CHAIN_SEP_RE.match(prev):
             heads.append(i)
+        else:
+            break  # message text from here on, including any chain it quotes
     return heads
 
 
