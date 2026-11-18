@@ -1396,23 +1396,31 @@ def _env_split_spec(words: list[str]):
     i = 1
     while i < len(words):
         word = words[i]
-        if word == "--" or not word.startswith("-"):
+        if word in {"--", "-"} or not word.startswith("-"):
             return None
-        if word == "--split-string":
-            return i, len(word)
-        if word.startswith("--split-string="):
-            return i, len("--split-string=")
-        if word in {"-", "--ignore-environment", "--debug", "--null"}:
-            i += 1
-            continue
-        if word in {"--unset", "--chdir", "--argv0"}:
-            i += 2
-            continue
-        if word.startswith(("--unset=", "--chdir=", "--argv0=")):
-            i += 1
-            continue
         if word.startswith("--"):
-            return None
+            # GNU getopt_long accepts unique prefixes. Optional signal operands
+            # are attached only; consuming the next word would hide its -S.
+            name, sep, _ = word[2:].partition("=")
+            options = {
+                "split-string": "split", "unset": "required",
+                "chdir": "required", "argv0": "required",
+                "ignore-environment": "none", "debug": "none", "null": "none",
+                "block-signal": "optional", "default-signal": "optional",
+                "ignore-signal": "optional", "list-signal-handling": "none",
+                "help": "exit", "version": "exit",
+            }
+            matches = ([name] if name in options else
+                       [key for key in options if key.startswith(name)])
+            if not name or len(matches) != 1:
+                return None  # unknown/ambiguous options fail in env itself
+            kind = options[matches[0]]
+            if kind == "exit" or (sep and kind == "none"):
+                return None
+            if kind == "split":
+                return i, len(name) + 2 + bool(sep)
+            i += 2 if kind == "required" and not sep else 1
+            continue
         j = 1
         while j < len(word):
             flag = word[j]
@@ -2195,8 +2203,8 @@ class _Analyzer:
         if split_spec is not None:
             index, offset = split_spec
             option = _expand_word(raw[index], st.vars)
-            separate = kept[index] in {"-S", "--split-string"} or (
-                not kept[index].startswith("--") and offset == len(kept[index]))
+            separate = offset == len(kept[index]) and not (
+                kept[index].startswith("--") and "=" in kept[index])
             value = (_expand_word(raw[index + 1], st.vars)
                      if index + 1 < len(raw) else None) if separate else (
                          option[offset:] if option is not None else None)

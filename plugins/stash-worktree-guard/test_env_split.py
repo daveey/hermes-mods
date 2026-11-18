@@ -40,6 +40,17 @@ DOUBLE_COMMANDS += [
 ]
 DOUBLE_COMMANDS += [r'''env -S "git\_stash\_'pop'"''']
 
+LONG_FLAGS = [
+    '--split=', '--s ', '--split-s=', '--spl ',
+    '--ignore-env -S ', '--un=UNUSED -S ', '--ch=. -S ',
+    '--default-signal -S ', '--block-signal=USR1 -S ',
+    '--ignore-signal -S ', '--list-signal-handling -S ',
+    '--def=USR1 -S ', '--bl -S ', '--ignore-s=USR1 -S ', '--list -S ',
+]
+LONG_COMMANDS = ['env ' + flags + shlex.quote(r'git\_stash\_pop')
+                 for flags in LONG_FLAGS]
+DOUBLE_COMMANDS += LONG_COMMANDS
+
 FOLLOWUP_COMMANDS = [
     'env ' + flags + " 'git\\_stash\\_pop'"
     for flags in ['-i -S', '-iS', '-vS', '-u UNUSED -S', '-C . -S',
@@ -126,6 +137,10 @@ def test_safe_quoted_data_and_literal_refspecs(wt, text, double, flags):
     (['env', '-CuS', 'printf'], None),
     (['env', '--unset=-S', '-vSgit'], (2, 3)),
     (['env', '--', '-S', 'git'], None),
+    (['env', '-', '-S', 'git'], None),
+    (['env', '--un', '-S', 'printf'], None),
+    (['env', '--ignore', '-S', 'git'], None),
+    (['env', '--s='], (1, 4)),
     (['env', 'printf', '-S', 'git'], None),
     (['env', 'NAME=value', '-S', 'git'], None),
     (['env', '--split-string='], (1, 15)),
@@ -151,6 +166,15 @@ def test_mutation_refused_and_real_gnu_mutates(wt, cmd):
                    capture_output=True, timeout=10)
     assert (wt / 'f.txt').read_bytes() == before[0]
     assert subprocess.check_output(['git', 'stash', 'list'], cwd=wt) == b''
+
+
+@pytest.mark.parametrize('flags', LONG_FLAGS)
+@pytest.mark.parametrize('text', [r'printf "%s" "git\_stash\_pop"',
+                                  r'git\_push\_origin\_HEAD:stash-topic'])
+def test_long_options_preserve_safe_data(wt, flags, text):
+    cmd = 'env ' + flags + shlex.quote(text)
+    assert guard.refuse_reason(cmd, str(wt)) is None
+    assert not _blocked(cmd, wt)
 
 
 def test_env_child_options_do_not_taint_caller(wt):
