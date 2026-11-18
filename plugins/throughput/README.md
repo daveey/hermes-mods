@@ -128,7 +128,18 @@ and a body that is not a JSON object a 422, and neither changes anything.
   and `allowed` (the same; null = no limit). `slots.pacing.held_starts` counts the cards whose start the pacing
   governor held in the last 5 minutes (`llm_paced` events in the replicas); pacing is not converted to slots,
   because its per-gateway limits are not published. Each pool carries its `pacing_factor`. `slots` is null if it cannot be computed; that never fails
-  the route. Tests: `tests/test_slots.py`. **Not tested**: against live replicas with macOS boot-UUID claims.
+  the route. Fresh snapshots add `observed_at`, `window_since`, `window_until` (Unix seconds), `valid: true`
+  and `stale: false`; `pacing` adds its own `window_since`/`window_until`. The observation is taken at refresh
+  start, not publication. At 30 seconds of wall or monotonic age, at a minute-window change, on cold start,
+  or after incomplete/failed reads, the response is `slots: null` (never stale limits or fabricated zero holds).
+  The current request's cap always recomputes the plan from the measurement.
+  All optional replica and usage reads run in one owned subprocess per root, not on GET/PUT's awaited path.
+  A two-second deadline cancels/kills and reaps that child; teardown joins its coordinator before reloading.
+  Failures back off one second. Plugin unload, server lifespan shutdown and process exit own cleanup.
+  Boot attribution uses only a nonblocking fresh Cards snapshot: a missing boot mapping leaves slots unavailable
+  until the regular accurate series path supplies one. No background Cards rebuild or empty series substitution.
+  Tests: `tests/test_slots.py`, `tests/test_advisory.py`, `tests/test_api.py` (real blocked Cards rebuild,
+  SQLite-lock GET/PUT bound, cancellation and lifecycle). **Not tested**: live macOS activation/soak.
 - **Runway** (`runway.py`): per subscription pool, from the usage samples core's Kanban pacing governor keeps in
   `llm_pacing.json` (no usage request is made): `remaining_pct` (sum of `100 - used` over the accounts' weekly
   windows), `burn_pct_per_h` (each account's slope over the last 10-60 minutes), `runway_s = remaining / burn`

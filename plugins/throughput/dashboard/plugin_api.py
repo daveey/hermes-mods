@@ -19,7 +19,21 @@ from typing import Any, Dict
 
 from fastapi import APIRouter, Body, HTTPException, Query
 
-router = APIRouter()
+from contextlib import asynccontextmanager
+
+
+@asynccontextmanager
+async def lifespan(app):
+    import importlib
+    advisory = importlib.import_module(pkg().__name__ + ".advisory")
+    advisory.start()
+    try:
+        yield
+    finally:
+        await asyncio.to_thread(advisory.stop)
+
+
+router = APIRouter(lifespan=lifespan)
 CACHE_S = 15
 _lock = threading.Lock()
 _range_locks: Dict[str, threading.Lock] = {}
