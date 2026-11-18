@@ -1341,6 +1341,9 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                 out_ids = []
             _log_outcome(session_id, n, "reply_nudge_outcome", p=res["p"], resolved=res["resolved"],
                          judged=res["judged"], evidence=res["evidence"], reply=(final_response or "")[:300],
+                         **({"recheck": _load("outcome_recheck").capture(n.get("nudge_id"), session_id,
+                                                                      final_response, log_lines)}
+                            if rule == "pr_state_claim" else {}),
                          **({"item_ids": out_ids} if out_ids else {}),
                          **({"asks": res["asks"]} if "asks" in res else {}),
                          **({"src": res["src"]} if "src" in res else {}),
