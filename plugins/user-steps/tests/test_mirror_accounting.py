@@ -38,31 +38,48 @@ def retain_connections(monkeypatch, request):
 def test_connection_spy_leaves_foreign_thread_connections_alone(tmp_path, monkeypatch, request):
     # Regression: a connect() on another thread during the spy's lifetime was retained
     # and then closed by the finalizer on the wrong thread (sqlite3.ProgrammingError).
+    # The creator thread stays alive until the finalizer has run, then verifies and
+    # closes its own handle on the thread that created it. A new thread is never relied
+    # on for that: the OS may or may not reuse a finished thread's ident (CPython 3.11
+    # on the CI runner does not), and sqlite3 rejects any other thread's use.
     finalizers = []
     monkeypatch.setattr(request, 'addfinalizer', finalizers.append)
     connections, connect = retain_connections(monkeypatch, request)
     assert len(finalizers) == 1
-    foreign = []
-    worker = threading.Thread(target=lambda: foreign.append(connect(tmp_path / 'foreign.sqlite3')))
-    worker.start()
-    worker.join()
-    own = connect(tmp_path / 'own.sqlite3')
-    finalizers[0]()  # must close ours and must not touch the foreign-thread handle
-    assert connections == [own]
-    with pytest.raises(sqlite3.ProgrammingError, match='closed'):
-        own.execute('SELECT 1')
+    created = threading.Event()
+    finalized = threading.Event()
     outcome = []
+    errors = []
 
-    def owning_thread_cleanup():
+    def creator():
+        conn = None
         try:
-            foreign[0].execute('SELECT 1')  # still open: the spy did not close it
-        finally:
-            foreign[0].close()
+            conn = connect(tmp_path / 'foreign.sqlite3')
+            created.set()
+            assert finalized.wait(timeout=10), 'finalizer did not run'
+            conn.execute('SELECT 1')  # still open: the spy did not close it
             outcome.append('ok')
+        except BaseException as exc:  # reported to the test thread below
+            errors.append(exc)
+        finally:
+            created.set()  # never leave the test thread waiting on a failed creator
+            if conn is not None:
+                conn.close()
 
-    closer = threading.Thread(target=owning_thread_cleanup)
-    closer.start()
-    closer.join()
+    worker = threading.Thread(target=creator, name='foreign-creator', daemon=True)
+    worker.start()
+    try:
+        assert created.wait(timeout=10), 'creator thread never connected'
+        own = connect(tmp_path / 'own.sqlite3')
+        finalizers[0]()  # must close ours and must not touch the foreign-thread handle
+        assert connections == [own]
+        with pytest.raises(sqlite3.ProgrammingError, match='closed'):
+            own.execute('SELECT 1')
+    finally:
+        finalized.set()
+        worker.join(timeout=10)
+    assert not worker.is_alive()
+    assert errors == []
     assert outcome == ['ok']
 
 
