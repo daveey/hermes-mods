@@ -1749,6 +1749,39 @@ def test_relay_recovered_revoked_401s_after_wake_are_not_a_storm(tmp_path):
     assert _errs(sg.collect(h, {}, "macbook", _ts("2026-11-18 02:10:00"))) == []
 
 
+@pytest.mark.parametrize("rotation", ["matching", "unrelated", "missing"])
+def test_relay_adoptions_in_unread_rotated_tail(tmp_path, rotation):
+    h = _relay_home(tmp_path, _wake_401s(), ["already consumed"])
+    path = h / "logs" / "agent.log"
+    cur = {"relay:default": {"ino": path.stat().st_ino, "off": path.stat().st_size}}
+    with path.open("a") as f:
+        f.write("\n".join(adopted_line("2026-11-18 02:04:56", s) for s in RELAY_SIDS) + "\n")
+    path.rename(path.with_name("agent.log.1"))
+    path.write_text("new log\n")
+    if rotation == "unrelated":
+        cur["relay:default"]["ino"] = -1
+    elif rotation == "missing":
+        path.with_name("agent.log.1").unlink()
+    sigs = _errs(sg.collect(h, cur, "macbook", _ts("2026-11-18 03:10:00")))
+    assert len(sigs) == (0 if rotation == "matching" else 1)
+    assert cur["relay:default"] == {"ino": path.stat().st_ino, "off": path.stat().st_size}
+
+
+def test_relay_rotated_reader_consumes_only_unread_complete_lines(tmp_path):
+    path = tmp_path / "agent.log"
+    path.write_bytes(b"consumed\n")
+    cur = {"relay": {"ino": path.stat().st_ino, "off": path.stat().st_size}}
+    with path.open("ab") as f:
+        f.write(b"adopted old\nunfinished")
+    path.rename(tmp_path / "agent.log.1")
+    path.write_bytes(b"adopted new\npartial")
+    assert sg.read_relay_lines(path, cur, "relay", NOW) == ["adopted old", "adopted new"]
+    assert sg.read_relay_lines(path, cur, "relay", NOW) == []
+    with path.open("ab") as f:
+        f.write(b" completed\n")
+    assert sg.read_relay_lines(path, cur, "relay", NOW) == ["partial completed"]
+
+
 def test_revoked_401_counts_unless_its_own_session_adopted(tmp_path):
     """Adoption in another session, or long after the 401, does not excuse it: still one storm."""
     adopted = [adopted_line("2026-11-18 02:04:44", RELAY_SIDS[0]), adopted_line("2026-11-18 02:04:50", "other_sid"),
