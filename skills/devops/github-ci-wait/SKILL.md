@@ -219,6 +219,8 @@ A user-approved batch through ONE full suite: acceptance is the batch's evidence
   diagnose that label's pool per `references/self-hosted-runner-migration.md` (Pitfalls, saturation by label).
 - Tests: `python3 -B -m unittest discover -s tests` from this skill's dir.
 
+Before Nix cache/save or stale fixed-output verification, read `references/nix-cache-verification.md`.
+
 ## CI refused for billing (account-wide outage)
 
 Every job fails in 1–4 s with zero steps across the account's repos, and the job's check-run annotation says it
