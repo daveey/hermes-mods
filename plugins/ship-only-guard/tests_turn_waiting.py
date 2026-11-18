@@ -184,6 +184,38 @@ def test_waiting_admission_does_not_rewrite_live_or_cooling_generation(monkeypat
     assert fake.refs == original
 
 
+@pytest.mark.parametrize("case", ["unreadable", "deadline", "existing"])
+def test_cli_retains_waiting_publication_evidence_on_retry_and_failure(monkeypatch, case):
+    monkeypatch.setattr(g, "_now", lambda: f.NOW)
+    monkeypatch.setattr(g, "_WAITING_WRITER_ENABLED", True)
+    fake = f.FakeGitHub({n: f.pr(n, f.H2563, ["hermes-sync"]) for n in (1, 2)})
+    monkeypatch.setattr(g.subprocess, "run", fake.run)
+    f.seed_turn(fake, 1, f.NOW - 60)
+    if case == "existing":
+        g.land_turn(2, f.R, f.H2563, env={})
+    if case == "unreadable":
+        real = fake.run
+        def run(argv, **kw):
+            if "matching-refs" in " ".join(argv) and fake.turn(2):
+                return f.SimpleNamespace(returncode=1, stdout="{}", stderr="")
+            return real(argv, **kw)
+        monkeypatch.setattr(g.subprocess, "run", run)
+    if case == "deadline":
+        real_stage = g._stage
+        def stage(name, fn, *args):
+            result = real_stage(name, fn, *args)
+            if name == "waiting-place admission":
+                raise g._PreflightExpired("deadline exceeded during " + name)
+            return result
+        monkeypatch.setattr(g, "_stage", stage)
+    status, message = g.land_turn(2, f.R, f.H2563, env={})
+    assert fake.turn(2)
+    assert status == 1
+    assert "refs/land-turn/pr-2" in message
+    assert "not merge permission" in message
+    assert "No land turn recorded" not in message
+
+
 def test_waiting_promotion_keeps_original_record_and_nontransitive_lanes():
     a = record(pr=1, files=["x"], acquired=f.NOW - 90)
     b = record(pr=2, files=["x", "y"], acquired=f.NOW - 60)
