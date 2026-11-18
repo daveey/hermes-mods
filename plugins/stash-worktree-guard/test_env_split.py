@@ -40,6 +40,30 @@ DOUBLE_COMMANDS += [
 ]
 DOUBLE_COMMANDS += [r'''env -S "git\_stash\_'pop'"''']
 
+LONG_FLAGS = [
+    '--split=', '--s ', '--split-s=', '--spl ',
+    '--ignore-env -S ', '--un=UNUSED -S ', '--ch=. -S ',
+    '--default-signal -S ', '--block-signal=USR1 -S ',
+    '--ignore-signal -S ', '--list-signal-handling -S ',
+    '--def=USR1 -S ', '--bl -S ', '--ignore-s=USR1 -S ', '--list -S ',
+]
+LONG_COMMANDS = ['env ' + flags + shlex.quote(r'git\_stash\_pop')
+                 for flags in LONG_FLAGS]
+DOUBLE_COMMANDS += LONG_COMMANDS
+
+FOLLOWUP_COMMANDS = [
+    'env ' + flags + " 'git\\_stash\\_pop'"
+    for flags in ['-i -S', '-iS', '-vS', '-u UNUSED -S', '-C . -S',
+                  '--unset=UNUSED -S', '--ignore-environment -S']
+] + [
+    r"env -S 'git\_stash\_pop${UNUSED}'",
+    r"UNUSED= env -S 'git\_stash\_pop${UNUSED}'",
+    r'''env -S "$(printf '%s' 'git\_stash\_pop')"''',
+]
+DOUBLE_COMMANDS += FOLLOWUP_COMMANDS
+DOUBLE_COMMANDS += ['launcher exec --unknown -- ' + cmd for cmd in FOLLOWUP_COMMANDS
+                    if cmd.startswith('env ')]
+
 
 @pytest.mark.parametrize('cmd', [CMD, *DOUBLE_COMMANDS])
 def test_escaped_separator_refusal_before_execution(wt, cmd):
@@ -94,13 +118,66 @@ def test_option_forms_refused(wt, flag, prefix):
     r'git\_push\_origin\_HEAD:stash-topic',
 ])
 @pytest.mark.parametrize('double', [False, True])
-def test_safe_quoted_data_and_literal_refspecs(wt, text, double):
+@pytest.mark.parametrize('flags', ['-S', '-i -S', '-iS', '-vS', '-u UNUSED -S',
+                                   '-C . -S', '--unset=UNUSED -S',
+                                   '--ignore-environment -S'])
+def test_safe_quoted_data_and_literal_refspecs(wt, text, double, flags):
     quoted = shlex.quote(text)
     if double:
         quoted = '"' + text.replace('"', '\\"') + '"'
-    cmd = 'launcher exec --unknown -- env -S ' + quoted
+    cmd = 'launcher exec --unknown -- env ' + flags + ' ' + quoted
     before = snapshot(wt)
     assert guard.refuse_reason(cmd, str(wt)) is None
     assert not _blocked(cmd, wt)
     assert snapshot(wt) == before
 
+
+@pytest.mark.parametrize('argv, expected', [
+    (['env', '-u', '-S', 'printf'], None),
+    (['env', '-CuS', 'printf'], None),
+    (['env', '--unset=-S', '-vSgit'], (2, 3)),
+    (['env', '--', '-S', 'git'], None),
+    (['env', '-', '-S', 'git'], None),
+    (['env', '--un', '-S', 'printf'], None),
+    (['env', '--ignore', '-S', 'git'], None),
+    (['env', '--s='], (1, 4)),
+    (['env', 'printf', '-S', 'git'], None),
+    (['env', 'NAME=value', '-S', 'git'], None),
+    (['env', '--split-string='], (1, 15)),
+])
+def test_env_option_operand_boundaries(argv, expected):
+    assert guard._env_split_spec(argv) == expected
+
+
+@pytest.mark.parametrize('cmd', [
+    r'''env -iS'git\_stash\_drop' ''',
+    r'''env -u UNUSED --split-string='git\_stash\_clear' ''',
+    r'''env -S"$(printf '%s' 'git\_stash\_drop')"''',
+    r'''env --split-string="$(printf '%s' 'git\_stash\_clear')"''',
+    r'''env -S 'git\_stash\_drop${UNUSED}' ''',
+])
+def test_mutation_refused_and_real_gnu_mutates(wt, cmd):
+    gnu_env()
+    before = snapshot(wt)
+    assert guard.refuse_reason(cmd, str(wt))
+    assert _blocked(cmd, wt)
+    assert snapshot(wt) == before
+    subprocess.run(['bash', '-c', cmd], cwd=wt, check=True,
+                   capture_output=True, timeout=10)
+    assert (wt / 'f.txt').read_bytes() == before[0]
+    assert subprocess.check_output(['git', 'stash', 'list'], cwd=wt) == b''
+
+
+@pytest.mark.parametrize('flags', LONG_FLAGS)
+@pytest.mark.parametrize('text', [r'printf "%s" "git\_stash\_pop"',
+                                  r'git\_push\_origin\_HEAD:stash-topic'])
+def test_long_options_preserve_safe_data(wt, flags, text):
+    cmd = 'env ' + flags + shlex.quote(text)
+    assert guard.refuse_reason(cmd, str(wt)) is None
+    assert not _blocked(cmd, wt)
+
+
+def test_env_child_options_do_not_taint_caller(wt):
+    cmd = "P=printf; env -iS 'true'; $P '%s' hello"
+    assert guard.refuse_reason(cmd, str(wt)) is None
+    assert not _blocked(cmd, wt)

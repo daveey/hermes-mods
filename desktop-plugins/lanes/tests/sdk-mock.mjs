@@ -18,7 +18,9 @@ globalThis.cancelAnimationFrame = clearTimeout
 const { createRoot } = require('react-dom/client')
 const query = require('@tanstack/react-query')
 const { Popover: P } = require('radix-ui')
+export const host = { routes: [], profileRoutes: async () => host.routes }
 const sdk = {
+  host,
   useQuery: query.useQuery,
   useQueryClient: query.useQueryClient,
   STATUSBAR_AREAS: { right: 'statusBar.right' },

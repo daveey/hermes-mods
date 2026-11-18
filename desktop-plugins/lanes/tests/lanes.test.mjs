@@ -2,7 +2,7 @@
 // (unconfigured reason, slider + pause produce the right PUTs, window switch refetches).
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { loadPlugin, mount as rawMount, button, React } from './sdk-mock.mjs'
+import { loadPlugin, mount as rawMount, button, React, host } from './sdk-mock.mjs'
 
 const P = await loadPlugin()
 
@@ -13,6 +13,7 @@ test.afterEach(async () => {
   for (const view of open.splice(0)) await view.close().catch(() => {})
   delete window[P.LOADED_FLAG]
   localStorage.clear()
+  host.routes = []
 })
 
 function lane(over = {}) {
@@ -170,4 +171,160 @@ test('row controls are locked while an Apply is in flight', async () => {
   await React.act(async () => release())
   await view.flush()
   assert.equal(document.querySelector('[data-lane="infra"] .hermes-lanes-volume button').disabled, false)
+})
+
+// ── which gateway ──
+const HUB = { connectionId: 'hub', targetProfile: 'default' }
+const HUB_ALT = { connectionId: 'hub', targetProfile: 'other-profile' }
+const MINI = { connectionId: 'mini', targetProfile: 'default' }
+const where = (opts) => opts.connectionId || 'local'
+
+const MAC = { connectionId: 'this-mac', mode: 'local', primary: true, profile: 'default', targetProfile: 'default' }
+const MAC_WORK = { connectionId: 'this-mac', mode: 'local', primary: true, profile: 'work', targetProfile: 'work' }
+
+test('the panel reads and writes, by id, on the gateway that has lanes', async () => {
+  const calls = []
+  const ctx = { rest: async (path, opts = {}) => {
+    calls.push([where(opts), opts.method || 'GET', path])
+    if (where(opts) === 'this-mac') return { configured: false, reason: 'no lanes are configured (kanban.admission.lanes)' }
+    if (where(opts) === 'mini') throw Error('unreachable')
+    return snap()
+  } }
+  const source = P.createSource(ctx, { profileRoutes: async () => [MAC, MAC_WORK, MINI, HUB_ALT, HUB] })
+  const body = await source.read(6)
+  assert.equal(body.configured, true)
+  assert.deepEqual(calls.map((c) => c[0]), ['this-mac', 'mini', 'hub'], 'each connection once, by id, never untagged')
+  await source.read(24)
+  assert.deepEqual(calls.at(-1), ['hub', 'GET', '/v1/lanes?hours=24'], 'settled: no further discovery')
+  await source.write('product', { paused: true })
+  assert.deepEqual(calls.at(-1), ['hub', 'PUT', '/v1/lanes/product'])
+})
+
+test('with lanes nowhere it shows the reason, names unreachable gateways, does not write, and looks again after UNCONFIGURED_MS', async () => {
+  let now = 0
+  const calls = []
+  const ctx = { rest: async (path, opts = {}) => {
+    calls.push(where(opts))
+    if (where(opts) === 'mini') throw Error('plugin not installed')
+    return { configured: false, reason: 'no lanes here' }
+  } }
+  const source = P.createSource(ctx, { profileRoutes: async () => [HUB, MINI] }, () => now)
+  const body = await source.read(6)
+  assert.match(body.reason, /^no lanes here; 1 other gateway\(s\) could not be reached \(plugin not installed\)$/)
+  assert.equal(calls.length, 2)
+  now = 1000
+  await source.read(6)
+  assert.equal(calls.length, 2, 'cached unconfigured answer')
+  await assert.rejects(source.write('product', { share: 1 }), /No gateway with lanes/)
+  now = P.UNCONFIGURED_MS + 1
+  await source.read(6)
+  assert.equal(calls.length, 4)
+})
+
+test('a failed read keeps the chosen gateway and is an error, not "no lanes"', async () => {
+  const calls = []
+  let hubUp = true
+  const ctx = { rest: async (path, opts = {}) => {
+    calls.push(where(opts))
+    if (where(opts) === 'hub') { if (!hubUp) throw Error('hub restarting'); return snap() }
+    return { configured: false, reason: 'no lanes here' }
+  } }
+  const source = P.createSource(ctx, { profileRoutes: async () => [MAC, HUB] })
+  await source.read(6)
+  hubUp = false
+  await assert.rejects(source.read(6), /hub restarting/)
+  await assert.rejects(source.read(6), /hub restarting/)
+  assert.equal(source.target().connectionId, 'hub', 'still the hub after two failures')
+  hubUp = true
+  assert.equal((await source.read(6)).configured, true)
+  assert.deepEqual(calls.slice(2), ['hub', 'hub', 'hub'], 'no search while it was down')
+  hubUp = false  // a success in between resets the count: two more failures still do not search
+  await assert.rejects(source.read(6))
+  await assert.rejects(source.read(6))
+  assert.equal(source.target().connectionId, 'hub')
+})
+
+test('after repeated failures, or when the gateway says lanes are gone, it looks again', async () => {
+  let hub = 'up'
+  const ctx = { rest: async (path, opts = {}) => {
+    if (where(opts) === 'hub') {
+      if (hub === 'down') throw Error('gone')
+      return hub === 'up' ? snap() : { configured: false, reason: 'removed' }
+    }
+    if (where(opts) === 'mini') return snap()
+    return { configured: false, reason: 'no lanes here' }
+  } }
+  const source = P.createSource(ctx, { profileRoutes: async () => [HUB, MINI] })
+  await source.read(6)
+  assert.equal(source.target().connectionId, 'hub')
+  hub = 'down'
+  for (let i = 1; i < P.FAILURES_BEFORE_REDISCOVERY; i++) await assert.rejects(source.read(6))
+  assert.equal((await source.read(6)).configured, true)
+  assert.equal(source.target().connectionId, 'mini')
+  const again = P.createSource(ctx, { profileRoutes: async () => [HUB, MINI] })
+  hub = 'up'
+  await again.read(6)
+  hub = 'unconfigured'
+  await again.read(6)
+  assert.equal(again.target().connectionId, 'mini')
+})
+
+test('the gateway with lanes is found whichever gateway is in front, and a missing route list falls back to an untagged request', async () => {
+  const calls = []
+  // Lanes live on this Mac's own connection; the window has another gateway in front, so an untagged request
+  // would land on the hub and miss them.
+  const ctx = { rest: async (path, opts = {}) => {
+    calls.push(where(opts))
+    return where(opts) === 'this-mac' ? snap() : { configured: false, reason: 'no lanes here' }
+  } }
+  const source = P.createSource(ctx, { profileRoutes: async () => [HUB, MAC, MAC_WORK, { connectionId: '', targetProfile: 'x' }] })
+  assert.equal((await source.read(6)).configured, true)
+  assert.deepEqual(calls, ['hub', 'this-mac'])
+  assert.equal(source.target().connectionId, 'this-mac')
+  calls.length = 0
+  await P.createSource(ctx, { profileRoutes: async () => { throw Error('no bridge') } }).read(6)
+  assert.deepEqual(calls, ['local'])
+})
+
+test('a search in which nothing answers throws, and the next read searches again', async () => {
+  let up = true
+  const calls = []
+  const ctx = { rest: async (path, opts = {}) => { calls.push(where(opts)); if (!up) throw Error('offline'); return { configured: false, reason: 'no lanes here' } } }
+  let now = 0
+  const source = P.createSource(ctx, { profileRoutes: async () => [HUB] }, () => now)
+  await source.read(6)
+  up = false
+  now = P.UNCONFIGURED_MS + 1
+  await assert.rejects(source.read(6), /offline/)
+  now += 1000
+  await assert.rejects(source.read(6), /offline/)
+  assert.equal(calls.length, 3, 'no stale "no lanes" answer served after a failed search')
+})
+
+test('a write goes to the gateway it is given, whatever is chosen now', async () => {
+  const calls = []
+  const ctx = { rest: async (path, opts = {}) => { calls.push([where(opts), opts.method || 'GET']); return snap() } }
+  const source = P.createSource(ctx, { profileRoutes: async () => [MAC, HUB] })
+  await source.read(6) // settles on this Mac
+  const target = source.target()
+  await source.write('product', { share: 1 }, { connectionId: 'hub' })
+  await source.write('infra', { share: 2 }, target)
+  assert.deepEqual(calls.slice(1), [['hub', 'PUT'], ['this-mac', 'PUT']])
+})
+
+test('mounted: the chip flag follows a remote gateway that has lanes', async () => {
+  host.routes = [MAC, HUB]
+  const calls = []
+  const ctx = { rest: async (path, opts = {}) => {
+    calls.push([where(opts), opts.method || 'GET', path])
+    return where(opts) === 'hub' ? snap() : { configured: false, reason: 'no lanes here' }
+  } }
+  const view = await mount(React.createElement(P.Lanes, { ctx }))
+  assert.equal(window[P.LOADED_FLAG], true)
+  await React.act(async () => window.dispatchEvent(new window.Event('hermes-show-lanes')))
+  await view.flush()
+  await view.click(document.querySelector('[data-lane="product"] .hermes-lanes-volume button'))
+  await view.click(document.querySelector('[data-lane="infra"] .hermes-lanes-volume button'))
+  await view.click(button('Apply'))
+  assert.deepEqual(calls.filter((c) => c[1] === 'PUT'), [['hub', 'PUT', '/v1/lanes/product'], ['hub', 'PUT', '/v1/lanes/infra']])
 })

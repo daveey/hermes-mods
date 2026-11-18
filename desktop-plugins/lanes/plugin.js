@@ -1,12 +1,13 @@
 // Lanes: how worker time is split between project lanes, and the controls for it.
+// Lanes live on one gateway; the panel finds it (createSource below) and reads and writes there.
 // Opens from the runners chip (which dispatches `hermes-show-lanes` where lanes are configured) and from the
 // palette. Data: GET /v1/lanes?hours=… on the local gateway (plugins/lanes): per lane target and actual share of
 // run-hours, running, ready, held at the gate, open, done, tokens and estimated cost. Controls: PUT /v1/lanes/<lane>
 // {share | paused}; the API also takes admit_per_day and has /v1/held, which this panel does not use yet.
 // Shares are relative volumes: the target percentage is share / sum of shares. A draft survives polls; Reset, a
 // successful Apply or closing the panel drops it, and the controls are locked while an Apply is in flight.
-import { useQuery, STATUSBAR_AREAS, PALETTE_AREA, Popover, PopoverTrigger, PopoverContent } from '@hermes/plugin-sdk'
-import { createElement as h, useState, useEffect } from 'react'
+import { host, useQuery, STATUSBAR_AREAS, PALETTE_AREA, Popover, PopoverTrigger, PopoverContent } from '@hermes/plugin-sdk'
+import { createElement as h, useState, useEffect, useMemo } from 'react'
 
 export const POLL_MS = 15000
 export const IDLE_POLL_MS = 300000
@@ -15,6 +16,83 @@ export const WINDOWS = [[1, '1h'], [6, '6h'], [24, '24h'], [168, '7d']]
 export const STORE_KEY = 'hermes-lanes-window'
 export const LOADED_FLAG = '__hermesLanesPanel'
 const COLORS = ['#f0a43a', '#8fb0ff', '#5fd4e6', '#d982f0', '#b4bac6', '#3ddc97', '#ef7b7b', '#c9d36a']
+
+// ── which gateway to talk to ──────────────────────────────────────────────
+// Lanes are configured on one gateway (the one that holds the board and runs the dispatcher), which is often
+// not the gateway this Desktop has in front. The source asks every connection once, by id (a request with a
+// connectionId and no profile is answered by that connection's default profile), and settles on the first that
+// answers `configured: true`; reads and writes then go to that connection by id, so they do not follow the
+// window when another gateway comes to the front. Only when the Desktop lists no connections does it fall back
+// to an untagged request, which goes to whichever gateway is in front.
+// A settled gateway is kept through failures: one failed read is an error to show and retry (gateways restart
+// several times a day), and only FAILURES_BEFORE_REDISCOVERY in a row, or an answer that says lanes are no
+// longer configured there, starts a new search. While no gateway has lanes the search repeats every
+// UNCONFIGURED_MS, and the reason shown names any gateway that could not be reached.
+export const UNCONFIGURED_MS = 60000
+export const FAILURES_BEFORE_REDISCOVERY = 3
+const validRoute = (r) => r && ['connectionId', 'targetProfile'].every((k) => typeof r[k] === 'string' && r[k].trim())
+
+export function createSource(ctx, hostRef = host, clock = () => Date.now()) {
+  let chosen // { connectionId } | { connectionId: null } (no connections listed: whichever is in front) | undefined
+  let failures = 0
+  let sweptAt = -Infinity
+  let unconfigured // the answer shown while no gateway has lanes
+  const opts = (target, extra = {}) => ({ ...extra, timeoutMs: REQUEST_TIMEOUT_MS, ...(target.connectionId ? { connectionId: target.connectionId } : {}) })
+  async function candidates() {
+    let list = []
+    try { list = ((await hostRef.profileRoutes()) || []).filter(validRoute) } catch { list = [] }
+    const ids = [...new Set(list.map((r) => r.connectionId))]
+    return ids.length ? ids.map((connectionId) => ({ connectionId })) : [{ connectionId: null }]
+  }
+  async function discover(path) {
+    sweptAt = clock()
+    failures = 0
+    let first
+    const unreachable = []
+    for (const target of await candidates()) {
+      try {
+        const body = await ctx.rest(path, opts(target))
+        if (body?.configured === true) { chosen = target; unconfigured = undefined; return body }
+        first ??= body
+      } catch (e) { unreachable.push(String(e?.message || e).slice(0, 80)) }
+    }
+    chosen = undefined
+    unconfigured = undefined // nothing to show from an older search if this one throws
+    if (!first) throw Error(unreachable[0] || 'No gateway answered')
+    const missed = unreachable.length ? `; ${unreachable.length} other gateway(s) could not be reached (${unreachable[0]})` : ''
+    unconfigured = { ...first, configured: false, reason: `${first?.reason || 'No lanes are configured.'}${missed}` }
+    return unconfigured
+  }
+  async function read(hours) {
+    const path = `/v1/lanes?hours=${hours}`
+    if (!chosen) return unconfigured && clock() - sweptAt < UNCONFIGURED_MS ? unconfigured : discover(path)
+    let body
+    try {
+      body = await ctx.rest(path, opts(chosen))
+    } catch (e) {
+      failures += 1
+      if (failures < FAILURES_BEFORE_REDISCOVERY) throw e // keep the gateway and the last data; the next poll retries
+      return discover(path)
+    }
+    failures = 0
+    return body?.configured === true ? body : discover(path)
+  }
+  // `target` is the gateway chosen when Apply was pressed: every lane of that Apply goes there even if a poll
+  // re-discovers meanwhile.
+  async function write(lane, body, target = chosen) {
+    if (!target) throw Error('No gateway with lanes configured')
+    return ctx.rest(`/v1/lanes/${encodeURIComponent(lane)}`, opts(target, { method: 'PUT', body }))
+  }
+  return { read, write, target: () => chosen }
+}
+
+// One source per plugin ctx, not per mount: the status bar remounts contributions often.
+const sources = new WeakMap()
+export function sourceFor(ctx) {
+  let s = sources.get(ctx)
+  if (!s) sources.set(ctx, (s = createSource(ctx)))
+  return s
+}
 
 // ── pure helpers (exported for tests) ─────────────────────────────────────
 
@@ -174,10 +252,11 @@ export function Lanes({ ctx }) {
   const [windowHours, setWindowState] = useState(loadWindow)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
+  const source = useMemo(() => sourceFor(ctx), [ctx])
   const key = ['lanes', windowHours]
   const query = useQuery({
     queryKey: key,
-    queryFn: () => ctx.rest(`/v1/lanes?hours=${windowHours}`, { timeoutMs: REQUEST_TIMEOUT_MS }),
+    queryFn: () => source.read(windowHours),
     // Closed, a slow probe: it tells the runners chip whether lanes work here (LOADED_FLAG below).
     refetchInterval: open ? POLL_MS : IDLE_POLL_MS,
     refetchIntervalInBackground: false,
@@ -202,10 +281,11 @@ export function Lanes({ ctx }) {
   const apply = async (pending) => {
     setSaving(true); setError('')
     let at = ''
+    const target = source.target()
     try {
       for (const [name, body] of pending) {
         at = name
-        await ctx.rest(`/v1/lanes/${encodeURIComponent(name)}`, { method: 'PUT', body, timeoutMs: REQUEST_TIMEOUT_MS })
+        await source.write(name, body, target)
       }
       await query.refetch()
       return true

@@ -22,6 +22,7 @@ Account names never leave this module.
 """
 from __future__ import annotations
 
+import math
 import json
 from pathlib import Path
 from typing import Optional
@@ -72,7 +73,11 @@ def _pacing(entry) -> dict:
     state = pace.get("state") if isinstance(pace, dict) else None
     until = pace.get("until") if isinstance(pace, dict) else None
     known = isinstance(until, (int, float)) and not isinstance(until, bool)
-    return {"pacing": state if state in PACING_STATES else None, "pacing_until": float(until) if known else None}
+    factor = pace.get("factor") if isinstance(pace, dict) else None
+    paced = isinstance(factor, (int, float)) and not isinstance(factor, bool) and math.isfinite(factor)
+    # ``pacing_factor``: the share of its recent concurrency a gateway keeps on a paced pool (slots.pacing_limit).
+    return {"pacing": state if state in PACING_STATES else None, "pacing_until": float(until) if known else None,
+            "pacing_factor": float(factor) if paced and state in PACING_STATES else None}
 
 
 def provider_runway(provider: str, entry, now: float) -> Optional[dict]:

@@ -167,6 +167,67 @@ unverified", scoping notes like "the other test files were not run").
 
 ## Tests
 
+Shell write classification grants data exemptions only when the **whole input** is
+in the bounded grammar G in `shell_commands.py`:
+
+- Words: unquoted `[A-Za-z0-9_./:=@%+,-]`, single-quoted strings, or double-quoted
+  strings without dollar signs, backticks or backslashes.
+- Lists/pipelines: `;`, `&&`, `||`, `|`, newline; every command must qualify.
+- Input redirection: `<` with a literal operand; `<<'D'` / `<<"D"` with a
+  verbatim body ending at a physical delimiter line, or an unquoted delimiter
+  whose body has no dollar sign, backtick or backslash. No fd prefixes/duplication,
+  here-strings, tab-stripping or mixed-quoted delimiters.
+- Commands: literal `hermes` (a call), `echo`, `printf`, `cat`, `grep`, `head`,
+  `tail`, `wc`, `cd`; or `git commit` with only `-m <word>`, `-a`, `--amend`,
+  `--allow-empty`, `-q`, `--no-edit`. No leading assignments or wrappers.
+- `printf` is output-only: optional `--`, then a non-option format using only
+  output conversions (`diouxXfFeEgGaAcbsq` or `%%`, with width/precision/flags).
+  `-v`, `%n`, unknown conversions, and decorated variable-writing conversions
+  are outside G. Any output redirection (`>` or `>>`) anywhere revokes G: even
+  an isolated write can poison a previously harmless executable for this or a
+  later invocation. This includes writes to apparent notes files; no pathname
+  allowlist or filesystem provenance is assumed. Output characters inside quoted
+  data or heredoc bodies are not operators. Input redirection combined with
+  `git commit` also remains outside G.
+
+`tests/test_output_poisoning.py` proves echo/printf/heredoc overwrite and append
+against initially harmless fixture executables, through real Bash and the actual
+hook. It also covers reversed-order and pipeline composition, isolated writes,
+and quoted-output-character controls. Four former output-to-notes/definitions
+controls now conservatively detect mentions, while plain quoted heredocs remain
+exempt.
+
+Inside G, other commands' arguments/input are data. Outside G, **no data exemption
+is possible**: the old any-position token scan applies to the entire string, with
+additional conservative nested-string and continuation readings preserving the
+previous nested-call detections. Unknown constructs never become an exemption.
+This deliberately flags even inert `bash /dev/null -c 'hermes kanban …'`, unrelated
+function definitions, `/bin/echo`, and printed substitutions. Plain echo/printf,
+grep, restricted Git messages and quoted heredoc bodies remain data.
+
+Consent is different from the argv-based gates: outside G it retains main's raw
+`_SHELL_WRITE_RE` over joined command/input/data, including the full target text.
+It must not rely on nested segment discovery for hub requests. Consent also retains
+that raw detector inside G whenever any command starts with `hermes` (including chat
+prompts and heredoc stdin). Only command-only `terminal` / `run_in_user_terminal`
+inputs can receive inert-data exemptions: process input/data may feed an existing
+interpreter, so joined fields and process tools retain the raw main detector.
+`tests/test_consent_execution_scope.py` verifies these boundaries and stopped-target refusals. The regression
+`tests/test_consent_raw_parity.py` covers shell/eval wrappers, here-strings, pipes,
+substituted command names, and SSH (classification only), plus inert controls and
+an independent frozen-main-regex comparison across the test-source corpus.
+Runnable hub probes use only a fixture fake and the allowlisted environment.
+
+`tests/test_command_position.py` covers every consumer and the real comment hook,
+including prior nested execution controls. `tests/test_inert_grammar.py` adds the
+review redefinition/continuation/output-process repros and 200 distinct whole-input
+boundary strings with independently declared membership. Runnable controls use a
+fake `hermes` and allowlisted environment, including availability probes and the
+positive startup control (only the fixture's `BASH_ENV` is added). No login shells;
+unavailable tools are recorded skips. This is static hook feedback, not an OS
+sandbox: ambient executable definitions, PATH contents, Git hooks, sourced files
+and computed command values are not resolved.
+
 `tests/test_acceptance_provenance_real_shapes.py` replays real state.db shapes (msg 931890 notice, peer-mail, exact steer, relays, stale and wrong-chat rows); `tests/test_acceptance_authority.py` (gate F) replays the t_7e2ee45c 2026-11-10 shape: a prepared waiver body applied with `f=…; hermes kanban edit <id> --body "$(cat $f)"` from a chat with no user turn, quoting a real user message of another chat, is refused; so are uncited waivers, notices, assistant text, worker prompts, missing ids, a quote older than the current body, a delegated parent's turn, dropping the DONE sentence and an unknown session. A fresh user turn in the same chat or its compression ancestor passes, as do restoring the original over a waiver and edits that keep acceptance. Paths: terminal (quoted and unquoted substitution), `mcp__terminal`, execute_code, tool_call, and the registered `pre_tool_call` hook with the `session_id` kwarg.
 
 `tests/test_title_context.py` covers the exact deferred-cleanup defect title: completed handoffs pass,

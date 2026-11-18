@@ -1,6 +1,7 @@
 """Observable contracts for mirror accounting, schema writes and read cleanup."""
 
 import sqlite3
+import threading
 from contextlib import ExitStack, closing, contextmanager
 
 import pytest
@@ -8,6 +9,61 @@ import pytest
 from test_kanban_mirror import OWNER, core
 from test_kanban_mirror_keyed import keyed, settle  # noqa: F401
 from test_withdrawal import ROOT, load_module
+
+
+def retain_connections(monkeypatch, request):
+    """Spy sqlite3.connect, strongly retaining this test thread's connections only.
+
+    The patch is process-global, so a background thread left by an earlier test can
+    connect while it is live. A sqlite3 handle may only be used on its creating
+    thread, so closing such a handle from the finalizer raises ProgrammingError and
+    is not ours to close. Only handles created on the owning thread are retained and
+    closed here (deterministically, on that thread); foreign ones pass through.
+    """
+    owner = threading.get_ident()
+    connections = []
+    request.addfinalizer(lambda: [conn.close() for conn in connections])
+    real_connect = sqlite3.connect
+
+    def retained_connect(*args, **kwargs):
+        conn = real_connect(*args, **kwargs)
+        if threading.get_ident() == owner:
+            connections.append(conn)
+        return conn
+
+    monkeypatch.setattr(sqlite3, 'connect', retained_connect)
+    return connections, retained_connect
+
+
+def test_connection_spy_leaves_foreign_thread_connections_alone(tmp_path, monkeypatch, request):
+    # Regression: a connect() on another thread during the spy's lifetime was retained
+    # and then closed by the finalizer on the wrong thread (sqlite3.ProgrammingError).
+    finalizers = []
+    monkeypatch.setattr(request, 'addfinalizer', finalizers.append)
+    connections, connect = retain_connections(monkeypatch, request)
+    assert len(finalizers) == 1
+    foreign = []
+    worker = threading.Thread(target=lambda: foreign.append(connect(tmp_path / 'foreign.sqlite3')))
+    worker.start()
+    worker.join()
+    own = connect(tmp_path / 'own.sqlite3')
+    finalizers[0]()  # must close ours and must not touch the foreign-thread handle
+    assert connections == [own]
+    with pytest.raises(sqlite3.ProgrammingError, match='closed'):
+        own.execute('SELECT 1')
+    outcome = []
+
+    def owning_thread_cleanup():
+        try:
+            foreign[0].execute('SELECT 1')  # still open: the spy did not close it
+        finally:
+            foreign[0].close()
+            outcome.append('ok')
+
+    closer = threading.Thread(target=owning_thread_cleanup)
+    closer.start()
+    closer.join()
+    assert outcome == ['ok']
 
 
 def test_skip_is_reported_to_real_core_accounting(keyed):
@@ -34,16 +90,7 @@ def test_schema_setup_is_one_real_write_transaction_per_store_inode(tmp_path, mo
     mod = load_module('mirror_schema_accounting', ROOT / 'kanban_mirror.py')
     # Keep strong references so constructor handles cannot be cleaned up by GC
     # at a lucky time. A sqlite connection context commits; it does not close.
-    connections = []
-    request.addfinalizer(lambda: [conn.close() for conn in connections])
-    real_connect = sqlite3.connect
-
-    def retained_connect(*args, **kwargs):
-        conn = real_connect(*args, **kwargs)
-        connections.append(conn)
-        return conn
-
-    monkeypatch.setattr(sqlite3, 'connect', retained_connect)
+    connections, retained_connect = retain_connections(monkeypatch, request)
 
     def new_store(path):
         # Close constructor-owned handles before moving either database. Moving

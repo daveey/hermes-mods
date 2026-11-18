@@ -11,6 +11,7 @@ import os
 import re
 import shlex
 import sqlite3
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -637,32 +638,28 @@ def check_create(args: dict, env=None, names_fn=None) -> Optional[str]:
 
 # HERMES_KANBAN_TASK is scrubbed from a worker's tool children; they carry the card id as HERMES_KANBAN_WORKER_TASK.
 _OWN_REFS = ("$HERMES_KANBAN_TASK", "${HERMES_KANBAN_TASK}", "$HERMES_KANBAN_WORKER_TASK", "${HERMES_KANBAN_WORKER_TASK}")
-_SEPARATORS = {";", "&&", "||", "|", "&", "\n", "(", ")"}
+
 
 
 def _is_own(ref: str, own: str) -> bool:
     return ref == own or ref.strip("\"'") in _OWN_REFS
 
 
+@lru_cache(maxsize=1)
+def _shell_commands():
+    import importlib.util
+
+    # Standalone tests and replay.py load core.py without a package.
+    spec = importlib.util.spec_from_file_location(
+        "kanban_honest_done_shell_commands", Path(__file__).with_name("shell_commands.py"))
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def _segments(command: str) -> list[list[str]]:
-    try:
-        lex = shlex.shlex(command, posix=True, punctuation_chars=";&|()\n")
-        lex.whitespace = " \t\r"
-        lex.whitespace_split = True
-        tokens = list(lex)
-    except ValueError:  # unbalanced quotes: fall back to a plain split
-        tokens = command.split()
-    segs, cur = [], []
-    for t in tokens:
-        if t in _SEPARATORS or set(t) <= set(";&|()\n"):
-            if cur:
-                segs.append(cur)
-            cur = []
-        else:
-            cur.append(t)
-    if cur:
-        segs.append(cur)
-    return segs
+    return _shell_commands().segments(command)
 
 
 def _opt(tokens: list[str], *names: str) -> Optional[str]:
@@ -676,17 +673,28 @@ def _opt(tokens: list[str], *names: str) -> Optional[str]:
 
 
 def _kanban_verb(seg: list[str]) -> Optional[tuple[str, list[str]]]:
-    """``(verb, args after verb)`` for a ``hermes kanban <verb> ...`` segment (global flags allowed)."""
-    for i, t in enumerate(seg):
-        if os.path.basename(t) == "kanban" and i > 0 and os.path.basename(seg[i - 1]) in ("hermes", "hermes.exe") \
-                or (t == "kanban" and i > 0 and seg[i - 1].endswith("hermes_cli.main")):
-            j = i + 1
-            while j < len(seg) and seg[j].startswith("-"):
-                # argparse takes any unique prefix of --board (`--boa x`) as --board, so it consumes a value too.
-                takes_value = seg[j] == "-b" or (len(seg[j]) > 2 and "--board".startswith(seg[j]))
-                j += 2 if "=" not in seg[j] and takes_value else 1
-            if j < len(seg):
-                return seg[j], seg[j + 1:]
+    """Any-position matching unless the WHOLE input proves a data exemption in G."""
+    if _shell_commands().exempt_segment(seg):
+        return None
+    for k in range(1, len(seg)):
+        if (os.path.basename(seg[k]) == "kanban" and os.path.basename(seg[k - 1]) in ("hermes", "hermes.exe")
+                or seg[k] == "kanban" and seg[k - 1].endswith("hermes_cli.main")):
+            hit = _verb_after(seg, k)
+            if hit:
+                return hit
+    return None
+
+
+def _verb_after(seg: list[str], i: int) -> Optional[tuple[str, list[str]]]:
+    if i >= len(seg) or os.path.basename(seg[i]) != "kanban":
+        return None
+    j = i + 1
+    while j < len(seg) and seg[j].startswith("-"):
+        # argparse takes any unique prefix of --board (`--boa x`) as --board, so it consumes a value too.
+        takes_value = seg[j] == "-b" or (len(seg[j]) > 2 and "--board".startswith(seg[j]))
+        j += 2 if "=" not in seg[j] and takes_value else 1
+    if j < len(seg):
+        return seg[j], seg[j + 1:]
     return None
 
 

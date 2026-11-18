@@ -21,7 +21,7 @@ assistant reply. What never goes in: tool output, system prompts, reasoning, fil
 import argparse, collections, fnmatch, json, os, re, sqlite3, sys, time
 from pathlib import Path
 
-DIGEST_V = 9            # v9: sessions carry `hidden` (probe_token_watch leftover test chats); v8: prev_tools
+DIGEST_V = 10           # v10: preserve runtime/restart provenance before injected-text cleanup
                         # v7: bounded user-turn head/tail + explicit clipping metadata
                         # v6: each user turn carries `prev`, the agent reply before it (head+tail clip), for the
                         #     self-heal backstop judge (without it \"why didnt this work\" reads as a new issue)
@@ -146,9 +146,10 @@ SYNTHETIC = re.compile(
     r"^\s*(\[(IMPORTANT:|STILL IN PROGRESS|Note: model was|Recent Summary|CONTEXT COMPACTION|Background task|Continuing toward your"
     r" standing goal|ASYNC DELEGATION|Message from another Hermes session|From the [^\]]{0,80}session|System: "
     r"|Cronjob \"|Continuing toward this kanban task|Your active task list was preserved"
-    r"|Current user objective preserved|Turn stopped by Desktop)"
+    r"|Current user objective preserved|Turn stopped by Desktop|runtime\]|System note: Your previous turn was interrupted)"
     # Kanban gateway notices: "<glyph> [board] @assignee Kanban t_…" (tui_gateway/session_notifications.py)
-    r"|[✔✖✘⏸⏱🔄]\ufe0f?\s+(\[[^\]\n]{1,80}\]\s+)?(@\S+\s+)?Kanban\s+t_"
+    r"|[✔✖✘⏸⏱🔄⏳⚠]\ufe0f?\s+(\[[^\]\n]{1,80}\]\s+)?(@\S+\s+)?Kanban\s+t_"
+    r"|⚠\ufe0f?\s+subagent\s+Subagent:|Canonical user decision\. Act only on the frozen revision below\."
     r"|You've reached the maximum number of tool-calling)", re.I)
 SYNTH_KIND = [("cron", "[Cronjob"), ("kanban", " Kanban t_"), ("kanban_continue", "kanban task"),
               ("todo_preserved", "task list was preserved"), ("objective_preserved", "objective preserved"),
@@ -182,6 +183,7 @@ def flatten(content: str) -> str:
 
 def clean_user(text: str) -> str:
     text = flatten(text)
+    text = re.split(r"\s*\[Canonical requests awaiting a user decision:", text, maxsplit=1)[0]
     for rx in INJECTED:
         text = rx.sub("", text)
     text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
@@ -420,6 +422,12 @@ def digest_db(profile, db, host, since, prev=None, have=None, keys=None, stats=N
         for m in msgs:
             role, content = m["role"], m["content"] or ""
             if role == "user":
+                # Cleanup strips System-note wrappers; check original flattened content first.
+                raw = flatten(content)
+                if SYNTHETIC.match(raw):
+                    head = raw[:80]
+                    sig["synthetic_" + next((k for k, w in SYNTH_KIND if w in head), "summary")] += 1
+                    continue
                 text = clean_user(content)
                 if not text:
                     continue
