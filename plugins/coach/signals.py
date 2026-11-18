@@ -1655,7 +1655,9 @@ def _handoff_signal(r: dict, why: str) -> dict:
             "symptom": symptom,
             "details": (details + (f"; revised reply: {reply}" if reply else ""))[:1500],
             "fp": (fp("agent", rule, r.get("session_id") or "", key) if key is not None
-                   else fp("agent", rule, r.get("session_id") or ""))}
+                   else fp("agent", rule, r.get("session_id") or "")),
+            **({"recheck": {**r["recheck"], "fingerprint": fp("agent", rule, r.get("session_id") or "", key)}}
+               if key is not None and rule == "pr_state_claim" and isinstance(r.get("recheck"), dict) else {})}
 
 
 def unjudged_outcome(o: dict) -> str:
@@ -2075,6 +2077,8 @@ RECHECKS: Dict[str, Callable[[dict], Optional[str]]] = {
 
 def recheck_exempts(recheck: dict) -> Optional[str]:
     """Why the detector named by recheck["kind"] would not fire now, or None (fires, or unknown kind: fail open)."""
+    if recheck.get("kind") == "coach_outcome":
+        return _outcome_recheck_module().exempts(recheck)
     fn = RECHECKS.get(str((recheck or {}).get("kind") or ""))
     return fn(recheck) if fn else None
 
@@ -2090,11 +2094,23 @@ _CRON_DETAILS_RE = re.compile(r"^(?:\(seen \d+x this pass\)\n)?job \S+ \(([^\n]*
                               r" filed: [^\n]*\nscript=[^\n]*\n")
 
 
+def _outcome_recheck_module():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("_coach_outcome_recheck", SELF_DIR / "outcome_recheck.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def defect_recheck(d: dict) -> Optional[dict]:
     """The recheck of a self-heal defect: its own field, else (rows deferred before the field existed) one rebuilt from a
     template-hold symptom or cron failure details, trusted only when it reproduces the row's fingerprint."""
     if isinstance(d.get("recheck"), dict):
+        if d["recheck"].get("kind") == "coach_outcome" and d["recheck"].get("fingerprint") != d.get("fingerprint"):
+            return None
         return d["recheck"]
+    if "coach pr_state_claim check:" in str(d.get("symptom") or ""):
+        return _outcome_recheck_module().legacy(d, _handoff_signal, _ro)
     m = _TEMPLATE_SYMPTOM_RE.match(str(d.get("symptom") or ""))
     if m and fp("agent", "template-hold", m.group(1), m.group(2).lower()) == d.get("fingerprint"):
         return template_recheck(m.group(1), m.group(2))
@@ -2374,7 +2390,11 @@ def collect_coach(home: Path, cur: dict, now: float, host: str = "") -> List[dic
             elif r.get("resolved") is not True:  # only an explicit "resolved" clears it
                 still = "still handed off" if rule == "handoff" else f"still failed {rule}"
                 why = f"the revised reply {still} (outcome p={r.get('p')})"
-                rec = {**n, "reply": r.get("reply") or "",
+                replay = r.get("recheck")
+                if (not isinstance(replay, dict) or replay.get("nudge_id") != n.get("nudge_id")
+                        or replay.get("session_id") != r.get("session_id")):
+                    replay = None
+                rec = {**n, "reply": r.get("reply") or "", "recheck": replay,
                        # a judged failure names its own item; resolved=None carries a status text, not an item
                        "outcome_evidence": str(r.get("evidence") or "") if r.get("resolved") is False else "",
                        # ...but whatever resolved is, its words reach the signal (agent-614ed52ae7)
