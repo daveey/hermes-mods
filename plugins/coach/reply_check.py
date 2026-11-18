@@ -2069,6 +2069,15 @@ def pr_state_claim(reply: str, tool_log: Optional[list] = None) -> Optional[str]
     # Conservatively require every repository in the raw reply to match. Mixed
     # or ambiguous scopes may nudge, but cannot grant a number-only exemption.
     raw = reply or ""
+    # Typed prose fields are not repository qualifiers. Mask only the value
+    # spans of recognized counters/status fields, never arbitrary numeric repo
+    # names, quoted identifiers, or an entire footer (which can contain claims).
+    raw = re.sub(r"(\btests?\s+pass(?:ed)?\s+)\d+/\d+(?=\.(?:\s|$)|[,;\s]|$)", r"\1COUNT", raw, flags=re.I)
+    raw = re.sub(r"(^Done means \([^\n)]+\): )\d+/\d+(?= first pass|, \d+ fix rounds)",
+                 r"\1COUNT", raw, flags=re.M)
+    raw = re.sub(r"(^Done means \([^\n)]+\): [^\n]*?; )n/a(?=:)", r"\1NOT_APPLICABLE", raw, flags=re.M)
+    raw = re.sub(r"(^Done means \([^\n)]+\): [^\n]*?; NOT_APPLICABLE: missing-credential, )"
+                 r"[45]\d\d/[45]\d\d(?=\.$|$)", r"\1HTTP_STATUS", raw, flags=re.M)
     # A word boundary truncates legal trailing '-' or '.' characters. Consume
     # the entire identifier alphabet; ambiguous prose punctuation stays scoped
     # conservatively rather than becoming evidence for a different repository.

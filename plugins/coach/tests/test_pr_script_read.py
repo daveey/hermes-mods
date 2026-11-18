@@ -189,6 +189,43 @@ def test_repository_token_is_not_truncated(tmp_path, monkeypatch, suffix, form, 
     assert bool(check(hooks, form.format(repo=repo))) == (not matching)
 
 
+HISTORICAL_REPLY = '''Checked at 00:49:27Z.
+- **Move guard:** #3051 (merged yesterday), #3149 (merged yesterday) and other #131 (merged yesterday) are merged. The installed tests pass 134/134. The deployment check passed.
+- **#3189:** merged with its receipt.
+- **#3139** is the guard's PR.
+  - It's still open at 4c1f66ea9b and has no ship receipt yet.
+  - Its required checks passed earlier.
+- **#3087:** the review is done.
+
+Done means (orchestrator): 2/2 first pass, 0 fix rounds; n/a: no new cards.
+Done means (auth): 3/3 first pass, 0 fix rounds; n/a: missing-credential, 401/403.
+Done means (review): 5/5 first pass, 0 fix rounds; n/a: verdict action (cards already done).
+Done means (analysis): 0/0, 0 fix rounds; n/a: no analysis this turn.
+'''
+
+
+@pytest.mark.parametrize('failed', [False, True])
+def test_full_reply_metadata_through_hooks(tmp_path, monkeypatch, failed):
+    hooks, rows, _ = begin(tmp_path, monkeypatch)
+    assert check(hooks, HISTORICAL_REPLY)
+    replay(hooks, tmp_path / 'read.sh', exit_code=int(failed))
+    check(hooks, HISTORICAL_REPLY, attempt=1)
+    assert _outcome(rows)['resolved'] is (not failed)
+
+
+@pytest.mark.parametrize('repo', ['134/134', '401/403', 'n/a', 'unrelated/repo'])
+@pytest.mark.parametrize('form', [
+    'PR #3139 is still open in {repo} today.',
+    'PR #3139 is still open in `{repo}` today.',
+    'Done means (review): PR #3139 is still open in {repo} today.',
+    'Done means (review): 2/2 first pass; n/a: repository {repo}',
+])
+def test_metadata_does_not_erase_repository_qualifiers(tmp_path, monkeypatch, repo, form):
+    hooks, _, _ = begin(tmp_path, monkeypatch)
+    replay(hooks, tmp_path / 'read.sh')
+    assert check(hooks, REPLY + '\n' + form.format(repo=repo))
+
+
 def test_short_repository_scope_is_ambiguous(tmp_path, monkeypatch):
     hooks, _, _ = begin(tmp_path, monkeypatch)
     replay(hooks, tmp_path / 'read.sh')
