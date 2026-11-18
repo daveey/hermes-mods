@@ -18,7 +18,8 @@ absent from the hub's `tasks`): `kanban_unlink` it once its own acceptance is me
 "No red cards" from the hub's sqlite is not "no red chats". The sidebar paints a chat red from
 `sessions.outcome_json` kind `decision` (hub `state.db`), fed by blocked cards on any gateway (the MacBook board
 alone can hold many) and by chat-level asks (`us_*` item ids) that are not cards. `red_cards.py list` covers both.
-Remote cards are commented and unblocked on their own host; `cross_task` only reads and comments.
+Remote cards are commented and unblocked on their own host; `cross_task` only reads and comments. The Desktop
+"For you" panel lists asks from every gateway; read another gateway's cards with `cross_task`, not this host's sqlite.
 - Macs: `tailnet_exec` with the tailnet host (`mbp`, `mini`), not the gateway name.
 - Workers: `~/.hermes/bin/hub-worker-exec worker-N -- bash -lc "hermes kanban comment <id> -- '...' && hermes kanban unblock <id>"`.
 - Live counts across gateways (the inventory printed `unreachable ...`, or the report needs this turn's statuses):
