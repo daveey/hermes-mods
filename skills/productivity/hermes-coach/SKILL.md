@@ -152,11 +152,8 @@ Undone notices are always plain cards.
 
 - Exercise the coach worker's startup and request routing separately. An inherited class-selector model must not be pinned to the worker's historical Anthropic default before the judge model is known. Keep explicit selector/provider conflicts visible. Price the resolved concrete route and freeze its model/provider in every runner (including transcript/dictionary judge paths) before reserving budget; otherwise another pooled worker can select a different route after pricing. Run `scripts/test-all -k hermes-coach` from a complete checkout: copying only scripts loses sibling-plugin fixtures and Git-based repository guards. Require a budget-reserved real judge response before calling a startup repair complete; all-None results are INCOMPLETE.
 
-- Weekly regex candidates are not adjudicated corrections. Reviewer openers, Subagent relays and Kanban warnings
-  are generated; appended context must not supply matching words. Check raw restart/runtime provenance before
-  cleanup. Legacy withdrawals need source session/time/quote; retain on lookup overflow or conflicting homes,
-  and honor minute-only timestamps. Exact quote, owner scope and live proof establish repair—not session matches
-  or nearby commits. Regression coverage: `scripts/test_askgate_weekly_noise.py`.
+- Before weekly provenance/legacy withdrawal changes, read `references/weekly-provenance.md`: source identity,
+  ambiguous raw evidence, and cold file-path consumer tests. Local import-order success never waives red CI.
 
 - xAI `x_search` via the Responses API (outside research scout): send `"tool_choice": "required"` and use
   `grok-4.5`, or the model often answers `[]` from memory without searching (`usage.num_server_side_tools_used: 0`).
