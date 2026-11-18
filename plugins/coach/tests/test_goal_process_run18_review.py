@@ -12,6 +12,21 @@ owned = _fixture.owned
 gd = _fixture.gd
 
 
+@pytest.fixture(autouse=True)
+def active_consumer_start(monkeypatch):
+    """Give the borrowed core session activity before its poller can reap it."""
+    import time
+    from tui_gateway import server
+
+    start = server._start_notification_poller
+
+    def start_active(sid, session):
+        session["last_active"] = time.time()
+        return start(sid, session)
+
+    monkeypatch.setattr(server, "_start_notification_poller", start_active)
+
+
 @pytest.mark.parametrize("refusal", [False, None, "exception"])
 def test_live_poller_retries_refusal_and_records_actual_success(consumer, tmp_path, monkeypatch, refusal):
     from tui_gateway import server
@@ -31,6 +46,12 @@ def test_live_poller_retries_refusal_and_records_actual_success(consumer, tmp_pa
         return submit(*args, **kwargs)
 
     monkeypatch.setattr(server, "_run_prompt_submit", once)
+    # Exercise the real reaper even in a short isolated run, before completion
+    # creates a pending notification that might itself protect the lease.
+    import time
+    lease = session["active_session_lease"]
+    server._release_idle_session_leases(time.time())
+    assert session["active_session_lease"] is lease
     complete()
     wait_until(lambda: health.available(tmp_path, "origin", registry.ownership_generation), timeout=5)
     stop.set()
