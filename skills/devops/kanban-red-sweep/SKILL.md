@@ -108,11 +108,7 @@ gave (Gate G). A rejected guard is never bypassed with another writer.
 
 ## Prevent the decision block in the worker
 
-Carry this rule into worker skills and card templates, not only the sweep: when evidence supports a recommended option inside the card's limits and normal review and landing gates, apply it rather than asking. Comment the pick and how to reverse it, then continue. Never bypass review or required CI.
-
-Reserve a human block for real money above standing envelopes; permissions or credentials; other people; safety or privacy consent; hard-to-reverse effects; changing a fixed test, threshold or target after its result; or genuinely toss-up options with no evidence of the user's preference. A recommended choice is not permission to cross those boundaries. A block-time warning is advisory: a successful block still ends the run, and must not be followed by another lifecycle call.
-
-Prevent acceptance-change surprises at card creation instead (slug `acceptance-waiver-owner-decision`): a card with a numeric gate states each threshold and preregisters, before execution and with independent review of the plan, one `IF FAIL <check>: <next step>` line per gate **in the card body** (re-measure once on fresh seeds, report FAIL and stop, file the decision card with options). Gate G reads only the body; a comment registers nothing. Comments may cite an exact body branch. For diagnostic steering that is not a registered disposition, use plain prose such as “On failure, quote the failing test and diagnose it.” A branch decides the next step; it never waives or passes the check. The worker then reports `metadata.acceptance_results` honestly (`fail` + the `branch` it followed) and the kanban-honest-done plugin's Gate G refuses a waived or guessed pass. When no branch fits, the honest outcome is a needs_input block naming the changed limit ("waives check 4", "lowers the 25% target"); that ask is legitimate, not avoidable.
+Read `references/prevent-decision-blocks.md` (apply-the-recommendation rule, `IF FAIL` branches at creation).
 
 ## 3. Act
 
@@ -167,16 +163,7 @@ Prevent acceptance-change surprises at card creation instead (slug `acceptance-w
   (`journalctl -k | grep -i 'out of memory'`) and the last log file in the card's workspace, find the surviving
   worktree, and comment cause, worktree path and a capped first command for the next run, then bump.
 - `no such task ... not imported here; last pickup skip: ...` on the hub means the card lives on the gateway that
-  created it (a worker's run filed it pinned to the hub). `hermes kanban edit` here fails with "unknown id" and a
-  plain twin `kanban_create` is refused `create_overlap`. Reach the origin box (`cross_task` read names the
-  gateway; `aws ssm send-command` with `sudo -u ubuntu -i bash -lc "hermes kanban ..."`, instance role,
-  us-west-2). A priority raise there is not enough when the skip count keeps climbing (top priority still sat
-  unimported for an hour): replace the card. Create a hub-local twin (`placement='local'`,
-  `distinct_from=[<id>]`, `distinct_reason` = it cannot import and is archived this turn, body = run the
-  original's body with all its limits, first step = stop if the original started), then comment and
-  `hermes kanban archive <id>` on the origin box and read back `archived`, so one owner remains.
-  A hub card parented on such an unimported card sits `todo` forever (`parent_missing` in its events, parent
-  absent from the hub's `tasks`): `kanban_unlink` it once its own acceptance is met or the twin exists.
+  created it: read `references/remote-homed-cards.md` (reach the origin box, or replace it with a hub-local twin).
 - A `ready` card that already ran and has an open PR: before bumping it, read `hermes kanban show <id>`
   Diagnostics and the PR (`gh pr view <N> --json state,mergeStateStatus,statusCheckRollup`). A hold of
   `respawn_guarded: active_pr` keeps the card from restarting until its PR merges or closes, so no priority
