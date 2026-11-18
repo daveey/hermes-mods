@@ -1630,7 +1630,8 @@ HANDOFF_GRACE_S = 15 * 60  # a nudge waits this long for its reply_nudge_outcome
 NUDGE_OPEN_S = 3 * 3600
 NUDGE_DELIVERY = ("reply_nudge_delivered", "reply_nudge_undelivered", "reply_nudge_abandoned")
 NUDGE_OUTCOME = ("reply_nudge_outcome", "nudge_outcome_lost", "nudge_outcome_subagent", "nudge_outcome_untracked",
-                 "nudge_outcome_missing", "nudge_outcome_unconfirmed", "nudge_outcome_unjudged")
+                 "nudge_outcome_missing", "nudge_outcome_unconfirmed", "nudge_outcome_unjudged",
+                 "nudge_outcome_peer_mail")
 # report_only outcome verdicts that may file (reply_check.STRONG_REPORT_ONLY_SRC; a test pins the match).
 STRONG_REPORT_ONLY_SRC = ("confirm", "closed_owner", "unverified_owner")
 # reply_check rules whose nudges get a reply_nudge_outcome (same as reply_check.RULES; a test pins the match).
@@ -1891,6 +1892,18 @@ def subagent_session(home: Path, n: dict) -> bool:
         if row:
             return str(row[0] or "").lower() == "subagent"
     return False
+
+
+# agent-df378b15af: a hermes-mail peer turn's reply goes back to the requesting agent (reply_check.peer_mail_turn), so
+# its report_only/status_only nudges are no user-facing defect either. The nudge record keeps the ask's first 40
+# chars (`ask_head`, whitespace-collapsed), which carry the envelope's opening; other rules still file.
+PEER_MAIL_HEAD = "[PEER MESSAGE from "
+PEER_MAIL_EXEMPT_RULES = ("report_only", "status_only")  # = reply_check.SUBAGENT_EXEMPT_RULES (a test pins it)
+
+
+def peer_mail_nudge(n: dict) -> bool:
+    return (str(n.get("rule") or "") in PEER_MAIL_EXEMPT_RULES
+            and str(n.get("ask_head") or "").lstrip().startswith(PEER_MAIL_HEAD))
 
 
 # Core's failed-turn boundary rows (agent/turn_failure_copy.py): the Hermes-authored assistant row closing a turn that
@@ -2397,14 +2410,19 @@ def collect_coach(home: Path, cur: dict, now: float, host: str = "") -> List[dic
                         "fp": fp("agent", "fixloop", r.get("session_id") or "", issue[:80])})
         elif r.get("event") == "reply_nudge" and rule in OUTCOME_RULES and (rule == "handoff" or r.get("outcome")):
             pending.append({**{k: r.get(k) for k in ("session_id", "rule", "p", "evidence", "draft_id", "platform",
-                                                     "nudge_id", "item_ids") + BACKEND_KEYS},
+                                                     "nudge_id", "item_ids", "ask_head") + BACKEND_KEYS},
                             "ts": at})
         elif r.get("event") == "reply_nudge_outcome" and rule in OUTCOME_RULES:
             n = next((n for n in pending if _outcome_matches(n, r)), None)
             if n is None:
                 continue
             pending.remove(n)
-            if r.get("resolved") is not True and subagent_session(home, n):
+            if r.get("resolved") is not True and peer_mail_nudge(n):
+                _coach_log(home, {"ts": now, "event": "nudge_outcome_peer_mail", "session_id": n.get("session_id") or "",
+                                  "rule": rule, "nudge_ts": n.get("ts"), "draft_id": n.get("draft_id"),
+                                  **_nid(n)})
+                _mark(opened, n, "o")
+            elif r.get("resolved") is not True and subagent_session(home, n):
                 _coach_log(home, {"ts": now, "event": "nudge_outcome_subagent", "session_id": n.get("session_id") or "",
                                   "rule": rule, "nudge_ts": n.get("ts"), "draft_id": n.get("draft_id"),
                                   **_nid(n)})
@@ -2457,6 +2475,12 @@ def collect_coach(home: Path, cur: dict, now: float, host: str = "") -> List[dic
     keep = []
     for n in pending:
         if now - float(n.get("ts") or 0) > HANDOFF_GRACE_S:
+            if peer_mail_nudge(n):
+                _coach_log(home, {"ts": now, "event": "nudge_outcome_peer_mail", "reason": "no_outcome",
+                                  "session_id": n.get("session_id") or "", "rule": n.get("rule"),
+                                  "nudge_ts": n.get("ts"), "draft_id": n.get("draft_id"), **_nid(n)})
+                _mark(opened, n, "o")
+                continue
             if subagent_session(home, n):
                 # agent-ee1b1162bc: a subagent's report to its parent agent is not a user-facing defect (any rule)
                 _coach_log(home, {"ts": now, "event": "nudge_outcome_subagent", "reason": "no_outcome",
