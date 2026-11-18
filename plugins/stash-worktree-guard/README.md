@@ -289,6 +289,10 @@ another linked worktree and `R` a scratch directory.
    is quoted as data before analysis, never executed by the guard. Other preceding env
    options, unknown shell expansions and GNU `${VAR}` expansion retain the existing
    evidence-based fallback rather than pretending to know the child's environment.
+   Literal split strings work through both shell single and double quotes; ordinary
+   backslashes in double quotes are preserved before GNU decoding. The unsupported
+   fallback can miss escaped separators combined with dynamic values (for example
+   `env -S 'git\_stash\_pop${X}'` when X is empty) or preceding options such as `-i`.
    In particular,
    `env -S "git -C WT $(echo c3Rhc2g= | base64 -d) pop"` can escape both argv analysis
    and the textual fallback. The fallback's dynamic-subcommand pattern requires a

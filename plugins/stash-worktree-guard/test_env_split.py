@@ -29,18 +29,32 @@ def snapshot(wt):
         ['git', 'rev-parse', 'refs/stash'], cwd=wt))
 
 
-def test_escaped_separator_refusal_before_execution(wt):
+DOUBLE_COMMANDS = [
+    prefix + 'env ' + flag + r'"git\_stash\_pop"'
+    for prefix in ['', 'launcher exec --unknown -- ']
+    for flag in ['-S ', '-S', '--split-string ', '--split-string=']
+]
+DOUBLE_COMMANDS += [
+    shell + ' ' + shlex.quote(r'env -S "git\_stash\_pop"')
+    for shell in ['bash -c', 'sh -c', 'eval']
+]
+DOUBLE_COMMANDS += [r'''env -S "git\_stash\_'pop'"''']
+
+
+@pytest.mark.parametrize('cmd', [CMD, *DOUBLE_COMMANDS])
+def test_escaped_separator_refusal_before_execution(wt, cmd):
     gnu_env()
     before = snapshot(wt)
-    reason = guard.refuse_reason(CMD, str(wt))
-    blocked = _blocked(CMD, wt)
+    reason = guard.refuse_reason(cmd, str(wt))
+    blocked = _blocked(cmd, wt)
     assert snapshot(wt) == before
     assert reason and blocked
 
 
-def test_escaped_separator_independent_real_restore(wt):
+@pytest.mark.parametrize('cmd', [CMD, *DOUBLE_COMMANDS])
+def test_escaped_separator_independent_real_restore(wt, cmd):
     gnu_env()
-    subprocess.run(['bash', '-c', CMD], cwd=wt, env=launcher(wt),
+    subprocess.run(['bash', '-c', cmd], cwd=wt, env=launcher(wt),
                    check=True, capture_output=True, timeout=10)
     assert (wt / 'f.txt').read_text() == 'stashed\n'
     assert subprocess.check_output(['git', 'stash', 'list'], cwd=wt) == b''
@@ -79,8 +93,12 @@ def test_option_forms_refused(wt, flag, prefix):
     r'git\_push\_origin\_HEAD:fix/stash-topic',
     r'git\_push\_origin\_HEAD:stash-topic',
 ])
-def test_safe_quoted_data_and_literal_refspecs(wt, text):
-    cmd = 'launcher exec --unknown -- env -S ' + shlex.quote(text)
+@pytest.mark.parametrize('double', [False, True])
+def test_safe_quoted_data_and_literal_refspecs(wt, text, double):
+    quoted = shlex.quote(text)
+    if double:
+        quoted = '"' + text.replace('"', '\\"') + '"'
+    cmd = 'launcher exec --unknown -- env -S ' + quoted
     before = snapshot(wt)
     assert guard.refuse_reason(cmd, str(wt)) is None
     assert not _blocked(cmd, wt)
