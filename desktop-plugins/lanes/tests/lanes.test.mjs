@@ -328,3 +328,26 @@ test('mounted: the chip flag follows a remote gateway that has lanes', async () 
   await view.click(button('Apply'))
   assert.deepEqual(calls.filter((c) => c[1] === 'PUT'), [['hub', 'PUT', '/v1/lanes/product'], ['hub', 'PUT', '/v1/lanes/infra']])
 })
+
+test('with lanes defined on every gateway, the panel settles on the one that steers them', async () => {
+  const calls = []
+  const plain = () => snap({ planner: null })                    // definitions only, as shared config gives every host
+  const steering = () => snap()                                  // the fixture's infra lane is gated and it has planner notes
+  assert.equal(P.steers(plain()), true, 'a gated lane alone marks a steering gateway')
+  const noGate = () => { const b = plain(); for (const l of Object.values(b.lanes)) l.gated = false; return b }
+  assert.equal(P.steers(noGate()), false)
+  const ctx = { rest: async (path, opts = {}) => { calls.push([where(opts), opts.method || 'GET']); return where(opts) === 'hub' ? steering() : noGate() } }
+  const source = P.createSource(ctx, { profileRoutes: async () => [MAC, MINI, HUB] })
+  assert.equal((await source.read(6)).planner.notes.length, 1)
+  assert.equal(source.target().connectionId, 'hub', 'not the first configured gateway')
+  await source.write('product', { share: 50 })
+  assert.deepEqual(calls.at(-1), ['hub', 'PUT'])
+})
+
+test('with no steering gateway it still uses the first configured one', async () => {
+  const noGate = () => { const b = snap({ planner: null }); for (const l of Object.values(b.lanes)) l.gated = false; return b }
+  const ctx = { rest: async () => noGate() }
+  const source = P.createSource(ctx, { profileRoutes: async () => [MAC, HUB] })
+  await source.read(6)
+  assert.equal(source.target().connectionId, 'this-mac')
+})

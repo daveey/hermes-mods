@@ -20,8 +20,8 @@ const COLORS = ['#f0a43a', '#8fb0ff', '#5fd4e6', '#d982f0', '#b4bac6', '#3ddc97'
 // ── which gateway to talk to ──────────────────────────────────────────────
 // Lanes are configured on one gateway (the one that holds the board and runs the dispatcher), which is often
 // not the gateway this Desktop has in front. The source asks every connection once, by id (a request with a
-// connectionId and no profile is answered by that connection's default profile), and settles on the first that
-// answers `configured: true`; reads and writes then go to that connection by id, so they do not follow the
+// connectionId and no profile is answered by that connection's default profile), and settles on the one that
+// steers lanes (see `steers`), else the first that answers `configured: true`; reads and writes then go to that connection by id, so they do not follow the
 // window when another gateway comes to the front. Only when the Desktop lists no connections does it fall back
 // to an untagged request, which goes to whichever gateway is in front.
 // A settled gateway is kept through failures: one failed read is an error to show and retry (gateways restart
@@ -30,6 +30,11 @@ const COLORS = ['#f0a43a', '#8fb0ff', '#5fd4e6', '#d982f0', '#b4bac6', '#3ddc97'
 // UNCONFIGURED_MS, and the reason shown names any gateway that could not be reached.
 export const UNCONFIGURED_MS = 60000
 export const FAILURES_BEFORE_REDISCOVERY = 3
+// Every host can carry the lane definitions (so cards are classified where they are created), but lanes are
+// steered on one gateway: the one whose config holds the gate and that runs the planner. Its shares are the ones
+// that count and the only ones a shared-config pass does not overwrite, so that is where the panel must read
+// and write. A gateway steers when a lane there is gated or it has planner notes.
+export const steers = (body) => Object.values(body?.lanes || {}).some((l) => l?.gated === true) || Boolean(body?.planner)
 const validRoute = (r) => r && ['connectionId', 'targetProfile'].every((k) => typeof r[k] === 'string' && r[k].trim())
 
 export function createSource(ctx, hostRef = host, clock = () => Date.now()) {
@@ -49,13 +54,17 @@ export function createSource(ctx, hostRef = host, clock = () => Date.now()) {
     failures = 0
     let first
     const unreachable = []
+    let fallback // the first configured gateway, used when none of them steers
     for (const target of await candidates()) {
       try {
         const body = await ctx.rest(path, opts(target))
-        if (body?.configured === true) { chosen = target; unconfigured = undefined; return body }
-        first ??= body
+        if (body?.configured === true) {
+          if (steers(body)) { chosen = target; unconfigured = undefined; return body }
+          fallback ??= { target, body }
+        } else first ??= body
       } catch (e) { unreachable.push(String(e?.message || e).slice(0, 80)) }
     }
+    if (fallback) { chosen = fallback.target; unconfigured = undefined; return fallback.body }
     chosen = undefined
     unconfigured = undefined // nothing to show from an older search if this one throws
     if (!first) throw Error(unreachable[0] || 'No gateway answered')
