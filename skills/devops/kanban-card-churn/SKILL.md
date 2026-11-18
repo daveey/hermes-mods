@@ -61,8 +61,8 @@ hermes kanban show <id> --json     # task.body, comments, events (read stdin as 
 Write down these numbers; the reply leads with them:
 - **Age vs work:** days since creation, number of runs, sum of run elapsed time. Hours of work over weeks of age
   means the problem is waiting, not effort.
-- **Run outcomes:** how many runs ended `blocked`/`scheduled` with the same gate unmet. Those are poll-and-repark
-  runs.
+- **Run outcomes:** count `blocked`/`scheduled` runs, then inspect their summaries and artifacts before calling
+  them poll-and-repark: a run can deliver a source verdict while final acceptance remains open.
 - **Context a run really gets:** the section sizes from `kanban context`. The thread is already tail-capped (30
   comments), so the usual bulk is `Parent task results` plus the files the body orders every run to read. Size
   those files (`wc -c`) and the project skill the body loads. Comments that contain their own `## ` headings
@@ -221,8 +221,9 @@ ends by proposing, and normally building, at least one fix at the point of failu
 - `unlink` takes several seconds per parent; run a long batch in the background.
 - A guard hook may refuse `rm` on a variable path and `mkdir`/`git commit` it believes is in a live checkout: use
   literal absolute paths and `git -C <worktree>`.
-- Extract a body with python reading `sys.stdin.buffer` and writing the file itself; a shell redirect of non-ASCII
-  text can leave an empty file and a failed pipeline.
+- Filter large `hermes kanban list --json` results inside the command (`| python3 -c '…'`) before returning
+  them to the tool; captured output can be truncated inside a JSON string and become unparsable. Extract bodies
+  from the original stream with Python, not from a truncated transcript or spill.
 - The gateway that answers `show` is not always the card's home: when `show` there prints no wake check but the
   events carry one with a `probe_host`, the card is homed on that host. Read the wake check, last probe result and
   your own edits back from the home (skill `hermes-workers` for pool workers).
