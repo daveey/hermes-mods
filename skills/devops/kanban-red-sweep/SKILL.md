@@ -301,7 +301,10 @@ and the final response.
   current human_request and block reason first (newest `blocked` event payload), so only the action changes.
 - Re-read each card's status and new events inside the script that writes to it; skip it if another chat changed it.
 
+- Before re-parking a linked card for days or ending a sweep chat, read `references/sweep-chat-status.md` (why the chat stays grey).
+
 ## Done means
+- [ ] If this chat created a cron or re-parked a linked card, does `hermes sessions outcome <id> --refresh --json` show no cron it still owns and no long-parked card it waits on (or the reply says which one and until when)?
 - [ ] Scope matched his words (step 0): a not-ready/Todo/Scheduled ask got the `waiting` audit at the top of the reply, not a red sweep?
 - [ ] Every board was inventoried, and the count per board and status was reported?
 - [ ] Each red card was classified with a live premise check, not from the block reason alone?
