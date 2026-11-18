@@ -135,9 +135,16 @@ and a body that is not a JSON object a 422, and neither changes anything.
   The current request's cap always recomputes the plan from the measurement.
   All optional replica and usage reads run in one owned subprocess per root, not on GET/PUT's awaited path.
   A two-second deadline cancels/kills and reaps that child; teardown joins its coordinator before reloading.
-  Failures back off one second. Plugin unload, server lifespan shutdown and process exit own cleanup.
-  Boot attribution uses only a nonblocking fresh Cards snapshot: a missing boot mapping leaves slots unavailable
-  until the regular accurate series path supplies one. No background Cards rebuild or empty series substitution.
+  While read within the last 45 seconds, a joined scheduler refreshes every 10 seconds and at minute boundaries;
+  failures back off one second and invalidate the prior snapshot. Cold reads and reads racing a minute-boundary
+  refresh can still return null; no expired window is served to hide refresh latency.
+  Plugin unload and process exit own cleanup. Router lifespan shutdown also cleans up when mounted before
+  startup; hot-mounted routers do not run that lifespan and rely on unload/process-exit cleanup.
+  Boot attribution uses only a nonblocking fresh Cards snapshot, rechecked at each refresh. Missing mappings
+  (including UUIDs Cards cannot learn), an empty sampled usage window, or any busy gateway without sampled
+  usage leave the entire slots advisory unavailable. This is intentionally fail-closed, not a claim that the
+  live fleet has complete attribution or usage. An unlearnable UUID need not recover on the next series refresh.
+  No background Cards rebuild or empty series substitution.
   Tests: `tests/test_slots.py`, `tests/test_advisory.py`, `tests/test_api.py` (real blocked Cards rebuild,
   SQLite-lock GET/PUT bound, cancellation and lifecycle). **Not tested**: live macOS activation/soak.
 - **Runway** (`runway.py`): per subscription pool, from the usage samples core's Kanban pacing governor keeps in

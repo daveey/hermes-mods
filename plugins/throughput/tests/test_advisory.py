@@ -205,6 +205,136 @@ def test_stop_and_start_are_serialized(tmp_path, monkeypatch):
     assert not A._stopped and not A._owners
 
 
+@pytest.mark.parametrize("interval", [15, 30])
+def test_steady_poll_availability(tmp_path, monkeypatch, interval):
+    """Drive the real coordinator/worker across minutes, without waiting wall minutes."""
+    from types import SimpleNamespace
+    clock = [NOW]
+    fake_time = SimpleNamespace(time=lambda: clock[0], monotonic=lambda: clock[0])
+    monkeypatch.setattr(A, "time", fake_time)
+    monkeypatch.setattr(S, "time", fake_time)
+    series, replica = measurement(tmp_path)
+    # Every later share window still contains a sampled minute and this completed run.
+    read = lambda: S.payload(tmp_path, series, 1000, replicas=[replica])
+    assert read() is None
+    owner = join(tmp_path)
+    available = []
+    for step in range(5, 181, 5):
+        clock[0] = NOW + step
+        if hasattr(owner, "wake"):
+            owner.wake.set()
+        # Give a due background flight its execution turn BEFORE the next client read.
+        # No read is allowed to trigger or repair that flight in this synchronization.
+        if step % 10 == 0 or int(clock[0]) % 60 == 0:
+            deadline = time.monotonic() + 0.5
+            while time.monotonic() < deadline:
+                if owner.snapshot and owner.snapshot[1]["observed_at"] == clock[0]:
+                    break
+                time.sleep(0.005)
+        if step % interval == 0:
+            got = read()
+            available.append(got is not None)
+            if got:
+                assert got["window_until"] == int(clock[0]) // 60 * 60
+                assert 0 <= clock[0] - got["observed_at"] < S.CACHE_S
+    assert all(available), available
+
+
+def wait_for(predicate):
+    deadline = time.monotonic() + 2
+    while not predicate() and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert predicate()
+
+
+def test_scheduler_idle_restart_and_failed_refresh(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    clock = [NOW]
+    fake_time = SimpleNamespace(time=lambda: clock[0], monotonic=lambda: clock[0])
+    monkeypatch.setattr(A, "time", fake_time)
+    monkeypatch.setattr(S, "time", fake_time)
+    series, replica = measurement(tmp_path)
+    read = lambda: S.payload(tmp_path, series, 1000, replicas=[replica])
+    assert read() is None
+    owner = join(tmp_path)
+    scheduler = owner.scheduler
+    # A refresh failure must invalidate even a not-yet-expired old observation.
+    replica.unlink()
+    first = owner.thread
+    clock[0] += 10
+    owner.wake.set()
+    wait_for(lambda: owner.thread is not first)
+    join(tmp_path)
+    assert owner.snapshot is None and read() is None
+    failed = owner.thread
+    assert read() is None and owner.thread is failed
+    # Repair, then let the scheduler retry without a request initiating the flight.
+    repaired = tmp_path / "repair"
+    repaired.mkdir()
+    _, new_replica = measurement(repaired)
+    replica.write_bytes(new_replica.read_bytes())
+    clock[0] += A.RETRY_S
+    owner.wake.set()
+    wait_for(lambda: owner.thread is not failed)
+    join(tmp_path)
+    assert read() is not None
+    # No polling -> stop background work at the exact activity boundary.
+    clock[0] += A.ACTIVE_S
+    owner.wake.set()
+    scheduler.join(2)
+    assert not scheduler.is_alive()
+    last = owner.thread
+    clock[0] += 60
+    assert owner.thread is last
+    assert read() is None
+    join(tmp_path)
+    new_scheduler = owner.scheduler
+    assert new_scheduler is not scheduler and new_scheduler.is_alive()
+    A.stop()
+    assert not new_scheduler.is_alive() and not owner.thread.is_alive()
+
+
+def test_proactive_flight_current_cap_and_joined_cancellation(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    clock = [NOW]
+    fake_time = SimpleNamespace(time=lambda: clock[0], monotonic=lambda: clock[0])
+    monkeypatch.setattr(A, "time", fake_time)
+    monkeypatch.setattr(S, "time", fake_time)
+    series, replica = measurement(tmp_path)
+    assert S.payload(tmp_path, series, 1000, replicas=[replica]) is None
+    owner = join(tmp_path)
+    scheduler = owner.scheduler
+    spawned = []
+    real = A.subprocess.Popen
+    def spawn(*args, **kwargs):
+        process = real(*args, **kwargs)
+        spawned.append(process)
+        return process
+    monkeypatch.setattr(A.subprocess, "Popen", spawn)
+    blocker = sqlite3.connect(replica)
+    blocker.execute("BEGIN EXCLUSIVE")
+    try:
+        clock[0] += 10
+        owner.wake.set()
+        wait_for(lambda: bool(spawned))
+        assert spawned[0].poll() is None
+        for _ in range(10):
+            got = S.payload(tmp_path, series, 2000, replicas=[replica])
+            assert got["gateways"]["worker-1"]["allowed"] == 2
+        assert len(spawned) == 1
+        clock[0] += 30
+        assert S.payload(tmp_path, series, 2000, replicas=[replica]) is None
+        started = time.monotonic()
+        A.stop()
+        assert time.monotonic() - started < 1
+        assert not scheduler.is_alive() and not owner.thread.is_alive()
+        assert spawned[0].returncode is not None
+        assert spawned[0].stdin.closed and spawned[0].stdout.closed
+    finally:
+        blocker.rollback()
+        blocker.close()
+
+
 def test_register_owns_reload_cleanup(monkeypatch):
     import throughput_under_test as plugin
     from throughput_under_test import sampler
