@@ -216,7 +216,11 @@ def _expand_word(raw: str, variables: dict) -> Optional[str]:
             i += 1
             if i == len(raw):
                 return None
-            out.append(raw[i])
+            if quote == '"' and raw[i] not in '$`"\\\n':
+                # Double quotes preserve backslashes before ordinary characters.
+                out.append("\\")
+            if raw[i] != "\n":
+                out.append(raw[i])
         elif char == "$" and quote != "'":
             match = re.match(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))", raw[i:])
             if not match:
