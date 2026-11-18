@@ -48,6 +48,7 @@ in text, from what you already know; investigation or fixing follows as a stated
 rule refuses further tool calls when the answer is overdue or the user says stop). Diagnosis-only applies only when the task or the
 user explicitly limits you to it ("analysis only", "diagnose, don't change anything", a read-only or diagnosis-only
 card). In that case, inspect and recheck independently, but don't change services, jobs, storage or credentials.
+For storage-full service incidents, do not require every read to fail before admitting a diagnostic deployment: a small feed GET can return200 at a frozen head while allocating writes fail. Match the captured write error separately; bind any diagnostic-only deployment exception to the exact live revision and incident head, retain an independent healthy control and bounded rollback, and never call a successful read write recovery.
 A passing `--dry-run` does not clear the failing path, because dry-run branches usually return before the
 precondition reads and writes. To get the real traceback read-only (for example, when a wrapper swallows the child's stderr), import the
 module, stub only its write functions (post, save) to print-and-raise, and run the real entry point. When the
