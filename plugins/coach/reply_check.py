@@ -2108,14 +2108,16 @@ def pr_state_claim(reply: str, tool_log: Optional[list] = None) -> Optional[str]
             if number:
                 refs.add(number[1])
                 # Natural-language list connectors are open-ended. Fail closed
-                # on subsequent standalone multi-digit integers, irrespective
-                # of connective, instead of crediting only a parsed prefix.
-                # Preserve narrowly typed read timestamps and test counters;
-                # word boundaries already exclude mixed alphanumeric SHAs.
+                # on subsequent standalone integers, irrespective of size or
+                # connective, instead of crediting only a parsed prefix.
+                # Underscores are Markdown delimiters, not identifier letters.
+                # Preserve only narrowly typed read times and count metadata.
                 rest = re.sub(r"\b\d{1,2}:\d{2}(?::\d{2})?Z?\b", "TIME", s[end:])
                 rest = re.sub(r"(\btests?\s+pass(?:ed)?\s+)\d+/\d+\b",
                               r"\1COUNT", rest, flags=re.I)
-                refs.update(re.findall(r"(?<!\w)\d{2,}(?!\w)", rest))
+                rest = re.sub(r"(?<![\w#])\d(?=\s+(?:checks?|runs?|tests?|minutes?)\b)",
+                              "COUNT", rest, flags=re.I)
+                refs.update(re.findall(r"(?<![^\W_])\d+(?![^\W_])", rest))
             elif not re.search(r"\b(?:this|that|the)\s+$", s[:mention.start()], re.I):
                 unresolved = True
         if refs:

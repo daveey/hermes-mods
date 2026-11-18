@@ -97,6 +97,15 @@ def test_unbounded_connectives_fail_closed(tmp_path, monkeypatch, separator, pre
     assert check(h, f'{prefix}3139{separator}3140 are still open.')
 
 
+@pytest.mark.parametrize('prefix', ['PRs ', 'Pull requests ', 'PR number ', 'PR-', 'PR #', '#'])
+@pytest.mark.parametrize('tail', ['7', '8 and 9', '_3140_', '3140_', '__7__', '*7*', '~~7~~'])
+def test_short_and_emphasized_list_numbers_require_read(tmp_path, monkeypatch, prefix, tail):
+    h = begin(tmp_path, monkeypatch)
+    write(h, tmp_path / 'r.sh')
+    run(h, tmp_path / 'r.sh')
+    assert check(h, f'{prefix}3139 and {tail} are still open.')
+
+
 @pytest.mark.parametrize('suffix', [' at 00:49Z', ' at 12:34:56Z',
                                   ' at 4c1f66ea9b', '; tests pass 134/134',
                                   ' with 3 checks pending'])
