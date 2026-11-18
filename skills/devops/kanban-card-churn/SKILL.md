@@ -21,9 +21,9 @@ metadata:
 
 A churned card is old, has many short runs, a long comment thread and a growing pile of files every run must
 read, and its acceptance is still unmet. The card is rarely slow; it is waiting, re-reading and re-parking. This
-skill has four parts and all four are required: **measure**, **clean up the card**, **change the producer** so
-the next card from the same recipe does not end up the same way, and **fix the root cause in the platform** so
-no recipe has to remember the rule.
+skill has four parts: **measure**, **clean up the card**, **check the producer**, and **check the platform mechanism**.
+Change only what the evidence shows failed; a spend-budget hold that correctly stopped further runs is not
+itself a platform defect.
 
 Answer the user's "why" in text as soon as step 2 is done, before any change. Then carry on.
 
@@ -177,9 +177,10 @@ Verify the prevention the same way as the cleanup: read the edited skill text ba
 
 ## 5. Root-cause fix: move the rule from prose into the mechanism
 
-Steps 3 and 4 fix one card and one recipe, in prose. Prose holds only when an agent loads that skill and follows
-it; every card already open, and every recipe you did not find, still has the problem. So each run of this skill
-ends by proposing, and normally building, at least one fix at the point of failure.
+Before proposing platform work, distinguish a missing mechanism from one that acted correctly. When a
+spend hold fired, first repair the work plan: retain the original acceptance, attach completed proof and a
+never-replay list, and bound the next run to missing-gate verification or a concrete handoff. Do not turn
+budget recovery into another platform project merely to satisfy this checklist.
 
 1. **For every cause you named in step 2, ask where a machine could have stopped it.** Write one line per cause:
    the moment it happens (a comment is posted, a card is parked, a parent is linked, a worker is held, a run ends
@@ -194,9 +195,9 @@ ends by proposing, and normally building, at least one fix at the point of failu
    | Wait on a dead home | a worker is held or stopped | the hold rehomes its open cards |
    | Nobody noticed | no detector | the step-0 query on a schedule, commenting on the owner card |
 
-2. **Search before you build.** Grep core, the plugins and open cards on every board for the mechanism. If it
-   exists, the next why is why it did not act (threshold, not deployed on that host, not reached by that path);
-   fix that. If a card already owns it, add one comment there with your evidence, do not build a second one.
+2. **Search before you build.** Check core, plugins and open cards for the mechanism. If it acted correctly,
+   record that result and stop platform investigation. If it failed, establish why (threshold, deployment or
+   entry path) before changing it. If a card already owns that defect, add evidence there, not a second owner.
 3. **Rank and pick.** Prefer a change that removes a whole class for every card over one that adds a new
    watcher or a new kind of card. A fix that creates cards or runs on a timer is the last resort: the platform
    working on itself is the cost you are trying to cut.
@@ -256,7 +257,7 @@ ends by proposing, and normally building, at least one fix at the point of failu
 - [ ] Old body saved; unlinked parents listed; `kanban context` size measured before and after?
 - [ ] The card is in a status that can start (not triage, not waiting on a dead home), read back after the change?
 - [ ] At least one producer (skill, template, recipe) was edited, or the reply says exactly why none could be?
-- [ ] Every cause has a point-of-failure line, and at least one mechanism was built (or an existing one fixed) with
-      a regression test replaying this card, or the reply says why none was possible?
+- [ ] Each platform defect claimed has evidence and a tested fix or named owner; mechanisms that worked are
+      explicitly accepted without inventing additional implementation?
 - [ ] Mechanisms not built are listed with their owner?
 - [ ] Anything not done (a fix not written, an environment not built) is listed as not done?
