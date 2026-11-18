@@ -12,3 +12,14 @@ original's body with all its limits, first step = stop if the original started),
 
 A hub card parented on such an unimported card sits `todo` forever (`parent_missing` in its events, parent
 absent from the hub's `tasks`): `kanban_unlink` it once its own acceptance is met or the twin exists.
+
+## Red chats and acting on other hosts
+
+"No red cards" from the hub's sqlite is not "no red chats". The sidebar paints a chat red from
+`sessions.outcome_json` kind `decision` (hub `state.db`), fed by blocked cards on any gateway (the MacBook board
+alone can hold many) and by chat-level asks (`us_*` item ids) that are not cards. `red_cards.py list` covers both.
+Remote cards are commented and unblocked on their own host; `cross_task` only reads and comments.
+- Macs: `tailnet_exec` with the tailnet host (`mbp`, `mini`), not the gateway name.
+- Workers: `~/.hermes/bin/hub-worker-exec worker-N -- bash -lc "hermes kanban comment <id> -- '...' && hermes kanban unblock <id>"`.
+- Hand-run a card's `wake_check` the way the dispatcher does (`bash -lc`): plain `ssh host cmd` lacks `~/.local/bin`,
+  so a `token-broker`/`hermes` call fails FileNotFoundError (rc 2) where the dispatcher gets a real answer.

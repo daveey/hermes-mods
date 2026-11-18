@@ -244,18 +244,17 @@ and the final response.
   `gh api -X PATCH repos/<o>/<r>/pulls/<N> --input body.json`, `gh api -X POST repos/<o>/<r>/issues/<N>/labels -f 'labels[]=<l>'`.
 - Released links (`released=1`) look linked in a raw join. Filter `released=0`.
 - A `startup_orphan_reap` session owns no chat work, yet still wakes on its cards' notices and publishes For-you
-  asks. A `decision_session` row with choices for a card means the user can answer it any second: leave that card to him.
+  asks. A `decision_session` row with choices for a card means the user can answer it any second: leave that card to him
+  unless he told you to decide; then write only behind a guard that aborts on any event or comment since the ask.
+  The row vanishes once the owner session starts another turn (outcome `running`), yet the ask stays open until the
+  card leaves `blocked` (archive logs `request_withdrawn`): `decision_sessions=0` does not mean no live ask.
 - The Desktop "For you" panel lists asks from every gateway. Cards that live on another gateway's board are read
   with `cross_task`, not this host's sqlite.
 - Don't publish the "may I sweep?" question as an approval tile first: this skill is the approval.
 - Write the sweep report as plain markdown. A `::user-step{...}` directive in a reply publishes its text as a
   For-you request, so a status table inside one becomes a fake ask that has to be withdrawn.
-- "No red cards" from the hub's sqlite is not "no red chats". The sidebar paints a chat red from
-  `sessions.outcome_json` kind `decision` (hub `state.db`), fed by blocked cards on any gateway (the MacBook board
-  alone can hold many) and by chat-level asks (`us_*` item ids) that are not cards. `red_cards.py list`
-  covers both; remote cards are commented and unblocked on their own host, `cross_task` only reads and comments.
-  Macs: `tailnet_exec` with the tailnet host (`mbp`, `mini`), not the gateway name. Workers:
-  `~/.hermes/bin/hub-worker-exec worker-N -- bash -lc "hermes kanban comment <id> -- '...' && hermes kanban unblock <id>"`.
+- "No red cards" from the hub's sqlite is not "no red chats", and a remote card is acted on on its own host. Before
+  reading or writing another host's cards or hand-running its `wake_check`, read `references/remote-homed-cards.md`.
 - A chat still painted red after its cards finished: run `hermes sessions outcome <id> --refresh` on its gateway. It
   re-derives the outcome from live cards, so a decision about a done card becomes `done`. Never edit `state.db`.
 - Chat-level asks (`us_*` extracted user-steps, For-you requests) can only be withdrawn by the chat that owns them;
