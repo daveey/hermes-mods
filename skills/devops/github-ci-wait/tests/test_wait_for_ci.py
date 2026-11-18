@@ -270,6 +270,27 @@ class DurableCheckoutTests(unittest.TestCase):
         self.assertFalse(self.wt.exists())
         self.assertEqual([Path(r).resolve() for r in seen], [self.main.resolve()])
 
+    def test_exact_run_mode_polls_from_the_main_checkout_after_the_worktree_is_removed(self):
+        # Entry path: the CLI in exact-run mode (--run-id) with --repo naming a worktree removed after the first poll
+        # (review 5948824299 nit 3: wait_runs ran every `gh run view` with cwd=<the removed worktree>).
+        import subprocess
+        from unittest import mock
+        seen = []
+
+        def fake_view(repo, slug, rid):
+            seen.append(Path(repo))
+            if len(seen) == 1:
+                subprocess.run(["git", "-C", str(self.main), "worktree", "remove", "--force", str(self.wt)],
+                               check=True, capture_output=True)
+                raise RuntimeError("transient gh error; poll again")
+            raise w.RunMissing("stop after the second poll")
+
+        with mock.patch.object(w, "view_run", side_effect=fake_view), mock.patch.object(w.time, "sleep"):
+            rc = w.main(["--run-id", "123", "--repo", str(self.wt), "--interval", "0"])
+        self.assertEqual(rc, 1)
+        self.assertFalse(self.wt.exists())
+        self.assertEqual([p.resolve() for p in seen], [self.main.resolve()] * 2)
+
 
 class GhRepoTests(unittest.TestCase):
     """Every gh call names the checkout's origin repo. A bare `gh run list` in a fork checkout with an `upstream`
