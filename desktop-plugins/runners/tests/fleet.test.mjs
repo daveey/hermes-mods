@@ -487,3 +487,30 @@ test('gateway rows: one grid line each in a shared column grid, no Investigate c
   assert.match(css, /\n\.hermes-fleet-gw>\.hermes-fleet-row>\*\{grid-row:1\}/)
   await ui.close()
 })
+
+test('with the lanes panel loaded the chip opens it; hermes-show-runners still opens runners', async () => {
+  const ctx = ctxWith([fleet(), fleet(), fleet()])
+  const ui = await mount(React.createElement(P.Runners, { ctx }))
+  let shown = 0
+  const onLanes = () => { shown += 1 }
+  window.addEventListener('hermes-show-lanes', onLanes)
+  try {
+    const chip = document.querySelector('[data-slot="runners-chip"]')
+    window.__hermesLanesPanel = true
+    await ui.click(chip)
+    assert.equal(shown, 1)
+    assert.equal(document.querySelector('[data-machine="worker-1"]'), null, 'runners popover stays closed')
+    window.dispatchEvent(new window.Event('hermes-show-runners'))
+    await ui.flush()
+    assert.ok(document.querySelector('[data-machine="worker-1"]'), 'the lanes panel can still open runners')
+    await ui.click(chip) // closes it
+    delete window.__hermesLanesPanel
+    await ui.click(chip)
+    assert.equal(shown, 1, 'without the lanes plugin the chip opens runners as before')
+    assert.ok(document.querySelector('[data-machine="worker-1"]'))
+  } finally {
+    delete window.__hermesLanesPanel
+    window.removeEventListener('hermes-show-lanes', onLanes)
+    await ui.close()
+  }
+})

@@ -18,6 +18,11 @@ def _register_throttle(ctx):
     gate = throttle.Gate(root, sampler.series_path(root), hub_db=throttle.hub_db_path())
     register_middleware("llm_execution", gate.middleware)
     register_hook = getattr(ctx, "register_hook", None)
+    if callable(register_hook):
+        try:
+            register_hook("kanban_start_gate", gate.start_gate)  # the dispatcher: no card starts over the cap
+        except Exception:  # a core without the start gate: cards start as before, their calls are still paced
+            log.info("throughput: this core has no kanban_start_gate hook; card starts are not throttled")
     # Not in a long-lived server process: core fires this hook synchronously for async callers too, so a hold
     # there would freeze the server's event loop, and with it the panel route that lowers the level.
     if callable(register_hook) and not sampler.eligible_process():

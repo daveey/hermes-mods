@@ -213,6 +213,85 @@ class ResolveRepoTests(unittest.TestCase):
         git.assert_not_called()
 
 
+class DurableCheckoutTests(unittest.TestCase):
+    """A wait started in a PR worktree outlives it: once the shas are resolved there, the wait runs from the main
+    checkout. A watcher whose worktree was removed mid-wait died with FileNotFoundError on its next gh call."""
+
+    def setUp(self):
+        import subprocess
+        import tempfile
+        self.root = Path(tempfile.mkdtemp())
+        self.main = self.root / "main"
+        self.wt = self.root / "wt"
+        self.plain = self.root / "plain"
+        self.plain.mkdir()
+        run = lambda *a: subprocess.run(["git", *a], check=True, capture_output=True)  # noqa: E731
+        run("init", "-q", str(self.main))
+        run("-C", str(self.main), "remote", "add", "origin", "git@github.com:me/proj.git")
+        run("-C", str(self.main), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty",
+            "-m", "base")
+        run("-C", str(self.main), "worktree", "add", "-q", str(self.wt), "-b", "pr")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def test_linked_worktree_maps_to_its_main_checkout(self):
+        self.assertEqual(w.durable_checkout(self.wt).resolve(), self.main.resolve())
+
+    def test_main_checkout_and_non_checkout_are_returned_as_is(self):
+        self.assertEqual(w.durable_checkout(self.main), self.main)
+        self.assertEqual(w.durable_checkout(self.plain), self.plain)
+
+    def test_cli_resolves_shas_in_the_worktree_then_waits_from_the_main_checkout(self):
+        # Entry path: the CLI with --repo naming a worktree that is removed right after the shas resolve.
+        import subprocess
+        from unittest import mock
+        sha = "a" * 40
+
+        def fake_git(repo, *args):
+            if args[0] == "rev-parse":
+                subprocess.run(["git", "-C", str(self.main), "worktree", "remove", "--force", str(self.wt)],
+                               check=True, capture_output=True)
+                return sha
+            return ""
+
+        seen = []
+
+        def stop(repo):
+            seen.append(repo)
+            raise RuntimeError("stop at make_contains")
+
+        with mock.patch.object(w, "git", side_effect=fake_git) as git, \
+                mock.patch.object(w, "make_contains", side_effect=stop):
+            with self.assertRaises(RuntimeError):
+                w.main([sha, "--repo", str(self.wt), "--branch", "pr", "--once"])
+        self.assertEqual([c.args[0] for c in git.call_args_list], [self.wt, self.wt])  # fetch, rev-parse
+        self.assertFalse(self.wt.exists())
+        self.assertEqual([Path(r).resolve() for r in seen], [self.main.resolve()])
+
+    def test_exact_run_mode_polls_from_the_main_checkout_after_the_worktree_is_removed(self):
+        # Entry path: the CLI in exact-run mode (--run-id) with --repo naming a worktree removed after the first poll
+        # (review 5948824299 nit 3: wait_runs ran every `gh run view` with cwd=<the removed worktree>).
+        import subprocess
+        from unittest import mock
+        seen = []
+
+        def fake_view(repo, slug, rid):
+            seen.append(Path(repo))
+            if len(seen) == 1:
+                subprocess.run(["git", "-C", str(self.main), "worktree", "remove", "--force", str(self.wt)],
+                               check=True, capture_output=True)
+                raise RuntimeError("transient gh error; poll again")
+            raise w.RunMissing("stop after the second poll")
+
+        with mock.patch.object(w, "view_run", side_effect=fake_view), mock.patch.object(w.time, "sleep"):
+            rc = w.main(["--run-id", "123", "--repo", str(self.wt), "--interval", "0"])
+        self.assertEqual(rc, 1)
+        self.assertFalse(self.wt.exists())
+        self.assertEqual([p.resolve() for p in seen], [self.main.resolve()] * 2)
+
+
 class GhRepoTests(unittest.TestCase):
     """Every gh call names the checkout's origin repo. A bare `gh run list` in a fork checkout with an `upstream`
     remote listed the upstream repo's runs, so the fork's commit was never found and every wait ended "stalled"."""

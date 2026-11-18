@@ -20,6 +20,7 @@ full card it would file) to coach log.jsonl; live files the investigation card o
 README's "Self-heal lane" section). Fail-open everywhere.
 """
 from __future__ import annotations
+import unicodedata
 
 import contextlib
 import hashlib
@@ -101,8 +102,18 @@ _HERMES_TAG_RE = (r"\[(?:" + "|".join(re.escape(t) for t in sorted(HERMES_TAGS, 
                   + r")(?=[\] :_,]|\s)")
 SYNTHETIC_RE = re.compile(
     r"^\s*(?:" + CROSS_SESSION_RE + r"|" + _HERMES_TAG_RE + r"|"
-    r"[\u2100-\u2bff\U0001F300-\U0001FAFF\ufe0f]{1,3}\s+(?:\[[^\]\n]+\]\s*)?(?:@\S+\s+)?Kanban\s+t_[0-9a-f]+\b|"
-    r"\[[A-Z][A-Za-z -]{2,40}(?::|\]| —)|(?i:\[coach\])|You've reached the maximum|[✔✓✗✖⚠] )")
+    r"[\u2100-\u2bff\U0001F300-\U0001FAFF\ufe0f]{1,3}\s+(?:\[[^\]\n]+\]\s*)?(?:@\S+\s+)?Kanban\s+t_\w+\b|"
+    r"\[[A-Z][A-Za-z -]{2,40}(?::|\]| —)|(?i:\[coach\])|You've reached the maximum)")
+
+_NOTICE_TAIL = re.compile(r"\ufe0f?\s*\[")
+_BRACKET_NOTICE = re.compile(r"^\[(?:kanban\b|IMPORTANT:|System note:|chat-closeout\b|owner-wake\b)", re.I)
+
+
+def synthetic(text: str) -> bool:
+    """Runtime envelopes plus legacy machine prompts, not bare human emoji."""
+    s = (text or "").lstrip()
+    return bool(SYNTHETIC_RE.match(s) or re.match(r"^(?:[✔✓✗✖] |⚠\ufe0f?\s+subagent\b)", s) or _BRACKET_NOTICE.match(s) or (s and
+        (unicodedata.category(s[0]) == "So" or s[0] == "ℹ") and _NOTICE_TAIL.match(s, 1)))
 # Any Kanban watcher notice ("<symbol> [board] @assignee Kanban t_x ...", gateway/kanban_watchers_notifier.py + the
 # gateway.kanban.ping locale strings: ⏳ chat-wait/quota/parent-unclaimed, ⏸ blocked, ⏱ timed out, 👀 review, 🛑 triage,
 # ⛔ gave up, 🔄 status, ℹ) is gateway-written, not David's words. Listing one symbol at a time (⏸, then ⏳ in e002e0f0)
@@ -474,7 +485,7 @@ def synthetic_user_row(d: dict) -> bool:
     if (d or {}).get("source") not in ("backstop", "complaint"):
         return False
     q = clean_user(d.get("quote") or "")
-    return bool(q) and not PROBE_RE.match(q) and bool(SYNTHETIC_RE.match(q))
+    return bool(q) and not PROBE_RE.match(q) and synthetic(q)
 
 
 def prefilter(user_text) -> bool:
@@ -482,7 +493,7 @@ def prefilter(user_text) -> bool:
     (The v1 complaint regex missed corrections like "you buy the credits" and nudges like "whats going on"; one cheap
     judge call per real user turn is the price of recall.)"""
     t = clean_user(user_text)[:2000]
-    if not t or SYNTHETIC_RE.match(t):
+    if not t or synthetic(t):
         return False
     return not ACK_RE.match(t[:200])
 

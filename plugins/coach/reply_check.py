@@ -31,6 +31,7 @@ import json
 import math
 import os
 import re
+import unicodedata
 import time
 from typing import Any, Callable, Optional
 from pathlib import Path
@@ -1379,7 +1380,16 @@ def status_only(user_ask: str, reply: str, tool_log: Optional[list] = None) -> O
 # row, a cron run, a subagent or a Kanban worker) gets one advisory hint per turn. It never holds a reply.
 # Off switch: env COACH_STATUS_PLAIN=off, or config plugins.entries.coach.settings.status_plain: false.
 SYNTHETIC_USER_RE = re.compile(
-    r"^\s*(?:[\u2714\u2713\u2716\u2717\u23f8\u26a0\u2757]|\[(?!image|screenshot)[^\]\n]{1,80}[\]:])", re.I)
+    r"^\s*\[(?!image|screenshot|OUT-OF-BAND USER MESSAGE)[^\]\n]{1,80}[\]:]", re.I)
+
+
+def synthetic_user_turn(text: str) -> bool:
+    """Status exclusions include legacy unbracket receipts, but not a human warning."""
+    s = (text or "").lstrip()
+    return bool(notice_turn(s) or SYNTHETIC_USER_RE.match(s) or
+                re.match(r"^(?:[✔✓✖✗⏸❗]|⚠\ufe0f?\s+subagent\b)", s))
+
+
 PROBE_TAG_RE = re.compile(r"^\s*\[selfheal-probe\]\s*", re.I)
 STATUS_PLAIN_HINT = (
     "[coach] status_plain: the user asked about progress (\"{ask}\"). Open with the state of their original ask in "
@@ -1466,7 +1476,7 @@ def status_plain_hint(user_ask: str, platform: str = "", parent_session_id: str 
         return None
     # a `[selfheal-probe]` live test stands in for a person (self_heal._NOT_HERMES_TAGS); it is not a Hermes row
     ask = PROBE_TAG_RE.sub("", user_ask[:ASK_HEAD], count=1)
-    if automation_prompt(ask) or SYNTHETIC_USER_RE.match(ask) or not PLAIN_STATUS_ASK_RE.search(ask):
+    if automation_prompt(ask) or synthetic_user_turn(ask) or not PLAIN_STATUS_ASK_RE.search(ask):
         return None
     if not status_plain_enabled():
         return None
@@ -3717,7 +3727,45 @@ NOT_NOTICES = {
 
 def notice_turn(user_ask: str) -> bool:
     """Only anchored automation envelopes, never a human question mentioning a notice."""
-    return bool(NOTICE_RE.search(user_ask or ""))
+    s = (user_ask or "").lstrip()
+    # Preserve known human lookalikes of the runtime's IMPORTANT batch headers: core's count-led headers state a
+    # fact ("3 Kanban task updates arrived", "2 background processes completed"); a count-led question is typed.
+    # Resume wrappers carry the human's interrupted request, not a job result: keep them out of the generic
+    # bracket fallback so strip_preamble can unwrap them (all four core openings, fresh and stale pause alike).
+    if HUMAN_IMPORTANT_LOOKALIKE.match(s) or _resume_request(s):
+        return False
+    return bool(NOTICE_RE.search(s) or _BRACKET_NOTICE.match(s) or (s and
+        (unicodedata.category(s[0]) == "So" or s[0] == "ℹ") and _NOTICE_TAIL.match(s, 1)))
+
+
+_NOTICE_TAIL = re.compile(r"\ufe0f?\s*\[")
+HUMAN_IMPORTANT_LOOKALIKE = re.compile(r"^\[IMPORTANT: (?:Background processes\b|\d+ [A-Za-z][A-Za-z -]{0,40}\?)")
+_BRACKET_NOTICE = re.compile(r'^\[(?:kanban\b|IMPORTANT:(?! The ["\u201c]| The user launched)|System note:|chat-closeout\b|owner-wake\b)', re.I)
+
+# Core's resume preambles (crash auto-continue tui_gateway/session_history.py, update pause tui_gateway/update_pause.py,
+# gateway restart recovery gateway/run.py, gateway/run_auto_continue_noise.py): a "[System note: …]" that carries the
+# user's own request after it. Such a turn is a human ask, not a "[System note:" notice (agent-6b76c58161). Only these
+# four openings: any other note stays a notice, and a note with nothing after it (or that never closes) stays whole.
+_SYSTEM_RESUME_NOTE_RE = re.compile(r"\[System note: (?:Your previous turn|The previous turn was interrupted by"
+                                    r"|A turn of yours paused for a|A new message)")
+
+
+def _note_end(text: str) -> int:
+    """Index of the "]" closing the leading "[…]" (nested brackets balanced), or -1 when it never closes."""
+    depth = 0
+    for i, ch in enumerate(text):
+        depth += (ch == "[") - (ch == "]")
+        if depth == 0:
+            return i
+    return -1
+
+
+def _resume_request(text: str) -> str:
+    """The request after a leading core resume note, or "" (not a resume note, never closes, nothing follows)."""
+    if not _SYSTEM_RESUME_NOTE_RE.match(text):
+        return ""
+    end = _note_end(text)
+    return text[end + 1:].strip() if end > 0 else ""
 
 
 def automation_prompt(user_ask: str) -> bool:
@@ -3744,12 +3792,7 @@ def strip_preamble(ask: str) -> str:
     for _ in range(4):  # a resumed turn that is interrupted again stacks a second note
         if not text.startswith(PREAMBLE_OPEN):
             break
-        depth, end = 0, -1
-        for i, ch in enumerate(text):
-            depth += (ch == "[") - (ch == "]")
-            if depth == 0:
-                end = i
-                break
+        end = _note_end(text)
         rest = text[end + 1:].lstrip() if end > 0 else ""
         if not rest:
             return ask

@@ -169,6 +169,15 @@ per turn itself, the repeat logged `live_chat_sleep_repeat`. Origin: self-heal a
 (one early interim line, ~25 tool calls, then a foreground `sleep 200; … ship` after a quota brake, and "why are you
 not answering me"). Tests: `tests/test_live_chat_sleep.py`.
 
+`scheduled_kill` (`scheduled_kill.py`) holds the first `process_manage kill` of a running background job that is
+still sleeping toward a scheduled run: a literal `sleep` of >= 60 s or a computed `sleep $secs`, outside a poll loop.
+The refusal states the computed wake time (start plus the `sleeping N` the job printed, else its literal sleep) in
+local and Pacific time, and asks for a tool check of the target before the kill, not in the same batch. It applies to
+any session type. It is held once per (session, job), and the repeat is logged `scheduled_kill_repeat` and goes
+through. A job whose sleep is over is never held. Origin: self-heal agent-d483b8fda1. The agent killed a valid
+00:01 PT job (`sleeping 10185`) because its own arithmetic said "~50 minutes", in the same batch as the `date` check
+that proved the job right. Tests: `tests/test_scheduled_kill.py`.
+
 ## Answer first (stop demand, plain question)
 
 `answer_first.py` classifies the live user's own message at `pre_llm_call` (notices, `[System note…]` and compaction

@@ -524,3 +524,25 @@ def test_stacked_preambles_strip_and_bare_preambles_stay():
     assert rc.strip_preamble(bare) == bare  # nothing real follows: unchanged
     for ask in ('fix X', '', 'What does [System note: x] mean?', '[System note: unterminated'):
         assert rc.strip_preamble(ask) == ask
+
+
+def test_resume_note_with_a_request_is_human_but_other_system_notes_stay_notices():
+    """eae0c2a2 made every "[System note:" a notice, which read David's resumed request as automation. Only core's
+    four resume openings followed by a request are human; bare, unterminated and other notes stay notices."""
+    notes = _core_preambles('fix X')
+    notes.pop('jobs_stopped_report')
+    for name, note in notes.items():
+        assert not rc.notice_turn(note), name
+    bare = '[System note: The previous turn was interrupted by a gateway restart.]'
+    for ask in (bare, '[System note: result', '[System note: result] fix X', '[System note: background work completed.]',
+                '[System note: Your previous turn was interrupted mid-run'):
+        assert rc.notice_turn(ask), ask
+    assert not rc.notice_turn(bare + '\n\nwhy are we waiting?')
+    # the stale pause note (tui_gateway/update_pause.py, later turns ran over the pause) and the gateway's
+    # "A new message has arrived" fallback also carry the request; they are not "Your previous turn" openings
+    for head in ('[System note: A turn of yours paused for a Hermes update at 09:00 (2 h ago) and only continues now.'
+                 ' The paused request was:]',
+                 '[System note: A new message has arrived. The conversation was interrupted.]'):
+        assert not rc.notice_turn(head + '\n\nfix X'), head
+        assert rc.strip_preamble(head + '\n\nfix X') == 'fix X', head
+        assert rc.notice_turn(head), head

@@ -153,16 +153,6 @@ def test_gate_holds_at_100_until_the_level_is_lowered(tmp_path):
     assert gate.wait() == pytest.approx(3 * T.POLL_S) and len(clock.sleeps) == 3
 
 
-def test_gate_holds_over_the_cap_until_the_rate_drops(tmp_path):
-    bucket = (END - 6 * 3600) // 900 * 900
-    db = _series(tmp_path, [("hub", bucket, 900_000.0), ("hub", END - 60, 48_000.0)])
-    T.write_level(tmp_path, 30)  # cap 700/s, rate 800/s: hold
-    gate, clock = _gate(tmp_path, db)
-    st = Store(db)
-    clock.on_sleep = lambda n: st.put("hub", "tokens_io", [(END - 60, 30_000.0)]) if n == 2 else None  # 500/s
-    assert gate.wait() == pytest.approx(2 * T.POLL_S)
-
-
 def test_gate_reads_no_series_when_off_or_fully_on(tmp_path, monkeypatch):
     db = _series(tmp_path, [])
     monkeypatch.setattr(T, "status", lambda *a: (_ for _ in ()).throw(AssertionError("series read")))
@@ -172,19 +162,6 @@ def test_gate_reads_no_series_when_off_or_fully_on(tmp_path, monkeypatch):
     gate, clock = _gate(tmp_path, db)
     clock.on_sleep = lambda n: T.write_level(tmp_path, 0)
     assert gate.wait() == pytest.approx(T.POLL_S)
-
-
-def test_gate_caches_a_passing_state_and_fails_open(tmp_path, monkeypatch):
-    db = _series(tmp_path, [])
-    T.write_level(tmp_path, 50)
-    gate, clock = _gate(tmp_path, db)
-    calls = []
-    monkeypatch.setattr(T, "status", lambda *a: calls.append(a) or {"holding": False})
-    gate.wait(), gate.wait()
-    assert len(calls) == 1  # one status read per STATE_TTL_S
-    clock.t += T.STATE_TTL_S + 1
-    monkeypatch.setattr(T, "status", lambda *a: (_ for _ in ()).throw(RuntimeError("boom")))
-    assert gate.wait() == 0.0  # a broken read never stalls a model call
 
 
 def test_middleware_waits_then_calls_through(tmp_path):
@@ -209,15 +186,25 @@ def test_register_adds_the_execution_middleware_and_the_auxiliary_hold(tmp_path,
                                     register_hook=lambda name, fn: hooks.append((name, fn))))
     assert [kind for kind, _ in registered] == ["llm_execution"]
     assert registered[0][1](next_call=lambda request: ("sent", request), request={"m": 1}) == ("sent", {"m": 1})
-    assert [name for name, _ in hooks] == ["pre_auxiliary_call"]
-    assert hooks[0][1].hermes_hook_timeout == T.AUX_HOOK_TIMEOUT_S  # core reads the budget off the callback
-    assert hooks[0][1](aux_task="title_generation", provider="p", model="m") is None  # off: returns at once
+    assert [name for name, _ in hooks] == ["kanban_start_gate", "pre_auxiliary_call"]
+    assert hooks[0][1](task_id="t_1", lane="ready", assignee="default", board=None) is None  # off: the card starts
+    assert hooks[1][1].hermes_hook_timeout == T.AUX_HOOK_TIMEOUT_S  # core reads the budget off the callback
+    assert hooks[1][1](aux_task="title_generation", provider="p", model="m") is None  # off: returns at once
     monkeypatch.setattr(sampler, "eligible_process", lambda *a, **k: True)  # a gateway / serve / dashboard process
     monkeypatch.setattr(sampler, "start", lambda *a, **k: False)
     registered.clear(), hooks.clear()
     plugin.register(SimpleNamespace(register_middleware=lambda kind, fn: registered.append((kind, fn)),
                                     register_hook=lambda name, fn: hooks.append((name, fn))))
-    assert [kind for kind, _ in registered] == ["llm_execution"] and hooks == []  # never block a server's event loop
+    assert [kind for kind, _ in registered] == ["llm_execution"]
+    assert [name for name, _ in hooks] == ["kanban_start_gate"]  # the dispatcher lives here; no auxiliary hold in
+    # a server process (never block its event loop)
+
+    def refuse(name, fn):
+        raise ValueError(f"unknown hook {name}")
+    registered.clear()
+    plugin.register(SimpleNamespace(register_middleware=lambda kind, fn: registered.append((kind, fn)),
+                                    register_hook=refuse))
+    assert [kind for kind, _ in registered] == ["llm_execution"]  # a core without the start gate still paces calls
     monkeypatch.setattr(sampler, "eligible_process", lambda *a, **k: False)
     registered.clear()
     plugin.register(SimpleNamespace(register_middleware=lambda kind, fn: registered.append((kind, fn))))
@@ -387,12 +374,171 @@ def test_status_and_gate_obey_another_gateways_level(tmp_path):
     assert out["percent"] == 30.0 and out["cap_per_s"] == 500.0 and out["holding"] is True and out["set_by"] == "hub"
     clock = Clock()
     gate = T.Gate(tmp_path, db, hub_db=hub, sleep=clock.sleep, clock=clock.now)
-    clock.on_sleep = lambda n: _hub_db(
-        tmp_path, {"hub": ({"throttle": {"percent": 0, "cap_per_s": None, "set_at": NOW + 1}}, 0)}) if n == 2 else None
-    assert gate.wait() == pytest.approx(2 * T.POLL_S)  # held by the hub's level, released when the hub turns it off
+    assert gate.plan(NOW)[0] == "pace" and gate.plan(NOW)[2] == NOW - 50  # paced by the hub's level and its cap
     hub = _hub_db(tmp_path, {"mini": ({"throttle": {"percent": 100, "cap_per_s": 0.0, "set_at": NOW - 1}}, 5)})
-    monkeypatch_free = T.Gate(tmp_path, tmp_path / "no-series.sqlite", hub_db=hub, sleep=clock.sleep, clock=clock.now)
-    assert monkeypatch_free.holding() is True  # 100 % from another gateway holds without any local series
+    gate = T.Gate(tmp_path, tmp_path / "no-series.sqlite", hub_db=hub, sleep=clock.sleep, clock=clock.now)
+    assert gate.holding() is True  # 100 % from another gateway holds without any local series
+    clock.on_sleep = lambda n: _hub_db(
+        tmp_path, {"mini": ({"throttle": {"percent": 0, "cap_per_s": None, "set_at": NOW + 1}}, 0)}) if n == 2 else None
+    assert gate.wait() == pytest.approx(2 * T.POLL_S)  # held by mini's level, released when mini turns it off
+
+
+# --- pacing ---------------------------------------------------------------------------------------------------
+
+def test_shares_are_a_quarter_even_the_rest_by_use_and_sum_to_one():
+    usage = {"hub": 300.0, "worker-1": 600.0, "mini": 100.0, "macbook": 0.0}
+    shares = {g: T.local_share(usage, g) for g in usage}
+    assert shares == {"hub": pytest.approx(0.0625 + 0.225), "worker-1": pytest.approx(0.0625 + 0.45),
+                      "mini": pytest.approx(0.0625 + 0.075), "macbook": pytest.approx(0.0625)}
+    assert sum(shares.values()) == pytest.approx(1.0)
+    assert T.local_share(usage, "new-host") == pytest.approx(0.25 / 5)  # not in the series yet: its even part of five
+    assert T.local_share({"hub": 0.0, "mini": 0.0}, "hub") == pytest.approx(0.5)  # nobody used anything: even
+    assert T.local_share({}, "hub") == 1.0 and T.local_share({}, None) == 1.0
+    assert T.local_share({"hub": 10.0}, None) == pytest.approx(0.25)  # an unnamed gateway: the even part only
+
+
+def test_usage_and_local_name_come_from_the_series(tmp_path):
+    db = _series(tmp_path, [("hub", END - 60, 30_000.0), ("hub", END - 120, 6_000.0), ("worker-1", END - 300, 4_000.0),
+                            ("mini", END - 600, None),  # sampled as missing: no usage, not listed
+                            ("hub", END - T.SHARE_WINDOW_S - 60, 9e9), ("hub", END, 9e9)])  # outside the window
+    assert T.usage_by_gateway(db, NOW) == {"hub": 36_000.0, "worker-1": 4_000.0}
+    assert T.local_name(db) is None
+    Store(db).set_meta("me", "hub")
+    assert T.local_name(db) == "hub"
+    assert T.usage_by_gateway(tmp_path / "missing.sqlite", NOW) == {} and T.local_name(tmp_path / "missing.sqlite") is None
+
+
+def test_call_tokens_is_measured_use_per_paced_call():
+    assert T.call_tokens(0.0, 5) == T.DEFAULT_CALL_TOKENS and T.call_tokens(90_000.0, 0) == T.DEFAULT_CALL_TOKENS
+    assert T.call_tokens(90_000.0, 30) == pytest.approx(3_000.0)
+    assert T.call_tokens(10.0, 100) == T.MIN_CALL_TOKENS and T.call_tokens(9e12, 1) == T.MAX_CALL_TOKENS
+
+
+def test_pacer_hands_out_slots_one_interval_apart_across_processes(tmp_path):
+    a, b = T.Pacer(tmp_path), T.Pacer(tmp_path)  # two processes on one Hermes root
+    assert a.reserve(NOW, 10.0) == NOW  # idle: the first call starts at once
+    assert b.reserve(NOW, 10.0) == NOW + 10 and a.reserve(NOW + 1, 10.0) == NOW + 20  # a queue, never a herd
+    assert b.reserve(NOW + 500, 10.0) == NOW + 500  # after a quiet spell no credit has piled up: one call, not many
+    assert a.reserve(NOW + 500, 10.0) == NOW + 510
+    assert a.passes(NOW) == 3  # counted by the minute of the slot: all three fall in the minute NOW is in
+    assert a.passes(NOW + 510) == 5 and a.passes(NOW + 510 + T.SHARE_WINDOW_S + 60) == 0
+    a.note(NOW + 520)  # a call made with the throttle off is counted too
+    assert a.passes(NOW + 520) == 6
+    T.pace_path(tmp_path).write_text("{broken")
+    assert a.reserve(NOW + 600, 10.0) == NOW + 600  # an unreadable state file starts over
+
+
+def _paced(tmp_path, percent=50, cap=1000.0, rows=(), me="hub"):
+    """A gateway at ``percent`` with a stored cap; its series holds ``rows`` and names itself ``me``."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    db = _series(tmp_path, list(rows))
+    if me:
+        Store(db).set_meta("me", me)
+    T.level_path(tmp_path).parent.mkdir(parents=True, exist_ok=True)
+    T.level_path(tmp_path).write_text(json.dumps({"percent": percent, "cap_per_s": cap, "set_at": NOW - 100}))
+    return db
+
+
+def test_gate_spaces_calls_so_a_queue_drains_at_the_gateways_share_of_the_cap(tmp_path):
+    # worker-1 used all of the window's tokens and this gateway none: share = its even part of two = 0.125 of 1000/s
+    db = _paced(tmp_path, cap=1000.0, rows=[("worker-1", END - 60, 60_000.0)])
+    gate, clock = _gate(tmp_path, db)
+    interval = T.DEFAULT_CALL_TOKENS / (0.125 * 1000.0)  # no use measured here yet: 20k tokens a call -> 160 s
+    assert gate.plan(NOW) == ("pace", pytest.approx(interval), NOW - 100)
+    starts = []
+    for _ in range(4):  # four calls arrive at the same moment, in four processes
+        g = T.Gate(tmp_path, db, sleep=clock.sleep, clock=clock.now)
+        t0 = clock.t
+        g.wait()
+        starts.append(clock.t - NOW)
+        clock.t = t0  # the next process also arrived at t0
+    assert starts == pytest.approx([0.0, interval, 2 * interval, 3 * interval])  # released one at a time
+    assert sum(1 for x in starts if x == 0.0) == 1  # exactly one starts at once: no burst
+
+
+def test_gate_interval_follows_the_measured_tokens_per_call(tmp_path):
+    db = _paced(tmp_path, cap=1000.0, rows=[("hub", END - 60, 90_000.0)])  # alone in the series: share 1.0
+    pacer = T.Pacer(tmp_path)
+    for i in range(30):
+        pacer.reserve(NOW - 600 + i, 0.0)  # 30 paced calls in the window: 3000 tokens a call
+    gate, _ = _gate(tmp_path, db)
+    assert gate.plan(NOW) == ("pace", pytest.approx(3.0), NOW - 100)
+    tiny = _paced(tmp_path / "t", cap=0.5, rows=[("hub", END - 60, 90_000.0)])
+    gate, _ = _gate(tmp_path / "t", tiny)
+    assert gate.plan(NOW)[1] == T.MAX_INTERVAL_S  # a sliver of a cap still lets a call through every ten minutes
+    zero = _paced(tmp_path / "z", cap=0.0, rows=[("hub", END - 60, 90_000.0)])
+    gate, _ = _gate(tmp_path / "z", zero)
+    assert gate.plan(NOW) == ("hold",)
+
+
+def test_calls_are_counted_while_the_throttle_is_off_so_the_first_paced_interval_is_measured(tmp_path):
+    db = _paced(tmp_path, percent=0, cap=None, rows=[("hub", END - 60, 90_000.0)])
+    gate, clock = _gate(tmp_path, db)
+    for _ in range(30):
+        assert gate.wait() == 0.0  # off: no wait, but each call is counted
+    assert T.Pacer(tmp_path).passes(NOW) == 30
+    T.level_path(tmp_path).write_text(json.dumps({"percent": 50, "cap_per_s": 1000.0, "set_at": NOW - 1}))
+    gate, _ = _gate(tmp_path, db)
+    assert gate.plan(NOW) == ("pace", pytest.approx(3.0), NOW - 1)  # 90k tokens / 30 calls at 1000/s: 3 s, at once
+
+
+def test_start_gate_holds_card_starts_while_the_fleet_is_over_the_cap(tmp_path, monkeypatch):
+    card = dict(task_id="t_1", lane="ready", assignee="default", board=None)
+    # fleet rate 800/s in the last minute against a cap of 500/s: over
+    db = _paced(tmp_path, cap=500.0, rows=[("hub", END - 60, 30_000.0), ("worker-1", END - 60, 18_000.0)])
+    gate, clock = _gate(tmp_path, db)
+    assert gate.start_gate(**card) == {"hold": True, "reason": "token_throttle"}
+    reads = []
+    real = T.status
+    monkeypatch.setattr(T, "status", lambda *a, **k: reads.append(a) or real(*a, **k))
+    for _ in range(50):  # the dispatcher asks for every candidate card: one read per START_GATE_TTL_S
+        gate.start_gate(**card)
+    assert reads == []
+    Store(db).put("hub", "tokens_io", [(END - 60, 6_000.0)])  # the fleet drops to 400/s: under the cap
+    assert gate.start_gate(**card) == {"hold": True, "reason": "token_throttle"}  # still the cached answer
+    clock.t += T.START_GATE_TTL_S
+    assert gate.start_gate(**card) is None and len(reads) == 1  # re-read: cards start again
+    under = _paced(tmp_path / "u", cap=5000.0, rows=[("hub", END - 60, 30_000.0)])
+    assert _gate(tmp_path / "u", under)[0].start_gate(**card) is None  # under the cap: cards start
+    off = _paced(tmp_path / "o", percent=0, cap=None, rows=[("hub", END - 60, 9e9)])
+    assert _gate(tmp_path / "o", off)[0].start_gate(**card) is None  # off: never holds a start
+    full = _paced(tmp_path / "f", percent=100, cap=0.0, rows=[])
+    assert _gate(tmp_path / "f", full)[0].start_gate(**card) == {"hold": True, "reason": "token_throttle"}
+    quiet = _paced(tmp_path / "q", cap=500.0, rows=[])
+    assert _gate(tmp_path / "q", quiet)[0].start_gate(**card) is None  # no measured rate: fail open
+    monkeypatch.setattr(T, "status", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    assert _gate(tmp_path, db)[0].start_gate(**card) is None  # a broken read starts the card
+
+
+def test_a_waiting_call_follows_a_changed_level(tmp_path):
+    db = _paced(tmp_path, cap=1000.0, rows=[("hub", END - 60, 90_000.0)])
+    T.Pacer(tmp_path).reserve(NOW, 300.0)  # the slot after this one is 300 s away
+    gate, clock = _gate(tmp_path, db)
+    clock.on_sleep = lambda n: T.write_level(tmp_path, 0, now=NOW + 1) if n == 2 else None
+    assert gate.wait() == pytest.approx(2 * T.POLL_S)  # turned off while waiting: released at the next poll
+    T.level_path(tmp_path).write_text(json.dumps({"percent": 50, "cap_per_s": 1000.0, "set_at": NOW + 2}))
+    gate, clock = _gate(tmp_path, db)
+    clock.on_sleep = lambda n: T.write_level(tmp_path, 100, now=NOW + 3) if n == 1 else (
+        T.write_level(tmp_path, 0, now=NOW + 4) if n == 4 else None)
+    assert gate.wait() == pytest.approx(4 * T.POLL_S)  # raised to 100 % while waiting: held until it is lowered
+
+
+def test_gate_caches_its_share_and_fails_open(tmp_path, monkeypatch):
+    db = _paced(tmp_path, cap=1000.0, rows=[("hub", END - 60, 90_000.0)])
+    gate, clock = _gate(tmp_path, db)
+    reads = []
+    real = T.usage_by_gateway
+    monkeypatch.setattr(T, "usage_by_gateway", lambda *a: reads.append(a) or real(*a))
+    gate.plan(NOW), gate.plan(NOW + 1)
+    assert len(reads) == 1  # one series read per PLAN_TTL_S
+    gate.plan(NOW + T.PLAN_TTL_S)
+    assert len(reads) == 2
+    monkeypatch.setattr(T, "effective", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    assert gate.plan(NOW) == ("pass",) and gate.wait() == 0.0  # a broken read never stalls a model call
+    monkeypatch.undo()
+    monkeypatch.setattr(T.Pacer, "reserve", lambda *a: (_ for _ in ()).throw(OSError("read-only disk")))
+    gate, clock = _gate(tmp_path, db)
+    assert gate.wait() == 0.0 and clock.sleeps == []  # no slot can be written: the call goes ahead
 
 
 def test_note_seen_acknowledges_the_level_and_gateways_lists_who_has_it(tmp_path):

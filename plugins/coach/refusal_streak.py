@@ -14,6 +14,7 @@ Stdlib only, Python 3.9+; signals.py loads it by path and passes its own helpers
 from __future__ import annotations
 
 import re
+import unicodedata
 import sqlite3
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -25,8 +26,7 @@ AUTO_RETRY_PREFIX = "[Hermes: automatic retry of"
 # kanban notice line ("<glyph> [board] @who Kanban t_...", tui_gateway/session_notifications.py), Hermes plugin
 # envelopes, core's resume/job notes and a cross-session relay.
 AUTOMATED_RE = re.compile(
-    r"^\s*(?:[ℹ✔✓⏸✖⏱🔄⏳⚠]\ufe0f?\s*(?:\[[^\]\n]+\]\s*)?(?:@\S+\s+)?Kanban\s+t_\w+"
-    r"|(?i:\[(?:chat-closeout|kanban close-out|owner-wake|false-stop recovery|goal continuation|babysitter)\b)"
+    r"^\s*(?:(?i:\[(?:chat-closeout|kanban close-out|owner-wake|false-stop recovery|goal continuation|babysitter)\b)"
     r"|\[System note:|\[Message from another Hermes session|\[ASYNC DELEGATION |\[IMPORTANT: Background process "
     r"|\[IMPORTANT: \d+ (?:Kanban task updates|background process results) arrived\b"
     r"|\[IMPORTANT: \d+ background (?:processes|subagent delegations) completed\b"
@@ -37,7 +37,14 @@ MAX_FILED = 500  # remembered sessions per db; older ones age out (their fingerp
 
 def automated(content: str) -> bool:
     """A row Hermes delivered on its own: core's retry of a failed automated delivery, or such a delivery itself."""
-    return content.startswith(AUTO_RETRY_PREFIX) or bool(AUTOMATED_RE.match(content))
+    s = (content or "").lstrip()
+    return s.startswith(AUTO_RETRY_PREFIX) or bool(AUTOMATED_RE.match(s) or _BRACKET_NOTICE.match(s) or (s and
+        (unicodedata.category(s[0]) == "So" or s[0] == "ℹ") and
+        (_NOTICE_TAIL.match(s, 1) or re.match(r"\ufe0f?\s*(?:@\S+\s+)?Kanban\s+t_\w+", s[1:]))))
+
+
+_NOTICE_TAIL = re.compile(r"\ufe0f?\s*\[")
+_BRACKET_NOTICE = re.compile(r'^\[(?:kanban\b|IMPORTANT:(?! The user launched)|System note:|chat-closeout\b|owner-wake\b)', re.I)
 
 
 def refused_streaks(conn: sqlite3.Connection, since_id: int, since_ts: float

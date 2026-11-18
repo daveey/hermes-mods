@@ -8,6 +8,7 @@ Line: {ts, host, session, skill, checks_first_pass, fix_rounds, user_correction,
 each field is filled.
 """
 from __future__ import annotations
+import unicodedata
 
 import argparse
 import contextlib
@@ -47,7 +48,16 @@ SYNTHETIC_RE = re.compile(
     r"^\s*(?:# Kanban task t_|\[(?:kanban|owner-wake|coach|selfheal-probe|System note|runtime|session-outcome|"
     r"Session babysitter|False-stop recovery|skill-outcomes|ASYNC DELEGATION|CONTEXT COMPACTION|"
     r"Your active task list was preserved|Skills pruned)\b|"
-    r"[✔✓✗✖⚠⏸]|\[?Canonical user decision|New note on your kanban task)", re.I)
+    r"⚠\ufe0f?\s+subagent\b|\[?Canonical user decision|New note on your kanban task)", re.I)
+
+_NOTICE_TAIL = re.compile(r"\ufe0f?\s*\[")
+_BRACKET_NOTICE = re.compile(r"^\[(?:kanban\b|IMPORTANT:|System note:|chat-closeout\b|owner-wake\b)", re.I)
+
+
+def runtime_notice(text: str) -> bool:
+    s = (text or "").lstrip()
+    return bool(SYNTHETIC_RE.match(s) or re.match(r"^[✔✓✗✖⏸]", s) or _BRACKET_NOTICE.match(s) or (s and
+        (unicodedata.category(s[0]) == "So" or s[0] == "ℹ") and _NOTICE_TAIL.match(s, 1)))
 # sessions.source values whose user turns are written by Hermes or a parent agent, never by a person
 MACHINE_SOURCES = {"subagent", "cron", "kanban", "tool"}
 REPLIED_SOURCES = ("keyword", "coach", "next_message")  # finalized on a real user reply
@@ -163,7 +173,9 @@ def _coach_synthetic_res() -> list:
                                                                   base / f"{mod_name}.py")
                     mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
                     spec.loader.exec_module(mod)  # type: ignore[union-attr]
-                    _coach_synth.append(getattr(mod, attr))
+                    # Prefer category-aware predicates; retain old coach compatibility.
+                    predicate = "synthetic" if mod_name == "self_heal" else "notice_turn"
+                    _coach_synth.append(getattr(mod, predicate, getattr(mod, attr).search))
                 except Exception:
                     continue
             if _coach_synth:
@@ -187,9 +199,9 @@ def is_real_user_message(text: Any, display_kind: Any = None) -> bool:
     text = unwrap_steer(text)
     if display_kind not in REAL_DISPLAY_KINDS:
         return False
-    if not isinstance(text, str) or not text.strip() or SYNTHETIC_RE.match(text):
+    if not isinstance(text, str) or not text.strip() or runtime_notice(text):
         return False
-    return not any(rx.search(text) for rx in _coach_synthetic_res())
+    return not any(predicate(text) for predicate in _coach_synthetic_res())
 
 
 def coach_correction(home: Any, session: str, user_ts: float, user_text: str) -> bool:

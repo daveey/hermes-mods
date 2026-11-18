@@ -335,7 +335,8 @@ def _panel_letter_hint(message: str, requests: list) -> str:
 # ---- hooks ---------------------------------------------------------------------------------------------
 
 # Runtime-written user rows (Kanban notices, auto-continue): a turn they start was not started by the user.
-_RUNTIME_KINDS = frozenset({"kanban_notice", "auto_continue"})
+_RUNTIME_KINDS = frozenset({"kanban_notice", "auto_continue", "internal_notification", "process_complete",
+                            "async_delegation_complete", "loop_tick"})
 AUTOMATIC_PREFIX = "[Automatic notice, not typed by the user] "
 
 
@@ -345,7 +346,11 @@ def _turn_message(user_message: Any, conversation_history: Any) -> str:
     text = user_message if isinstance(user_message, str) else ""
     for msg in reversed(conversation_history if isinstance(conversation_history, list) else []):
         if isinstance(msg, dict) and msg.get("role") == "user":
-            if (msg.get("display_kind") or "") in _RUNTIME_KINDS and not text.startswith(AUTOMATIC_PREFIX):
+            kind = msg.get("display_kind") or ""
+            content = msg.get("content")
+            canonical = (kind == "internal_notification" and isinstance(content, str)
+                         and content.lstrip().startswith("Canonical user decision."))
+            if kind in _RUNTIME_KINDS and not canonical and not text.startswith(AUTOMATIC_PREFIX):
                 return AUTOMATIC_PREFIX + text
             break
     return text

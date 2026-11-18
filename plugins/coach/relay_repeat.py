@@ -100,7 +100,7 @@ CLOSED = ("done", "archived")
 # Hermes-written user rows reply_check.notice_turn does not class as notices (blocked/failed Kanban notices, the todo
 # list and system notes re-injected after compaction, coach nudges, ready-wait notices): never a person asking again.
 # A backtest of the rule on 10 days of hub chats fired on all of these before this exclusion.
-_SYNTHETIC_RE = re.compile(r"^\s*(?:[\u2714\u2713\u2716\u2717\u23f3\u23f8\u26a0\u2757]|\[(?!image|screenshot)[^\]\n]{1,80}[\]:])", re.I)
+_SYNTHETIC_RE = re.compile(r"^\s*\[(?!image|screenshot|OUT-OF-BAND USER MESSAGE)[^\]\n]{1,80}[\]:]", re.I)
 
 HINT = ("[coach] The user has asked again ({n} time{s}) while your replies relayed {owner}'s unfinished progress "
         "(\"{phrase}\"). A repeat ask in a live chat ends that owner's budget: take the next step yourself this turn "
@@ -256,7 +256,7 @@ def relay_owner(reply: str) -> Optional[dict]:
 
 
 def _automated(user_text: str) -> bool:
-    return bool(_rc().automation_prompt(user_text) or _SYNTHETIC_RE.match(user_text or ""))  # == rc.SYNTHETIC_USER_RE
+    return bool(_rc().automation_prompt(user_text) or _rc().synthetic_user_turn(user_text))
 
 
 def repeat_ask(user_text: str) -> bool:
