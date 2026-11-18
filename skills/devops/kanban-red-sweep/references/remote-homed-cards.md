@@ -21,5 +21,20 @@ alone can hold many) and by chat-level asks (`us_*` item ids) that are not cards
 Remote cards are commented and unblocked on their own host; `cross_task` only reads and comments.
 - Macs: `tailnet_exec` with the tailnet host (`mbp`, `mini`), not the gateway name.
 - Workers: `~/.hermes/bin/hub-worker-exec worker-N -- bash -lc "hermes kanban comment <id> -- '...' && hermes kanban unblock <id>"`.
+- Live counts across gateways (the inventory printed `unreachable ...`, or the report needs this turn's statuses):
+  one read-only sqlite script looping over `kanban.db` and `kanban/boards/*/kanban.db`, copied to the hub and run
+  there, on every online worker with `~/.hermes/bin/hub-worker-exec all --timeout 60 -- /tmp/<script>` (offline ones
+  are listed and skipped), on each Mac over ssh, and locally.
 - Hand-run a card's `wake_check` the way the dispatcher does (`bash -lc`): plain `ssh host cmd` lacks `~/.local/bin`,
   so a `token-broker`/`hermes` call fails FileNotFoundError (rc 2) where the dispatcher gets a real answer.
+
+## Fleet inventory readers
+
+`red_cards.py list` reads other gateways' live boards (beyond lagging replicas) only through readers configured in the monitor host's
+`state/red-sweep-sources.json` (file missing: `unreachable fleet coverage-config-missing`).
+For managed workers, check the monitor host's already-authorized instance-role SSM route before leaving a
+placeholder unreachable reader. Discover running instances by exact configured identity, require a unique match,
+and use GetCommandInvocation (ListCommandInvocations may be intentionally denied). A bounded read-only snapshot can
+ship a reviewed pinned collector when the worker's installed CLI is older. Keep the whole reader below the inventory
+caller timeout, bound delivery/execution too, compress stdout to stay within SSM's response cap, and fail closed on
+truncated output. Never grant new IAM access or restart a worker to make inventory green.
