@@ -21,6 +21,7 @@ import re
 import sqlite3
 import sys
 import time
+import unicodedata
 import uuid
 from pathlib import Path
 from typing import Callable, Optional
@@ -106,11 +107,21 @@ def flatten(msg) -> str:
     return str(msg or "")
 
 
+_NOTICE_TAIL = re.compile(r"\ufe0f?\s*\[")
+
+
+def runtime_notice(text: str) -> bool:
+    """Retain legacy notices; recognize glyph envelopes without a closed list."""
+    s = (text or "").lstrip()
+    return bool(SYNTHETIC_RE.match(s) or (s and (
+        (unicodedata.category(s[0]) == "So" or s[0] == "ℹ") and _NOTICE_TAIL.match(s, 1))))
+
+
 def is_still_broken(text: str) -> bool:
     t = flatten(text)
     m = OOB_RE.match(t)  # a steering message is the user's own words inside a Hermes wrapper
     t = m.group(1) if m else t
-    return bool(t.strip()) and not SYNTHETIC_RE.match(t) and bool(STILL_BROKEN_RE.search(t[:1500]))
+    return bool(t.strip()) and not runtime_notice(t) and bool(STILL_BROKEN_RE.search(t[:1500]))
 
 
 def proc_start(pid) -> Optional[float]:
@@ -243,7 +254,7 @@ class Store:
         m = OOB_RE.match(t)
         t = m.group(1) if m else t
         hits = []
-        if t.strip() and not SYNTHETIC_RE.match(t):
+        if t.strip() and not runtime_notice(t):
             try:
                 hits = curriculum_mod().text_hits(self.curriculum(), t)
             except Exception:
