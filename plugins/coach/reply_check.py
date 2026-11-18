@@ -2090,9 +2090,30 @@ def pr_state_claim(reply: str, tool_log: Optional[list] = None) -> Optional[str]
     hit = None
     context_ids = set()
     for s in _SENTENCE_END.split(text):
-        refs = {m[1] for m in re.finditer(r"(?:#|\bPR\s+|/pull/)([1-9]\d*)\b", s, re.I)}
+        # Use the claim detector's PR grammar, including its bare PR/request
+        # matches, then consume an attached number (PR-42, PR number 42).
+        mentions = list(_MF_PR_RE.finditer(s))
+        # Qualified repo#N can follow a word character, which the claim
+        # grammar's standalone # alternative deliberately does not match.
+        refs = set(re.findall(r"#([1-9]\d*)\b", s))
+        unresolved = False
+        for mention in mentions:
+            number = re.search(r"([1-9]\d*)$", mention[0])
+            if not number:
+                number = re.match(r"\s*(?:-\s*|number\s+)?#?([1-9]\d*)\b",
+                                  s[mention.end():], re.I)
+            if number:
+                refs.add(number[1])
+            elif not re.search(r"\b(?:this|that|the)\s+$", s[:mention.start()], re.I):
+                unresolved = True
         if refs:
             context_ids = refs
+        elif unresolved:
+            context_ids = set()
+        # Explicitly contrasting subjects cannot inherit even when a prior
+        # sentence provided a read PR. This also rejects 'the other PR'.
+        if re.search(r"\b(?:other|another)\s+(?:PRs?|pull\s+requests?)\b", s, re.I):
+            context_ids = set()
 
         if s.rstrip(" *_").endswith("?"):
             continue

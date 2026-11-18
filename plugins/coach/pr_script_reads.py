@@ -11,6 +11,12 @@ import shlex
 
 CAP = 20000
 PREFIX = '   <- PR state result: '
+# Only tools whose contracts cannot edit the saved script preserve provenance.
+# Unknown/new tools fail closed; broad executors and delegators are not readers.
+READ_ONLY_TOOLS = frozenset({
+    'read_file', 'search_files', 'skill_view', 'skills_list',
+    'tool_describe', 'hermes_tool_search',
+})
 ROW = re.compile(r'(?:[\w-]+)?#([1-9]\d*) (OPEN|CLOSED|MERGED) merged=(null|[0-9TZ:.-]+) head=([0-9a-f]{7,40})')
 
 
@@ -133,10 +139,7 @@ def observe(state, tool, args, result, ok):
     data = obj(result)
     if tool in ('write_file', 'patch'):
         path = path_key(data.get('resolved_path') or args.get('path'))
-        kept.pop(path_key(args.get('path')), None)
-        kept.pop(path, None)  # overwrite/patch invalidates earlier provenance even on failure
-        if not path:
-            kept.clear()  # unresolved relative mutation may name any retained file
+        kept.clear()  # any mutation breaks the verified-write -> run chain
         if tool == 'write_file' and path and ok and data.get('verified') is True:
             ids = script_ids(args.get('content'))
             if ids and path_key(data.get('resolved_path', args.get('path'))) == path:
@@ -145,7 +148,7 @@ def observe(state, tool, args, result, ok):
                 kept[path] = ids
         return []
     if tool != 'terminal':
-        if tool in ('execute_code', 'browser_exec'):
+        if tool not in READ_ONLY_TOOLS:
             kept.clear()
         return []
     path = execution_path(args.get('command'))
