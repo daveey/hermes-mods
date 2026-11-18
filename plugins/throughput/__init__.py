@@ -32,8 +32,27 @@ def _register_throttle(ctx):
             log.info("throughput: this core has no pre_auxiliary_call hook; auxiliary calls are not throttled")
 
 
+def _advisory_lifecycle(action):
+    # Dashboard loads this plugin under a separate private package name. Own both
+    # copies on plugin reload; do not import/start a dashboard just to stop it.
+    import sys
+    from . import advisory
+    getattr(advisory, action)()
+    dashboard = sys.modules.get("hermes_throughput_plugin.advisory")
+    if dashboard is not None and dashboard is not advisory:
+        getattr(dashboard, action)()
+
+
+def _stop_advisory():
+    _advisory_lifecycle("stop")
+
+
 def register(ctx):
     from . import sampler
+    _advisory_lifecycle("start")
+    on_unload = getattr(ctx, "on_unload", None)
+    if callable(on_unload):
+        on_unload(_stop_advisory)
     try:
         _register_throttle(ctx)
     except Exception:  # never break plugin loading

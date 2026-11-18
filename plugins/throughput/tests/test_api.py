@@ -18,6 +18,19 @@ def api(monkeypatch):
     return mod
 
 
+def test_api_lifespan_owns_advisory_refresh(api):
+    import importlib
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    advisory = importlib.import_module(api.pkg().__name__ + ".advisory")
+    advisory.stop()
+    app = FastAPI()
+    app.include_router(api.router)
+    with TestClient(app):
+        assert not advisory._stopped
+    assert advisory._stopped and not advisory._owners
+
+
 def test_single_flight_and_cache(api, monkeypatch):
     calls = []
 
@@ -106,6 +119,113 @@ def test_real_build_by_model_end_to_end(api, tmp_path, monkeypatch):
     m = c.get("/p/v1/series?range=1h&by=model").json()
     assert "by" not in g and g["series"]["tokens_io"]["hub"][-2] == 8.0
     assert m["by"] == "model" and m["models"] == ["m-a", "unreported"] and m["series"]["tokens_io"]["m-a"][-2] == 7.0
+
+
+def test_throttle_does_not_wait_for_real_cards_rebuild(api, tmp_path, monkeypatch):
+    import concurrent.futures
+    import importlib
+    import json
+    import sqlite3
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_HUB_STATE", str(tmp_path / "hub"))
+    monkeypatch.setattr(api, "_registry", lambda: {"me": "worker-1"})
+    sampler, _ = api._services()
+    monkeypatch.setattr(sampler, "start", lambda *a, **k: False)
+    cards = api._state["cards"]
+    cards.known = lambda: None
+    replicas = tmp_path / "replicas"
+    replicas.mkdir()
+    cards.replica_dir = replicas
+    now = time.time()
+    with sqlite3.connect(replicas / "cards.db") as db:
+        db.executescript("CREATE TABLE tasks (id TEXT, created_at REAL, created_on TEXT, completed_at REAL, status TEXT);"
+                         "CREATE TABLE task_events (id INTEGER, task_id TEXT, kind TEXT, payload TEXT, created_at REAL);")
+        db.execute("INSERT INTO tasks VALUES ('t', ?, 'worker-1', ?, 'done')", (now - 120, now - 60))
+        db.execute("INSERT INTO task_events VALUES (1, 't', 'claimed', ?, ?)",
+                   (json.dumps({"holder": "worker-1"}), now - 90))
+    entered, release = threading.Event(), threading.Event()
+    real_build = cards._build
+
+    def blocked_build(at):
+        entered.set()
+        assert release.wait(5)
+        return real_build(at)
+
+    monkeypatch.setattr(cards, "_build", blocked_build)
+    app = FastAPI()
+    app.include_router(api.router, prefix="/p")
+    slots = importlib.import_module(api.pkg().__name__ + ".slots")
+    with TestClient(app) as client, concurrent.futures.ThreadPoolExecutor(3) as pool:
+        series = pool.submit(client.get, "/p/v1/series?range=1h")
+        try:
+            assert entered.wait(1)
+            started = time.monotonic()
+            get = pool.submit(client.get, "/p/v1/throttle")
+            put = pool.submit(client.put, "/p/v1/throttle", json={"percent": 37})
+            assert get.result(timeout=0.8).status_code == 200
+            response = put.result(timeout=0.8)
+            assert time.monotonic() - started < 1
+            assert response.status_code == 200 and response.json()["percent"] == 37
+            saved = json.loads((tmp_path / "cache/throughput/throttle.json").read_text())
+            assert saved["percent"] == 37 and response.json()["set_at"] == saved["set_at"]
+            assert response.json()["gateways"] == [{"name": "worker-1", "seen": True}]
+            assert not series.done()
+        finally:
+            release.set()
+        result = series.result(timeout=2)
+        assert result.status_code == 200
+        assert sum(result.json()["series"]["cards_out"]["worker-1"]) == 1
+    if hasattr(slots, "stop"):
+        slots.stop()
+
+
+def test_throttle_routes_do_not_wait_for_slots_sqlite(api, tmp_path, monkeypatch):
+    import concurrent.futures
+    import importlib
+    import sqlite3
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from test_slots import _replica
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_HUB_STATE", str(tmp_path / "hub"))
+    monkeypatch.setattr(api, "_registry", lambda: {"me": "worker-1"})
+    api._services()
+    advisory = importlib.import_module(api.pkg().__name__ + ".advisory")
+    replicas = tmp_path / "kanban/sync-shadow"
+    replicas.mkdir(parents=True)
+    replica = _replica(replicas, [])
+    blocker = sqlite3.connect(replica)
+    blocker.execute("BEGIN EXCLUSIVE")
+    entered, processes = threading.Event(), []
+    real = advisory.subprocess.Popen
+    def spawn(*args, **kwargs):
+        process = real(*args, **kwargs)
+        processes.append(process)
+        entered.set()
+        return process
+    monkeypatch.setattr(advisory.subprocess, "Popen", spawn)
+    app = FastAPI()
+    app.include_router(api.router, prefix="/p")
+    try:
+        with TestClient(app) as client, concurrent.futures.ThreadPoolExecutor(2) as pool:
+            assert client.get("/p/v1/throttle").json()["slots"] is None
+            assert entered.wait(1)
+            started = time.monotonic()
+            get = pool.submit(client.get, "/p/v1/throttle")
+            put = pool.submit(client.put, "/p/v1/throttle", json={"percent": 42})
+            assert get.result(timeout=0.8).json()["slots"] is None
+            result = put.result(timeout=0.8).json()
+            assert result["percent"] == 42 and result["slots"] is None
+            assert time.monotonic() - started < 1
+            assert len(processes) == 1 and processes[0].poll() is None
+            assert client.get("/p/v1/throttle").json()["percent"] == 42
+        assert processes[0].poll() is not None  # shutdown reaped even while the replica remains locked
+    finally:
+        blocker.rollback()
+        blocker.close()
 
 
 def test_throttle_routes_end_to_end(api, tmp_path, monkeypatch):

@@ -127,6 +127,7 @@ class Cards:
         self.clock = clock
         self._lock = threading.Lock()
         self._cache: Optional[tuple[float, dict]] = None
+        self._advisory_known = None
         self._claims: dict[tuple[str, str, float], tuple[Optional[str], Optional[str]]] = {}
 
     def events(self) -> dict:
@@ -138,6 +139,19 @@ class Cards:
             out = self._build(now)
             self._cache = (now, out)
             return out
+
+    def advisory_snapshot(self):
+        """Copy fresh boot attribution without waiting for (or starting) a series rebuild."""
+        if not self._lock.acquire(blocking=False):
+            return None
+        try:
+            hit = self._cache
+            if hit is None or not 0 <= self.clock() - hit[0] < CACHE_S:
+                return None
+            return {"observed_at": hit[0], "boot_map": dict(hit[1]["boot_map"]),
+                    "known": None if self._advisory_known is None else list(self._advisory_known)}
+        finally:
+            self._lock.release()
 
     def _build(self, now: float) -> dict:
         known = self.known()
@@ -168,6 +182,7 @@ class Cards:
                 c.close()
         self._claims = {k: v for k, v in self._claims.items() if k[2] >= since}  # drop cards out of the window
         bmap = learn_boot_map(votes, known)
+        self._advisory_known = None if known is None else frozenset(known)
         return {
             "created": [(t, classify(on)) for t, on in created],
             "done": [(t, attribute(h, lk, bmap, known)) for t, (h, lk) in done_raw],

@@ -100,7 +100,7 @@ def test_pacing_holds_counts_distinct_cards_in_the_window(tmp_path):
 
 
 def test_payload_reads_series_and_replicas(tmp_path):
-    S._cache.clear()
+    S.advisory.start()
     st = Store(tmp_path / "series.sqlite")
     st.put("worker-1", "tokens_io", [(END - 60 * m, 60_000.0) for m in range(1, 16)])  # 900k in the window
     db = _replica(tmp_path, [(f"t{n}", "done", START, END, {"holder": "worker-1"}, False) for n in range(10)])
@@ -109,7 +109,12 @@ def test_payload_reads_series_and_replicas(tmp_path):
     c.commit()
     c.close()
     got = S.payload(tmp_path, tmp_path / "series.sqlite", 500.0, now=NOW, replicas=[db])
-    assert got["window_s"] == 900 and got["pacing"] == {"held_starts": 1, "window_s": 300.0}
+    assert got is None
+    S.advisory._owners[str(tmp_path)].thread.join(3)
+    got = S.payload(tmp_path, tmp_path / "series.sqlite", 500.0, now=NOW, replicas=[db])
+    assert got["window_s"] == 900 and got["pacing"]["held_starts"] == 1
+    assert got["pacing"]["window_s"] == 300.0
     row = got["gateways"]["worker-1"]
     assert row["tokens_per_slot_per_s"] == 100.0 and row["avg_busy"] == 10.0 and row["share"] == 1.0
     assert row["by_throttle"] == 5 and row["allowed"] == 5 and row["rate_per_s"] == 1000.0
+    S.stop()

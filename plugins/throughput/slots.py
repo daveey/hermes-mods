@@ -18,15 +18,15 @@ The Runners panel crosses out a gateway's slots beyond ``allowed``.
   replicas record: ``pacing.held_starts``, the cards whose start the governor held in the last
   ``PACING_WINDOW_S`` (their ``llm_paced`` events), fleet-wide.
 
-Everything here is read-only and fails open: an unreadable replica contributes no busy time, and a gateway
-without data gets no limit rather than a wrong one.
+The throttle route reads only a fresh snapshot. All optional reads run in one owned,
+killable worker per root; cold, expired or incomplete measurements return null rather
+than presenting missing observations as zero usage or measured slot limits.
 """
 from __future__ import annotations
 
 import math
 import sqlite3
 import statistics
-import threading
 import time
 from pathlib import Path
 from typing import Iterable, Optional
@@ -40,12 +40,11 @@ CLAIM_SLACK_S = 5.0  # a run's ``claimed`` event is written just before the run 
 CACHE_S = 30.0
 PACING_WINDOW_S = 300.0
 
-_cache: dict = {}
-_lock = threading.Lock()
+from . import advisory
 
 
 def busy_seconds(replicas: Iterable[Path], since: float, until: float, boot_map: Optional[dict] = None,
-                 known: Optional[set] = None) -> dict[str, float]:
+                 known: Optional[set] = None, *, strict: bool = False) -> dict[str, float]:
     """Busy slot-seconds per gateway in ``[since, until)``: every card run overlapping the window, clipped to it.
 
     A run with no end counts only while its card is still running on that run (a dangling open run row would
@@ -55,6 +54,8 @@ def busy_seconds(replicas: Iterable[Path], since: float, until: float, boot_map:
         try:
             c = ro_connect(db)
         except sqlite3.Error:
+            if strict:
+                raise
             continue
         try:
             rows = c.execute(
@@ -65,11 +66,15 @@ def busy_seconds(replicas: Iterable[Path], since: float, until: float, boot_map:
                 "WHERE r.started_at < ? AND (r.ended_at > ? OR (r.ended_at IS NULL AND t.status = 'running' "
                 "AND t.current_run_id = r.id))", (CLAIM_SLACK_S, until, since)).fetchall()
         except sqlite3.Error:
+            if strict:
+                raise
             rows = []
         finally:
             c.close()
         for started, ended, payload in rows:
             holder, lock = cards_mod.parse_claim(payload)
+            if strict and not holder and cards_mod.boot_uuid(lock) and cards_mod.boot_uuid(lock) not in (boot_map or {}):
+                raise ValueError("boot attribution unavailable")
             gateway = cards_mod.attribute(holder, lock, boot_map or {}, known)
             if gateway in (cards_mod.UNATTRIBUTED, cards_mod.EPHEMERAL):
                 continue
@@ -79,19 +84,23 @@ def busy_seconds(replicas: Iterable[Path], since: float, until: float, boot_map:
     return out
 
 
-def pacing_holds(replicas: Iterable[Path], since: float, until: float) -> int:
+def pacing_holds(replicas: Iterable[Path], since: float, until: float, *, strict: bool = False) -> int:
     """Cards whose start the pacing governor held in ``[since, until)`` (distinct cards with an ``llm_paced`` event)."""
     held = set()
     for db in replicas:
         try:
             c = ro_connect(db)
         except sqlite3.Error:
+            if strict:
+                raise
             continue
         try:
             held.update((str(db), r[0]) for r in c.execute(
                 "SELECT DISTINCT task_id FROM task_events WHERE kind = 'llm_paced' AND created_at >= ? "
                 "AND created_at < ?", (since, until)))
         except sqlite3.Error:
+            if strict:
+                raise
             pass
         finally:
             c.close()
@@ -126,29 +135,58 @@ def plan(cap_per_s: Optional[float], usage: dict[str, float], busy: dict[str, fl
     return out
 
 
-def payload(root: Path, series_db: Path, cap_per_s: Optional[float], cards=None,
-            now: Optional[float] = None, replicas: Optional[Iterable[Path]] = None) -> dict:
-    """``{"window_s", "gateways": {name: plan row}, "pacing": {"held_starts", "window_s"}}`` for the throttle API.
-    The replica reads are cached ``CACHE_S``."""
-    now = time.time() if now is None else now
+def collect(request: dict) -> dict:
+    """Read a complete measurement in the disposable worker; errors are not zeros."""
+    now = request["now"]
     until = int(now) // 60 * 60
     since = until - throttle.SHARE_WINDOW_S
-    key = (str(root), until)
-    with _lock:
-        hit = _cache.get("busy")
-        if hit and hit[0] == key and time.monotonic() - hit[1] < CACHE_S:
-            busy, held = hit[2], hit[3]
-        else:
-            boot_map, known = {}, None
-            if cards is not None:
-                try:
-                    boot_map, known = cards.events().get("boot_map") or {}, cards.known()
-                except Exception:  # advisory attribution only: never fail the throttle route
-                    boot_map, known = {}, None
-            paths = list(replicas) if replicas is not None else cards_mod.replica_paths(Path(root))
-            busy = busy_seconds(paths, since, until, boot_map, known)
-            held = pacing_holds(paths, now - PACING_WINDOW_S, now + 1)
-            _cache["busy"] = (key, time.monotonic(), busy, held)
-    usage = throttle.usage_by_gateway(series_db, now)
-    return {"window_s": throttle.SHARE_WINDOW_S, "gateways": plan(cap_per_s, usage, busy),
-            "pacing": {"held_starts": held, "window_s": PACING_WINDOW_S}}
+    paths = request["replicas"]
+    if paths is None:
+        paths = cards_mod.replica_paths(Path(request["root"]))
+    if not paths:
+        raise ValueError("no replica observations")
+    busy = busy_seconds(paths, since, until, request["boot_map"],
+                        None if request.get("known") is None else set(request["known"]), strict=True)
+    held = pacing_holds(paths, now - PACING_WINDOW_S, now + 1, strict=True)
+    conn = ro_connect(Path(request["series_db"]))
+    try:
+        rows = conn.execute("SELECT gateway, SUM(value) FROM minutes WHERE metric='tokens_io' AND minute>=? AND minute<? "
+                            "AND value IS NOT NULL GROUP BY gateway", (since, until)).fetchall()
+    finally:
+        conn.close()
+    usage = {str(g): float(v) for g, v in rows}
+    if not usage or set(busy) - set(usage):
+        raise ValueError("missing usage observations")
+    return {"observed_at": now, "window_since": since, "window_until": until,
+            "usage": usage, "busy": busy, "held": held}
+
+
+def payload(root: Path, series_db: Path, cap_per_s: Optional[float], cards=None,
+            now: Optional[float] = None, replicas: Optional[Iterable[Path]] = None) -> Optional[dict]:
+    """Return only a fresh advisory snapshot; cold/expired/failed data is unavailable."""
+    now = time.time() if now is None else now
+    until = int(now) // 60 * 60
+
+    def fresh(hit):
+        return (hit is not None and 0 <= time.monotonic() - hit[0] < CACHE_S
+                and 0 <= now - hit[1]["observed_at"] < CACHE_S and hit[1]["window_until"] == until)
+
+    attribution = cards.advisory_snapshot() if cards is not None else None
+    request = {"root": str(root), "series_db": str(series_db), "now": now,
+               "replicas": None if replicas is None else [str(p) for p in replicas],
+               "boot_map": (attribution or {}).get("boot_map", {}),
+               "known": (attribution or {}).get("known")}
+    hit = advisory.read(root, request, fresh)
+    if not fresh(hit):
+        return None
+    data = hit[1]
+    return {"window_s": throttle.SHARE_WINDOW_S, "gateways": plan(cap_per_s, data["usage"], data["busy"]),
+            "observed_at": data["observed_at"], "window_since": data["window_since"],
+            "window_until": data["window_until"], "valid": True, "stale": False,
+            "pacing": {"held_starts": data["held"], "window_s": PACING_WINDOW_S,
+                       "window_since": data["observed_at"] - PACING_WINDOW_S,
+                       "window_until": data["observed_at"] + 1}}
+
+
+def stop():
+    advisory.stop()
