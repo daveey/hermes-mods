@@ -6,14 +6,17 @@ import { loadPlugin, mount as rawMount, button, React, host } from './sdk-mock.m
 
 const P = await loadPlugin()
 
+// What the Desktop's task pill does on click: true = nobody took it over, so the pill opens the board.
+const pillOpensBoard = () => window.dispatchEvent(new window.Event(P.KANBAN_CHIP_EVENT, { cancelable: true }))
+
 // Every mounted view is closed after its test, pass or fail: a leaked panel keeps its poll timer and its DOM.
 const open = []
 async function mount(...args) { const view = await rawMount(...args); open.push(view); return view }
 test.afterEach(async () => {
   for (const view of open.splice(0)) await view.close().catch(() => {})
-  delete window[P.LOADED_FLAG]
   localStorage.clear()
   host.routes = []
+  host.navigated.length = 0
 })
 
 function lane(over = {}) {
@@ -111,9 +114,11 @@ test('the event opens the panel, fetches the saved window, and Apply PUTs', asyn
   const ctx = ctxWith(calls, (path, opts) => (opts.method === 'PUT' ? snap({ lanes: { ...snap().lanes, product: lane({ share: 30, paused: true }) } }) : snap()))
   const view = await mount(React.createElement(P.Lanes, { ctx }))
   assert.deepEqual(calls, [['/v1/lanes?hours=6', 'GET', undefined]]) // one probe while closed
-  assert.equal(window[P.LOADED_FLAG], true, 'configured lanes: the runners chip may open this panel')
-  await React.act(async () => window.dispatchEvent(new window.Event('hermes-show-lanes')))
+  assert.equal(document.querySelector('[data-lane="product"]'), null, 'closed until the pill is clicked')
+  let opensBoard
+  await React.act(async () => { opensBoard = pillOpensBoard() })
   await view.flush()
+  assert.equal(opensBoard, false, 'configured lanes: the task pill opens this panel instead of the board')
   await view.click(document.querySelector('[data-lane="product"] .hermes-lanes-volume button'))
   // A poll that brings a new snapshot object must not drop the unsaved edit.
   await React.act(async () => view.client.refetchQueries({ queryKey: ['lanes', 6] }))
@@ -125,16 +130,19 @@ test('the event opens the panel, fetches the saved window, and Apply PUTs', asyn
   assert.equal(button('Apply').disabled, true, 'and clears the draft')
   await view.click(button('24h'))
   assert.equal(calls.at(-1)[0], '/v1/lanes?hours=24')
+  await view.click(button('Board'))
+  assert.deepEqual(host.navigated, ['/kanban'], 'the panel still leads to the board')
+  assert.equal(document.querySelector('[data-lane="product"]'), null, 'and closes')
   await view.close()
-  assert.equal(window[P.LOADED_FLAG], undefined)
+  assert.equal(pillOpensBoard(), true, 'unmounted: the pill opens the board again')
 })
 
-test('without working lanes the runners chip is left alone', async () => {
+test('without working lanes the task pill is left alone and opens the board', async () => {
   const view = await mount(React.createElement(P.Lanes, { ctx: ctxWith([], () => ({ configured: false, reason: 'this Hermes core has no lanes support yet' })) }))
-  assert.equal(window[P.LOADED_FLAG], undefined)
+  assert.equal(pillOpensBoard(), true)
   await view.close()
   const broken = await mount(React.createElement(P.Lanes, { ctx: { rest: async () => { throw Error('404') } } }))
-  assert.equal(window[P.LOADED_FLAG], undefined)
+  assert.equal(pillOpensBoard(), true)
   await broken.close()
 })
 
@@ -312,7 +320,7 @@ test('a write goes to the gateway it is given, whatever is chosen now', async ()
   assert.deepEqual(calls.slice(1), [['hub', 'PUT'], ['this-mac', 'PUT']])
 })
 
-test('mounted: the chip flag follows a remote gateway that has lanes', async () => {
+test('mounted: the task pill follows a remote gateway that has lanes', async () => {
   host.routes = [MAC, HUB]
   const calls = []
   const ctx = { rest: async (path, opts = {}) => {
@@ -320,7 +328,7 @@ test('mounted: the chip flag follows a remote gateway that has lanes', async () 
     return where(opts) === 'hub' ? snap() : { configured: false, reason: 'no lanes here' }
   } }
   const view = await mount(React.createElement(P.Lanes, { ctx }))
-  assert.equal(window[P.LOADED_FLAG], true)
+  assert.equal(pillOpensBoard(), false, 'lanes on a remote gateway: the pill opens this panel')
   await React.act(async () => window.dispatchEvent(new window.Event('hermes-show-lanes')))
   await view.flush()
   await view.click(document.querySelector('[data-lane="product"] .hermes-lanes-volume button'))

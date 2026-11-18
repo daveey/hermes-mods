@@ -1,6 +1,6 @@
 // Lanes: how worker time is split between project lanes, and the controls for it.
 // Lanes live on one gateway; the panel finds it (createSource below) and reads and writes there.
-// Opens from the runners chip (which dispatches `hermes-show-lanes` where lanes are configured) and from the
+// Opens from the status-bar task pill (where lanes are configured; see KANBAN_CHIP_EVENT) and from the
 // palette. Data: GET /v1/lanes?hours=… on the local gateway (plugins/lanes): per lane target and actual share of
 // run-hours, running, ready, held at the gate, open, done, tokens and estimated cost. Controls: PUT /v1/lanes/<lane>
 // {share | paused}; the API also takes admit_per_day and has /v1/held, which this panel does not use yet.
@@ -14,7 +14,9 @@ export const IDLE_POLL_MS = 300000
 export const REQUEST_TIMEOUT_MS = 20000
 export const WINDOWS = [[1, '1h'], [6, '6h'], [24, '24h'], [168, '7d']]
 export const STORE_KEY = 'hermes-lanes-window'
-export const LOADED_FLAG = '__hermesLanesPanel'
+// The Desktop's status-bar task pill (board icon, bar of open cards, count) fires this cancellable event before
+// it opens the board. Where lanes work, this panel takes the click over; its Board button opens the board.
+export const KANBAN_CHIP_EVENT = 'hermes-kanban-chip'
 const COLORS = ['#f0a43a', '#8fb0ff', '#5fd4e6', '#d982f0', '#b4bac6', '#3ddc97', '#ef7b7b', '#c9d36a']
 
 // ── which gateway to talk to ──────────────────────────────────────────────
@@ -224,7 +226,7 @@ function Row({ row, maxOpen, onShare, onPause, saving }) {
     h('div', { className: 'hermes-lanes-cost', title: c.title }, c.text))
 }
 
-export function Panel({ snap, windowHours, onWindow, onApply, saving, error, onRunners }) {
+export function Panel({ snap, windowHours, onWindow, onApply, saving, error, onBoard }) {
   const [draft, setDraft] = useState({})
   if (!snap) return h('div', { className: 'hermes-lanes-note' }, error ? `Unavailable: ${error}` : 'Loading…')
   if (!snap.configured) return h('div', { className: 'hermes-lanes-note' }, snap.reason || 'No lanes are configured.')
@@ -239,7 +241,7 @@ export function Panel({ snap, windowHours, onWindow, onApply, saving, error, onR
       h('span', { className: 'hermes-lanes-dim' }, `${list.reduce((s, r) => s + r.running, 0)} running · ${list.reduce((s, r) => s + r.open, 0)} open · ${snap.scope === 'fleet' ? 'whole fleet' : 'this board'}`),
       snap.shadow ? h('span', { className: 'hermes-lanes-warn', title: 'kanban.admission.lane_shadow is on: cards are classified and counted, but nothing is held, capped, reordered or paused' }, 'Shadow mode: reporting only') : null,
       h('span', { className: 'hermes-lanes-grow' }),
-      onRunners ? h('button', { type: 'button', onClick: onRunners }, 'Runners') : null,
+      onBoard ? h('button', { type: 'button', onClick: onBoard }, 'Board') : null,
       h('div', { className: 'hermes-lanes-seg', role: 'group', 'aria-label': 'Window' },
         WINDOWS.map(([value, label]) => h('button', { key: value, type: 'button', className: value === windowHours ? 'is-on' : '', 'aria-pressed': value === windowHours, onClick: () => onWindow(value) }, label)))),
     h(Split, { label: 'Target', list, field: 'target' }),
@@ -266,7 +268,7 @@ export function Lanes({ ctx }) {
   const query = useQuery({
     queryKey: key,
     queryFn: () => source.read(windowHours),
-    // Closed, a slow probe: it tells the runners chip whether lanes work here (LOADED_FLAG below).
+    // Closed, a slow probe: it decides whether the task pill's click opens this panel (below).
     refetchInterval: open ? POLL_MS : IDLE_POLL_MS,
     refetchIntervalInBackground: false,
     refetchOnWindowFocus: false,
@@ -278,12 +280,14 @@ export function Lanes({ ctx }) {
     window.addEventListener('hermes-show-lanes', show)
     return () => window.removeEventListener('hermes-show-lanes', show)
   }, [])
-  // The runners chip opens this panel only where lanes are configured and the API answers.
+  // The task pill opens this panel only where lanes are configured and the API answers; anywhere else its
+  // click is left alone and opens the board as before.
   const working = query.data?.configured === true
   useEffect(() => {
     if (!working) return undefined
-    window[LOADED_FLAG] = true
-    return () => { delete window[LOADED_FLAG] }
+    const take = (event) => { event.preventDefault(); setOpen(true) }
+    window.addEventListener(KANBAN_CHIP_EVENT, take)
+    return () => window.removeEventListener(KANBAN_CHIP_EVENT, take)
   }, [working])
   // One PUT per changed lane, in order. On a failure the lanes already written stay written: refetch so the panel
   // shows them, name the lane that failed, and keep the draft so the rest can be retried.
@@ -310,7 +314,7 @@ export function Lanes({ ctx }) {
       h(Panel, {
         snap: query.data, windowHours, saving, error: error || (query.error ? String(query.error.message).slice(0, 200) : ''),
         onWindow: (v) => { setWindowState(v); saveWindow(v) }, onApply: apply,
-        onRunners: () => { setOpen(false); window.dispatchEvent(new window.Event('hermes-show-runners')) }
+        onBoard: () => { setOpen(false); host.navigate('/kanban') }
       })))
 }
 
@@ -357,7 +361,7 @@ export default {
     style.textContent = CSS
     document.head.append(style)
     ctx.onDispose(() => style.remove())
-    ctx.register({ id: 'anchor', area: STATUSBAR_AREAS.right, order: 6.5, render: () => h(Lanes, { ctx }) })
+    ctx.register({ id: 'anchor', area: STATUSBAR_AREAS.right, order: 80.5, render: () => h(Lanes, { ctx }) })  // beside the task pill (order 80)
     ctx.register({
       id: 'show-lanes',
       area: PALETTE_AREA,

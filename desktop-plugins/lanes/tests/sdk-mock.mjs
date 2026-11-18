@@ -18,7 +18,7 @@ globalThis.cancelAnimationFrame = clearTimeout
 const { createRoot } = require('react-dom/client')
 const query = require('@tanstack/react-query')
 const { Popover: P } = require('radix-ui')
-export const host = { routes: [], profileRoutes: async () => host.routes }
+export const host = { routes: [], navigated: [], profileRoutes: async () => host.routes, navigate: (path) => host.navigated.push(path) }
 const sdk = {
   host,
   useQuery: query.useQuery,
