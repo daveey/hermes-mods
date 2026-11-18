@@ -14,7 +14,8 @@ home (``~/.hermes``, ``$HERMES_HOME``), outside scratch, cache, archive and back
   ``-readonly`` and ``mode=ro``/``immutable=1`` URIs pass.
 - Opening a live database at all (reads included) with a ``sqlite3`` CLI or a ``python -c`` / ``python -m sqlite3``
   whose SQLite has the WAL-reset bug (3.7.0-3.51.2, https://sqlite.org/wal.html#walresetbug). Hermes holds these
-  files with SQLite 3.53.1; Ubuntu 24.04's ``/usr/bin/sqlite3`` and ``python3`` are 3.45.1 and Xcode's are 3.51.0.
+  files with SQLite 3.53.1; Ubuntu 24.04's ``/usr/bin/sqlite3`` and ``python3`` are 3.45.1, macOS's are 3.51.0. Only root-owned system
+  binaries are ever run to ask their version; anything else is unknown and not blocked.
   The refusal names ``~/.hermes/bin/hermes-core-python -m sqlite3`` (managed SQLite), which the write and
   maintenance rules above still judge like ``sqlite3``.
 - ``rm`` / ``mv`` / ``truncate`` of a live database's ``<db>.corrupt.*.bak`` quarantine: deleting it once
@@ -81,19 +82,40 @@ def wal_reset_vulnerable(info) -> bool:
                 or (3, 44, 6) <= info < (3, 45, 0))
 
 
+# Only programs installed by the OS or a system package manager are ever run to ask their SQLite version: never a
+# path the agent wrote, never with the gateway's environment (it carries provider secrets the terminal strips).
+_TRUSTED_DIRS = ("/usr/bin", "/bin", "/usr/local/bin", "/opt/homebrew/bin", "/opt/homebrew/Cellar",
+                 "/Library/Developer/CommandLineTools", "/Applications/Xcode.app", "/usr/lib", "/usr/libexec")
+_SYSTEM_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+
+
 def _resolve(word: str) -> Optional[str]:
+    """Absolute path of the program ``word`` names, or None. A relative path depends on the command's working
+    directory, which this hook does not know: unresolved. A bare name is looked up on the system directories the
+    terminal tool always carries (core's _SANE_PATH), not on this process's PATH."""
     if "/" in word:
         path = _expand(word)
-        return path if os.path.isfile(path) else None
-    search = os.pathsep.join(p for p in (os.environ.get("PATH", ""), "/usr/local/bin:/usr/bin:/bin") if p)
-    return shutil.which(word, path=search)
+        return path if path.startswith("/") and os.path.isfile(path) else None
+    return shutil.which(word, path=_SYSTEM_PATH)
+
+
+def _trusted(path: str) -> bool:
+    """Root-owned, not writable by group/others, in a system directory: safe to run with an empty environment."""
+    try:
+        real = os.path.realpath(path)
+        st = os.stat(real)
+    except OSError:
+        return False
+    return (st.st_uid == 0 and not (st.st_mode & 0o022) and real.startswith(_TRUSTED_DIRS)
+            and os.access(real, os.X_OK))
 
 
 def program_sqlite_version(word: str, kind: str) -> Optional[tuple]:
-    """(major, minor, patch) of the SQLite that program ``word`` (``kind`` "cli" or "python") would use, asked by
-    running it once per binary file; None when it cannot be resolved or asked (the guard then does not block)."""
+    """(major, minor, patch) of the SQLite that program ``word`` (``kind`` "cli" or "python") uses, or None when it is
+    unknown: not resolvable, not a trusted system binary (it is never run then), or it did not answer in time. Asked
+    once per binary file and process (a timeout is not remembered)."""
     path = _resolve(word)
-    if not path:
+    if not path or not _trusted(path):
         return None
     try:
         st = os.stat(path)
@@ -103,15 +125,25 @@ def program_sqlite_version(word: str, kind: str) -> Optional[tuple]:
     if key in _VERSION_CACHE:
         return _VERSION_CACHE[key]
     argv = [path, "--version"] if kind == "cli" else [path, "-I", "-c", "import sqlite3; print(sqlite3.sqlite_version)"]
-    version = None
+    env = {"PATH": _SYSTEM_PATH, "LC_ALL": "C", "HOME": "/nonexistent"}
+    if os.environ.get("DEVELOPER_DIR"):
+        env["DEVELOPER_DIR"] = os.environ["DEVELOPER_DIR"]  # macOS /usr/bin stubs pick Xcode by it
     try:
-        out = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
-                             timeout=_PROBE_TIMEOUT_S, stdin=subprocess.DEVNULL).stdout
-        m = re.match(r"\s*(\d+)\.(\d+)(?:\.(\d+))?", out or "")
-        if m:
-            version = tuple(int(g or 0) for g in m.groups())
-    except (OSError, subprocess.SubprocessError, ValueError):
-        version = None
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                                text=True, cwd="/", env=env, start_new_session=True)
+    except OSError:
+        return None
+    try:
+        out, _ = proc.communicate(timeout=_PROBE_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, 9)
+        except OSError:
+            pass
+        proc.communicate()
+        return None  # not cached: a slow host must not switch the check off for this binary
+    m = re.match(r"\s*(\d+)\.(\d+)(?:\.(\d+))?", out or "")
+    version = tuple(int(g or 0) for g in m.groups()) if m else None
     _VERSION_CACHE[key] = version
     return version
 
@@ -123,8 +155,8 @@ def _unsafe_program(word: str, kind: str, db: str) -> Optional[str]:
     if version is None or not wal_reset_vulnerable(version):
         return None
     return (f"`{word}` uses SQLite {'.'.join(map(str, version))}, which {WAL_RESET_MARK} (3.7.0-3.51.2); it must not "
-            f"open live database {db}, which Hermes holds open with SQLite 3.53.1. Use `{MANAGED_SQLITE_CLI} {db} "
-            "\"<sql>\"` (managed SQLite)")
+            f"open live database {db}, which Hermes holds open with its managed SQLite (3.51.3 or later). Use "
+            f"`{MANAGED_SQLITE_CLI} {db} \"<sql>\"`")
 
 
 def _statements(text: str) -> Iterable[str]:
@@ -1282,17 +1314,18 @@ def _check_sqlite3(args: list[str], seg: list[str], in_home: bool, program: Opti
             return f"`sqlite3 .backup/.save` would overwrite live database file {target}"
     if db is None or not is_live(db, in_home):
         return None
-    if program is not None:
-        why = _unsafe_program(program[0], program[1], db)
+    readonly_open = readonly or re.search(r"[?&](?:mode=ro|immutable=1)", db)
+    kind = _sql_kind(text) or ("write" if fed and not text else None)
+    board = _board_of(db, in_home)
+    if program is not None and not (kind == "write" and board is not None and not readonly_open):
+        why = _unsafe_program(program[0], program[1], db)  # a raw board write gets the board's refusal below instead
         if why:
             return why
-    if readonly or re.search(r"[?&](?:mode=ro|immutable=1)", db):
+    if readonly_open:
         return None
-    kind = _sql_kind(text) or ("write" if fed and not text else None)
     if kind == "maintenance":
         return f"`sqlite3` would run maintenance (REINDEX/VACUUM/checkpoint/journal pragma) on live database {db}"
     if kind == "write":
-        board = _board_of(db, in_home)
         if board is not None:
             return (f"`sqlite3` would write to live Kanban board {db}; a raw write skips the board's own "
                     f"transitions, events and locks (hub incident 2026-10-28). Use {_kanban_verb(text, board)}")
@@ -1619,9 +1652,10 @@ def recover_command(slug: str, db: Optional[Path] = None) -> str:
 
 def message(why: str) -> str:
     if WAL_RESET_MARK in why:
-        return (f"SQLITE LIVE GUARD: blocked: {why}. Two SQLite builds on one WAL database can corrupt it when one "
-                "writes while another checkpoints (https://sqlite.org/wal.html#walresetbug); the hub's state.db search "
-                "index was damaged on 2026-11-18 with an affected build holding it. Do not work around this guard.")
+        return (f"SQLITE LIVE GUARD: blocked: {why}. With an affected SQLite, two connections on one WAL database can "
+                "corrupt it when one writes while another checkpoints (https://sqlite.org/wal.html#walresetbug); the "
+                "hub's state.db search index was found damaged on 2026-11-18 while an affected build held it. Do not "
+                "work around this guard.")
     head = (
         f"SQLITE LIVE GUARD: blocked: {why}. Another process may have this database open; deleting its "
         "-wal/-shm or swapping the file under it splits writers across WAL views and corrupts the board on the "

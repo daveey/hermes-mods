@@ -954,6 +954,52 @@ def test_terminal_tool_call_is_blocked(versions):
     assert blocked("terminal", command="sqlite3 -readonly ~/.hermes/state.db 'pragma quick_check'")
 
 
-def test_real_probe_reads_this_interpreter():
-    assert _REAL_PROBE(sys.executable, "python") == tuple(sqlite3.sqlite_version_info)
+def test_real_probe_reads_a_trusted_system_interpreter():
+    if not plugin.guard._trusted("/usr/bin/python3"):
+        pytest.skip("no root-owned /usr/bin/python3 here")
+    out = subprocess.run(["/usr/bin/python3", "-I", "-c", "import sqlite3; print(sqlite3.sqlite_version)"],
+                         capture_output=True, text=True, cwd="/").stdout.strip()
+    assert _REAL_PROBE("/usr/bin/python3", "python") == tuple(int(x) for x in out.split("."))
     assert _REAL_PROBE("/nonexistent/sqlite3", "cli") is None
+
+
+def test_untrusted_or_relative_binaries_are_never_run(tmp_path, monkeypatch):
+    marker = tmp_path / "ran"
+    evil = tmp_path / "evil" / "sqlite3"
+    evil.parent.mkdir()
+    evil.write_text(f"#!/bin/sh\ntouch {marker}\necho 3.45.1\n")
+    evil.chmod(0o755)
+    monkeypatch.chdir(tmp_path)
+    for word in (str(evil), "./evil/sqlite3", "evil/sqlite3"):
+        assert _REAL_PROBE(word, "cli") is None
+    assert not marker.exists()
+
+
+def test_bare_name_is_resolved_on_system_directories_only(tmp_path, monkeypatch):
+    shadow = tmp_path / "bin" / "sqlite3"
+    shadow.parent.mkdir()
+    shadow.write_text("#!/bin/sh\necho 3.45.1\n")
+    shadow.chmod(0o755)
+    monkeypatch.setenv("PATH", str(shadow.parent) + os.pathsep + os.environ.get("PATH", ""))
+    resolved = plugin.guard._resolve("sqlite3")
+    assert resolved is None or not resolved.startswith(str(tmp_path))
+
+
+def test_trusted_system_probe_runs_with_an_empty_environment(monkeypatch):
+    monkeypatch.setenv("FAKE_SECRET_API_KEY", "s3cret")
+    seen = {}
+    real_popen = plugin.guard.subprocess.Popen
+    def spy(argv, **kw):
+        seen.update(kw)
+        return real_popen(argv, **kw)
+    monkeypatch.setattr(plugin.guard.subprocess, "Popen", spy)
+    monkeypatch.setattr(plugin.guard, "_VERSION_CACHE", {})
+    v = _REAL_PROBE("/bin/sh", "cli")  # trusted, answers no version: unknown
+    assert v is None and seen.get("cwd") == "/" and "FAKE_SECRET_API_KEY" not in seen.get("env", {})
+    assert seen.get("start_new_session") is True
+
+
+def test_kanban_write_by_an_affected_build_gets_the_board_refusal(versions):
+    versions[("sqlite3", "cli")] = (3, 45, 1)
+    why = plugin.guard.check_shell("sqlite3 ~/.hermes/kanban.db \"update tasks set status='done' where id='t_1'\"")
+    assert "Kanban board" in why and plugin.guard.WAL_RESET_MARK not in why
