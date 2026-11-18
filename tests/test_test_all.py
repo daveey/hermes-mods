@@ -203,6 +203,51 @@ class TestAll(unittest.TestCase):
         self.assertEqual(again.returncode, 1, again.stdout + again.stderr)
         self.assertEqual(len(list(output.glob('*.log'))), 4)
 
+    def test_failed_test_ids_survive_a_skip_flood_that_hides_them_from_the_tail(self):
+        # plugins/coach in CI: 3 failed, 4560 skipped -> the 40-line tail was all SKIPPED rows.
+        make_tree(self.root, {
+            'flood': '''
+                import pytest
+                @pytest.mark.parametrize('n', range(120))
+                def test_skipped(n):
+                    pytest.skip('needs Hermes core %d' % n)
+                def test_real_failure():
+                    assert False, 'SECRET_MESSAGE_MARKER'
+                @pytest.fixture
+                def broken_fixture():
+                    raise RuntimeError('boom')
+                def test_setup_error(broken_fixture): pass
+                def test_ok(): pass
+            ''',
+        })
+        output = self.root / 'logs'
+        receipt = self.root / 'results.json'
+        r = run(self.root, '--no-core', '--output-dir', str(output), '--json', str(receipt))
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        row = json.loads(receipt.read_text())['suites'][0]
+        self.assertEqual(row['failed_ids'], ['FAILED plugins/flood/test_load.py::test_real_failure',
+                                             'ERROR plugins/flood/test_load.py::test_setup_error'])
+        self.assertNotIn('FAILED plugins/flood', row['tail'])  # really hidden from the bounded tail
+        self.assertIn('failed/error tests in plugins/flood (2):', r.stdout)
+        self.assertIn('FAILED plugins/flood/test_load.py::test_real_failure', r.stdout)
+        self.assertIn('ERROR plugins/flood/test_load.py::test_setup_error', r.stdout)
+        self.assertIn('full log: ' + row['log_path'], r.stdout)
+        self.assertNotIn('SECRET_MESSAGE_MARKER', r.stdout)  # ids only; messages stay in the retained log
+        self.assertIn(b'SECRET_MESSAGE_MARKER', Path(row['log_path']).read_bytes())
+
+    def test_failed_ids_read_only_the_last_short_summary_block(self):
+        runner = runpy.run_path(str(RUNNER))
+        out = ('FAILED fake/nested.py::captured_output - x\n'
+               '=== short test summary info ===\n'
+               'FAILED a/b.py::T::t[1] - AssertionError: m\n'
+               'ERROR c/d.py::e\n'
+               'SKIPPED [1] f.py:1: why\n'
+               '=== 1 failed in 1s ===\n')
+        self.assertEqual(runner['failed_ids'](out), ['FAILED a/b.py::T::t[1]', 'ERROR c/d.py::e'])
+        self.assertEqual(runner['failed_ids']('FAILED x.py::t - m\n3 passed in 1s\n'), [])
+        many = '=== short test summary info ===\n' + ''.join(f'FAILED t.py::t{i}\n' for i in range(300))
+        self.assertEqual(len(runner['failed_ids'](many)), runner['FAILED_ID_CAP'])
+
     def test_output_dir_retains_timeout_partial_bytes(self):
         import hashlib
         make_tree(self.root, {'hang': '''
