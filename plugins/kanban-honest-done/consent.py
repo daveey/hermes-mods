@@ -187,8 +187,8 @@ def write_texts(tool_name: str, args: Any) -> list[str]:
     if name == "delegate_task":
         return [] if str(args.get("action") or "spawn").lower() in ("list", "stop") else [json.dumps(args, default=str)]
     if name in SHELL_TOOLS:
-        return [text for key in ("command", "input", "data") if args.get(key)
-                for text in shell_write_texts(str(args[key]))]
+        command = " ; ".join(str(args[key]) for key in ("command", "input", "data") if args.get(key))
+        return shell_write_texts(command)
     if name == "execute_code":
         code = str(args.get("code") or "")
         return [code] if _SHELL_WRITE_RE.search(code) or "kanban_" in code else []
@@ -210,21 +210,17 @@ def shell_write_texts(command: str) -> list[str]:
             core = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(core)
             core = sys.modules.setdefault(key, core)
+    shell = core._shell_commands()
+    if not shell.within_inert_grammar(command):
+        # Consent's main detector is a raw regex, not the core argv detector.
+        # Preserve its entire text (including all targets), even when one parsed
+        # segment already exposes another write. Only whole-input G may exempt.
+        return [command] if _SHELL_WRITE_RE.search(command) else []
     writes = []
     for seg in core._segments(command):
         parsed = core._kanban_verb(seg)
         if parsed and _SHELL_WRITE_RE.search('kanban ' + parsed[0]):
             writes.append(' '.join(parsed[1]))
-            continue
-        shell = core._shell_commands()
-        if shell.within_inert_grammar(command) and shell.exempt_segment(seg):
-            continue
-        # Outside G every hub mention retains the any-position rule too.
-        hub = next((k for k in range(len(seg)) if os.path.basename(seg[k]) == 'hermes-hub'), None)
-        if hub is not None:
-            text = ' '.join(seg[hub:])
-            if _SHELL_WRITE_RE.search(text):
-                writes.append(text)
     return writes
 
 

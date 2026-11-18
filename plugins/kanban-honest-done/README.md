@@ -203,6 +203,14 @@ This deliberately flags even inert `bash /dev/null -c 'hermes kanban …'`, unre
 function definitions, `/bin/echo`, and printed substitutions. Plain echo/printf,
 grep, restricted Git messages and quoted heredoc bodies remain data.
 
+Consent is different from the argv-based gates: outside G it retains main's raw
+`_SHELL_WRITE_RE` over joined command/input/data, including the full target text.
+It must not rely on nested segment discovery for hub requests. The regression
+`tests/test_consent_raw_parity.py` covers shell/eval wrappers, here-strings, pipes,
+substituted command names, and SSH (classification only), plus inert controls and
+an independent frozen-main-regex comparison across the test-source corpus.
+Runnable hub probes use only a fixture fake and the allowlisted environment.
+
 `tests/test_command_position.py` covers every consumer and the real comment hook,
 including prior nested execution controls. `tests/test_inert_grammar.py` adds the
 review redefinition/continuation/output-process repros and 200 distinct whole-input
