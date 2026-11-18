@@ -281,10 +281,7 @@ and the final response.
   approved PR's card, intersect `git diff --name-only $(git merge-base HEAD origin/main) HEAD` with the same diff
   against `origin/main`. On overlap, the card needs a rebase plus a new review, so review custody no longer pins it to
   the old host: move it to a worker with free slots, and have the new review pinned to that worker.
-- To find a PR's owner card, start from the review card the notice names: the owner is usually its child link
-  (`cross_task read <review id>`, or the Mac's `kanban/sync-shadow/*.db`). Otherwise match its branch name
-  (`headRefName`, e.g. `wt/<slug>`) and the card ids in the PR body against card bodies and comments on every host.
-  Searching only for `PR<n>`/`#<n>` misses owners that published the PR after their body was written.
+- Finding a PR's owner card, the open-PR owner census and restoring an archived owner: `references/pr-owner-cards.md`.
 - Count a worker's free slots before moving cards to it: `max_in_progress` minus running, and check
   `kanban_pickup_skips` for recent `budget_exhausted` rows. One free slot with several contenders is not capacity.
 - A burst of `rate_limited` runs (`HTTP 429 ... quota unavailable for openai-codex/...`) is not an outage by itself.
@@ -308,7 +305,7 @@ and the final response.
 - [ ] Scope matched his words (step 0): a not-ready/Todo/Scheduled ask got the `waiting` audit at the top of the reply, not a red sweep?
 - [ ] Every board was inventoried, and the count per board and status was reported?
 - [ ] Each red card was classified with a live premise check, not from the block reason alone?
-- [ ] Every agent-clearable card was completed, archived or unblocked, each with an evidence comment, and no owner of an open core PR (`gh pr list --base main --state open`) was archived or left spend-triaged?
+- [ ] Every agent-clearable card was completed, archived or unblocked, each with an evidence comment, and every open core PR (bots aside) still has a live owner card that isn't spend-triaged, by a census that read archived rows too (`references/pr-owner-cards.md`)?
 - [ ] Each decision card was either unblocked on your recommendation (comment says it is a guess under the standing rule) or asked because you were really unsure?
 - [ ] Cards still waiting on the user are linked via `notify-subscribe --platform tui`, read back `released=0`?
 - [ ] The remaining asks went out as no-timeout `clarify` batches (recommended first, Skip last, no card ids), each answer recorded on its card, and stale For-you requests withdrawn?
