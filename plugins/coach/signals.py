@@ -357,6 +357,32 @@ def read_new(path: Path, cur: dict, key: str, now: float, span: Optional[list] =
     return lines
 
 
+def read_relay_lines(path: Path, cur: dict, key: str, now: float) -> List[str]:
+    """Recover the previous inode's unread .1 tail before reading the active log.
+
+    Keep this relay-only: read_new callers with byte spans need a single-file range.
+    Each file retains the MAX_READ tail cap; older rotations are not backfilled.
+    """
+    lines = []
+    c = cur.get(key) or {}
+    try:
+        if c.get("ino") is not None and path.stat().st_ino != c["ino"]:
+            with path.with_name(path.name + ".1").open("rb") as f:
+                st = os.fstat(f.fileno())  # verify the opened file, not a racy path stat
+                off = int(c.get("off") or 0)
+                if st.st_ino == c["ino"] and 0 <= off <= st.st_size:
+                    start = max(off, st.st_size - MAX_READ)
+                    f.seek(start)
+                    data = f.read(st.st_size - start)
+                    end = data.rfind(b"\n") + 1
+                    lines = data[:end].decode("utf-8", "replace").splitlines()
+                    if start > off and lines:
+                        lines = lines[1:]  # cap may start mid-record
+    except OSError:
+        pass  # missing/unreadable .1 must not prevent reading the current log
+    return lines + read_new(path, cur, key, now)
+
+
 def seed_only_first_sight(path: Path, cur: dict, key: str) -> bool:
     """For logs whose lines carry no timestamp: on first sight (no cursor for `key`) set the cursor at the end of
     `path` and return True, so the caller files nothing. A backlog read on first sight (new host, new profile,
@@ -763,7 +789,7 @@ def collect_errors(home: Path, cur: dict, now: float, host: str = "") -> List[di
                 s["profile"] = prof
                 out.append(s)
         auth += [dict(a, profile=prof) for a in prof_auth]
-        adopted += relay_adoptions(read_new(h / "logs" / "agent.log", cur, f"relay:{prof}", now))
+        adopted += relay_adoptions(read_relay_lines(h / "logs" / "agent.log", cur, f"relay:{prof}", now))
         out += reconnect_storms(cur, prof, recs, now, host)
     out += auth_storms(cur, auth, now, host, adopted)
     return out
