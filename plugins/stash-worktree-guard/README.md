@@ -254,6 +254,14 @@ look for its `mods-reload: ... ok (stash-worktree-guard)` activation receipt or 
 
 ## Explicit out-of-scope compositions
 
+Programs defined on the filesystem are outside the guard's static model: executable
+scripts (such as `./s.sh`), Makefile targets, custom `git --exec-path` helpers, and
+renamed symlinks (such as a symlink to `xargs` under another name). The guard does not
+read their program contents or resolve symlink targets to discover what they execute.
+This boundary applies both unwrapped and under wrappers whose parsing fails; a
+wrapper does not bring filesystem-defined behavior into scope. Such programs can
+execute `git stash pop` even when the guard allows their invocation.
+
 The following are **known unblocked cross-branch restore paths**, not covered restore
 controls. Each remains out of scope; documenting them does not make them safe. Encoded
 payloads below mean base64 text whose decoded contents perform a restore. `WT` denotes
