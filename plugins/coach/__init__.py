@@ -479,6 +479,8 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
 
     # session -> this user turn's long_wait_pending_reply record (long_wait.py; self-heal agent-f1f8b24e9d)
     wait_turns: dict = shared.setdefault("long_wait_turns", {})
+    # (session, job) whose kill scheduled_kill already held once (scheduled_kill.py; self-heal agent-d483b8fda1)
+    sched_kill_held: set = shared.setdefault("scheduled_kill_held", set())
 
     def _wait_turn(session_id, user_message, platform="", parent_session_id=""):
         try:
@@ -537,6 +539,13 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             msg = msg or lw.check_stale(wait_turns, session_id, tool_name, args, store.log)
         except Exception as exc:
             log.debug("coach long_wait: %s", exc)
+            msg = None
+        if msg:
+            return {"action": "block", "message": msg}
+        try:  # first kill of a job still sleeping toward its scheduled run (scheduled_kill.py; agent-d483b8fda1)
+            msg = _load("scheduled_kill").check(sched_kill_held, session_id, tool_name, args, store.log)
+        except Exception as exc:
+            log.debug("coach scheduled_kill: %s", exc)
             msg = None
         if msg:
             return {"action": "block", "message": msg}
