@@ -90,6 +90,7 @@ can revert a worker's local edit after the card reported it.
 
 | Finding | Action |
 |---|---|
+| Card owns an open core PR (base `main`, published by it), in any red or triage state | Spare it before any row below: never archive it; on its home board `hermes kanban spend-budget <id> --exempt --reason "<user's words>"`, then `promote` it if spend-triaged. The PR's fate stays with its owner (the user ruled core PR owners are never culled: an archived or spend-held owner orphans a written PR). The guard freeze bars new guard cards, not this |
 | Comment or live check shows the ask is already satisfied (PR merged, CI green, cert present, host back) | Verify the artifact yourself, comment the evidence, then `kanban_complete`/`hermes kanban complete`, or unblock so the owner finishes |
 | Premise is false: account suspended or renamed, repo moved, PR closed, host retired, work superseded by a newer owner | Comment the evidence, archive it (superseded), or unblock it so the owner re-plans |
 | Silent-default decision (`human_request` says "no answer = X") older than a few days | Apply the default: comment "silence = default X", then archive or complete as the card says |
@@ -250,8 +251,6 @@ and the final response.
   unless he told you to decide; then write only behind a guard that aborts on any event or comment since the ask.
   The row vanishes once the owner session starts another turn (outcome `running`), yet the ask stays open until the
   card leaves `blocked` (archive logs `request_withdrawn`): `decision_sessions=0` does not mean no live ask.
-- The Desktop "For you" panel lists asks from every gateway. Cards that live on another gateway's board are read
-  with `cross_task`, not this host's sqlite.
 - Don't publish the "may I sweep?" question as an approval tile first: this skill is the approval.
 - Write the sweep report as plain markdown. A `::user-step{...}` directive in a reply publishes its text as a
   For-you request, so a status table inside one becomes a fake ask that has to be withdrawn.
@@ -309,7 +308,7 @@ and the final response.
 - [ ] Scope matched his words (step 0): a not-ready/Todo/Scheduled ask got the `waiting` audit at the top of the reply, not a red sweep?
 - [ ] Every board was inventoried, and the count per board and status was reported?
 - [ ] Each red card was classified with a live premise check, not from the block reason alone?
-- [ ] Every agent-clearable card was completed, archived or unblocked, each with an evidence comment?
+- [ ] Every agent-clearable card was completed, archived or unblocked, each with an evidence comment, and no owner of an open core PR (`gh pr list --base main --state open`) was archived or left spend-triaged?
 - [ ] Each decision card was either unblocked on your recommendation (comment says it is a guess under the standing rule) or asked because you were really unsure?
 - [ ] Cards still waiting on the user are linked via `notify-subscribe --platform tui`, read back `released=0`?
 - [ ] The remaining asks went out as no-timeout `clarify` batches (recommended first, Skip last, no card ids), each answer recorded on its card, and stale For-you requests withdrawn?
