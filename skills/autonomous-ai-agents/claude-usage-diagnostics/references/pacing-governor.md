@@ -2,7 +2,7 @@
 
 Symptom: pool cards sit `ready` while workers have free slots, and stall notices report 0 claims, sometimes with
 "admission reason unknown". The governor (`hermes_cli/kanban_llm_pacing.py`, `hermes_cli/kanban_llm_pacing_dispatch.py`)
-stops new claims on a provider while its pooled accounts burn faster than their remaining windows sustain.
+observes pool burn and stops claims for genuinely held pools. Check effective `kanban.llm_pacing.pace_starts` before interpreting `paced`: current default is false, so paced burn alone imposes no admission limit or claim-time pace reroute. Only an explicit true restores proportional start limits. Do not re-enable those limits to manufacture a rollout acceptance event; reconcile old paced-trigger criteria with the current approved policy. Read actual route payloads by schema: `run_route` uses `provider`/`model` on current cores, while `worker_result` uses `route_provider`/`route_model`; `selected_provider` alone can miss real runs.
 
 ## Check
 
