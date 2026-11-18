@@ -3729,7 +3729,11 @@ def notice_turn(user_ask: str) -> bool:
     """Only anchored automation envelopes, never a human question mentioning a notice."""
     s = (user_ask or "").lstrip()
     # Preserve known human lookalikes of the runtime's IMPORTANT batch headers.
-    if re.match(r"^\[IMPORTANT: (?:Background processes\b|\d+ background processes\?)", s):
+    if re.match(r"^\[IMPORTANT: (?:Background processes\b|\d+ (?:background processes|Kanban task updates)\?)", s):
+        return False
+    # A closed resume note wraps a human request, unlike a standalone runtime
+    # notice. Keep explicit job receipts whole before considering that wrapper.
+    if s.startswith(PREAMBLE_OPEN) and not NOTICE_RE.search(s) and _preamble_rest(s):
         return False
     return bool(NOTICE_RE.search(s) or _BRACKET_NOTICE.match(s) or (s and
         (unicodedata.category(s[0]) == "So" or s[0] == "ℹ") and _NOTICE_TAIL.match(s, 1)))
@@ -3751,6 +3755,18 @@ def automation_prompt(user_ask: str) -> bool:
 PREAMBLE_OPEN = "[System note:"
 
 
+def _preamble_rest(text: str) -> str:
+    """Return the payload after one balanced leading note, or empty if absent."""
+    if not text.startswith(PREAMBLE_OPEN):
+        return ""
+    depth = 0
+    for i, ch in enumerate(text):
+        depth += (ch == "[") - (ch == "]")
+        if depth == 0:
+            return text[i + 1:].lstrip()
+    return ""
+
+
 def strip_preamble(ask: str) -> str:
     """The user's request behind core's leading "[System note: …]" resume preamble(s) (crash auto-continue, update
     pause, gateway restart recovery; agent-6b76c58161). Unchanged when the ask has no preamble, the note never
@@ -3763,13 +3779,7 @@ def strip_preamble(ask: str) -> str:
     for _ in range(4):  # a resumed turn that is interrupted again stacks a second note
         if not text.startswith(PREAMBLE_OPEN):
             break
-        depth, end = 0, -1
-        for i, ch in enumerate(text):
-            depth += (ch == "[") - (ch == "]")
-            if depth == 0:
-                end = i
-                break
-        rest = text[end + 1:].lstrip() if end > 0 else ""
+        rest = _preamble_rest(text)
         if not rest:
             return ask
         text = rest
