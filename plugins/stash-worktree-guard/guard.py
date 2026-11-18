@@ -1386,14 +1386,52 @@ def _env_split(text: str) -> list[str]:
     return out
 
 
-def _env_split_option(word: str) -> bool:
-    return word in {"-S", "--split-string"} or word.startswith(("-S", "--split-string="))
+def _env_split_spec(words: list[str]):
+    """Locate a split-string operand without treating option values as options.
+
+    Return (option index, attached-value offset); an offset at the end of the
+    option means the next word is the operand. Stop at env's command boundary.
+    Unknown option grammars retain the existing wrapper fallback.
+    """
+    i = 1
+    while i < len(words):
+        word = words[i]
+        if word == "--" or not word.startswith("-"):
+            return None
+        if word == "--split-string":
+            return i, len(word)
+        if word.startswith("--split-string="):
+            return i, len("--split-string=")
+        if word in {"-", "--ignore-environment", "--debug", "--null"}:
+            i += 1
+            continue
+        if word in {"--unset", "--chdir", "--argv0"}:
+            i += 2
+            continue
+        if word.startswith(("--unset=", "--chdir=", "--argv0=")):
+            i += 1
+            continue
+        if word.startswith("--"):
+            return None
+        j = 1
+        while j < len(word):
+            flag = word[j]
+            if flag == "S":
+                return i, j + 1
+            if flag in "uCa":
+                i += int(j + 1 == len(word))
+                break
+            if flag not in "iv0":
+                return None
+            j += 1
+        i += 1
+    return None
 
 
 def _skip_wrappers(words: list[str], external_time: Optional[list] = None) -> list[str]:
     while words:
         if (os.path.basename(words[0]) == "env" and len(words) > 1
-                and _env_split_option(words[1])):
+                and _env_split_spec(words) is not None):
             return words  # simple() owns this argv-changing grammar boundary
         if os.path.basename(words[0]) == "time":
             # This is the external program; the shell keyword was parsed as a pipeline.
@@ -2153,23 +2191,34 @@ class _Analyzer:
                              unknown_command=" ".join(assigns + raw), git_assigns=assigns)
             return [st], [st]
         cmd = os.path.basename(name)
-        if cmd == "env" and len(raw) > 1 and _env_split_option(wrapper_words[-len(raw) + 1]):
-            option = _expand_word(raw[1], st.vars) or _literal(raw[1])
-            separate = option in {"-S", "--split-string"}
-            value = (_expand_word(raw[2], st.vars) if len(raw) > 2 else None) if separate else (
-                option.split("=", 1)[1] if option.startswith("--") else option[2:])
+        split_spec = _env_split_spec(kept) if cmd == "env" else None
+        if split_spec is not None:
+            index, offset = split_spec
+            option = _expand_word(raw[index], st.vars)
+            separate = kept[index] in {"-S", "--split-string"} or (
+                not kept[index].startswith("--") and offset == len(kept[index]))
+            value = (_expand_word(raw[index + 1], st.vars)
+                     if index + 1 < len(raw) else None) if separate else (
+                         option[offset:] if option is not None else None)
             try:
                 if value is None or depth >= MAX_DEPTH:
                     raise _ParseError("unresolved env split-string")
                 decoded = _env_split(value)
             except _ParseError:
-                self.fail_closed(" ".join(raw))
-                self.shadow_argv(raw, st, depth, redirs=redirs)
+                # This operand becomes argv, not inert shell data. Text evidence
+                # cannot bound expansion (even an empty ${VAR} changes word edges).
+                self.record(None, "stash", ["pop"], _EvidenceNote(
+                    f"matched command `{' '.join(raw)}`: unresolved env split-string "
+                    "may construct a stash operation; refusing conservatively"))
             else:
-                # env executes a child, not shell code. Re-quote each decoded word:
-                # literal $, semicolons, quotes and spaces cannot become shell syntax.
-                child_words = ["env", *map(shlex.quote, decoded), *raw[3 if separate else 2:]]
-                self.simple(("simple", assigns, child_words, redirs), st.copy(), depth + 1,
+                # Earlier env options may change cwd/environment. Do not claim a
+                # known repository, and never propagate child uncertainty to caller.
+                child = _unknown([st]) if index > 1 or (
+                    not kept[index].startswith("--") and offset > 2) else st.copy()
+                # Re-quote decoded argv so literal $, spaces and ; remain data.
+                child_words = ["env", *map(shlex.quote, decoded),
+                               *raw[index + (2 if separate else 1):]]
+                self.simple(("simple", assigns, child_words, redirs), child, depth + 1,
                             nested=True)
             return [st], [st]
         if cmd == "alias":
@@ -2342,8 +2391,9 @@ class _Analyzer:
             for index, w in enumerate(raw[1:], 1):
                 word = _expand_word(w, st.vars)
                 base = os.path.basename(word) if word is not None else None
-                env_split = (base == "env" and index + 1 < len(raw)
-                             and _env_split_option(_expand_word(raw[index + 1], st.vars) or ""))
+                env_split = (base == "env" and _env_split_spec([
+                    _expand_word(part, st.vars) or _literal(part)
+                    for part in raw[index:]]) is not None)
                 if (base in SHELLS or env_split
                         or (base is not None and re.fullmatch(r"git(?:-[\w-]+)?", base))
                         or (base is None and _command_unknown(w, st))):
