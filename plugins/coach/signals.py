@@ -523,6 +523,11 @@ def parse_errors(lines: List[str], reconnects: Optional[list] = None, auth: Opti
             recs.append(cur)
         elif cur is not None:
             cur["cont"].append(ln)
+    return _classify_error_records(recs, reconnects, auth, host, prof)
+
+
+def _classify_error_records(recs, reconnects=None, auth=None, host="", prof="default"):
+    """Shared classifier for collection and deferred single-record replay."""
     held = _cron_held_failures(recs)
     lease_lines: dict = {}  # session -> its latest selection_lease_missing record (agent-235b66c443)
     left_pool: dict = {}  # (session, entry id) -> when core logged that entry left the pool (agent-47adfc1ed2)
@@ -545,7 +550,7 @@ def parse_errors(lines: List[str], reconnects: Optional[list] = None, auth: Opti
         if (stalled and r["level"] == "ERROR"
                 and r["logger"] == "hermes_plugins.slack_workspace.follow"):
             eid, fingerprint, count, rc = stalled.groups()
-            out.append({"kind": "errors", "component": "plugin", "at": r["at"],
+            out.append({"recheck": errors_recheck(r, host=host, prof=prof), "kind": "errors", "component": "plugin", "at": r["at"],
                         "session_id": r["sid"], "profile": prof,
                         "symptom": f"Slack follower {eid} stalled: {count} identical failures rc={rc}; backing off",
                         "details": home_tilde("\n".join([r["msg"]] + r["cont"]))[:1500],
@@ -563,7 +568,7 @@ def parse_errors(lines: List[str], reconnects: Optional[list] = None, auth: Opti
             continue
         stall = RELAY_STALL_RE.match(r["msg"]) if r["logger"] == RELAY_LOGGER else None
         if stall:
-            out.append({"kind": "errors", "component": "agent", "at": r["at"], "session_id": r["sid"],
+            out.append({"recheck": errors_recheck(r, host=host, prof=prof), "kind": "errors", "component": "agent", "at": r["at"], "session_id": r["sid"],
                         "symptom": f"relay re-pull found no new token on {host or 'this host'}: a revoked "
                                    f"hub-minted row stalled the turn {stall.group(1)}s",
                         "details": home_tilde(f"{r['level']} {r['logger']}: {r['msg']}")[:1500],
@@ -574,7 +579,7 @@ def parse_errors(lines: List[str], reconnects: Optional[list] = None, auth: Opti
             gkind, gm = guard
             prov = ((gm.group(1) or "").lower() if gkind == "moved-off-entry" and gm.group(1)
                     else _provider_of("", r["msg"]))
-            out.append({"kind": "errors", "component": "agent", "at": r["at"], "session_id": r["sid"],
+            out.append({"recheck": errors_recheck(r, host=host, prof=prof), "kind": "errors", "component": "agent", "at": r["at"], "session_id": r["sid"],
                         "symptom": f"credential guard {gkind} ({prov}): {r['msg'][:160]}",
                         "details": home_tilde("\n".join([f"{r['level']} {r['logger']}: {r['msg']}"]
                                                         + r["cont"]))[:1500],
@@ -583,7 +588,7 @@ def parse_errors(lines: List[str], reconnects: Optional[list] = None, auth: Opti
         am = ATTENTION_RE.match(r["msg"])
         if am:
             key, hours, attempts = am.groups()
-            out.append({"kind": "errors", "component": "gateway", "at": r["at"], "session_id": "",
+            out.append({"recheck": errors_recheck(r, host=host, prof=prof), "kind": "errors", "component": "gateway", "at": r["at"], "session_id": "",
                         "symptom": f"{key} NEEDS_ATTENTION on {host or 'this host'} ({prof}): failing/reconnecting "
                                    f"continuously for {hours} hours ({attempts} attempts)",
                         "details": home_tilde(f"{r['level']} {r['logger']}: {r['msg']}")[:1500],
@@ -592,7 +597,7 @@ def parse_errors(lines: List[str], reconnects: Optional[list] = None, auth: Opti
         bm = ADMISSION_BUSY_RE.match(r["msg"])
         if bm:
             what, secs = bm.groups()
-            out.append({"kind": "errors", "component": "agent", "at": r["at"], "session_id": r["sid"],
+            out.append({"recheck": errors_recheck(r, host=host, prof=prof), "kind": "errors", "component": "agent", "at": r["at"], "session_id": r["sid"],
                         "symptom": f"{what} refused: update admission lock busy for {secs}s with no update hold "
                                    f"on {host or 'this host'} ({prof})",
                         "details": home_tilde(f"{r['level']} {r['logger']}: {r['msg']}")[:1500],
@@ -601,7 +606,7 @@ def parse_errors(lines: List[str], reconnects: Optional[list] = None, auth: Opti
         qm = QUOTA_NOT_HELD_RE.match(r["msg"]) if r["logger"] == "cron.scheduler" else None
         if qm:
             job, exc_name = qm.groups()
-            out.append({"kind": "errors", "component": "cron", "at": r["at"], "session_id": r["sid"],
+            out.append({"recheck": errors_recheck(r, host=host, prof=prof), "kind": "errors", "component": "cron", "at": r["at"], "session_id": r["sid"],
                         "symptom": f"cron quota failure not held on {host or 'this host'} ({prof}): {exc_name} "
                                    f"maps to no hold, so job '{job}' re-fires into a closed provider window",
                         "details": home_tilde(f"{r['level']} {r['logger']}: {r['msg']}")[:1500],
@@ -609,7 +614,7 @@ def parse_errors(lines: List[str], reconnects: Optional[list] = None, auth: Opti
             continue
         dns = PROVIDER_DNS_RE.fullmatch(r["msg"])
         if dns and r["level"] == "ERROR" and OWN_LOGGER_RE.match(r["logger"]):
-            out.append({"kind": "errors", "component": "agent", "at": r["at"], "session_id": r["sid"],
+            out.append({"recheck": errors_recheck(r, host=host, prof=prof), "kind": "errors", "component": "agent", "at": r["at"], "session_id": r["sid"],
                         "symptom": f"provider host does not resolve while network is up: {dns.group(1)}",
                         "details": home_tilde(f"{r['level']} {r['logger']}: {r['msg']}")[:1500],
                         "fp": fp("agent", "provider-dns", dns.group(1))})
@@ -619,7 +624,7 @@ def parse_errors(lines: List[str], reconnects: Optional[list] = None, auth: Opti
                 and not NONRETRYABLE_PROVIDER_RE.match(nr.group(1))):
             why = nr.group(1).strip()
             ctx = [lease_lines[r["sid"]]] if r["sid"] and r["sid"] in lease_lines else []
-            out.append({"kind": "errors", "component": "agent", "at": r["at"], "session_id": r["sid"],
+            out.append({"recheck": errors_recheck(r, host=host, prof=prof), "kind": "errors", "component": "agent", "at": r["at"], "session_id": r["sid"],
                         "symptom": f"turn failed on a Hermes refusal: {why[:160]}",
                         "details": home_tilde("\n".join(ctx + [f"{r['level']} {r['logger']}: {r['msg']}"]
                                                         + r["cont"]))[:1500],
@@ -689,12 +694,12 @@ def parse_errors(lines: List[str], reconnects: Optional[list] = None, auth: Opti
             tag = f"{status or 'auth'} {reason}"
             sym = (f"{exc_type.split('.')[-1]} [{tag}] in {where}" + (f" [{plug}]" if plug else "")
                    + f": {r['msg'][:90]}")
-            out.append({"kind": "errors", "component": comp, "at": r["at"], "session_id": r["sid"], "symptom": sym,
+            out.append({"recheck": errors_recheck(r, host=host, prof=prof), "kind": "errors", "component": comp, "at": r["at"], "session_id": r["sid"], "symptom": sym,
                         "details": details[-1500:],
                         "fp": fp(comp, "tb", exc_type, tag, *[f"{a}:{b}" for a, b in inner])})
             continue
         sym = f"{exc_type.split('.')[-1]} in {where}" + (f" [{plug}]" if plug else "") + f": {r['msg'][:90]}"
-        out.append({"kind": "errors", "component": comp, "at": r["at"], "session_id": r["sid"], "symptom": sym,
+        out.append({"recheck": errors_recheck(r, host=host, prof=prof), "kind": "errors", "component": comp, "at": r["at"], "session_id": r["sid"], "symptom": sym,
                     "details": details[-1500:],
                     "fp": fp(comp, "tb", exc_type, *_reason_code(exc_line), *_git_step(r["msg"]),
                           *[f"{a}:{b}" for a, b in inner])})
@@ -1037,7 +1042,9 @@ def parse_worker_crashes(lines: List[str]) -> List[dict]:
                 or provider_5xx(exc, blk[ei], _exc_body(blk[tbs[-1]:ei + 1 + EXC_BODY_LINES], blk[ei]))):
             continue
         body = [l for k, l in enumerate(blk[ei + 1:ei + 1 + EXC_BODY_LINES], ei + 1) if k not in noise]
-        crash = {"pid": pid, "exc": exc, "msg": msg, "block": blk[tbs[-1]:ei + 1] + body}
+        crash = {"pid": pid, "exc": exc, "msg": msg, "block": blk[tbs[-1]:ei + 1] + body,
+                 "recheck": errors_recheck({"logger": "managed-worker", "msg": "", "cont": blk,
+                                            "level": "ERROR", "at": 0, "sid": ""}, worker=True)}
         if pid in stamps:
             crash["t"], crash["core"] = stamps[pid]
         out.append(crash)
@@ -1089,7 +1096,8 @@ def worker_storms(cur: dict, crashes: List[dict], now: float, host: str) -> List
                                       f"{span_s // 60} min (logs/managed-worker.log). pids: "
                                       f"{', '.join(pids)}\n{when}{_span_note(c)}"
                                       f"Latest (pid {c['pid']}):\n{tb}")[:1500],
-                    "fp": fp("kanban", "worker-storm", c["exc"], norm)})
+                    "fp": fp("kanban", "worker-storm", c["exc"], norm),
+                    **({"recheck": c["recheck"]} if "recheck" in c else {})})
     if evs or filed:
         cur["worker_storm"] = {"ev": evs[-200:], "filed": filed}
     else:
@@ -2126,10 +2134,59 @@ def _cron_failure_exempt(r: dict) -> Optional[str]:
     return None
 
 
+ERROR_RECHECK_LINES = 128
+ERROR_RECHECK_CHARS = 65536
+
+
+def errors_recheck(r: dict, host: str = "", prof: str = "default", worker: bool = False) -> dict:
+    """Retain bounded classifier input, never trust a clipped record to prove absence."""
+    cont, remaining = [], ERROR_RECHECK_CHARS
+    for line in r["cont"][:ERROR_RECHECK_LINES]:
+        cont.append(line[:remaining])
+        remaining -= len(cont[-1])
+        if remaining == 0:
+            break
+    result = {"kind": "errors_record", "logger": r["logger"][:256], "msg": r["msg"][:8192],
+              "cont": cont, "level": r["level"], "at": r["at"], "sid": r["sid"][:256],
+              "host": host[:256], "profile": prof[:256], "worker": worker}
+    result["truncated"] = (cont != r["cont"] or result["msg"] != r["msg"]
+                           or result["logger"] != r["logger"] or result["sid"] != r["sid"]
+                           or result["host"] != host or result["profile"] != prof)
+    return result
+
+
+def _errors_record_exempt(r: dict) -> Optional[str]:
+    """Re-run the actual classifier; incomplete/malformed evidence cannot withdraw a defect."""
+    import math
+    try:
+        if r.get("truncated", False) is not False or type(r.get("worker", False)) is not bool:
+            return None
+        for key, cap in (("logger", 256), ("msg", 8192), ("sid", 256), ("host", 256), ("profile", 256)):
+            if not isinstance(r.get(key), str) or len(r[key]) > cap:
+                return None
+        if not r["logger"] or r.get("level") not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
+            return None
+        if type(r.get("at")) not in (int, float) or not math.isfinite(r["at"]):
+            return None
+        cont = r.get("cont")
+        if (not isinstance(cont, list) or len(cont) > ERROR_RECHECK_LINES
+                or any(not isinstance(line, str) for line in cont)
+                or sum(map(len, cont)) > ERROR_RECHECK_CHARS):
+            return None
+        if r.get("worker", False):
+            found = parse_worker_crashes([f"[pid 1] {line}" for line in cont])
+        else:
+            found = _classify_error_records([r], host=r["host"], prof=r["profile"])
+        return None if found else "error record no longer fires (current classifier)"
+    except Exception:  # malformed/unknown evidence must fail open to filing
+        return None
+
+
 # Detector re-checks for deferred signals (t_01a1d5815b28b08b): a signal carries {"kind": <key>, ...} as "recheck";
 # self_heal.retry_deferred calls recheck_exempts before filing and withdraws the row when the detector, on the code
 # running now, would not fire. A new detector kind adds its collector's own skip predicate here.
 RECHECKS: Dict[str, Callable[[dict], Optional[str]]] = {
+    "errors_record": _errors_record_exempt,
     "template_hold": lambda r: _template_hold_exempt(str(r.get("rule") or ""), str(r.get("head") or "")),
     "cron_failure": _cron_failure_exempt,
     "held_wall": lambda r: (f"held wall: {str(r.get('line') or '')[-120:]} (a pin's designed short-wall hold)"
