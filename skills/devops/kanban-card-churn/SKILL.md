@@ -1,7 +1,7 @@
 ---
 name: kanban-card-churn
 description: "Use when one Kanban card has many runs, comments or a huge context and still isn't done."
-version: 1.4.0
+version: 1.5.0
 author: daveey
 license: MIT
 triggers:
@@ -108,6 +108,7 @@ four of these at once.
 | Self-continuation loop | dozens of `continued` runs in a few days, then `continuation_exhausted` and a split into slices | none needed once split; check the slices are not parked on the same wall | body: acceptance in slices from the start, each with its own done rule |
 | Infeasible acceptance found late | a hard cap (time, memory, budget) the work cannot meet, discovered after 100 runs | record the measured gap and the options in the state file | first run of any card with a hard cap is a feasibility probe that reports the margin before building |
 | Paused graph left open | every card `todo`/`scheduled` behind a pause someone applied by default; clock-only wakes weeks out | put the exact resume-or-stop decision to the user; archive the graph on stop | a pause names who applied it, the user's words or the default used, and the one sentence that resumes it |
+| Coordinator fan-out | one card created 100+ child cards, linked each as a parent, and has one `blocked: await linked X` run per child | state file with position and wait chain; no restructuring | batch obstacles found in one pass into one child; link a child only while it gates; wake on its completion |
 | Poll-and-repark | runs that only reread state and reschedule | wake on the real producer event only | spend budget; wake checks on events, not timers |
 
 ## 3. Clean up the card
@@ -131,8 +132,11 @@ overwrite it.
    it must say: read the state file first; gates close one at a time; fixture first; batch fixes; fix forward;
    never wait on a single-homed card; status goes in the state file. Keep the done rule ("block naming the exact
    gate, never done with a gate unproven").
-5. **Parents.** Unlink parents that are done or archived (their results are a large share of the context) and
-   list their ids in the state file. Leave open parents linked.
+5. **Parents.** First check the core the card's workers run: `git -C ~/.hermes/hermes-agent merge-base
+   --is-ancestor 6291d495 HEAD`. With it, the context shows only the 8 most recently completed parents and
+   names the rest, so leave the links alone (they are the graph's record) and confirm with `kanban context`.
+   Without it, unlink parents that are done or archived and list their ids in the state file. Leave open
+   parents linked either way.
 6. **Dead waits.** Do not unhold, restart or touch a held machine. Remove the dependency instead: record the
    failed attempt as evidence and make the next action something this card can do.
 7. **Tell the thread once.** One comment: who you are, on whose instruction, what it supersedes, the files
