@@ -630,7 +630,22 @@ def parse_errors(lines: List[str], reconnects: Optional[list] = None, auth: Opti
         if r["logger"] == "cron.scheduler" and MONITOR_SOURCE_FAILED_RE.match(r["msg"]):
             continue  # the cron job's own source failure, its stderr quoted: the cron lane files a failing streak
         # the last exception of the printed chain; a traceback quoted inside a message is message text
-        start = _chain_heads(r["cont"])[-1]
+        heads = _chain_heads(r["cont"])
+        owner = _quote_owner(r["cont"], heads)
+        if owner is not None:
+            # A quoted CHAINED stderr puts separators inside the message, so its headers look like chain members
+            # (agent-95944cb790: google-auth's `raise new_exc from caught_exc` in a cron monitor's stderr filed as
+            # "TransportError in __call__"). When the quoting member is the gateway's cron re-raise, the rest is
+            # that script's stderr (core logs that RuntimeError unwrapped): the cron lane files it. Any other quoting
+            # member keeps the last header, so a real outer exception (`raise X from exc`) still files.
+            ob = r["cont"][owner:next((h for h in heads if h > owner), len(r["cont"]))]
+            oe = _traceback_end(ob, 0)
+            otb = ob if oe is None else ob[:oe]
+            oframes = [FRAME_RE.match(l).groups() for l in otb if FRAME_RE.match(l)]
+            om = EXC_RE.match(ob[oe]) if oe is not None else None
+            if _session_cron_rewrap(otb, oframes, (om.group(1) if om else "") or "Exception"):
+                continue  # the cron run's own failure, re-raised by the gateway: the cron lane files it
+        start = heads[-1]
         block = r["cont"][start:]
         ei = _traceback_end(block, 0)
         tb = block if ei is None else block[:ei]
@@ -964,10 +979,10 @@ def _chain_heads(blk: List[str], skip=()) -> List[int]:
     the first header, and each one whose nearest non-blank line above is CPython's chain separator. Any other
     header sits inside an exception message (a child's stderr quoted by `RuntimeError(stderr)`), so it is message
     text, not the exception that was raised (agent-2dc9a44cfa: a cron script's HTTPError quoted in the gateway's
-    re-raise defeated _session_cron_rewrap). Once a quoted header is seen, every later header is quoted text too: a
-    quoted stderr can hold its own chain, separators included (agent-95944cb790: google-auth's `raise new_exc from
-    caught_exc` inside a cron monitor's stderr filed as "TransportError in __call__"). Headers at indexes in `skip`
-    are ignored."""
+    re-raise defeated _session_cron_rewrap). A quoted stderr can hold its own chain, separators included, and a
+    separator after quoted text can as well start a real outer exception (`raise LookupError(..) from exc`): the
+    text cannot tell them apart, so such headers count as chain members here and `_quote_owner` names the member
+    whose message holds the quote. Headers at indexes in `skip` are ignored."""
     heads = []
     for i, l in enumerate(blk):
         if i in skip or not l.startswith("Traceback (most recent call last)"):
@@ -975,9 +990,17 @@ def _chain_heads(blk: List[str], skip=()) -> List[int]:
         prev = next((blk[k] for k in range(i - 1, -1, -1) if blk[k].strip()), "")
         if not heads or CHAIN_SEP_RE.match(prev):
             heads.append(i)
-        else:
-            break  # message text from here on, including any chain it quotes
     return heads
+
+
+def _quote_owner(blk: List[str], heads: List[int], skip=()) -> Optional[int]:
+    """The chain head whose exception message quotes a traceback (the last head before the first header that is
+    not a chain head), or None when nothing in `blk` is quoted."""
+    q = next((i for i, l in enumerate(blk) if i not in skip and i not in heads
+              and l.startswith("Traceback (most recent call last)")), None)
+    if q is None:
+        return None
+    return max((h for h in heads if h < q), default=None)
 
 
 def parse_worker_crashes(lines: List[str]) -> List[dict]:
