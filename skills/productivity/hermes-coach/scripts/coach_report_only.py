@@ -62,8 +62,12 @@ party (false)? null when problem is false.
 resolves it), even if final verification is pending.
   "started": the agent started a concrete fix that is now in progress and says so (spawned/assigned a worker, card, \
 subagent or background job specifically to fix it, opened a PR).
-  "proposed": no fix yet, but the reply proposes a concrete solution or plan (what would change and how), possibly \
-asking for a go-ahead.
+  "proposed": no fix yet, but the reply proposes a concrete solution or plan (what would change and how) that \
+genuinely waits on David's go: it asks for a go-ahead or a choice on new scope, acceptance, safety, permissions, budget \
+or spend.
+  "planned": no fix yet, and the reply names the concrete next step the agent itself should take, but no go-ahead is \
+needed (it says it is agent work / needs nothing from David, or it is a fix inside approved work), and the turn ended \
+without doing or starting it.
   "offered": only a vague offer ("want me to fix it?", "I can look into it") with no concrete solution.
   "report_only": the reply describes or diagnoses the problem, or says it is not fixed / can be ignored / is owned by \
 an existing task / was relayed to someone, WITHOUT fixing it, starting a new fix, or proposing a concrete solution.
@@ -84,7 +88,9 @@ SYNTHETIC_RX = re.compile(r"^\s*(\[(IMPORTANT|System|SYSTEM|Background|backgroun
 # Compaction writes these as user rows: a summary, then a prompt that resumes the turn it interrupted. Neither is a
 # human message, and the replies after the resume prompt belong to the interrupted turn.
 CONTINUATION_RX = re.compile(r"^\s*\[(Your active task list was preserved|CONTEXT COMPACTION)")
-OUTCOMES = ("fixed", "started", "proposed", "offered", "report_only", "na")
+OUTCOMES = ("fixed", "started", "proposed", "planned", "offered", "report_only", "na")
+# "planned" (a no-go-needed next step left unstarted, agent-7abafd6255) is the same stall as report_only and counts in it.
+STALL_OUTCOMES = ("report_only", "planned")
 
 
 # ----------------------------------------------------------------------------------------------- extraction
@@ -289,7 +295,7 @@ def compute(turns, labels):
         if not lab:
             continue
         f, g = family(t), trigger(t, lab)
-        ro = 1 if lab.get("outcome") == "report_only" else 0
+        ro = 1 if lab.get("outcome") in STALL_OUTCOMES else 0
         for d, k in ((cells, (f, g)), (by_t, g), (by_f, f)):
             c = d.setdefault(k, {"n": 0, "report_only": 0})
             c["n"] += 1
