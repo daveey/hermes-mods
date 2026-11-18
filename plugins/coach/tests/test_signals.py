@@ -1779,6 +1779,32 @@ def test_revoked_401_waits_for_the_relay_repull_across_passes(tmp_path):
     assert _errs(sg.collect(h2, cur2, "macbook", _ts("2026-11-18 02:09:00"))) == []
 
 
+@pytest.mark.parametrize("delay", [600, 3600, 6 * 3600])
+def test_recovered_401s_first_seen_by_a_delayed_sweep_are_not_a_storm(tmp_path, delay):
+    """A first sweep, cursor reset or a sweep delayed by sleep reads hour-old 401s and their adoptions together;
+    the adoptions must clear them even though they are older than the persisted-adoption retention (PR 274 review)."""
+    adopted = [adopted_line("2026-11-18 02:04:56", s) for s in RELAY_SIDS]
+    h = _relay_home(tmp_path, _wake_401s(), adopted)
+    assert _errs(sg.collect(h, {}, "macbook", _ts("2026-11-18 02:04:56") + delay)) == []
+
+
+@pytest.mark.parametrize("delay", [600, 3600])
+def test_unrecovered_401s_first_seen_by_a_delayed_sweep_still_file(tmp_path, delay):
+    """Control: the same delayed first sight with no adoption (or only another session's) is one storm."""
+    h = _relay_home(tmp_path, _wake_401s(), [adopted_line("2026-11-18 02:04:56", "other_sid")])
+    sigs = _errs(sg.collect(h, {}, "macbook", _ts("2026-11-18 02:04:56") + delay))
+    assert len(sigs) == 1 and "3 anthropic 401 (revoked)" in sigs[0]["symptom"]
+
+
+def test_persisted_adoptions_are_pruned_after_the_window(tmp_path):
+    h = _relay_home(tmp_path, _wake_401s(), [adopted_line("2026-11-18 02:04:56", s) for s in RELAY_SIDS[:2]])
+    cur = {}
+    assert _errs(sg.collect(h, cur, "macbook", _ts("2026-11-18 02:05:00"))) == []
+    assert len(cur["auth"]["adopt"]) == 2 and len(cur["auth"]["ev"]) == 1  # third 401 still pending
+    assert _errs(sg.collect(h, cur, "macbook", _ts("2026-11-18 03:05:00"))) == []  # 1 unrecovered: no storm
+    assert not (cur.get("auth") or {}).get("adopt")
+
+
 NO_NEW_TOKEN = ("2026-11-12 23:36:21,004 WARNING [20261026_170127_f07c32] run_agent: OAuth relay: no new token for "
                 "pool entry d88ec8 within 121s of a revoked 401")
 
