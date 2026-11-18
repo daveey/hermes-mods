@@ -8,6 +8,7 @@ import importlib.util
 from pathlib import Path
 import re
 import sys
+import tempfile
 import unittest
 import unicodedata
 
@@ -194,6 +195,52 @@ class RuntimeNoticeContract(unittest.TestCase):
                        'def new_private():\n    return r"[✔⏸]"'):
             self.assertTrue(private_glyph_lists(source, 'plugins/new/core.py'))
         self.assertFalse(private_glyph_lists('PATTERN = r"[a-z]"', 'plugins/new/core.py'))
+
+
+class CoachCurriculumNoticeContract(unittest.TestCase):
+    """Exercise the store called by coach's live user hook, not just a predicate."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.core = load(ROOT, 'coach/core.py')
+
+    def check_turn(self, text, human):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self.core.Store(Path(tmp))
+            store.curriculum = lambda: [{
+                'id': 'correction', 'trigger': {'text': 'still not working'},
+                'adopted': {}, 'tip': 'Use a reproducible done-check.',
+            }]
+            with self.subTest(entrypoint='is_still_broken'):
+                self.assertEqual(human, bool(self.core.is_still_broken(text)))
+            state = store.user_turn('contract', text)
+            self.assertEqual(1, state['turns'])
+            with self.subTest(entrypoint='Store.user_turn.still_broken'):
+                self.assertEqual(int(human), state.get('still_broken', 0))
+            with self.subTest(entrypoint='Store.user_turn.tip_text'):
+                self.assertEqual({'correction': 1} if human else {}, state.get('tip_text', {}))
+            self.assertEqual(state, store.session('contract'))
+
+    def test_curriculum_runtime_glyph_notices(self):
+        for glyph in GLYPHS + '☃🧪🜁':
+            for suffix in (' [default]', '\ufe0f [default]', '\t[default]', '[default]'):
+                text = glyph + suffix + ' @default Kanban t_abcdef: still not working'
+                for wrapped in (False, True):
+                    with self.subTest(glyph=glyph, suffix=suffix, wrapped=wrapped):
+                        turn = ('[OUT-OF-BAND USER MESSAGE]\n' + text +
+                                '\n[/OUT-OF-BAND USER MESSAGE]') if wrapped else text
+                        self.check_turn(turn, human=False)
+
+    def test_curriculum_human_corrections_and_steers(self):
+        for prefix in ('', '👍 yes, ', '✅ done, ', '⚠ careful, ',
+                       'Canonical user decision. ', 'I saw ⏳ [default]; ',
+                       'A [default] ', '⏳ words [default] '):
+            text = prefix + 'still not working'
+            for wrapped in (False, True):
+                with self.subTest(prefix=prefix, wrapped=wrapped):
+                    turn = ('[OUT-OF-BAND USER MESSAGE]\n' + text +
+                            '\n[/OUT-OF-BAND USER MESSAGE]') if wrapped else text
+                    self.check_turn(turn, human=True)
 
 
 if __name__ == '__main__':
