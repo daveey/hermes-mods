@@ -1,7 +1,7 @@
 ---
 name: kanban-card-churn
 description: "Use when one Kanban card has many runs, comments or a huge context and still isn't done."
-version: 1.1.0
+version: 1.2.0
 author: daveey
 license: MIT
 triggers:
@@ -35,8 +35,13 @@ sqlite3 "file:$HOME/.hermes/kanban/sync-shadow/default.db?mode=ro" "select t.id,
  (select count(*) from task_comments c where c.task_id=t.id) comments,
  cast((strftime('%s','now')-t.created_at)/86400 as int) age_d, substr(t.title,1,70)
  from tasks t join task_runs r on r.task_id=t.id where t.status not in ('done','archived')
+ and r.outcome not in ('released','reclaimed')
  group by t.id order by runs desc limit 15"
 ```
+Count only runs that did work: a dispatch loop can leave 200 zero-second `released` runs on a card that is
+otherwise a healthy weekly check. Also look at runs in the last 7 days and total run-hours: a card with many
+runs, many hours and steady output (one pull request per day) is a long serial pipeline, not churn. Clean its
+context and waits, but do not restructure it.
 The replica is for ranking and for per-run outcome counts (`task_runs.outcome`, `started_at`, `ended_at`) only.
 Everything you act on comes from the CLI on the owning gateway.
 
@@ -93,6 +98,7 @@ four of these at once.
 | Finished parents kept for the record | 10 to 20 done parents; `Parent task results` is half the context | unlink them, list ids in the state file | recipe: list finished prerequisites in the state file, do not link them |
 | Other cards park on this one | consumer cards post a recheck comment every wake | state file rule: no recheck comments | fix the consumers' skill; check first whether it already says so |
 | Workspace litter | hundreds of numbered scripts, several full checkouts | note it; delete only your own files | body rule: reuse one checkout, remove one-off scripts at run end |
+| Handshake phrase mismatch | two cards wake on each other's comments; a request sits unanswered until a backstop | post one pointer that matches the waiting card's wake phrase; never fake the answer | fixed tokens (`X-REQUEST <id>@<sha>`, `X-GRANT`, `X-REFUSE`) in both bodies; wake checks match the token only; the sender reads the receiver's wake check after posting |
 | Poll-and-repark | runs that only reread state and reschedule | wake on the real producer event only | spend budget; wake checks on events, not timers |
 
 ## 3. Clean up the card
@@ -167,6 +173,11 @@ Verify the prevention the same way as the cleanup: read the edited skill text ba
   literal absolute paths and `git -C <worktree>`.
 - Extract a body with python reading `sys.stdin.buffer` and writing the file itself; a shell redirect of non-ASCII
   text can leave an empty file and a failed pipeline.
+- The gateway that answers `show` is not always the card's home: when `show` there prints no wake check but the
+  events carry one with a `probe_host`, the card is homed on that host. Read the wake check, last probe result and
+  your own edits back from the home (skill `hermes-workers` for pool workers).
+- Before posting on a card that others wake on, read the wake checks of the cards waiting on it: a comment that
+  happens to contain their match text wakes them. Say in the comment what it is not.
 - Edit the card on its owning gateway. An edit on a replica is overwritten by the next sync.
 
 ## Done means
