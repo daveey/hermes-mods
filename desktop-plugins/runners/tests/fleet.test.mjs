@@ -94,7 +94,7 @@ test('waiting: header counts dispatched cards; rows split placement fit with too
   assert.deepEqual(['waiting', 'ineligible'].map((k) => mini.querySelector(`.hermes-fleet-${k}`).textContent), ['0', '90'])
   // The units are in the column header, once.
   assert.deepEqual([...ui.container.querySelectorAll('.hermes-fleet-cols > span')].map((e) => e.textContent),
-    ['Machine', 'Slots', 'Waiting', "Can't run", 'CPU', 'RAM', 'Disk free', 'Busy', ''])
+    ['Machine', 'Slots', 'Waiting', "Can't run", 'CPU', 'RAM', 'Disk free', 'Tok/slot', 'Busy', ''])
   await ui.close()
   const old = await render(P.merge([{ route, body: fleet(), at: NOW }], NOW))  // older gateway: no count
   assert.doesNotMatch(old.container.textContent, /waiting/)
@@ -468,7 +468,7 @@ test('gateway rows: one grid line each in a shared column grid, no Investigate c
   assert.deepEqual(rows.map((r) => r.dataset.machine), ['hub', 'worker-1', 'mini'])
   for (const r of rows) {
     assert.deepEqual([...r.children].map((c) => c.className.split(' ')[0]),
-      ['hermes-fleet-name', 'hermes-fleet-slots', 'hermes-fleet-cell', 'hermes-fleet-cell', 'hermes-fleet-cell', 'hermes-fleet-cell', 'hermes-fleet-cell', 'hermes-fleet-count', 'hermes-fleet-info'])
+      ['hermes-fleet-name', 'hermes-fleet-slots', 'hermes-fleet-cell', 'hermes-fleet-cell', 'hermes-fleet-cell', 'hermes-fleet-cell', 'hermes-fleet-cell', 'hermes-fleet-cell', 'hermes-fleet-count', 'hermes-fleet-info'])  // + Tok/slot
     assert.equal(r.children.length, ui.container.querySelectorAll('.hermes-fleet-cols > span').length, 'one cell per header column')
   }
   // Flags are hover text on the (i): a row with nothing to say keeps an empty, hidden placeholder so columns hold.

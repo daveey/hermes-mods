@@ -50,6 +50,32 @@ Slot styles: filled = busy, outline = free, dotted = offline/unknown, hatched = 
 red = lost (machine holds cards but the Board has not seen it for 10 min). An asleep machine with nothing
 running is grey with "not seen for N min". A section the gateway cannot read says Unknown/Stale with the reason.
 
+## Token throttle and crossed-out slots
+
+With the throughput plugin on the gateway, the panel shows its token throttle above the gateway table: the same
+0-100 % level as the Throughput panel (`GET`/`PUT /api/plugins/throughput/v1/throttle`), the cap, the fleet rate
+any subscription pool the pacing governor has paced or held, and how many card starts it held in the last
+5 minutes. Pacing is text only: the governor's per-machine limits are not published, so no slot is crossed out
+for it. Dragging previews; releasing sets the level.
+
+Each gateway row then crosses out the slots a limit will not let run. The gateway answers with, per machine,
+its token cost per slot and `allowed`: the slots its share of the token cap pays for
+(`plugins/throughput/slots.py`). Slots are drawn busy first, then
+free, and every slot past `allowed` gets an X: a free one "cannot start", a busy one "over the limit". The
+reason is the slot's hover text and a line in the row's ⓘ. The **Tok/slot** column is in+out tokens per busy
+slot per minute over the last 15 minutes (grey when it is the fleet median because the machine ran too little
+to measure, "–" when unknown). A machine without a slot cap has nothing to cross out.
+
+The chip's Workers and Hub bars hatch the right end of the track for the crossed-out share, and the bar turns
+red once the usable slots are taken, even if crossed-out ones are free.
+
+Without the throughput plugin, with an older one that sends no `slots`, or when that request fails, there is no
+slider, no column value and nothing is crossed out.
+
+Tests (`tests/throttle.test.mjs`): the limit maths, a rendered panel with a token limit, the panel without
+throttle data, the slider's preview and single commit, and the chip summary. **Not tested**: the request to the
+throughput API from a live Desktop (the tests pass the payload in), and the X drawing itself (CSS).
+
 ## Data and load
 
 `GET /api/plugins/runners/v1/fleet` (plugins/runners/dashboard/plugin_api.py, logic in plugins/runners/fleet.py).

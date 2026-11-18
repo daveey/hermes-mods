@@ -406,7 +406,7 @@ export function ago(ms) {
 
 const isHub = (m) => m.name === 'hub' || (m.labels || []).includes('machine:hub')
 
-export function summarize(view) {
+export function summarize(view, throttle = null) {
   // A stopped machine (held and off) has no capacity: it is left out of every slot total.
   const g = (view.gateways.machines || []).filter((m) => m.state !== 'stopped'), c = view.ci.machines || []
   const gBusy = g.reduce((n, m) => n + m.running.length, 0)
@@ -421,9 +421,12 @@ export function summarize(view) {
   // without a slot cap (pinned-only Macs) has no capacity to fill, so it is left out.
   const capped = g.filter((m) => typeof m.slots === 'number' && m.slots > 0)
   const hub = capped.filter(isHub), workers = capped.filter((m) => !isHub(m))
+  // `usable`: slots a token or pacing limit leaves startable (all of them when no limit is known).
+  // Present only with throttle data, so a view without the throughput plugin keeps its old shape.
   const meter = (ms) => ({
     busy: ms.reduce((n, m) => n + m.running.length, 0),
-    slots: ms.reduce((n, m) => n + m.slots, 0)
+    slots: ms.reduce((n, m) => n + m.slots, 0),
+    ...(throttle ? { usable: ms.reduce((n, m) => n + (slotLimit(m, limitRow(throttle, m.name))?.allowed ?? m.slots), 0) } : {})
   })
   return {
     gBusy, gSlots, gWaiting, cBusy, cSlots: slots.length, cOffline, lost,
@@ -432,12 +435,72 @@ export function summarize(view) {
   }
 }
 
+// ── token throttle and pacing: slots a limit will not let run ────────────────────────────────────────────
+// GET/PUT /api/plugins/throughput/v1/throttle (plugins/throughput: throttle.py, slots.py). `slots.gateways[name]`
+// carries each gateway's token cost per slot and `allowed`, the slots its share of the token cap pays for.
+// Slots beyond `allowed` are crossed out; pacing shows as text (pools paced, card starts held), not as slots. Without the throughput plugin (or with an
+// older one) there is no `slots` and nothing is crossed out.
+export const THROTTLE_PATH = '/api/plugins/throughput/v1/throttle'
+
+function bridge(path, opts = {}) {
+  const api = typeof window !== 'undefined' ? window.hermesDesktop?.api : null
+  if (!api) return Promise.reject(new Error('Hermes desktop bridge unavailable'))
+  let connectionId
+  try { connectionId = host.activeConnectionId?.() || host.state?.connectionId?.get?.() || undefined } catch { connectionId = undefined }
+  return api({ path, timeoutMs: REQUEST_TIMEOUT_MS, ...opts, ...(connectionId ? { connectionId } : {}) })
+}
+
+export const limitRow = (throttle, name) => throttle?.slots?.gateways?.[name] || null
+
+export function fmtTokens(n) {
+  if (typeof n !== 'number' || !isFinite(n)) return '–'
+  return n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${Math.round(n / 1e3)}k` : String(Math.round(n))
+}
+
+// How many of a machine's slots its share of the token cap pays for. null = the throttle limits nothing here.
+// The pacing governor is not turned into slots: its per-machine limits are not published (plugins/throughput/slots.py).
+export function slotLimit(m, row) {
+  if (!row || typeof row.allowed !== 'number' || typeof m.slots !== 'number') return null
+  const allowed = Math.max(0, Math.min(m.slots, Math.floor(row.allowed)))
+  const why = `token throttle allows ${allowed} of ${m.slots} slots here: ${fmtTokens((row.cap_per_s || 0) * 60)} tok/min share ÷ ${fmtTokens((row.tokens_per_slot_per_s || 0) * 60)} per slot`
+  return { allowed, throttled: Math.max(0, m.slots - allowed), why }
+}
+
+export function throttleLine(throttle) {
+  if (!throttle) return ''
+  const p = Math.round(throttle.percent ?? 0)
+  const cap = typeof throttle.cap_per_s === 'number' ? ` · cap ${fmtTokens(throttle.cap_per_s * 60)} tok/min` : ''
+  const rate = typeof throttle.rate_per_s === 'number' ? ` · fleet ${fmtTokens(throttle.rate_per_s * 60)} tok/min` : ''
+  const paced = (throttle.pools || []).filter((x) => x.pacing === 'paced' || x.pacing === 'held')
+    .map((x) => `${x.provider} ${x.pacing}${x.pacing === 'paced' && typeof x.pacing_factor === 'number' ? ` ${Math.round(x.pacing_factor * 100)}%` : ''}`)
+  const held = throttle.slots?.pacing?.held_starts
+  const holds = typeof held === 'number' && held > 0
+    ? ` · ${held} card start${held === 1 ? '' : 's'} held by pacing in the last ${Math.round((throttle.slots.pacing.window_s || 300) / 60)} min` : ''
+  return `Throttle ${p === 0 ? 'off' : `${p}%`}${p > 0 && p < 100 ? cap : p >= 100 ? ' · holding every call' : ''}${rate}${paced.length ? ` · pacing: ${paced.join(', ')}` : ''}${holds}`
+}
+
+export function ThrottleBar({ throttle, onThrottle, error }) {
+  const [draft, setDraft] = useState(null)
+  if (!throttle) return null
+  const percent = draft == null ? Math.round(throttle.percent ?? 0) : draft
+  const commit = () => { const p = draft; setDraft(null); if (p != null && p !== Math.round(throttle.percent ?? 0)) onThrottle?.(p) }
+  return h('div', { className: 'hermes-fleet-throttle', 'data-slot': 'runners-throttle' },
+    h('input', {
+      type: 'range', min: 0, max: 100, step: 1, value: percent, disabled: !onThrottle, 'aria-label': 'Token throttle percent',
+      onChange: (e) => setDraft(Number(e.target.value)), onMouseUp: commit, onTouchEnd: commit, onKeyUp: commit, onBlur: commit
+    }),
+    h('span', { className: 'hermes-fleet-throttle-text', 'data-throttle': String(percent) },
+      draft == null ? throttleLine(throttle) : `Throttle ${draft}% (release to set)`),
+    error ? h('span', { className: 'hermes-fleet-warning' }, `⚠ ${text(error)}`) : null)
+}
+
 const SLOT_TITLE = { busy: 'busy', idle: 'free', offline: 'offline', unknown: 'state unknown' }
 
-function Slot({ state, title, onClick, onMouseEnter, slotId }) {
+function Slot({ state, title, onClick, onMouseEnter, slotId, throttled }) {
   return h(onClick ? 'button' : 'span', {
     type: onClick ? 'button' : undefined,
-    className: `hermes-fleet-slot is-${state}`,
+    className: `hermes-fleet-slot is-${state}${throttled ? ' is-throttled' : ''}`,
+    'data-throttled': throttled ? 'true' : undefined,
     title, 'aria-label': title, onClick, onMouseEnter,
     'data-runner-slot': slotId || undefined
   })
@@ -485,6 +548,7 @@ const GW_COLS = [
   ['waiting', 'Waiting', 'Unleased ready cards that match this machine and need a slot here'],
   ['ineligible', "Can't run", 'Unleased ready cards whose placement, skills or pins do not match this machine'],
   ['cpu', 'CPU', '1-min load ÷ cores'], ['ram', 'RAM', 'Memory in use'], ['disk', 'Disk free'],
+  ['tok', 'Tok/slot', 'In+out tokens per busy slot per minute, last 15 min'],
   ['count', 'Busy'], ['info', '']
 ]
 
@@ -505,7 +569,9 @@ function MeterCell({ k, v }) {
     h('span', { className: 'hermes-fleet-num' }, value))
 }
 
-function GatewayRow({ m, now }) {
+function GatewayRow({ m, now, limit }) {
+  const lim = slotLimit(m, limit)
+  const over = (i) => !!lim && i >= lim.allowed
   const free = m.slots == null ? 0 : Math.max(0, m.slots - m.running.length)
   const freeState = m.state === 'active' ? 'idle' : m.state === 'draining' ? 'draining' : 'unknown'
   const v = loadParts(m.load, now)
@@ -520,6 +586,7 @@ function GatewayRow({ m, now }) {
   const meta = [
     m.pinned_only ? 'pinned only' : null,
     m.slots == null ? 'slots not set' : m.slots_source === 'local' ? 'slots from local cap' : null,
+    lim && lim.throttled ? `${lim.throttled} slot(s) crossed out: ${lim.why}` : null,
     drainNote || m.reason,
     v ? (v.stale ? `load ${v.stale}` : null) : 'load not reported'
   ].filter(Boolean).join(' · ')
@@ -529,15 +596,24 @@ function GatewayRow({ m, now }) {
     h('span', { className: 'hermes-fleet-name' }, h('span', { className: 'hermes-fleet-machine-name' }, text(m.name)),
       drainNote ? h('span', { className: 'hermes-fleet-drain-label', title: drainNote }, m.state) : null),
     h('span', { className: 'hermes-fleet-slots' },
-      ...m.running.map((r) => h(Slot, {
-        key: `${r.board}/${r.task}`, state: m.state === 'lost' ? 'lost' : 'busy',
-        title: `${r.task} · ${text(r.title)}\nboard ${r.board}${r.started_at ? ` · running ${ago(now - r.started_at * 1000)}` : ''}`,
+      ...m.running.map((r, i) => h(Slot, {
+        key: `${r.board}/${r.task}`, state: m.state === 'lost' ? 'lost' : 'busy', throttled: over(i),
+        title: `${r.task} · ${text(r.title)}\nboard ${r.board}${r.started_at ? ` · running ${ago(now - r.started_at * 1000)}` : ''}${over(i) ? `\nover the limit: ${lim.why}` : ''}`,
         onClick: () => openCard(r)
       })),
-      ...Array.from({ length: free }, (_, i) => h(Slot, { key: `free-${i}`, state: freeState, title: drainNote || SLOT_TITLE[freeState] }))),
+      ...Array.from({ length: free }, (_, i) => {
+        const x = over(m.running.length + i)
+        return h(Slot, { key: `free-${i}`, state: freeState, throttled: x, title: drainNote || (x ? `cannot start: ${lim.why}` : SLOT_TITLE[freeState]) })
+      })),
     h('span', { className: 'hermes-fleet-cell hermes-fleet-waiting', title: m.waiting != null ? `${m.waiting} unleased ready card(s) for gateway-dispatched profiles match placement labels (including skill labels) on ${m.name}. Need a slot here; portable cards can also fit other machines. Does not include transient admission limits or machine availability.` : undefined }, m.waiting != null ? `${m.waiting}` : ''),
     h('span', { className: 'hermes-fleet-cell hermes-fleet-ineligible', title: m.ineligible != null ? `${m.ineligible} unleased ready card(s) for gateway-dispatched profiles cannot run here: placement labels, skill labels, machine pins or pinned-only policy do not match ${m.name}, or the card is another gateway's default-placement card that ${m.name} never picks up.` : undefined }, m.ineligible != null ? `${m.ineligible}` : ''),
     h(MeterCell, { k: 'cpu', v }), h(MeterCell, { k: 'ram', v }), h(MeterCell, { k: 'disk', v }),
+    h('span', {
+      className: `hermes-fleet-cell hermes-fleet-tok${limit?.cost_source === 'measured' ? '' : ' is-none'}`,
+      title: typeof limit?.tokens_per_slot_per_s === 'number'
+        ? (limit.cost_source === 'measured' ? 'measured on this machine, last 15 min' : 'fleet median: too little run time here to measure')
+        : 'not measured'
+    }, typeof limit?.tokens_per_slot_per_s === 'number' ? fmtTokens(limit.tokens_per_slot_per_s * 60) : '–'),
     h('span', { className: 'hermes-fleet-count' },
       m.slots == null ? `${m.running.length}` : `${m.running.length}/${m.slots}`),
     meta ? h('span', { className: 'hermes-fleet-info', role: 'img', tabIndex: 0, 'data-tip': meta, 'aria-label': `${text(m.name)}: ${meta}` }, 'i')
@@ -706,8 +782,8 @@ function StoppedNote({ machines, now }) {
     }, text(m.name))]))
 }
 
-export function Panel({ view, now, repairClient }) {
-  const s = summarize(view)
+export function Panel({ view, now, repairClient, throttle = null, onThrottle, throttleError }) {
+  const s = summarize(view, throttle)
   const stopped = view.gateways.machines.filter((m) => m.state === 'stopped')
   return h('div', { className: 'hermes-fleet' },
     h('div', { className: 'hermes-fleet-head' },
@@ -715,9 +791,10 @@ export function Panel({ view, now, repairClient }) {
       h('span', null, `${s.gBusy} / ${s.gSlots} slots busy`,
         s.gWaiting != null ? h('span', { title: 'Unleased ready cards assigned to gateway-dispatched profiles, counted once across board replicas. Excludes non-dispatched assignees; some cards cannot run on every machine.' }, ` · ${s.gWaiting} waiting`) : null)),
     h(SectionNote, { section: view.gateways }),
+    h(ThrottleBar, { throttle, onThrottle, error: throttleError }),
     h('div', { className: 'hermes-fleet-gw' },
       h(GatewayHead),
-      ...view.gateways.machines.filter((m) => m.state !== 'stopped').map((m) => h(GatewayRow, { key: m.name, m, now }))),
+      ...view.gateways.machines.filter((m) => m.state !== 'stopped').map((m) => h(GatewayRow, { key: m.name, m, now, limit: limitRow(throttle, m.name) }))),
     h(StoppedNote, { machines: stopped, now }),
     h('div', { className: 'hermes-fleet-head' },
       h('span', null, 'CI workers (GitHub Actions)'),
@@ -754,15 +831,18 @@ function useNow(active) {
 // Track = capacity, fill = scheduled. Green while there is room, red once every slot is taken.
 export function meterTone(m) {
   if (!m.slots) return 'none'
-  return m.busy >= m.slots ? 'full' : 'ok'
+  return m.busy >= Math.min(m.slots, m.usable ?? m.slots) ? 'full' : 'ok'
 }
 
 function Meter({ name, m }) {
   const tone = meterTone(m)
   const pct = m.slots ? Math.min(100, Math.round((m.busy / m.slots) * 100)) : 0
-  return h('span', { className: 'hermes-fleet-chipmeter', 'data-meter': name.toLowerCase(), 'data-tone': tone },
+  // The right end of the track is hatched for slots a token or pacing limit will not let start.
+  const cut = m.slots && typeof m.usable === 'number' ? Math.max(0, Math.min(100, Math.round(((m.slots - m.usable) / m.slots) * 100))) : 0
+  return h('span', { className: 'hermes-fleet-chipmeter', 'data-meter': name.toLowerCase(), 'data-tone': tone, 'data-throttled': cut ? String(m.slots - m.usable) : undefined },
     h('span', null, name),
-    h('span', { className: `hermes-fleet-chipbar is-${tone}` }, h('span', { style: { width: `${pct}%` } })))
+    h('span', { className: `hermes-fleet-chipbar is-${tone}` }, h('span', { style: { width: `${pct}%` } }),
+      cut ? h('i', { className: 'hermes-fleet-chipcut', style: { width: `${cut}%` } }) : null))
 }
 
 // The React Query cache keeps the last view across refetches (no flicker, no spinner);
@@ -789,12 +869,33 @@ export function Runners({ ctx }) {
   useEffect(() => { if (open && visible) query.refetch() }, [open])
   const now = useNow(open && visible)
   const view = query.data
-  const s = view ? summarize(view) : null
+  // The token throttle and per-gateway slot limits (throughput plugin). Absent or failing: nothing is crossed out.
+  const [throttleError, setThrottleError] = useState(null)
+  const tq = useQuery({
+    queryKey: ['runners', 'throttle'],
+    queryFn: async () => { try { return await bridge(THROTTLE_PATH) } catch { return null } },
+    refetchInterval: visible ? POLL_OPEN_MS : false,
+    refetchIntervalInBackground: false,
+    refetchOnWindowFocus: false,
+    retry: false,
+    staleTime: 5000
+  })
+  const throttle = tq.data && typeof tq.data === 'object' && 'percent' in tq.data ? tq.data : null
+  const onThrottle = async (percent) => {
+    try {
+      await bridge(THROTTLE_PATH, { method: 'PUT', body: { percent } })
+      setThrottleError(null)
+    } catch (e) {
+      setThrottleError(`throttle not set: ${e?.message || e}`)
+    }
+    tq.refetch()
+  }
+  const s = view ? summarize(view, throttle) : null
   const label = s
     ? `Runners · hub ${s.hub.busy}/${s.hub.slots} · workers ${s.workers.busy}/${s.workers.slots}`
     : 'Runners …'
   const title = s
-    ? `Hub ${s.hub.busy}/${s.hub.slots} slots scheduled · Workers ${s.workers.busy}/${s.workers.slots} · CI ${s.cBusy}/${s.cSlots} busy${s.gWaiting ? ` · ${s.gWaiting} waiting` : ''}${s.lost ? ` · ${s.lost} machine lost` : ''}`
+    ? `Hub ${s.hub.busy}/${s.hub.slots} slots scheduled · Workers ${s.workers.busy}/${s.workers.slots}${typeof s.workers.usable === 'number' && s.workers.usable < s.workers.slots ? ` (${s.workers.slots - s.workers.usable} throttled)` : ''} · CI ${s.cBusy}/${s.cSlots} busy${s.gWaiting ? ` · ${s.gWaiting} waiting` : ''}${s.lost ? ` · ${s.lost} machine lost` : ''}`
     : 'Loading runners'
   // With the lanes plugin loaded, the chip opens the lanes panel (it has a Runners button back to this one);
   // `hermes-show-runners` still opens this popover directly.
@@ -847,11 +948,11 @@ const CSS = `
 .hermes-fleet-group-meta{font-size:11px;color:var(--ui-text-tertiary);white-space:nowrap}
 .hermes-fleet-chev{color:var(--ui-text-tertiary);font-size:10px}
 .hermes-fleet-group>.hermes-fleet-row{padding-left:18px}
-.hermes-fleet-gw{display:grid;grid-template-columns:repeat(7,max-content) minmax(max-content,1fr) max-content;row-gap:3px}
+.hermes-fleet-gw{display:grid;grid-template-columns:repeat(8,max-content) minmax(max-content,1fr) max-content;row-gap:3px}
 .hermes-fleet-gw>.hermes-fleet-row,.hermes-fleet-cols{display:grid;grid-column:1/-1;grid-template-columns:subgrid;column-gap:16px;align-items:center;white-space:nowrap}
 .hermes-fleet-gw>.hermes-fleet-row>*{grid-row:1}
 .hermes-fleet-cols{font-size:10px;text-transform:uppercase;letter-spacing:.04em;color:var(--ui-text-tertiary)}
-.hermes-fleet-cols>[data-col=waiting],.hermes-fleet-cols>[data-col=ineligible],.hermes-fleet-cols>[data-col=count]{text-align:right}
+.hermes-fleet-cols>[data-col=waiting],.hermes-fleet-cols>[data-col=ineligible],.hermes-fleet-cols>[data-col=count],.hermes-fleet-cols>[data-col=tok]{text-align:right}
 .hermes-fleet-gw .hermes-fleet-name{grid-column:1;max-width:150px;display:flex;align-items:center;gap:6px}
 .hermes-fleet-machine-name{min-width:0;overflow:hidden;text-overflow:ellipsis}
 .hermes-fleet-drain-label{flex-shrink:0;font-size:10px;opacity:.75}
@@ -865,11 +966,13 @@ const CSS = `
 .hermes-fleet-gw .hermes-fleet-meter[data-meter=disk]{grid-column:7}
 .hermes-fleet-gw .hermes-fleet-meter.is-stale,.hermes-fleet-gw .hermes-fleet-meter.is-none{color:var(--ui-text-tertiary)}
 .hermes-fleet-gw .hermes-fleet-num{flex:1;text-align:right}
-.hermes-fleet-gw .hermes-fleet-info{grid-column:9;margin-left:-8px;position:relative;box-sizing:border-box;width:13px;height:13px;border:1px solid var(--ui-text-tertiary);border-radius:50%;display:inline-flex;align-items:center;justify-content:center;font:italic 600 9px/1 Georgia,serif;color:var(--ui-text-secondary);cursor:help}
+.hermes-fleet-gw .hermes-fleet-info{grid-column:10;margin-left:-8px;position:relative;box-sizing:border-box;width:13px;height:13px;border:1px solid var(--ui-text-tertiary);border-radius:50%;display:inline-flex;align-items:center;justify-content:center;font:italic 600 9px/1 Georgia,serif;color:var(--ui-text-secondary);cursor:help}
 .hermes-fleet-gw .hermes-fleet-info.is-empty{visibility:hidden}
 .hermes-fleet-gw .hermes-fleet-info:hover::after,.hermes-fleet-gw .hermes-fleet-info:focus-visible::after{content:attr(data-tip);position:absolute;right:-2px;top:calc(100% + 5px);z-index:5;padding:3px 7px;border:1px solid var(--ui-stroke-secondary);border-radius:5px;background:var(--ui-bg,#1b1b1f);color:var(--ui-text-primary,inherit);font:normal 400 11px/1.4 system-ui,sans-serif;white-space:normal;width:max-content;max-width:min(480px,calc(100vw - 32px));overflow-wrap:anywhere;box-shadow:0 2px 8px rgba(0,0,0,.35);pointer-events:none}
 .hermes-fleet-gw .hermes-fleet-info:hover,.hermes-fleet-gw .hermes-fleet-info:focus-visible{border-color:var(--ui-text-secondary);color:inherit;outline:none}
-.hermes-fleet-gw .hermes-fleet-count{grid-column:8}
+.hermes-fleet-gw .hermes-fleet-count{grid-column:9}
+.hermes-fleet-gw .hermes-fleet-tok{grid-column:8;margin:0;text-align:right}
+.hermes-fleet-gw .hermes-fleet-tok.is-none{color:var(--ui-text-tertiary)}
 .hermes-fleet-note,.hermes-fleet-foot{font-size:11px;color:var(--ui-text-tertiary)}
 .hermes-fleet-foot{margin-top:8px}
 .hermes-fleet-pop{grid-column:1/-1;display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:2px 0 4px;padding:6px;border:1px solid var(--ui-stroke-secondary);border-radius:6px;background:var(--ui-bg)}
@@ -878,6 +981,12 @@ const CSS = `
 .hermes-fleet-pop button:disabled{opacity:.55}
 .hermes-fleet-slot{display:inline-block;width:10px;height:10px;border-radius:2px;border:1px solid var(--ui-text-tertiary);padding:0;background:transparent}
 button.hermes-fleet-slot{cursor:pointer}
+.hermes-fleet-slot.is-throttled{position:relative;border-color:#d08a1e;background-image:linear-gradient(45deg,transparent calc(50% - .6px),#d08a1e calc(50% - .6px),#d08a1e calc(50% + .6px),transparent calc(50% + .6px)),linear-gradient(-45deg,transparent calc(50% - .6px),#d08a1e calc(50% - .6px),#d08a1e calc(50% + .6px),transparent calc(50% + .6px))}
+.hermes-fleet-slot.is-busy.is-throttled{background-color:var(--ui-accent);border-color:var(--ui-accent);background-image:linear-gradient(45deg,transparent calc(50% - .6px),var(--ui-bg,#fff) calc(50% - .6px),var(--ui-bg,#fff) calc(50% + .6px),transparent calc(50% + .6px)),linear-gradient(-45deg,transparent calc(50% - .6px),var(--ui-bg,#fff) calc(50% - .6px),var(--ui-bg,#fff) calc(50% + .6px),transparent calc(50% + .6px))}
+.hermes-fleet-throttle{display:flex;align-items:center;gap:8px;font-size:11px;color:var(--ui-text-secondary);margin:2px 0 4px}
+.hermes-fleet-throttle input[type=range]{width:120px;flex-shrink:0}
+.hermes-fleet-chipbar{position:relative}
+.hermes-fleet-chipcut{position:absolute;right:0;top:0;height:100%;background:repeating-linear-gradient(45deg,transparent 0 2px,#d08a1e 2px 3px)}
 .hermes-fleet-slot.is-busy{background:var(--ui-accent);border-color:var(--ui-accent)}
 .hermes-fleet-slot.is-offline,.hermes-fleet-slot.is-unknown{border-style:dotted;opacity:.6}
 .hermes-fleet-slot.is-draining{background:repeating-linear-gradient(45deg,transparent 0 2px,var(--ui-text-tertiary) 2px 3px)}
