@@ -19,9 +19,11 @@ const COLORS = ['#f0a43a', '#8fb0ff', '#5fd4e6', '#d982f0', '#b4bac6', '#3ddc97'
 
 // ── which gateway to talk to ──────────────────────────────────────────────
 // Lanes are configured on one gateway (the one that holds the board and runs the dispatcher), which is often
-// not the gateway this Desktop is attached to. The source asks the attached gateway first, then every other
-// connection once (a request with a connectionId and no profile is answered by that connection's default
-// profile), and settles on the first that answers `configured: true`; reads and writes then go to that one.
+// not the gateway this Desktop has in front. The source asks every connection once, by id (a request with a
+// connectionId and no profile is answered by that connection's default profile), and settles on the first that
+// answers `configured: true`; reads and writes then go to that connection by id, so they do not follow the
+// window when another gateway comes to the front. Only when the Desktop lists no connections does it fall back
+// to an untagged request, which goes to whichever gateway is in front.
 // A settled gateway is kept through failures: one failed read is an error to show and retry (gateways restart
 // several times a day), and only FAILURES_BEFORE_REDISCOVERY in a row, or an answer that says lanes are no
 // longer configured there, starts a new search. While no gateway has lanes the search repeats every
@@ -31,7 +33,7 @@ export const FAILURES_BEFORE_REDISCOVERY = 3
 const validRoute = (r) => r && ['connectionId', 'targetProfile'].every((k) => typeof r[k] === 'string' && r[k].trim())
 
 export function createSource(ctx, hostRef = host, clock = () => Date.now()) {
-  let chosen // { connectionId } | { connectionId: null } (the attached gateway) | undefined (not found yet)
+  let chosen // { connectionId } | { connectionId: null } (no connections listed: whichever is in front) | undefined
   let failures = 0
   let sweptAt = -Infinity
   let unconfigured // the answer shown while no gateway has lanes
@@ -39,10 +41,8 @@ export function createSource(ctx, hostRef = host, clock = () => Date.now()) {
   async function candidates() {
     let list = []
     try { list = ((await hostRef.profileRoutes()) || []).filter(validRoute) } catch { list = [] }
-    // The attached connection is asked without an id; its own routes are marked primary.
-    const others = new Set(list.filter((r) => !r.primary).map((r) => r.connectionId))
-    for (const r of list) if (r.primary) others.delete(r.connectionId)
-    return [{ connectionId: null }, ...[...others].map((connectionId) => ({ connectionId }))]
+    const ids = [...new Set(list.map((r) => r.connectionId))]
+    return ids.length ? ids.map((connectionId) => ({ connectionId })) : [{ connectionId: null }]
   }
   async function discover(path) {
     sweptAt = clock()
@@ -57,6 +57,7 @@ export function createSource(ctx, hostRef = host, clock = () => Date.now()) {
       } catch (e) { unreachable.push(String(e?.message || e).slice(0, 80)) }
     }
     chosen = undefined
+    unconfigured = undefined // nothing to show from an older search if this one throws
     if (!first) throw Error(unreachable[0] || 'No gateway answered')
     const missed = unreachable.length ? `; ${unreachable.length} other gateway(s) could not be reached (${unreachable[0]})` : ''
     unconfigured = { ...first, configured: false, reason: `${first?.reason || 'No lanes are configured.'}${missed}` }
@@ -76,7 +77,7 @@ export function createSource(ctx, hostRef = host, clock = () => Date.now()) {
     failures = 0
     return body?.configured === true ? body : discover(path)
   }
-  // `target` is the gateway a draft was made against: an Apply sends every lane there even if a poll
+  // `target` is the gateway chosen when Apply was pressed: every lane of that Apply goes there even if a poll
   // re-discovers meanwhile.
   async function write(lane, body, target = chosen) {
     if (!target) throw Error('No gateway with lanes configured')
