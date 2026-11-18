@@ -53,10 +53,11 @@ of `{"argv": ["approved-reader", "..."]}`. Each authorized unattended reader mus
 `red_cards.py list --local-json` from that gateway. Discover the full gateway roster before
 configuring it; include offline gateways, not only currently reachable ones. Never add SSH
 credentials or enable a transport to evade an approval. Missing configuration and failed
-readers print `unreachable ...`; neither means zero cards. Replicas can lag and do not prove
+readers print `unreachable ...`; neither means zero cards: read those gateways directly (and set up
+managed-worker readers) per `references/remote-homed-cards.md`. Replicas can lag and do not prove
 owner reachability. Check the roster against configured readers each sweep; an omitted gateway
 is a coverage gap. A live local non-red row takes precedence over its stale replica.
-For managed workers, check the monitor host's already-authorized instance-role SSM route before leaving a placeholder unreachable reader. Discover running instances by exact configured identity, require a unique match, and use GetCommandInvocation (ListCommandInvocations may be intentionally denied). A bounded read-only snapshot can ship a reviewed pinned collector when the worker's installed CLI is older. Keep the whole reader below the inventory caller timeout, bound delivery/execution too, compress stdout to stay within SSM's response cap, and fail closed on truncated output. Never grant new IAM access or restart a worker to make inventory green. Record gateway-local blocked-event IDs: replica event IDs are not owner event IDs.
+Record gateway-local blocked-event IDs: replica event IDs are not owner event IDs.
 
 Classify decision-session items alongside cards. Re-test stale `us_*` premises and withdraw
 through the supported user-steps/action_request withdrawal route; never edit `state.db`.
@@ -79,7 +80,8 @@ did not end with `end_reason='startup_orphan_reap'`. Report **unlinked** (no lin
 **reaped-only** cards separately: no chat will ever pick them up.
 
 Then for each card read the latest ~6 `task_events` and the last 2 `task_comments`. The latest comment often
-already says "resolved", "green again" or "replacement found". The block reason alone is stale evidence.
+already says "resolved", "green again" or "replacement found". The block reason alone (newest `blocked` event payload, not a `tasks`
+column) is stale evidence.
 For a card from a recurring reporter, also list newer cards with the same title or `created_by`: a done sibling
 may have settled the question. Then read the files it claims on disk, since a redeploy from the tracked source
 can revert a worker's local edit after the card reported it.
@@ -300,8 +302,7 @@ and the final response.
   giving a reason that names the owning surface, so the user isn't asked twice.
 - An old ask missing what unblock and archive mean: amend it in place with `hermes kanban block <id> "<same reason>"
   --human-request "$(cat hr.json)" --metadata-only` (prints `Classified ... (metadata only; remains parked)`). Read the
-  current human_request and block reason first (tasks row or last block event payload), so only the action changes.
-- Before saying an ask is still blocked, re-read it: the user may have answered on another surface since the last read.
+  current human_request and block reason first (newest `blocked` event payload), so only the action changes.
 - Re-read each card's status and new events inside the script that writes to it; skip it if another chat changed it.
 
 ## Done means
@@ -312,5 +313,5 @@ and the final response.
 - [ ] Each decision card was either unblocked on your recommendation (comment says it is a guess under the standing rule) or asked because you were really unsure?
 - [ ] Cards still waiting on the user are linked via `notify-subscribe --platform tui`, read back `released=0`?
 - [ ] The remaining asks went out as no-timeout `clarify` batches (recommended first, Skip last, no card ids), each answer recorded on its card, and stale For-you requests withdrawn?
-- [ ] The report names the unlinked and reaped-only cards that still need the user?
+- [ ] The report names the unlinked and reaped-only cards that still need the user, and every status and count in it was read on its home board this turn (he may have answered since), earlier-turn writes worded as earlier (coach `claimed_mutation` rejects older write claims)?
 - [ ] Every red card has a `red_cards.py log` line with class, action, avoidable and a prevention slug, and any slug at 3+ in `stats` has its one prevention card?
