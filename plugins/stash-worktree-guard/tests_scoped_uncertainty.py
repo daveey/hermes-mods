@@ -145,6 +145,29 @@ WRAPPER_STDIN = {
 REFUSE.update(WRAPPED_GIT)
 REFUSE.update(WRAPPED_MUTATIONS)
 REFUSE.update(WRAPPER_STDIN)
+# Review round 5 (PR #252 @63314c7c): an unknown quoted head may be consumed by its wrapper
+# (`env "$A"` with A=X=1, `flock L "$A"` with A=env), so the rest of the argv is the real
+# command. Its suffix reading is not split again, so a nested runner or interpreter there
+# (`xargs -a args git`) runs input the guard never analyzed: never scoped locally.
+_ARGS = "printf 'stash pop' > args.txt; "
+WRAPPER_DEFERRED = {
+    "deferred-env-assign-xargs-a": "A=$(printf A=1); " + _ARGS + 'flock /tmp/l env "$A" xargs -a args.txt git',
+    "deferred-env-assign-xargs-stdin": "A=$(printf A=1); " + _ARGS + 'flock /tmp/l env "$A" xargs git < args.txt',
+    "deferred-env-assign-xargs-long": "A=$(printf A=1); " + _ARGS
+                                      + 'flock /tmp/l env "$A" xargs --arg-file=args.txt git',
+    "deferred-env-assign-xargs-path": "A=$(printf A=1); " + _ARGS + 'flock /tmp/l env "$A" /usr/bin/xargs -a args.txt git',
+    "deferred-env-assign-dashdash": "A=$(printf A=1); " + _ARGS + 'flock /tmp/l env -- "$A" xargs -a args.txt git',
+    "deferred-env-assign-nice": "A=$(printf A=1); " + _ARGS + 'flock /tmp/l env "$A" nice xargs -a args.txt git',
+    "deferred-env-assign-timeout": "A=$(printf A=1); " + _ARGS + 'flock /tmp/l env "$A" timeout 5 xargs -a args.txt git',
+    "deferred-flock-consumed-head": "A=$(printf env); " + _ARGS + 'flock /tmp/l "$A" xargs -a args.txt git',
+    "deferred-env-assign-parallel": "A=$(printf A=1); " + _ARGS + 'flock /tmp/l env "$A" parallel -a args.txt git',
+    "deferred-env-assign-python": "A=$(printf A=1); printf 'import os; os.system(\"git stash pop\")' > s.py; "
+                                  'flock /tmp/l env "$A" python3 s.py',
+}
+REFUSE.update(WRAPPER_DEFERRED)
+# Controls: the same consumed head before a program that runs nothing stays allowed.
+ALLOW["deferred-control-grep"] = "A=$(printf A=1); " + _ARGS + 'flock lock env "$A" grep -c pop args.txt'
+ALLOW["deferred-control-cat"] = "A=$(printf A=1); " + _ARGS + 'flock lock env "$A" cat args.txt'
 
 
 @pytest.mark.parametrize("name", [n for n in WRAPPED_MUTATIONS if n.endswith("-drop")])
@@ -165,7 +188,8 @@ def test_refused_mutation_really_drops_shared_stash(wt, tmp_path, name):
 _REAL_PROG = {"wrapped-flock": "flock", "wrapped-flock-cmdsub": "flock",
               "wrapped-xargs-herestring": "xargs", "wrapped-setsid": "setsid",
               "wrapped-ionice": "ionice", "wrapped-taskset": "taskset",
-              **{n: "flock" for n in WRAPPER_STDIN if n != "wrapper-stdin-token-broker"}}
+              **{n: "flock" for n in WRAPPER_STDIN if n != "wrapper-stdin-token-broker"},
+              **{n: "flock" for n in WRAPPER_DEFERRED if n != "deferred-env-assign-parallel"}}
 
 
 @pytest.fixture
