@@ -108,6 +108,10 @@ HINTS = {
                    "\"none\"/\"all\" claim from it, select `issueCount` (GraphQL) or `total_count` (REST) and split the "
                    "window until each part is under 1000; PRs merged in a window: "
                    "github-ci-wait `scripts/merged_since.py` (exits 3 at the cap)."),
+    "gated_dispatch": ("Helper {delegation} is dispatched, not started: its goal makes the work conditional on an "
+                       "admission, reservation, slot or pacing hold it has not obtained yet (\"{gate}\"). Until its "
+                       "result shows it got one, report it as dispatched and conditional (\"starts only if "
+                       "admitted\"), never \"started\" or \"underway\", and say what you will do if it is refused."),
 }
 
 # plan_first: a new build ask (a build verb plus a real spec), not a fix/bug report and not already a go.
@@ -1891,6 +1895,56 @@ def search_cap(tool: str, args: dict, result: Any) -> Optional[str]:
     end = out.find("\n", m.end())
     line = out[start:end if end >= 0 else len(out)].strip()
     return line[:120] or "1000"
+
+
+# gated_dispatch (agent-376c3d93de): a background delegate_task whose goal makes the work conditional on admission
+# ("Obtain supported sole-writer reservation before editing; if pacing expressly bars execution report exact wall
+# instead") came back `dispatched`, and the agent told the user "The correction is started". The helper got no
+# reservation and changed nothing. The dispatch result now carries one hint per delegation saying it is not a start.
+_GATE_NOUN = r"(?:reservation|admission|admitted|slot|lease|pacing|quota|capacity|dispatcher|execution\s+grant)"
+GATED_GOAL_RE = re.compile(
+    # obtain/acquire ... <gate noun> ... before <editing|any edit|changing|starting>
+    r"\b(?:obtain|get|acquire|secure|hold|wait\s+for)\w*\b[^.;\n]{0,60}?\b" + _GATE_NOUN + r"\b[^.;\n]{0,40}?"
+    r"\bbefore\s+(?:any\s+|making\s+|starting\s+)?(?:edit|chang|writ|fix|implement|start|work)\w*"
+    # if <gate noun> ... bars/refuses/denies/blocks/holds ...
+    r"|\bif\b[^.;\n]{0,40}?\b" + _GATE_NOUN + r"\b[^.;\n]{0,40}?\b(?:bar|refuse|den(?:y|ie)|block|hold|forbid)s?\b"
+    # only if/once/after ... admitted / a reservation / a slot
+    r"|\b(?:only|once)\s+(?:if|when|after|once)\b[^.;\n]{0,30}?\b" + _GATE_NOUN + r"\b",
+    re.I)
+
+
+def _dispatch_goals(a: dict, d: dict) -> list:
+    """The goal texts of a delegate_task spawn: its args' tasks (or single goal) and the result's `goals` echo."""
+    raw = a.get("tasks")
+    tasks: list = raw if isinstance(raw, list) else [{"goal": a.get("goal")}]
+    goals = [str(t.get("goal") or "") for t in tasks if isinstance(t, dict)]
+    echo = d.get("goals")
+    return goals + [g for g in (echo if isinstance(echo, list) else []) if isinstance(g, str)]
+
+
+def gated_dispatch(tool: str, args: Any, result: Any) -> Optional[str]:
+    """The delegation id (or "helper") of a background delegate_task spawn whose result says `dispatched` and whose
+    goal is gated on admission/reservation/pacing, else None."""
+    if (tool or "").rsplit("__", 1)[-1] != "delegate_task":
+        return None
+    a = args if isinstance(args, dict) else {}
+    if str(a.get("action") or "spawn") != "spawn":
+        return None
+    d = _as_dict(result)
+    if d is None or str(d.get("status") or "") != "dispatched":
+        return None
+    if not any(GATED_GOAL_RE.search(g) for g in _dispatch_goals(a, d)):
+        return None
+    return str(d.get("delegation_id") or "helper")
+
+
+def gated_phrase(args: Any, result: Any) -> str:
+    """The gate clause gated_dispatch matched, for the hint."""
+    for g in _dispatch_goals(args if isinstance(args, dict) else {}, _as_dict(result) or {}):
+        m = GATED_GOAL_RE.search(g)
+        if m:
+            return " ".join(m.group(0).split())[:120].replace("{", "(").replace("}", ")").replace('"', "'")
+    return ""
 
 
 _HEAVY_EXEC = {"pytest", "py.test", "run_tests.sh", "test-all", "vitest", "wait_for_ci.py"}
@@ -4530,6 +4584,16 @@ class AgentCoach:
         if shown:
             self._fire(self._s(sid), sid, "search_cap", "session",
                        shown=shown.replace("{", "(").replace("}", ")").replace("`", "'"))
+
+    def check_gated_dispatch(self, sid: str, tool: str, args: Any, result: Any) -> None:
+        """gated_dispatch rule (once per delegation): a background helper dispatched with an admission-gated goal.
+        Run from transform_tool_result so the hint lands on the dispatch result itself."""
+        if not sid:
+            return
+        deleg = gated_dispatch(tool, args, result)
+        if deleg:
+            self._fire(self._s(sid), sid, "gated_dispatch", deleg, delegation=deleg,
+                       gate=gated_phrase(args, result))
 
     def check_metric_split(self, sid: str, tool: str, args: Any) -> None:
         """metric_split rule (once per number per session): a kanban_complete/comment/create text with a metric score
