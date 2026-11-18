@@ -38,6 +38,7 @@ const MACHINE_POLL_MS = 30_000
 const LINEAGE_TTL_MS = 5 * 60_000
 const MAX_LABEL = 38
 const KANBAN_ACTIVE = new Set(['todo', 'ready', 'running', 'scheduled', 'blocked', 'review', 'triage'])
+const REPORTED_CLOSED = new Set(['done', 'archived'])
 const SUBAGENT_DONE = new Set(['completed', 'failed', 'interrupted', 'cancelled', 'timeout', 'error'])
 
 const STATE_COLOR = {
@@ -370,6 +371,10 @@ function taskChip(t, status) {
     board: str(t.board) || 'default',
     stale: Boolean(t.stale),
     state: status,
+    // What the owner last reported for a closed card this chat still holds unreleased (`done_pending_release`, or
+    // `unknown` beside `reported_status`): display only, the state stays unknown. A stale read reports nothing.
+    reported: status === 'unknown' && t.unfinished && !t.stale
+      ? (str(t.status) === 'done_pending_release' ? 'done' : REPORTED_CLOSED.has(str(t.reported_status)) ? str(t.reported_status) : null) : null,
     label: str(t.title) || t.id,
     assignee: str(t.assignee) || null,
     // Where the card runs or will run (backend `run_machine`): 'hub', a worker name, 'worker-pool', or null.
