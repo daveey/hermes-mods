@@ -249,6 +249,9 @@ and the final response.
 
 ## Pitfalls
 
+- A remote-homed card's replica row (`kanban/sync-shadow/`) is only as fresh as its home gateway's newest event: a
+  sleeping Mac's heartbeats arrive late in a batch. Check that age first, then the host's own board, and report
+  "unknown" rather than "stalled" when it is stale (`references/replica-freshness.md`).
 - `gh` on the hub default profile is not logged in. Use `token-broker exec --scope user/github -- gh ...`.
 - `gh pr edit` can fail on a deprecated-Projects GraphQL error and change nothing. Use REST and read it back:
   `gh api -X PATCH repos/<o>/<r>/pulls/<N> --input body.json`, `gh api -X POST repos/<o>/<r>/issues/<N>/labels -f 'labels[]=<l>'`.

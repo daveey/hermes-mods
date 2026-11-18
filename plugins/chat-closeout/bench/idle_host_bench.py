@@ -49,6 +49,7 @@ def main() -> int:
     ap.add_argument("--replica-rows", type=int, default=3000)
     ap.add_argument("--ticks", type=int, default=12)
     ap.add_argument("--unrelated-churn", action="store_true", help="change a non-batch board task each tick")
+    ap.add_argument("--sibling-churn", action="store_true", help="change one working sibling card and transcript each tick")
     ap.add_argument("--json", type=Path)
     args = ap.parse_args()
     sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -79,7 +80,7 @@ def main() -> int:
             batch = rng.sample(running, 2)
             led.write(next(sids), batch=batch, open=batch)
         churn_id = None
-        if args.unrelated_churn:
+        if args.unrelated_churn or args.sibling_churn:
             from hermes_cli import kanban_activity_revision as rev
             used = {k for r in led.pending() for k in r['batch']}
             churn_id = next(t for t in tids if t not in used)
@@ -132,6 +133,13 @@ def main() -> int:
             if churn_id is not None:
                 with sqlite3.connect(world['board']) as conn:
                     conn.execute('UPDATE tasks SET title=? WHERE id=?', (f'unrelated tick {clock.wall}', churn_id))
+            if args.sibling_churn:
+                sibling = next(r for r in led.pending() if r['batch'] and r['batch'][0] in running)
+                with sqlite3.connect(world['board']) as conn:
+                    conn.execute('UPDATE tasks SET title=? WHERE id=?', (f'sibling tick {clock.wall}', sibling['batch'][0]))
+                with sqlite3.connect(home / 'state.db') as conn:
+                    conn.execute('INSERT INTO messages (session_id, role, content, timestamp, active) VALUES (?,?,?,?,1)',
+                                 (sibling['session_id'], 'user', 'fixture sibling activity', clock.wall))
             c0 = time.thread_time()
             plugin._host_pass(False)
             totals.append((time.thread_time() - c0) * 1000.0)

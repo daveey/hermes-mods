@@ -25,6 +25,29 @@ The mutable base-drift read stays **last**, after approval/hold checks, so the
 optimization does not widen the final base-read race. Optional turn acquisition
 starts only when its budget fits; lack of time never changes a refusal to allow.
 
+The merge-only speculative scan omits the merging PR's **own old-ticket drift
+history**, not its verdict validation or changed-head approval/carry policy.
+This provisional result is not stored as full eligibility. Admission still needs
+approval and the final **fresh** compare: for a clean final snapshot the omitted
+drift-yield predicate is false; an overlapping or unreadable final snapshot
+refuses regardless of turn selection. Earlier/indirect peers and nontransitive
+ordering are unchanged. This is not an unconditional own-ticket reservation.
+If final drift refuses and own eligibility was deferred, the hook directs the
+caller to `--land-turn` instead of speculatively resolving history/acquisition.
+Standalone readers, acquisition and `--land-turn` retain the full yield rule.
+
+`tests_own_ticket_budget.py` exercises the full command hook with six tickets:
+old own clean admission takes four causal subprocess rounds (14.8 seconds at
+3.7 seconds/read) within the unchanged deadline; old own overlap reports
+update-branch guidance. It covers admission equivalence, fresh own drift,
+standalone fairness, cache isolation, held-waiter drift, timeout/late-result
+refusal and no late writes. `tests_turn.SimClock` honors subprocess timeouts,
+starts nested children at their parent's dispatch time and propagates completion
+on join. A waiter needing five serial rounds at 3.7 seconds/read genuinely
+exhausts 18 seconds and must still fail closed; best-effort attribution cannot
+repair an already-exhausted canonical compare. `tests_final_drift_order.py`
+proves a state push during parallel work defeats an earlier cached clean compare.
+
 Preflights taking at least one second log elapsed time and allowed/refused status,
 without logging submitted commands. `tests_budget.py` and `tests_parallel.py`
 cover registration, clipping, nested context propagation, named real subprocess
@@ -192,6 +215,27 @@ carry verdict). Objects are content-addressed, missing ones are fetched, and a
 broken store makes git fail, which refuses; the store is trusted like the local
 `git` binary. An expired deadline during the probe still fails closed.
 Tests: `tests_carry_reference.py`.
+**Lifting shallow cuts whose parents are present (t_01a1e3427f6574fc).** The
+depth bound assumed each merge base sits within 128 commits of its merge's
+tips. State moves about 300 commits a day, so a state PR refreshed after
+sitting approved for most of a day had its carry refused ("fetch depth cuts
+history before the merge base") even when the borrowed store held every
+commit below the cut, and each refresh needed a fresh review. Right after the
+fetch, still under its lock and before any reader runs, each commit the fetch
+recorded in `shallow` is lifted only when every parent named in its raw
+object (`git cat-file commit`, which the graft does not hide) exists as a
+commit (`git cat-file -e <parent>^{commit}`). `shallow` is rewritten
+atomically with the cuts that stay, or removed when none stay. A present
+parent came either from a store `_borrow` validated as non-shallow and
+non-partial (expected complete ancestry) or from the fetch within depth (its
+own ancestry present or still cut). Missing needed ancestry makes git fail,
+which refuses. A cut with any absent parent or failed cut read/parent probe
+stays; independently validated cuts may still lift. A failed shallow-file
+read or rewrite leaves the whole file unchanged. The fetch, the
+merge-base rules and every refusal text are unchanged. Measured on PR #3381's
+refresh merge (its merge base 322 commits below the merged state tip): with
+`~/code/hermes` borrowed, the carry verdict went from the depth refusal to
+clean in 6.0 s. Tests: `tests_carry_lift.py`, `tests_carry_credentials.py`.
 Any failed or odd read refuses with the
 reason; a blocking verdict on H itself is never overridden. Base drift is
 checked separately and still applies. Why: #1812, #1837 and #2438 were refused

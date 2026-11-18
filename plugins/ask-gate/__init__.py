@@ -353,8 +353,20 @@ def run_judge(session_id: str, asks: list[str], tools: list[dict], reply: str = 
 
 # ---- L1 + L4 ------------------------------------------------------------------------------------------
 _WRAP = re.compile(r"\[OUT-OF-BAND USER MESSAGE[^\]]*\]\s*(.*?)\s*\[/OUT-OF-BAND USER MESSAGE\]", re.S)
-# Runtime-written user rows carry these display_kinds (the set user-steps uses for the same question).
-_RUNTIME_KINDS = frozenset({"kanban_notice", "auto_continue"})
+# Runtime-written user rows carry these display_kinds: core's machinery kinds (agent/turn_empty_response.py
+# _MACHINERY_DISPLAY_KINDS) plus auto_continue. Listing only kanban_notice/auto_continue let an internal_notification
+# row (core's "⏳ ... ready 30 min with no worker" notice) through as David's answer to an open ask.
+# internal_notification also relays a canonical user decision (David's own button choice), which stays answer
+# evidence; "steer" is David's typed mid-turn message.
+_RUNTIME_KINDS = frozenset({"kanban_notice", "auto_continue", "internal_notification", "process_complete",
+                            "async_delegation_complete", "loop_tick"})
+
+
+def _runtime_row(kind: Any, content: Any) -> bool:
+    if (kind or "") not in _RUNTIME_KINDS:
+        return False
+    return not (kind == "internal_notification" and isinstance(content, str)
+                and content.lstrip().startswith(approval_reuse.DECISION_PREFIX))
 
 
 def _human_text(msg: str) -> str | None:
@@ -371,7 +383,7 @@ def _runtime_turn(user_message: str, history: list) -> bool:
     for m in reversed(history if isinstance(history, list) else []):
         if isinstance(m, dict) and m.get("role") == "user":
             content = m.get("content")
-            return ((m.get("display_kind") or "") in _RUNTIME_KINDS and isinstance(content, str)
+            return (_runtime_row(m.get("display_kind"), content) and isinstance(content, str)
                     and content.strip()[:200] == (user_message or "").strip()[:200])
     return False
 
@@ -387,7 +399,7 @@ def pre_llm_call(session_id: str = "", user_message: str = "", conversation_hist
     try:
         LOG.reset(session_id)
         hist = [m.get("content") for m in (conversation_history or []) if isinstance(m, dict) and m.get("role") == "user"
-                and isinstance(m.get("content"), str) and (m.get("display_kind") or "") not in _RUNTIME_KINDS]
+                and isinstance(m.get("content"), str) and not _runtime_row(m.get("display_kind"), m.get("content"))]
         runtime = _runtime_turn(user_message or "", conversation_history or [])
         users = [t for t in (_human_text(h) for h in hist + ([] if runtime else [user_message or ""])) if t]
         LOG.set_users(session_id, users)

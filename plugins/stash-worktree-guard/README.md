@@ -254,6 +254,14 @@ look for its `mods-reload: ... ok (stash-worktree-guard)` activation receipt or 
 
 ## Explicit out-of-scope compositions
 
+Programs defined on the filesystem are outside the guard's static model: executable
+scripts (such as `./s.sh`), Makefile targets, custom `git --exec-path` helpers, and
+renamed symlinks (such as a symlink to `xargs` under another name). The guard does not
+read their program contents or resolve symlink targets to discover what they execute.
+This boundary applies both unwrapped and under wrappers whose parsing fails; a
+wrapper does not bring filesystem-defined behavior into scope. Such programs can
+execute `git stash pop` even when the guard allows their invocation.
+
 The following are **known unblocked cross-branch restore paths**, not covered restore
 controls. Each remains out of scope; documenting them does not make them safe. Encoded
 payloads below mean base64 text whose decoded contents perform a restore. `WT` denotes
@@ -274,8 +282,18 @@ another linked worktree and `R` a scratch directory.
    filesystem effects. We deliberately do not taint aliases after *every* non-inert
    program: that would also make ordinary sequences such as `npm test; git lg`
    uncertain without evidence of a config change.
-3. **Dynamic Git subcommands inside `env -S` strings.** The split-string form is not
-   interpreted with env's splitting rules. In particular,
+3. **Dynamic Git subcommands inside `env -S` strings.** Literal split strings are
+   decoded when `-S`/`--split-string` (separate or attached value) is env's first option,
+   including GNU `\\_` separators, quoting, escapes, comments and `\\c` termination.
+   Decoding is bounded to 16 KiB and the existing recursion/step budgets; decoded argv
+   is quoted as data before analysis, never executed by the guard. Other preceding env
+   options, unknown shell expansions and GNU `${VAR}` expansion retain the existing
+   evidence-based fallback rather than pretending to know the child's environment.
+   Literal split strings work through both shell single and double quotes; ordinary
+   backslashes in double quotes are preserved before GNU decoding. The unsupported
+   fallback can miss escaped separators combined with dynamic values (for example
+   `env -S 'git\_stash\_pop${X}'` when X is empty) or preceding options such as `-i`.
+   In particular,
    `env -S "git -C WT $(echo c3Rhc2g= | base64 -d) pop"` can escape both argv analysis
    and the textual fallback. The fallback's dynamic-subcommand pattern requires a
    character before the expansion marker; it is not a complete detector for a word

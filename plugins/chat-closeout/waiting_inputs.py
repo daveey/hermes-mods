@@ -358,16 +358,17 @@ class ReplicaWatch:
             finally:
                 conn.close()
 
-    def key(self, now: float, stale_after: float = HUB_STALE_AFTER_S) -> Any:
+    def key(self, now: float, stale_after: float = HUB_STALE_AFTER_S, *, tails: Optional[set[str]] = None) -> Any:
         """The batch rows' substantive digests and every clock verdict at ``now``. Raises when unreadable."""
         with self.lock:
             if not self.ok:
                 raise LookupError("replica unreadable")
             if self.path is None:
                 return ["no-replica"]
-            rows = sorted([gw, key, d] for (gw, key), (_t, d, _o, _r) in self.rows.items())
+            own = {k: v for k, v in self.rows.items() if tails is None or v[0] in tails}
+            rows = sorted([gw, key, d] for (gw, key), (_t, d, _o, _r) in own.items())
             owners = sorted([gw, key, _fresh(o, now, REPLICA_FRESH_S)]
-                            for (gw, key), (_t, _d, o, _r) in self.rows.items() if o is not None)
+                            for (gw, key), (_t, _d, o, _r) in own.items() if o is not None)
             scopes = sorted([gw, s, _fresh(at, now, w)] for gw, lst in self.gateways.items() for s, at, w in lst)
             meta = dict(self.meta or {})
         raw = meta.get("last_ok")

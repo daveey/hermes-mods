@@ -169,6 +169,29 @@ per turn itself, the repeat logged `live_chat_sleep_repeat`. Origin: self-heal a
 (one early interim line, ~25 tool calls, then a foreground `sleep 200; … ship` after a quota brake, and "why are you
 not answering me"). Tests: `tests/test_live_chat_sleep.py`.
 
+`scheduled_kill` (`scheduled_kill.py`) holds the first `process_manage kill` of a running background job that is
+still sleeping toward a scheduled run: a literal `sleep` of >= 60 s or a computed `sleep $secs`, outside a poll loop.
+The refusal states the computed wake time (start plus the `sleeping N` the job printed, else its literal sleep) in
+local and Pacific time, and asks for a tool check of the target before the kill, not in the same batch. It applies to
+any session type. It is held once per (session, job), and the repeat is logged `scheduled_kill_repeat` and goes
+through. A job whose sleep is over is never held. Origin: self-heal agent-d483b8fda1. The agent killed a valid
+00:01 PT job (`sleeping 10185`) because its own arithmetic said "~50 minutes", in the same batch as the `date` check
+that proved the job right. Tests: `tests/test_scheduled_kill.py`.
+
+## Answer first (stop demand, plain question)
+
+`answer_first.py` classifies the live user's own message at `pre_llm_call` (notices, `[System note…]` and compaction
+rows are not his words; Desktop's `[Turn stopped…]` prefix is stripped):
+- **stop**: a demand to stop acting or just answer ("stop", "stop doing things", "answer my question", "just answer")
+  with no new action asked for ("stop the gateway", "stop and revert that" are actions). `pre_tool_call` refuses
+  every tool call of that turn (`agent_block rule=answer_first kind=stop`): reply in text from what you know.
+- **question**: an explain/why/what/status question with no action verb in imperative position ("i asked to set up
+  X" is narration; "can you set up X?" is a request). Reads are fine; after 6 calls or 120 s with no text to the user
+  the next call is refused once (`kind=question`), the repeat goes through (`answer_first_repeat`).
+Quiet for cron, Kanban workers, subagents; `COACH_ANSWER_FIRST=0` disables. Origin: self-heal agent-e9ebbbb4cd (an
+"explain what this session is doing" got 13 silent calls, and after "STOP DOING THINGS< ANSWER MY … QUESTION" two more,
+one filing an approval request). Tests: `tests/test_answer_first.py`.
+
 ## Traceback attribution
 
 Bug detection decodes JSON tool envelopes before inspecting frame paths and exception tails.
@@ -936,6 +959,12 @@ no Kanban completion notice for it arrived since (when it named no card: no comp
 tells the agent to take the next step itself this turn or `delegate_task` with fix authority, and to link an unlinked
 card to the chat. Logged as `agent_hint` with `rule=relay_repeat` (`n` = repeat asks in the current run of relays).
 Cron, Kanban and subagent turns are skipped.
+
+**Dispatcher scope:** a watcher notice ending `Do not run its work outside the dispatcher.` is exempt from
+`report_only` and `status_only` pressure, including deterministic stalled-queue and repeated-relay branches.
+This extends the existing scope guard, not execution permissions: read-only status and owner handoff remain
+available, while quota/review gates remain unchanged. Quoted policy and a subsequent unrelated user request
+are not exempt. Regression: `test_report_only_owner_queue.py` covers held and unrestricted queue controls.
 
 Detection guard: the hook marks the turn (`relay_repeat_turn` in the loop state), and the reply check passes
 `relay_repeat=True` to `reply_check.check`: report_only joins the candidates (unless a scope limit excludes it), the

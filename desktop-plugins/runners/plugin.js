@@ -407,7 +407,8 @@ export function ago(ms) {
 const isHub = (m) => m.name === 'hub' || (m.labels || []).includes('machine:hub')
 
 export function summarize(view) {
-  const g = view.gateways.machines || [], c = view.ci.machines || []
+  // A stopped machine (held and off) has no capacity: it is left out of every slot total.
+  const g = (view.gateways.machines || []).filter((m) => m.state !== 'stopped'), c = view.ci.machines || []
   const gBusy = g.reduce((n, m) => n + m.running.length, 0)
   const gSlots = g.reduce((n, m) => n + (m.slots ?? m.running.length), 0)
   const slots = c.flatMap((m) => m.slots)
@@ -508,10 +509,13 @@ function GatewayRow({ m, now }) {
   const free = m.slots == null ? 0 : Math.max(0, m.slots - m.running.length)
   const freeState = m.state === 'active' ? 'idle' : m.state === 'draining' ? 'draining' : 'unknown'
   const v = loadParts(m.load, now)
-  const drainNote = m.state === 'draining'
+  // A held machine that is still up or still holds a card. Once it is off ('stopped') it has no row: StoppedNote.
+  const held = m.state === 'draining'
+  const holdTail = 'finishes running cards, takes no new ones'
+  const drainNote = held
     ? m.hold_reason === undefined
-      ? 'draining: reason unavailable (dashboard older than hold metadata); finishes running cards, takes no new ones'
-      : `draining: ${m.hold_reason ? text(m.hold_reason) : 'no reason recorded'} (held by ${m.hold_owner ? text(m.hold_owner) : m.hold_by ? text(m.hold_by) : 'unknown'}, ${typeof m.hold_at === 'number' ? ago(now - m.hold_at) : 'time unknown'}); finishes running cards, takes no new ones`
+      ? `${m.state}: reason unavailable (dashboard older than hold metadata); ${holdTail}`
+      : `${m.state}: ${m.hold_reason ? text(m.hold_reason) : 'no reason recorded'} (held by ${m.hold_owner ? text(m.hold_owner) : m.hold_by ? text(m.hold_by) : 'unknown'}, ${typeof m.hold_at === 'number' ? ago(now - m.hold_at) : 'time unknown'}); ${holdTail}`
     : null
   const meta = [
     m.pinned_only ? 'pinned only' : null,
@@ -523,7 +527,7 @@ function GatewayRow({ m, now }) {
   // (native title tooltips do not show inside the Desktop popover).
   return h('div', { className: `hermes-fleet-row is-${m.state}`, 'data-machine': m.name },
     h('span', { className: 'hermes-fleet-name' }, h('span', { className: 'hermes-fleet-machine-name' }, text(m.name)),
-      drainNote ? h('span', { className: 'hermes-fleet-drain-label', title: drainNote }, 'draining') : null),
+      drainNote ? h('span', { className: 'hermes-fleet-drain-label', title: drainNote }, m.state) : null),
     h('span', { className: 'hermes-fleet-slots' },
       ...m.running.map((r) => h(Slot, {
         key: `${r.board}/${r.task}`, state: m.state === 'lost' ? 'lost' : 'busy',
@@ -690,8 +694,21 @@ function SectionNote({ section }) {
   return h('div', { className: 'hermes-fleet-note', role: 'status' }, msg)
 }
 
+// Machines that were shut down on purpose get one line under the grid, not a row each: a row of
+// dotted slots and hours-old CPU/RAM numbers for a machine that is off reads as "still there".
+function StoppedNote({ machines, now }) {
+  if (!machines.length) return null
+  return h('div', { className: 'hermes-fleet-note hermes-fleet-stopped', 'data-stopped': machines.length },
+    `${machines.length} off: `,
+    ...machines.flatMap((m, i) => [i ? ', ' : null, h('span', {
+      key: m.name, 'data-machine': m.name,
+      title: `stopped: ${m.hold_reason ? text(m.hold_reason) : 'no reason recorded'} (held by ${m.hold_owner ? text(m.hold_owner) : m.hold_by ? text(m.hold_by) : 'unknown'}, ${typeof m.hold_at === 'number' ? ago(now - m.hold_at) : 'time unknown'}); machine is off (${text(m.reason)})`
+    }, text(m.name))]))
+}
+
 export function Panel({ view, now, repairClient }) {
   const s = summarize(view)
+  const stopped = view.gateways.machines.filter((m) => m.state === 'stopped')
   return h('div', { className: 'hermes-fleet' },
     h('div', { className: 'hermes-fleet-head' },
       h('span', null, 'Gateway workers'),
@@ -700,7 +717,8 @@ export function Panel({ view, now, repairClient }) {
     h(SectionNote, { section: view.gateways }),
     h('div', { className: 'hermes-fleet-gw' },
       h(GatewayHead),
-      ...view.gateways.machines.map((m) => h(GatewayRow, { key: m.name, m, now }))),
+      ...view.gateways.machines.filter((m) => m.state !== 'stopped').map((m) => h(GatewayRow, { key: m.name, m, now }))),
+    h(StoppedNote, { machines: stopped, now }),
     h('div', { className: 'hermes-fleet-head' },
       h('span', null, 'CI workers (GitHub Actions)'),
       h('span', null, `${s.cBusy} / ${s.cSlots} busy${s.cOffline ? ` · ${s.cOffline} offline` : ''}`)),
@@ -778,7 +796,13 @@ export function Runners({ ctx }) {
   const title = s
     ? `Hub ${s.hub.busy}/${s.hub.slots} slots scheduled · Workers ${s.workers.busy}/${s.workers.slots} · CI ${s.cBusy}/${s.cSlots} busy${s.gWaiting ? ` · ${s.gWaiting} waiting` : ''}${s.lost ? ` · ${s.lost} machine lost` : ''}`
     : 'Loading runners'
-  return h(Popover, { open, onOpenChange: setOpen },
+  // With the lanes plugin loaded, the chip opens the lanes panel (it has a Runners button back to this one);
+  // `hermes-show-runners` still opens this popover directly.
+  const onOpenChange = (next) => {
+    if (next && window.__hermesLanesPanel) window.dispatchEvent(new window.Event('hermes-show-lanes'))
+    else setOpen(next)
+  }
+  return h(Popover, { open, onOpenChange },
     h(PopoverTrigger, { asChild: true },
       h('button', { type: 'button', className: BAR, 'data-slot': 'runners-chip', 'aria-label': `Show runners: ${label}`, title },
         s && (s.tone === 'bad' || s.tone === 'warn') ? h(StatusDot, { tone: s.tone }) : null,

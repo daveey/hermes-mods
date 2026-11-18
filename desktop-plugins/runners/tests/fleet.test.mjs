@@ -420,6 +420,29 @@ test('draining: hover text carries the hold reason, holder and age; the row show
   await ui.close()
 })
 
+test('stopped: a held machine that is off has no row and no slots, only a name in the off line', async () => {
+  const body = fleet()
+  const off = (name) => ({ name, state: 'stopped', reason: 'stopped: held, not seen for 500 min', labels: [], pinned_only: false, slots: 10, slots_source: 'registry', running: [], waiting: 8, ineligible: 3, load: { at: NOW - 500 * 60000, cpu_pct: 18 }, hold_reason: 'shutdown', hold_by: 'admin', hold_owner: 'session:s@hub', hold_at: NOW - 2 * 3600000 })
+  const up = { name: 'worker-1', state: 'active', reason: null, labels: [], pinned_only: false, slots: 10, slots_source: 'registry', running: [] }
+  body.gateways.machines = [up, off('worker-2'), off('worker-5')]
+  const view = P.merge([{ route, body, at: NOW }], NOW)
+  const s = P.summarize(view)
+  assert.equal(s.gSlots, 10)
+  assert.equal(s.workers.slots, 10)
+  const ui = await render(view)
+  try {
+    assert.equal(ui.container.querySelectorAll('.hermes-fleet-row[data-machine="worker-2"], .hermes-fleet-row[data-machine="worker-5"]').length, 0)
+    assert.ok(ui.container.querySelector('.hermes-fleet-row[data-machine="worker-1"]'))
+    const note = ui.container.querySelector('.hermes-fleet-stopped')
+    assert.equal(note.textContent, '2 off: worker-2, worker-5')
+    assert.equal(note.querySelector('[data-machine="worker-5"]').title, 'stopped: shutdown (held by session:s@hub, 2h ago); machine is off (stopped: held, not seen for 500 min)')
+    assert.equal(note.querySelectorAll('.hermes-fleet-slot').length, 0)
+  } finally { await ui.close() }
+  body.gateways.machines = [up]
+  const none = await render(P.merge([{ route, body, at: NOW }], NOW))
+  try { assert.equal(none.container.querySelector('.hermes-fleet-stopped'), null) } finally { await none.close() }
+})
+
 test('draining: hover names the hold_owner card/session, falling back to hold_by', async () => {
   const body = fleet()
   const held = { state: 'draining', reason: 'draining', labels: [], pinned_only: false, slots: 2, slots_source: 'registry', running: [] }
@@ -463,4 +486,31 @@ test('gateway rows: one grid line each in a shared column grid, no Investigate c
   assert.match(css, /\n\.hermes-fleet-gw>\.hermes-fleet-row,\.hermes-fleet-cols\{[^}]*grid-template-columns:subgrid[^}]*white-space:nowrap/)
   assert.match(css, /\n\.hermes-fleet-gw>\.hermes-fleet-row>\*\{grid-row:1\}/)
   await ui.close()
+})
+
+test('with the lanes panel loaded the chip opens it; hermes-show-runners still opens runners', async () => {
+  const ctx = ctxWith([fleet(), fleet(), fleet()])
+  const ui = await mount(React.createElement(P.Runners, { ctx }))
+  let shown = 0
+  const onLanes = () => { shown += 1 }
+  window.addEventListener('hermes-show-lanes', onLanes)
+  try {
+    const chip = document.querySelector('[data-slot="runners-chip"]')
+    window.__hermesLanesPanel = true
+    await ui.click(chip)
+    assert.equal(shown, 1)
+    assert.equal(document.querySelector('[data-machine="worker-1"]'), null, 'runners popover stays closed')
+    window.dispatchEvent(new window.Event('hermes-show-runners'))
+    await ui.flush()
+    assert.ok(document.querySelector('[data-machine="worker-1"]'), 'the lanes panel can still open runners')
+    await ui.click(chip) // closes it
+    delete window.__hermesLanesPanel
+    await ui.click(chip)
+    assert.equal(shown, 1, 'without the lanes plugin the chip opens runners as before')
+    assert.ok(document.querySelector('[data-machine="worker-1"]'))
+  } finally {
+    delete window.__hermesLanesPanel
+    window.removeEventListener('hermes-show-lanes', onLanes)
+    await ui.close()
+  }
 })

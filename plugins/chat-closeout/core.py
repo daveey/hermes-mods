@@ -2,6 +2,7 @@
 watchdog. No Hermes imports at module level; everything that touches Hermes is passed in or imported lazily, so the
 tests run on throwaway SQLite files."""
 from __future__ import annotations
+import unicodedata
 
 import contextlib
 from collections import OrderedDict
@@ -28,7 +29,15 @@ MAX_WAKES_PER_HOUR = 2        # hard cap per chat, whatever the cards do
 STALE_S = 1800.0              # watchdog: unseen results / missing close-out older than this
 WATCHDOG_EVERY_S = 900.0
 STUCK_S = 24 * 3600.0         # watchdog: a pending row with nothing found working, this long
-NOTICE_RE = re.compile(r"^\s*(?:[✔⏸✖⏱🔄]\s*\[|\[chat-closeout\])")
+NOTICE_RE = re.compile(r"^\s*\[chat-closeout\]")
+_NOTICE_TAIL = re.compile(r"\ufe0f?\s*\[")
+_BRACKET_NOTICE = re.compile(r"^\[(?:kanban\b|IMPORTANT:|System note:|chat-closeout\b|owner-wake\b)", re.I)
+
+
+def runtime_notice(text: str) -> bool:
+    s = (text or "").lstrip()
+    return bool(NOTICE_RE.match(s) or _BRACKET_NOTICE.match(s) or (s and
+        (unicodedata.category(s[0]) == "So" or s[0] == "ℹ") and _NOTICE_TAIL.match(s, 1)))
 TAG = "[chat-closeout]"
 
 
@@ -2236,7 +2245,7 @@ def last_user_at(state_dbs: Iterable[Path], ids: Iterable[str], pool: Optional[R
             ph = ",".join("?" for _ in ids)
             for r in conn.execute(f"SELECT content, timestamp FROM messages WHERE role='user' AND session_id IN ({ph}) "
                                   f"{dk} ORDER BY timestamp DESC LIMIT 20", ids):
-                if NOTICE_RE.match(str(r["content"] or "")):
+                if runtime_notice(str(r["content"] or "")):
                     continue
                 best = max(best, float(r["timestamp"] or 0))
                 break

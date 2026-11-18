@@ -56,6 +56,34 @@ def test_waiting_eligibility_cache_does_not_reuse_legacy_verdict(monkeypatch):
         assert g._turn_yielded(record(), data, f.R, None, {}) is True
 
 
+def test_refreshed_waiting_peer_is_undecided_even_with_exact_approval(monkeypatch):
+    monkeypatch.setattr(g, "_now", lambda: f.NOW)
+    data = f.pr(1, f.H2600, ["hermes-sync"])
+    outcome = g.peer_eligibility(record(), data)
+    assert isinstance(outcome, g._Undecided)
+    assert "patch" in outcome.reason
+    # A legacy record has no original-patch constraint.
+    assert g.peer_eligibility(record(waiting=False), data) is True
+
+
+@pytest.mark.parametrize("uncertain", [False, True])
+def test_only_definite_hold_has_structured_admission_evidence(monkeypatch, uncertain):
+    monkeypatch.setattr(g, "_now", lambda: f.NOW)
+    fake = f.FakeGitHub({n: f.pr(n, f.H2563, ["hermes-sync"]) for n in (1, 2)})
+    monkeypatch.setattr(g.subprocess, "run", fake.run)
+    age = g._TURN_REFRESH_GRACE + 1 if uncertain else 60
+    f.seed_turn(fake, 1, f.NOW - age)
+    hold = g._turn_hold_refusal(2, fake.prs[2], f.R, None, {})
+    assert isinstance(hold, str)
+    assert isinstance(hold, g._DefiniteTurnHold) is (not uncertain)
+    if not uncertain:
+        assert hold.holder["pr"] == 1
+        assert hold.ref == "refs/land-turn/pr-1"
+        assert "PR #1 holds" in hold
+    else:
+        assert "may still hold" in hold
+
+
 def test_waiting_promotion_keeps_original_record_and_nontransitive_lanes():
     a = record(pr=1, files=["x"], acquired=f.NOW - 90)
     b = record(pr=2, files=["x", "y"], acquired=f.NOW - 60)
