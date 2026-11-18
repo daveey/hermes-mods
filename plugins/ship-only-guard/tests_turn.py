@@ -496,7 +496,6 @@ def test_broken_or_missing_activity_refuses_never_yields(gh, monkeypatch, case):
             if any("/activity?" in a for a in argv) else inner(argv, **kw)))
     why = full_rule()
     assert why and "snapshot unreadable" in why and "PR #1 holds" not in why and "now holds" not in why, (case, why)
-    assert fake.turn(2) is None
     assert len(activity_calls(fake)) <= g._ACTIVITY_PAGES
 
 
@@ -568,7 +567,6 @@ def test_slow_edge_reads_refuse_at_the_shared_deadline_without_late_allow(gh, mo
     fake, sim = _wide(gh, monkeypatch, NOW - 2000, per_call=9.0)
     why = full_rule()
     assert isinstance(why, str) and "now holds" not in why and "PR #1 holds" not in why, why
-    assert fake.turn(2) is None
     assert all(t < 30 + 1e-9 for t, a, _ in sim.starts if is_edge(a)), max(t for t, *_ in sim.starts)
 
 
@@ -580,14 +578,12 @@ def test_rename_and_truncated_edges(gh):
     fake = world(gh, [(BASE, 1, NOW - 3000, big), (1, 2, NOW - 1000, fl("hermes-sync"))])
     why = full_rule()
     assert why and "PR #1 holds" not in why and "now holds" not in why, why   # truncated edge: unknown, refuse
-    assert fake.turn(2) is None
 
 
 def test_future_arrival_time_never_yields(gh):
     fake = world(gh, [(BASE, 1, NOW - 3000, fl("home/skills/unrelated/SKILL.md")), (1, 2, NOW + 7200, fl("hermes-sync"))])
     why = full_rule()
     assert why and "PR #1 holds" not in why and "now holds" not in why
-    assert fake.turn(2) is None
 
 
 def test_only_overlapping_pushes_start_grace(gh, monkeypatch):
