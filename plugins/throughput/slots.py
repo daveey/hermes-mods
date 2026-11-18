@@ -1,8 +1,7 @@
-"""How many card slots each gateway can use under the token throttle and the subscription pacing governor.
+"""How many card slots each gateway's share of the token throttle pays for, and how many card starts the
+subscription pacing governor is holding.
 
-A worker with 16 slots can look idle while only two of them can start a card (2026-11-17: worker-a1 ran 2 of 16
-under ``llm_pacing ... running=1 limit=1``). The Runners panel draws the difference: slots beyond ``allowed`` are
-crossed out.
+The Runners panel crosses out a gateway's slots beyond ``allowed``.
 
 * **Token cost per slot** (``tokens_per_slot_per_s``): a gateway's in+out tokens over the last
   ``throttle.SHARE_WINDOW_S`` divided by its busy slot-seconds in the same window. Busy slot-seconds are card runs
@@ -11,12 +10,13 @@ crossed out.
   (``cost_source: "fleet_median"``); with none measured the cost is unknown and the throttle sets no slot limit.
 * **by_throttle**: ``floor(share x cap / cost per slot)``, with the share ``throttle.local_share`` gives that
   gateway. None when no cap is set or the cost is unknown; 0 at a cap of zero.
-* **by_pacing**: an estimate of core's ``kanban_llm_pacing.admit_limit`` summed over the governed pools that are
-  not open: a paced pool allows ``max(1, floor(average busy slots x factor))``, a held pool 0. Core applies the
-  factor to the gateway's average concurrency on that one provider, which only that gateway knows; this uses its
-  average busy slots on all providers, so it can read high, never low by more than the one-run floor. None when
-  no pool is paced or held.
-* **allowed**: the smaller of the two that are known; None when neither limits anything.
+* **allowed**: ``by_throttle`` (None = the throttle limits nothing here).
+* **Pacing is not turned into slots.** Core's governor limits concurrent runs per provider pool per gateway
+  (``kanban_llm_pacing.admit_limit``) from numbers only that gateway holds, and a card's pool is chosen at
+  admission. An estimate from the pool factors alone said 2 slots per machine on 2026-11-17 while the workers
+  ran about 10 cards each, so no per-machine pacing limit is reported. What is reported is what the Board
+  replicas record: ``pacing.held_starts``, the cards whose start the governor held in the last
+  ``PACING_WINDOW_S`` (their ``llm_paced`` events), fleet-wide.
 
 Everything here is read-only and fails open: an unreadable replica contributes no busy time, and a gateway
 without data gets no limit rather than a wrong one.
@@ -38,7 +38,7 @@ from .sampler import ro_connect
 MIN_BUSY_S = 300.0  # under five busy slot-minutes in the window a gateway's own cost per slot is noise
 CLAIM_SLACK_S = 5.0  # a run's ``claimed`` event is written just before the run row
 CACHE_S = 30.0
-LIMITING = ("paced", "held")
+PACING_WINDOW_S = 300.0
 
 _cache: dict = {}
 _lock = threading.Lock()
@@ -79,26 +79,28 @@ def busy_seconds(replicas: Iterable[Path], since: float, until: float, boot_map:
     return out
 
 
-def pacing_limit(avg_busy: float, pools: Iterable[dict]) -> Optional[int]:
-    """Slots the pacing governor leaves this gateway, estimated; None when no pool is paced or held."""
-    limit, limiting = 0, False
-    for pool in pools or ():
-        state = pool.get("pacing")
-        if state not in LIMITING:
+def pacing_holds(replicas: Iterable[Path], since: float, until: float) -> int:
+    """Cards whose start the pacing governor held in ``[since, until)`` (distinct cards with an ``llm_paced`` event)."""
+    held = set()
+    for db in replicas:
+        try:
+            c = ro_connect(db)
+        except sqlite3.Error:
             continue
-        limiting = True
-        if state == "held":
-            continue
-        factor = pool.get("pacing_factor")
-        factor = float(factor) if isinstance(factor, (int, float)) and math.isfinite(factor) and factor > 0 else 0.0
-        limit += max(1, math.floor(max(0.0, avg_busy) * factor))
-    return limit if limiting else None
+        try:
+            held.update((str(db), r[0]) for r in c.execute(
+                "SELECT DISTINCT task_id FROM task_events WHERE kind = 'llm_paced' AND created_at >= ? "
+                "AND created_at < ?", (since, until)))
+        except sqlite3.Error:
+            pass
+        finally:
+            c.close()
+    return len(held)
 
 
-def plan(cap_per_s: Optional[float], usage: dict[str, float], busy: dict[str, float], pools: Iterable[dict],
+def plan(cap_per_s: Optional[float], usage: dict[str, float], busy: dict[str, float],
          window_s: float = throttle.SHARE_WINDOW_S) -> dict[str, dict]:
-    """Per gateway: share, cost per slot and the slots each limit allows (see the module docstring)."""
-    pools = list(pools or ())
+    """Per gateway: share, cost per slot and the slots the token throttle pays for (see the module docstring)."""
     names = sorted(set(usage) | set(busy))
     cost = {g: usage.get(g, 0.0) / busy[g] for g in names if busy.get(g, 0.0) >= MIN_BUSY_S}
     measured = [v for v in cost.values() if v > 0]
@@ -115,20 +117,19 @@ def plan(cap_per_s: Optional[float], usage: dict[str, float], busy: dict[str, fl
             by_throttle = 0
         else:
             by_throttle = math.floor(share * cap_per_s / per_slot) if per_slot else None
-        by_pacing = pacing_limit(avg_busy, pools)
-        known = [n for n in (by_throttle, by_pacing) if n is not None]
         out[g] = {
             "share": round(share, 4), "cap_per_s": None if cap_per_s is None else round(share * cap_per_s, 2),
             "rate_per_s": round(usage.get(g, 0.0) / window_s, 2), "avg_busy": round(avg_busy, 2),
             "tokens_per_slot_per_s": None if per_slot is None else round(per_slot, 2), "cost_source": source,
-            "by_throttle": by_throttle, "by_pacing": by_pacing, "allowed": min(known) if known else None,
+            "by_throttle": by_throttle, "allowed": by_throttle,
         }
     return out
 
 
-def payload(root: Path, series_db: Path, cap_per_s: Optional[float], pools: Iterable[dict], cards=None,
+def payload(root: Path, series_db: Path, cap_per_s: Optional[float], cards=None,
             now: Optional[float] = None, replicas: Optional[Iterable[Path]] = None) -> dict:
-    """``{"window_s", "gateways": {name: plan row}}`` for the throttle API. Busy time is cached ``CACHE_S``."""
+    """``{"window_s", "gateways": {name: plan row}, "pacing": {"held_starts", "window_s"}}`` for the throttle API.
+    The replica reads are cached ``CACHE_S``."""
     now = time.time() if now is None else now
     until = int(now) // 60 * 60
     since = until - throttle.SHARE_WINDOW_S
@@ -136,7 +137,7 @@ def payload(root: Path, series_db: Path, cap_per_s: Optional[float], pools: Iter
     with _lock:
         hit = _cache.get("busy")
         if hit and hit[0] == key and time.monotonic() - hit[1] < CACHE_S:
-            busy = hit[2]
+            busy, held = hit[2], hit[3]
         else:
             boot_map, known = {}, None
             if cards is not None:
@@ -146,6 +147,8 @@ def payload(root: Path, series_db: Path, cap_per_s: Optional[float], pools: Iter
                     boot_map, known = {}, None
             paths = list(replicas) if replicas is not None else cards_mod.replica_paths(Path(root))
             busy = busy_seconds(paths, since, until, boot_map, known)
-            _cache["busy"] = (key, time.monotonic(), busy)
+            held = pacing_holds(paths, now - PACING_WINDOW_S, now + 1)
+            _cache["busy"] = (key, time.monotonic(), busy, held)
     usage = throttle.usage_by_gateway(series_db, now)
-    return {"window_s": throttle.SHARE_WINDOW_S, "gateways": plan(cap_per_s, usage, busy, pools)}
+    return {"window_s": throttle.SHARE_WINDOW_S, "gateways": plan(cap_per_s, usage, busy),
+            "pacing": {"held_starts": held, "window_s": PACING_WINDOW_S}}

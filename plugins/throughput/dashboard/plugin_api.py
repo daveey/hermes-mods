@@ -135,8 +135,8 @@ def throttle_payload(now: float | None = None) -> Dict[str, Any]:
     out["pools"] = runway.pools(runway.pacing_path(root), now)
     try:  # advisory (the Runners panel crosses out slots a limit will not let run): never fail the route
         slots = importlib.import_module(pkg().__name__ + ".slots")
-        out["slots"] = slots.payload(root, sampler.series_path(root), out["cap_per_s"], out["pools"],
-                                     cards=_state["cards"], now=now)
+        out["slots"] = slots.payload(root, sampler.series_path(root), out["cap_per_s"], cards=_state["cards"],
+                                     now=now)
     except Exception:
         out["slots"] = None
     out["now"] = now

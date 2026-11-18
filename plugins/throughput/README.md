@@ -121,6 +121,14 @@ and a body that is not a JSON object a 422, and neither changes anything.
   without `register_middleware` shows the slider but enforces nothing.
 - **Not covered by tests**: the middleware and the hook inside a live core agent loop (the tests call the registered
   callbacks with a stand-in for core's call closure), and the hub link round trip between two real hosts.
+- **Slots** (`slots.py`): `slots.gateways[name]` in the same payload, for the Runners panel: `share` of the cap,
+  `cap_per_s` (share x cap), `rate_per_s` and `avg_busy` over the 15-minute share window,
+  `tokens_per_slot_per_s` (tokens / busy slot-seconds from the Board replicas' card runs; `cost_source`
+  `measured`, or `fleet_median` under five busy slot-minutes), `by_throttle` = floor(cap share / cost per slot)
+  and `allowed` (the same; null = no limit). `slots.pacing.held_starts` counts the cards whose start the pacing
+  governor held in the last 5 minutes (`llm_paced` events in the replicas); pacing is not converted to slots,
+  because its per-gateway limits are not published. Each pool carries its `pacing_factor`. `slots` is null if it cannot be computed; that never fails
+  the route. Tests: `tests/test_slots.py`. **Not tested**: against live replicas with macOS boot-UUID claims.
 - **Runway** (`runway.py`): per subscription pool, from the usage samples core's Kanban pacing governor keeps in
   `llm_pacing.json` (no usage request is made): `remaining_pct` (sum of `100 - used` over the accounts' weekly
   windows), `burn_pct_per_h` (each account's slope over the last 10-60 minutes), `runway_s = remaining / burn`
