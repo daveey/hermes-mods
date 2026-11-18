@@ -2099,11 +2099,21 @@ def pr_state_claim(reply: str, tool_log: Optional[list] = None) -> Optional[str]
         unresolved = False
         for mention in mentions:
             number = re.search(r"([1-9]\d*)$", mention[0])
+            end = mention.end()
             if not number:
                 number = re.match(r"\s*(?:-\s*|number\s+)?#?([1-9]\d*)\b",
-                                  s[mention.end():], re.I)
+                                  s[end:], re.I)
+                if number:
+                    end += number.end()
             if number:
                 refs.add(number[1])
+                # A plural/list claim requires evidence for every item, not
+                # just the number immediately attached to the PR mention.
+                while listed := re.match(
+                        r"\s*(?:,\s*(?:(?:and|or)\s+)?|(?:and|or)\s+|[&/])"
+                        r"\s*#?([1-9]\d*)\b", s[end:], re.I):
+                    refs.add(listed[1])
+                    end += listed.end()
             elif not re.search(r"\b(?:this|that|the)\s+$", s[:mention.start()], re.I):
                 unresolved = True
         if refs:

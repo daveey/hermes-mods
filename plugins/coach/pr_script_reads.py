@@ -15,7 +15,7 @@ PREFIX = '   <- PR state result: '
 # Unknown/new tools fail closed; broad executors and delegators are not readers.
 READ_ONLY_TOOLS = frozenset({
     'read_file', 'search_files', 'skill_view', 'skills_list',
-    'tool_describe', 'hermes_tool_search',
+    'tool_describe', 'tool_search',
 })
 ROW = re.compile(r'(?:[\w-]+)?#([1-9]\d*) (OPEN|CLOSED|MERGED) merged=(null|[0-9TZ:.-]+) head=([0-9a-f]{7,40})')
 
@@ -143,8 +143,6 @@ def observe(state, tool, args, result, ok):
         if tool == 'write_file' and path and ok and data.get('verified') is True:
             ids = script_ids(args.get('content'))
             if ids and path_key(data.get('resolved_path', args.get('path'))) == path:
-                if len(kept) >= 8:
-                    kept.pop(next(iter(kept)))
                 kept[path] = ids
         return []
     if tool != 'terminal':
