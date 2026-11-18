@@ -167,6 +167,7 @@ untouched.
 ## Pitfalls
 
 - Passing your rationale "so they understand" defeats the method. If the spec needs it, put it in the spec.
+- Include the target repository's root and affected-area AGENTS/contribution rules in the readiness reading list. For observer APIs, identify the concrete production consumer and activation/readback path before calling the slice shippable; real-caller tests alone do not satisfy a repository ban on unconsumed hooks. Keep privacy-reduced diagnostic envelopes separate from lossless replay evidence.
 - Line numbers go stale after any edit; cite headings, and re-read before assigning a location.
 - A reviewer citing a path that does not exist is itself a finding about the spec only if the spec claims the
   path exists now; files the plan says it will create are not missing.
