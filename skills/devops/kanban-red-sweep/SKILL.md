@@ -243,7 +243,8 @@ and the final response.
 - `gh pr edit` can fail on a deprecated-Projects GraphQL error and change nothing. Use REST and read it back:
   `gh api -X PATCH repos/<o>/<r>/pulls/<N> --input body.json`, `gh api -X POST repos/<o>/<r>/issues/<N>/labels -f 'labels[]=<l>'`.
 - Released links (`released=1`) look linked in a raw join. Filter `released=0`.
-- A session ended by `startup_orphan_reap` still shows as unarchived but will never act. Treat it as no owner.
+- A `startup_orphan_reap` session owns no chat work, yet still wakes on its cards' notices and publishes For-you
+  asks. A `decision_session` row with choices for a card means the user can answer it any second: leave that card to him.
 - The Desktop "For you" panel lists asks from every gateway. Cards that live on another gateway's board are read
   with `cross_task`, not this host's sqlite.
 - Don't publish the "may I sweep?" question as an approval tile first: this skill is the approval.
