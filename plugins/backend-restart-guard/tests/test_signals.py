@@ -39,7 +39,11 @@ CASES = [
     ('python_probe', "python3 -c 'import os; os.kill({gw}, 0)'", False),
     ('late_list', 'kill -9 {gw} -l', True),
     ('sig0', 'kill -SIG0 {gw}', False),
-    ('pkill_newest', 'pkill -n python3', True),
+    # {exe}, not a literal python3: the fixture backend is this interpreter, and under a venv it is
+    # `venv/bin/python` (the no-core pre-push gate on hermes-hub). The literal pattern matches neither its
+    # name nor its command line, so the guard rightly allowed it and this case failed there 5 of 5 times
+    # (2026-11-17).
+    ('pkill_newest', 'pkill -n {exe}', True),
     ('pkill_backend_probe', "pkill -0 -f 'hermes serve'", False),
     ('wrapped_signal', 'python3 ~/.hermes/sync-runner/hermes-sync pause-turns --timeout 180 -- kill -9 {gw}', True),
 ]
