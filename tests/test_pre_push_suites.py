@@ -87,6 +87,14 @@ class PushGate(GateFixture):
         self.assertIn('EMERGENCY BYPASS', result.stdout)
         self.assertEqual(self.tip(), self.git('rev-parse', 'HEAD').stdout.strip())
 
+    def test_suites_can_tell_they_run_in_the_publish_gate(self):
+        # plugins/runners skips its absolute CPU budget here: the pushing host is not quiet deployment hardware.
+        self.test.write_text('import os\ndef test_contract():\n    assert os.environ.get("HERMES_MODS_PUSH_GATE") == "1"\n')
+        self.commit()
+        env = {k: v for k, v in self.env.items() if k != 'HERMES_MODS_PUSH_GATE'}
+        self.git('push', 'origin', 'HEAD:main', env=env)
+        self.assertEqual(self.tip(), self.git('rev-parse', 'HEAD').stdout.strip())
+
     def test_git_environment_and_snapshot_metadata_are_isolated(self):
         self.test.write_text('''import os, subprocess
 from pathlib import Path
