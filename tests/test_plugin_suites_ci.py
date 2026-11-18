@@ -123,6 +123,20 @@ class PluginSuitesWorkflow(unittest.TestCase):
         self.assertNotIn("--hermes-core", self.text)
         self.assertNotIn("continue-on-error", self.text)
 
+    def test_failure_uploads_full_suite_logs_only(self):
+        run = self.text.split("      - name: Run selected suites", 1)[1].split("      - name: Upload", 1)[0]
+        self.assertRegex(run, r'--output-dir "\$logs"')
+        self.assertIn('logs="${RUNNER_TEMP}/suite-logs"', run)
+        step = self.text.split("      - name: Upload full suite logs", 1)[1]
+        self.assertRegex(step, r"(?m)^        if: failure\(\)$")
+        self.assertIn("uses: actions/upload-artifact@v4", step)
+        self.assertIn("name: suite-logs-${{ matrix.python }}", step)
+        self.assertIn("path: ${{ runner.temp }}/suite-logs", step)
+        self.assertRegex(step, r"(?m)^          retention-days: \d+$")
+        self.assertNotIn("continue-on-error", step)
+        # Never a way to turn the red job green: the upload step is the last step and the run step still exits $rc.
+        self.assertIn("exit $rc", run)
+
 
 WORKFLOWS = ROOT / ".github" / "workflows"
 
@@ -571,6 +585,32 @@ class Summary(unittest.TestCase):
                 {"name": "plugins/a", "status": "PASS", "passed": 1, "failed": 0, "errors": 0, "skipped": 0}]}))
             with redirect_stdout(StringIO()):
                 self.assertEqual(mod.summary(res), 0)
+
+    def test_failing_suite_names_its_failed_test_ids_and_log(self):
+        # pytest's 4,500 skip rows push FAILED rows out of test-all's tail; the receipt carries them instead.
+        mod = _load_selector()
+        with tempfile.TemporaryDirectory() as d:
+            res = Path(d, "r.json")
+            res.write_text(json.dumps({"python": "3.14.10", "suites": [
+                {"name": "plugins/coach", "status": "FAIL", "passed": 3067, "failed": 2, "errors": 1, "skipped": 4560,
+                 "failed_ids": ["FAILED plugins/coach/tests/test_a.py::T::test_one",
+                                "ERROR plugins/coach/tests/test_b.py::test_two"],
+                 "log_path": "/x/plugins_coach-abc.log", "log_sha256": "f" * 64}]}))
+            out = StringIO()
+            with patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(Path(d, "summary.md"))}), \
+                    redirect_stdout(out):
+                self.assertEqual(mod.summary(res), 1)
+            text = out.getvalue()
+            self.assertIn("::error title=plugins/coach failed test on Python 3.14.10::"
+                          "FAILED plugins/coach/tests/test_a.py::T::test_one", text)
+            self.assertIn("ERROR plugins/coach/tests/test_b.py::test_two", text)
+            self.assertIn("plugins_coach-abc.log sha256 " + "f" * 64, text)
+            self.assertIn("- `FAILED plugins/coach/tests/test_a.py::T::test_one`", Path(d, "summary.md").read_text())
+            # A pre-existing receipt without failed_ids still summarizes.
+            res.write_text(json.dumps({"python": "3.14.10", "suites": [
+                {"name": "plugins/coach", "status": "FAIL", "passed": 1, "failed": 1, "errors": 0, "skipped": 0}]}))
+            with redirect_stdout(StringIO()):
+                self.assertEqual(mod.summary(res), 1)
 
 
 if __name__ == "__main__":
