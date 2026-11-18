@@ -227,6 +227,71 @@ def test_session_cron_rewrap_quoting_the_script_traceback_files_nothing():
     assert sg.parse_errors(rec) == []
 
 
+# The MacBook monitor record behind agent-95944cb790 (2026-11-17, allie_mail_monitor.sh with DNS down): the script's
+# stderr quotes a CHAINED traceback (google-auth's `raise new_exc from caught_exc`), so a chain separator sits inside
+# the quoted message and its second header used to look like the raised exception ("TransportError in __call__").
+_V = "/home/you/.hermes/installs/x/venv/lib/python3.14/site-packages"
+CHAINED_SCRIPT_STDERR = [
+    "stderr:",
+    "Traceback (most recent call last):",
+    f'  File "{_V}/urllib3/connection.py", line 198, in _new_conn',
+    "    sock = connection.create_connection(",
+    "socket.gaierror: [Errno 8] nodename nor servname provided, or not known",
+    "",
+    "The above exception was the direct cause of the following exception:",
+    "",
+    "Traceback (most recent call last):",
+    f'  File "{_V}/google/oauth2/_client.py", line 198, in _token_endpoint_request_no_throw',
+    "    response = request(",
+    f'  File "{_V}/google/auth/transport/requests.py", line 280, in __call__',
+    "    raise new_exc from caught_exc",
+    "google.auth.exceptions.TransportError: HTTPSConnectionPool(host='oauth2.googleapis.com', port=443): Max retries "
+    "exceeded with url: /token (Caused by NameResolutionError(\"Failed to resolve 'oauth2.googleapis.com' ([Errno 8] "
+    "nodename nor servname provided, or not known)\"))",
+    "mail monitor: invalid search JSON: Expecting value: line 1 column 1 (char 0)",
+]
+
+
+def test_session_cron_rewrap_quoting_a_chained_script_traceback_files_nothing():
+    rec = SESSION_CRON_TB + ["RuntimeError: Script exited with code 1"] + CHAINED_SCRIPT_STDERR
+    assert sg.parse_errors(rec) == []
+
+
+def test_scheduler_monitor_source_failure_is_left_to_the_cron_lane():
+    # cron.scheduler's own ERROR for the same tick (no exc_info): the traceback is the monitor script's, quoted.
+    rec = ["2026-11-17 18:00:18,000 ERROR cron.scheduler: Job 'f58038cae3fb': monitor source failed: "
+           "Script exited with code 1"] + CHAINED_SCRIPT_STDERR
+    assert sg.parse_errors(rec) == []
+    # another cron.scheduler record quoting the same traceback still files
+    other = ["2026-11-17 18:00:18,000 ERROR cron.scheduler: Job 'f58038cae3fb' delivery failed"] + CHAINED_SCRIPT_STDERR
+    assert len(sg.parse_errors(other)) == 1
+
+
+def test_monitor_source_failed_line_matches_core():
+    # Detection guard: the skip keys on core's exact log call; a core rewording must break this test.
+    import os
+    root = Path(os.environ.get("HERMES_TEST_CORE") or Path.home() / ".hermes/hermes-agent")
+    src = root / "cron/scheduler.py"
+    if not src.exists():
+        if os.environ.get("HERMES_TEST_CORE"):
+            raise AssertionError(f"HERMES_TEST_CORE set but {src} is missing")
+        pytest.skip("Hermes core checkout not found")
+    lines = [l.strip() for l in src.read_text().splitlines()]
+    assert lines.count(sg.MONITOR_SOURCE_FAILED_SRC) == 1
+    assert sg.MONITOR_SOURCE_FAILED_RE.match("Job '%s': monitor source failed: %s" % ("f58038cae3fb", "x"))
+
+
+def test_chained_exception_after_a_quoted_chain_files_the_outer_exception():
+    # Not the cron re-raise: our own RuntimeError quoting a child's chained traceback files as ours, at our frame.
+    rec = ([f"2026-11-17 18:00:00,000 ERROR gateway.run: helper failed",
+            "Traceback (most recent call last):",
+            f'  File "{_H}/hermes-agent/gateway/run.py", line 20, in run_helper',
+            "    raise RuntimeError(err)",
+            "RuntimeError: helper exited 1"] + CHAINED_SCRIPT_STDERR)
+    sigs = sg.parse_errors(rec)
+    assert len(sigs) == 1 and sigs[0]["symptom"].startswith("RuntimeError in run_helper (run.py)"), sigs
+
+
 def test_chained_exception_files_the_last_exception_in_the_chain():
     rec = ["2026-11-03 13:00:00,000 ERROR gateway.run: handler failed",
            "Traceback (most recent call last):",
