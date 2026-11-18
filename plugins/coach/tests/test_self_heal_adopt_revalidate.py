@@ -265,3 +265,66 @@ def test_detect_record_takes_provenance_from_one_row(store):
     assert rec["evidence"] == "cron died" and rec["ts"] == 200.0 and rec["detect_ts"] == 200.0
     assert "session_id" not in rec and "host" not in rec and rec["card"] == "t_c"
     assert sh._adoption_log_records(store, {fp})[fp]["detect"] == rec
+
+
+# --- agent-9b12cb8ed8 (11-18): an owner on ANOTHER gateway was never re-judged ---------------------------------------
+
+REMOTE = json.loads((Path(__file__).parent / "fixtures" / "selfheal_remote_owner_adoption_agent_9b12cb8ed8.json").read_text())
+
+
+def _hub_replica(path, owner, gw="macbook", board="default"):
+    """This host's hermes-hub replica holding the MacBook card, shaped like the real `tasks` rows."""
+    import sqlite3
+    path.parent.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(path)
+    db.execute("create table replica (gw text, coll text, key text, version integer, seq integer, data text, "
+               "updated_at integer, primary key (gw, coll, key))")
+    db.execute("insert into replica values(?,?,?,?,?,?,?)",
+               (gw, "tasks", f"default/{board}/{owner['id']}", 1, 1,
+                json.dumps({**owner, "status": "done", "board": board, "gateway": gw, "profile": "default"}), 1))
+    db.commit()
+    db.close()
+    return path
+
+
+def test_owner_on_another_gateway_is_read_from_the_replica_and_rejected(store, monkeypatch, tmp_path):
+    """The lane approved a MacBook card (user-steps decisionCard 422) as owner of "unfinished work left without
+    timely completion update". `hermes kanban show` on the hub cannot see a MacBook card, so every pass logged
+    `ok: null` (unreadable, kept): 106 passes 11-13..11-18, then the lane drew its VERIFY card. The owner is now read
+    from the hub replica, judged with the same rule, and rejected."""
+    monkeypatch.setattr(sh, "budget", OPEN)
+    fp = "agent-9b12cb8ed8"
+    case = REMOTE[fp]
+    owner = case["wrong_owner"]
+    legacy_adoption(store, fp, case, board="macbook:default")
+    hdb = _hub_replica(tmp_path / "hub" / "hub.db", owner)
+    monkeypatch.setattr(sh, "host_name", lambda: "hermes-hub")
+    monkeypatch.setattr(sh._placement_evidence, "home_machine", lambda: "hub")
+    monkeypatch.setattr(sh, "_lookup_sources", lambda runner=None: (tmp_path / "home", hdb))
+    board = Board([])  # the hub's own board has no such card
+    sh.reconcile(store, runner=board, now=case["detect"]["ts"] + 86400)
+    st = sh.LaneState(store.root).get(fp)
+    assert not board.creates(), "no VERIFY card may be filed against the unrelated MacBook card"
+    assert st["status"] == "stale" and not st.get("fix_card") and owner["id"] in st["rejected_owners"]
+    assert [r["card"] for r in events(store, "selfheal_adoption_rejected")] == [owner["id"]]
+    assert not [r for r in events(store, "selfheal_adoption_revalidated") if r.get("ok") is None]
+    queued = pending(store)[fp]
+    assert queued["session_id"] == case["detect"]["session_id"] and queued["quote"] == case["detect"]["evidence"]
+
+
+def test_remote_owner_the_replica_cannot_describe_is_still_kept_unreadable(store, monkeypatch, tmp_path):
+    """No replica row (or no replica at all) is still `unreadable, kept`: absence is never a refusal."""
+    monkeypatch.setattr(sh, "budget", OPEN)
+    fp = "agent-9b12cb8ed8"
+    case = REMOTE[fp]
+    legacy_adoption(store, fp, case, board="macbook:default")
+    monkeypatch.setattr(sh, "host_name", lambda: "hermes-hub")
+    monkeypatch.setattr(sh._placement_evidence, "home_machine", lambda: "hub")
+    for hdb in (None, _hub_replica(tmp_path / "hub" / "hub.db", dict(case["wrong_owner"], id="t_other0000000001"))):
+        monkeypatch.setattr(sh, "_lookup_sources", lambda runner=None, hdb=hdb: (tmp_path / "home", hdb))
+        sh.reconcile(store, runner=Board([]), now=case["detect"]["ts"] + 86400)
+        st = sh.LaneState(store.root).get(fp)
+        assert st["status"] == "approved" and st["fix_card"] == case["wrong_owner"]["id"]
+        assert not events(store, "selfheal_adoption_rejected")
+        sh.LaneState(store.root).update(fp, adopt_checked_at=0)  # let the hourly re-judge run again
+    assert [r["ok"] for r in events(store, "selfheal_adoption_revalidated")] == [None, None]

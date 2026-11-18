@@ -6915,14 +6915,48 @@ def _adoption_log_records(store, fps: set) -> dict:
 ADOPT_RECHECK_S = 3600  # an owner whose text could not be read is re-judged at most hourly, not every 5-min pass
 
 
-def _owner_card_text(card: str, board: Optional[str], runner=None) -> Optional[dict]:
+def _replica_task_text(card: str, board: Optional[str], hub_db: Optional[Path]) -> Optional[dict]:
+    """The text of a card that lives on another gateway, from this host's hermes-hub replica (read-only), whatever its
+    status: a revalidation judges an owner that may long since be done (_replica_card_text drops non-adoptable
+    statuses, which is right for picking a new owner and wrong for re-judging an old one). None when the board names
+    no gateway, the replica is absent/unreadable, or it holds no titled record of this card from that gateway."""
+    import sqlite3
+    gw = str(board or "").partition(":")[0]
+    if not gw or ":" not in str(board) or hub_db is None or not Path(hub_db).exists():
+        return None
+    try:
+        con = _ro_state(Path(hub_db))
+    except sqlite3.Error:
+        return None
+    try:
+        rows = con.execute("SELECT data FROM replica WHERE gw = ? AND coll = 'tasks' AND key LIKE ?",
+                           (gw, "%/" + card)).fetchall()
+    except sqlite3.Error:
+        return None
+    finally:
+        con.close()
+    for (raw,) in rows:
+        try:
+            t = json.loads(raw)
+        except ValueError:
+            continue
+        if isinstance(t, dict) and t.get("id") == card and t.get("gateway") == gw and t.get("title"):
+            return {"id": card, **{k: t.get(k) for k in ("title", "body", "idempotency_key", "status", "created_at",
+                                                         "completed_at")}}
+    return None
+
+
+def _owner_card_text(card: str, board: Optional[str], runner=None, hub_db: Optional[Path] = None) -> Optional[dict]:
     """The owner card's title/body/key/created/completed via `hermes kanban show --json`; None when unreadable or
     when the board's answer carries no title (a reply that cannot be judged is not a refusal). The board is resolved
     by lane_owner: a digest lane's '<gateway>:<board>' is shown on this host's board part first; another gateway's
-    card that is not there reads as unreadable (kept, re-judged later), never as a refusal."""
+    card that is not there is read from the hub replica (`_replica_task_text`), and only a card the replica cannot
+    describe either reads as unreadable (kept, re-judged later), never as a refusal. Before the replica fallback an
+    owner on the MacBook was unreadable on every pass, so an old-rule adoption was never re-judged (11-13..11-18:
+    eight lanes, 106 passes each, all `ok: None`) and still drew its VERIFY card (agent-9b12cb8ed8)."""
     own = lane_owner(card, board, runner)
     if own["argv"] is None:
-        return None
+        return _replica_task_text(card, board, hub_db if hub_db is not None else _lookup_sources(runner)[1])
     task = own["task"] if own["shown"] else _show_task(own["argv"], card, runner)[0]
     if not isinstance(task, dict) or "title" not in task:
         return None
