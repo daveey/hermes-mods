@@ -2086,7 +2086,7 @@ def _turn_delete_all(refs, repo, cwd, env):
     def one(ref):
         try:
             _turn_delete(ref, repo, cwd, env)
-        except _Unreadable:
+        except (_Unreadable, _PreflightExpired):
             pass
     threads = [threading.Thread(target=contextvars.copy_context().run, args=(one, r), daemon=True) for r in refs]
     for t in threads:
@@ -2156,10 +2156,12 @@ def peer_eligibility(rec, data):
         if not any(not blocked for _, blocked in _earlier_approvals(data, head)):
             return False
         return _Undecided(f"its refreshed head {head[:10]} has no exact-head verdict and whether an earlier "
-                          "approval carries to it needs the carry content walk")
+                          "approval carries to it needs the carry content walk; an exact-head verdict can "
+                          "resolve that carry uncertainty")
     if _now() - _turn_order(rec)[0] >= _TURN_REFRESH_GRACE:
         return _Undecided("its ticket is past the refresh grace and whether drift on its areas went "
-                          "unrefreshed that long needs the drift-start walk")
+                          "unrefreshed that long needs the drift-start walk; a blocking exact-head verdict "
+                          "releases the ticket, but an approval does not resolve this drift uncertainty")
     return True
 
 
@@ -2261,7 +2263,7 @@ def _turn_hold_refusal_scoped(number, data, repo, cwd, env):
                        f"the state land turn until {_until(rec['expires'])} ({ref}); this PR waits behind that "
                        f"older turn ({hit[1]} ~ {hit[0]}). Undecided here because {why}: the bounded turn check "
                        "never walks another PR's carry or drift history. Refresh now if drift is reported below; "
-                       f"retry when PR #{rec['pr']} merges, closes, gets an exact-head verdict, or its turn "
+                       f"retry when PR #{rec['pr']} merges, closes, yields, or its turn "
                        "expires. Do not park on the hold instead of refreshing.")
             break
     _turn_delete_all(released, repo, cwd, env)
