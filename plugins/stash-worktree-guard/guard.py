@@ -330,6 +330,25 @@ def _glob_bracket(raw: str, i: int) -> bool:
     return "]" in raw[i + 1:]
 
 
+_DEFERRING = RUNNERS | _INTERPRETERS | {"source", ".", "eval"}
+
+
+def _defers_unseen(words) -> bool:
+    """True if a word of ``words`` may name a program that runs input the guard cannot see.
+
+    Inside a hypothetical argv suffix the guard does not split again, so a nested runner
+    (``xargs -a FILE git``, ``parallel``, ``flock M …``) or an interpreter reading a script
+    file never has its own argv suffixes, appended words or file analyzed. Scoping the
+    uncertainty of such an argv locally would drop exactly the evidence it hides.
+    """
+    for w in words:
+        lit = _literal(w) or ""
+        base = re.sub(r"[\d.]+$", "", os.path.basename(lit)) or os.path.basename(lit)
+        if base in _DEFERRING or os.path.basename(lit) in _DEFERRING:
+            return True
+    return False
+
+
 def _splittable(raw: str) -> bool:
     """True if an unquoted expansion in ``raw`` may split into several words."""
     quote, i = None, 0
@@ -1960,15 +1979,15 @@ class _Analyzer:
         except _ParseError:
             # Expanded words carry scalar evidence that the raw text may only hold split.
             if (self.suffix and self.suffix[0] is node and self.suffix[1] is not None
-                    and not any(os.path.basename(w or "") in _APPENDING_RUNNERS
-                                for w in wrapper_words)):
+                    and not _defers_unseen(wrapper_words)):
                 # The parser established this argv's boundaries. Failure to resolve a
                 # hypothetical wrapper suffix is local, not a failed shell parse: it
                 # cannot turn quoted data elsewhere into an executable Git operation.
                 # Its stdin (pipe, here-doc, here-string text) is input it may run as
-                # Git words, so it is part of the local evidence. Unread stdin (`< file`)
-                # or an appending runner (xargs/parallel/find, which may also read
-                # `-a file`) takes words the guard never saw: that stays fail-closed.
+                # Git words, so it is part of the local evidence. Unread stdin (`< file`),
+                # or a later word naming a program that runs input the guard never sees at
+                # this depth (xargs/parallel/find appending words, perhaps from `-a file`; a
+                # nested runner; an interpreter's script file), stays fail-closed.
                 self.local_evidence(" ".join(words + wrapper_words) + "\n" + self.suffix[1])
             else:
                 self.fail_closed(" ".join(words + wrapper_words))
@@ -2002,7 +2021,8 @@ class _Analyzer:
         if name is None:
             # Unknown command name: it may be git itself, or a wrapper of a later word.
             suffix = self.suffix if self.suffix and self.suffix[0] is node else None
-            if suffix and suffix[1] is not None and not _splittable(raw[0]):
+            if (suffix and suffix[1] is not None and not _splittable(raw[0])
+                    and not _defers_unseen(raw[1:])):
                 # A hypothetical suffix of a known program's argv (`grep -- "$l" "$f"` read
                 # as if grep ran "$f"), headed by a word that stays one word: the uncertainty
                 # is this argv's alone, and the rest of the command was parsed and analyzed,
@@ -2016,6 +2036,11 @@ class _Analyzer:
                 # outside it; it is refused when the command anywhere holds stash/restore text
                 # (`S=$(printf stash)`), the same text evidence the whole-command fallback used,
                 # but no longer turned into a phantom call when no Git argv may run.
+                # The head may also be consumed by the enclosing wrapper (`env "$A" …` with
+                # A=X=1, `flock "$A" …`), making the rest of this argv the real command. Its
+                # suffix reading is analyzed, but not split again: when that rest names a
+                # runner or interpreter (`xargs -a args git`), its input is unseen, so the
+                # argv keeps the whole-command fallback below (_defers_unseen).
                 self.local_evidence(" ".join(words) + "\n" + suffix[1])
                 saved = self.suffix, self.splitting
                 self.suffix, self.splitting = None, True  # already a suffix: not split again
