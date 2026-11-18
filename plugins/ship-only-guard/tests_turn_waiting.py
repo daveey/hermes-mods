@@ -282,3 +282,48 @@ def test_waiting_promotion_keeps_original_record_and_nontransitive_lanes():
     active.remove(1)
     assert select() == [2]  # promotion is derived, never a ref rewrite
     assert json.dumps(snapshot, sort_keys=True) == before
+
+
+def test_uncertain_waiting_lane_never_suppresses_a_possible_successor():
+    a = record(pr=1, files=["x"], acquired=f.NOW - 90)
+    b = record(pr=2, files=["x", "y"], acquired=f.NOW - 60)
+    c = record(pr=3, files=["y"], acquired=f.NOW - 30)
+    snapshot = [(f"refs/land-turn/pr-{r['pr']}", r) for r in (a, b, c)]
+    selected = list(g.possible_turns(snapshot,
+        lambda ref, rec: g._Undecided("original patch unreadable") if rec["pr"] == 1 else True,
+        lambda: None))
+    assert [r["pr"] for _, r, _ in selected] == [1, 2, 3]
+    assert all(why is not None for _, _, why in selected)
+    # Decidable A holds: B is suppressed, C is effective (not transitive FIFO).
+    assert [r["pr"] for _, r, _ in g.possible_turns(snapshot, lambda *_: True, lambda: None)] == [1, 3]
+
+
+def test_waiting_expiry_cooldown_and_fenced_rearm_are_bounded(monkeypatch):
+    clock = [f.NOW]
+    monkeypatch.setattr(g, "_now", lambda: clock[0])
+    monkeypatch.setattr(g, "_WAITING_WRITER_ENABLED", True)
+    fake = f.FakeGitHub({n: f.pr(n, f.H2563, ["hermes-sync"]) for n in (1, 2, 3)})
+    monkeypatch.setattr(g.subprocess, "run", fake.run)
+    f.seed_turn(fake, 1, f.NOW - 60)
+    assert "waiting place recorded" in f.merge(2, f.H2563)
+    original = dict(fake.turn(2))
+    oid = fake.refs["refs/land-turn/pr-2"]
+    fake.pr_state[1] = "closed"
+    assert f.merge(2, f.H2563) is None
+    clock[0] = original["expires"]  # expiry boundary is not a live reservation
+    with g._scope():
+        assert not g._live_turns(f.R, None, {})
+    f.seed_turn(fake, 3, clock[0] - 1)
+    assert "PR #3 holds" in f.merge(2, f.H2563)
+    assert fake.refs["refs/land-turn/pr-2"] == oid
+    assert fake.turn(2) == original
+    clock[0] = original["expires"] + g._TURN_TTL
+    f.seed_turn(fake, 3, clock[0] - 1)
+    assert "waiting place recorded" in f.merge(2, f.H2563)
+    new_oid = fake.refs["refs/land-turn/pr-2"]
+    assert new_oid != oid
+    assert fake.commits[new_oid]["parents"] == [oid]
+    assert fake.turn(2)["acquired"] == clock[0]
+    assert fake.turn(2)["expires"] == clock[0] + g._TURN_TTL
+    writes = [call for call in fake.calls if "PATCH" in call]
+    assert len(writes) == 1 and not any("DELETE" in call for call in fake.calls)
