@@ -2069,11 +2069,14 @@ def pr_state_claim(reply: str, tool_log: Optional[list] = None) -> Optional[str]
     # Conservatively require every repository in the raw reply to match. Mixed
     # or ambiguous scopes may nudge, but cannot grant a number-only exemption.
     raw = reply or ""
-    github_repo = r"(?:https?://)?github\.com/([\w.-]+/[\w.-]+)\b"
+    # A word boundary truncates legal trailing '-' or '.' characters. Consume
+    # the entire identifier alphabet; ambiguous prose punctuation stays scoped
+    # conservatively rather than becoming evidence for a different repository.
+    github_repo = r"(?:https?://)?github\.com/([\w.-]+/[\w.-]+)(?![\w.-])"
     context_repos = {m[1].lower() for m in re.finditer(github_repo, raw, re.I)}
     without_urls = re.sub(github_repo + r"[^\s<>\"'`]*", " ", raw, flags=re.I)
     context_repos |= {m[1].lower() for m in re.finditer(
-        r"(?<![\w/:.-])([\w.-]+/[\w.-]+)\b", without_urls)}
+        r"(?<![\w/:.-])([\w.-]+/[\w.-]+)(?![\w.-])", without_urls)}
     ambiguous_short_ref = bool(re.search(r"(?<![\w/.-])[\w.-]+#[1-9]\d*\b", without_urls))
     hit = None
     context_ids = set()

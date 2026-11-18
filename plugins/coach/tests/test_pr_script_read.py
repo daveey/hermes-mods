@@ -172,6 +172,23 @@ def test_raw_repository_scope(tmp_path, monkeypatch, repo, form):
     assert bool(check(hooks, form.format(repo=repo))) == (repo != 'example/repo')
 
 
+@pytest.mark.parametrize('suffix', ['-', '--', '.', '..', '_', '-.'])
+@pytest.mark.parametrize('form', [
+    'PR #3139 is still open in {repo} today.',
+    'PR #3139 is still open in `{repo}` today.',
+    'PR https://github.com/{repo}/pull/3139 is still open.',
+    'PR github.com/{repo}/pull/3139 is still open.',
+    'PR {repo}#3139 is still open.',
+])
+@pytest.mark.parametrize('matching', [False, True])
+def test_repository_token_is_not_truncated(tmp_path, monkeypatch, suffix, form, matching):
+    hooks, _, _ = begin(tmp_path, monkeypatch)
+    repo = 'example/repo' + suffix
+    source = SCRIPT.replace('example/repo', repo) if matching else SCRIPT
+    replay(hooks, tmp_path / 'read.sh', source=source)
+    assert bool(check(hooks, form.format(repo=repo))) == (not matching)
+
+
 def test_short_repository_scope_is_ambiguous(tmp_path, monkeypatch):
     hooks, _, _ = begin(tmp_path, monkeypatch)
     replay(hooks, tmp_path / 'read.sh')
