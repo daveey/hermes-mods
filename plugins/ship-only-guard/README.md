@@ -343,7 +343,7 @@ fails GitHub's rebase merge. hermes-sync pushes live skill edits straight to
 Skill prose next to code (`home/skills/x/scripts/*.py`) and markdown outside
 the skill trees still overlap.
 
-**Ordered land turns (protocol 2).** A drift refusal of a green, approved PR
+**Ordered land turns (protocol 3).** A drift refusal of a green, approved PR
 may record `refs/land-turn/pr-<N>`, pointing at a commit with subject
 `land-turn pr=<N>` and one JSON line containing `pr`, `head`, `acquired`,
 `expires`, and `files`. The lifetime is 90 minutes; repeat refusals and changed
@@ -508,7 +508,7 @@ holders. Missing/tree/blob targets cannot become commit parents: acquisition ref
 without replacing the ref. Close/merge the owning PR to release its semantic hold,
 or use fenced maintenance to repair the ref; never force-patch it as recovery.
 Malformed closed records do not block. No peer's live malformed ref is edited
-or deleted as recovery. State pre-push requires protocol 2 and invokes this same
+or deleted as recovery. State pre-push requires protocol 3 and invokes this same
 reader and selector for direct non-export pushes, instead of reconstructing
 eligibility from a recorded tree. Deploy the plugin before the state wrapper.
 

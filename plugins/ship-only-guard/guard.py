@@ -1563,7 +1563,7 @@ def _attribute_hits(repo, names, window, subject, cwd, env):
 # scripts/state-push-guard pre-push) a direct non-sync push. The turn only ever adds refusals; any error
 # reading it refuses: an incomplete snapshot cannot establish turn order.
 _TURN_PREFIX = "land-turn/pr-"
-TURN_PROTOCOL = 2          # effective acquisition order + eligibility, shared by state pre-push
+TURN_PROTOCOL = 3          # waiting-safe readers + retained refs + fenced non-force generations
 _TURN_TTL = 5400             # one refreshed CI cycle (#2563: 10-45 min) plus the merge attempt, with slack
 _TURN_REFRESH_GRACE = 900    # refresh the drifted acquisition head within 15 minutes
 _TURN_BUDGET = 10            # acquisition write budget; reads never silently truncate
