@@ -1081,6 +1081,29 @@ YIELD_NOTE = ("The user sent a message while this was waiting. Read it and answe
               "call run_in_user_terminal with this job_id to keep waiting.")
 
 
+# agent-7e5ac22ea5 recurrence: "done" in chat usually arrives as the message that yields the wait, so the yielded
+# result is where the agent decides. It used to carry only YIELD_NOTE (no output, no action=enter), and the agent
+# kept waiting on a window that waited for Enter. When the window's last line asks for Enter, say so here.
+def enter_wait_line(output: str | None, status: str | None) -> str:
+    """The running window's last non-blank line when it asks for Enter/Return, else ""."""
+    if status != "running" or not output:
+        return ""
+    lines = [ln.strip() for ln in str(output).replace("\r", "\n").split("\n") if ln.strip()]
+    line = lines[-1] if lines else ""
+    return line if _ENTER_PROMPT.search(line) else ""
+
+
+def yield_note(result: dict) -> str:
+    """YIELD_NOTE, plus the action=enter instruction when the window is waiting for Enter (sets waiting_for_enter)."""
+    line = enter_wait_line(result.get("output"), result.get("status"))
+    if not line:
+        return YIELD_NOTE
+    result["waiting_for_enter"] = line
+    return (YIELD_NOTE + f" The window is waiting for Enter ({line[-200:]!r}). If the user's message says that step "
+            f"is done, call run_in_user_terminal with action=enter and this job_id now to press Return there; don't "
+            f"ask them to press it and don't just keep waiting.")
+
+
 FINAL = ("ran", "declined", "failed", "withdrawn", "abandoned")
 
 
@@ -2779,6 +2802,8 @@ def wait_for(job: Path, wait_s: float, reconcile: bool = False) -> dict:
         if len(out) > OUTPUT_TAIL:
             out = f"[… {len(out) - OUTPUT_TAIL} chars trimmed; full log {log}]\n" + out[-OUTPUT_TAIL:]
         result["output"] = out
+    if yielded and result["status"] == "running" and result.get("note", "").startswith(YIELD_NOTE):
+        result["note"] = yield_note(result) + result["note"][len(YIELD_NOTE):]  # now that the output is attached
     if result["status"] == "declined":
         result["note"] = "The user declined in the terminal. Do not re-run it unasked; ask what they want instead."
     return result
@@ -3625,6 +3650,7 @@ def handle_remote(args: dict, session_id: str | None = None, **_kw: Any) -> str:
                     return json.dumps(start_failed(base, entry, res, device))
                 job_id, terminal = str(res["job_id"]), res.get("terminal")
         res: dict = {}
+        seen: dict = {}  # the last full status answer (its output = what the window showed)
         yielded = False
         while True:
             left = deadline - time.time()
@@ -3634,6 +3660,8 @@ def handle_remote(args: dict, session_id: str | None = None, **_kw: Any) -> str:
                 res = courier_offline(job_id, device)
                 break
             yielded = bool(res.pop("yielded", False))
+            if res.get("ok") and not yielded and res.get("job_id") in (None, job_id):
+                seen = res
             if yielded or not res.get("ok") or res.get("status") in FINAL or time.time() >= deadline:
                 break
             if _interrupted():
@@ -3673,8 +3701,15 @@ def handle_remote(args: dict, session_id: str | None = None, **_kw: Any) -> str:
         if res.get("courier") == "offline":
             return json.dumps(res)
         if yielded and res.get("ok") and res.get("status") not in FINAL:
+            # the yield cut the poll short, so its stub carries no output: show the window as the last poll saw it
+            # (no extra courier round trip: the courier may still be serving the cut-short poll)
+            if "output" not in res and seen.get("output") is not None:
+                res.update({k: seen[k] for k in ("status", "output") if k in seen})
             res["yielded"] = True
-            res["note"] = YIELD_NOTE + f" (The window is on `{device}`.)"
+            res["note"] = yield_note(res) + f" (The window is on `{device}`.)"
+            if "output" not in res:
+                res["note"] += (" If their message says a step in that window is done, poll this job_id once with "
+                                "wait_s=1: if its output ends asking for Enter, call action=enter.")
         elif res.get("ok") and res.get("status") == "awaiting_consent":
             res["next"] = res.get("next") or CONSENT_NEXT
             res["note"] = res["next"] + f" (The prompt and the window are on `{device}`.)"
