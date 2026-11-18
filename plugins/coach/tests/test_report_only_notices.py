@@ -517,6 +517,30 @@ def test_core_resume_preambles_strip_to_the_real_request():
         assert not rc.automation_prompt(note), f'{name}: a resumed human request must stay judged'
 
 
+@pytest.mark.parametrize('note', [
+    '[System note: Your previous turn was interrupted mid-run.]',
+    '[System note: A turn of yours paused for a Hermes update.]',
+    '[System note: The previous turn was interrupted by a gateway restart.]',
+    '[System note: Resume [the earlier request] after restart.]',
+])
+def test_resume_wrapper_is_not_a_standalone_notice_without_core(note):
+    ask = note + '\n\nfix X'
+    assert not rc.notice_turn(ask)
+    assert not rc.automation_prompt(ask)
+    assert rc.strip_preamble(ask) == 'fix X'
+    assert rc.strip_preamble(note + '\n\n' + ask) == 'fix X'
+    assert rc.notice_turn(note)
+    assert rc.strip_preamble(note) == note
+
+
+def test_generic_runtime_notes_and_job_reports_remain_notices():
+    for ask in ('[System note: result', '[System note: result]',
+                CORE_ENVELOPES['jobs_stopped'] + '\n\nJob report: stopped.'):
+        assert rc.notice_turn(ask)
+        assert rc.strip_preamble(ask) == ask
+    assert not rc.notice_turn('[IMPORTANT: 3 Kanban task updates? why so many')
+
+
 def test_stacked_preambles_strip_and_bare_preambles_stay():
     inner = _core_preambles('fix X')['auto_continue']
     assert rc.strip_preamble(_core_preambles(inner)['pause']) == 'fix X'
