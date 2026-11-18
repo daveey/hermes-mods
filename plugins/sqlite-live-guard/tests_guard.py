@@ -1003,3 +1003,12 @@ def test_kanban_write_by_an_affected_build_gets_the_board_refusal(versions):
     versions[("sqlite3", "cli")] = (3, 45, 1)
     why = plugin.guard.check_shell("sqlite3 ~/.hermes/kanban.db \"update tasks set status='done' where id='t_1'\"")
     assert "Kanban board" in why and plugin.guard.WAL_RESET_MARK not in why
+
+
+def test_trusted_directory_match_needs_a_path_boundary(monkeypatch):
+    monkeypatch.setattr(plugin.guard.os, "stat", lambda p: os.stat_result((0o100755, 0, 0, 1, 0, 0, 0, 0, 0, 0)))
+    monkeypatch.setattr(plugin.guard.os, "access", lambda p, m: True)
+    monkeypatch.setattr(plugin.guard.os.path, "realpath", lambda p: p)
+    assert plugin.guard._trusted("/usr/bin/sqlite3")
+    assert not plugin.guard._trusted("/usr/binx/sqlite3")
+    assert not plugin.guard._trusted("/binaries/sqlite3")

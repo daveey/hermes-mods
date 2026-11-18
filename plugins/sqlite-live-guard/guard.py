@@ -106,7 +106,7 @@ def _trusted(path: str) -> bool:
         st = os.stat(real)
     except OSError:
         return False
-    return (st.st_uid == 0 and not (st.st_mode & 0o022) and real.startswith(_TRUSTED_DIRS)
+    return (st.st_uid == 0 and not (st.st_mode & 0o022) and real.startswith(tuple(d + "/" for d in _TRUSTED_DIRS))
             and os.access(real, os.X_OK))
 
 
@@ -117,6 +117,7 @@ def program_sqlite_version(word: str, kind: str) -> Optional[tuple]:
     path = _resolve(word)
     if not path or not _trusted(path):
         return None
+    path = os.path.realpath(path)  # run exactly the file that was judged, not a symlink that may be swapped
     try:
         st = os.stat(path)
     except OSError:
