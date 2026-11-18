@@ -27,7 +27,7 @@ import threading
 import time
 import urllib.parse
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Literal, Optional
 
 DEFAULT_CLIENT = Path.home() / ".local" / "share" / "hermes-mail" / "hermes_hub.py"
 # The poller syncs every 60 s; a pull older than this means the replica may be behind the hub.
@@ -485,8 +485,14 @@ def _gw_filter(rows, gateway: Optional[str], exclude: Iterable[str]):
     return [r for r in rows if (not gateway or r["gateway"] == gateway) and r["gateway"] not in ex]
 
 
+PREFETCH_SESSION_FIELDS = frozenset({
+    "activity", "archived", "automated", "gateway", "hidden", "id", "message_count",
+    "parent_session_id", "profile", "started_at",
+})
+
+
 def sessions(gateway: Optional[str] = None, exclude: Iterable[str] = (), include_archived: bool = False,
-             limit: int = 500) -> dict:
+             limit: int = 500, projection: Optional[Literal["prefetch"]] = None) -> dict:
     def fn(v: View):
         def pick(cands):
             ex = {g for g in exclude if g}
@@ -498,7 +504,11 @@ def sessions(gateway: Optional[str] = None, exclude: Iterable[str] = (), include
             rows.sort(key=act)
             return rows[:max(1, min(limit, 5000))]
         rows = _sort_activity(v.rows("sessions", pick))  # same stable order the full read gave
-        return {"sessions": rows[:max(1, min(limit, 5000))]}
+        rows = rows[:max(1, min(limit, 5000))]
+        if projection == "prefetch":
+            # Project only final decorated rows: preserve overrides, missing/null, and the decode cache.
+            rows = [{k: value for k, value in row.items() if k in PREFETCH_SESSION_FIELDS} for row in rows]
+        return {"sessions": rows}
     return _with_view(fn, sessions=[])
 
 
