@@ -21,6 +21,18 @@ No agent hooks or tools: `register()` is a no-op; everything is `dashboard/plugi
 | GET | `/requests` | what this gateway asked other gateways to change |
 | POST | `/request` `{gateway, coll, key, action, args?, base_version?}` | `{id, queued_locally, state}`; 400 bad action/args/key shape, 404 unknown gateway, 503 hermes-hub missing |
 
+`GET /sessions?projection=prefetch` keeps only fields present on each final row from:
+`activity`, `archived`, `automated`, `gateway`, `hidden`, `id`, `message_count`,
+`parent_session_id`, `profile`, `started_at`. Missing fields stay missing and nulls stay null.
+Omit `projection` for the unchanged full response; any other value returns 422.
+Filtering, archive/shared overrides, ordering and limits run before projection. The response
+envelope (including unavailable, stale and offline state) is unchanged. Full and projected
+polls have separate in-flight reads and snapshots, including warming and stale fallbacks.
+This reduces serialized response bytes, not upstream replica decoding. The shared synthetic
+Desktop fixture in `tests/fixtures/hub-sync-sessions-prefetch-projection.json` exercises the
+actual endpoint and requires at least 50% JSON body-byte reduction; it is not production data
+or a production latency measurement.
+
 Own records come from the `published` table (`local: true`), other gateways' from `replica`; `stale` is true when
 the last successful hub pull is older than 180 s. `pending` lists this gateway's unsent/unapplied requests for the
 record. Allowed actions: sessions `rename{title}`/`archive`/`unarchive`/`pin`/`unpin`; inbox `act{action, input?}`/
