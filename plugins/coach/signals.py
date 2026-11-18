@@ -697,7 +697,10 @@ def auth_storms(cur: dict, recs: List[dict], now: float, host: str,
     st = cur.get("auth") or {}
     filed = float(st.get("filed") or 0)
     keep = now - AUTH_STORM_S - RELAY_SETTLE_S
-    ad = [a for a in (st.get("adopt") or []) + list(adopted or []) if a.get("at", 0) > keep and a.get("sid")]
+    # Match against every adoption read (newly read backfill too: a first or delayed sweep reads hour-old 401s and
+    # their adoptions together); prune only what is persisted. A retained event is newer than `keep`, so any
+    # adoption that can still clear it is newer than `keep` as well.
+    ad = [a for a in (st.get("adopt") or []) + list(adopted or []) if a.get("sid") and a.get("at")]
     evs = [e for e in st.get("ev") or [] if e.get("at", 0) >= now - BACKFILL_S]
     evs += [{k: r.get(k) for k in ("at", "sid", "status", "reason", "provider", "profile", "details")}
             for r in recs if r["at"] >= now - BACKFILL_S]
@@ -727,6 +730,7 @@ def auth_storms(cur: dict, recs: List[dict], now: float, host: str,
                         "fp": fp("agent", "auth-storm", provs, statuses, reasons)})
             win = []
     evs = [e for e in evs if e["at"] > max(filed, keep)]
+    ad = [a for a in ad if a["at"] > keep]
     if evs or filed > now - AUTH_STORM_S:
         cur["auth"] = {"ev": evs, "filed": filed, **({"adopt": ad} if ad else {})}
     else:
