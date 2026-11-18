@@ -146,6 +146,7 @@ Undone notices are always plain cards.
 
 ## Done means
 
+- [ ] Before classifying an `ask-gate-weekly` hit as a detector miss, did you inspect exact historical log events matching its quote, session and incident scope, allowing live detection without a retained lane owner and recording missing evidence as unknown rather than a miss?
 - [ ] For each frozen weekly ask-gate candidate, did you inspect raw envelopes and earlier product replies before deciding human authorship, rather than treating API ingestion metadata or session source as proof?
 - [ ] Before calling an ask-gate hit a miss, checked every `<data>/*/selfheal-seen.json` plus local `coach/selfheal.json` with `detection_for`, and, when testing the cross-host path on the hub, removed same-session hub fingerprints only from a scratch home copy so local detections cannot mask the cross-host result?
 
