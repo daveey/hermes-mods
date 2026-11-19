@@ -78,6 +78,20 @@ Inside a dispatcher-spawned worker (`HERMES_KANBAN_TASK` set), a `pre_tool_call`
 | H | (any session) a **write that delegates an action the user did not consent to**: after an approval result in this chat is a non-consent (`BLOCKED: … has NOT consented` / timed out, "Silence is not consent"), any `kanban_create`, `kanban_comment`, `kanban_supervisor_request`, `cross_task`/`cross_session` send, `delegate_task`, or `hermes kanban`/`hermes-hub` write command naming a card the blocked call named, until the user's next real message in that chat. A worker is bound by the stops of the chat its card came from (`tasks.session_id` or the body's `origin @session:`), on the same host. `consent.py` (see below) | `post_tool_call` records, `pre_tool_call` refuses, `pre_llm_call` clears |
 | I | completing your **own** card with a handoff that **claims a delivery to another card** ("posted on t_X", "commented on t_X", "relayed to t_X") with no write result behind it. `delivery.py` (see below) | same paths as B |
 
+Gate D keeps `(gateway, profile, session)` qualifiers throughout membership checks;
+malformed short qualified tokens cannot backtrack into a profile name. Replica
+fallback is restricted to the same owner gateway, board and profile. For a
+courier-owned card executing at its origin gateway, `origin_receipts.py` can
+recognize the existing authenticated origin obligation even when the board
+shadow omits notification subscriptions. It requires an unreleased binding,
+matching accepted receipt/hash/request and exact owner/origin identity, a current
+matching publication/marker, fresh replica metadata and readable live owner
+scope. All reads are read-only; it never creates, refreshes, adopts or releases
+an obligation. Missing, stale or malformed evidence does not count. No exemption
+is based on scratch sessions or prose describing another card. Tests:
+`tests/test_origin_receipt_recognition.py` (identity negatives, receipt freshness,
+malformed-token regression and query-only connection/closure checks).
+
 Each refusal says what to do: finish the missing part, or `kanban_create` the follow-up (`parents=[<this card>]`)
 and name its id, or `kanban_block` with the exact physical step. Completing another card (a reviewer approving a
 card in review) is not gated.
