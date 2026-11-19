@@ -14,7 +14,8 @@ def test_speculative_complete_snapshot_does_not_cleanup_on_rejected_approval(gh)
     assert any("graphql" in c for c in fake.calls)  # speculation actually read the cooled snapshot
 
 
-def test_combined_hold_and_drift_keeps_approval_priority_and_never_acquires(gh):
+def test_combined_hold_and_drift_keeps_approval_priority_and_never_acquires(gh, monkeypatch):
+    monkeypatch.setattr(g, "_WAITING_WRITER_ENABLED", False)
     fake = gh({n: pr(n, H2563, ["hermes-sync"]) for n in (1, 2)}, compare=delta(["hermes-sync"]))
     seed_turn(fake, 1, NOW - 60)
     why = merge(2, H2563)

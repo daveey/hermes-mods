@@ -2326,7 +2326,7 @@ def _turn_acquire(number, data, repo, cwd, env, prechecked=False):
 
 # Rollout fence: enable only after all state readers AND old writers are replaced.
 # No command environment override: a caller cannot opt out of the deployment fence.
-_WAITING_WRITER_ENABLED = False
+_WAITING_WRITER_ENABLED = True
 
 
 def _turn_wait(number, data, repo, cwd, env, hold):

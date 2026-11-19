@@ -10,6 +10,10 @@ from tests_carry import real_merges  # noqa: F401
 g = c.g
 
 
+def test_waiting_writer_enabled_for_rollout():
+    assert g._WAITING_WRITER_ENABLED is True
+
+
 def setup(monkeypatch, tmp_path, real_merges):
     h0, heads, answers = real_merges
     c.fake(monkeypatch, answers=answers)
