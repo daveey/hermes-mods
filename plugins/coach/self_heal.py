@@ -3213,6 +3213,48 @@ def backlog_priority(d: dict, now: float, recurrence: bool = False) -> tuple:
             d.get("fingerprint") or "")
 
 
+def backlog_bypass(d: dict) -> bool:
+    """Urgent infrastructure classes, from structured fields only (never symptom keywords).
+
+    Kanban/worker = dispatcher; gateway = service availability; auth/credential =
+    credential path; quota/pacing = scheduling capacity; billing/payment/budget =
+    money path. Corruption incidents can take any service down. No exemption from
+    daily-card or lane budgets: this only overrides ranking and intraday pacing.
+    """
+    components = {"kanban", "gateway", "auth", "credential", "credentials", "quota",
+                  "pacing", "billing", "payment", "budget"}
+    kinds = {"worker", "gateway", "corruption", "credential", "credentials", "auth",
+             "quota", "pacing", "billing", "payment", "down", "outage"}
+    incident = d.get("incident")
+    return (d.get("component") in components or d.get("kind") in kinds
+            or (isinstance(incident, dict) and bool(incident.get("db") and incident.get("host"))))
+
+
+def backlog_allowance(cap: int, filed: int, now: float, bypass: bool = False) -> int:
+    """UTC pacing leaves slots for intraday discoveries, without changing the cap."""
+    import math
+    hour = int(now) % 86400 // 3600
+    ceiling = cap if bypass else math.ceil(cap * (hour + 1) / 24)
+    return max(0, ceiling - filed)
+
+
+def _backlog_queue(d: dict, store, now: float, why: str = "ranked backlog", **extra) -> dict:
+    # A persisted queue is custody, including for forwarded monitors.
+    db = _pending_db(store)
+    try:
+        row = db.execute("SELECT payload FROM pending WHERE fp=?", (d["fingerprint"],)).fetchone()
+    finally:
+        db.close()
+    cached = json.loads(row[0]) if row else {}
+    for key in ("backlog_severity", "backlog_severity_ready", "backlog_bump"):
+        if key in cached:
+            d = {**d, key: cached[key]}
+    if not row:  # failed classifications retry on drain, not on every occurrence
+        d = backlog_classify(d)
+    return _defer_investigation(d, {"action": "queued", "retry_at": _iso(now),
+                                   "why": why, "stop_pass": False, **extra}, store)
+
+
 def backlog_classify(d: dict, judge=None) -> dict:
     """One successful pool classification per fingerprint. Failure is neutral and retryable.
 
@@ -3251,7 +3293,12 @@ def fold_payloads(old: dict, new: dict, why: str = "", keep_old: bool = False) -
         (old, new) if (_detected_at(old) or 0) <= (_detected_at(new) or 0) else (new, old))
     oa, ob = list(a.get("occurrences") or [_occurrence(a)]), list(b.get("occurrences") or [_occurrence(b)])
     if not why and {_occ_key(o) for o in oa} <= {_occ_key(o) for o in ob}:
-        return {**b, "fingerprint": (old if keep_old else new).get("fingerprint") or b.get("fingerprint")}  # re-deferred
+        out = {**b, "fingerprint": (old if keep_old else new).get("fingerprint") or b.get("fingerprint")}
+        # A re-defer of the same evidence must preserve cached classification/manual priority.
+        for key in ("backlog_severity", "backlog_severity_ready", "backlog_bump"):
+            if key in old:
+                out[key] = old[key]
+        return out
     overlap = len({_occ_key(o) for o in oa} & {_occ_key(o) for o in ob})
     count = (int(a.get("occurrence_count") or len(oa)) + int(b.get("occurrence_count") or len(ob)) - overlap)
     merged = list({_occ_key(o): o for o in sorted(oa + ob, key=lambda o: o.get("at") or 0)}.values())
@@ -3356,7 +3403,7 @@ def _defer_missing_board(d: dict, board: str, store, now: float) -> dict:
     return _defer_investigation(d, result, store)
 
 
-PENDING_MAX_AGE_S = 7 * 86400  # detections waiting longer than this are dropped, not filed late
+PENDING_MAX_AGE_S = 7 * 86400  # compatibility constant only: age never deletes pending evidence
 _SOURCE_RANK = {"complaint": 0, "admission": 0, "signal": 1}  # in-chat judges, then machine signals (9/10 real in
 # the Oct 2026 shadow sample), then the digest backstop (3/6) and anything else
 
@@ -3687,12 +3734,35 @@ def backlog_shadow(store, now: float) -> list:
     return out
 
 
-def retry_deferred(store=None, now: Optional[float] = None, filer=None) -> list:
+def retry_deferred(store=None, now: Optional[float] = None, filer=None, hourly: bool = False) -> list:
+    """Serialize drains; the existing five-minute cron requests hourly gating."""
+    store = _store(store)
+    now = time.time() if now is None else now
+    if not lane_config().get("backlog_ranked", False):
+        return _retry_deferred(store, now, filer)
+    import fcntl
+    Path(store.root).mkdir(parents=True, exist_ok=True)
+    with (Path(store.root) / "selfheal_backlog.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return []
+        stamp = Path(store.root) / "selfheal_backlog.last"
+        try:
+            last = float(stamp.read_text())
+        except (OSError, ValueError):
+            last = 0.0
+        if hourly and now - last < 3600:
+            return []
+        stamp.write_text(str(now))
+        return _retry_deferred(store, now, filer)
+
+
+def _retry_deferred(store=None, now: Optional[float] = None, filer=None) -> list:
     """Recheck due investigations through normal admission, never automatically release a card.
 
-    Highest priority first (`_pending_priority`); the pass stops at the first renewed denial, since every later row
-    would hit the same cap. Rows whose detection is older than PENDING_MAX_AGE_S are dropped (`selfheal_skip`,
-    why `stale pending`), which bounds the queue when input outruns the budget. Resolved sibling crash
+    Ranked rollout uses importance and pacing; the legacy comparison uses `_pending_priority`.
+    Age alone never deletes evidence, even on rollback. Resolved sibling crash
     incidents are withdrawn before the cap-ordered filing pass, with `resolved under <fp>` evidence; so is a signal
     whose own detector would not fire on the code deployed now (`detector_exempts_now: <why>`)."""
     store = _store(store)
@@ -3703,6 +3773,7 @@ def retry_deferred(store=None, now: Optional[float] = None, filer=None) -> list:
         fold_pending_keys(store)
     except Exception as exc:  # health: allow BLE001 -- folding is advisory; the filing dedupe still holds
         store.log({"event": "selfheal_pending_fold_error", "error": str(exc)[:200]})
+    ranked = lane_config().get("backlog_ranked", False)
     if lane_config().get("backlog_shadow", False):
         backlog_shadow(store, now)
     db = _pending_db(store)
@@ -3713,14 +3784,7 @@ def retry_deferred(store=None, now: Optional[float] = None, filer=None) -> list:
         due = []
         for fp, payload, version in rows:
             d = json.loads(payload)
-            at = _detected_at(d)
-            if at is not None and now - at > PENDING_MAX_AGE_S:
-                with db:
-                    db.execute("DELETE FROM pending WHERE fp=? AND version=?", (fp, version))
-                store.log({"event": "selfheal_skip", "mode": "live", "fingerprint": fp,
-                           "why": f"stale pending (detected {_iso(at)}, > {PENDING_MAX_AGE_S // 86400}d)"})
-                out.append({"action": "skip", "why": "stale pending"})
-                continue
+
             if synthetic_user_row(d):  # before the cap-ordered pass: a denial stops that pass before late rows
                 with db:
                     db.execute("DELETE FROM pending WHERE fp=? AND version=?", (fp, version))
@@ -3740,11 +3804,26 @@ def retry_deferred(store=None, now: Optional[float] = None, filer=None) -> list:
                 store.log({"event": "selfheal_skip", "mode": "live", "fingerprint": fp, "why": closed})
                 out.append({"action": "skip", "why": closed})
                 continue
-            due.append((_pending_priority(d), fp, d, version))
+            if ranked:
+                classified = backlog_classify(d)
+                if classified != d:
+                    with db:
+                        changed = db.execute("UPDATE pending SET payload=? WHERE fp=? AND version=?",
+                                             (json.dumps(classified), fp, version)).rowcount
+                    if not changed:
+                        continue  # a concurrent fold owns newer evidence; reconsider next pass
+                    d = classified
+                st = LaneState(store.root).get(fp)
+                priority = (not backlog_bypass(d), *backlog_priority(d, now,
+                            bool(st.get("status") == "fixed" or st.get("recurrences"))))
+            else:
+                priority = _pending_priority(d)
+            due.append((priority, fp, d, version))
         due.sort(key=lambda r: r[0])
         for i, (_, fp, d, version) in enumerate(due):
             try:
-                result = (filer or file_defect)(d, store=store, m="live", now=now)
+                kwargs: dict = {"backlog_drain": True} if ranked else {}
+                result = (filer or file_defect)(d, store=store, m="live", now=now, **kwargs)
             except Exception as exc:
                 result = {"action": "error", "why": str(exc)[:300]}
             out.append(result)
@@ -5957,6 +6036,8 @@ def _over_cap(d: dict, fp: str, board: Optional[str], store, runner, now: float,
         return {"action": "error", "why": why}
     if n < cap:
         return None
+    if kind == "defect" and (cfg or lane_config()).get("backlog_ranked", False):
+        return _backlog_queue(d, store, now, why=f"daily card cap: {n} >= {cap}", over_cap=True)
     card, error = _get_digest(store, board, now, cap, runner)
     commented = False
     if card:
@@ -5988,7 +6069,8 @@ def _over_cap(d: dict, fp: str, board: Optional[str], store, runner, now: float,
 
 def file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now: Optional[float] = None,
                 cfg: Optional[dict] = None, budget_fn: Optional[Callable] = None,
-                owner_fn: Optional[Callable] = None, sig_owner_fn: Optional[Callable] = None) -> dict:
+                owner_fn: Optional[Callable] = None, sig_owner_fn: Optional[Callable] = None,
+                backlog_drain: bool = False) -> dict:
     store = _store(store)
     now = now or time.time()
     incident = corruption_incident(d, now)
@@ -5998,7 +6080,8 @@ def file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now: 
              "fingerprint": "sqlitecorrupt-" + hashlib.sha1(key.encode()).hexdigest()[:16]}
     def run():
         with _admission_lock(store, live=(m or mode()) == "live" and is_hub(cfg)):
-            return _file_defect(d, store, m, runner, now, cfg, budget_fn, owner_fn, sig_owner_fn)
+            return _file_defect(d, store, m, runner, now, cfg, budget_fn, owner_fn, sig_owner_fn,
+                                backlog_drain=backlog_drain)
     if not incident or (m or mode()) != "live" or not is_hub(cfg):
         return run()
     # Lane JSON is a read/check/create/write transaction. One lock also protects different
@@ -6012,7 +6095,8 @@ def file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now: 
 
 def _file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now: Optional[float] = None,
                 cfg: Optional[dict] = None, budget_fn: Optional[Callable] = None,
-                owner_fn: Optional[Callable] = None, sig_owner_fn: Optional[Callable] = None) -> dict:
+                owner_fn: Optional[Callable] = None, sig_owner_fn: Optional[Callable] = None,
+                backlog_drain: bool = False) -> dict:
     """File one defect: {fingerprint, component, symptom, source, kind, p_defect, session_id, quote, host, at,
     details}. Returns {"action": would_file|filed|skip|forwarded|error, ...}.
     Optional `filed_by`: the card doing a hand (re-)filing; never its owner, and its quote is no complaint turn."""
@@ -6171,6 +6255,16 @@ def _file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now:
     capped = _over_cap(d, fp, args.get("board"), store, runner, now, cfg)
     if capped:
         return capped
+    if cfg.get("backlog_ranked", False):
+        if not backlog_drain:
+            return _backlog_queue(d, store, now)
+        # Recheck under the same admission lock as cap/budget/create.
+        try:
+            filed = cards_created_today(args.get("board"), now)
+        except Exception as exc:  # health: allow BLE001 -- unknown count fails closed
+            return {"action": "error", "why": f"daily card count unreadable: {exc}"}
+        if not backlog_allowance(daily_card_cap(cfg), filed, now, backlog_bypass(d)):
+            return {"action": "queued", "why": "intraday pacing", "stop_pass": False}
     known, gen = known_cards(st), dec["gen"]
     tid, out, err = None, "", ""
     for _ in range(5):  # an idempotency key that hands back an earlier card (any non-archived status) -> next gen
@@ -8300,7 +8394,7 @@ def cron(data: Path, store=None, now: Optional[float] = None, backstop_every: fl
     except Exception as exc:
         lines.append(f"pull: streak tracking failed: {exc}")
     if mode() == "live":
-        for r in retry_deferred(store, now=now):
+        for r in retry_deferred(store, now=now, **({"hourly": True} if lane_config().get("backlog_ranked") else {})):
             lines.append(f"deferred: {json.dumps(r)[:300]}")
     for fp, what in sync(store, now=now):
         lines.append(f"inbox: {fp} {what}")
