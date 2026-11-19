@@ -6,6 +6,10 @@ collection starts only through the explicit supervised entry script. Mutation,
 dispatch and workspace execution remain disabled. Repair sessions have a separate
 default-off gate: enable only after live owner-routed duplicate-click acceptance.
 
+Optional [App inventory routing and shared PAT budget](APP-INVENTORY.md) includes
+runtime fields, incomplete-cache semantics, and the required ledger-safe rollback
+order. Reverting code before migrating the capped ledger is not safe.
+
 ## Collector and API deployment
 
 The manifest declares the collector's systemd/launchd service and

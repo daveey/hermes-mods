@@ -461,7 +461,12 @@ class Collector:
             coverage, provenance, errors = [], [], []
             for scope, result in results:
                 sid = scope['id']
+                previous_scope = self.scope_results.get(sid, {})
+                last_success = previous_scope.get('last_success_at')
+                if last_success is None and previous_scope.get('complete'):
+                    last_success = previous_scope.get('observed_at')
                 self.scope_results[sid] = dict(attempted_at=now,
+                    last_success_at=result.observed_at if result.complete else last_success,
                     served_at=served_at(scope) if result.error in ('budget_deferred', 'cycle_budget') else now,
                     coverage=dict(scope_id=sid, state='complete' if result.complete else 'partial',
                                   enumerated_count=len(result.rows), provider_total_count=result.total_count,

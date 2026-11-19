@@ -404,7 +404,7 @@ def main(argv=None):
     runtime = load_runtime(args.runtime)
     # Every GET runs inside an open broker vend: the GitHub quota ledger records it
     # and the shared reserve/brake can refuse it (providers/runtime.py).
-    github = BrokerVendGitHub({k: BrokerCredential(**v) for k, v in runtime['credentials'].items()},
+    github = BrokerVendGitHub({k: BrokerCredential.from_mapping(v) for k, v in runtime['credentials'].items()},
         broker_command=(runtime.get('broker_executable', 'token-broker'),))
     try:
         report = _run(args, source, config, runtime, github, discovery)
@@ -416,7 +416,9 @@ def main(argv=None):
 
 def _run(args, source, config, runtime, github, discovery):
     resolver = github
-    adapter = MaintenanceGitHub(transport=github.transport, credential_resolver=resolver, clock=lambda: time.time())
+    adapter = MaintenanceGitHub(transport=github.transport, credential_resolver=resolver,
+        clock=lambda: time.time(), hourly_request_cap=runtime.get('hourly_request_cap'),
+        inventory_credentials=runtime.get('inventory_credentials'))
     identity = tuple(config[k] for k in ('owner_gateway_id', 'owner_profile', 'owner_epoch'))
     state = Path(args.state_dir)
     with OwnerLock(state / 'collector.lock', config, identity), Store(state / 'state.sqlite') as store:

@@ -1060,7 +1060,7 @@ def domain_for(service, home):
         if cached and cached[0] == signature:
             return cached[1]
         from .providers.runtime import BrokerCredential, BrokerVendGitHub
-        references = {ref: BrokerCredential(**spec) for ref, spec in raw.get('credentials', {}).items()}
+        references = {ref: BrokerCredential.from_mapping(spec) for ref, spec in raw.get('credentials', {}).items()}
         # Every GitHub request runs inside the vend, recorded in the quota ledger.
         github = BrokerVendGitHub(references, reason='Dispatch runner jobs',
                                   broker_command=tuple(raw.get('broker_executable') and [raw['broker_executable']] or ['token-broker']))
