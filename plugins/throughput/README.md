@@ -88,9 +88,9 @@ and a body that is not a JSON object a 422, and neither changes anything.
   proportion to what each used (every gateway computes the same shares from the same series, so they sum to 1). It then spaces
   its calls `tokens per call / (share x cap)` seconds apart, where tokens per call is its own measured in+out
   tokens per model call over those 15 minutes (20k until it has measured any; every call is counted, throttled or
-  not). Calls on one gateway queue for slots in `cache/throughput/throttle-pace.json` under a file lock, across
-  all its Hermes processes: an idle gateway's first call starts at once, the rest follow one interval apart, and
-  unused time is not saved up. The spacing is capped at 10 minutes, so a gateway with a sliver of the cap still
+  not). Calls on one gateway share `cache/throughput/throttle-pace.json` under a file lock, across all its Hermes
+  processes: an idle gateway's first call starts at once, the rest follow one interval apart, and unused time is
+  not saved up. The spacing is capped at 10 minutes, so a gateway with a sliver of the cap still
   makes progress. At 100 % (or a cap of zero) every call waits until the level is lowered; a waiting call re-reads
   the level every 5 s. Shares and tokens per call are re-read every 30 s per process. This replaced a rule that
   held every call while the fleet rate was over the cap and released them all when it dipped under, which
@@ -98,6 +98,17 @@ and a body that is not a JSON object a 422, and neither changes anything.
   follows the cap as closely as the tokens-per-call estimate holds; a gateway whose calls suddenly grow overshoots
   until its 15-minute average catches up. `holding` in the payload still means "the measured fleet rate is above
   the cap right now".
+- **Chats are never throttled; slots are granted at start.** Only Kanban card runs (`HERMES_KANBAN_TASK` or
+  `HERMES_KANBAN_WORKER_TASK` set) and cron calls (`platform` `cron`) wait; any other call, an interactive chat,
+  is counted for tokens per call and goes ahead at once, at any level, without touching the pace. Auxiliary calls
+  follow the same rule, with the parent turn's platform (empty outside a turn, so there only the card variables
+  decide). A paced call polls the pace file and is stamped (`last_start`) only when it starts, once one interval
+  has passed since the last start. A wait holds no slot: the earlier version booked a slot before waiting, so
+  waits that ended early (a stop, the auxiliary 540 s bound, a crash) and every level change left booked slots
+  behind, and the queue ratcheted past the 10-minute cap (waits of 763-966 s were logged). Calls count in the
+  minute they start. A stored stamp more than one interval ahead is treated as now. During rollout an older
+  process sharing the file books its slot after the `next_at` a new process writes on each start, and a new
+  process honours an older process's `next_at` only while it is at most one interval ahead.
 - **Card starts** follow the same cap. On a core with the `kanban_start_gate` hook the dispatcher asks the plugin
   before each claim, and a card stays ready (guard reason `start_gate:token_throttle`) while the fleet's measured
   rate is over the cap, or the level is 100 %. The answer is cached for 15 s and fails open. Pacing alone only

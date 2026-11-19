@@ -20,3 +20,6 @@ import pytest  # noqa: E402
 def _no_real_hub_link(tmp_path, monkeypatch):
     """Never read this machine's hermes-hub replica: the throttle's fleet level comes from a test's own fixture."""
     monkeypatch.setenv("HERMES_HUB_STATE", str(tmp_path / "no-hub-link"))
+    # The throttle classifies a call by these (card run vs chat): a test run inside a card must not inherit them.
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_WORKER_TASK", raising=False)

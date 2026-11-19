@@ -171,7 +171,7 @@ def test_middleware_waits_then_calls_through(tmp_path):
     clock.on_sleep = lambda n: T.write_level(tmp_path, 0)
     seen = []
     out = gate.middleware(next_call=lambda request: seen.append(request) or "response", request={"model": "m"},
-                          session_id="s", original_request={"model": "m"})
+                          session_id="s", original_request={"model": "m"}, platform="cron")
     assert out == "response" and seen == [{"model": "m"}] and len(clock.sleeps) == 1
 
 
@@ -343,7 +343,7 @@ def test_an_unusable_call_object_still_holds(tmp_path, monkeypatch):
     gate, clock = _gate(tmp_path, db)
     clock.on_sleep = lambda n: T.write_level(tmp_path, 0) if n == 2 else None
     monkeypatch.setattr(T, "agent_of", lambda call: (_ for _ in ()).throw(RuntimeError("odd callable")))
-    assert gate.middleware(next_call=lambda request: "r", request={}) == "r" and len(clock.sleeps) == 2
+    assert gate.middleware(next_call=lambda request: "r", request={}, platform="cron") == "r" and len(clock.sleeps) == 2
 
 
 def test_sampler_loop_acknowledges_the_level_each_pass(tmp_path, monkeypatch):
@@ -416,16 +416,17 @@ def test_call_tokens_is_measured_use_per_paced_call():
 
 def test_pacer_hands_out_slots_one_interval_apart_across_processes(tmp_path):
     a, b = T.Pacer(tmp_path), T.Pacer(tmp_path)  # two processes on one Hermes root
-    assert a.reserve(NOW, 10.0) == NOW  # idle: the first call starts at once
-    assert b.reserve(NOW, 10.0) == NOW + 10 and a.reserve(NOW + 1, 10.0) == NOW + 20  # a queue, never a herd
-    assert b.reserve(NOW + 500, 10.0) == NOW + 500  # after a quiet spell no credit has piled up: one call, not many
-    assert a.reserve(NOW + 500, 10.0) == NOW + 510
-    assert a.passes(NOW) == 3  # counted by the minute of the slot: all three fall in the minute NOW is in
-    assert a.passes(NOW + 510) == 5 and a.passes(NOW + 510 + T.SHARE_WINDOW_S + 60) == 0
+    assert a.try_take(NOW, 10.0) == 0.0  # idle: the first call starts at once
+    assert b.try_take(NOW, 10.0) == 10.0 and a.try_take(NOW + 1, 10.0) == 9.0  # never a herd; asking books nothing
+    assert b.try_take(NOW + 10, 10.0) == 0.0 and a.try_take(NOW + 10, 10.0) == 10.0  # one start per interval
+    assert b.try_take(NOW + 500, 10.0) == 0.0  # after a quiet spell no credit has piled up: one call, not many
+    assert a.try_take(NOW + 500, 10.0) == 10.0
+    assert a.passes(NOW + 10) == 2  # only calls that started, in the minute they started
+    assert a.passes(NOW + 500) == 3 and a.passes(NOW + 500 + T.SHARE_WINDOW_S + 60) == 0
     a.note(NOW + 520)  # a call made with the throttle off is counted too
-    assert a.passes(NOW + 520) == 6
+    assert a.passes(NOW + 520) == 4
     T.pace_path(tmp_path).write_text("{broken")
-    assert a.reserve(NOW + 600, 10.0) == NOW + 600  # an unreadable state file starts over
+    assert a.try_take(NOW + 600, 10.0) == 0.0  # an unreadable state file starts over
 
 
 def _paced(tmp_path, percent=50, cap=1000.0, rows=(), me="hub"):
@@ -445,13 +446,16 @@ def test_gate_spaces_calls_so_a_queue_drains_at_the_gateways_share_of_the_cap(tm
     gate, clock = _gate(tmp_path, db)
     interval = T.DEFAULT_CALL_TOKENS / (0.125 * 1000.0)  # no use measured here yet: 20k tokens a call -> 160 s
     assert gate.plan(NOW) == ("pace", pytest.approx(interval), NOW - 100)
-    starts = []
-    for _ in range(4):  # four calls arrive at the same moment, in four processes
-        g = T.Gate(tmp_path, db, sleep=clock.sleep, clock=clock.now)
-        t0 = clock.t
-        g.wait()
-        starts.append(clock.t - NOW)
-        clock.t = t0  # the next process also arrived at t0
+    # four calls arrive at the same moment, in four processes, and poll as Gate.wait does (each nap is at most
+    # POLL_S and ends no later than the start it was told about)
+    pacer, starts, due = T.Pacer(tmp_path), [], {i: float(NOW) for i in range(4)}
+    while due:
+        i = min(due, key=lambda k: (due[k], k))
+        left = pacer.try_take(due[i], interval)
+        if left <= 0:
+            starts.append(due.pop(i) - NOW)
+        else:
+            due[i] += min(T.POLL_S, left)
     assert starts == pytest.approx([0.0, interval, 2 * interval, 3 * interval])  # released one at a time
     assert sum(1 for x in starts if x == 0.0) == 1  # exactly one starts at once: no burst
 
@@ -460,7 +464,7 @@ def test_gate_interval_follows_the_measured_tokens_per_call(tmp_path):
     db = _paced(tmp_path, cap=1000.0, rows=[("hub", END - 60, 90_000.0)])  # alone in the series: share 1.0
     pacer = T.Pacer(tmp_path)
     for i in range(30):
-        pacer.reserve(NOW - 600 + i, 0.0)  # 30 paced calls in the window: 3000 tokens a call
+        pacer.try_take(NOW - 600 + i, 0.0)  # 30 paced calls in the window: 3000 tokens a call
     gate, _ = _gate(tmp_path, db)
     assert gate.plan(NOW) == ("pace", pytest.approx(3.0), NOW - 100)
     tiny = _paced(tmp_path / "t", cap=0.5, rows=[("hub", END - 60, 90_000.0)])
@@ -512,7 +516,7 @@ def test_start_gate_holds_card_starts_while_the_fleet_is_over_the_cap(tmp_path, 
 
 def test_a_waiting_call_follows_a_changed_level(tmp_path):
     db = _paced(tmp_path, cap=1000.0, rows=[("hub", END - 60, 90_000.0)])
-    T.Pacer(tmp_path).reserve(NOW, 300.0)  # the slot after this one is 300 s away
+    T.Pacer(tmp_path).try_take(NOW, 300.0)  # a call just started: the next start is one interval (90 s) away
     gate, clock = _gate(tmp_path, db)
     clock.on_sleep = lambda n: T.write_level(tmp_path, 0, now=NOW + 1) if n == 2 else None
     assert gate.wait() == pytest.approx(2 * T.POLL_S)  # turned off while waiting: released at the next poll
@@ -536,7 +540,7 @@ def test_gate_caches_its_share_and_fails_open(tmp_path, monkeypatch):
     monkeypatch.setattr(T, "effective", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
     assert gate.plan(NOW) == ("pass",) and gate.wait() == 0.0  # a broken read never stalls a model call
     monkeypatch.undo()
-    monkeypatch.setattr(T.Pacer, "reserve", lambda *a: (_ for _ in ()).throw(OSError("read-only disk")))
+    monkeypatch.setattr(T.Pacer, "try_take", lambda *a: (_ for _ in ()).throw(OSError("read-only disk")))
     gate, clock = _gate(tmp_path, db)
     assert gate.wait() == 0.0 and clock.sleeps == []  # no slot can be written: the call goes ahead
 
@@ -606,7 +610,7 @@ def test_a_held_turn_reports_activity_every_poll_and_a_stop_request_ends_the_wai
     gate, clock = _gate(tmp_path, db)
     agent, sent = FakeAgent(), []
     clock.on_sleep = lambda n: T.write_level(tmp_path, 0) if n == 3 else None
-    assert gate.middleware(next_call=_api_call_of(agent, sent), request={"m": 1}) == "response"
+    assert gate.middleware(next_call=_api_call_of(agent, sent), request={"m": 1}, platform="cron") == "response"
     assert agent.touched == ["token throttle: waiting (0s)", "token throttle: waiting (5s)",
                              "token throttle: waiting (10s)"]  # once per poll, for as long as it waits
     assert sent == [(agent, {"m": 1})]
@@ -615,14 +619,15 @@ def test_a_held_turn_reports_activity_every_poll_and_a_stop_request_ends_the_wai
     gate, clock = _gate(tmp_path, db)
     agent, sent = FakeAgent(), []
     clock.on_sleep = lambda n: setattr(agent, "_interrupt_requested", True) if n == 2 else None
-    assert gate.middleware(next_call=_api_call_of(agent, sent), request={"m": 2}) == "response"
+    assert gate.middleware(next_call=_api_call_of(agent, sent), request={"m": 2}, platform="cron") == "response"
     assert len(clock.sleeps) == 2 and sent == [(agent, {"m": 2})]  # the user's stop reaches core's own handling
 
     gate, clock = _gate(tmp_path, db)
     agent = FakeAgent()
     agent._touch_activity = lambda desc: (_ for _ in ()).throw(RuntimeError("boom"))
     clock.on_sleep = lambda n: T.write_level(tmp_path, 0)
-    assert gate.middleware(next_call=_api_call_of(agent, []), request={}) == "response"  # a failing report is ignored
+    assert gate.middleware(next_call=_api_call_of(agent, []), request={},
+                           platform="cron") == "response"  # a failing report is ignored
 
 
 def test_core_execution_chain_hands_the_gate_a_call_that_leads_to_the_agent(tmp_path, monkeypatch):
@@ -646,7 +651,7 @@ def test_core_execution_chain_hands_the_gate_a_call_that_leads_to_the_agent(tmp_
     monkeypatch.setattr(plugins, "_delivery_manager", lambda: manager)
     agent, sent = FakeAgent(), []
     out = middleware.run_llm_execution_middleware({"model": "m"}, _api_call_of(agent, sent), session_id="s",
-                                                  model="m", provider="p", api_call_count=1)
+                                                  platform="cron", model="m", provider="p", api_call_count=1)
     assert out == "response" and sent == [(agent, {"model": "m"})] and order == ["other"] and failures == []
     assert agent.touched == ["token throttle: waiting (0s)", "token throttle: waiting (5s)"]
 
@@ -666,8 +671,8 @@ def test_a_held_card_without_an_agent_renews_its_claim(tmp_path, monkeypatch):
     gate, clock = _gate(tmp_path, db)
     clock.on_sleep = lambda n: T.write_level(tmp_path, 0) if n == 2 else None
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
-    gate.middleware(next_call=lambda request: "r", request={})
-    assert beats == []  # not a card run
+    gate.middleware(next_call=lambda request: "r", request={}, platform="cron")
+    assert beats == [] and len(clock.sleeps) == 2  # a held cron call, not a card run: no claim to renew
     T.write_level(tmp_path, 100)
     gate, clock = _gate(tmp_path, db)
     clock.on_sleep = lambda n: T.write_level(tmp_path, 0) if n == 2 else None
@@ -680,15 +685,15 @@ def test_auxiliary_calls_wait_up_to_the_hook_budget_and_the_admission_judge_neve
     db = _series(tmp_path, [])
     T.write_level(tmp_path, 100)
     gate, clock = _gate(tmp_path, db)
-    assert gate.aux_hold(aux_task="title_generation", provider="p", model="m") is None
+    assert gate.aux_hold(aux_task="title_generation", provider="p", model="m", platform="cron") is None
     assert sum(clock.sleeps) == pytest.approx(T.AUX_HOLD_MAX_S)  # still held: the call goes ahead at the bound
     assert T.AUX_HOLD_MAX_S < T.AUX_HOOK_TIMEOUT_S and gate.aux_hold.hermes_hook_timeout == T.AUX_HOOK_TIMEOUT_S
     gate, clock = _gate(tmp_path, db)
-    gate.aux_hold(aux_task="hub_admission")
+    gate.aux_hold(aux_task="hub_admission", platform="cron")
     assert clock.sleeps == []  # the dispatcher's judge is never held
     gate, clock = _gate(tmp_path, db)
     clock.on_sleep = lambda n: T.write_level(tmp_path, 0) if n == 2 else None
-    gate.aux_hold(aux_task="compression")
+    gate.aux_hold(aux_task="compression", platform="cron")
     assert len(clock.sleeps) == 2  # released as soon as the level allows
     gate, clock = _gate(tmp_path, db)
     gate.aux_hold()

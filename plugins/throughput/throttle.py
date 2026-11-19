@@ -15,9 +15,13 @@
   a share of the cap (``local_share``: a quarter split evenly between the gateways that sampled tokens in the
   last 15 minutes, the rest in proportion to what each used) and spaces its calls ``call_tokens / (share x cap)`` seconds
   apart, where ``call_tokens`` is this gateway's measured in+out tokens per model call (every call is counted,
-  throttled or not, so the figure is ready when the slider moves). Calls on one gateway queue
-  for slots in ``throttle-pace.json`` (a file lock orders every Hermes process on the root), so nothing is
-  released in a herd. An earlier version held every call while the fleet rate was over the cap and released
+  throttled or not, so the figure is ready when the slider moves). Calls on one gateway share
+  ``throttle-pace.json`` (a file lock orders every Hermes process on the root): a call starts only once
+  ``interval`` has passed since the last start (grant-at-start, ``Pacer.try_take``), so nothing is released in a
+  herd. Nothing is booked while a call waits: the earlier reserve-before-wait kept the slots of waits that ended
+  early and re-booked on every level change, so the queue ratcheted past the 600 s cap (waits of 763-966 s).
+* Only card runs (``HERMES_KANBAN_TASK`` / ``HERMES_KANBAN_WORKER_TASK`` set) and cron calls (``platform`` cron)
+  are throttled (``throttled``); an interactive chat's calls are counted but never wait. An earlier version held every call while the fleet rate was over the cap and released
   them all when it dipped under: 2026-11-17, cap 76k tokens/min, the fleet averaged 116k with bursts to 794k.
 * Card starts follow the same cap: the dispatcher asks the ``kanban_start_gate`` hook before each claim
   (``Gate.start_gate``) and a card stays ready while the fleet's measured rate is over the cap, so worker slots
@@ -390,8 +394,10 @@ class Pacer:
             fcntl.flock(fd, fcntl.LOCK_EX)
             state = _read_json(self.path)
             state = state if isinstance(state, dict) else {}
+            before = json.dumps(state, sort_keys=True)
             out = fn(state)
-            _write_json(self.path, state)
+            if json.dumps(state, sort_keys=True) != before:  # a waiter's poll changes nothing: no rewrite
+                _write_json(self.path, state)
             return out
         finally:
             os.close(fd)  # releases the lock
@@ -406,13 +412,44 @@ class Pacer:
         calls[key] = calls.get(key, 0) + 1
         state["calls"] = calls
 
-    def reserve(self, now: float, interval: float) -> float:
-        """The time this call may start: now if the gateway is idle, else ``interval`` after the previous slot."""
+    @staticmethod
+    def clamp_stamps(state: dict, now: float, interval: float) -> None:
+        """Bring stored stamps back to ``now`` when read: a ``last_start`` ahead of now (an odd clock, or a file
+        from elsewhere), and a ``next_at`` an older process booked (reserve-before-wait; ours equals
+        ``granted_next_at``) more than one interval ahead. So no stored state delays a call by more than one
+        interval."""
+        last = _number(state.get("last_start"))
+        if last is not None and last > now:
+            state["last_start"] = now
+        booked = _number(state.get("next_at"))
+        if booked is not None and booked != _number(state.get("granted_next_at")) and booked > now + max(0.0, interval):
+            state["next_at"] = now
+
+    @staticmethod
+    def ready_at(state: dict, now: float, interval: float) -> float:
+        """When the next call may start (after ``clamp_stamps``): ``interval`` after the last call that started
+        (now when none has), and not before an older process's booked ``next_at``."""
+        last = _number(state.get("last_start"))
+        ready = now if last is None else last + max(0.0, interval)
+        booked = _number(state.get("next_at"))
+        if booked is not None and booked != _number(state.get("granted_next_at")):
+            ready = max(ready, booked)
+        return ready
+
+    def try_take(self, now: float, interval: float) -> float:
+        """Start a call now if ``interval`` has passed since the last start: 0.0 (granted; the start is stamped and
+        counted in the minute of ``now``), else the seconds left. Nothing is booked while a call waits, so a waiter
+        that gives up, fails or dies leaves no slot behind, and a shorter interval applies at once.
+        ``next_at`` is still written for an older process sharing the file: it books its slot after this start."""
         def take(state):
-            slot = max(_number(state.get("next_at")) or 0.0, now)
-            state["next_at"] = slot + max(0.0, interval)
-            self._count(state, slot, now)
-            return slot
+            self.clamp_stamps(state, now, interval)
+            ready = self.ready_at(state, now, interval)
+            if now < ready:
+                return ready - now
+            state["last_start"] = now
+            state["next_at"] = state["granted_next_at"] = now + max(0.0, interval)
+            self._count(state, now, now)
+            return 0.0
         return self._locked(take)
 
     def note(self, now: float) -> None:
@@ -491,39 +528,36 @@ class Gate:
 
     def wait(self, *, beat: Optional[Callable[[float], None]] = None,
              stop: Optional[Callable[[], bool]] = None, max_s: Optional[float] = None) -> float:
-        """Block until this call's slot; returns the seconds waited. ``beat(waited)`` runs every poll (the caller's
-        liveness report), ``stop()`` true or ``max_s`` reached ends the wait early. A waiting call re-reads the
-        level every poll: lowering it releases the call, and a new level gets a new slot."""
+        """Block until this call may start; returns the seconds waited. ``beat(waited)`` runs every poll (the
+        caller's liveness report), ``stop()`` true or ``max_s`` reached ends the wait early. A waiting call re-reads
+        the level every poll: lowering it releases the call. Grant-at-start: a paced call asks ``Pacer.try_take``
+        each poll and is stamped only when it starts, so a wait holds no slot and a level change books nothing."""
         started = self._clock()
-        slot: Optional[float] = None
-        slot_for = None
         announced = False
         while True:
             now = self._clock()
             plan = self.plan(now)
             if plan[0] == "pass":
-                if not announced:
-                    try:
-                        self._pacer.note(now)
-                    except Exception:  # counting is best effort
-                        log.debug("throughput throttle: call count failed", exc_info=True)
+                try:
+                    self._pacer.note(now)  # it starts now: counted, so tokens-per-call stays measured
+                except Exception:  # counting is best effort
+                    log.debug("throughput throttle: call count failed", exc_info=True)
                 break
             if plan[0] == "pace":
-                if slot is None or slot_for != plan[2]:
-                    try:
-                        slot, slot_for = self._pacer.reserve(now, plan[1]), plan[2]
-                    except Exception:  # fail open: an unwritable pace file must never stall a model call
-                        log.debug("throughput throttle: slot reservation failed", exc_info=True)
-                        break
-                if now >= slot:
+                try:
+                    left = self._pacer.try_take(now, plan[1])
+                except Exception:  # fail open: an unwritable pace file must never stall a model call
+                    log.debug("throughput throttle: pace file unusable", exc_info=True)
                     break
-                nap = min(POLL_S, slot - now)
+                if left <= 0:
+                    break
+                nap = min(POLL_S, left)
             else:
-                slot, nap = None, POLL_S
+                left, nap = None, POLL_S
             if not announced:
                 announced = True
                 log.info("throughput throttle: holding a model call (%s)",
-                         "level 100%" if plan[0] == "hold" else "next slot in %.0fs" % (slot - now))
+                         "level 100%" if left is None else "next start in %.0fs" % left)
             for report in (beat, self._beat):
                 if report is not None:
                     try:
@@ -533,7 +567,7 @@ class Gate:
             self._sleep(nap)
             waited = self._clock() - started
             if (max_s is not None and waited >= max_s) or (stop is not None and _true(stop)):
-                log.info("throughput throttle: wait ended after %.0fs before its slot", waited)
+                log.info("throughput throttle: wait ended after %.0fs before its start", waited)
                 return waited
         waited = self._clock() - started
         if announced:
@@ -559,7 +593,20 @@ class Gate:
                 self._start = hit
         return {"hold": True, "reason": START_GATE_REASON} if hit[1] else None
 
-    def middleware(self, *, next_call, request, **_context):
+    def _exempt(self, platform) -> bool:
+        """A chat call is never held: it is counted (so it still shows in tokens-per-call) and goes ahead without
+        reading or stamping the pace. Only card and cron calls are throttled."""
+        if throttled(platform):
+            return False
+        try:
+            self._pacer.note(self._clock())
+        except Exception:  # counting is best effort
+            log.debug("throughput throttle: call count failed", exc_info=True)
+        return True
+
+    def middleware(self, *, next_call, request, **context):
+        if self._exempt(context.get("platform")):
+            return next_call(request)
         try:
             agent = agent_of(next_call)
         except Exception:  # an odd callable: wait without liveness reports rather than skip the hold
@@ -571,12 +618,25 @@ class Gate:
                       stop=lambda: bool(getattr(agent, "_interrupt_requested", False)))
         return next_call(request)
 
-    def aux_hold(self, aux_task=None, **_payload) -> None:
-        """``pre_auxiliary_call``: an auxiliary call waits too, for at most ``AUX_HOLD_MAX_S``."""
-        if str(aux_task or "") not in AUX_NOT_HELD:
-            self.wait(beat=_card_heartbeat, max_s=AUX_HOLD_MAX_S)
+    def aux_hold(self, aux_task=None, platform=None, **_payload) -> None:
+        """``pre_auxiliary_call``: a card's or cron's auxiliary call waits too, for at most ``AUX_HOLD_MAX_S``.
+        ``platform`` is core's parent-turn platform (empty for a call outside a turn), so outside a turn only the
+        card environment decides."""
+        if str(aux_task or "") in AUX_NOT_HELD or self._exempt(platform):
+            return
+        self.wait(beat=_card_heartbeat, max_s=AUX_HOLD_MAX_S)
 
     aux_hold.hermes_hook_timeout = AUX_HOOK_TIMEOUT_S
+
+
+CARD_ENV = ("HERMES_KANBAN_TASK", "HERMES_KANBAN_WORKER_TASK")
+
+
+def throttled(platform, env=None) -> bool:
+    """Whether a model call is throttled: a Kanban card run (either card variable set) or a cron job
+    (``platform == "cron"``). Everything else is an interactive chat, which the throttle never holds."""
+    env = os.environ if env is None else env
+    return any(env.get(name) for name in CARD_ENV) or str(platform or "") == "cron"
 
 
 def _true(check: Callable[[], bool]) -> bool:
