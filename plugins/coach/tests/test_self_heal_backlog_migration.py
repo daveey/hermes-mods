@@ -65,6 +65,40 @@ def pending_rows(st):
         db.close()
 
 
+@pytest.mark.parametrize("kind", ["receipt", "backport", "undeployed"])
+def test_other_kinds_are_not_reclassified_as_defects(tmp_path, kind):
+    st = store(tmp_path)
+    body = comment_body(detection()).replace("not filed (defect)", f"not filed ({kind})")
+    inv = inventory([comment(1, body=body)])
+    out = mig.migrate_digest_backlog(sh, st, inventory=inv, prunes={"rows": []},
+                                    dry_run=False, now=NOW)
+    assert not pending_rows(st)
+    assert out["other_kinds"] == [FP]
+    assert mig.parse_digest_comment_blocks(sh, body)[0]["kind"] == kind
+    again = mig.migrate_digest_backlog(sh, st, inventory=inv, prunes={"rows": []},
+                                      dry_run=False, now=NOW)
+    assert again["imported_comment_ids"] == []
+
+
+def test_backup_failure_never_publishes_partial_bak(tmp_path, monkeypatch):
+    src, dest = tmp_path / "source.sqlite", tmp_path / "source.sqlite.bak"
+    with sh.contextlib.closing(sqlite3.connect(src)) as db:
+        db.execute("CREATE TABLE example (value)")
+        db.commit()
+    original = mig.sqlite3.connect
+    class BrokenSource:
+        def backup(self, target):
+            target.execute("CREATE TABLE incomplete (value)")
+            target.commit()
+            raise OSError("interrupted backup")
+        def close(self):
+            pass
+    monkeypatch.setattr(mig.sqlite3, "connect", lambda p: BrokenSource() if p == src else original(p))
+    with pytest.raises(OSError, match="interrupted backup"):
+        mig._sqlite_backup(src, dest)
+    assert not dest.exists()
+
+
 def test_missing_provenance_fails_closed(tmp_path):
     st = store(tmp_path)
     inv = inventory([comment(1)])
