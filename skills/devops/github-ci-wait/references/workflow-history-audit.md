@@ -100,6 +100,19 @@ original failure. Before promoting a lane, inspect both branch protection and ap
 aggregate gate's dependencies and conditional paths. Use observed queue/wall durations and runner capacity;
 a cancelled-run fraction alone does not measure pushes executed or establish sufficient merge-path capacity.
 
+## Pre-transfer CI history
+
+A repo transfer can leave the old CI history unreadable. Since daveey/hermes moved to
+softmax-universe/daveey-hermes, runs from before the move return 404. PR heads from before the move show 0 check
+runs and 0 statuses, even heads that were verified green at the time. Zero checks on such a PR is no evidence that
+it merged without CI, and no reason to open a ship-gate investigation. Prove that its code passed on a later commit
+instead:
+
+- `gh api repos/O/R/compare/<sha>...main` reports `ahead` or `identical`;
+- every required context (read from the current protection) is green in that main head's `check-runs`.
+
+Cite this as CI on a descendant, not on the PR's exact head.
+
 ## Sources
 
 - [Workflow runs REST API](https://docs.github.com/en/rest/actions/workflow-runs#list-workflow-runs-for-a-workflow): filters, pagination and search cap.
