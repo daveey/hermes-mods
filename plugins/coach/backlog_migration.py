@@ -39,7 +39,7 @@ class DigestMigrationError(ValueError):
 
 
 def migrate_digest_backlog(sh, store, inventory=None, prunes=None, dry_run=True, now=None,
-                           board="default"):
+                           board="default", expected_prune_count=None):
     """Import digest comments into ``store``'s pending sqlite.
 
     ``sh``: the ``self_heal`` module (fold/LaneState/_ro_state/canonicalize).
@@ -50,6 +50,11 @@ def migrate_digest_backlog(sh, store, inventory=None, prunes=None, dry_run=True,
     """
     now = sh.time.time() if now is None else float(now)
     prune_rows = _load_prunes(prunes)
+    if expected_prune_count is not None:
+        if (len(prune_rows) != expected_prune_count
+                or any("manual backlog prune" not in str(r.get("why") or "").lower()
+                       or not r.get("ts") for r in prune_rows)):
+            raise DigestMigrationError("incomplete manual-prune provenance")
     cards = _load_inventory(sh, inventory, board)
     pruned = _pruned_forms(sh, [row for row in prune_rows if row.get("symptom") and row.get("component")])
     pruned.update(row["fingerprint"] for row in prune_rows)
@@ -66,7 +71,7 @@ def migrate_digest_backlog(sh, store, inventory=None, prunes=None, dry_run=True,
                         pruned.update(forms)
         changed = pruned != before
     pending = _read_pending(sh, store)
-    pending_versions = {fp: row["version"] for fp, row in pending.items()}
+    pending_snapshot = json.loads(json.dumps(pending))
     provenance = _read_provenance(sh, store)
     existing_keys = list(pending)
     lane = sh.LaneState(store.root)
@@ -117,6 +122,8 @@ def migrate_digest_backlog(sh, store, inventory=None, prunes=None, dry_run=True,
                     "board": board,
                 }
                 forms = _fp_forms(sh, detection)
+                if detection.get("component") and detection.get("symptom"):
+                    detection = sh.canonicalize(detection)
                 disposition = None
                 if forms & pruned:
                     disposition = "pruned"
@@ -136,6 +143,7 @@ def migrate_digest_backlog(sh, store, inventory=None, prunes=None, dry_run=True,
                         if target is not None:
                             old = pending[target]["payload"]
                             merged = sh.fold_payloads(old, detection)
+                            merged["fingerprint"] = target
                             pending[target] = {
                                 "payload": merged,
                                 "retry": min(pending[target]["retry"], now),
@@ -150,8 +158,9 @@ def migrate_digest_backlog(sh, store, inventory=None, prunes=None, dry_run=True,
                                 "retry": now,
                                 "version": uuid.uuid4().hex,
                             }
-                            pending[fp] = row
-                            writes.append(("insert", fp, row))
+                            target = detection["fingerprint"]
+                            pending[target] = row
+                            writes.append(("insert", target, row))
                             disposition = "queued"
                             report["queued"].append(fp)
                 provenance_rows.append(
@@ -167,48 +176,53 @@ def migrate_digest_backlog(sh, store, inventory=None, prunes=None, dry_run=True,
     if not mutated:
         return report
 
-    path = Path(store.root) / PENDING_NAME
-    if path.exists():
-        bak = path.with_suffix(".sqlite.bak")
-        _sqlite_backup(path, bak)
-        report["bak"] = str(bak)
-
-    db = sh._pending_db(store)
-    try:
-        with db:
-            db.execute(
-                f"CREATE TABLE IF NOT EXISTS {PROVENANCE_TABLE} ("
-                "source_kind TEXT NOT NULL, source_id TEXT NOT NULL, "
-                "fingerprint TEXT, disposition TEXT, card_id TEXT, comment_id TEXT, "
-                "imported_at REAL NOT NULL, PRIMARY KEY (source_kind, source_id))"
-            )
-            for op, fp, row in writes:
-                payload = json.dumps(row["payload"])
-                if op == "insert":
-                    db.execute(
-                        "INSERT INTO pending VALUES (?, ?, ?, ?)",
-                        (fp, payload, row["retry"], row["version"]),
-                    )
-                else:
-                    db.execute(
-                        "UPDATE pending SET payload=?, retry=?, version=? WHERE fp=?",
-                        (payload, row["retry"], row["version"], fp),
-                    )
-            db.executemany(
-                f"INSERT OR IGNORE INTO {PROVENANCE_TABLE} "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                provenance_rows,
-            )
-    finally:
-        db.close()
-
-    for lane_key, detection in history:
+    # Same lock order as backlog_control: admission -> pending -> lane.
+    # Planning is read-only; revalidate the whole snapshot (including inserts and
+    # same-version classification updates), not just the rows we intend to touch.
+    with sh._admission_lock(store):
+        db = sh._pending_db(store)
         try:
-            lane.retain_backlog(lane_key, detection)
-        except Exception:
-            report["history_retained"] = [x for x in report["history_retained"]
-                                          if x != detection["fingerprint"]]
-            report["excluded_resolved"].append(detection["fingerprint"])
+            with db:
+                db.execute("BEGIN IMMEDIATE")
+                with lane._locked():
+                    if (_read_pending(sh, store) != pending_snapshot
+                            or _read_provenance(sh, store) != provenance
+                            or lane.read() != lane_map):
+                        raise DigestMigrationError("migration snapshot changed; retry dry-run")
+                    path = Path(store.root) / PENDING_NAME
+                    bak = path.with_suffix(".sqlite.bak")
+                    if not bak.exists():
+                        _sqlite_backup(path, bak)
+                    report["bak"] = str(bak)
+                    db.execute(
+                        f"CREATE TABLE IF NOT EXISTS {PROVENANCE_TABLE} ("
+                        "source_kind TEXT NOT NULL, source_id TEXT NOT NULL, "
+                        "fingerprint TEXT, disposition TEXT, card_id TEXT, comment_id TEXT, "
+                        "imported_at REAL NOT NULL, PRIMARY KEY (source_kind, source_id))"
+                    )
+                    # Write evidence BEFORE recording import completion. A crash
+                    # rolls back SQLite; retry unions the same occurrence hashes
+                    # into lane evidence without changing lifecycle or count.
+                    for lane_key, detection in history:
+                        old = lane.read()[lane_key].get("backlog_evidence")
+                        evidence = sh.fold_payloads(old, detection) if old else dict(detection)
+                        evidence["fingerprint"] = lane_key
+                        evidence["backlog_stats"] = sh._backlog_stats(evidence)
+                        lane._apply(lane_key, {"backlog_evidence": evidence})
+                    for op, fp, row in writes:
+                        payload = json.dumps(row["payload"])
+                        if op == "insert":
+                            db.execute("INSERT INTO pending VALUES (?, ?, ?, ?)",
+                                       (fp, payload, row["retry"], row["version"]))
+                        else:
+                            db.execute("UPDATE pending SET payload=?, retry=?, version=? WHERE fp=?",
+                                       (payload, row["retry"], row["version"], fp))
+                    db.executemany(
+                        f"INSERT INTO {PROVENANCE_TABLE} VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        provenance_rows,
+                    )
+        finally:
+            db.close()
     report["preserved_pending_keys"] = existing_keys
     return report
 
