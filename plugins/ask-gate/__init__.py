@@ -533,7 +533,20 @@ def _has_ask(text: str, howto: bool) -> bool:
 def _strip_refused(text: str, refused: list[str], howto: bool, directives_only: bool) -> str | None:
     """The draft without the refused ask sentences, or None when they can't be cut out cleanly."""
     out = user_step_lifecycle._DIRECTIVE.sub("", text)
-    for ask in sorted({a for a in refused if isinstance(a, str) and a.strip()}, key=len, reverse=True):
+    refused = sorted({a for a in refused if isinstance(a, str) and a.strip()}, key=len, reverse=True)
+    # Detection returns normalized units, not source spans: bold is removed,
+    # inline code/quotes become X, and checklist items inherit their heading.
+    # Match those units before literal deletion destroys their source context.
+    # Drop a matching source line conservatively rather than guessing offsets
+    # through normalization (which could leave part of the instruction behind).
+    source_lines = []
+    for line in out.splitlines():
+        normalized = core._clean(core._strip_noise(core._strip_quotes(line)))
+        if any(ask in normalized for ask in refused):
+            continue
+        source_lines.append(line)
+    out = "\n".join(source_lines)
+    for ask in refused:
         out = out.replace(ask, "")
     lines = []
     for line in out.splitlines():

@@ -102,6 +102,46 @@ def test_ask_only_draft_still_never_leaks_the_ask(unreconcilable):
     assert result["replace"].strip() and "edit the merge queue" not in result["replace"]
 
 
+def test_formatted_checklist_after_budget_keeps_findings(gate):
+    # Reconstructed from the incident's logged extracted asks: formatting and
+    # inline-code normalization mean those asks are not substrings of the draft.
+    draft = """The test workflow passed on the current head.
+
+Three things are still wrong, and each needs you in your browser.
+
+**Your checklist:**
+**1. Repository access**
+- The install covers every example-org repo, not just example-project.
+- Open https://example.com/settings/installations/123
+- Under **Repository access**, choose **Only select repositories**, pick **example-project**, then **Save**.
+
+**2. Private key**
+- There's no private key on your Mac. I found no `.pem` in Downloads or Desktop.
+- Open https://example.com/settings/apps/example-settings
+- Under **Private keys**, click **Generate a private key**.
+
+**3. Secrets permission**
+- example-bot still has no Secrets permission. Its permissions list doesn't include `secrets`.
+- Open https://example.com/settings/apps/example-bot/permissions
+- Set **Secrets** to **Read and write**, then **Save**.
+
+The API readback completed without changing any settings.
+"""
+    asks = gate.core.find_asks(draft)
+    assert any("Under Repository access" in a for a in asks)
+    assert any("doesn't include X" in a for a in asks)
+    result = gate._refuse("s1", "unverified", draft, asks,
+                          "It did not pass the current-state check.", 2, 2)
+    text = result["replace"]
+    assert "The test workflow passed on the current head." in text
+    assert "The API readback completed without changing any settings." in text
+    assert not _bare(text)
+    assert "Generate a private key" not in text
+    assert "Only select repositories" not in text
+    assert "Read and write" not in text
+    assert not gate._has_ask(text.split("\n\n(I left")[0], False)
+
+
 def test_judge_rejected_ask_after_budget_keeps_findings(gate):
     from conftest import llm_returning
     gate.LLM = llm_returning([("unverified", "unchecked premise", "run the check")])
