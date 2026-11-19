@@ -443,9 +443,11 @@ def _thresholds_mod():
 # "Origin chat: @session:default@macbook/20261025_233046_d48ade", "report ... to origin @session:X",
 # "origin_session=@session:X". The id group is the bare session id (what task_chat_links / notify subs store).
 ORIGIN_SESSION_RE = re.compile(
-    r"\borigin(?:_session)?\b[^\n@]{0,60}@session:(?:[\w.-]+(?:@[\w.-]+)?/)?([A-Za-z0-9][\w-]{5,})(?![\w-]|/)", re.I)
-# The lookahead stops `@session:default/ (a cron run)` -- a placeholder with no id -- from backtracking into
-# reading the profile name `default` as the session id (cron-b48bd46e2a's fix card could not complete).
+    r"\borigin(?:_session)?\b[^\n@]{0,60}@session:"
+    r"(?:(?P<profile>[\w.-]+)(?:@(?P<gateway>[\w.-]+))?/)?"
+    r"(?P<session>[A-Za-z0-9][\w-]{5,})(?![\w@/-])", re.I)
+# '@' and '/' cannot terminate a bare session: malformed qualified tokens must
+# not backtrack into the profile name. Retain all qualifiers for membership.
 REPORTED_RE = re.compile(r"\bfollow-through:\s*SENT\b", re.I)
 # A "SENT" note that carries the send's failure is not a send (live test: ok:false, "No connected Hermes Desktop").
 FAILED_SEND_RE = re.compile(r"\"?ok\"?\s*:\s*false|\bno connected\b|\b(?:send|delivery) failed\b"
@@ -456,9 +458,42 @@ FAILED_SEND_RE = re.compile(r"\"?ok\"?\s*:\s*false|\bno connected\b|\b(?:send|de
 _DQUOTED = re.compile(r"\"[^\"]{0,1200}\"|\u201c[^\u201d]{0,1200}\u201d")
 
 
+def origin_refs(text: str) -> list[tuple[str, str, str]]:
+    """(gateway, profile, session), with absent qualifiers left empty."""
+    return list(dict.fromkeys((m['gateway'] or '', m['profile'] or '', m['session'])
+                             for m in ORIGIN_SESSION_RE.finditer(_DQUOTED.sub('""', text or ''))))
+
+
 def origin_sessions(text: str) -> list[str]:
-    """Session ids a card's prose names as its origin chat (quoted text is someone else's words: skipped)."""
-    return list(dict.fromkeys(ORIGIN_SESSION_RE.findall(_DQUOTED.sub('""', text or ""))))
+    """Compatibility view for callers that only display the session IDs."""
+    return list(dict.fromkeys(ref[2] for ref in origin_refs(text)))
+
+
+def _matches_origin(wanted, reached):
+    return any(wanted[2] == ref[2] and (not wanted[0] or wanted[0] == ref[0])
+               and (not wanted[1] or wanted[1] == ref[1]) for ref in reached)
+
+
+def _origin_receipt_context(task_id, board, owner):
+    """Trusted runtime paths and scope; never infer owner profile from the reader's profile."""
+    try:
+        from hermes_cli.kanban_execution_observations import board_owner_profile
+        from hermes_cli.kanban_origin import _hub_db, gateway_name
+        from hermes_cli import kanban_origin_ledger as ledger
+        from hermes_cli.config import get_hermes_home
+        from hermes_cli.profiles import get_active_profile_name
+        profile = board_owner_profile(board)
+        if not owner or not profile:
+            return None
+
+        def live(conn, task, expected, now):
+            return _sibling('origin_receipts').owner_live(conn, task, expected, now, ledger)
+
+        return dict(owner=dict(gateway=owner, profile=profile, board=_board_slug(board), task_id=task_id),
+                    gateway=gateway_name(), profile=get_active_profile_name(),
+                    ledger=get_hermes_home() / 'kanban/origin-ledger.db', replica=_hub_db(), owner_live=live)
+    except (ImportError, AttributeError, OSError, ValueError):
+        return None
 
 
 def check_origin_reached(task_id: str, board: Path, body: str) -> Optional[str]:
@@ -472,15 +507,15 @@ def check_origin_reached(task_id: str, board: Path, body: str) -> Optional[str]:
     try:
         comments = [r[0] or "" for r in conn.execute(
             "SELECT body FROM task_comments WHERE task_id=?", (task_id,))] if _has_table(conn, "task_comments") else []
-        wanted = origin_sessions("\n".join([body] + comments))
+        wanted = origin_refs("\n".join([body] + comments))
         if not wanted:
             return None
-        reached = _reached_chats(conn, task_id)
+        reached = _reached_origins(conn, task_id, board)
         owner = _created_on(conn, task_id)
         for c in comments:
             if REPORTED_RE.search(c) and not FAILED_SEND_RE.search(c):
-                reached |= {s for s in wanted if s in c}
-        missing = [s for s in wanted if s not in reached]
+                reached.update(origin_refs(c.replace("@session:", "origin @session:")))
+        missing = [s for s in wanted if not _matches_origin(s, reached)]
     except sqlite3.Error:
         return None
     finally:
@@ -490,6 +525,8 @@ def check_origin_reached(task_id: str, board: Path, body: str) -> Optional[str]:
         # but its chat links are written on the owning gateway and reach X only through the Board replica
         # (t_01a1d48abbb62104: owned by macbook, run on worker-4, linked on macbook, refused on worker-4).
         for p in replica_paths([board]):
+            if _board_slug(p) != _board_slug(board) or _board_profile(p) != _board_profile(board):
+                continue
             try:
                 rconn = ro_connect(p)
             except sqlite3.Error:
@@ -500,17 +537,63 @@ def check_origin_reached(task_id: str, board: Path, body: str) -> Optional[str]:
                 found_here = rconn.execute("SELECT 1 FROM tasks WHERE id=?", (task_id,)).fetchone()
                 if not found_here:
                     continue
-                hit = _reached_chats(rconn, task_id)
-                missing = [s for s in missing if s not in hit]
-                owner = owner or _created_on(rconn, task_id)
+                replica_owner = _created_on(rconn, task_id)
+                if owner and replica_owner != owner:
+                    continue
+                hit = _reached_origins(rconn, task_id, p)
+                missing = [s for s in missing if not _matches_origin(s, hit)]
+                owner = owner or replica_owner
             except sqlite3.Error:
                 continue
             finally:
                 rconn.close()
+    if missing:
+        context = _origin_receipt_context(task_id, board, owner)
+        hit = _sibling('origin_receipts').reached(context, ro_connect) if context else set()
+        missing = [s for s in missing if not _matches_origin(s, hit)]
     if not missing:
         return None
-    return origin_refusal(task_id, missing) + remote_origin_hint(task_id, board, body, comments, missing[0],
-                                                                  owner=owner)
+    labels = [f"{profile}@{gw}/{sid}" if gw else f"{profile}/{sid}" if profile else sid
+              for gw, profile, sid in missing]
+    return origin_refusal(task_id, labels) + remote_origin_hint(task_id, board, body, comments, missing[0][2],
+                                                               owner=owner)
+
+
+def _board_profile(board):
+    try:
+        from hermes_cli.kanban_execution_observations import board_owner_profile
+        return board_owner_profile(board) or ''
+    except ImportError:
+        return ''
+
+
+def _reached_origins(conn, task_id, board):
+    """Keep scope in notification/link evidence; a matching SID elsewhere is not a link."""
+    reached = set()
+    names = _gateway_names()
+    gateway = _created_on(conn, task_id) or (names[0] if names else '')
+    profile = _board_profile(board)
+    # Historical board schemas have no profile column; their links were default-profile links.
+    try:
+        row = conn.execute('SELECT session_id FROM tasks WHERE id=?', (task_id,)).fetchone()
+        if row and row[0]:
+            reached.add((gateway, profile, row[0]))
+    except sqlite3.Error:
+        pass
+    if _has_table(conn, 'task_chat_links'):
+        columns = {r[1] for r in conn.execute('PRAGMA table_info(task_chat_links)')}
+        profile_sql = 'chat_profile' if 'chat_profile' in columns else "'default'"
+        for gw, prof, sid in conn.execute(
+                f'SELECT chat_gateway,{profile_sql},chat_session FROM task_chat_links WHERE task_id=? AND released=0',
+                (task_id,)):
+            reached.add((gw or '', prof or 'default', sid))
+    if _has_table(conn, 'kanban_notify_subs'):
+        for platform, chat in conn.execute('SELECT platform,chat_id FROM kanban_notify_subs WHERE task_id=?', (task_id,)):
+            if platform == 'hub' and chat and len(chat.split('/')) == 3:
+                reached.add(tuple(chat.split('/')))
+            elif platform == 'tui' and chat:
+                reached.add((gateway, profile, chat))
+    return reached
 
 
 def _reached_chats(conn: sqlite3.Connection, task_id: str) -> set[str]:
@@ -544,6 +627,8 @@ def _created_on(conn: sqlite3.Connection, task_id: str) -> str:
 def _board_slug(board: Path) -> str:
     """``<root>/kanban/boards/<slug>/kanban.db`` -> slug; the root ``kanban.db`` is ``default``."""
     p = Path(board)
+    if p.parent.name == 'sync-shadow':
+        return p.stem
     return p.parent.name if p.parent.parent.name == "boards" else "default"
 
 
