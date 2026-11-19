@@ -140,18 +140,39 @@ and a body that is not a JSON object a 422, and neither changes anything.
   1.9.55 or newer carries `mode`, `budget_at` and `pool_caps`).
   - **Caps**: every budget cap is scaled by the slider, `budget x (1 - percent/100)`: 0 % is the full budget, 100 %
     holds every throttled call. `cap_per_s` in the payload is the scaled global cap; `budget` is `{state, budget_at,
-    age_s, budget_per_s, cap_per_s, pool_caps}` (`null` for a slider level), `mode` is `auto` or `manual`.
+    age_s, budget_per_s, pool_budgets, cap_per_s, pool_caps, governed_rate_per_s, governed_cap_per_s}` (`null` for a
+    slider level; `pool_budgets` unscaled, `pool_caps` scaled), `mode` is `auto` or `manual`.
+  - **The slider on a budget level** (`PUT /v1/throttle` while the level in force is `auto`) keeps `mode`,
+    `cap_per_s`, `pool_caps` and `budget_at` and changes only `percent` and `set_at`, so reserve holds stay in force
+    on every gateway; the panel previews the same. On a slider level it writes a slider level, as before.
   - **Calls**: a card or cron call is paced at its own pool's cap (core's middleware context `provider`), with the
     same share and tokens-per-call as above and its own slot in the pace file (`pools.<provider>`). A pool cap of 0
     holds the call; `null` (rate unknown) passes; a provider without a pool cap (or a call naming none) passes,
     ungoverned. Chats pass as always.
-  - **Card starts** hold while the measured fleet rate is over the scaled global cap (none while the global rate is
-    unknown).
+  - **Card starts** hold at 100 %, or while the governed pools' fleet rate is over the sum of their scaled caps.
+    Governed pools are those whose scaled cap is a positive number; their rate is their providers' in+out tokens/s
+    over the last 3 sampled minutes, from the series' per-model rows (`tokens_io:<model>`, every gateway, the
+    `by=model` data) attributed to a provider with core's `provider_for_model` (`claude*` anthropic, `gpt-`/`codex`/
+    `o1`/`o3`/`o4` openai-codex, `grok` xai-oauth; the same table when core is absent). Tokens on other providers,
+    `unreported` and `other` tokens, and pools at reserve or of unknown rate do not count, so an interactive chat
+    on an ungoverned provider never holds a start. The series does not tell chats from card runs, so chat tokens on
+    a governed provider do count (they spend that pool's quota too). No governed pool, or a sum of 0 (every pool at
+    reserve or unknown), never holds a start: reserve holds stay per pool, in the call pacing above and in core's
+    own held pools. The global `cap_per_s` (pools of known rate only) is shown, not used to hold starts.
   - **Stale budget**: `budget.state` is `fresh` up to 20 minutes after `budget_at`, `stale` (caps kept) up to 60
     minutes, then `expired`: no global or pool cap from it, every call and start passes (fail open), except at
     100 %. The panel shows `Budget −p% · cap …`, with "budget stale … keeping last caps" or "budget expired … no
     cap".
   - A level without `mode` (or `mode: "manual"`) is the slider level above, unchanged, whatever other fields it has.
+  - **Exactly one host** may set `budget_publish`. Two publishers each see the other's newer level as "not ours"
+    and rewrite on every pass, alternating forever.
+  - **Turning it off**: after `budget_publish` is set false the last auto level stays in force (stale after 20
+    minutes, expired after 60: then no budget cap) until it expires or the slider moves; 100 % still holds every
+    throttled call and card start, expired or not. A slider move on it keeps it a budget level (above).
+  - **Rollout order**: deploy this plugin fleet-wide and restart the workers (and every long-lived Hermes process)
+    before enabling `budget_publish`. An older plugin reads an auto record's `cap_per_s` as an unscaled manual cap
+    (and ignores `pool_caps`), and a gateway on a hub client older than 1.9.55 receives the record without `mode`,
+    `budget_at` and `pool_caps`.
   - Tests: `tests/test_throttle_budget.py`; panel text `desktop-plugins/throughput/tests/throughput.test.mjs`.
     **Not tested**: a real publish through two hub links, and a live core passing `provider` to the middleware.
 - **Fail open**: an unreadable level, a missing series db or replica, or a failed read never holds a call. A core

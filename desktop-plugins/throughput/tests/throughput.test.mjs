@@ -632,4 +632,10 @@ test('budget mode: the slider scales the published budget; stale and expired bud
   assert.equal(P.previewThrottle(auto(), 40).cap_per_s, 6)
   assert.equal(P.previewThrottle(auto(), 100).cap_per_s, 0)
   assert.equal(P.previewThrottle(auto({ budget: { state: 'expired', budget_per_s: 10 } }), 40).cap_per_s, null)
+  // the preview stays a budget level: mode kept, pool caps scaled from the unscaled budgets, a reserve 0 stays 0
+  const moved = P.previewThrottle(auto({ budget: { state: 'fresh', budget_per_s: 10, pool_budgets: { anthropic: 0, 'openai-codex': 6, 'xai-oauth': null } } }), 50)
+  assert.equal(moved.mode, 'auto')
+  assert.deepEqual(moved.budget.pool_caps, { anthropic: 0, 'openai-codex': 3, 'xai-oauth': null })
+  assert.equal(moved.budget.cap_per_s, 5)
+  assert.match(P.throttleText(moved, 's'), /^Budget −50% · cap 5\.0 tok\/s/)
 })

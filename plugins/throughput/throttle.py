@@ -44,7 +44,8 @@
   provider pool's (0 at reserve, None while its rate is unknown), stamped ``budget_at`` = ``v2.computed_at``. The
   slider's ``percent`` stays the user's and scales every budget cap: ``budget x (1 - percent/100)``. Model calls
   are paced per pool (``Gate.plan`` with the call's ``provider``): a pool cap of 0 holds, None or a provider without
-  a pool cap passes. Card starts hold while the fleet rate is over the scaled global cap. A budget older than
+  a pool cap passes. Card starts hold while the governed pools' rate is over the sum of their positive scaled caps
+  (``governed_load``); the slider keeps a budget level a budget level (``set_level``). A budget older than
   ``BUDGET_STALE_S`` is stale (caps kept), older than ``BUDGET_EXPIRE_S`` expired: no cap from it (fail open). A
   level without ``mode`` (or ``mode: "manual"``) is the slider level above, unchanged.
 """
@@ -180,6 +181,20 @@ def write_level(root: Path, percent, now: Optional[float] = None, reference: Opt
     value = clamp(percent)
     _write_json(level_path(root), {"percent": value, "cap_per_s": cap(value, reference),
                                    "set_at": stamp(time.time() if now is None else now)})
+    return value
+
+
+def set_level(root: Path, level: dict, percent, now: float, reference: Optional[float] = None) -> float:
+    """The slider: store ``percent`` at ``now``. When ``level`` (the one in force) is a budget level, the new level
+    keeps its ``mode``, ``cap_per_s``, ``pool_caps`` and ``budget_at`` and changes only ``percent`` and ``set_at``:
+    a manual level there would drop every pool cap, reserve holds included, fleet-wide until the publisher folds it
+    back in. Otherwise it is a slider level against ``reference`` (``write_level``)."""
+    if level.get("mode") != AUTO:
+        return write_level(root, percent, now, reference)
+    value = clamp(percent)
+    _write_json(level_path(root), {"mode": AUTO, "percent": value, "cap_per_s": level.get("cap_per_s"),
+                                   "pool_caps": dict(level.get("pool_caps") or {}),
+                                   "budget_at": level.get("budget_at"), "set_at": stamp(now)})
     return value
 
 
@@ -345,14 +360,14 @@ def budget(level: dict, now: float) -> Optional[dict]:
     """What a budget level (``mode: "auto"``) caps right now; None for a slider level. ``state`` is ``fresh``,
     ``stale`` (older than ``BUDGET_STALE_S``: the caps are kept) or ``expired`` (older than ``BUDGET_EXPIRE_S``, or
     no ``budget_at``: no cap, fail open). ``cap_per_s`` and ``pool_caps`` are scaled by the slider,
-    ``budget x (1 - percent/100)``; ``budget_per_s`` is the unscaled fleet budget."""
+    ``budget x (1 - percent/100)``; ``budget_per_s`` and ``pool_budgets`` are the unscaled budgets."""
     if level.get("mode") != AUTO:
         return None
     at = level.get("budget_at")
     age = None if at is None else now - at
     state = "expired" if age is None or age > BUDGET_EXPIRE_S else "stale" if age > BUDGET_STALE_S else "fresh"
     out = {"state": state, "budget_at": at, "age_s": age, "budget_per_s": level.get("cap_per_s"),
-           "cap_per_s": None, "pool_caps": {}}
+           "pool_budgets": dict(level.get("pool_caps") or {}), "cap_per_s": None, "pool_caps": {}}
     if state == "expired":
         return out
     scale = 1.0 - clamp(level["percent"]) / 100.0
@@ -376,16 +391,86 @@ def limit_of(level: dict, reference: Optional[float], now: Optional[float] = Non
     return cap(percent, reference)
 
 
+_PROVIDER_PREFIXES = (("claude", "anthropic"), ("gpt-", "openai-codex"), ("codex", "openai-codex"),
+                      ("o1", "openai-codex"), ("o3", "openai-codex"), ("o4", "openai-codex"), ("grok", "xai-oauth"))
+
+
+def provider_of_model(model) -> str:
+    """The subscription pool a model name belongs to: core's ``machine_throughput_metrics.provider_for_model``
+    (the rule core's capacity model attributes registry ``tokens_by_model`` with), else the same prefix table."""
+    try:
+        from hermes_cli.machine_throughput_metrics import provider_for_model
+        return str(provider_for_model(model))
+    except Exception:  # outside a Hermes runtime, or an older core
+        name = str(model or "").strip().lower().rsplit("/", 1)[-1]
+        return next((provider for prefix, provider in _PROVIDER_PREFIXES if name.startswith(prefix)), "unknown")
+
+
+def provider_rates(series_db: Path, now: float) -> Optional[dict[str, float]]:
+    """Fleet in+out tokens/s per provider now: the series' per-model rows (``tokens_io:<model>``, every gateway)
+    over the sampled minutes among the last ``RATE_MINUTES``, attributed by ``provider_of_model``. ``unreported``
+    and ``other`` tokens belong to no provider. None when no minute in the window was sampled by model."""
+    if not Path(series_db).is_file():
+        return None
+    from .sampler import ro_connect
+    until = int(now) // 60 * 60
+    try:
+        c = ro_connect(series_db)
+    except sqlite3.Error:
+        return None
+    try:
+        rows = c.execute("SELECT minute, substr(metric, 11), SUM(value) FROM minutes WHERE substr(metric, 1, 10) = "
+                         "'tokens_io:' AND minute>=? AND minute<? AND value IS NOT NULL GROUP BY minute, metric",
+                         (until - RATE_MINUTES * 60, until)).fetchall()
+    except sqlite3.Error:
+        return None
+    finally:
+        c.close()
+    minutes = {int(m) for m, _, _ in rows}
+    if not minutes:
+        return None
+    totals: dict[str, float] = {}
+    for _, model, value in rows:
+        if model in ("unreported", "other"):
+            continue
+        provider = provider_of_model(model)
+        totals[provider] = totals.get(provider, 0.0) + float(value)
+    return {p: v / (len(minutes) * 60.0) for p, v in totals.items()}
+
+
+def governed_load(level: dict, series_db: Path, now: float) -> tuple[Optional[float], Optional[float]]:
+    """A budget level's start-gate comparison: ``(rate, cap)`` over the pools whose scaled cap is a positive
+    number, the rate being their providers' fleet tokens/s only (chats on ungoverned providers, ungoverned
+    providers, pools at reserve and pools of unknown rate do not count). ``(None, None)`` when no pool qualifies;
+    rate None when the series has no per-model minutes."""
+    caps = {p: v for p, v in budget(level, now)["pool_caps"].items() if v is not None and v > 0}
+    if not caps:
+        return None, None
+    rates = provider_rates(series_db, now)
+    rate = None if rates is None else sum(rates.get(p, 0.0) for p in caps)
+    return rate, sum(caps.values())
+
+
 def status(root: Path, series_db: Path, now: Optional[float] = None, hub_db: Optional[Path] = None) -> dict:
+    """``holding`` is what the start gate obeys. A slider level: the fleet rate over its cap (or 100 %). A budget
+    level: 100 %, or the governed pools' rate over the sum of their positive scaled caps (``governed_load``); no
+    such pool, or a sum of 0, never holds a start (reserve holds stay per pool, in ``Gate.plan`` and core)."""
     now = time.time() if now is None else now
     level = effective(root, hub_db, now)
     percent = level["percent"]
     reference, rate = reference_rate(series_db, now), fleet_rate(series_db, now)
     limit = limit_of(level, reference, now)
-    holding = percent >= 100 or (limit is not None and rate is not None and rate > limit)
+    b = budget(level, now)
+    if b is None:
+        holding = percent >= 100 or (limit is not None and rate is not None and rate > limit)
+    else:
+        governed_rate, governed_cap = governed_load(level, series_db, now)
+        b.update(governed_rate_per_s=governed_rate, governed_cap_per_s=governed_cap)
+        holding = percent >= 100 or (governed_cap is not None and governed_cap > 0 and governed_rate is not None
+                                     and governed_rate > governed_cap)
     return {"percent": percent, "reference_per_s": reference, "cap_per_s": limit, "rate_per_s": rate,
             "holding": holding, "set_at": level["set_at"] or None, "set_by": level["source"],
-            "mode": level.get("mode") or "manual", "budget": budget(level, now)}
+            "mode": level.get("mode") or "manual", "budget": b}
 
 
 def pace_path(root: Path) -> Path:

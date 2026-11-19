@@ -171,10 +171,14 @@ export function capRate(throttle, unit) {
 // Budget mode scales the published fleet budget instead: 0 % is the full budget, an expired budget caps nothing.
 export function previewThrottle(throttle, percent) {
   if (throttle?.mode === 'auto') {
+    // Saving keeps the budget level (mode, budget, pool caps) and changes only the percent: preview exactly that.
     const b = throttle.budget || {}
-    const full = b.state === 'expired' ? null : b.budget_per_s
-    const cap_per_s = percent >= 100 ? 0 : full == null ? null : (1 - percent / 100) * full
-    return { ...throttle, percent, cap_per_s }
+    const live = b.state !== 'expired'
+    const scale = percent >= 100 ? 0 : 1 - percent / 100
+    const full = live ? b.budget_per_s : null
+    const cap_per_s = percent >= 100 ? 0 : full == null ? null : scale * full
+    const pool_caps = live ? Object.fromEntries(Object.entries(b.pool_budgets || {}).map(([k, v]) => [k, v == null ? null : scale * v])) : {}
+    return { ...throttle, percent, cap_per_s, budget: { ...b, cap_per_s: full == null ? null : scale * full, pool_caps } }
   }
   const ref = throttle?.reference_per_s
   const cap_per_s = percent <= 0 ? null : percent >= 100 ? 0 : ref == null ? null : (1 - percent / 100) * ref

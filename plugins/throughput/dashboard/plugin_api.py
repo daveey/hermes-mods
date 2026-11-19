@@ -165,8 +165,10 @@ def set_throttle(percent: Any) -> Dict[str, Any]:
     throttle = importlib.import_module(pkg().__name__ + ".throttle")
     root, hub_db, now = _state["root"], throttle.hub_db_path(), time.time()
     # Stamp it after the level in force, so a gateway whose clock runs ahead cannot outrank this newer setting.
-    stamp = max(now, throttle.effective(root, hub_db, now)["set_at"] + 0.002)  # 2 ms: stamps round to 1 ms
-    throttle.write_level(root, percent, stamp, throttle.reference_rate(sampler.series_path(root), now))
+    level = throttle.effective(root, hub_db, now)
+    stamp = max(now, level["set_at"] + 0.002)  # 2 ms: stamps round to 1 ms
+    # On a budget level only percent and set_at change: the pool caps (reserve holds) stay in force fleet-wide.
+    throttle.set_level(root, level, percent, stamp, throttle.reference_rate(sampler.series_path(root), now))
     throttle.note_seen(root, hub_db, stamp)
     return throttle_payload()
 

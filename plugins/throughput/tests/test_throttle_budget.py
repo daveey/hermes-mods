@@ -150,16 +150,70 @@ def test_percent_scales_global_and_pool_caps(tmp_path):
     assert T.status(tmp_path, db, NOW)["cap_per_s"] == 0.0 and gate.plan(NOW, "openrouter") == ("hold",)
 
 
-def test_start_gate_holds_while_the_fleet_rate_is_over_the_scaled_global_cap(tmp_path):
-    over = _series(tmp_path / "o", [("hub", END - 60, 48_000.0)])  # 800/s
-    _auto(tmp_path / "o", percent=50, cap=1000.0)  # effective cap 500/s
-    assert _gate(tmp_path / "o", over)[0].start_gate(**CARD) == {"hold": True, "reason": "token_throttle"}
-    under = _series(tmp_path / "u", [("hub", END - 60, 24_000.0)])  # 400/s
-    _auto(tmp_path / "u", percent=50, cap=1000.0)
+def _models(root, rows, me="hub"):
+    """A series with per-model rows: ``[(gateway, model, minute, tokens)]`` (``tokens_io:<model>``)."""
+    db = _series(root, me=me)
+    st = Store(db)
+    for gateway, model, minute, value in rows:
+        st.put(gateway, f"tokens_io:{model}", [(minute, value)])
+    return db
+
+
+def test_start_gate_holds_when_governed_pools_are_over_their_scaled_caps(tmp_path):
+    # anthropic 400/s + codex 200/s = 600/s on governed pools, against (400 + 600) x 0.5 = 500/s
+    rows = [("hub", "claude-opus-5-5", END - 60, 18_000.0), ("worker-1", "claude-sonnet-5-5", END - 60, 6_000.0),
+            ("hub", "gpt-6-astra", END - 60, 12_000.0)]
+    db = _models(tmp_path / "o", rows)
+    _auto(tmp_path / "o", percent=50, cap=1000.0)
+    assert _gate(tmp_path / "o", db)[0].start_gate(**CARD) == {"hold": True, "reason": "token_throttle"}
+    b = T.status(tmp_path / "o", db, NOW)["budget"]
+    assert b["governed_rate_per_s"] == pytest.approx(600.0) and b["governed_cap_per_s"] == pytest.approx(500.0)
+    under = _models(tmp_path / "u", rows)
+    _auto(tmp_path / "u", percent=0, cap=1000.0)  # full budget: 1000/s
     assert _gate(tmp_path / "u", under)[0].start_gate(**CARD) is None
-    unknown = _series(tmp_path / "n", [("hub", END - 60, 9e9)])
-    _auto(tmp_path / "n", cap=None)  # no global rate known: no global cap
-    assert _gate(tmp_path / "n", unknown)[0].start_gate(**CARD) is None
+
+
+def test_start_gate_ignores_ungoverned_and_chat_traffic(tmp_path):
+    # 9M tokens/min on providers without a pool cap (an OpenRouter chat model, unattributed tokens), 60/s governed
+    rows = [("hub", "deepseek-v4", END - 60, 9e6), ("hub", "unreported", END - 60, 9e6),
+            ("mini", "gemini-3-pro", END - 60, 9e6), ("hub", "claude-opus-5-5", END - 60, 3_600.0)]
+    db = _models(tmp_path, rows)
+    Store(db).put("hub", "tokens_io", [(END - 60, 27e6 + 3_600.0)])  # the scalar the old gate compared
+    _auto(tmp_path, cap=1000.0, pools={"anthropic": 100.0})
+    out = T.status(tmp_path, db, NOW)
+    assert out["rate_per_s"] > 400_000 and out["budget"]["governed_rate_per_s"] == pytest.approx(60.0)
+    assert out["holding"] is False and _gate(tmp_path, db)[0].start_gate(**CARD) is None
+
+
+def test_reserve_plus_unknown_pools_never_hold_card_starts(tmp_path):
+    # the global budget is 0 (anthropic at reserve, codex rate unknown) and the fleet is busy: starts still go
+    rows = [("hub", "claude-opus-5-5", END - 60, 60_000.0), ("hub", "gpt-6-astra", END - 60, 60_000.0)]
+    db = _models(tmp_path, rows)
+    Store(db).put("hub", "tokens_io", [(END - 60, 120_000.0)])  # 2000/s over a global budget of 0
+    _auto(tmp_path, cap=0.0, pools={"anthropic": 0.0, "openai-codex": None})
+    out = T.status(tmp_path, db, NOW)
+    assert out["cap_per_s"] == 0.0 and out["holding"] is False
+    assert out["budget"]["governed_cap_per_s"] is None
+    gate = _gate(tmp_path, db)[0]
+    assert gate.start_gate(**CARD) is None
+    assert gate.plan(NOW, "anthropic") == ("hold",)  # the reserve hold stays on that pool's calls
+    _auto(tmp_path, cap=0.0, pools={})  # no pools at all
+    assert T.status(tmp_path, db, NOW)["holding"] is False
+    _auto(tmp_path, percent=100, cap=0.0, pools={"anthropic": 0.0})  # the slider at 100 % still stops starts
+    assert T.status(tmp_path, db, NOW)["holding"] is True
+
+
+def test_provider_rates_attribute_models_like_core(tmp_path):
+    rows = [("hub", "claude-opus-5-5", END - 60, 6_000.0), ("hub", "anthropic/claude-haiku-5-5", END - 120, 6_000.0),
+            ("hub", "gpt-6-luna", END - 60, 1_200.0), ("hub", "grok-4.7", END - 60, 600.0),
+            ("hub", "unreported", END - 60, 9e9), ("hub", "claude-opus-5-5", END, 9e9)]  # current minute: excluded
+    db = _models(tmp_path, rows)
+    rates = T.provider_rates(db, NOW)
+    # two sampled minutes (120 s): anthropic 12k, codex 1.2k, xai 0.6k
+    assert rates == {"anthropic": pytest.approx(100.0), "openai-codex": pytest.approx(10.0),
+                     "xai-oauth": pytest.approx(5.0)}
+    assert T.provider_rates(tmp_path / "missing.sqlite", NOW) is None
+    assert T.provider_rates(_series(tmp_path / "e"), NOW) is None
 
 
 def test_stale_budget_keeps_its_caps_between_20_and_60_minutes(tmp_path):
@@ -167,7 +221,7 @@ def test_stale_budget_keeps_its_caps_between_20_and_60_minutes(tmp_path):
     _auto(tmp_path, cap=500.0, pools={"anthropic": 0.0}, budget_at=NOW - 30 * 60)
     out = T.status(tmp_path, db, NOW)
     assert out["mode"] == "auto" and out["budget"]["state"] == "stale"
-    assert out["cap_per_s"] == 500.0 and out["holding"] is True
+    assert out["cap_per_s"] == 500.0 and out["budget"]["pool_caps"] == {"anthropic": 0.0}
     assert _gate(tmp_path, db)[0].plan(NOW, "anthropic") == ("hold",)
     _auto(tmp_path, cap=500.0, pools={"anthropic": 0.0}, budget_at=NOW - 20 * 60)  # exactly 20 min: still fresh
     assert T.status(tmp_path, db, NOW)["budget"]["state"] == "fresh"
@@ -378,3 +432,28 @@ def test_publisher_host_writes_from_the_sampler_loop_and_acknowledges_it(tmp_pat
     data = json.loads(T.level_path(tmp_path).read_text())
     assert data["mode"] == "auto" and data["pool_caps"] == {"anthropic": 400.0, "openai-codex": 600.0}
     assert json.loads(T.seen_path(tmp_path).read_text())["set_at"] == data["set_at"]
+
+
+# --- the slider on a budget level ---------------------------------------------------------------------------------
+
+def test_slider_move_on_a_budget_level_keeps_the_pool_caps(tmp_path):
+    db = _series(tmp_path)
+    _auto(tmp_path, percent=0, cap=1000.0, pools={"anthropic": 0.0, "openai-codex": 600.0}, budget_at=NOW - 60)
+    level = T.effective(tmp_path, None, NOW)
+    assert T.set_level(tmp_path, level, 40, NOW + 1, reference=5000.0) == 40.0
+    data = json.loads(T.level_path(tmp_path).read_text())
+    assert data == {"mode": "auto", "percent": 40.0, "cap_per_s": 1000.0,
+                    "pool_caps": {"anthropic": 0.0, "openai-codex": 600.0}, "budget_at": NOW - 60, "set_at": NOW + 1}
+    gate, _ = _gate(tmp_path, db)
+    assert gate.plan(NOW + 1, "anthropic") == ("hold",)  # the reserve hold survives the slider
+    assert gate.plan(NOW + 1, "openai-codex")[1] == pytest.approx(20_000 / 360.0)
+
+
+def test_slider_move_on_a_manual_level_is_unchanged(tmp_path):
+    T.write_level(tmp_path, 10, now=NOW - 100, reference=2000.0)
+    level = T.effective(tmp_path, None, NOW)
+    T.set_level(tmp_path, level, 30, NOW, reference=2000.0)
+    assert json.loads(T.level_path(tmp_path).read_text()) == {"percent": 30.0, "cap_per_s": pytest.approx(1400.0),
+                                                              "set_at": NOW}
+    T.set_level(tmp_path, {"percent": 0.0, "cap_per_s": None, "set_at": 0.0, "source": None}, 0, NOW + 1)
+    assert json.loads(T.level_path(tmp_path).read_text()) == {"percent": 0.0, "cap_per_s": None, "set_at": NOW + 1}

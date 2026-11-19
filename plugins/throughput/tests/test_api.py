@@ -306,3 +306,35 @@ def test_throttle_routes_end_to_end(api, tmp_path, monkeypatch):
     for not_an_object in (50, [50]):
         assert c.put("/p/v1/throttle", json=not_an_object).status_code == 422, not_an_object
     assert c.get("/p/v1/throttle").json()["percent"] == 0  # a refused write changes nothing
+
+
+def test_put_on_a_budget_level_keeps_its_pool_caps(api, tmp_path, monkeypatch):
+    """The slider on the budget-publish host's level: only percent and set_at change, a reserve cap of 0 stays."""
+    import importlib
+    import json
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(api, "_registry", lambda: {"me": "hub", "machines": {"hub": {}}})
+    monkeypatch.setattr(api, "_known_machines", lambda: None)
+    api._services()
+    root = api._state["root"]
+    runway = importlib.import_module(api.pkg().__name__ + ".runway")
+    monkeypatch.setattr(runway, "pacing_path", lambda _root: tmp_path / "llm_pacing.json")
+    throttle = importlib.import_module(api.pkg().__name__ + ".throttle")
+    now = time.time()
+    level = {"mode": "auto", "percent": 0, "cap_per_s": 1000.0, "pool_caps": {"anthropic": 0.0, "openai-codex": 600.0},
+             "budget_at": now - 60, "set_at": now - 30}
+    throttle.level_path(root).parent.mkdir(parents=True, exist_ok=True)
+    throttle.level_path(root).write_text(json.dumps(level))
+    app = FastAPI()
+    app.include_router(api.router, prefix="/p")
+    put = TestClient(app).put("/p/v1/throttle", json={"percent": 25}).json()
+    stored = json.loads(throttle.level_path(root).read_text())
+    assert stored["mode"] == "auto" and stored["percent"] == 25 and stored["pool_caps"] == level["pool_caps"]
+    assert stored["cap_per_s"] == 1000.0 and stored["budget_at"] == pytest.approx(level["budget_at"], abs=1e-3)
+    assert stored["set_at"] > level["set_at"]
+    assert put["mode"] == "auto" and put["cap_per_s"] == pytest.approx(750.0)
+    assert put["budget"]["pool_caps"] == {"anthropic": 0.0, "openai-codex": pytest.approx(450.0)}
+    gate = throttle.Gate(root, tmp_path / "none.sqlite")
+    assert gate.plan(time.time(), "anthropic") == ("hold",)
