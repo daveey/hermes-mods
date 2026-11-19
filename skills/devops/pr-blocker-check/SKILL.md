@@ -52,6 +52,8 @@ head ("resuming: ... not rebasing or re-gating", then review refused on the old 
 main && git rebase origin/main` in the worktree first, then rerun ship: it re-gates, pushes the new head and
 reruns CI.
 
+When Kanban completion reports `pr_acceptance: missing` although `gh pr checks --required` reports none, inspect `commits/<sha>/check-suites`, not just the PR rollup. Installed third-party apps can leave queued suites with zero runs. The acceptance gate treats these as potentially real CI until its idle-suite grace expires (check `hermes_cli/kanban_pr_fallback.py`; currently 15 minutes). Only after that can a documented `contract_waiver` cover genuine absent checks; it never bypasses active CI. Preserve the pushed deliverable and checkpoint until the grace elapses, then re-read exact-head checks and retry completion. Do not invent a success status or change repository CI to evade the gate.
+
 A head with no Actions runs at all minutes after its push (`gh api 'repos/O/R/actions/runs?head_sha=<sha>' --jq .total_count` prints 0) while `mergeable` reads UNKNOWN is usually a conflict, not a queue: GitHub creates no `pull_request` runs for a PR that conflicts with its base. Run the conflicting row's merge-tree check before scheduling a retry. For the same reason, a wake_check that parks on a PR head's CI must also wake (exit 0) when that head still has no runs ~15 min after its push: one that reads zero runs as "not yet" sleeps its owner until the park cap.
 
 `checks_pending` with the new head's run stuck `pending` (no jobs) usually means an older run is holding the
