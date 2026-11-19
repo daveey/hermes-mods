@@ -241,7 +241,7 @@ contexts, including a separate platform-state gate. No prefix/version stripping,
 alias is safe: an absent required context remains failure. These job expectations are not a complete branch
 protection/ruleset evaluator (nor app-identity validation); external status contexts need their own exact-head proof.
 The probe checks only the `--expect` entries you pass: **the manifest must enumerate every required context**; a
-required context you omit is silently unchecked (the probe is not a policy evaluator and cannot notice it). It
+required context you omit is silently unchecked. It
 refuses a repeated `RUN:JOB` with conflicting conclusions before any gh call, and fails a run with more than one job
 bearing an expected name (ambiguous, in any order); it never picks one by position.
 
@@ -260,10 +260,10 @@ See [required-context regression and causal chain](references/required-context-c
 - Read a Kanban reviewer's verdict from the run, not the card: `select summary,metadata from task_runs where
   task_id=? order by id desc limit 1`. `tasks.result` is often empty, so a watcher grepping it never sees APPROVE and
   waits until timeout. Verify the verdict yourself before arming the merge.
-- Every new head (your own rebase included) needs a fresh exact-head verdict, even when `git range-diff` shows
-  every patch identical: main moved underneath it. Ask the SAME reviewer lineage for a delta review of the new
-  sha (a done card can't be reopened unless it sits in review; create a continuation card, pinned to the same
-  model, and link it as parent of the ship card).
+- A new head needs a fresh exact-head verdict (own rebase included: main moved under it) unless policy carries
+  the approval (Hermes: `hermes-core-wt ship`'s clean rebase, range-diff all `=`; state update-branch, same
+  `git patch-id --verbatim`; ship-only-guard refuses briefs demanding a review per new head). Ask the SAME
+  reviewer lineage for a delta review (done card: a continuation card, same model, parent of the ship card).
 - Exact-head failure: first read main HEAD's own failing checks (`gh api repos/O/R/commits/main/check-runs`) and their test ids: the same tests red on main mean every PR inherits them (shard numbers differ per PR), so find or file the main fix. Else check main's commits since the merge-base for a fix (rebase), or re-run the failing files on a detached worktree at the merge-base. Inherited: route it to the breaking commit's owner (search cards for the test name), rebase onto the fix, re-verify range-diff, push `--force-with-lease=<ref>:<old sha>`, request the delta review. Never merge over a red aggregate.
 - Hosted Actions refused for billing on a repo WITHOUT branch protection or required checks: run the workflow's
   exact commands locally at the exact head for every matrix entry (`uv run --no-project --python 3.X --with
