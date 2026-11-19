@@ -819,7 +819,10 @@ export function Panel() {
   // a replacement ask; old bridges without identity must fail open rather than hide an unknown set.
   const askKeys = typeof US?.openAskKeys === 'function' ? US.openAskKeys() : []
   const attention = attentionKeys(askKeys, sorted)
-  const collapsed = askKeys.length === asks && !!collapsedKeys && attention.every(k => collapsedKeys.includes(k))
+  // Empty attention only matches an explicitly empty fold. Otherwise every([])
+  // would reuse a fold saved for answered asks (including legacy asks:N keys).
+  const collapsed = askKeys.length === asks && !!collapsedKeys &&
+    (attention.length > 0 ? attention.every(k => collapsedKeys.includes(k)) : collapsedKeys.length === 0)
   const toggle = () => { const next = collapsed ? null : attention; writeCollapsed(next); setCollapsedState(next) }
   // `busy` is this chat's own turn (the agent writing a reply), not card work: say so, or "working" next to
   // "2 waiting" reads as a card running when none is.

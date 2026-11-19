@@ -368,6 +368,42 @@ test('panel: legacy count-only collapse cannot hide current canonical asks', asy
   assert.equal(el().querySelector('[data-panel-toggle]').getAttribute('aria-expanded'), 'true')
 })
 
+test('panel: legacy ask fold does not collapse zero-attention running work', async () => {
+  window.localStorage.setItem('hermes.sessionPanel.collapsed.v1', JSON.stringify(['asks:2']))
+  bridges({ asks: 0, chips: [card('t_run', 'running', { activityAt: Date.now() / 1000 })] })
+  await show(J.jsx(m.Panel, { key: 'legacy-empty-attention' }))
+  assert.equal(el().querySelector('[data-panel-toggle]').getAttribute('aria-expanded'), 'true')
+})
+
+test('panel: answering the last folded ask reopens remaining running work', async () => {
+  window.localStorage.clear()
+  bridges({ asks: 1, chips: [card('t_run', 'running', { activityAt: Date.now() / 1000 })] })
+  window.__userSteps.openAskKeys = () => ['owner-qualified-ask-a']
+  const mount = () => show(J.jsx(m.Panel, { key: 'answered-last-ask' }))
+  const expanded = () => el().querySelector('[data-panel-toggle]').getAttribute('aria-expanded')
+  await mount()
+  await React.act(async () => el().querySelector('[data-panel-toggle]').click())
+  assert.equal(expanded(), 'false')
+  window.__userSteps.openAskCount = () => 0
+  window.__userSteps.openAskKeys = () => []
+  await mount()
+  assert.equal(expanded(), 'true', 'a fold made for an ask must not hide unrelated running work')
+})
+
+test('panel: deliberate zero-attention fold persists across remount', async () => {
+  window.localStorage.clear()
+  bridges({ asks: 0, chips: [card('t_run', 'running', { activityAt: Date.now() / 1000 })] })
+  const mount = () => show(J.jsx(m.Panel, { key: 'deliberate-empty-fold' }))
+  const expanded = () => el().querySelector('[data-panel-toggle]').getAttribute('aria-expanded')
+  await mount()
+  assert.equal(expanded(), 'true')
+  await React.act(async () => el().querySelector('[data-panel-toggle]').click())
+  assert.equal(expanded(), 'false')
+  await show(null)
+  await mount()
+  assert.equal(expanded(), 'false', 'an explicit empty-attention fold is still remembered')
+})
+
 test('panel: a count-only bridge fails open rather than reusing a saved fold', async () => {
   window.localStorage.setItem('hermes.sessionPanel.collapsed.v1', JSON.stringify(['asks:2']))
   bridges({ asks: 2, chips: [] })
