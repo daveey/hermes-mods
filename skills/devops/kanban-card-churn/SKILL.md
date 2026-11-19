@@ -115,7 +115,7 @@ four of these at once.
 
 ## 3. Clean up the card
 
-Before editing and again before promotion, re-read the newest body, budget events and comments. When concurrent
+Before editing and again before promotion, re-read the newest body, budget events and comments. For a foreign spend-held card, preflight `kanban_supervisor_request` operator `spend_promote` with `dry_run=true` against the current episode before preparing a release. Its `spend_budget_decision_ready.producer` must name this decision card; a producer of `chats` is not delegated by prose in a cleanup card. A `spend_scope` refusal requires disposition by that authenticated managing owner, not ordinary unblock, a new relay card, or a copied approval. Keep prepared state explicitly unapplied until body, attachment and finite allowance are read back on the owner. When concurrent
 orchestrators have changed the same card's scope or run allowance, reconcile to one scope, one budget and one
 promoting owner rather than adding overlapping allowances or overwriting a competing decision.
 
