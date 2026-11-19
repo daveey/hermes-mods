@@ -3763,6 +3763,60 @@ def _detector_exempts_now(d: dict, cache: Optional[dict] = None) -> Optional[str
     return f"detector_exempts_now: {why}" if why else None
 
 
+def backlog_report(store, now: float, board: str = "default", *, filed_today=None, cap=None) -> dict:
+    """Read-only standing-report snapshot, including non-cap retry waits.
+
+    The publisher owns card lifecycle separately. This reader neither classifies,
+    creates pending storage, nor changes any retry/version or LaneState status.
+    """
+    path = Path(store.root) / "selfheal_pending.sqlite"
+    rows = []
+    if path.exists():
+        with contextlib.closing(_ro_state(path)) as db:
+            rows = db.execute("SELECT fp, payload, retry FROM pending").fetchall()
+    lane = LaneState(store.root).read()
+    ranked = []
+    counts = {"pending": 0, "due": 0, "urgent": 0, "severity_retry": 0}
+    for fp, payload, retry in rows:
+        d = json.loads(payload)
+        if (d.get("board") or "default") != board:
+            continue
+        st = lane.get(fp) or {}
+        recurrence = bool(st.get("status") == "fixed" or st.get("recurrences"))
+        urgent = backlog_bypass(d)
+        due = retry <= now
+        counts["pending"] += 1
+        counts["due"] += int(due)
+        counts["urgent"] += int(urgent)
+        counts["severity_retry"] += int(not d.get("backlog_severity_ready"))
+        item = {"fingerprint": fp, "score": backlog_score(d, now, recurrence),
+                "urgent": urgent, "due": due, "retry_at": retry,
+                "symptom": str(d.get("symptom") or "unknown"),
+                "occurrences": int(d.get("occurrence_count") or 1)}
+        ranked.append(((not urgent, *backlog_priority(d, now, recurrence)), item))
+    ranked.sort(key=lambda row: row[0])
+    top = [item for _, item in ranked[:25]]
+    cap = daily_card_cap() if cap is None else cap
+    filed_today = cards_created_today(board, now) if filed_today is None else filed_today
+    lines = [f"# Self-heal backlog — {board}", f"Updated {_iso(now)} (UTC). Report only; do not dispatch.",
+             f"Pending: {counts['pending']}; due: {counts['due']}; urgent: {counts['urgent']}; "
+             f"severity retry: {counts['severity_retry']}.",
+             f"Filed today: {filed_today}/{cap}; paced allowance: "
+             f"{backlog_allowance(cap, filed_today, now, False)}."]
+    if filed_today >= cap:
+        lines.append("daily cap full — urgent rows remain queued; no cap or budget bypass.")
+    lines.extend(["", "## Top 25 (urgent first, then importance)"])
+    for i, item in enumerate(top, 1):
+        symptom = " ".join(item["symptom"].split())[:240]
+        state = "due" if item["due"] else f"retry {_iso(item['retry_at'])}"
+        lines.append(f"{i}. `{item['fingerprint']}` — score {item['score']:.6g}; "
+                     f"{item['occurrences']} occurrences; {state}"
+                     f"{' [URGENT]' if item['urgent'] else ''}: {symptom}")
+    if not top:
+        lines.append("No pending fingerprints.")
+    return {"board": board, "counts": counts, "top": top, "body": "\n".join(lines)}
+
+
 def backlog_shadow(store, now: float) -> list:
     """Observe the proposed ranking without changing admission, retries or lane state."""
     db = _pending_db(store)

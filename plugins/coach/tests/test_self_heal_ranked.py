@@ -33,6 +33,26 @@ def pending(e):
         return {fp: json.loads(p) for fp, p in db.execute("SELECT fp,payload FROM pending")}
 
 
+def test_report_is_readonly_bounded_and_names_cap_blocked_bypass(ranked):
+    e = ranked
+    for i in range(30):
+        d = {"fingerprint": f"raw-{i}", "component": "agent", "source": "signal",
+             "symptom": f"failure {i}", "at": NOW, "p_defect": .5,
+             "backlog_severity": 2, "board": "default"}
+        sh._defer_investigation(d, {"retry_at": sh._iso(NOW + (3600 if i == 29 else -1))}, e.store)
+    urgent = {"fingerprint": "urgent", "component": "auth", "at": NOW,
+              "symptom": "credentials unavailable", "board": "default"}
+    sh._defer_investigation(urgent, {"retry_at": sh._iso(NOW-1)}, e.store)
+    before = pending(e)
+    result = sh.backlog_report(e.store, NOW, "default", filed_today=5, cap=5)
+    assert result["counts"] == {"pending": 31, "due": 30, "urgent": 1, "severity_retry": 31}
+    assert len(result["top"]) == 25
+    assert result["top"][0]["fingerprint"] == "urgent"
+    assert "daily cap full" in result["body"] and "urgent" in result["body"]
+    assert pending(e) == before
+    assert not e.board.creates()
+
+
 def test_cap_five_files_highest_not_first_arrival(ranked):
     e = ranked
     now = int(NOW) // 86400 * 86400 + 23 * 3600

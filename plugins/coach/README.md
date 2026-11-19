@@ -1456,6 +1456,24 @@ monitors). `d` = `{fingerprint, component, symptom, source, kind, p_defect, sess
   their canonical key (`fold_pending_keys`, `selfheal_pending_folded`). A folded row keeps the newest payload, lists
   every occurrence in `occurrences`, `occurrence_count` and its `details` (so the card that finally files shows them),
   and `merge_reasons` for duplicate-check folds. Tests: `tests/test_self_heal_dedupe_keys.py`.
+- **Ranked backlog rollout** (`backlog_ranked: true` in hub `selfheal-config.json`, off by default):
+  keep the same `selfheal_pending.sqlite` four-column queue and CAS versions; LaneState remains the only
+  filed/fixed/suppressed/recurrence authority. Detection keeps its admission and owner-dedupe checks but queues
+  final creates. The existing five-minute cron drains at most hourly, urgent structured classes first, then
+  `severity × decayed frequency × p_defect × source weight × complaint/recurrence/manual boosts`.
+  Frequency has a seven-day half-life; age never deletes a row, even with the rollout disabled.
+  Pool-Haiku classifies severity once per fingerprint; failures use severity 2 and retry next drain.
+  Ordinary filing allowance is `ceil(cap × (UTC hour+1)/24) - filed_today`; urgent classes ignore pacing,
+  never the cap or lane budget. Non-cap retry timestamps and pre-filing rechecks remain in force.
+  `backlog_shadow: true` logs proposed rankings without switching admission.
+  `python self_heal.py backlog bump|drop <fp> [--board default] [--reason TEXT]` doubles manual priority or
+  suppresses through LaneState while preserving evidence. Commands are hub-only.
+  `python self_heal.py backlog-migrate --inventory board --prunes <private-json> --expected-prunes <count>`
+  is read-only by default; `--apply` backs up the pending DB once and transactionally imports digest provenance.
+  Reapplication is idempotent. Manual-prune aliases are excluded; receipt/backport/undeployed comments remain
+  source-card history, never new defect investigations. Retain the private provenance input and review the
+  dry-run before applying. Rollback disables `backlog_ranked`; queue schema and lifecycle history stay compatible.
+  Tests: `test_self_heal_backlog.py`, `test_self_heal_ranked.py`, `test_self_heal_backlog_migration.py`.
 - **Daily card cap** (`daily_card_cap`, default 40, env `COACH_SELFHEAL_DAILY_CAP`): cards created_by `self-heal` on
   the board since 00:00Z. At the cap a new defect (or backport/deploy-check) files no card: the day's digest card
   (key `selfheal-digest:<YYYY-MM-DD>`, title `self-heal digest <date>: defects over the daily cap`, not counted,

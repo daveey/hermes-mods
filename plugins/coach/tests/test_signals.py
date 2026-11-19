@@ -1538,15 +1538,19 @@ def test_route_monitor_shadow_is_not_owned(tmp_path):
     assert not r["owned"] and r["result"]["action"] == "would_file"  # shadow: the monitor still posts its card
 
 
-def test_forward_parses_hub_result():
-    out = json.dumps({"action": "filed", "card": "t_9"})
+@pytest.mark.parametrize("hub_result", [{"action": "filed", "card": "t_9"},
+                                        {"action": "queued", "fingerprint": "monitor-example"}])
+def test_forward_parses_hub_result(hub_result):
+    out = json.dumps(hub_result)
     runner = lambda argv, capture_output=True, text=True, input=None, timeout=None: SimpleNamespace(
         returncode=0, stdout="warning: noise\n" + out + "\n", stderr="")
     store = SimpleNamespace(root=Path("/nonexistent"), log=lambda rec: None)
     r = sh.file_defect(sg.monitor_defect(MON), store=store, m="live", cfg={"hub_ssh": "you@hub.example.com",
                                                                             "hub_host": "elsewhere"},
                        runner=runner, now=NOW)
-    assert r["action"] == "forwarded" and r["hub_result"]["card"] == "t_9" and sg.lane_owns(r)
+    assert r["action"] == "forwarded" and r["hub_result"] == hub_result and sg.lane_owns(r)
+    routed = sg.route_monitor(MON, filer=lambda d: r)
+    assert routed["owned"]  # no fallback monitor card after durable hub enqueue
 
 
 def _cron_job(i, streak, status, at, detail="Script exited with code 1"):
