@@ -101,6 +101,15 @@ ask only once its prerequisite is verifiably in place. If an early one is alread
   only when a permission limit widens (more targets, data or spend), and name it in a scope line
   `New since your approval: <limit key>: <what widened>`. ask-gate enforces both (`approval_single_use`,
   `approval_reuse` in `plugins/ask-gate/approval_reuse.py`).
+- A single-attempt (latched) root runner spends its latch on a preflight refusal, and each refusal costs a fix,
+  re-review and relaunch. Before launching, check its review exercised the read-only preflight predicates against
+  LIVE state, not fixtures (owner/mode of every file it reads, emptiness or row-state checks on live tables); if
+  not, run the ones that need no root yourself, or send it back. Fixture tests pass on a root-owned file or empty
+  table the live host doesn't have. After a refusal, read live state back, comment "latch spent, nothing changed,
+  approval not consumed" plus the cause, and require a new runner with a new latch and staging directory.
+- A "worker exited unexpectedly" notice on a card with an owner-terminal step is often a finished handoff whose
+  block was refused: read the card's newest comments and the newest evidence `HANDOFF.md` before treating it as a
+  crash. A runner that is ready, reviewed and unlaunched is yours to launch that turn.
 - Serialize owner-context tests too, and give each attempt a unique log directory: isolated HOME/board fixtures
   still overwrite evidence when two chats share output paths. If that happened, hash the retained coherent logs
   and count them as one proof, not two independent runs; do not rerun merely to recreate overwritten evidence.
