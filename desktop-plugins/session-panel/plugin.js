@@ -463,7 +463,7 @@ export function doneRows(tasks) {
 }
 
 /** Attention keys: a new ask or a new stuck item reopens a collapsed panel. */
-export const attentionKeys = (asks, sorted) => [`asks:${asks}`, ...sorted.unasked.map(i => i.key), ...sorted.stuck.map(i => i.key)]
+export const attentionKeys = (askKeys, sorted) => [...askKeys.map(key => `ask:${key}`), ...sorted.unasked.map(i => i.key), ...sorted.stuck.map(i => i.key)]
 
 // ── data ────────────────────────────────────────────────────────────────────
 
@@ -783,8 +783,11 @@ export function Panel() {
   const legacy = US?.Strip ? jsx(US.Strip, { hideCards: sorted.unasked.map(i => i.chip) }, 'legacy') : null
   // Keep finished history reachable even after the final open card closes.
   if (!finished?.length && !US?.hasQueuePresentation?.() && !hasOpenWork(sorted, { asks, steps: US?.snapshot?.ledger?.steps, issues: US?.snapshot?.issues })) return null
-  const attention = attentionKeys(asks, sorted)
-  const collapsed = !!collapsedKeys && attention.every(k => collapsedKeys.includes(k))
+  // The user-steps bridge qualifies these by owner/request/revision. A count alone cannot distinguish
+  // a replacement ask; old bridges without identity must fail open rather than hide an unknown set.
+  const askKeys = typeof US?.openAskKeys === 'function' ? US.openAskKeys() : []
+  const attention = attentionKeys(askKeys, sorted)
+  const collapsed = askKeys.length === asks && !!collapsedKeys && attention.every(k => collapsedKeys.includes(k))
   const toggle = () => { const next = collapsed ? null : attention; writeCollapsed(next); setCollapsedState(next) }
   // `busy` is this chat's own turn (the agent writing a reply), not card work: say so, or "working" next to
   // "2 waiting" reads as a card running when none is.

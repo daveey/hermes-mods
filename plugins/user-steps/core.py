@@ -29,6 +29,7 @@ MAX_NEW_PER_HOUR = 12
 ATTR_BUDGET = 1024
 DIRECTIVE = "user-step"
 OPTION_MAX = 200
+MAX_OPTIONS = 4  # most answer buttons any surface renders; a longer menu is asked as free text
 # Retired migration fallback: one generic button that asked the USER to request agent work.
 LEGACY_FALLBACK = [{'id': 'request-context', 'label': 'Request complete action', 'effect': 'revise'}]
 
@@ -821,7 +822,12 @@ def question_title(text: str, span: str, reply: str, block: dict) -> str:
 
 
 def validate(raw_steps: Any, reply: str, open_steps: list[dict], dropped: Optional[list] = None,
-             *, continuity: bool = False) -> list[dict]:
+             *, continuity: bool = False, reasons: Optional[list] = None) -> list[dict]:
+    """Validated steps. ``dropped`` keeps its terminal-handoff/silent-default contract; ``reasons`` (optional)
+    receives one ``{reason, text}`` per raw step that did not survive, or ``downgraded_*`` notes."""
+    def why(reason: str, label: str = "") -> None:
+        if reasons is not None:
+            reasons.append({"reason": reason, "text": re.sub(r"\s+", " ", str(label or "")).strip()[:120]})
     out: list[dict] = []
     # The creation boundary needs repeats too, including those resolved while the
     # model runs. Ordinary extractor callers retain their old deduplication.
@@ -830,22 +836,30 @@ def validate(raw_steps: Any, reply: str, open_steps: list[dict], dropped: Option
     used_blocks: set[tuple[int, int]] = set()
     for s in raw_steps if isinstance(raw_steps, list) else []:
         if not isinstance(s, dict):
+            why("not_an_object")
             continue
         text = re.sub(r"\s+", " ", str(s.get("text") or "")).strip()[:300]
         span = str(s.get("verbatim_span") or "").strip()
         kind = str(s.get("kind") or "").strip().lower()
         # Options keep their full text: migration only turns ones literally present in the
         # source into buttons, so a cut-off label would never match (or would show mid-word).
-        opts = [re.sub(r"\s+", " ", str(o)).strip()[:OPTION_MAX] for o in (s.get("options") or []) if str(o).strip()][:4]
+        opts = [re.sub(r"\s+", " ", str(o)).strip()[:OPTION_MAX] for o in (s.get("options") or []) if str(o).strip()]
         if not text or not span:
+            why("missing_text" if not text else "missing_span", text or span)
             continue
         if kind not in KINDS:
+            kind = "input"
+        if kind == "choose" and len(opts) > MAX_OPTIONS:
+            # No surface renders more than MAX_OPTIONS buttons, and keeping the first few would silently offer a
+            # menu that omits the user's real option. Ask as free text (the span still carries every option).
+            why("downgraded_options_over_limit", text)
             kind = "input"
         if kind == "choose" and len(opts) < 2:
             kind = "input"
         if kind != "choose":
             opts = []
         if _NOT_ASK.search(span):
+            why("not_an_ask", text)
             continue  # hypothetical / mention-only, whatever the model said
         _blk = locate(reply, span)
         if _blk is not None and _SILENT_DEFAULT.search(_plain(_blk["text"])) \
@@ -853,22 +867,30 @@ def validate(raw_steps: Any, reply: str, open_steps: list[dict], dropped: Option
             logging.getLogger("user-steps").info("user-steps: silent_default_suppressed span=%r", span[:120])
             if dropped is not None:
                 dropped.append("silent_default: " + text)
+            why("silent_default", text)
             continue  # optional offer with a silent default elsewhere in the paragraph: not a blocking ask
         if assent_echo(span) or assent_echo(text):
+            why("assent_echo", text)
             continue  # "I'd say yes." echoes assent; it asks nothing
         if quiet and not directly_asks(span):
+            why("declares_no_user_action", text)
             continue  # the reply says nothing waits on the user; a status line is not an ask
         block = locate(reply, span)
         if block is None or _norm(span) not in _norm(block["text"]):
+            why("span_not_in_reply", text)
             continue  # full evidence required; locate's framing prefix is not validation
         if span_is_quoted(span, block["text"]):
+            why("quoted_span", text)
             continue  # a phrase inside quotation marks is cited, not asked
         slot = ask_slot(block, span)
         if slot in used_blocks:
+            why("block_already_used", text)
             continue  # one block (one list line, for bullet lists of distinct asks) yields at most one item
         if in_digest_report(span, block["text"]):
+            why("digest_report", text)
             continue  # a digest of asks that live elsewhere is a status report, not a new tile
         if recommendation_without_request(span, block["text"]):
+            why("recommendation_without_request", text)
             continue  # a recommendation is not permission to manufacture a choice
         text = question_title(text, span, reply, block)
         fence = following_fence(reply, block)
@@ -879,15 +901,20 @@ def validate(raw_steps: Any, reply: str, open_steps: list[dict], dropped: Option
             candidate["payload"] = fence
         key = action_identity(candidate) if continuity else _norm(text)
         if key in seen:
+            why("duplicate_of_open_or_earlier", text)
             continue
         if is_terminal_handoff(text, span, reply):
             if dropped is not None:
                 dropped.append(text)
+            why("terminal_handoff", text)
             continue  # terminal-doable: the agent runs it via run_in_user_terminal, no For-you card
         seen.add(key)
         used_blocks.add(slot)
         out.append(candidate)
     # Suppression/reuse must not be truncated by a *new* action budget.
+    if not continuity:
+        for extra in out[MAX_NEW_PER_REPLY:]:
+            why("reply_cap", extra["text"])
     return out if continuity else out[:MAX_NEW_PER_REPLY]
 
 
@@ -988,6 +1015,7 @@ def extract(reply: str, open_steps: list[dict], user_msg: str, llm: Optional[LLM
     by_id = {s["id"]: s for s in open_steps}
     titles = _elsewhere_titles(elsewhere)
     dropped: list[str] = []
+    reasons: list[dict] = []
     if llm is not None:
         try:
             d = _parse_json(llm(SYSTEM, build_prompt(reply, open_steps, user_msg, titles)))
@@ -998,16 +1026,31 @@ def extract(reply: str, open_steps: list[dict], user_msg: str, llm: Optional[LLM
                        and isinstance(x.get("verbatim_span"), str) and locate(reply, x["verbatim_span"]) is not None]
             resolved = [x for x in resolved if not _still_asked(by_id[x], reply, repeats, user_msg)]
             mapped = elsewhere_mapped(d.get("elsewhere"), reply, titles)
-            steps = without_elsewhere(validate(d.get("steps"), reply, open_steps, dropped, continuity=continuity), mapped)
+            raw_steps = d.get("steps")
+            validated = validate(raw_steps, reply, open_steps, dropped, continuity=continuity, reasons=reasons)
+            steps = without_elsewhere(validated, mapped)
+            for gone in validated:
+                if gone not in steps:
+                    reasons.append({"reason": "elsewhere_mapped", "text": str(gone.get("text"))[:120]})
             return {"steps": steps, "resolved": resolved, "repeats": repeats, "elsewhere": mapped,
-                    "source": "model", "dropped": dropped}
+                    "source": "model", "dropped": dropped,
+                    "diag": {"raw_steps": len(raw_steps) if isinstance(raw_steps, list) else 0,
+                             "raw_steps_type": type(raw_steps).__name__, "validated": len(validated),
+                             "reasons": reasons}}
         except Exception as exc:  # fall back to the regex detector; resolution then only comes from buttons
             err = f"{type(exc).__name__}: {exc}"[:200]
             dropped.clear()
-            return {"steps": validate(regex_steps(reply), reply, open_steps, dropped, continuity=continuity), "resolved": [], "source": "regex",
-                    "error": err, "dropped": dropped}
-    return {"steps": validate(regex_steps(reply), reply, open_steps, dropped, continuity=continuity), "resolved": [], "source": "regex",
-            "dropped": dropped}
+            reasons.clear()
+            raw_steps = regex_steps(reply)
+            steps = validate(raw_steps, reply, open_steps, dropped, continuity=continuity, reasons=reasons)
+            return {"steps": steps, "resolved": [], "source": "regex", "error": err, "dropped": dropped,
+                    "diag": {"raw_steps": len(raw_steps), "raw_steps_type": "list", "validated": len(steps),
+                             "reasons": reasons}}
+    raw_steps = regex_steps(reply)
+    steps = validate(raw_steps, reply, open_steps, dropped, continuity=continuity, reasons=reasons)
+    return {"steps": steps, "resolved": [], "source": "regex", "dropped": dropped,
+            "diag": {"raw_steps": len(raw_steps), "raw_steps_type": "list", "validated": len(steps),
+                     "reasons": reasons}}
 
 
 # ---- in-message frame ----------------------------------------------------------------------------------
@@ -1266,9 +1309,10 @@ def add_step(session_id: str, question: str, options: list, *, ledger: Optional[
                     raise ValueError('authorizes must be a boolean')
                 choice['authorizes'] = o['authorizes']
             choices.append(choice)
-    choices = choices[:4]
     labels = [c["label"] for c in choices]
-    kind = "choose" if len(labels) >= 2 else "input"
+    kind = "choose" if 2 <= len(labels) <= MAX_OPTIONS else "input"
+    if len(labels) > MAX_OPTIONS:
+        choices = []  # keep every label in the paragraph, never a partial button menu
     lg = ledger or Ledger()
     root = lg.root(session_id)
     with lg.edit(root) as d:
@@ -1371,7 +1415,8 @@ def process_reply(reply: str, session_id: str, *, user_msg: str = "", llm: Optio
         if not retired:
             raise
         logging.getLogger("user-steps").exception("publication failed after retirement; preserving hold")
-        return {"text": HELD_REPLY, "steps": [], "resolved": [], "source": "retirement-hold"}
+        return {"text": HELD_REPLY, "steps": [], "resolved": [], "source": "retirement-hold",
+                "diagnostics": {"retirement_hold": True}}
 
 
 def _process_reply(reply: str, session_id: str, *, user_msg: str, llm: Optional[LLM],
@@ -1387,7 +1432,8 @@ def _process_reply(reply: str, session_id: str, *, user_msg: str, llm: Optional[
     root = ledger.root(session_id)
     opened = ledger.open_steps(session_id)
     if not opened and not _worth_asking(reply):
-        return {"text": None, "steps": [], "resolved": [], "source": "skip"}
+        return {"text": None, "steps": [], "resolved": [], "source": "skip",
+                "diagnostics": {"skipped": "not_worth_asking"}}
     card_asks = [e for e in card_asks or () if isinstance(e, dict) and e.get('kind') == KANBAN_ASK]
     listed, tiles = reply_listing(opened, action_store, action_owner, card_asks)
     # Other chats' open asks are only a relay source in a turn a runtime notice started (relay provenance). In a
@@ -1411,8 +1457,16 @@ def _process_reply(reply: str, session_id: str, *, user_msg: str, llm: Optional[
     # in such a reply that shares the card's subject is that card's ask, even when it adds a fallback the card
     # does not carry yet (live: "... or send his current username" minted two unlinked tiles beside the card).
     relayed = {r.get('id') for r in res.get("repeats") or () if isinstance(r, dict)} & {e['id'] for e in card_asks}
+    diag = res.get("diag") or {}
+    pub_drops: list[dict] = []
+
+    def drop(reason: str, step) -> None:
+        pub_drops.append({"reason": reason, "text": str((step or {}).get("text") or "")[:120]})
+
     card_hits = [(s, card_ask_for(s, card_asks, res.get("repeats") or (), reply, relayed=relayed)) for s in res["steps"]]
     restated = [(s, e) for s, e in card_hits if e is not None]
+    for s, _e in restated:
+        drop("restates_card_ask", s)
     res["steps"] = [s for s, e in card_hits if e is None]
     # A Post/approval ask from the chat that posted an open reply-draft card restates that card: the card's Post
     # button is the ask. Publish nothing for it (defect kanban-354519516c: the extra step kept the chat red).
@@ -1421,6 +1475,7 @@ def _process_reply(reply: str, session_id: str, *, user_msg: str, llm: Optional[
         card = reply_draft_holds(session_id, s.get("kind"), s.get("text"), s.get("verbatim_span"))
         if card is not None:
             held_by_card.append((s, card))
+            drop("reply_draft_holds_ask", s)
         else:
             kept.append(s)
     res["steps"] = kept
@@ -1481,6 +1536,8 @@ def _process_reply(reply: str, session_id: str, *, user_msg: str, llm: Optional[
                 # Evidence does not delimit dependent instructions in other blocks.
                 # Hold the whole draft rather than leave an orphaned approval ask.
                 retired.extend(suppressed)
+                for s in suppressed:
+                    drop("retired_action_hold", s)
                 text, held = HELD_REPLY, True
             budget = publication_budget(d["steps"], now)
             asks = open_asks(action_store, action_owner, d["steps"]) if action_store is not None else []
@@ -1496,10 +1553,13 @@ def _process_reply(reply: str, session_id: str, *, user_msg: str, llm: Optional[
             for candidate, prior in matches:
                 block = locate(text, candidate["verbatim_span"])
                 if held or candidate in suppressed or block is None:
+                    if block is None and not held and candidate not in suppressed:
+                        drop("span_not_located", candidate)
                     continue
                 key, span = ask_key(candidate.get('text')), ask_key(candidate.get('verbatim_span'))
                 if ((len(key) >= _ASK_KEY_MIN and key in other_keys)
                         or (len(span) >= _SPAN_KEY_MIN and len(span.split()) >= 5 and span in other_keys)):
+                    drop("elsewhere_open_ask", candidate)
                     continue
                 if action_store is not None:
                     same = same_open_ask(candidate, asks, res.get("repeats") or (), mapped, turn_requests, reply=text)
@@ -1508,12 +1568,15 @@ def _process_reply(reply: str, session_id: str, *, user_msg: str, llm: Optional[
                         mapped.setdefault(ask_key(candidate["verbatim_span"]), same)
                         if same["step"] is not None and all(p.get("id") != same["step"]["id"] for p in published):
                             published.append(dict(same["step"]))
+                        drop("reused_open_ask", candidate)
                         continue
                 existing = next((s for s in prior if s.get("status") == "open"), None)
                 if existing is not None:
                     published.append(dict(existing))
+                    drop("reused_open_step", candidate)
                     continue
                 if budget <= 0 or (action_store is None and _norm(candidate["text"]) in seen):
+                    drop("publication_budget" if budget <= 0 else "duplicate_open_text", candidate)
                     continue
                 # The step's paragraph (and so the request's scope) is the text frame() puts in the directive:
                 # the paragraph, or its single line when over the attr budget, never the whole list around it.
@@ -1553,6 +1616,10 @@ def _process_reply(reply: str, session_id: str, *, user_msg: str, llm: Optional[
         sync_card(ledger, root, session_id, session_ref or f"@session:default/{session_id}", cards)
     return {"text": text if text != reply else None, "steps": published, "resolved": resolved, "source": res["source"],
             "dropped": res.get("dropped") or [],
+            "diagnostics": {"raw_steps": diag.get("raw_steps"), "raw_steps_type": diag.get("raw_steps_type"),
+                            "validated": diag.get("validated", len(res["steps"])),
+                            "validation_drops": diag.get("reasons") or [],
+                            "publication_drops": pub_drops, "published": len(published)},
             **({"card_asks": [e["id"] for _, e in restated]} if restated else {}),
             **({"error": res["error"]} if res.get("error") else {})}
 

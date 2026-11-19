@@ -332,6 +332,49 @@ test('panel: the caret folds the whole panel to its header, like the task list; 
   assert.ok(el().querySelector('[data-section="needs-you"]'), 'expanding shows the asks again')
 })
 
+test('panel: canonical ask identity reopens the same-count queue and persists deliberate folding', async () => {
+  window.localStorage.clear()
+  bridges({ asks: 2, chips: [] })
+  let keys = ['["gateway-a","default","ask-a",1]', '["gateway-a","default","ask-b",1]']
+  window.__userSteps.openAskKeys = () => keys
+  const mount = async () => show(J.jsx(m.Panel, { key: 'canonical-fold' }))
+  const expanded = () => el().querySelector('[data-panel-toggle]').getAttribute('aria-expanded')
+  await mount()
+  await React.act(async () => el().querySelector('[data-panel-toggle]').click())
+  assert.equal(expanded(), 'false', 'the user can deliberately fold the current asks')
+  keys = [...keys].reverse()
+  await mount()
+  assert.equal(expanded(), 'false', 'polling/order changes do not reopen the same set')
+  await show(null)
+  await mount()
+  assert.equal(expanded(), 'false', 'folding the same identities survives remount')
+  keys = [keys[0], '["gateway-a","default","ask-c",1]']
+  await mount()
+  assert.equal(expanded(), 'true', 'a replacement ask reopens even though the count stays two')
+  await React.act(async () => el().querySelector('[data-panel-toggle]').click())
+  await show(null)
+  await mount()
+  assert.equal(expanded(), 'false', 'the replacement set can be deliberately folded too')
+  keys = [keys[0], '["gateway-a","default","ask-c",2]']
+  await mount()
+  assert.equal(expanded(), 'true', 'a new request revision requires attention')
+})
+
+test('panel: legacy count-only collapse cannot hide current canonical asks', async () => {
+  window.localStorage.setItem('hermes.sessionPanel.collapsed.v1', JSON.stringify(['asks:2']))
+  bridges({ asks: 2, chips: [] })
+  window.__userSteps.openAskKeys = () => ['owner-qualified-ask-a', 'owner-qualified-ask-b']
+  await show(J.jsx(m.Panel, { key: 'legacy-count-fold' }))
+  assert.equal(el().querySelector('[data-panel-toggle]').getAttribute('aria-expanded'), 'true')
+})
+
+test('panel: a count-only bridge fails open rather than reusing a saved fold', async () => {
+  window.localStorage.setItem('hermes.sessionPanel.collapsed.v1', JSON.stringify(['asks:2']))
+  bridges({ asks: 2, chips: [] })
+  await show(React.createElement(m.Panel, { key: 'identity-unavailable' }))
+  assert.equal(el().querySelector('[data-panel-toggle]').getAttribute('aria-expanded'), 'true')
+})
+
 test('panel: a new ask reopens a folded panel', async () => {
   window.localStorage.clear()
   const s = Date.now() / 1000
