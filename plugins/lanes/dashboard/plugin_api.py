@@ -6,7 +6,8 @@ GET /api/plugins/lanes/v1/held?lane=x: cards waiting at a lane gate. POST /api/p
 Without lanes: ``GET /v1/lanes`` answers ``{"configured": false, "reason": ...}`` on a core without lanes support or
 with no lanes configured, so the panel can say why it is empty; every other route answers 409 in both cases.
 Reads are cached for 10 s per window; a write starts a new cache generation, so a read that began before it
-cannot be stored after it.
+cannot be stored after it. `blocked_on_you` is whatever core's snapshot reports (human-request parks); older
+cores omit it and the Desktop strip treats a missing count as 0.
 """
 from __future__ import annotations
 

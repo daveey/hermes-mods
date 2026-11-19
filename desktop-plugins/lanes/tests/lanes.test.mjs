@@ -21,15 +21,15 @@ test.afterEach(async () => {
 
 function lane(over = {}) {
   return { share: 10, paused: false, gated: false, admit_per_day: null, admitted_today: 0, describe: '', target: 0, actual: 0,
-    run_seconds: 0, runs: 0, running: 0, ready: 0, held: 0, open: 0, done: 0, oldest_ready_s: null, cost_usd: 0, tokens: 0, usage_runs: 0, ...over }
+    run_seconds: 0, runs: 0, running: 0, ready: 0, held: 0, blocked_on_you: 0, open: 0, done: 0, oldest_ready_s: null, cost_usd: 0, tokens: 0, usage_runs: 0, ...over }
 }
 
 function snap(over = {}) {
   return {
     configured: true, window_hours: 6, scope: 'fleet', planner: { notes: [{ lane: 'product', text: 'nothing ready' }] },
     lanes: {
-      product: lane({ share: 30, target: 0.5, actual: 0.03, open: 18 }),
-      infra: lane({ share: 30, target: 0.5, actual: 0.97, gated: true, admit_per_day: 50, admitted_today: 12, ready: 120, held: 40, open: 253, running: 9,
+      product: lane({ share: 30, target: 0.5, actual: 0.03, open: 18, running: 2, blocked_on_you: 3 }),
+      infra: lane({ share: 30, target: 0.5, actual: 0.97, gated: true, admit_per_day: 50, admitted_today: 12, ready: 120, held: 40, open: 253, running: 9, blocked_on_you: 4,
         run_seconds: 3600 * 250, runs: 400, done: 60, cost_usd: 47.651, tokens: 12_500_000, usage_runs: 140, oldest_ready_s: 7200 })
     },
     ...over
@@ -113,12 +113,13 @@ test('the event opens the panel, fetches the saved window, and Apply PUTs', asyn
   const calls = []
   const ctx = ctxWith(calls, (path, opts) => (opts.method === 'PUT' ? snap({ lanes: { ...snap().lanes, product: lane({ share: 30, paused: true }) } }) : snap()))
   const view = await mount(React.createElement(P.Lanes, { ctx }))
-  assert.deepEqual(calls, [['/v1/lanes?hours=6', 'GET', undefined]]) // one probe while closed
-  assert.equal(document.querySelector('[data-lane="product"]'), null, 'closed until the pill is clicked')
+  assert.deepEqual(calls, [['/v1/lanes?hours=6', 'GET', undefined]]) // one probe while collapsed
+  assert.ok(document.querySelector('[data-lane-pill="product"]'), 'collapsed pills are visible')
+  assert.equal(document.querySelector('[data-lane="product"]'), null, 'collapsed until the pill is clicked')
   let opensBoard
   await React.act(async () => { opensBoard = pillOpensBoard() })
   await view.flush()
-  assert.equal(opensBoard, false, 'configured lanes: the task pill opens this panel instead of the board')
+  assert.equal(opensBoard, false, 'configured lanes: the task pill expands this strip instead of the board')
   await view.click(document.querySelector('[data-lane="product"] .hermes-lanes-volume button'))
   // A poll that brings a new snapshot object must not drop the unsaved edit.
   await React.act(async () => view.client.refetchQueries({ queryKey: ['lanes', 6] }))
@@ -132,7 +133,7 @@ test('the event opens the panel, fetches the saved window, and Apply PUTs', asyn
   assert.equal(calls.at(-1)[0], '/v1/lanes?hours=24')
   await view.click(button('Board'))
   assert.deepEqual(host.navigated, ['/kanban'], 'the panel still leads to the board')
-  assert.equal(document.querySelector('[data-lane="product"]'), null, 'and closes')
+  assert.equal(document.querySelector('[data-lane="product"]'), null, 'and collapses')
   await view.close()
   assert.equal(pillOpensBoard(), true, 'unmounted: the pill opens the board again')
 })
@@ -358,4 +359,61 @@ test('with no steering gateway it still uses the first configured one', async ()
   const source = P.createSource(ctx, { profileRoutes: async () => [MAC, HUB] })
   await source.read(6)
   assert.equal(source.target().connectionId, 'this-mac')
+})
+
+test('meter is blue running, yellow not ready, red blocked on you; missing blocked_on_you is zero', () => {
+  assert.deepEqual(P.meter({ running: 2, open: 18, blocked_on_you: 3 }), { running: 2, notReady: 13, blocked: 3, total: 18 })
+  assert.deepEqual(P.meter({ running: 2, open: 18 }), { running: 2, notReady: 16, blocked: 0, total: 18 })
+  assert.deepEqual(P.meter({}), { running: 0, notReady: 0, blocked: 0, total: 0 })
+})
+
+test('older SDKs without TOP_STRIP_AREA still activate at shell.topStrip', () => {
+  assert.equal(P.TOP_STRIP_AREA, 'shell.topStrip')
+  assert.equal('TOP_STRIP_AREA' in globalThis.__lanesSdk, false)
+})
+
+test('registers a top strip, not a status-bar popup', () => {
+  const areas = []
+  const dispose = []
+  P.default.register({ register: (c) => areas.push(c), onDispose: (fn) => dispose.push(fn) })
+  assert.equal(areas.find((a) => a.id === 'strip')?.area, 'shell.topStrip')
+  assert.equal(areas.some((a) => String(a.area).startsWith('statusBar')), false)
+  assert.ok(areas.some((a) => a.id === 'show-lanes' && a.area === 'palette'))
+  for (const fn of dispose) fn()
+})
+
+test('open/closed is persisted; collapsed is the default', async () => {
+  const ctx = ctxWith([], () => snap())
+  const first = await mount(React.createElement(P.Lanes, { ctx }))
+  assert.equal(first.container.getAttribute('data-open') || document.querySelector('[data-slot=lanes-strip]')?.getAttribute('data-open'), '0')
+  assert.equal(document.querySelector('[data-lane="product"]'), null)
+  await first.click(button('Expand lanes'))
+  assert.equal(localStorage.getItem(P.OPEN_KEY), '1')
+  assert.ok(document.querySelector('[data-lane="product"]'))
+  await first.close()
+  const again = await mount(React.createElement(P.Lanes, { ctx }))
+  assert.ok(document.querySelector('[data-lane="product"]'), 'remount restores expanded')
+  assert.equal(document.querySelector('[data-slot=lanes-strip]').getAttribute('data-open'), '1')
+  await again.click(button('Collapse lanes'))
+  assert.equal(localStorage.getItem(P.OPEN_KEY), '0')
+  assert.equal(document.querySelector('[data-lane="product"]'), null)
+})
+
+test('clicking a lane pill expands and scrolls to that row', async () => {
+  const seen = []
+  const orig = HTMLElement.prototype.scrollIntoView
+  HTMLElement.prototype.scrollIntoView = function (opts) { seen.push([this.getAttribute('data-lane'), opts]) }
+  try {
+    const view = await mount(React.createElement(P.Lanes, { ctx: ctxWith([], () => snap()) }))
+    assert.equal(document.querySelector('[data-lane="infra"]'), null)
+    await view.click(document.querySelector('[data-lane-pill="infra"]'))
+    assert.ok(document.querySelector('[data-lane="infra"]'))
+    assert.equal(document.querySelector('[data-slot=lanes-strip]').getAttribute('data-open'), '1')
+    assert.deepEqual(seen.filter((s) => s[0] === 'infra').map((s) => s[1]), [{ block: 'nearest' }])
+    const body = document.querySelector('.hermes-lanes-body')
+    assert.equal(body.style.maxHeight, '60vh')
+    assert.equal(getComputedStyle(body).overflow, 'auto')
+  } finally {
+    HTMLElement.prototype.scrollIntoView = orig
+  }
 })

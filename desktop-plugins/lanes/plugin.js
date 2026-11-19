@@ -1,23 +1,31 @@
 // Lanes: how worker time is split between project lanes, and the controls for it.
-// Lanes live on one gateway; the panel finds it (createSource below) and reads and writes there.
-// Opens from the status-bar task pill (where lanes are configured; see KANBAN_CHIP_EVENT) and from the
-// palette. Data: GET /v1/lanes?hours=… on the local gateway (plugins/lanes): per lane target and actual share of
-// run-hours, running, ready, held at the gate, open, done, tokens and estimated cost. Controls: PUT /v1/lanes/<lane>
-// {share | paused}; the API also takes admit_per_day and has /v1/held, which this panel does not use yet.
-// Shares are relative volumes: the target percentage is share / sum of shares. A draft survives polls; Reset, a
-// successful Apply or closing the panel drops it, and the controls are locked while an Apply is in flight.
-import { host, useQuery, STATUSBAR_AREAS, PALETTE_AREA, Popover, PopoverTrigger, PopoverContent } from '@hermes/plugin-sdk'
-import { createElement as h, useState, useEffect, useMemo } from 'react'
+// Lanes live on one gateway; the strip finds it (createSource below) and reads and writes there.
+// Docked at the top of the window (shell.topStrip). Collapsed by default: one line of per-lane pills.
+// The status-bar task pill (KANBAN_CHIP_EVENT) and the palette "Show lanes" command expand it.
+// Data: GET /v1/lanes?hours=… (plugins/lanes): per lane target and actual share of run-hours, running,
+// ready, held at the gate, blocked_on_you (human asks), open, done, tokens and estimated cost.
+// Controls: PUT /v1/lanes/<lane> {share | paused}; the API also takes admit_per_day and has /v1/held,
+// which this panel does not use yet. Shares are relative volumes: the target percentage is share / sum
+// of shares. A draft survives polls; Reset, a successful Apply or collapsing the strip drops it, and
+// the controls are locked while an Apply is in flight.
+import * as sdk from '@hermes/plugin-sdk'
+import { createElement as h, useState, useEffect, useMemo, useRef } from 'react'
+
+const { host, useQuery, PALETTE_AREA } = sdk
+// Older Desktops do not export TOP_STRIP_AREA; a named import would throw at load and skip activation.
+export const TOP_STRIP_AREA = sdk.TOP_STRIP_AREA || 'shell.topStrip'
 
 export const POLL_MS = 15000
 export const IDLE_POLL_MS = 300000
 export const REQUEST_TIMEOUT_MS = 20000
 export const WINDOWS = [[1, '1h'], [6, '6h'], [24, '24h'], [168, '7d']]
 export const STORE_KEY = 'hermes-lanes-window'
+export const OPEN_KEY = 'hermes-lanes-open'
 // The Desktop's status-bar task pill (board icon, bar of open cards, count) fires this cancellable event before
-// it opens the board. Where lanes work, this panel takes the click over; its Board button opens the board.
+// it opens the board. Where lanes work, this strip takes the click over; its Board button opens the board.
 export const KANBAN_CHIP_EVENT = 'hermes-kanban-chip'
 const COLORS = ['#f0a43a', '#8fb0ff', '#5fd4e6', '#d982f0', '#b4bac6', '#3ddc97', '#ef7b7b', '#c9d36a']
+export const METER_COLORS = { running: '#388bfd', notReady: '#d4a72c', blocked: '#d64545' }
 
 // ── which gateway to talk to ──────────────────────────────────────────────
 // Lanes are configured on one gateway (the one that holds the board and runs the dispatcher), which is often
@@ -118,6 +126,14 @@ export function saveWindow(hours, storage = globalThis.localStorage) {
   try { storage?.setItem(STORE_KEY, String(hours)) } catch {}
 }
 
+export function loadOpen(storage = globalThis.localStorage) {
+  try { return storage?.getItem(OPEN_KEY) === '1' } catch { return false }
+}
+
+export function saveOpen(open, storage = globalThis.localStorage) {
+  try { storage?.setItem(OPEN_KEY, open ? '1' : '0') } catch {}
+}
+
 /** Rows in server order with a stable color, the target each lane WOULD get with `draft` shares applied. */
 export function rows(snap, draft = {}) {
   const names = Object.keys(snap?.lanes || {})
@@ -191,6 +207,20 @@ export function changes(snap, draft) {
   }).filter(([, body]) => Object.keys(body).length)
 }
 
+/** Open-card mix for a mini pill: blue running, yellow not ready, red human-blocked. Older cores omit blocked_on_you. */
+export function meter(row) {
+  const running = Number(row?.running) || 0
+  const blocked = Number(row?.blocked_on_you) || 0
+  const open = Number(row?.open) || 0
+  const notReady = Math.max(0, open - running - blocked)
+  return { running, notReady, blocked, total: running + notReady + blocked }
+}
+
+function laneSelector(name) {
+  const esc = globalThis.CSS?.escape ? globalThis.CSS.escape(name) : String(name).replace(/\\/g, '\\\\').replace(/"/g, '\\"')
+  return `[data-lane="${esc}"]`
+}
+
 // ── components ────────────────────────────────────────────────────────────
 
 function Split({ label, list, field }) {
@@ -258,18 +288,51 @@ export function Panel({ snap, windowHours, onWindow, onApply, saving, error, onB
       h('button', { type: 'button', className: 'is-primary', disabled: !pending.length || saving, onClick: async () => { if (await onApply(pending)) setDraft({}) } }, saving ? 'Applying…' : 'Apply')))
 }
 
+function MiniBar({ row }) {
+  const m = meter(row)
+  const total = m.total || 1
+  const seg = (key, count) => count > 0
+    ? h('span', { key, 'data-segment': key, style: { width: `${(count / total) * 100}%`, background: METER_COLORS[key] } })
+    : null
+  return h('span', {
+    className: 'hermes-lanes-mini-bar', role: 'img',
+    'aria-label': `${m.running} running, ${m.notReady} not ready, ${m.blocked} blocked on you`
+  }, seg('running', m.running), seg('notReady', m.notReady), seg('blocked', m.blocked))
+}
+
+function MiniPill({ row, onOpen }) {
+  return h('button', {
+    type: 'button', className: 'hermes-lanes-pill', 'data-lane-pill': row.name,
+    title: `${row.name}: ${row.running} running · ${row.ready} ready · ${Number(row.blocked_on_you) || 0} blocked on you · ${row.open} open`,
+    onClick: () => onOpen(row.name)
+  },
+    h('span', { className: 'hermes-lanes-dot', style: { background: row.color }, 'aria-hidden': 'true' }),
+    h('span', { className: 'hermes-lanes-pill-name' }, row.name),
+    h(MiniBar, { row }),
+    h('span', { className: 'hermes-lanes-pill-open' }, row.open))
+}
+
 export function Lanes({ ctx }) {
-  const [open, setOpen] = useState(false)
+  const [open, setOpenState] = useState(loadOpen)
+  const [focus, setFocus] = useState('')
   const [windowHours, setWindowState] = useState(loadWindow)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
+  const bodyRef = useRef(null)
   const source = useMemo(() => sourceFor(ctx), [ctx])
+  const setOpen = (value) => {
+    setOpenState((prev) => {
+      const next = typeof value === 'function' ? value(prev) : value
+      saveOpen(next)
+      return next
+    })
+  }
   const key = ['lanes', windowHours]
   const query = useQuery({
     queryKey: key,
     queryFn: () => source.read(windowHours),
-    // Closed, a slow probe: it decides whether the task pill's click opens this panel (below).
-    refetchInterval: open ? POLL_MS : IDLE_POLL_MS,
+    // Collapsed still shows counts, so poll at the live interval once lanes are configured.
+    refetchInterval: (q) => q.state.data?.configured ? POLL_MS : IDLE_POLL_MS,
     refetchIntervalInBackground: false,
     refetchOnWindowFocus: false,
     retry: false,
@@ -280,7 +343,7 @@ export function Lanes({ ctx }) {
     window.addEventListener('hermes-show-lanes', show)
     return () => window.removeEventListener('hermes-show-lanes', show)
   }, [])
-  // The task pill opens this panel only where lanes are configured and the API answers; anywhere else its
+  // The task pill expands this strip only where lanes are configured and the API answers; anywhere else its
   // click is left alone and opens the board as before.
   const working = query.data?.configured === true
   useEffect(() => {
@@ -289,6 +352,11 @@ export function Lanes({ ctx }) {
     window.addEventListener(KANBAN_CHIP_EVENT, take)
     return () => window.removeEventListener(KANBAN_CHIP_EVENT, take)
   }, [working])
+  useEffect(() => {
+    if (!open || !focus) return undefined
+    const el = (bodyRef.current || document).querySelector(laneSelector(focus))
+    el?.scrollIntoView?.({ block: 'nearest' })
+  }, [open, focus])
   // One PUT per changed lane, in order. On a failure the lanes already written stay written: refetch so the panel
   // shows them, name the lane that failed, and keep the draft so the rest can be retried.
   const apply = async (pending) => {
@@ -308,18 +376,34 @@ export function Lanes({ ctx }) {
       return false
     } finally { setSaving(false) }
   }
-  return h(Popover, { open, onOpenChange: setOpen },
-    h(PopoverTrigger, { asChild: true }, h('span', { className: 'hermes-lanes-anchor', 'data-slot': 'lanes-anchor', 'aria-hidden': 'true' })),
-    h(PopoverContent, { side: 'top', align: 'end', sticky: 'always', 'aria-label': 'Lanes', className: 'hermes-lanes-popover', style: { width: 'min(1120px, calc(100vw - 24px))', maxHeight: '76vh', overflow: 'auto' } },
+  if (!working) return null
+  const list = rows(query.data)
+  const openLane = (name) => { setFocus(name); setOpen(true) }
+  return h('div', { className: 'hermes-lanes-strip', 'data-slot': 'lanes-strip', 'data-open': open ? '1' : '0' },
+    h('div', { className: 'hermes-lanes-mini' },
+      list.map((row) => h(MiniPill, { key: row.name, row, onOpen: openLane })),
+      h('button', {
+        type: 'button', className: 'hermes-lanes-toggle', 'aria-expanded': open,
+        'aria-label': open ? 'Collapse lanes' : 'Expand lanes', onClick: () => setOpen((v) => !v)
+      }, open ? '▴' : '▾')),
+    open ? h('div', { ref: bodyRef, className: 'hermes-lanes-body', style: { maxHeight: '60vh', overflow: 'auto' } },
       h(Panel, {
         snap: query.data, windowHours, saving, error: error || (query.error ? String(query.error.message).slice(0, 200) : ''),
         onWindow: (v) => { setWindowState(v); saveWindow(v) }, onApply: apply,
         onBoard: () => { setOpen(false); host.navigate('/kanban') }
-      })))
+      })) : null)
 }
 
 const CSS = `
-.hermes-lanes-anchor{display:inline-block;width:0;height:100%}
+.hermes-lanes-strip{display:flex;flex-direction:column;min-width:0;width:100%}
+.hermes-lanes-mini{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:4px 8px;min-height:28px}
+.hermes-lanes-pill{display:inline-flex;align-items:center;gap:6px;height:22px;padding:0 8px;border:1px solid var(--ui-stroke-secondary);border-radius:999px;background:transparent;color:inherit;font:inherit;cursor:pointer}
+.hermes-lanes-pill-name{font-weight:600;font-size:12px}
+.hermes-lanes-pill-open{font-variant-numeric:tabular-nums;font-size:11px;color:var(--ui-text-tertiary)}
+.hermes-lanes-mini-bar{display:inline-flex;width:28px;height:6px;border-radius:3px;overflow:hidden;background:var(--ui-stroke-secondary);flex:none}
+.hermes-lanes-mini-bar>span{height:100%;display:block;min-width:0}
+.hermes-lanes-toggle{margin-left:auto;height:22px;padding:0 8px;border:1px solid var(--ui-stroke-secondary);border-radius:6px;background:transparent;color:inherit;font:inherit;cursor:pointer}
+.hermes-lanes-body{max-height:60vh;overflow:auto}
 .hermes-lanes{display:flex;flex-direction:column;gap:8px;font-size:12px;padding:6px}
 .hermes-lanes-head,.hermes-lanes-foot{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 .hermes-lanes-head strong{font-size:14px}
@@ -355,13 +439,13 @@ const CSS = `
 export default {
   id: 'lanes',
   name: 'Lanes',
-  description: 'Panel: the split of worker time between project lanes, backlog, throughput and cost, with volume controls.',
+  description: 'Top strip: the split of worker time between project lanes, backlog, throughput and cost, with volume controls.',
   register(ctx) {
     const style = document.createElement('style')
     style.textContent = CSS
     document.head.append(style)
     ctx.onDispose(() => style.remove())
-    ctx.register({ id: 'anchor', area: STATUSBAR_AREAS.right, order: 80.5, render: () => h(Lanes, { ctx }) })  // beside the task pill (order 80)
+    ctx.register({ id: 'strip', area: TOP_STRIP_AREA, order: 10, render: () => h(Lanes, { ctx }) })
     ctx.register({
       id: 'show-lanes',
       area: PALETTE_AREA,
