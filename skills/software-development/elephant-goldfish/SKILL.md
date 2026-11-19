@@ -187,6 +187,7 @@ untouched.
 - Before adding a busy-chat workload to an existing replay, trace custody deferral before assuming it creates a buffered claim, and trace every existing latency oracle and shared fixture consumer. A waking sibling can prevent the very claim the test intends to measure; blocking one chat also delays the original alternating notice stream, not only newly injected events. Require explicit reachable fixture ordering and separate eligibility accounting without weakening baseline acceptance.
 - Paths are part of the prompt: a directory named `flawed/`, `expected/` or `mismatch/` tells the reviewer what
   to find. Keep spec, fixture and source paths neutral.
+- For read-only caches that "borrow" another owner's journal anchor/certificate, check the anchor's revision equals the cache's retained base revision. An anchor proves lineage only at its own revision; advancing a delta base past it reduces safety to stat fences (fork/restore between anchor and base). Require base advance only at anchored revisions. Likewise, when a delta path keeps "private previous output", check whether a shared global (e.g. a last-result written by strict callers too) is the literal carry authority; bind to its identity or fall back.
 - "Read-only" is an instruction, not enforcement: reviewers may execute source to probe behavior (useful
   evidence) and leave caches such as `__pycache__/`. Run `git status` on the source after the review and record
   anything they created.
