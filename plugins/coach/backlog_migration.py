@@ -86,6 +86,7 @@ def migrate_digest_backlog(sh, store, inventory=None, prunes=None, dry_run=True,
         "pruned": [],
         "history_retained": [],
         "excluded_resolved": [],
+        "other_kinds": [],
         "skipped_comments": 0,
         "preserved_pending_keys": list(existing_keys),
         "imported_comment_ids": [],
@@ -125,7 +126,12 @@ def migrate_digest_backlog(sh, store, inventory=None, prunes=None, dry_run=True,
                 if detection.get("component") and detection.get("symptom"):
                     detection = sh.canonicalize(detection)
                 disposition = None
-                if forms & pruned:
+                if detection.get("kind") not in (None, "defect"):
+                    # Source card/comment stays the historical evidence owner.
+                    # Receipts/backports must never become defect investigations.
+                    disposition = "other_kind"
+                    report["other_kinds"].append(fp)
+                elif forms & pruned:
                     disposition = "pruned"
                     report["pruned"].append(fp)
                 else:
@@ -242,7 +248,11 @@ def parse_digest_comment_blocks(sh, body: str) -> list:
         start = m.start()
         end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
         chunk = text[start:end]
-        blocks.append(_parse_occurrence_chunk(sh, chunk, m.group(1)))
+        detection = _parse_occurrence_chunk(sh, chunk, m.group(1))
+        prefix = text[matches[i - 1].end() if i else 0:start]
+        kinds = re.findall(r"(?m)^Over the daily cap [^\n]*not filed \(([^)]+)\):\s*$", prefix)
+        detection["kind"] = kinds[-1] if kinds else None
+        blocks.append(detection)
     return blocks
 
 
@@ -482,13 +492,20 @@ def _read_provenance(sh, store) -> set:
 
 
 def _sqlite_backup(src: Path, dest: Path) -> None:
+    import os
     dest.parent.mkdir(parents=True, exist_ok=True)
+    temp = dest.with_name(dest.name + "." + uuid.uuid4().hex + ".tmp")
     s = sqlite3.connect(src)
     try:
-        d = sqlite3.connect(dest)
+        d = sqlite3.connect(temp)
         try:
             s.backup(d)
         finally:
             d.close()
+        with temp.open("rb") as handle:
+            os.fsync(handle.fileno())
+        # Publish only a complete snapshot, without replacing an existing backup.
+        os.link(temp, dest)
     finally:
         s.close()
+        temp.unlink(missing_ok=True)
