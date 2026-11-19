@@ -65,8 +65,8 @@ branch, check the pinned branch back out, and carry on in a worktree.
 `scripts/wait_for_ci.py` (in this skill's dir). Run it from inside the repo checkout; it needs `git` and an authenticated `gh`.
 From any other directory, `--gh-repo OWNER/NAME` uses that repo's `~/code/<name>` checkout (exact `origin` match) and exits 1 (`not a git checkout`) without one: pass
 `--repo <checkout>` too (hub state PRs: `~/.hermes/repos/hermes-state`, or a scratch `git clone --bare --single-branch --branch <b>`, which the script accepts), or pin the run (`--run-id RUN --head-sha SHA`).
-A linked worktree is a fine `--repo` in both modes: the shas resolve there (exact-run mode has none), then the wait
-polls from its main checkout, so removing the PR worktree mid-wait no longer kills the waiter.
+A linked worktree is a fine `--repo` (removing it mid-wait is safe), never the live `~/.hermes/hermes-agent`:
+fetching into it can repack the tree every backend runs from; use a scratch bare clone.
 
 ```bash
 S=<this skill dir>/scripts/wait_for_ci.py
