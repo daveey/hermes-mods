@@ -55,6 +55,11 @@ ambiguous acceptance tolerance, test a stricter sufficient bound without redefin
 Before filing a physical/on-device/sign-in ask, read `references/physical-asks.md`: search all boards and
 relevant gateways for the same device + evidence, reuse its owner, and require `resolved_check` for readable
 build/file/waiter prerequisites. Expired flows wake their owner to refresh the same ask, never imply consent.
+A console-only step behind the user's own re-auth (password, passkey, emailed sudo code), such as editing a GitHub
+App's permissions or creating an App (no REST API: the manifest flow needs a browser), goes to the user as direct
+URLs with the exact field values to set in their own browser. Verify the result through the API afterwards. Do not
+drive the auth flow in an agent-held pane or tab: they have to authenticate in person regardless, and the user
+prefers one link list to a series of half-automated retries.
 A report relaying another surface's ask is status, not a new request: name its owning card/surface and do not
 republish it as an imperative, action_request or For-you choice in the reporting chat.
 A future or conditional step ("when the build is ready you'll get one ask: ...") is a plain sentence, never a
