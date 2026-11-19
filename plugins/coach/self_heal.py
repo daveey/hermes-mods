@@ -669,7 +669,9 @@ def guard_refusal_signal(tool_name: str, args=None, result=None) -> Optional[dic
                "too tight; add a core regression test for this shape.")
     sym = f"lifecycle guard fail-closed refusal ({shape})"
     return {"p_defect": 0.9, "kind": "guard_refusal", "component": "gateway", "symptom": sym,
-            "fingerprint": GUARD_FP_PREFIX + hashlib.sha1(shape.encode()).hexdigest()[:12], "source": "signal",
+            "fingerprint": GUARD_FP, "source": "signal",  # the shape is evidence: one defect for every sub-type
+            "canon_fingerprint": GUARD_FP, "raw_fingerprint": GUARD_FP_PREFIX + hashlib.sha1(shape.encode()).hexdigest()[:12],
+            "canon_key": "lifecycle-guard:gateway",
             "shape": shape, "tool": tool_name, "evidence": f"{tool_name or 'tool'}: {reason[:240]}",
             "details": details, "every_occurrence": True, "comment_open_card": True}
 
@@ -1099,6 +1101,63 @@ def fingerprint(component: str, symptom: str) -> str:
     comp = component if component in COMPONENTS else "other"
     key = comp + ":" + " ".join(stems)
     return comp + "-" + hashlib.sha1(key.encode()).hexdigest()[:10]
+
+
+# Canonical keys for machine signals. A signal's symptom (and the fingerprint its collector computed) carries the
+# varying payload: the reply quote a coach re-check failed on, a cron job's stderr, the guard's refusal sub-type, an
+# exception's message. Over 6 days to 2026-11-19, 284 detections made 279 fingerprints (53 for report_only alone),
+# so every occurrence filed its own card. Each rule keeps only the stable part; the full text stays in the card's
+# evidence and in the occurrence comments. In-chat judges (complaint/admission/backstop) write free prose that could
+# start with these words, so the rules apply to `source == "signal"` only. The producers apply them (signals.to_defect
+# for every collector signal, guard_refusal_signal); `_file_defect` files under the fingerprint it is handed, and
+# retry_deferred folds pending rows queued under old ids (fold_pending_keys).
+GUARD_FP = GUARD_FP_PREFIX + hashlib.sha1(b"fail-closed").hexdigest()[:12]  # every fail-closed sub-type: one defect
+CANON_RULES = (  # (rule, symptom regex, stable parts of the match)
+    ("coach-recheck", re.compile(r"^agent's revised reply still failed the coach (\S+) check\b"), (1,)),
+    ("coach-no-outcome", re.compile(r"^coach (\S+) nudge got no outcome\b"), (1,)),
+    ("coach-template-hold", re.compile(r"^coach (\S+) held \d+ repl\w* whose user turn has the same opening text\b"),
+     (1,)),
+    ("cron-failed", re.compile(r"^cron job '(.+?)' failed on \S+?:"), (1,)),  # the job name; host and stderr dropped
+    ("lifecycle-guard", re.compile(r"^lifecycle guard fail-closed refusal\b"), ()),
+    ("exception", re.compile(r"^(?:[A-Za-z_]\w*\.)*([A-Z]\w*) in ([A-Za-z_]\w*) \(([\w./-]+\.py)\)(?: \[([^\]]+)\])?"),
+     (1, 2, 3, 4)),  # type, function, file, plugin tag; the message is payload
+)  # "turn interrupted ..." symptoms are fixed strings already, one per stop cause on purpose (with_stop_cause)
+
+
+def canonical_key(component: str, symptom: str, source: str = "signal") -> Optional[str]:
+    """The stable key of a machine signal (`<rule>:<comp>:<parts>`), or None when no rule matches."""
+    if (source or "signal") != "signal":
+        return None
+    comp = component if component in COMPONENTS else "other"
+    for rule, rx, groups in CANON_RULES:
+        m = rx.match(str(symptom or "").strip())
+        if m:
+            return ":".join([rule, comp] + [m.group(g) or "" for g in groups])
+    return None
+
+
+def canonical_fingerprint(component: str, symptom: str, source: str = "signal") -> Optional[str]:
+    key = canonical_key(component, symptom, source)
+    if key is None:
+        return None
+    if key.startswith("lifecycle-guard:"):
+        return GUARD_FP
+    comp = component if component in COMPONENTS else "other"
+    return comp + "-" + hashlib.sha1(("canon\0" + key).encode()).hexdigest()[:10]
+
+
+def canonicalize(d: dict) -> dict:
+    """``d`` with its fingerprint replaced by the canonical one when a rule matches. The collector's own id stays in
+    `raw_fingerprint` (rechecks and legacy rebuilds compare against it) and the key in `canon_key`. A SQLite
+    corruption incident keeps its own per-(db, host, hour) id (:func:`corruption_incident`)."""
+    if d.get("incident"):
+        return d
+    canon = canonical_fingerprint(d.get("component") or "other", d.get("symptom") or "", d.get("source") or "")
+    raw = d.get("fingerprint") or fingerprint(d.get("component") or "other", d.get("symptom") or "")
+    if not canon or canon == raw:
+        return d if d.get("fingerprint") else {**d, "fingerprint": raw}
+    return {**d, "fingerprint": canon, "canon_fingerprint": canon, "raw_fingerprint": d.get("raw_fingerprint") or raw,
+            "canon_key": canonical_key(d.get("component") or "other", d.get("symptom") or "", d.get("source") or "")}
 
 
 def _json_objects(raw: str):
@@ -3081,6 +3140,101 @@ def _pending_db(store):
     return db
 
 
+PENDING_OCCURRENCES_MAX = 20  # occurrences one pending row keeps (the newest); the count keeps growing
+FOLD_MARK = "Occurrences folded into this detection"
+
+
+def _occurrence(d: dict) -> dict:
+    return {"at": _detected_at(d), "session_id": d.get("session_id") or None, "host": d.get("host"),
+            "fingerprint": d.get("raw_fingerprint") or d.get("fingerprint"), "symptom": str(d.get("symptom") or "")[:200],
+            "evidence": str(d.get("quote") or d.get("evidence") or "")[:200]}
+
+
+def _occ_key(o: dict) -> tuple:
+    return (o.get("at"), o.get("session_id"), o.get("fingerprint"), o.get("symptom"))
+
+
+def fold_payloads(old: dict, new: dict, why: str = "", keep_old: bool = False) -> dict:
+    """One pending row for one defect: the newer payload (its evidence and recheck are the freshest) plus every
+    earlier occurrence, listed in `occurrences` and in `details` so the card that finally files shows them all.
+    ``keep_old``: ``old`` leads whatever its age (a duplicate-check fold: the row keeps its own identity)."""
+    a, b = (new, old) if keep_old else (
+        (old, new) if (_detected_at(old) or 0) <= (_detected_at(new) or 0) else (new, old))
+    oa, ob = list(a.get("occurrences") or [_occurrence(a)]), list(b.get("occurrences") or [_occurrence(b)])
+    if not why and {_occ_key(o) for o in oa} <= {_occ_key(o) for o in ob}:
+        return {**b, "fingerprint": (old if keep_old else new).get("fingerprint") or b.get("fingerprint")}  # re-deferred
+    overlap = len({_occ_key(o) for o in oa} & {_occ_key(o) for o in ob})
+    count = (int(a.get("occurrence_count") or len(oa)) + int(b.get("occurrence_count") or len(ob)) - overlap)
+    merged = list({_occ_key(o): o for o in sorted(oa + ob, key=lambda o: o.get("at") or 0)}.values())
+    out = {**b, "fingerprint": (old if keep_old else new).get("fingerprint") or b.get("fingerprint"),
+           "occurrences": merged[-PENDING_OCCURRENCES_MAX:], "occurrence_count": max(count, len(merged))}
+    reasons = list(a.get("merge_reasons") or []) + list(b.get("merge_reasons") or []) + ([why] if why else [])
+    if reasons:
+        out["merge_reasons"] = list(dict.fromkeys(reasons))[-PENDING_OCCURRENCES_MAX:]
+    base = str(b.get("details") or "").split(FOLD_MARK, 1)[0].rstrip()
+    if len(merged) > 1:
+        lines = "".join(f"\n- {_iso(o['at']) if o.get('at') else '?'} · host {o.get('host') or '?'} · session "
+                        f"{o.get('session_id') or 'none'} · {o.get('symptom') or '?'}" for o in merged[-10:])
+        out["details"] = (base + f"\n\n{FOLD_MARK} ({out['occurrence_count']} in all, newest 10):" + lines)[-3000:]
+    return out
+
+
+def fold_pending_keys(store) -> list:
+    """Merge pending rows that share a defect: rows queued under old (payload-bearing) fingerprints whose canonical key
+    is shared with another row fold into one row under that key. A lone row keeps its id. -> [{from, into}]."""
+    import uuid
+    if not (Path(store.root) / "selfheal_pending.sqlite").exists():
+        return []
+    db = _pending_db(store)
+    moved = []
+    try:
+        with db:
+            rows = db.execute("SELECT fp, payload, retry FROM pending ORDER BY rowid").fetchall()
+            live = {fp: (json.loads(p), r) for fp, p, r in rows}
+            canon = {fp: canonicalize({**d, "fingerprint": d.get("fingerprint") or fp})["fingerprint"]
+                     for fp, (d, _) in live.items()}
+            groups: dict = {}
+            for fp, c in canon.items():
+                groups.setdefault(c, []).append(fp)
+            for fp, payload, retry in rows:
+                into = canon[fp]
+                if fp not in live or into == fp or len(groups[into]) < 2:
+                    continue  # a lone row keeps its id (its lane, rechecks and withdrawals name it)
+                c = canonicalize({**live[fp][0], "fingerprint": live[fp][0].get("fingerprint") or fp})
+                if into in live:
+                    merged, r2 = fold_payloads(live[into][0], c), min(retry, live[into][1])
+                else:
+                    merged, r2 = c, retry
+                db.execute("DELETE FROM pending WHERE fp=?", (fp,))
+                db.execute("INSERT INTO pending VALUES (?, ?, ?, ?) ON CONFLICT(fp) DO UPDATE SET "
+                           "payload=excluded.payload, retry=excluded.retry, version=excluded.version",
+                           (into, json.dumps(merged), r2, uuid.uuid4().hex))
+                live.pop(fp)
+                live[into] = (merged, r2)
+                moved.append({"from": fp, "into": into})
+    finally:
+        db.close()
+    for mv in moved:
+        store.log({"event": "selfheal_pending_folded", "fingerprint": mv["from"], "into": mv["into"], "why": "same key"})
+    return moved
+
+
+def fold_into_pending(store, into: str, d: dict, why: str) -> bool:
+    """Fold detection ``d`` into the pending row ``into`` (a duplicate-check verdict). False when that row is gone."""
+    db = _pending_db(store)
+    try:
+        with db:
+            row = db.execute("SELECT payload FROM pending WHERE fp=?", (into,)).fetchone()
+            if not row:
+                return False
+            import uuid  # a new version: a retry pass that loaded the row before this fold must not erase it
+            db.execute("UPDATE pending SET payload=?, version=? WHERE fp=?",
+                       (json.dumps(fold_payloads(json.loads(row[0]), d, why, keep_old=True)), uuid.uuid4().hex, into))
+            return True
+    finally:
+        db.close()
+
+
 def _defer_investigation(d: dict, result: dict, store):
     """Persist before acknowledging a denial; all producers may advance their cursors afterward."""
     import datetime
@@ -3089,9 +3243,11 @@ def _defer_investigation(d: dict, result: dict, store):
     db = _pending_db(store)
     try:
         with db:
+            row = db.execute("SELECT payload FROM pending WHERE fp=?", (d["fingerprint"],)).fetchone()
+            payload = fold_payloads(json.loads(row[0]), d) if row else d
             db.execute("INSERT INTO pending VALUES (?, ?, ?, ?) ON CONFLICT(fp) DO UPDATE SET "
                        "payload=excluded.payload, retry=excluded.retry, version=excluded.version",
-                       (d["fingerprint"], json.dumps(d), retry, uuid.uuid4().hex))
+                       (d["fingerprint"], json.dumps(payload), retry, uuid.uuid4().hex))
     finally:
         db.close()
     store.log({"event": "selfheal_deferred", "fingerprint": d["fingerprint"], **result})
@@ -3425,6 +3581,10 @@ def retry_deferred(store=None, now: Optional[float] = None, filer=None) -> list:
     now = now or time.time()
     if not (Path(store.root) / "selfheal_pending.sqlite").exists():
         return []
+    try:
+        fold_pending_keys(store)
+    except Exception as exc:  # health: allow BLE001 -- folding is advisory; the filing dedupe still holds
+        store.log({"event": "selfheal_pending_fold_error", "error": str(exc)[:200]})
     db = _pending_db(store)
     out = []
     recheck_cache: dict = {}
@@ -5188,6 +5348,266 @@ def open_owner(fp: str, board: Optional[str], exclude=(), home: Optional[Path] =
     return None
 
 
+_EVIDENCE_RE = re.compile(r"^- Symptom: (?P<symptom>.*)\n- Component: (?P<component>[\w-]+) · detector: "
+                          r"(?P<source>[\w-]+)", re.M)
+_FP_LINE_RE = re.compile(r"(?m)^fingerprint: ([a-z]+-[0-9a-f]{8,})[ \t]*$")
+
+
+def open_selfheal_cards(board: Optional[str], exclude=(), home: Optional[Path] = None) -> list:
+    """Every OPEN self-heal card on the target board whose body carries the detector evidence block, oldest first:
+    [{id, status, key, title, symptom, component, source, fingerprint}]. Deploy-kind cards (one host's missing fix)
+    and the digest are not defect owners. A board without a DB has none; an unreadable one raises sqlite3.Error."""
+    path = board_db_path(board, home)
+    if path is None or not path.exists():
+        return []
+    con = _ro_state(path)
+    try:
+        cols = {c[1] for c in con.execute("PRAGMA table_info(tasks)")}
+        if not {"body", "created_by"} <= cols:
+            return []
+        key = "idempotency_key" if "idempotency_key" in cols else "NULL"
+        order = "created_at, id" if "created_at" in cols else "id"
+        rows = con.execute(f"SELECT id, status, {key}, title, body FROM tasks WHERE created_by = ? "
+                           f"AND status NOT IN ('done', 'archived') ORDER BY {order}", (CREATED_BY,)).fetchall()
+    finally:
+        con.close()
+    out = []
+    skip = set(exclude or ())
+    for tid, status, k, title, body in rows:
+        if tid in skip or _DEPLOY_KIND_RE.search(str(k or "")) or str(k or "").startswith(DIGEST_KEY):
+            continue
+        m = _EVIDENCE_RE.search(body or "")
+        if not m:
+            continue
+        line = _FP_LINE_RE.search(body or "")
+        comp = m.group("component").strip().lower()
+        out.append({"id": tid, "status": status, "key": k, "title": title, "symptom": m.group("symptom").strip(),
+                    "component": comp if comp in COMPONENTS else "other", "source": m.group("source"),
+                    "fingerprint": line.group(1) if line else None})
+    return out
+
+
+def canonical_owner(fp: str, board: Optional[str], exclude=(), home: Optional[Path] = None) -> Optional[dict]:
+    """The oldest open self-heal card whose own evidence (component, symptom, detector) canonicalizes to ``fp``: a
+    defect filed before canonical keys, under its payload-bearing fingerprint. -> open_owner's shape, via canonical."""
+    for c in open_selfheal_cards(board, exclude, home):
+        if canonical_fingerprint(c["component"], c["symptom"], c["source"]) == fp:
+            return {"id": c["id"], "status": c["status"], "key": c["key"], "title": c["title"], "via": "canonical"}
+    return None
+
+
+# Duplicate check: a detection whose key matches no open owner goes to one cheap-model call that compares it with the
+# open self-heal cards and pending rows of the same component. In-chat complaints are reworded by the judge every
+# time, so no key can join them; this is what does. It merges only at DUPE_CONFIDENCE within one component; "new",
+# lower confidence, an unknown id, an error or a timeout file normally (the daily cap still applies).
+DUPE_TASK = "coach_selfheal_dupe"  # aux task name (call_llm fallback; auxiliary.coach_selfheal_dupe.model overrides)
+DUPE_MODEL = "claude-haiku-5-5"
+DUPE_CONFIDENCE = 0.85
+DUPE_TIMEOUT_S = 30  # it runs under the admission lock: a slow model holds the lane, so fail fast and file
+DUPE_MAX_CANDIDATES = 30  # per kind (open cards, pending rows), newest first
+DUPE_STATE = "selfheal-dupecheck.json"  # <coach>/: {fp: {same|checked, at}}: one call per new candidate, not per pass
+DUPE_MEMO_S = 3 * 86400
+DUPE_SYS = """You deduplicate defect reports for the self-heal lane of an AI agent system ("Hermes"). Each report is a
+short symptom line a detector or a judge wrote. Decide whether the NEW report is the same defect as one of the
+listed OPEN reports: the same broken behaviour in the same place, one that a single fix would resolve. Reports of
+one defect often differ in wording, quoted text, session, host, ids, counts and timestamps; that does not make them
+different. Different rules, checks, jobs, functions, tools or failure modes are different defects, even when the
+words overlap. When unsure, answer new.
+
+Reply with ONE JSON object and nothing else:
+{"verdict": "same" | "new", "id": "<the matching report's id, empty for new>", "confidence": <0.0-1.0>,
+ "reason": "<one sentence>"}"""
+
+
+def dupe_check_enabled(cfg: Optional[dict] = None) -> bool:
+    """`dupe_check` in selfheal-config.json (default on); env COACH_SELFHEAL_DUPE_CHECK=0/1 overrides."""
+    env = os.environ.get("COACH_SELFHEAL_DUPE_CHECK", "").strip().lower()
+    if env:
+        return env not in ("0", "false", "off", "no")
+    return bool((lane_config() if cfg is None else cfg).get("dupe_check", True))
+
+
+def dupe_model() -> tuple:
+    """(provider, model): env COACH_SELFHEAL_DUPE_MODEL/_PROVIDER, else auxiliary.coach_selfheal_dupe, else
+    anthropic DUPE_MODEL (a Haiku-class model the subscription pool serves)."""
+    model = os.environ.get("COACH_SELFHEAL_DUPE_MODEL", "")
+    provider = os.environ.get("COACH_SELFHEAL_DUPE_PROVIDER", "")
+    if not model:
+        try:
+            from hermes_cli.config import load_config  # type: ignore
+            c = (load_config().get("auxiliary") or {}).get(DUPE_TASK) or {}
+            model, provider = c.get("model") or "", c.get("provider") or ""
+        except Exception:
+            pass
+    return (provider or "anthropic"), (model or DUPE_MODEL)
+
+
+def dupe_judge() -> Callable[[str, str], str]:
+    """The duplicate-check model call: the subscription pool (`plugins/pool-llm/bin/hermes-pool-llm ask`) first, then
+    core call_llm under task DUPE_TASK. A pool timeout raises (no second wait); a pool failure falls back."""
+    def judge(system: str, prompt: str) -> str:
+        import subprocess
+        provider, model = dupe_model()
+        _MODEL_TL.model = model
+        pool = hermes_home() / "plugins" / "pool-llm" / "bin" / "hermes-pool-llm"
+        if pool.exists():
+            r = subprocess.run([str(pool), "ask", "--provider", provider, "--model", model, "--system", system,
+                                "--max-tokens", "800", "-"], input=prompt, capture_output=True, text=True,
+                               timeout=DUPE_TIMEOUT_S)
+            if r.returncode == 0 and r.stdout.strip():
+                return r.stdout.strip()
+        from agent.auxiliary_client import call_llm  # type: ignore
+        resp = call_llm(task=DUPE_TASK, provider=provider, model=model,
+                        messages=[{"role": "system", "content": system}, {"role": "user", "content": prompt}],
+                        max_tokens=800, temperature=0, timeout=DUPE_TIMEOUT_S)
+        return (getattr(resp.choices[0].message, "content", None) or "").strip()
+    return judge
+
+
+def _pending_candidates(store, comp: str, skip: set) -> list:
+    if not (Path(store.root) / "selfheal_pending.sqlite").exists():
+        return []
+    db = _pending_db(store)
+    try:
+        rows = db.execute("SELECT fp, payload FROM pending").fetchall()
+    finally:
+        db.close()
+    out = []
+    for pfp, payload in rows:
+        try:
+            p = json.loads(payload)
+        except ValueError:
+            continue
+        pc = p.get("component") if p.get("component") in COMPONENTS else "other"
+        if pfp in skip or pc != comp:
+            continue
+        out.append({"id": pfp, "kind": "pending", "symptom": str(p.get("symptom") or "")[:240],
+                    "at": _detected_at(p) or 0})
+    return sorted(out, key=lambda c: -c["at"])[:DUPE_MAX_CANDIDATES]
+
+
+def dupe_candidates(d: dict, fp: str, board: Optional[str], store) -> list:
+    """Open self-heal cards and pending rows in ``d``'s component, never ``d``'s own fingerprints:
+    [{id, kind: card|pending, symptom, ...}], newest first within each kind."""
+    comp = d.get("component") if d.get("component") in COMPONENTS else "other"
+    skip = {fp, d.get("raw_fingerprint"), d.get("canon_fingerprint")} - {None}
+    cards = [{"id": c["id"], "kind": "card", "symptom": c["symptom"][:240], "status": c["status"], "key": c["key"],
+              "title": c["title"]}
+             for c in open_selfheal_cards(board, exclude=[d.get("filed_by")] if d.get("filed_by") else ())
+             if c["component"] == comp and c.get("fingerprint") not in skip]
+    return cards[-DUPE_MAX_CANDIDATES:][::-1] + _pending_candidates(store, comp, skip)
+
+
+def dupe_prompt(d: dict, cands: list) -> str:
+    ev = str(d.get("quote") or d.get("evidence") or "").strip()
+    lines = "\n".join(f"- id {c['id']} ({'open card' if c['kind'] == 'card' else 'queued, not filed yet'}): "
+                      f"{c['symptom']}" for c in cands)
+    return (f"NEW report (component {d.get('component') or 'other'}, detector {d.get('source') or '?'}):\n"
+            f"- symptom: {str(d.get('symptom') or '?')[:300]}\n"
+            + (f"- evidence: {ev[:300]}\n" if ev else "")
+            + f"\nOPEN reports in the same component:\n{lines}\n")
+
+
+def dupe_verdict(raw: str) -> Optional[dict]:
+    v = next((o for o in _json_objects(raw) if "verdict" in o), None)
+    if v is None:
+        return None
+    try:
+        return {"verdict": str(v.get("verdict") or "").strip().lower(), "id": str(v.get("id") or "").strip(),
+                "confidence": max(0.0, min(1.0, float(v.get("confidence") or 0))),
+                "reason": " ".join(str(v.get("reason") or "").split())[:300]}
+    except (TypeError, ValueError):
+        return None
+
+
+def _save_dupe_state(store, memo_all: dict) -> None:
+    try:
+        _save_json_state(store, DUPE_STATE, memo_all)
+    except OSError as exc:  # the verdict still stands this pass; only the reuse memo is lost
+        store.log({"event": "selfheal_dupe_check_state_error", "error": str(exc)[:200]})
+
+
+def _dupe_check(d: dict, fp: str, board: Optional[str], store, runner, now: float,
+                cfg: Optional[dict] = None) -> Optional[dict]:
+    """One cheap-model call for a detection with no open owner by key (see DUPE_SYS). A same-as-<card> verdict at
+    DUPE_CONFIDENCE becomes an occurrence comment on that card through _dedupe_open_owner (DEDUP_MAX_PER_DAY holds);
+    same-as-<pending row> folds into that row. Every verdict is logged (`selfheal_dupe_check`). -> skip result | None."""
+    if not dupe_check_enabled(cfg) or d.get("incident") or d.get("filed_by"):
+        return None  # an incident has its own identity and adoption rules; a hand re-file is deliberate
+    rec = {"event": "selfheal_dupe_check", "fingerprint": fp, "component": d.get("component"),
+           "source": d.get("source"), "symptom": str(d.get("symptom") or "")[:200], "board": board}
+    try:
+        cands = dupe_candidates(d, fp, board, store)
+    except Exception as exc:  # health: allow BLE001 -- an unreadable board/queue files normally (cap still holds)
+        store.log({**rec, "verdict": "error", "error": f"candidates: {exc}"[:200]})
+        return None
+    memo_all = {k: v for k, v in _json_state(store, DUPE_STATE).items()
+                if now - float((v or {}).get("at") or 0) < DUPE_MEMO_S}
+    memo = memo_all.get(fp) or {}
+    by_id = {c["id"]: c for c in cands}
+    if memo.get("same") in by_id:  # an earlier verdict merged this fingerprint into a still-open target
+        store.log({**rec, "verdict": "same", "id": memo["same"], "cached": True, "reason": memo.get("reason")})
+        return _dupe_merge(d, fp, by_id[memo["same"]], board, store, runner, now, memo.get("reason") or "",
+                           float(memo.get("confidence") or DUPE_CONFIDENCE), memo.get("model") or "")
+    checked = set(memo.get("checked") or [])
+    todo = [c for c in cands if c["id"] not in checked]
+    if not todo:
+        store.log({**rec, "verdict": "new", "cached": bool(cands), "candidates": 0,
+                   "why": "no candidates" if not cands else "every candidate already judged"})
+        return None
+    _MODEL_TL.model = None
+    t0 = time.time()
+    try:
+        raw = dupe_judge()(DUPE_SYS, dupe_prompt(d, todo))
+        v = dupe_verdict(raw)
+    except Exception as exc:  # health: allow BLE001 -- model error or timeout: file normally (cap still holds)
+        store.log({**rec, "verdict": "error", "candidates": len(todo), "error": f"{type(exc).__name__}: {exc}"[:200],
+                   "secs": round(time.time() - t0, 1)})
+        return None
+    model = getattr(_MODEL_TL, "model", None) or ""
+    rec.update(candidates=len(todo), model=model, secs=round(time.time() - t0, 1))
+    if v is None:
+        store.log({**rec, "verdict": "error", "error": "unparsable answer", "raw": str(raw)[:200]})
+        return None
+    target = by_id.get(v["id"]) if v["verdict"] == "same" else None
+    rec.update(verdict=v["verdict"], id=v["id"] or None, confidence=v["confidence"], reason=v["reason"])
+    if target is not None and v["confidence"] >= DUPE_CONFIDENCE:
+        memo_all[fp] = {"same": target["id"], "at": now, "reason": v["reason"], "confidence": v["confidence"],
+                        "model": model}
+        _save_dupe_state(store, memo_all)
+        store.log({**rec, "merge": True})
+        return _dupe_merge(d, fp, target, board, store, runner, now, v["reason"], v["confidence"], model)
+    why = ("new" if v["verdict"] != "same" else "unknown id" if target is None else
+           f"confidence {v['confidence']:.2f} < {DUPE_CONFIDENCE}")
+    memo_all[fp] = {"checked": sorted(checked | {c["id"] for c in todo})[-200:], "at": now}
+    _save_dupe_state(store, memo_all)
+    store.log({**rec, "merge": False, "why": why})
+    return None
+
+
+def _dupe_merge(d: dict, fp: str, target: dict, board: Optional[str], store, runner, now: float, reason: str,
+                confidence: float, model: str) -> Optional[dict]:
+    try:
+        return _dupe_merge_into(d, fp, target, board, store, runner, now, reason, confidence, model)
+    except Exception as exc:  # health: allow BLE001 -- a failed merge files normally (the daily cap still holds)
+        store.log({"event": "selfheal_dupe_check", "fingerprint": fp, "verdict": "error", "id": target.get("id"),
+                   "error": f"merge: {type(exc).__name__}: {exc}"[:200]})
+        return None
+
+
+def _dupe_merge_into(d: dict, fp: str, target: dict, board: Optional[str], store, runner, now: float, reason: str,
+                     confidence: float, model: str) -> Optional[dict]:
+    why = f"duplicate check ({model or 'model'}, confidence {confidence:.2f}): {reason}"
+    if target["kind"] == "card":
+        owner = {"id": target["id"], "status": target.get("status"), "key": target.get("key"),
+                 "title": target.get("title"), "via": "dupe-check"}
+        return _dedupe_open_owner(d, fp, board, store, runner, now, owner=owner, reason=why)
+    if fold_into_pending(store, target["id"], d, f"{fp}: {why}"):
+        store.log({"event": "selfheal_pending_folded", "fingerprint": fp, "into": target["id"], "why": why[:300]})
+        return {"action": "skip", "why": f"duplicate of pending {target['id']}", "dedup": True, "folded": target["id"]}
+    return None
+
+
 def cards_created_today(board: Optional[str], now: float, home: Optional[Path] = None) -> int:
     """Cards created_by self-heal on the target board since 00:00Z of ``now``'s UTC day, the day's digest card
     excluded. A board without a DB has none; an unreadable one raises sqlite3.Error."""
@@ -5224,16 +5644,25 @@ def _occurrence_text(d: dict, now: float, limit: int = 600) -> str:
             f"- evidence: {ev[:limit] if ev else '(none; the lane log has the detection: selfheal_detect ' + d['fingerprint'] + ')'}")
 
 
-def _dedupe_open_owner(d: dict, fp: str, board: Optional[str], store, runner, now: float) -> Optional[dict]:
+def _dedupe_open_owner(d: dict, fp: str, board: Optional[str], store, runner, now: float,
+                       owner: Optional[dict] = None, reason: str = "") -> Optional[dict]:
     """Filing dedupe: an open owner of ``fp`` on the target board takes this occurrence as a comment, and nothing is
-    filed (`selfheal_dedup_commented`). The same owner is commented again only from a new session or after
-    DEDUP_COMMENT_S (`selfheal_dedup_held` otherwise), so a detector that re-fires every pass cannot flood it.
-    A hand re-file's own card (`filed_by`) is never its owner. -> the skip result, or None to file."""
-    try:
-        owner = open_owner(fp, board, exclude=[d.get("filed_by")] if d.get("filed_by") else ())
-    except Exception as exc:  # health: allow BLE001 -- a failed lookup must not stop filing; the daily cap still holds
-        store.log({"event": "selfheal_dedup_error", "fingerprint": fp, "board": board, "error": str(exc)[:200]})
-        return None
+    filed (`selfheal_dedup_commented`). The owner is the card keyed/lined with ``fp``, else with the detection's raw
+    (pre-canonical) fingerprint, else an open self-heal card whose own evidence canonicalizes to ``fp`` (filed under
+    an old-style fingerprint). ``owner`` + ``reason``: an owner the duplicate check chose (:func:`_dupe_check`).
+    The same owner is commented again only from a new session or after DEDUP_COMMENT_S (`selfheal_dedup_held`
+    otherwise), so a detector that re-fires every pass cannot flood it. A hand re-file's own card (`filed_by`) is
+    never its owner. -> the skip result, or None to file."""
+    if owner is None:
+        exclude = [d.get("filed_by")] if d.get("filed_by") else ()
+        ids = list(dict.fromkeys(x for x in (fp, d.get("raw_fingerprint"), d.get("canon_fingerprint")) if x))
+        try:
+            owner = (next((o for o in (open_owner(x, board, exclude=exclude) for x in ids) if o), None)
+                     or (canonical_owner(d["canon_fingerprint"], board, exclude=exclude)
+                         if d.get("canon_fingerprint") else None))
+        except Exception as exc:  # health: allow BLE001 -- a failed lookup must not stop filing; the daily cap holds
+            store.log({"event": "selfheal_dedup_error", "fingerprint": fp, "board": board, "error": str(exc)[:200]})
+            return None
     if not owner:
         return None
     memo_all = _json_state(store, DEDUP_STATE)
@@ -5242,25 +5671,29 @@ def _dedupe_open_owner(d: dict, fp: str, board: Optional[str], store, runner, no
     sid = d.get("session_id") or ""
     day = _utc_day(now)
     seen = list(memo.get("sessions") or [])
-    n_today = int(memo.get("n") or 0) if memo.get("day") == day else 0
+    # per owner card: canonical keys and duplicate-check merges send several fingerprints to one card
+    n_today = sum(int((v or {}).get("n") or 0) for v in memo_all.values()
+                  if (v or {}).get("owner") == owner["id"] and (v or {}).get("day") == day)
     fresh = (not memo or (sid and sid not in seen) or now - float(memo.get("at") or 0) >= DEDUP_COMMENT_S)
     res = {"action": "skip", "why": f"open owner {owner['id']} ({owner['via']} match)", "card": owner["id"],
            "dedup": True}
     rec = {"fingerprint": fp, "card": owner["id"], "via": owner["via"], "owner_status": owner["status"],
-           "board": board, "session_id": sid or None, "source": d.get("source")}
+           "board": board, "session_id": sid or None, "source": d.get("source"),
+           **({"reason": reason[:300]} if reason else {})}
     if not fresh or n_today >= DEDUP_MAX_PER_DAY:
         store.log({"event": "selfheal_dedup_held", **rec,
                    "why": "same owner and session within the hour" if not fresh else
                    f"{n_today} occurrence comments on this owner today"})
         return {**res, "commented": False}
     body = (f"Self-heal: another occurrence of the defect this card owns. The lane filed no new card for it.\n"
-            f"{_occurrence_text(d, now)}")
+            + (f"- matched by: {reason[:400]}\n" if reason else "") + _occurrence_text(d, now))
     try:
         rc, out, err = _run(_kanban_board_argv(board) + ["comment", owner["id"], body], runner)
     except Exception as exc:  # health: allow BLE001 -- the occurrence is still not filed: the owner holds the defect
         rc, out, err = 1, "", str(exc)
     if rc == 0:
-        memo_all[fp] = {"owner": owner["id"], "at": now, "day": day, "n": n_today + 1,
+        mine = int(memo.get("n") or 0) if memo.get("day") == day else 0
+        memo_all[fp] = {"owner": owner["id"], "at": now, "day": day, "n": mine + 1,
                         "sessions": (seen + ([sid] if sid and sid not in seen else []))[-20:]}
         memo_all = {k: v for k, v in memo_all.items() if now - float((v or {}).get("at") or 0) < 7 * 86400}
         _save_json_state(store, DEDUP_STATE, memo_all)
@@ -5469,6 +5902,10 @@ def _file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now:
     cfg = lane_config() if cfg is None else cfg
     if not d.get("fingerprint"):
         d = {**d, "fingerprint": fingerprint(d.get("component") or "other", d.get("symptom") or "")}
+    if d.get("raw_fingerprint") and d["raw_fingerprint"] != d["fingerprint"]:
+        lane0 = LaneState(store.root)  # a lane already tracking the collector's own id keeps it (in-flight/fixed lanes)
+        if not lane0.get(d["fingerprint"]) and lane0.get(d["raw_fingerprint"]):
+            d = {**d, "fingerprint": d["raw_fingerprint"]}
     fp = d["fingerprint"]
     if m == "off":
         return {"action": "skip", "why": "COACH_SELFHEAL=off"}
@@ -5598,7 +6035,8 @@ def _file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now:
                "budget_available": b.get("available", True)}
         store.log(rec)
         return {"action": "would_file", **rec}
-    deduped = _dedupe_open_owner(d, fp, args.get("board"), store, runner, now)
+    deduped = (_dedupe_open_owner(d, fp, args.get("board"), store, runner, now)
+               or _dupe_check(d, fp, args.get("board"), store, runner, now, cfg))
     if deduped:
         return deduped
     unavailable = _budget_unavailable(b, fp, store)

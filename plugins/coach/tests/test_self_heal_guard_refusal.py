@@ -1,12 +1,12 @@
-"""Lifecycle-guard false refusals reach the self-heal lane: one card per shape, later occurrences comment on the open
-card, a fresh card once that card is done, nothing for a true lifecycle refusal or a `[selfheal-probe]` session.
+"""Lifecycle-guard false refusals reach the self-heal lane: one card for every fail-closed shape (the shape is evidence,
+not identity: canonical keys, 2026-11-19), later occurrences comment on the open card, a fresh card once that card is
+done, nothing for a true lifecycle refusal or a `[selfheal-probe]` session.
 
 The refusal texts below are verbatim from core main (tools/terminal_tool_guards.py gateway_lifecycle_block, cron/
 lifecycle_guard.py _unreadable_reason / _budget_exhausted / check_gateway_lifecycle). The core-backed tests at the end
 produce the same refusals from the real guard and skip where core is not importable (public CI)."""
 import contextlib
 import functools
-import hashlib
 import importlib.util
 import json
 import sqlite3
@@ -137,15 +137,17 @@ def test_three_false_refusals_of_one_shape_open_one_card_and_comment(lane):
     assert det[0]["fingerprint"].startswith("lifecycleguard-")
 
 
-def test_second_shape_opens_second_card(lane):
+def test_second_shape_comments_on_the_one_card(lane):
+    """Every fail-closed sub-type is one defect (one fingerprint): a second shape is an occurrence, not a card."""
     refuse(lane, SQLITE)
     refuse(lane, BUDGET, command="bash ./deploy.sh", session_id="20261112_090100_bbbbbb")
     refuse(lane, BUDGET, command="bash ./deploy.sh", session_id="20261112_090200_cccccc")
     creates = lane.runner.creates()
-    assert len(creates) == 2, creates
-    assert "refusal (sqlite)" in body(creates[0]) and "refusal (budget/paths)" in body(creates[1])
-    assert len(lane.runner.comments()) == 1  # the 2nd budget refusal comments on the budget card
-    assert "t_00000002" in lane.runner.comments()[0]
+    assert len(creates) == 1, creates
+    assert "refusal (sqlite)" in body(creates[0])
+    comments = lane.runner.comments()
+    assert len(comments) == 2 and all("t_00000001" in c for c in comments), comments
+    assert "budget" in " ".join(comments[0])  # the new shape rides the occurrence comment
 
 
 def test_refusal_after_card_done_opens_fresh_card(lane):
@@ -259,7 +261,8 @@ def test_dedupe_window_expires(tmp_path):
 
 
 def _fp(sh, shape):
-    return sh.GUARD_FP_PREFIX + hashlib.sha1(shape.encode()).hexdigest()[:12]
+    """The lane fingerprint of a refusal of ``shape``: one for every shape (sh.GUARD_FP)."""
+    return sh.GUARD_FP
 
 
 def _no_reentry(real):
@@ -356,7 +359,7 @@ def guard(monkeypatch):
     return SimpleNamespace(run=run, lg=lg)
 
 
-def test_core_oversized_and_budget_refusals_are_hits_of_two_shapes(guard, tmp_path, monkeypatch):
+def test_core_oversized_and_budget_refusals_are_two_shapes_of_one_defect(guard, tmp_path, monkeypatch):
     sh = plugin._load("self_heal")
     big = tmp_path / "big.sh"
     big.write_text("# pad\n" * 300000 + "echo hi\n")  # > 1 MiB, no lifecycle text
@@ -369,7 +372,7 @@ def test_core_oversized_and_budget_refusals_are_hits_of_two_shapes(guard, tmp_pa
     out2 = guard.run(f"sh {small}", tmp_path)
     hit2 = sh.guard_refusal_signal("terminal", {"command": f"sh {small}"}, out2)
     assert hit2 and hit2["shape"] == "budget/paths", out2
-    assert hit["fingerprint"] != hit2["fingerprint"]
+    assert hit["fingerprint"] == hit2["fingerprint"] == sh.GUARD_FP
 
 
 def test_core_true_lifecycle_refusal_opens_no_card(guard, lane, tmp_path):

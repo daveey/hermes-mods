@@ -1427,6 +1427,35 @@ monitors). `d` = `{fingerprint, component, symptom, source, kind, p_defect, sess
   `selfheal:<fp>` or `selfheal:<fp>:…`, or whose body has that line on its own, gets the occurrence as a comment
   (`selfheal_dedup_commented`; again only from a new session or after an hour, else `selfheal_dedup_held`) and
   nothing is filed. An unreadable board logs `selfheal_dedup_error` and files (the cap still bounds it).
+  The owner lookup also tries the detection's `raw_fingerprint` and, for a canonical key, any open self-heal card
+  whose own evidence block canonicalizes to the same key (`via: canonical`: cards filed before canonical keys).
+- **Canonical keys** (`CANON_RULES`, `canonicalize`; machine signals only, `source == "signal"`, applied by the
+  producers: `signals.to_defect` for every collector signal, `guard_refusal_signal`): the fingerprint is built from
+  the stable part of the symptom, never its payload. Coach re-check failure / no-outcome / template hold → rule name;
+  cron failure → job name (host and stderr dropped, two jobs stay two); lifecycle-guard fail-closed refusal → one
+  key (`GUARD_FP`) for every sub-type, the shape stays as evidence; `<Exc> in <func> (<file>.py) [<plugin>]` → type,
+  function, file and plugin (the message is payload). `turn interrupted …` symptoms are fixed strings, one per stop
+  cause on purpose (`with_stop_cause`), and keep their own ids. The collector's own id is kept as `raw_fingerprint`
+  (rechecks and legacy rebuilds compare against it) and an existing lane under it keeps tracking that id.
+  `_file_defect` files under the fingerprint it is handed, so a payload forwarded by a host still on older code, or a
+  lone pending row queued before this change, files under its old id until it drains. Measured 2026-11-19: 284
+  detections in 6 days had 279 fingerprints (53 for report_only re-check failures alone).
+- **Duplicate check** (`_dupe_check`, after the open-owner dedupe; `dupe_check` in `selfheal-config.json`, default
+  on, env `COACH_SELFHEAL_DUPE_CHECK`): a detection with no owner by key goes to one cheap-model call (aux task
+  `coach_selfheal_dupe`, model `claude-haiku-5-5` (30 s timeout) on the subscription pool `plugins/pool-llm/bin/hermes-pool-llm`
+  first, core `call_llm` second; `auxiliary.coach_selfheal_dupe` or `COACH_SELFHEAL_DUPE_MODEL` overrides) with the
+  open self-heal cards and pending rows of the same component (newest 30 of each). `same` + a listed id + confidence
+  ≥ `DUPE_CONFIDENCE` (0.85) merges: into a card as an occurrence comment through the filing dedupe (its
+  `DEDUP_MAX_PER_DAY`, counted per card over every fingerprint that reached it, and hourly hold apply, the model's reason in the comment; a hand re-file (`filed_by`) and a SQLite incident skip the check), into a pending row by folding.
+  `new`, lower confidence, an unknown id, an unparsable answer, an error or a timeout files normally (the
+  daily cap still applies). Every verdict logs `selfheal_dupe_check`; `<coach>/selfheal-dupecheck.json` remembers
+  each fingerprint's merge target and the candidates already judged, so a re-check calls the model only for new
+  candidates.
+- **Pending queue, one row per defect**: `_defer_investigation` folds a detection into the row already under its
+  (canonical) fingerprint, and each `retry_deferred` pass first moves rows queued under old payload fingerprints to
+  their canonical key (`fold_pending_keys`, `selfheal_pending_folded`). A folded row keeps the newest payload, lists
+  every occurrence in `occurrences`, `occurrence_count` and its `details` (so the card that finally files shows them),
+  and `merge_reasons` for duplicate-check folds. Tests: `tests/test_self_heal_dedupe_keys.py`.
 - **Daily card cap** (`daily_card_cap`, default 40, env `COACH_SELFHEAL_DAILY_CAP`): cards created_by `self-heal` on
   the board since 00:00Z. At the cap a new defect (or backport/deploy-check) files no card: the day's digest card
   (key `selfheal-digest:<YYYY-MM-DD>`, title `self-heal digest <date>: defects over the daily cap`, not counted,

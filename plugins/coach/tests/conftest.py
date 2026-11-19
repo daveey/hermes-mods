@@ -34,6 +34,8 @@ _GUARD.install()
 os.environ['HERMES_HOME'] = _COLLECTION_HOME.name
 os.environ['HERMES_RUNTIME_DIR'] = str(Path(_COLLECTION_HOME.name) / 'tools')
 os.environ['COACH_LESSONS'] = '0'
+# The self-heal duplicate check calls a model; suites that exercise it enable it with a stub judge.
+os.environ['COACH_SELFHEAL_DUPE_CHECK'] = '0'
 # future_clock reads this pinned clock: 2026-11-11 23:58 PST (07:58 UTC), when every incident time quoted in the
 # suite's fixtures is past (reply_check._wall_now; test_future_clock passes its own instants).
 os.environ['COACH_CLOCK_EPOCH'] = '1794470280'

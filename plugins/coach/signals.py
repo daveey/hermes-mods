@@ -2237,7 +2237,11 @@ def _outcome_recheck_module():
 
 def defect_recheck(d: dict) -> Optional[dict]:
     """The recheck of a self-heal defect: its own field, else (rows deferred before the field existed) one rebuilt from a
-    template-hold symptom or cron failure details, trusted only when it reproduces the row's fingerprint."""
+    template-hold symptom or cron failure details, trusted only when it reproduces the row's fingerprint. A row the lane
+    filed under its canonical key (self_heal.canonicalize: fingerprint == canon_fingerprint) is checked against the
+    collector's own `raw_fingerprint`; any other mismatch stays untrusted."""
+    if d.get("raw_fingerprint") and d.get("fingerprint") and d.get("fingerprint") == d.get("canon_fingerprint"):
+        d = {**d, "fingerprint": d["raw_fingerprint"]}
     if isinstance(d.get("recheck"), dict):
         if d["recheck"].get("kind") == "coach_outcome" and d["recheck"].get("fingerprint") != d.get("fingerprint"):
             return None
@@ -2647,6 +2651,10 @@ def to_defect(s: dict) -> dict:
     for k in ("profile", "monitor", "kanban", "kanban_hold", "comment_open_card", "recheck"):
         if s.get(k):
             d[k] = s[k]
+    try:  # the stable key (self_heal.CANON_RULES): one fingerprint per defect, whatever the payload
+        d = _canon_self_heal().canonicalize(d)
+    except Exception:  # health: allow BLE001 -- a forwarder without self_heal.py files the collector's own id
+        pass
     return d
 
 
@@ -2709,6 +2717,16 @@ def resolve_host(home: Path, given: Optional[str], remember: bool = False) -> st
         if str(sync).lower() == node.lower():
             return str(label)
     return node
+
+
+_CANON_SH: list = []
+
+
+def _canon_self_heal():
+    """self_heal loaded once per process for to_defect's canonical keys (a pure function of the defect)."""
+    if not _CANON_SH:
+        _CANON_SH.append(_self_heal())
+    return _CANON_SH[0]
 
 
 def _self_heal():
