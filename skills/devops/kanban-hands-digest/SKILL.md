@@ -39,6 +39,7 @@ The card set for the session-scoped question: Find them from this session's own 
 task strip, then `kanban_show` each and report the blocked ones. For a session he links (`@session:<profile>/<id>`),
 query each board: `select id,status,block_kind,title from tasks where status not in ('done','archived') and
 (session_id='<id>' or id in (select task_id from task_chat_links where chat_session='<id>' and coalesce(released,0)=0))`.
+The system `sqlite3` is refused on live boards (SQLite live guard): run these queries as a small script under `~/.hermes/bin/hermes-core-python` with `sqlite3.connect('file:<abs path>?mode=ro', uri=True)`; its `-m sqlite3` form does not take a `file:` URI. The main board is `~/.hermes/kanban.db`; `kanban/kanban.db` has no `tasks` table.
 "Nothing running, all waiting" means: walk each card's open parents and its scheduled `wake_check` target down to
 the leaf that nothing will move (a decision card, a `ready` card whose events are only `skipped_nonspawnable`,
 a throttled queue, a PR wait whose PR is no longer queued: check its labels/timeline and the waiter's exit,
