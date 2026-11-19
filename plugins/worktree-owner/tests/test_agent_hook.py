@@ -193,7 +193,8 @@ class AgentHook(unittest.TestCase):
 
     def test_overlapping_stop_and_session_end_do_not_double_handle(self):
         import threading
-        p = self.make("proj-race", "brace")
+        # merged work, so both events remove it (a fresh tree is kept on Stop; see the born_head tests)
+        p = self.make("proj-race", "brace"); self.commit_push(p, "r.txt", "brace"); self.merge_to_main("brace")
         out = []
         ts = [threading.Thread(target=lambda e=e: out.append(self.end(event=e))) for e in ("Stop", "SessionEnd")]
         [t.start() for t in ts]; [t.join() for t in ts]
@@ -208,6 +209,107 @@ class AgentHook(unittest.TestCase):
         (gd / self.b.MARKER).write_text(json.dumps(marker))
         self.assertEqual(self.end(), [])
         self.assertTrue(p.exists())
+
+    # --- Stop keeps trees nobody has worked in yet (2026-11-18: a session's prepared trees removed 60 s after its turn)
+    def make_detached(self, name, sid="sess-1"):
+        p = self.code / name
+        cmd = f"cd {self.repo} && git worktree add --detach {p} origin/main"
+        self.post(cmd, sid, f"tu-{name}", event="PreToolUse")
+        git(self.repo, "worktree", "add", "-q", "--detach", str(p), "origin/main")
+        self.post(cmd, sid, f"tu-{name}")
+        return p
+
+    def head(self, p):
+        return git(p, "rev-parse", "HEAD").strip()
+
+    def log(self):
+        return self.b.LOG.read_text() if self.b.LOG.exists() else ""
+
+    def assert_fresh_kept_on_stop_then_removed_on_session_end(self, p):
+        self.assertEqual(self.marker(p)["born_head"], self.head(p))
+        res = self.end(event="Stop")
+        self.assertEqual([r["action"] for r in res], ["kept: no commits since it was made"])
+        self.assertTrue(p.exists())
+        self.assertIn(f"KEEP {p} (made by claude session sess-1): no commits since it was made; the session is still "
+                      f"running", self.log())
+        self.assertEqual([r["action"] for r in self.end(event="SessionEnd")], ["removed"])
+        self.assertFalse(p.exists())
+
+    def test_fresh_detached_tree_is_kept_on_stop_and_removed_on_session_end(self):
+        self.assert_fresh_kept_on_stop_then_removed_on_session_end(self.make_detached("proj-det"))
+
+    def test_fresh_branch_tree_is_kept_on_stop_and_removed_on_session_end(self):
+        self.assert_fresh_kept_on_stop_then_removed_on_session_end(self.make("proj-br", "wt/br"))
+
+    def test_tree_with_a_merged_commit_is_removed_on_stop(self):
+        p = self.make("proj-mstop", "bms"); self.commit_push(p, "m.txt", "bms"); self.merge_to_main("bms")
+        self.assertEqual([r["action"] for r in self.end(event="Stop")], ["removed"]); self.assertFalse(p.exists())
+
+    def test_tree_whose_head_is_a_merged_pr_head_is_removed_on_stop(self):
+        p = self.make("proj-prstop", "bps"); self.commit_push(p, "s.txt", "bps")
+        git(self.repo, "push", "-q", "origin", "--delete", "bps")
+        self.prs["bps"] = self.head(p)
+        self.assertEqual([r["action"] for r in self.end(event="Stop")], ["removed"]); self.assertFalse(p.exists())
+
+    def _legacy(self, p, age_s=0.0):
+        gd = Path(git(p, "rev-parse", "--absolute-git-dir").strip())
+        mk = self.marker(p); mk.pop("born_head")
+        (gd / self.b.MARKER).write_text(json.dumps(mk))
+        if age_s:
+            t = time.time() - age_s
+            os.utime(gd / self.b.MARKER, (t, t))
+
+    def test_legacy_marker_younger_than_a_day_at_the_remote_tip_is_kept_on_stop(self):
+        p = self.make_detached("proj-leg-young"); self._legacy(p, age_s=23 * 3600)
+        res = self.end(event="Stop")
+        self.assertTrue(res[0]["action"].startswith("kept: no commits since it was made (legacy marker"))
+        self.assertTrue(p.exists())
+        self.assertEqual([r["action"] for r in self.end(event="SessionEnd")], ["removed"])
+
+    def test_legacy_marker_older_than_a_day_keeps_todays_rule_on_stop(self):
+        p = self.make_detached("proj-leg-old"); self._legacy(p, age_s=25 * 3600)
+        self.assertEqual([r["action"] for r in self.end(event="Stop")], ["removed"]); self.assertFalse(p.exists())
+
+    def test_legacy_marker_behind_the_remote_tip_keeps_todays_rule_on_stop(self):
+        p = self.make_detached("proj-leg-behind"); self._legacy(p)
+        other = self.make("proj-adv", "badv", sid="sess-9"); self.commit_push(other, "n.txt", "badv")
+        self.merge_to_main("badv")  # origin/main moved on; the legacy tree is an ancestor, not the tip
+        self.assertEqual([r["action"] for r in self.end(event="Stop")], ["removed"]); self.assertFalse(p.exists())
+
+    def test_locked_tree_is_kept_on_both_events(self):
+        p = self.make("proj-lock", "blk"); self.commit_push(p, "l.txt", "blk"); self.merge_to_main("blk")
+        git(self.repo, "worktree", "lock", "--reason", "subagent at work", str(p))
+        for ev in ("Stop", "SessionEnd"):
+            self.assertEqual([r["action"] for r in self.end(event=ev)], ["kept: locked (subagent at work)"], ev)
+            self.assertTrue(p.exists())
+        self.assertIn(f"KEEP {p} (made by claude session sess-1): locked (subagent at work)", self.log())
+        git(self.repo, "worktree", "unlock", str(p))
+        self.assertEqual([r["action"] for r in self.end(event="SessionEnd")], ["removed"])
+
+    def test_locked_tree_without_a_reason_is_kept(self):
+        p = self.make_detached("proj-lock2")
+        git(self.repo, "worktree", "lock", str(p))
+        self.assertEqual([r["action"] for r in self.end(event="SessionEnd")], ["kept: locked (no reason given)"])
+        self.assertTrue(p.exists())
+
+    def test_teardown_argv_carries_the_event_and_old_format_means_stop(self):
+        from unittest import mock
+        with mock.patch.object(self.h.subprocess, "Popen") as po:
+            self.h.handle({"hook_event_name": "SessionEnd", "session_id": "s1", "cwd": "/c"}, "claude", env={})
+            self.h.handle({"hook_event_name": "Stop", "session_id": "s2", "cwd": "/c"}, "claude", env={})
+        argvs = [c.args[0] for c in po.call_args_list]
+        self.assertEqual([self.h.parse_teardown_argv(a[1:])[1:] for a in argvs],
+                         [("s1", "/c", self.h.END_DELAY_S, "SessionEnd"), ("s2", "/c", 0.0, "Stop")])
+        old = ["agent_hook.py", "--teardown", "claude", "sess-1", str(self.repo), "3.0"]
+        self.assertEqual(self.h.parse_teardown_argv(old), ("claude", "sess-1", str(self.repo), 3.0, "Stop"))
+        self.assertEqual(self.h.parse_teardown_argv(old + ["bogus"])[-1], "Stop")
+        # an old-format child (spawned by a hook that predates the event arg) keeps a fresh tree
+        p = self.make_detached("proj-oldargv")
+        self.assertEqual(self.h.main(old[:-1] + ["0"]), 0)
+        self.assertTrue(p.exists())
+        self.assertIn("event=Stop: 1 marked tree(s), 0 removed", self.log())
+        self.assertEqual(self.h.main(old[:-1] + ["0", "SessionEnd"]), 0)
+        self.assertFalse(p.exists())
 
     def test_main_never_fails_on_garbage(self):
         self.assertEqual(self.h.handle({}, "claude", env={}), [])

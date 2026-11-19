@@ -222,6 +222,18 @@ def _cd_targets(text: str, bases: list[str]) -> list[str]:
     return out
 
 
+def _born_head(path: str | None) -> str | None:
+    """The tree's full HEAD sha, or None when it cannot be read."""
+    if not path:
+        return None
+    try:
+        r = _git(path, "rev-parse", "--verify", "-q", "HEAD", timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    sha = r.stdout.strip()
+    return sha if r.returncode == 0 and re.fullmatch(r"[0-9a-f]{40}([0-9a-f]{24})?", sha) else None
+
+
 def register_markers(since: float, env, extra_dirs: list[str] | None = None, text: str | None = None,
                      tool: str = "terminal", owner: dict | None = None) -> list[dict]:
     owner = owner_from_env(env) if owner is None else owner
@@ -237,6 +249,9 @@ def register_markers(since: float, env, extra_dirs: list[str] | None = None, tex
         card = _workspace_card(path, owner) if path else None
         who = dict(card, made_by=owner) if card else owner
         rec = dict(who, path=path, registered_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"), host=os.uname().nodename.split(".")[0])
+        born = _born_head(path)
+        if born:  # HEAD at birth: a tree still at it has no commits of its own (agent_hook's Stop keeps it)
+            rec["born_head"] = born
         try:
             Path(gd, MARKER).write_text(json.dumps(rec, indent=1))
             if card:

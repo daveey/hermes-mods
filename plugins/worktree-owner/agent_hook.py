@@ -12,7 +12,9 @@ Events:
 - Stop (at most every STOP_EVERY_S per session) and SessionEnd: a detached child removes this session's marked
   worktrees that are clean, have no live process cwd inside, and are merged: HEAD is an ancestor of the remote
   default branch (after a fetch), or a merged GitHub PR's head is exactly HEAD (squash merges, deleted branches).
-  The branch is kept. Everything else is left for mac-worktree-gc.
+  The branch is kept. Everything else is left for mac-worktree-gc. A locked tree (`git worktree lock`) is always
+  kept. On Stop (the session still runs) a tree still at its birth HEAD (marker ``born_head``) has no commits of its
+  own and is kept: it may just have been handed to a subagent. SessionEnd removes it as before.
 
 Log: ~/.hermes/logs/worktree-owner.log (lines tagged ``agent:<name>``).
 """
@@ -110,6 +112,7 @@ def merged_pr_heads(path: str, branch: str) -> list[str]:
 
 
 _fetched: dict[str, str | None] = {}
+_tips: dict[str, set[str]] = {}  # repo -> origin/<default> sha before and after this run's fetch
 
 
 def _default_ref(main: str) -> str | None:
@@ -120,10 +123,51 @@ def _default_ref(main: str) -> str | None:
     if not ref or ref == "origin/HEAD":
         ref = next((c for c in ("origin/main", "origin/master")
                     if base._git(main, "rev-parse", "-q", "--verify", c, timeout=20).returncode == 0), None)
+    tips = set()
     if ref:
+        tips.add(base._git(main, "rev-parse", "-q", "--verify", ref, timeout=20).stdout.strip())
         base._git(main, "fetch", "-q", "origin", ref.split("/", 1)[1], timeout=120)
+        tips.add(base._git(main, "rev-parse", "-q", "--verify", ref, timeout=20).stdout.strip())
+    _tips[main] = {t for t in tips if t}
     _fetched[main] = ref
     return ref
+
+
+LEGACY_FRESH_S = 24 * 3600.0
+EVENTS = ("Stop", "SessionEnd")
+
+
+def _lock_reason(gd: str | None) -> str | None:
+    """`git worktree lock` reason ('' when locked without one), None when not locked."""
+    if not gd:
+        return None
+    try:
+        return Path(gd, "locked").read_text().strip()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return "unreadable lock file"
+
+
+def _fresh_reason(path: str, main: str, head: str, rec: dict | None, gd: str | None) -> str | None:
+    """Why a clean 'merged' tree is really one nobody has worked in yet (None: it has done its work).
+
+    `HEAD is an ancestor of origin/<default>` is also true of a tree made a minute ago from origin/<default> and
+    handed to a subagent (2026-11-18: two such trees were removed 60 s after the turn ended). A tree still at its
+    birth HEAD has no commits of its own, so nothing of it can have landed.
+    """
+    born = (rec or {}).get("born_head")
+    if born:
+        return "no commits since it was made" if head == born else None
+    # Marker written before born_head existed: within a day of registration, HEAD exactly at the remote default tip
+    # (before or after this run's fetch) is the same signature. Older legacy markers keep today's rule.
+    try:
+        age = time.time() - Path(gd, base.MARKER).stat().st_mtime if gd else None
+    except OSError:
+        age = None
+    if age is not None and age < LEGACY_FRESH_S and head in _tips.get(main, set()):
+        return "no commits since it was made (legacy marker, HEAD at the remote default tip)"
+    return None
 
 
 def not_merged_reason(path: str, main: str) -> str | None:
@@ -142,17 +186,30 @@ def not_merged_reason(path: str, main: str) -> str | None:
     return f"not merged into {ref or 'the default branch'} and no merged PR at HEAD"
 
 
-def remove_if_merged(path: str, why: str) -> dict:
+def remove_if_merged(path: str, why: str, event: str = "Stop", rec: dict | None = None, gd: str | None = None) -> dict:
+    """*event* is the hook that started teardown. Anything but SessionEnd counts as Stop: the session still runs."""
     rp = os.path.realpath(path)
     if any(c == rp or c.startswith(rp + "/") or c == path or c.startswith(path + "/") for c in base.live_cwds()):
         base._log(f"KEEP {path} ({why}): a live process works in it")
         return dict(path=path, action="kept: live process")
+    if gd is None:
+        gd = base._git(path, "rev-parse", "--absolute-git-dir").stdout.strip() or None
+    lock = _lock_reason(gd)
+    if lock is not None:
+        base._log(f"KEEP {path} ({why}): locked ({lock or 'no reason given'})")
+        return dict(path=path, action=f"kept: locked ({lock or 'no reason given'})")
     common = base._git(path, "rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip()
     main = os.path.dirname(common) if common else path
     keep = not_merged_reason(path, main)
     if keep:
         base._log(f"KEEP {path} ({why}): {keep}; mac-worktree-gc handles it after 7 idle days")
         return dict(path=path, action=f"kept: {keep}")
+    if event != "SessionEnd":
+        fresh = _fresh_reason(path, main, base._git(path, "rev-parse", "HEAD").stdout.strip(), rec, gd)
+        if fresh:
+            base._log(f"KEEP {path} ({why}): {fresh}; the session is still running")
+            return dict(path=path, action=f"kept: {fresh}")
+    # Never --force: without it git refuses a locked tree (and dirty ones), even if one appeared since the checks.
     r = base._git(main, "worktree", "remove", path, timeout=600)
     if r.returncode != 0:
         base._log(f"WARN remove {path} failed: {r.stderr.strip()[:200]}")
@@ -161,17 +218,18 @@ def remove_if_merged(path: str, why: str) -> dict:
     return dict(path=path, action="removed")
 
 
-def teardown(sid: str, agent: str, cwd: str = "") -> list[dict]:
+def teardown(sid: str, agent: str, cwd: str = "", event: str = "Stop") -> list[dict]:
     """Serialised per session (Stop and SessionEnd children can overlap) via an flock."""
     import fcntl
     STATE.mkdir(parents=True, exist_ok=True)
     with open(STATE / f"lock-{_safe(agent)}-{_safe(sid)}", "w") as lk:
         fcntl.flock(lk, fcntl.LOCK_EX)
-        return _teardown(sid, agent, cwd)
+        return _teardown(sid, agent, cwd, event)
 
 
-def _teardown(sid: str, agent: str, cwd: str = "") -> list[dict]:
+def _teardown(sid: str, agent: str, cwd: str = "", event: str = "Stop") -> list[dict]:
     _fetched.clear()
+    _tips.clear()
     out = []
     for common in base._common_dirs([cwd]):
         for gd in glob.glob(os.path.join(common, "worktrees", "*")):
@@ -184,7 +242,7 @@ def _teardown(sid: str, agent: str, cwd: str = "") -> list[dict]:
                 continue
             path = rec.get("path") or base._wt_path(gd)
             if rec.get("agent") == agent and rec.get("agent_session_id") == sid and path and os.path.isdir(path):
-                out.append(remove_if_merged(path, f"made by {agent} session {sid}"))
+                out.append(remove_if_merged(path, f"made by {agent} session {sid}", event, rec, gd))
     return out
 
 
@@ -202,13 +260,31 @@ def end(payload: dict, agent: str, detach: bool = True) -> list[dict]:
         STATE.mkdir(parents=True, exist_ok=True)
         mark.touch()
     cwd = str(payload.get("cwd") or "")
+    event = "SessionEnd" if payload.get("hook_event_name") == "SessionEnd" else "Stop"
     if detach:  # never hold the agent up (and outlive its exit at SessionEnd)
-        delay = END_DELAY_S if payload.get("hook_event_name") == "SessionEnd" else 0
-        subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--teardown", agent, sid, cwd, str(delay)],
-                         cwd="/", stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         start_new_session=True)
+        subprocess.Popen(teardown_argv(agent, sid, cwd, event), cwd="/", stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
         return []
-    return teardown(sid, agent, cwd)
+    return teardown(sid, agent, cwd, event)
+
+
+def teardown_argv(agent: str, sid: str, cwd: str, event: str) -> list[str]:
+    delay = END_DELAY_S if event == "SessionEnd" else 0
+    return [sys.executable, str(Path(__file__).resolve()), "--teardown", agent, sid, cwd, str(delay), event]
+
+
+def parse_teardown_argv(argv: list[str]) -> tuple[str, str, str, float, str]:
+    """(agent, sid, cwd, delay, event). The event arg is new: an argv without it (spawned by a hook that predates it)
+    or with an unknown value means Stop, the keeping side. SessionEnd re-runs teardown when the session really ends,
+    so keeping costs at most a later removal; treating it as SessionEnd could remove a tree a subagent is about to
+    work in."""
+    _, _, agent, sid, cwd, *rest = argv
+    try:
+        delay = float(rest[0]) if rest else 0.0
+    except ValueError:
+        delay = 0.0
+    event = rest[1] if len(rest) > 1 and rest[1] in EVENTS else "Stop"
+    return agent, sid, cwd, delay, event
 
 
 def _board_db(env) -> str:
@@ -294,12 +370,12 @@ def handle(payload, agent: str, env=None, detach: bool = True) -> list[dict]:
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) >= 4 and argv[1] == "--teardown":
-        _, _, agent, sid, cwd, *rest = argv
-        time.sleep(float(rest[0]) if rest else 0)
+    if len(argv) >= 5 and argv[1] == "--teardown":
+        agent, sid, cwd, delay, event = parse_teardown_argv(argv)
+        time.sleep(delay)
         try:
-            res = teardown(sid, agent, cwd)
-            base._log(f"agent:{agent} teardown session={sid}: {len(res)} marked tree(s), "
+            res = teardown(sid, agent, cwd, event)
+            base._log(f"agent:{agent} teardown session={sid} event={event}: {len(res)} marked tree(s), "
                       f"{sum(r['action'] == 'removed' for r in res)} removed")
         except Exception as e:  # noqa: BLE001
             base._log(f"agent:{agent} WARN teardown failed: {type(e).__name__}: {e}")

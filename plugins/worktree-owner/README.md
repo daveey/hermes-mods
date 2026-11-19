@@ -75,6 +75,19 @@ The same rule for worktrees made by Claude Code or Codex sessions (and their sub
   fetch, or a merged GitHub PR (`gh pr list --head <branch> --state merged`) has exactly HEAD as its head (squash
   merges, auto-deleted branches). The branch is kept. Unmerged, dirty or busy trees are left to the backstop GC.
 
+**A tree nobody has worked in yet is not "merged".** A tree made a minute ago from `origin/main` is clean and its
+HEAD is an ancestor of the default branch, so the merge test alone passes it; on 2026-11-18 a session prepared two
+trees, handed them to background subagents (which run inside the agent process, so no live cwd protected them) and
+ended its turn, and the Stop teardown removed both 60 s later. Registration therefore records the tree's HEAD at
+birth (`born_head` in the marker). On `Stop` (the session is still running) a tree whose HEAD is still `born_head` is
+kept with `KEEP <path> (<why>): no commits since it was made; the session is still running`; on `SessionEnd` it is
+removed as before, since the session that would use it is gone. Markers written before `born_head` existed are kept
+on Stop when they are under 24 h old and HEAD is exactly the remote default tip (before or after the fetch), the
+same signature; older ones follow the merge rule. A tree locked with `git worktree lock` is kept on both events with
+`KEEP <path> (<why>): locked (<reason>)`, and teardown never passes `--force` (git refuses to remove a locked tree
+without `-f -f`). The detached teardown child gets the event as its last argument; one spawned without it (an older
+hook) is treated as Stop, the keeping side: a wrong keep costs a later removal, a wrong removal costs work.
+
 `~/.claude/settings.json`:
 
 ```json
@@ -106,7 +119,7 @@ New sessions and Kanban workers load it. Sessions that are already open keep run
 python3 -B -m unittest discover -s plugins/worktree-owner/tests
 ```
 
-Stdlib unit suite: 83 tests using disposable Git repos and boards, including a replay of the 2026-10-29 concurrent-creation misattribution and dirty/unpushed-tree preservation. On macOS run it with Python >= 3.12 and `TMPDIR` set to a non-symlinked dir (e.g. `TMPDIR=$(realpath ~/.hermes/cache/scratch)`): `/var` -> `/private/var` breaks the path assertions. Linux runs on Linux; macOS lsof semantics are exercised with subprocess fixtures, not claimed as a live macOS test.
+Stdlib unit suite: 93 tests using disposable Git repos and boards, including a replay of the 2026-10-29 concurrent-creation misattribution and dirty/unpushed-tree preservation. On macOS run it with Python >= 3.12 and `TMPDIR` set to a non-symlinked dir (e.g. `TMPDIR=$(realpath ~/.hermes/cache/scratch)`): `/var` -> `/private/var` breaks the path assertions. Linux runs on Linux; macOS lsof semantics are exercised with subprocess fixtures, not claimed as a live macOS test.
 
 Bootstrapped runtime integration (requires a core checkout with scratch preservation, and on Linux an existing noninteractive readlink grant for non-dumpable processes):
 
