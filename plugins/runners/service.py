@@ -96,12 +96,13 @@ class _Carry:
     state, the output row, its projection, its provenance entry, when computed); hosts maps a host id to (its
     host result, its maintenance) as that build saw them."""
 
-    __slots__ = ('current', 'built_at', 'rows', 'hosts', 'computed', 'blocks')
+    __slots__ = ('current', 'built_at', 'rows', 'hosts', 'computed', 'blocks', 'cache_epochs')
 
     def __init__(self, current, built_at):
         self.current, self.built_at = current, built_at
         self.rows, self.hosts, self.computed = {}, {}, 0
         self.blocks = []
+        self.cache_epochs = []
 
 
 @dataclass
@@ -126,7 +127,9 @@ class _Result:
         # Parse once per memo generation, never once per scope on every panel read.
         epochs = {}
         self.cache_epochs = []
-        for row in shared['meta'].get('inventory_cache', ()):
+        if carry is not None:
+            self.cache_epochs = carry.cache_epochs
+        for row in (() if carry is not None else shared['meta'].get('inventory_cache', ())):
             stamp = row['fetched_at']
             if stamp not in epochs:
                 epochs[stamp] = datetime.fromisoformat(stamp).timestamp() if stamp is not None else None
@@ -147,6 +150,34 @@ class _Result:
         result = pickle.loads(self.blob)
         result['meta'].update(fresh)
         return result
+
+
+def _scope_cache(scopes, snapshot, now, previous=(), *, timestamp=iso):
+    """Carry unchanged scope templates, without retaining entire snapshots.
+
+    Re-evaluate future timestamps on each build, including after clock rollback.
+    Age is projected only in the response view, never mutated on a carried row.
+    """
+    old = {entry[0]['scope_id']: entry for entry in previous}
+    saved_results = (snapshot or {}).get('scope_results', {})
+    result, formatted = [], {}
+    for scope in scopes:
+        sid = scope['id']
+        saved = saved_results.get(sid, {})
+        fetched = saved.get('last_success_at')
+        if fetched is None and saved.get('complete'):
+            fetched = saved.get('observed_at')
+        if type(fetched) not in (int, float) or not math.isfinite(fetched) or fetched > now:
+            fetched = None
+        incomplete = not bool(saved.get('complete')) or fetched is None
+        entry = old.get(sid)
+        if entry is None or entry[1] != fetched or entry[0]['incomplete'] != incomplete:
+            if fetched not in formatted:
+                formatted[fetched] = timestamp(fetched) if fetched is not None else None
+            entry = (dict(scope_id=sid, fetched_at=formatted[fetched], age_s=None,
+                          incomplete=incomplete), fetched)
+        result.append(entry)
+    return result
 
 
 def _next_flip(stamps, ttls, now):
@@ -388,7 +419,7 @@ class Service:
             _READS[path] = fresh
         return fresh
 
-    def _meta(self,snapshot,*,shared=False):
+    def _meta(self,snapshot,*,shared=False,cache_epochs=None):
         # shared=True (a memoized build): coverage and source errors stay the shared snapshot's own (never mutated
         # here or by a reader), provenance entries are copied one level (their state is set below).
         copy = (lambda v: v) if shared else deepcopy
@@ -403,16 +434,12 @@ class Service:
             if value not in formatted:
                 formatted[value] = iso(value)
             return formatted[value]
-        for scope in c['scopes']:
-            saved = (snapshot or {}).get('scope_results', {}).get(scope['id'], {})
-            fetched = saved.get('last_success_at')
-            if fetched is None and saved.get('complete'):
-                fetched = saved.get('observed_at')
-            if type(fetched) not in (int, float) or not math.isfinite(fetched) or fetched > now:
-                fetched = None
-            cache.append(dict(scope_id=scope['id'], fetched_at=timestamp(fetched),
-                              age_s=now-fetched if fetched is not None else None,
-                              incomplete=not bool(saved.get('complete')) or fetched is None))
+        if cache_epochs is None:
+            cache_epochs = _scope_cache(c['scopes'], snapshot, now, timestamp=timestamp)
+            cache = [dict(row, age_s=now-epoch if epoch is not None else None)
+                     for row, epoch in cache_epochs]
+        else:
+            cache = [row for row, _ in cache_epochs]
         return dict(inventory_cache=cache, contract_version=1,request_id=ident('request'),owner=dict(gateway_id=c['owner_gateway_id'],profile=c['owner_profile'],owner_epoch=c['owner_epoch'],config_revision=c['config_revision']),
                     generated_at=timestamp(now),observed_at=timestamp(at),expires_at=timestamp(at+ttl) if at is not None else None,
                     freshness=('fresh' if 0<=now-at<=ttl else 'stale') if at is not None else 'unknown',
@@ -513,7 +540,10 @@ class Service:
         """The inventory. With ``carry`` (an earlier build's ``_Carry`` or None) it also returns this build's
         ``_Carry``, and reuses each runner row whose inputs equal the carried ones (see ``inventory``)."""
         tracked = carry is not _NO_CARRY
-        meta=self._meta(snap, shared=not copy_rows); c=self.config; rows=[]; projections=[]
+        cache_epochs = (_scope_cache(self.config['scopes'], snap, now,
+                                    carry.cache_epochs if carry not in (_NO_CARRY, None) else ())
+                        if tracked else None)
+        meta=self._meta(snap, shared=not copy_rows, cache_epochs=cache_epochs); c=self.config; rows=[]; projections=[]
         # Collection timestamps repeat across rows. Bound this build-local cache;
         # typed keys preserve numeric representation at datetime boundaries.
         stamp = lru_cache(maxsize=256, typed=True)(iso)
@@ -532,6 +562,8 @@ class Service:
         current = meta['freshness'] == 'fresh'
         host_results = snap.get('host_results', {}) if snap else {}
         built = _Carry(current, now) if tracked else None
+        if built is not None:
+            built.cache_epochs = cache_epochs
         if carry is _NO_CARRY or (carry is not None and carry.current != current):
             carry = None
         host_flip = {}  # host id -> _host_flip
