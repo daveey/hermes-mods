@@ -16,6 +16,7 @@ from dataclasses import dataclass, asdict
 from email.utils import parsedate_to_datetime
 import hashlib
 import math
+import logging
 import random
 import re
 import time
@@ -54,7 +55,8 @@ class GitHubActions:
                  max_job_requests=10, max_repositories=10, max_runs=10,
                  enrichment_interval=60, backoff_base=2, backoff_cap=300,
                  max_cycle_requests=32, pace_requests=False, pacing_window=0,
-                 quota_reserve=0, max_hourly_requests=None, precharge_pacing=False):
+                 quota_reserve=0, max_hourly_requests=None, precharge_pacing=False,
+                 hourly_request_cap=None, inventory_credentials=None):
         for value in (timeout, max_pages, max_job_requests, max_repositories,
                       max_runs, enrichment_interval, backoff_base, backoff_cap):
             if not isinstance(value, (float, int)) or not math.isfinite(value) or value <= 0:
@@ -86,6 +88,16 @@ class GitHubActions:
         self.quota_reserve, self.max_hourly_requests = quota_reserve, max_hourly_requests
         self.max_cycle_requests, self.pace_requests = max_cycle_requests, pace_requests
         self.precharge_pacing = precharge_pacing
+        if hourly_request_cap is not None and (type(hourly_request_cap) is not int or hourly_request_cap < 1):
+            raise ValueError('invalid_provider_options')
+        self.hourly_request_cap = hourly_request_cap
+        if inventory_credentials is not None and (
+                type(inventory_credentials) is not dict or any(
+                    type(k) is not str or type(v) is not str or not v
+                    for k, v in inventory_credentials.items())):
+            raise ValueError('invalid_provider_options')
+        self.inventory_credentials = dict(inventory_credentials or {})
+        self._hourly_attempts = []
         self._cycle_remaining = None
         self._budgets, self._cache, self._enriched = {}, {}, {}
         # Advisory scheduling only; never evidence or an authorization cache.
@@ -108,13 +120,32 @@ class GitHubActions:
     def export_state(self):
         """Persist only pacing/backoff, never tokens or authorized page caches."""
         with self._lock:
-            return {key: asdict(budget) for key, budget in self._budgets.items()}
+            state = {key: asdict(budget) for key, budget in self._budgets.items()}
+            if self.hourly_request_cap is not None:
+                state['@global-hourly-attempts'] = {'timestamps': list(self._hourly_attempts)}
+            return state
 
     def restore_state(self, state):
         with self._lock:
             restored = {}
             if type(state) is not dict:
                 raise ValueError('invalid_budget_state')
+            state = dict(state)
+            if '@global-hourly-attempts' not in state and self.hourly_request_cap is not None:
+                # A pre-cap ledger has unknown recent consumption. Fence the
+                # first hour conservatively, preserving every existing quota.
+                now = self.clock()
+                attempts = {'timestamps': [now] * self.hourly_request_cap}
+                logging.getLogger(__name__).info(
+                    'inventory cap migration incomplete=true reset=%s', now + 3600)
+            else:
+                attempts = state.pop('@global-hourly-attempts', {'timestamps': []})
+            if (type(attempts) is not dict or set(attempts) != {'timestamps'}
+                    or type(attempts['timestamps']) is not list
+                    or any(type(t) not in (int, float) or not math.isfinite(t) or t < 0
+                           for t in attempts['timestamps'])):
+                raise ValueError('invalid_budget_state')
+            hourly_attempts = sorted(attempts['timestamps'])
             for key, value in state.items():
                 if type(key) is not str or not key or len(key) > 256 or type(value) is not dict:
                     raise ValueError('invalid_budget_state')
@@ -130,6 +161,7 @@ class GitHubActions:
                     raise ValueError('invalid_budget_state')
                 restored[key] = budget
             self._budgets = restored
+            self._hourly_attempts = hourly_attempts
 
     @staticmethod
     def _name(name, parts):
@@ -148,7 +180,7 @@ class GitHubActions:
     def _credential(self, scope):
         try:
             c = self.credential_resolver(scope['credential_ref'])
-            if not isinstance(c, Credential) or not c.key or not isinstance(c.token, str) or not c.token or any(ord(x) < 33 or ord(x) > 126 for x in c.token):
+            if not isinstance(c, Credential) or c.quota_kind not in ('user', 'installation') or not c.key or c.key == '@global-hourly-attempts' or not isinstance(c.token, str) or not c.token or any(ord(x) < 33 or ord(x) > 126 for x in c.token):
                 raise ValueError()
             return c
         except Exception:
@@ -193,6 +225,15 @@ class GitHubActions:
     def _request(self, credential, path, *, redirect=True, metadata=False):
         # All routes are generated locally, including the one-hop numeric alias.
         now = self.clock()
+        capped = self.hourly_request_cap is not None and credential.quota_kind != 'installation'
+        if capped:
+            if self.state_sink is None:
+                raise BudgetPersistenceError('hourly_cap_requires_durable_sink')
+            self._hourly_attempts = [t for t in self._hourly_attempts if t > now - 3600]
+            if len(self._hourly_attempts) >= self.hourly_request_cap:
+                reset = self._hourly_attempts[0] + 3600
+                logging.getLogger(__name__).info('inventory hourly cap incomplete=true reset=%s', reset)
+                raise _Failure('cycle_budget', math.ceil(reset - now))
         if self._cycle_remaining is not None:
             if self._cycle_remaining <= 0:
                 raise _Failure('cycle_budget')
@@ -233,6 +274,8 @@ class GitHubActions:
             if self._cycle_remaining is not None:
                 self._cycle_remaining -= 1
             budget.next_at = max(now, budget.next_at) + self._request_spacing(budget, now)
+        if capped:
+            self._hourly_attempts.append(now)
         reservation = self.export_state()
         reservation[credential.key]['until'] = max(
             budget.until, now + self.timeout + self.backoff_cap)
@@ -264,7 +307,10 @@ class GitHubActions:
         status = response.status
         if metadata and status == 301:
             return response  # canonical.py validates the only admissible next path
-        if status == 301 and redirect and re.fullmatch(r'/repos/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/actions/runners\?per_page=100&page=[1-9][0-9]*', path):
+        # Installation grants name exact repositories; numeric aliases are not
+        # authorized by that allowlist. Fall through to the scope-local moved
+        # cooldown, rather than poisoning the installation bucket on refusal.
+        if status == 301 and redirect and credential.quota_kind != 'installation' and re.fullmatch(r'/repos/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/actions/runners\?per_page=100&page=[1-9][0-9]*', path):
             url = response.body.get('url') if type(response.body) is dict else None
             suffix = path[path.index('/actions/'):]
             match = re.fullmatch(re.escape(self.ENDPOINT) + r'/repositories/([1-9][0-9]*)' + re.escape(suffix), url) if type(url) is str else None
@@ -381,7 +427,9 @@ class GitHubActions:
             rows, total, seen = [], None, set()
             try:
                 s = self._scope(scope)
-                c = self._credential(s)
+                # Observe-only enumeration routing, not metadata or dispatch.
+                ref = self.inventory_credentials.get(s['kind'] + ':' + s['name'].lower())
+                c = self._credential(dict(s, credential_ref=ref) if ref else s)
                 budget = self._budgets.get(c.key)
                 if self.pace_requests and budget and self.clock() + self.pacing_window < budget.next_at:
                     raise _Failure('budget_deferred')

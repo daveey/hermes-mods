@@ -35,6 +35,8 @@ def svc(cfg, path, at):
 def comparable(inv):
     inv = deepcopy(inv)
     inv['meta'].pop('request_id'); inv['meta'].pop('generated_at')
+    for row in inv['meta'].get('inventory_cache', []):
+        row.pop('age_s')  # request-time age, asserted separately below
     return inv
 
 
@@ -46,6 +48,8 @@ def test_unchanged_inputs_reuse_the_decode_and_the_result(env):
     second = svc(cfg, path, 1002).inventory()
     assert len(builds) == 1 and len(decodes) == n  # neither decoded nor built again
     assert comparable(first) == comparable(second)
+    assert first['meta']['inventory_cache'][0]['age_s'] == 1
+    assert second['meta']['inventory_cache'][0]['age_s'] == 2
     assert first['meta']['request_id'] != second['meta']['request_id']
     assert second['meta']['generated_at'] != first['meta']['generated_at']
 
