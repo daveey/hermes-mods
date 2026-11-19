@@ -81,14 +81,13 @@ def test_validation_drop_reasons_are_recorded(home):
 
 
 def test_terminal_handoff_keeps_dropped_semantics_and_gets_reason(home):
-    reply = "The build is staged.\n\nPlease run `make deploy` in the repo."
-    step = {"text": "Run make deploy", "kind": "do", "verbatim_span": "Please run `make deploy` in the repo."}
+    span = "Run `sudo mdutil -i off /Volumes/Assets` on the box so indexing stops."
+    reply = "The build is staged.\n\n" + span
+    step = {"text": "Turn indexing off", "kind": "do", "verbatim_span": span}
     out = run(home, llm_of({"steps": [step]}), reply=reply)
-    if out["dropped"]:  # classifier-dependent; when it fires both views must agree
-        assert out["dropped"] == ["Run make deploy"]
-        assert "terminal_handoff" in reasons(out)
-    else:
-        assert out["diagnostics"]["validation_drops"] == [] or out["steps"] == []
+    assert out["steps"] == []
+    assert out["dropped"] == ["Turn indexing off"]
+    assert reasons(out) == ["terminal_handoff"]
 
 
 def test_dropped_list_unchanged_without_reasons():
@@ -117,6 +116,38 @@ def test_llm_failure_falls_back_with_diag():
         raise TimeoutError("down")
     res = core.extract(REPLY, [], "", boom)
     assert res["source"] == "regex" and "TimeoutError" in res["error"] and "diag" in res
+    assert "model" not in res["diag"]  # nothing was learned from a model that never answered
+
+
+def test_fallback_after_model_answer_preserves_model_diagnostic(monkeypatch):
+    real = core.validate
+
+    def flaky(raw, *a, **kw):
+        if not getattr(flaky, "failed", False):
+            flaky.failed = True
+            kw["reasons"].append({"reason": "partial", "text": "x"})
+            raise RuntimeError("validator broke")
+        return real(raw, *a, **kw)
+    monkeypatch.setattr(core, "validate", flaky)
+    res = core.extract(REPLY, [], "", llm_of({"steps": [STEP, STEP]}))
+    assert res["source"] == "regex" and "RuntimeError" in res["error"]
+    assert res["diag"]["model"] == {"raw_steps": 2, "raw_steps_type": "list",
+                                    "reasons": [{"reason": "partial", "text": "x"}]}
+    assert res["diag"]["raw_steps"] == len(core.regex_steps(REPLY))
+
+
+def test_fallback_model_diagnostic_reaches_process_reply(home, monkeypatch):
+    real = core.validate
+
+    def flaky(raw, *a, **kw):
+        if not getattr(flaky, "failed", False):
+            flaky.failed = True
+            raise RuntimeError("validator broke")
+        return real(raw, *a, **kw)
+    monkeypatch.setattr(core, "validate", flaky)
+    out = run(home, llm_of({"steps": [STEP]}))
+    assert out["source"] == "regex" and out["diagnostics"]["model"] == {
+        "raw_steps": 1, "raw_steps_type": "list", "reasons": []}
 
 
 def test_elsewhere_mapped_reason():
@@ -160,6 +191,28 @@ def test_elsewhere_publication_drop_is_reported(home, monkeypatch):
 def test_skip_reports_reason(home):
     out = run(home, None, reply="Done.")
     assert out["source"] == "skip" and out["diagnostics"] == {"skipped": "not_worth_asking"}
+
+
+def test_held_draft_reports_every_candidate(home):
+    lg = core.Ledger(home / "user-steps", home / "state.db")
+    steps = [{"text": f"Approve the {n} change", "kind": "approve",
+              "verbatim_span": f"Should I apply the {n} change now?"} for n in ("first", "second", "third")]
+    with lg.edit("S1") as d:
+        d["steps"].append({**steps[0], "id": "us_old0000001", "options": [], "status": "resolved", "created": 1,
+                           "session": "S1", "paragraph": steps[0]["verbatim_span"]})
+    reply = "Checks passed.\n\n" + "\n\n".join(x["verbatim_span"] for x in steps)
+    out = run(home, llm_of({"steps": steps}), reply=reply)
+    assert out["text"] == core.HELD_REPLY and out["steps"] == []
+    d = out["diagnostics"]
+    assert d["validated"] == 3 and d["published"] == 0
+    assert sorted((p["reason"], p["text"]) for p in d["publication_drops"]) == sorted([
+        ("retired_action_hold", steps[0]["text"]),
+        ("held_with_retired_action", steps[1]["text"]),
+        ("held_with_retired_action", steps[2]["text"])])
+
+
+def test_system_prompt_directs_more_than_four_options_to_input():
+    assert "more than 4 options" in core.SYSTEM and 'kind "input"' in core.SYSTEM
 
 
 # ---- more than four options ----------------------------------------------------------------------------
