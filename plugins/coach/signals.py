@@ -3072,7 +3072,7 @@ def lane_owns(res: dict) -> bool:
     a = (res or {}).get("action")
     if a == "forwarded":
         return lane_owns(res.get("hub_result") or {})
-    if a == "filed":
+    if a in ("filed", "queued"):
         return True
     return a == "skip" and "COACH_SELFHEAL=off" not in str(res.get("why"))
 

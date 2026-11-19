@@ -645,15 +645,14 @@ def test_pending_pass_stops_at_the_first_renewed_denial(store):
     assert len(left) == 3  # nothing lost by stopping early
 
 
-def test_stale_pending_is_dropped_with_a_skip_event_not_filed_late(store):
+def test_old_pending_is_retained_and_filed_not_deleted_by_age(store):
     old = defect(symptom="old", at=NOW - 8 * 86400)
     fresh = defect(symptom="fresh", at=NOW - 60)
     _queue(store, old, fresh)
     got = []
     sh.retry_deferred(store, now=NOW + 3601, filer=lambda d, **kw: got.append(d["symptom"]) or {"action": "filed"})
-    assert got == ["fresh"]
-    assert any("stale pending" in e["why"] and e["fingerprint"] == old["fingerprint"]
-               for e in ev(store, "selfheal_skip"))
+    assert got == ["fresh", "old"]
+    assert not any("stale pending" in e["why"] for e in ev(store, "selfheal_skip"))
     assert sh.retry_deferred(store, now=NOW + 7200, filer=lambda *a, **k: pytest.fail("resurrected")) == []
 
 
