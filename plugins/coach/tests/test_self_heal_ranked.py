@@ -91,6 +91,47 @@ def test_detector_text_cannot_spoof_bypass():
                                   "symptom": "quota credentials outage billing down"})
 
 
+def test_classifier_concurrent_fold_does_not_overwrite(ranked, monkeypatch):
+    e = ranked
+    d = defect(at=NOW-60)
+    file(e, d)
+    def classify(payload):
+        sh._defer_investigation({**d, "at": NOW, "quote": "new evidence during classification"},
+                               {"retry_at": sh._iso(NOW)}, e.store)
+        return {**payload, "backlog_severity": 4}
+    monkeypatch.setattr(sh, "backlog_classify", classify)
+    assert drain(e, NOW) == []
+    row = pending(e)[d["fingerprint"]]
+    assert row["occurrence_count"] == 2
+    assert row["quote"] == "new evidence during classification"
+    assert not e.board.creates()
+
+
+def test_ranked_rechecks_detector_before_classification(ranked, monkeypatch):
+    e = ranked
+    d = defect(source="signal")
+    file(e, d)
+    seen = []
+    monkeypatch.setattr(sh, "_detector_exempts_now", lambda payload, cache: seen.append(payload) or "now exempt")
+    monkeypatch.setattr(sh, "backlog_classify", lambda _: pytest.fail("exempt evidence classified"))
+    result = drain(e, NOW)
+    assert seen and result == [{"action": "skip", "why": "now exempt"}]
+    assert not pending(e) and not e.board.creates()
+
+
+def test_recurrence_uses_cached_severity(ranked, monkeypatch):
+    e = ranked
+    d = defect(at=NOW)
+    sh.LaneState(e.store.root).update(d["fingerprint"], status="fixed", fixed_at=NOW-8*3600,
+        card="t_previous", gen=1, backlog_evidence={**d, "backlog_severity": 4, "backlog_severity_ready": True})
+    seen = []
+    real = sh.backlog_classify
+    monkeypatch.setattr(sh, "backlog_classify", lambda payload: seen.append(payload) or real(payload))
+    assert file(e, d)["action"] == "queued"
+    assert seen[0]["backlog_severity_ready"] is True and seen[0]["backlog_severity"] == 4
+    assert pending(e)[d["fingerprint"]]["backlog_severity"] == 4
+
+
 def test_concurrent_fold_survives_drain_delete(ranked):
     e = ranked
     d = defect(at=NOW-60)
