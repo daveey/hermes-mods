@@ -204,4 +204,50 @@ test('composed: resolved receipt keeps its queue mounted even when no actionable
   await React.act(async () => root.render(null)); dispose()
 })
 
+test('composed: real openAskKeys bridge reopens same-count replacements and revision changes', async () => {
+  await React.act(async () => root.render(null))
+  steps.resetCanonicalCacheForTests()
+  const first = { ...canonicalRequest, title: 'Synthetic first ask', aliases: [] }
+  const second = { ...first, requestId: '00000000-0000-4000-8000-000000000097', title: 'Synthetic second ask' }
+  const replacement = { ...first, requestId: '00000000-0000-4000-8000-000000000098', title: 'Synthetic replacement ask' }
+  const requests = [first, second]
+  const dispose = wire({ chips: [], items: [], requests, ledgerSteps: [] })
+  const expanded = () => el().querySelector('[data-panel-toggle]')?.getAttribute('aria-expanded')
+  const toggle = async () => React.act(async () => { el().querySelector('[data-panel-toggle]').click(); await flush() })
+  const read = async () => React.act(async () => { await steps.refreshRequests(); await flush() })
+  try {
+    await render('identity-bridge')
+    assert.equal(typeof window.__userSteps.openAskKeys, 'function', 'registered bridge exposes canonical identities')
+    assert.equal(window.__userSteps.openAskCount(), 2)
+    assert.equal(expanded(), 'true')
+    await toggle()
+    assert.equal(expanded(), 'false')
+    requests.reverse()
+    await read()
+    assert.equal(expanded(), 'false', 'same set in a new poll order stays folded')
+    await React.act(async () => { root.render(null); await flush() })
+    await render('identity-bridge-remount')
+    assert.equal(expanded(), 'false', 'the real bridge preserves a deliberate fold on remount')
+    requests.splice(0, requests.length, first, replacement)
+    await read()
+    assert.equal(window.__userSteps.openAskCount(), 2)
+    assert.equal(expanded(), 'true', 'request replacement reopens via the bridge event, without explicit panel render')
+    await toggle()
+    assert.equal(expanded(), 'false')
+    requests.splice(0, requests.length, first, { ...replacement, revision: 2 })
+    await read()
+    assert.equal(window.__userSteps.openAskCount(), 2)
+    assert.equal(expanded(), 'true', 'a new revision reopens even when request ID and count are unchanged')
+    await toggle()
+    await React.act(async () => { root.render(null); await flush() })
+    await render('identity-bridge-revised-remount')
+    assert.equal(expanded(), 'false', 'the revised set can also be deliberately folded and restored')
+  } finally {
+    await React.act(async () => { root.render(null); await flush() })
+    dispose()
+    steps.resetCanonicalCacheForTests()
+    window.localStorage.clear()
+  }
+})
+
 test('done', () => { root.unmount() })
