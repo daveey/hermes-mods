@@ -233,6 +233,21 @@ def test_apply_provenance_idempotent(tmp_path):
     assert first["queued"]
 
 
+@pytest.mark.parametrize("which", ["pending", "lane"])
+def test_unreadable_state_fails_closed(tmp_path, which):
+    st = store(tmp_path)
+    if which == "lane":
+        (st.root / "selfheal_lane.json").write_text("broken json")
+    else:
+        db = sh._pending_db(st)
+        with db:
+            db.execute("INSERT INTO pending VALUES (?, ?, ?, ?)", (FP, "broken json", NOW, "v"))
+        db.close()
+    with pytest.raises(mig.DigestMigrationError, match="pending payload|lane lifecycle"):
+        mig.migrate_digest_backlog(sh, st, inventory=inventory([comment(1)]), prunes={"rows": []}, dry_run=False)
+    assert not (st.root / "selfheal_pending.sqlite.bak").exists()
+
+
 def test_prune_count_and_provenance_fail_closed(tmp_path):
     st = store(tmp_path)
     for prunes in ({"rows": []}, {"rows": [{"fingerprint": FP}]}):

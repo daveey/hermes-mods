@@ -75,7 +75,7 @@ def migrate_digest_backlog(sh, store, inventory=None, prunes=None, dry_run=True,
     provenance = _read_provenance(sh, store)
     existing_keys = list(pending)
     lane = sh.LaneState(store.root)
-    lane_map = lane.read()
+    lane_map = _read_lane(lane)
 
     report = {
         "dry_run": bool(dry_run),
@@ -187,7 +187,7 @@ def migrate_digest_backlog(sh, store, inventory=None, prunes=None, dry_run=True,
                 with lane._locked():
                     if (_read_pending(sh, store) != pending_snapshot
                             or _read_provenance(sh, store) != provenance
-                            or lane.read() != lane_map):
+                            or _read_lane(lane) != lane_map):
                         raise DigestMigrationError("migration snapshot changed; retry dry-run")
                     path = Path(store.root) / PENDING_NAME
                     bak = path.with_suffix(".sqlite.bak")
@@ -429,6 +429,18 @@ def _pending_key(pending: dict, forms: set):
     return None
 
 
+def _read_lane(lane) -> dict:
+    try:
+        data = json.loads(lane.path.read_text())
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as exc:
+        raise DigestMigrationError("unreadable lane lifecycle") from exc
+    if not isinstance(data, dict) or any(not isinstance(v, dict) for v in data.values()):
+        raise DigestMigrationError("invalid lane lifecycle")
+    return data
+
+
 def _read_pending(sh, store) -> dict:
     path = Path(store.root) / PENDING_NAME
     if not path.exists():
@@ -443,8 +455,10 @@ def _read_pending(sh, store) -> dict:
                 "SELECT fp, payload, retry, version FROM pending"):
             try:
                 data = json.loads(payload)
-            except ValueError:
-                data = {}
+            except ValueError as exc:
+                raise DigestMigrationError(f"invalid pending payload: {fp}") from exc
+            if not isinstance(data, dict):
+                raise DigestMigrationError(f"invalid pending payload: {fp}")
             out[fp] = {"payload": data, "retry": retry, "version": version}
         return out
     finally:
