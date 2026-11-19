@@ -58,8 +58,8 @@ gateway only; cards cover every gateway.
 
 ## Throttle and runway
 
-`GET /v1/throttle` returns `{percent, reference_per_s, cap_per_s, rate_per_s, holding, set_at, set_by, scope, fleet,
-gateways, pools, now}`; `PUT /v1/throttle` with `{"percent": 0..100}` sets the level; any other `percent` is a 400
+`GET /v1/throttle` returns `{percent, reference_per_s, cap_per_s, rate_per_s, holding, set_at, set_by, mode, budget,
+scope, fleet, gateways, pools, now}`; `PUT /v1/throttle` with `{"percent": 0..100}` sets the level; any other `percent` is a 400
 and a body that is not a JSON object a 422, and neither changes anything.
 
 - **Level**: 0 = no cap, 100 = a cap of zero, between = `(1 - percent/100) x reference_per_s`, where the reference is
@@ -128,6 +128,32 @@ and a body that is not a JSON object a 422, and neither changes anything.
   held at all: core fires the hook synchronously for async callers, and a hold would freeze the server's event
   loop, including the route that lowers the level. The dispatcher's admission judge (`hub_admission`) is never
   held, and neither is the max-iterations summary, which calls the provider directly.
+- **Budget mode** (`mode: "auto"`). On the host whose core config sets `kanban.llm_pacing.budget_publish: true` (the
+  hub; read like core's dispatcher reads `kanban.llm_pacing`), the sampler reads core's capacity model (`v2` in
+  `<kanban home>/llm_pacing.json`) once a minute and writes the level as `{"mode": "auto", "percent", "cap_per_s":
+  v2.global_rate_tokens_per_s, "pool_caps": {provider: rate_tokens_per_s, 0 when at_reserve, null when the rate is
+  unknown}, "budget_at": v2.computed_at, "set_at"}`. It keeps the fleet's `percent` (the newest level any gateway
+  set, so a slider moved anywhere is folded in on the next pass) and rewrites only when that level is not its own
+  budget, when any cap moves by more than 5 %, or 15 minutes after its last write; a missing or malformed `v2` writes
+  nothing, and any other host never writes. Its `set_at` is the obeyed level's plus 1 ms, not the clock, so a newer
+  slider setting elsewhere still outranks it until it is folded in. The level travels like any other (hub client
+  1.9.55 or newer carries `mode`, `budget_at` and `pool_caps`).
+  - **Caps**: every budget cap is scaled by the slider, `budget x (1 - percent/100)`: 0 % is the full budget, 100 %
+    holds every throttled call. `cap_per_s` in the payload is the scaled global cap; `budget` is `{state, budget_at,
+    age_s, budget_per_s, cap_per_s, pool_caps}` (`null` for a slider level), `mode` is `auto` or `manual`.
+  - **Calls**: a card or cron call is paced at its own pool's cap (core's middleware context `provider`), with the
+    same share and tokens-per-call as above and its own slot in the pace file (`pools.<provider>`). A pool cap of 0
+    holds the call; `null` (rate unknown) passes; a provider without a pool cap (or a call naming none) passes,
+    ungoverned. Chats pass as always.
+  - **Card starts** hold while the measured fleet rate is over the scaled global cap (none while the global rate is
+    unknown).
+  - **Stale budget**: `budget.state` is `fresh` up to 20 minutes after `budget_at`, `stale` (caps kept) up to 60
+    minutes, then `expired`: no global or pool cap from it, every call and start passes (fail open), except at
+    100 %. The panel shows `Budget −p% · cap …`, with "budget stale … keeping last caps" or "budget expired … no
+    cap".
+  - A level without `mode` (or `mode: "manual"`) is the slider level above, unchanged, whatever other fields it has.
+  - Tests: `tests/test_throttle_budget.py`; panel text `desktop-plugins/throughput/tests/throughput.test.mjs`.
+    **Not tested**: a real publish through two hub links, and a live core passing `provider` to the middleware.
 - **Fail open**: an unreadable level, a missing series db or replica, or a failed read never holds a call. A core
   without `register_middleware` shows the slider but enforces nothing.
 - **Not covered by tests**: the middleware and the hook inside a live core agent loop (the tests call the registered

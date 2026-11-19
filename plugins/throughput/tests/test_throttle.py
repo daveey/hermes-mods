@@ -107,7 +107,8 @@ def test_status(tmp_path):
     db = _series(tmp_path, [("hub", bucket, 900_000.0), ("hub", END - 60, 48_000.0)])  # peak 1000/s, now 800/s
     assert T.status(tmp_path, db, NOW) == {"percent": 0.0, "reference_per_s": pytest.approx(1000.0),
                                            "cap_per_s": None, "rate_per_s": pytest.approx(800.0), "holding": False,
-                                           "set_at": None, "set_by": None}  # never set, by no one
+                                           "set_at": None, "set_by": None, "mode": "manual",
+                                           "budget": None}  # never set, by no one
     T.write_level(tmp_path, 10)
     assert T.status(tmp_path, db, NOW)["cap_per_s"] == pytest.approx(900.0)
     assert T.status(tmp_path, db, NOW)["holding"] is False

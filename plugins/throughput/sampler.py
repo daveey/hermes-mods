@@ -639,6 +639,12 @@ def _loop(stop: threading.Event, root: Path) -> None:
                 log.exception("throughput: tick failed")
             try:
                 from . import throttle
+                # the budget-publish host turns core's capacity model into the fleet level (throttle.py)
+                throttle.publish_budget_if_enabled(root, throttle.hub_db_path())
+            except Exception:
+                log.exception("throughput: budget publication failed")
+            try:
+                from . import throttle
                 throttle.note_seen(root, throttle.hub_db_path())  # acknowledge the fleet level this gateway obeys
             except Exception:
                 log.exception("throughput: throttle acknowledgement failed")

@@ -614,3 +614,22 @@ test('register: chip right after Runners, palette entry, CSS removed on dispose'
   dispose()
   assert.ok(![...document.head.querySelectorAll('style')].some((s) => s.textContent.includes('.hermes-tp-chart')))
 })
+
+test('budget mode: the slider scales the published budget; stale and expired budgets say so', () => {
+  const auto = (over = {}) => throttle({
+    mode: 'auto', percent: 0, cap_per_s: 10, holding: false,
+    budget: { state: 'fresh', budget_at: END - 60, age_s: 60, budget_per_s: 10, cap_per_s: 10, pool_caps: { anthropic: 4 } },
+    ...over
+  })
+  assert.equal(P.throttleText(auto(), 's'), 'Budget · cap 10 tok/s') // 0 % is the full budget, not "off"
+  assert.equal(P.throttleText(auto({ percent: 25, cap_per_s: 7.5, holding: true }), 'm'), 'Budget −25% · cap 450 tok/m · over the cap, holding card starts')
+  assert.equal(P.throttleText(auto({ percent: 100, cap_per_s: 0 }), 'm'), 'Budget −100% · holding every call')
+  assert.equal(P.throttleText(auto({ budget: { state: 'stale', age_s: 1800, budget_per_s: 10 } }), 's'), 'Budget · cap 10 tok/s · budget stale (30 min old), keeping last caps')
+  assert.equal(P.throttleText(auto({ cap_per_s: null, budget: { state: 'expired', age_s: 7200, budget_per_s: 10 } }), 's'), 'Budget · budget expired (2.0 h old), no cap')
+  assert.equal(P.throttleText(auto({ cap_per_s: null, budget: { state: 'fresh', age_s: 60, budget_per_s: null } }), 's'), 'Budget · cap none tok/s')
+  // preview: (1 - p) x the budget; 100 = zero; an expired budget previews no cap
+  assert.equal(P.previewThrottle(auto(), 0).cap_per_s, 10)
+  assert.equal(P.previewThrottle(auto(), 40).cap_per_s, 6)
+  assert.equal(P.previewThrottle(auto(), 100).cap_per_s, 0)
+  assert.equal(P.previewThrottle(auto({ budget: { state: 'expired', budget_per_s: 10 } }), 40).cap_per_s, null)
+})

@@ -38,12 +38,22 @@
   panel route that lowers the level. The dispatcher's admission judge (``AUX_NOT_HELD``) is never held.
 * Fail open: an unreadable level, no cap, or no measured rate never holds a call. Only 100 % holds without a
   rate.
+* Budget mode (``mode: "auto"``): on the host whose core config sets ``kanban.llm_pacing.budget_publish`` the
+  sampler turns core's capacity model (``llm_pacing.json`` ``v2``) into the level once a minute
+  (``publish_budget``): ``cap_per_s`` is the fleet budget (``global_rate_tokens_per_s``) and ``pool_caps`` each
+  provider pool's (0 at reserve, None while its rate is unknown), stamped ``budget_at`` = ``v2.computed_at``. The
+  slider's ``percent`` stays the user's and scales every budget cap: ``budget x (1 - percent/100)``. Model calls
+  are paced per pool (``Gate.plan`` with the call's ``provider``): a pool cap of 0 holds, None or a provider without
+  a pool cap passes. Card starts hold while the fleet rate is over the scaled global cap. A budget older than
+  ``BUDGET_STALE_S`` is stale (caps kept), older than ``BUDGET_EXPIRE_S`` expired: no cap from it (fail open). A
+  level without ``mode`` (or ``mode: "manual"``) is the slider level above, unchanged.
 """
 from __future__ import annotations
 
 import json
 import logging
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -74,6 +84,12 @@ AUX_HOOK_TIMEOUT_S = 600.0  # core's ceiling for one hook callback (``hermes_hoo
 AUX_HOLD_MAX_S = 540.0  # return before that ceiling: a timed-out callback is suppressed for a minute
 AUX_NOT_HELD = frozenset({"hub_admission"})
 REFERENCE_TTL_S = 600.0  # the 24-hour peak moves slowly and its scan is the expensive read
+AUTO = "auto"  # a level whose caps are the published budget (``publish_budget``); anything else is the slider's
+BUDGET_STALE_S = 20 * 60.0  # a budget computed longer ago than this is stale: its caps are kept, flagged
+BUDGET_EXPIRE_S = 60 * 60.0  # ... and longer ago than this, expired: no cap from it (fail open)
+BUDGET_REWRITE_S = 15 * 60.0  # the publisher rewrites an unchanged budget this often (under BUDGET_STALE_S)
+BUDGET_MOVE = 0.05  # ... and at once when any cap moves by more than this fraction
+PROVIDER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}")  # a pool key: the hub client's rule too
 
 
 def level_path(root: Path) -> Path:
@@ -106,13 +122,34 @@ def stamp(value) -> float:
     return 0.0 if number is None else round(number, 3)
 
 
+def provider_name(key) -> bool:
+    """A pool key the throttle accepts: a short plain provider name (``anthropic``, ``openai-codex``)."""
+    return isinstance(key, str) and PROVIDER_RE.fullmatch(key) is not None
+
+
+def pool_caps_of(raw) -> dict[str, Optional[float]]:
+    """``{provider: tokens/s or None}`` from a stored or published ``pool_caps``: entries with a bad key, or a value
+    that is neither None nor a finite number >= 0, are dropped; anything but a map is ``{}``."""
+    out: dict[str, Optional[float]] = {}
+    for key, value in (raw.items() if isinstance(raw, dict) else ()):
+        number = _number(value)
+        if not provider_name(key) or (value is not None and (number is None or number < 0)):
+            continue
+        out[key] = number
+    return out
+
+
 def _record(data) -> Optional[dict]:
-    """``{percent, cap_per_s, set_at}`` from a stored or published level; None when it is not one."""
+    """``{percent, cap_per_s, set_at}`` from a stored or published level (plus ``mode``, ``budget_at`` and
+    ``pool_caps`` for a budget level, ``mode: "auto"``); None when it is not one."""
     if not isinstance(data, dict) or _number(data.get("percent")) is None:
         return None
     limit = _number(data.get("cap_per_s"))
-    return {"percent": clamp(data.get("percent")), "cap_per_s": None if limit is None else max(0.0, limit),
-            "set_at": stamp(data.get("set_at"))}
+    rec = {"percent": clamp(data.get("percent")), "cap_per_s": None if limit is None else max(0.0, limit),
+           "set_at": stamp(data.get("set_at"))}
+    if data.get("mode") == AUTO:
+        rec.update(mode=AUTO, budget_at=_number(data.get("budget_at")), pool_caps=pool_caps_of(data.get("pool_caps")))
+    return rec
 
 
 def _read_json(path: Path):
@@ -304,10 +341,36 @@ def fleet_rate(series_db: Path, now: float) -> Optional[float]:
     return sum(minutes.values()) / (len(minutes) * 60.0) if minutes else None
 
 
-def limit_of(level: dict, reference: Optional[float]) -> Optional[float]:
+def budget(level: dict, now: float) -> Optional[dict]:
+    """What a budget level (``mode: "auto"``) caps right now; None for a slider level. ``state`` is ``fresh``,
+    ``stale`` (older than ``BUDGET_STALE_S``: the caps are kept) or ``expired`` (older than ``BUDGET_EXPIRE_S``, or
+    no ``budget_at``: no cap, fail open). ``cap_per_s`` and ``pool_caps`` are scaled by the slider,
+    ``budget x (1 - percent/100)``; ``budget_per_s`` is the unscaled fleet budget."""
+    if level.get("mode") != AUTO:
+        return None
+    at = level.get("budget_at")
+    age = None if at is None else now - at
+    state = "expired" if age is None or age > BUDGET_EXPIRE_S else "stale" if age > BUDGET_STALE_S else "fresh"
+    out = {"state": state, "budget_at": at, "age_s": age, "budget_per_s": level.get("cap_per_s"),
+           "cap_per_s": None, "pool_caps": {}}
+    if state == "expired":
+        return out
+    scale = 1.0 - clamp(level["percent"]) / 100.0
+    if level.get("cap_per_s") is not None:
+        out["cap_per_s"] = level["cap_per_s"] * scale
+    out["pool_caps"] = {p: None if v is None else v * scale for p, v in (level.get("pool_caps") or {}).items()}
+    return out
+
+
+def limit_of(level: dict, reference: Optional[float], now: Optional[float] = None) -> Optional[float]:
     """The cap in tokens/s a level means: the one stored with it, else (a level stored without one) the cap against
-    this gateway's own reference."""
+    this gateway's own reference. A budget level: its scaled global budget (None when expired or unknown), and 0 at
+    100 %."""
     percent = level["percent"]
+    if level.get("mode") == AUTO:
+        if percent >= 100:
+            return 0.0
+        return budget(level, time.time() if now is None else now)["cap_per_s"]
     if 0 < percent < 100 and level.get("cap_per_s") is not None:
         return level["cap_per_s"]
     return cap(percent, reference)
@@ -318,10 +381,11 @@ def status(root: Path, series_db: Path, now: Optional[float] = None, hub_db: Opt
     level = effective(root, hub_db, now)
     percent = level["percent"]
     reference, rate = reference_rate(series_db, now), fleet_rate(series_db, now)
-    limit = limit_of(level, reference)
+    limit = limit_of(level, reference, now)
     holding = percent >= 100 or (limit is not None and rate is not None and rate > limit)
     return {"percent": percent, "reference_per_s": reference, "cap_per_s": limit, "rate_per_s": rate,
-            "holding": holding, "set_at": level["set_at"] or None, "set_by": level["source"]}
+            "holding": holding, "set_at": level["set_at"] or None, "set_by": level["source"],
+            "mode": level.get("mode") or "manual", "budget": budget(level, now)}
 
 
 def pace_path(root: Path) -> Path:
@@ -436,18 +500,34 @@ class Pacer:
             ready = max(ready, booked)
         return ready
 
-    def try_take(self, now: float, interval: float) -> float:
-        """Start a call now if ``interval`` has passed since the last start: 0.0 (granted; the start is stamped and
-        counted in the minute of ``now``), else the seconds left. Nothing is booked while a call waits, so a waiter
-        that gives up, fails or dies leaves no slot behind, and a shorter interval applies at once.
-        ``next_at`` is still written for an older process sharing the file: it books its slot after this start."""
+    @staticmethod
+    def _slot(state: dict, pool: Optional[str]) -> dict:
+        """Where a call's start is stamped: the file itself, or a budget pool's own entry under ``pools`` (each
+        pool is paced at its own cap; an older process ignores the key)."""
+        if pool is None:
+            return state
+        pools = state.get("pools")
+        if not isinstance(pools, dict):
+            pools = state["pools"] = {}
+        slot = pools.get(pool)
+        if not isinstance(slot, dict):
+            slot = pools[pool] = {}
+        return slot
+
+    def try_take(self, now: float, interval: float, pool: Optional[str] = None) -> float:
+        """Start a call now if ``interval`` has passed since the last start (of ``pool``'s calls, when given): 0.0
+        (granted; the start is stamped and counted in the minute of ``now``), else the seconds left. Nothing is
+        booked while a call waits, so a waiter that gives up, fails or dies leaves no slot behind, and a shorter
+        interval applies at once. ``next_at`` is still written for an older process sharing the file: it books its
+        slot after this start."""
         def take(state):
-            self.clamp_stamps(state, now, interval)
-            ready = self.ready_at(state, now, interval)
+            slot = self._slot(state, pool)
+            self.clamp_stamps(slot, now, interval)
+            ready = self.ready_at(slot, now, interval)
             if now < ready:
                 return ready - now
-            state["last_start"] = now
-            state["next_at"] = state["granted_next_at"] = now + max(0.0, interval)
+            slot["last_start"] = now
+            slot["next_at"] = slot["granted_next_at"] = now + max(0.0, interval)
             self._count(state, now, now)
             return 0.0
         return self._locked(take)
@@ -500,12 +580,16 @@ class Gate:
             self._rate = (now, share, tokens)
         return share, tokens
 
-    def plan(self, now: float) -> tuple:
-        """``("pass",)``, ``("hold",)`` (100 %, or a cap of zero) or ``("pace", seconds between calls, set_at)``.
-        Off and fully on read only the level; a level in between reads the series. Any failed read passes."""
+    def plan(self, now: float, provider: Optional[str] = None) -> tuple:
+        """``("pass",)``, ``("hold",)`` (100 %, or a cap of zero) or ``("pace", seconds between calls, set_at)``
+        (``("pace", seconds, set_at, pool)`` for a budget pool). Off and fully on read only the level; a level in
+        between reads the series. Any failed read passes. A budget level paces the call's ``provider`` pool: cap 0
+        holds, None (rate unknown), no pool cap for it, or an expired budget passes."""
         try:
             level = effective(self.root, self.hub_db, now)
             percent = level["percent"]
+            if level.get("mode") == AUTO:
+                return self._budget_plan(level, now, provider)
             if percent <= 0:
                 return ("pass",)
             if percent >= 100:
@@ -522,12 +606,28 @@ class Gate:
             log.debug("throughput throttle: plan failed", exc_info=True)
             return ("pass",)
 
+    def _budget_plan(self, level: dict, now: float, provider: Optional[str]) -> tuple:
+        if level["percent"] >= 100:
+            return ("hold",)
+        caps = budget(level, now)["pool_caps"]
+        limit = caps.get(provider) if isinstance(provider, str) else None
+        if limit is None:
+            return ("pass",)  # an ungoverned provider, a pool whose rate is unknown, or no budget: fail open
+        if limit <= 0:
+            return ("hold",)  # the pool is at reserve (or the slider takes it all)
+        share, tokens = self._share_and_tokens(now)
+        allowed = share * limit
+        if allowed <= 0:
+            return ("hold",)
+        return ("pace", min(MAX_INTERVAL_S, tokens / allowed), level["set_at"], provider)
+
     def holding(self) -> bool:
         """True while every call waits (100 %); a paced level is not a hold."""
         return self.plan(self._clock())[0] == "hold"
 
     def wait(self, *, beat: Optional[Callable[[float], None]] = None,
-             stop: Optional[Callable[[], bool]] = None, max_s: Optional[float] = None) -> float:
+             stop: Optional[Callable[[], bool]] = None, max_s: Optional[float] = None,
+             provider: Optional[str] = None) -> float:
         """Block until this call may start; returns the seconds waited. ``beat(waited)`` runs every poll (the
         caller's liveness report), ``stop()`` true or ``max_s`` reached ends the wait early. A waiting call re-reads
         the level every poll: lowering it releases the call. Grant-at-start: a paced call asks ``Pacer.try_take``
@@ -536,7 +636,7 @@ class Gate:
         announced = False
         while True:
             now = self._clock()
-            plan = self.plan(now)
+            plan = self.plan(now) if provider is None else self.plan(now, provider)
             if plan[0] == "pass":
                 try:
                     self._pacer.note(now)  # it starts now: counted, so tokens-per-call stays measured
@@ -545,7 +645,8 @@ class Gate:
                 break
             if plan[0] == "pace":
                 try:
-                    left = self._pacer.try_take(now, plan[1])
+                    left = (self._pacer.try_take(now, plan[1]) if len(plan) < 4
+                            else self._pacer.try_take(now, plan[1], plan[3]))
                 except Exception:  # fail open: an unwritable pace file must never stall a model call
                     log.debug("throughput throttle: pace file unusable", exc_info=True)
                     break
@@ -611,11 +712,12 @@ class Gate:
             agent = agent_of(next_call)
         except Exception:  # an odd callable: wait without liveness reports rather than skip the hold
             agent = None
+        provider = context.get("provider")
         if agent is None:
-            self.wait(beat=_card_heartbeat)
+            self.wait(beat=_card_heartbeat, provider=provider)
         else:
             self.wait(beat=lambda waited: agent._touch_activity(f"token throttle: waiting ({waited:.0f}s)"),
-                      stop=lambda: bool(getattr(agent, "_interrupt_requested", False)))
+                      stop=lambda: bool(getattr(agent, "_interrupt_requested", False)), provider=provider)
         return next_call(request)
 
     def aux_hold(self, aux_task=None, platform=None, **_payload) -> None:
@@ -624,9 +726,90 @@ class Gate:
         card environment decides."""
         if str(aux_task or "") in AUX_NOT_HELD or self._exempt(platform):
             return
-        self.wait(beat=_card_heartbeat, max_s=AUX_HOLD_MAX_S)
+        self.wait(beat=_card_heartbeat, max_s=AUX_HOLD_MAX_S, provider=_payload.get("provider"))
 
     aux_hold.hermes_hook_timeout = AUX_HOOK_TIMEOUT_S
+
+
+# --- the budget publisher: core's capacity model -> the fleet level (one host, the sampler, once a minute) -----
+
+def budget_publisher() -> bool:
+    """Whether this host publishes the budget: core config ``kanban.llm_pacing.budget_publish`` is true (read the
+    way core's dispatcher reads its pacing section). False outside a Hermes runtime or on any unreadable config."""
+    try:
+        from hermes_cli.kanban_model_tier import load_tier_config
+        section = load_tier_config()
+    except Exception:  # an older core without the tier loader
+        try:
+            from hermes_cli.config import load_config
+            section = (load_config() or {}).get("kanban")
+        except Exception:
+            return False
+    pacing = section.get("llm_pacing") if isinstance(section, dict) else None
+    return isinstance(pacing, dict) and pacing.get("budget_publish") is True
+
+
+def budget_of_v2(v2) -> Optional[dict]:
+    """``{cap_per_s, pool_caps, budget_at}`` from core's ``llm_pacing.json`` ``v2``; None when it is missing or
+    malformed (no finite ``computed_at``, ``pools`` not a map, a global rate that is neither None nor a number >= 0).
+    A pool at reserve caps at 0; a pool whose rate is unknown (or unreadable) is None; a bad pool key is skipped."""
+    if not isinstance(v2, dict):
+        return None
+    at, pools, total = _number(v2.get("computed_at")), v2.get("pools"), v2.get("global_rate_tokens_per_s")
+    if at is None or at <= 0 or not isinstance(pools, dict):
+        return None
+    if total is not None and (_number(total) is None or total < 0):
+        return None
+    caps: dict[str, Optional[float]] = {}
+    for provider, entry in pools.items():
+        if not provider_name(provider) or not isinstance(entry, dict):
+            continue
+        rate = _number(entry.get("rate_tokens_per_s"))
+        caps[provider] = 0.0 if entry.get("at_reserve") is True else (None if rate is None or rate < 0 else rate)
+    return {"cap_per_s": None if total is None else float(total), "pool_caps": caps, "budget_at": at}
+
+
+def _moved(old: Optional[float], new: Optional[float]) -> bool:
+    if old is None or new is None:
+        return (old is None) != (new is None)
+    return abs(new - old) > BUDGET_MOVE * abs(old) if old else new != 0
+
+
+def publish_budget(root: Path, hub_db: Optional[Path], pacing_file: Path, now: Optional[float] = None) -> bool:
+    """Write the budget into this host's level file (``mode: "auto"``); True when it wrote. Keeps the fleet's
+    ``percent`` (the newest level any gateway set). Rewrites only when the level it obeys is not its own budget
+    (a slider moved somewhere), any cap moved by more than ``BUDGET_MOVE``, or ``BUDGET_REWRITE_S`` passed since
+    the last write. A missing or malformed ``v2`` writes nothing. ``set_at`` is the obeyed level's plus 1 ms, not
+    the clock: a newer slider setting on another gateway then still outranks this write until it is folded in."""
+    now = time.time() if now is None else now
+    data = _read_json(pacing_file)
+    new = budget_of_v2(data.get("v2") if isinstance(data, dict) else None)
+    if new is None:
+        return False
+    level = effective(root, hub_db, now)
+    path = level_path(root)
+    if level["source"] is None and level.get("mode") == AUTO:
+        try:
+            age = now - path.stat().st_mtime
+        except OSError:
+            age = BUDGET_REWRITE_S
+        old = level.get("pool_caps") or {}
+        moved = (_moved(level.get("cap_per_s"), new["cap_per_s"]) or set(old) != set(new["pool_caps"])
+                 or any(_moved(old[p], v) for p, v in new["pool_caps"].items()))
+        if not moved and age < BUDGET_REWRITE_S:
+            return False
+    set_at = stamp(level["set_at"] + 0.001) if level["set_at"] > 0 else stamp(now)
+    _write_json(path, {"mode": AUTO, "percent": level["percent"], "cap_per_s": new["cap_per_s"],
+                       "pool_caps": new["pool_caps"], "budget_at": round(new["budget_at"], 3), "set_at": set_at})
+    return True
+
+
+def publish_budget_if_enabled(root: Path, hub_db: Optional[Path], now: Optional[float] = None) -> bool:
+    """The sampler's once-a-minute step: publish only on the budget-publish host."""
+    if not budget_publisher():
+        return False
+    from .runway import pacing_path
+    return publish_budget(root, hub_db, pacing_path(root), now)
 
 
 CARD_ENV = ("HERMES_KANBAN_TASK", "HERMES_KANBAN_WORKER_TASK")

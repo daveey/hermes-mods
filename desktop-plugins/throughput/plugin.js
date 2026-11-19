@@ -168,7 +168,14 @@ export function capRate(throttle, unit) {
 }
 
 // What the level would cap at, before the server confirms it (the slider's live label and line while dragging).
+// Budget mode scales the published fleet budget instead: 0 % is the full budget, an expired budget caps nothing.
 export function previewThrottle(throttle, percent) {
+  if (throttle?.mode === 'auto') {
+    const b = throttle.budget || {}
+    const full = b.state === 'expired' ? null : b.budget_per_s
+    const cap_per_s = percent >= 100 ? 0 : full == null ? null : (1 - percent / 100) * full
+    return { ...throttle, percent, cap_per_s }
+  }
   const ref = throttle?.reference_per_s
   const cap_per_s = percent <= 0 ? null : percent >= 100 ? 0 : ref == null ? null : (1 - percent / 100) * ref
   return { ...(throttle || {}), percent, cap_per_s }
@@ -226,7 +233,23 @@ export function scopeTitle(throttle) {
   return `${by}${lag}${waiting.length && throttle.set_at != null ? ` Not acknowledged yet: ${waiting.join(', ')}.` : ''}`
 }
 
+// Budget mode: the caps are the quota budget the hub publishes, scaled down by the slider. A budget 20-60 min old is
+// stale (its caps are kept); older, it is expired and caps nothing (fail open).
+export function budgetText(throttle, unit) {
+  const p = Math.round(throttle?.percent ?? 0)
+  const b = throttle?.budget || {}
+  const head = p > 0 ? `Budget \u2212${p}%` : 'Budget'
+  const age = b.age_s == null ? '' : ` (${fmtDuration(b.age_s)} old)`
+  if (p >= 100) return `${head} \u00b7 holding every call`
+  if (b.state === 'expired') return `${head} \u00b7 budget expired${age}, no cap`
+  const cap = capRate(throttle, unit)
+  const stale = b.state === 'stale' ? ` \u00b7 budget stale${age}, keeping last caps` : ''
+  const over = throttle?.holding ? ' \u00b7 over the cap, holding card starts' : ''
+  return `${head} \u00b7 cap ${cap == null ? 'none' : fmt(cap)} tok/${unit}${stale}${over}`
+}
+
 export function throttleText(throttle, unit) {
+  if (throttle?.mode === 'auto') return budgetText(throttle, unit)
   const p = Math.round(throttle?.percent ?? 0)
   if (p <= 0) return 'Throttle off'
   const cap = capRate(throttle, unit)
