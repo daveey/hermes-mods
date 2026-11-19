@@ -45,3 +45,7 @@ HERMES_DESKTOP_DIR=/path/to/desktop node --test desktop-plugins/session-panel/te
 ```
 
 Historical incidents require live or preserved renderer state for exact attribution; these regressions establish the visibility failure and its correction, not the cause of every previously red chat.
+
+## Waiting is folded to counts
+
+The **Waiting** section shows only its heading by default: `Waiting · N` followed by what the rows wait on, `P on parent · S on schedule · U unknown` (plus `· K other` when a row fits none, such as a card in triage). Clicking the heading opens the rows for that chat; the choice is not kept across chats or relaunches. *On parent* = a `todo` card or one waiting on another card; *on schedule* = a scheduled card or any other named wait (timer, CI run, deploy); *unknown* = the row's status could not be read (stale read, missing or expired evidence, a sub-agent or process without evidence), never guessed from its last known state. The status row of a still-blocked card whose request was retired stays visible while folded, because nothing else shows it.

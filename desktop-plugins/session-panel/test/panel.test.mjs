@@ -548,6 +548,7 @@ test('rows lead with their state box, not a dot; hub cards carry the H there too
     card('t_w_wait', 'scheduled', { runMachine: 'worker-1' })
   ] })
   await show(React.createElement(m.Panel, { key: 'row-pips' }))
+  await React.act(async () => el().querySelector('[data-waiting-toggle]').click())
   const rows = [...el().querySelectorAll('[data-panel-row]')]
   assert.ok(rows.length >= 4)
   assert.ok(!rows.some(r => r.textContent.includes('●')), 'no bullet dots left in rows')
@@ -559,6 +560,47 @@ test('rows lead with their state box, not a dot; hub cards carry the H there too
   assert.equal(el().querySelectorAll('[data-pip]').length, 4, 'header pips unchanged by row marks')
 })
 
+
+test('waitKind sorts waiting rows into parent, schedule, unknown and other', () => {
+  const out = m.classify([
+    card('t_sched', 'scheduled', { look: 'waiting', waitingOn: 'ci https://github.com/o/r/actions/runs/1' }),
+    card('t_bare', 'scheduled'),
+    card('t_card', 'scheduled', { look: 'waiting', waitingOn: 'card t_x on hub' }),
+    card('t_gone', 'running', { stale: true }),
+    card('t_triage', 'triage', { look: 'waiting', waitingOn: 'triage' }),
+    { key: 'sub:a', kind: 'sub', label: 'Legacy sub-agent' }
+  ], { nowMs: NOW })
+  assert.deepEqual(Object.fromEntries(out.waiting.map(i => [i.key, m.waitKind(i)])),
+    { 'kb:t_sched': 'schedule', 'kb:t_bare': 'schedule', 'kb:t_card': 'parent', 'kb:t_gone': 'unknown', 'kb:t_triage': 'other', 'sub:a': 'unknown' })
+  // A todo card reaches Waiting only through a fresh board read; it waits on its parents.
+  assert.equal(m.waitKind({ kind: 'kanban', detail: 'todo · board status', chip: { state: 'todo' } }), 'parent')
+  assert.equal(m.waitKind({ kind: 'kanban', detail: 'status unknown (missing qualified identity) · last known: running', chip: { state: 'running' } }), 'unknown',
+    'a status-unknown row is never guessed from its last known state')
+  assert.equal(m.waitBreakdown(out.waiting).text, '1 on parent · 2 on schedule · 2 unknown · 1 other')
+  assert.equal(m.waitBreakdown(out.waiting.filter(i => i.key === 'kb:t_gone')).text, '0 on parent · 0 on schedule · 1 unknown', 'other shows only when non-zero')
+})
+
+test('panel: Waiting is folded to counts by default and opens per chat', async () => {
+  window.localStorage.clear()
+  bridges({ chips: [
+    card('t_w1', 'scheduled', { look: 'waiting', waitingOn: 'clock 11:00', label: 'Timer card' }),
+    card('t_w2', 'scheduled', { look: 'waiting', waitingOn: 'card t_x', label: 'Child card' }),
+    card('t_w3', 'running', { stale: true, label: 'Lost card' })
+  ] })
+  await show(React.createElement(m.Panel, { key: 'waiting-fold' }))
+  const toggle = () => el().querySelector('[data-waiting-toggle]')
+  assert.equal(el().querySelector('[data-section="waiting"]').textContent, 'Waiting · 3')
+  assert.equal(el().querySelector('[data-waiting-breakdown]').textContent, '1 on parent · 1 on schedule · 1 unknown')
+  assert.equal(toggle().getAttribute('aria-expanded'), 'false')
+  assert.equal(el().querySelectorAll('[data-row-pip="waiting"]').length, 0, 'no waiting rows while folded')
+  assert.doesNotMatch(el().querySelector('[data-panel-body]').textContent, /Timer card|Child card|Lost card/)
+  await React.act(async () => toggle().click())
+  assert.equal(toggle().getAttribute('aria-expanded'), 'true')
+  assert.equal(el().querySelectorAll('[data-row-pip="waiting"]').length, 3)
+  assert.match(el().textContent, /Timer card/)
+  await React.act(async () => toggle().click())
+  assert.equal(el().querySelectorAll('[data-row-pip="waiting"]').length, 0)
+})
 
 // [daveey] Switching chats shows the panel at once: last-known data paints first, reads replace it.
 test('panel: a chat whose runtime id has not landed yet (resume) still shows its cards', async () => {

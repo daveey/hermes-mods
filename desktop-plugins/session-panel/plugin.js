@@ -15,7 +15,8 @@
  *                last-known copy after a failed read) is never stuck or needs-you: it lists under Waiting as
  *                "status unknown", since the card may have been answered or archived since
  *   In progress  running and in-review cards, sub-agents, background processes, rented machines
- *   Waiting      parked cards and what they wait on
+ *   Waiting      parked cards and what they wait on; folded by default to counts (on parent / on schedule /
+ *                unknown), opened per chat
  *   footer       open ready/not-yet-started cards, then a per-chat finished-history disclosure
  * collapsed    the header line alone (caret + counts, needs-you in red) plus one line per waiting card (up to 3);
  *                the header is the composer status stack's own disclosure row (caret, icon, label), so this panel
@@ -33,7 +34,7 @@ import { useEffect, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'session-panel'
-const VERSION = 'session-panel-v4-reported-closed'
+const VERSION = 'session-panel-v5-waiting-folded'
 export const STUCK_CARD_S = 2 * 3600 // running card with no event this long
 export const STUCK_SUB_MS = 30 * 60_000 // sub-agent with no new tool call this long
 const DONE_POLL_MS = 30_000
@@ -347,6 +348,27 @@ export function classify(chips, { nowMs = Date.now(), silence = new Map(), isAsk
     out.waiting.push({ ...item(c), detail: on || (c.state === 'scheduled' ? 'scheduled' : c.state === 'unknown' ? 'status unknown' : c.state) })
   }
   return out
+}
+
+/** What a Waiting row waits on, for the folded section's counts: `parent` (another card must finish first),
+ *  `schedule` (a timer, CI run, deploy or other scheduled wake), `unknown` (its status could not be read), else
+ *  `other` (triage, a retired ask's blocked owner). A status-unknown row is never guessed into parent/schedule. */
+export const WAIT_KINDS = ['parent', 'schedule', 'unknown', 'other']
+const WAIT_LABEL = { parent: 'on parent', schedule: 'on schedule', unknown: 'unknown', other: 'other' }
+export function waitKind(i) {
+  const c = i?.chip || {}
+  if (c.stale || /^(status )?unknown\b/.test(str(i?.detail)) || /\bunknown \(/.test(str(i?.detail)) || c.state === 'unknown') return 'unknown'
+  if (i?.kind !== 'kanban' || i.cardStatus) return i?.kind === 'kanban' ? 'other' : 'unknown'
+  const on = str(c.waitingOn)
+  if (c.state === 'todo' || /^(blocked )?(parent|card|task)s?\b/i.test(on)) return 'parent'
+  if (c.state === 'scheduled' || (on && c.state !== 'triage' && c.state !== 'blocked')) return 'schedule'
+  return 'other'
+}
+export function waitBreakdown(rows) {
+  const n = { parent: 0, schedule: 0, unknown: 0, other: 0 }
+  for (const i of rows || []) n[waitKind(i)]++
+  // The three named buckets always show (a zero is information); `other` only when something is in it.
+  return { n, text: WAIT_KINDS.filter(k => k !== 'other' || n.other).map(k => `${n[k]} ${WAIT_LABEL[k]}`).join(' · ') }
 }
 
 /** True when the chat has anything not finished: an ask, a card/sub-agent/process that is open, an open ledger
@@ -728,6 +750,7 @@ export function Panel() {
   const [collapsedKeys, setCollapsedState] = useState(readCollapsed)
   const [finishedScopes, setFinishedScopes] = useState(() => new Set())
   const [reportedScopes, setReportedScopes] = useState(() => new Set())
+  const [waitingScopes, setWaitingScopes] = useState(() => new Set())
   const focused = useValue(host.state.focusedSessionId)
   const stored = useValue(host.state.focusedStoredSessionId)
   const busy = useValue(host.state.busy)
@@ -770,6 +793,15 @@ export function Panel() {
     else next.add(scope)
     return next
   })
+  // Waiting rows are folded by default: the heading carries what they wait on as counts; open is per chat.
+  const waitingOpen = waitingScopes.has(scope)
+  const toggleWaiting = () => setWaitingScopes(previous => {
+    const next = new Set(previous)
+    if (next.has(scope)) next.delete(scope)
+    else next.add(scope)
+    return next
+  })
+  const waitingBreakdown = waitBreakdown(sorted.waiting)
   const reported = sorted.reported
   const reportedOpen = reportedScopes.has(scope)
   const toggleReported = () => setReportedScopes(previous => {
@@ -830,8 +862,13 @@ export function Panel() {
       ...sorted.blockedUpstream.map(i => jsx(Row, { i, k: 'blockedUpstream' }, i.key)),
       sorted.active.length > 0 && jsx('h3', { 'data-section': 'in-progress', style: heading('var(--muted-foreground)'), children: `In progress · ${sorted.active.length}` }),
       ...sorted.active.map(i => jsx(Row, { i, k: 'running' }, i.key)),
-      sorted.waiting.length > 0 && jsx('h3', { 'data-section': 'waiting', style: heading('var(--muted-foreground)'), children: `Waiting · ${sorted.waiting.length}` }),
-      ...sorted.waiting.map(i => jsx(Row, { i, k: 'waiting' }, i.key)),
+      sorted.waiting.length > 0 && jsxs('button', { type: 'button', 'data-waiting-toggle': '', 'aria-expanded': waitingOpen, onClick: toggleWaiting, title: waitingOpen ? 'Hide waiting cards' : 'Show waiting cards', style: { display: 'flex', alignItems: 'baseline', flexWrap: 'wrap', gap: 8, width: '100%', margin: '12px 0 6px', padding: 0, background: 'transparent', border: 0, cursor: 'pointer', font: 'inherit', textAlign: 'left', color: 'var(--muted-foreground)' }, children: [
+        jsx('span', { 'aria-hidden': true, style: { fontSize: 10, width: 10 }, children: waitingOpen ? '▾' : '▸' }),
+        jsx('h3', { 'data-section': 'waiting', style: { ...heading('var(--muted-foreground)'), margin: 0 }, children: `Waiting · ${sorted.waiting.length}` }),
+        jsx('span', { 'data-waiting-breakdown': '', style: muted, children: waitingBreakdown.text })
+      ] }),
+      // A still-blocked owner whose ask was retired has no other surface: its status row is never folded away.
+      ...sorted.waiting.filter(i => waitingOpen || i.cardStatus).map(i => jsx(Row, { i, k: 'waiting' }, i.key)),
       (finished?.length || reported.length || sorted.ready.length || sorted.queued.length) ? jsxs('div', { style: { borderTop: '1px solid color-mix(in srgb, var(--border) 60%, transparent)', marginTop: 10, paddingTop: 4 }, children: [
         jsx(Fold, { label: `Ready · ${sorted.ready.length}`, items: sorted.ready, k: 'ready' }),
         jsx(Fold, { label: `Not started · ${sorted.queued.length}`, items: sorted.queued, k: 'queued' }),
