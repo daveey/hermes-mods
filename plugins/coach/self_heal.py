@@ -3197,15 +3197,42 @@ def _backlog_mass(stats: dict, now: float) -> float:
     return float(stats["mass"]) * 0.5 ** (max(0.0, now - float(stats["at"])) / BACKLOG_HALF_LIFE_S)
 
 
+def _backlog_parts(d: dict) -> dict:
+    """Compact occurrence identities survive evidence truncation and snapshot replay.
+
+    Values are (timestamp, mass, count). Legacy truncated history is an opaque
+    contribution, not invented occurrences; its stable identity survives all folds.
+    These are score provenance, not a second lifecycle store.
+    """
+    if "backlog_parts" in d:
+        return d["backlog_parts"]
+    import hashlib
+    occurrences = d.get("occurrences") or [_occurrence(d)]
+    parts = {}
+    for o in occurrences:
+        key = hashlib.sha256(repr(_occ_key(o)).encode()).hexdigest()
+        at = o.get("at")
+        parts[key] = [at if isinstance(at, (int, float)) else 0.0,
+                      1.0 if isinstance(at, (int, float)) else 0.0, 1]
+    stats = _backlog_stats(d)
+    represented = sum(_backlog_mass({"at": v[0], "mass": v[1]}, stats["at"]) for v in parts.values())
+    count = max(0, int(d.get("occurrence_count") or len(parts)) - len(parts))
+    residual = max(0.0, stats["mass"] - represented)
+    if count or residual > 1e-9:
+        identity = json.dumps([parts, stats, count], sort_keys=True)
+        key = "legacy:" + hashlib.sha256(identity.encode()).hexdigest()
+        parts[key] = [stats["at"], residual, count]
+    return parts
+
+
 def _backlog_fold_stats(a: dict, b: dict, oa: list, ob: list) -> dict:
     sa, sb = _backlog_stats(a), _backlog_stats(b)
     at = max(sa["at"], sb["at"])
-    common = {_occ_key(o) for o in oa} & {_occ_key(o) for o in ob}
-    overlap = sum(0.5 ** (max(0.0, at - o["at"]) / BACKLOG_HALF_LIFE_S)
-                  for o in oa if _occ_key(o) in common and isinstance(o.get("at"), (int, float)))
+    parts = {**_backlog_parts(a), **_backlog_parts(b)}
+    mass = sum(_backlog_mass({"at": v[0], "mass": v[1]}, at) for v in parts.values())
     first = [s["first_seen"] for s in (sa, sb) if s.get("first_seen") is not None]
     last = [s["last_seen"] for s in (sa, sb) if s.get("last_seen") is not None]
-    return {"at": at, "mass": max(0.0, _backlog_mass(sa, at) + _backlog_mass(sb, at) - overlap),
+    return {"at": at, "mass": mass,
             "first_seen": min(first) if first else None, "last_seen": max(last) if last else None,
             "sessions": sorted(set(sa["sessions"]) | set(sb["sessions"])),
             "hosts": sorted(set(sa["hosts"]) | set(sb["hosts"])),
@@ -3269,7 +3296,8 @@ def _backlog_queue(d: dict, store, now: float, why: str = "ranked backlog", **ex
         row = db.execute("SELECT payload FROM pending WHERE fp=?", (d["fingerprint"],)).fetchone()
     finally:
         db.close()
-    cached = json.loads(row[0]) if row else {}
+    cached = json.loads(row[0]) if row else (
+        (LaneState(store.root).read().get(d["fingerprint"]) or {}).get("backlog_evidence") or {})
     for key in ("backlog_severity", "backlog_severity_ready", "backlog_bump"):
         if key in cached:
             d = {**d, key: cached[key]}
@@ -3316,19 +3344,20 @@ def fold_payloads(old: dict, new: dict, why: str = "", keep_old: bool = False) -
     a, b = (new, old) if keep_old else (
         (old, new) if (_detected_at(old) or 0) <= (_detected_at(new) or 0) else (new, old))
     oa, ob = list(a.get("occurrences") or [_occurrence(a)]), list(b.get("occurrences") or [_occurrence(b)])
-    if not why and {_occ_key(o) for o in oa} <= {_occ_key(o) for o in ob}:
+    pa, pb = _backlog_parts(a), _backlog_parts(b)
+    if not why and pa.keys() <= pb.keys():
         out = {**b, "fingerprint": (old if keep_old else new).get("fingerprint") or b.get("fingerprint")}
         # A re-defer of the same evidence must preserve cached classification/manual priority.
         for key in ("backlog_severity", "backlog_severity_ready", "backlog_bump"):
             if key in old:
                 out[key] = old[key]
         return out
-    overlap = len({_occ_key(o) for o in oa} & {_occ_key(o) for o in ob})
-    count = (int(a.get("occurrence_count") or len(oa)) + int(b.get("occurrence_count") or len(ob)) - overlap)
+    parts = {**pa, **pb}
+    count = sum(v[2] for v in parts.values())
     merged = list({_occ_key(o): o for o in sorted(oa + ob, key=lambda o: o.get("at") or 0)}.values())
     out = {**b, "fingerprint": (old if keep_old else new).get("fingerprint") or b.get("fingerprint"),
            "occurrences": merged[-PENDING_OCCURRENCES_MAX:], "occurrence_count": max(count, len(merged)),
-           "backlog_stats": _backlog_fold_stats(a, b, oa, ob)}
+           "backlog_parts": parts, "backlog_stats": _backlog_fold_stats(a, b, oa, ob)}
     for key in ("backlog_severity", "backlog_severity_ready", "backlog_bump"):
         if key in old:
             out[key] = old[key]
@@ -3407,6 +3436,7 @@ def _defer_investigation(d: dict, result: dict, store):
     db = _pending_db(store)
     try:
         with db:
+            db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT payload FROM pending WHERE fp=?", (d["fingerprint"],)).fetchone()
             payload = fold_payloads(json.loads(row[0]), d) if row else d
             db.execute("INSERT INTO pending VALUES (?, ?, ?, ?) ON CONFLICT(fp) DO UPDATE SET "

@@ -45,6 +45,25 @@ def test_fold_keeps_frequency_beyond_evidence_window():
     assert sh.backlog_score(again, NOW) == pytest.approx(sh.backlog_score(d, NOW))
 
 
+def test_overlapping_snapshots_and_independent_batches_keep_exact_mass():
+    d = detection(at=NOW - 100)
+    retained = None
+    for i in range(1, 81):
+        d = sh.fold_payloads(d, detection(at=NOW - 100 + i))
+        if i in (40, 60, 80):
+            retained = sh.fold_payloads(retained, d) if retained else d
+    assert retained["occurrence_count"] == 81
+    assert sh.backlog_score(retained, NOW) == pytest.approx(sh.backlog_score(d, NOW))
+    independent = detection(at=NOW + 10)
+    for i in range(1, 41):
+        independent = sh.fold_payloads(independent, detection(at=NOW + 10 + i))
+    combined = sh.fold_payloads(retained, independent)
+    assert combined["occurrence_count"] == 122
+    assert sh.backlog_score(combined, NOW + 100) == pytest.approx(
+        sh.backlog_score(retained, NOW + 100) + sh.backlog_score(independent, NOW + 100))
+    assert sh.fold_payloads(combined, d)["occurrence_count"] == 122
+
+
 def test_severity_failure_neutral_and_retryable():
     def fail(*args):
         raise TimeoutError("test timeout")
