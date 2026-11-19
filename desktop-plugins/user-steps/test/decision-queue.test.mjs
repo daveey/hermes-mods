@@ -840,6 +840,58 @@ test('with the session panel loaded, the For you strip yields to it and its part
  } finally { delete window.__sessionPanel; dispose() }
 })
 
+test('openAskKeys bridge preserves qualified revision identity and exactly matches attention eligibility', async () => {
+ await show(null) // a previous queue must not consume this test's readback fixture
+ window.localStorage.clear()
+ m.resetCanonicalCacheForTests()
+ const dispose = m.default.register({ register() {} })
+ const originalOwner = host.state.focusedSessionOwner.value
+ const originalSession = host.state.focusedStoredSessionId.value
+ try {
+  const bridge = window.__userSteps
+  assert.equal(typeof bridge.openAskKeys, 'function', 'registration exposes canonical ask identities')
+  assert.equal(bridge.openAskKeys, m.openAskKeys, 'registration exports the real identity function')
+  const live = freshRequest({ title: 'Synthetic bridge ask' })
+  const remote = { ...live, owner: { ...owner, gatewayId: 'G2' } }
+  const pending = freshRequest({ resolution: { operationId: 'bridge-pending', choiceId: 'yes', revision: 1 } })
+  const dismissed = freshRequest()
+  m.dismissRequest(dismissed)
+  const ignored = [
+   dismissed,
+   freshRequest({ scope: { complete: false, markdown: '', sourceRefs: [] } }),
+   freshRequest({ state: 'withdrawn' }),
+   ...['resolved', 'superseded', 'cancelled'].map(state => freshRequest({ state, resolution: { operationId: `bridge-${state}`, choiceId: 'yes', revision: 1 } }))
+  ]
+  const rows = [...ignored, pending, remote, live, live]
+  const key = (r, scope = ['C1', 'default', 'S1']) => `${JSON.stringify(scope)}:${JSON.stringify([r.owner.gatewayId, r.owner.profile, r.requestId])}:${r.revision}`
+  const expected = [live, remote, pending].map(r => key(r)).sort()
+  await m.refreshRequests(async () => ({ requests: rows }))
+  assert.deepEqual(bridge.openAskKeys(), expected, 'no duplicates, agent work, dismissed or terminal history; pending delivery stays')
+  assert.equal(bridge.openAskCount(), expected.length)
+  await m.refreshRequests(async () => ({ requests: [...rows].reverse() }))
+  assert.deepEqual(bridge.openAskKeys(), expected, 'poll ordering cannot change identities')
+  await m.refreshRequests(async () => ({ requests: [{ ...live, revision: 2 }, live] }))
+  assert.deepEqual(bridge.openAskKeys(), [key({ ...live, revision: 2 })], 'highest canonical revision changes attention')
+  for (const ownerRoute of [{ connectionId: 'C2', profile: 'default' }, { connectionId: 'C1', profile: 'work' }]) {
+   host.state.focusedSessionOwner.value = ownerRoute
+   assert.deepEqual(bridge.openAskKeys(), [], 'a previous owner scope never leaks across focus')
+   assert.equal(bridge.openAskCount(), 0)
+   const routed = { ...live, owner: { ...live.owner, profile: ownerRoute.profile } }
+   await m.refreshRequests(async () => ({ requests: [routed] }))
+   assert.deepEqual(bridge.openAskKeys(), [key(routed, [ownerRoute.connectionId, ownerRoute.profile, 'S1'])])
+  }
+  host.state.focusedStoredSessionId.value = null
+  assert.deepEqual(bridge.openAskKeys(), [], 'a chat without a stored identity has no asks')
+  assert.equal(bridge.openAskCount(), 0)
+ } finally {
+  dispose()
+  host.state.focusedSessionOwner.value = originalOwner
+  host.state.focusedStoredSessionId.value = originalSession
+  m.resetCanonicalCacheForTests()
+  window.localStorage.clear()
+ }
+})
+
 test('embedded queue drops its own frame, heading and minimize control', async () => {
  const r = freshRequest({ title: 'Embedded ask' })
  const calls = []

@@ -29,7 +29,7 @@ MAX_NEW_PER_HOUR = 12
 ATTR_BUDGET = 1024
 DIRECTIVE = "user-step"
 OPTION_MAX = 200
-MAX_OPTIONS = 4  # most answer buttons any surface renders; a longer menu is asked as free text
+MAX_OPTIONS = 4  # largest option menu extraction/add_step keep as buttons; a longer list is asked as free text with every label left in the paragraph
 # Retired migration fallback: one generic button that asked the USER to request agent work.
 LEGACY_FALLBACK = [{'id': 'request-context', 'label': 'Request complete action', 'effect': 'revise'}]
 
@@ -367,7 +367,8 @@ Kinds:
 - do: the user must perform something outside the chat (click, plug in, sign in, buy, test on a device),
   then tell the assistant it is done.
 - choose: the user must pick one of 2-4 named options. Put the options in "options", recommended first, each
-  under 40 characters.
+  under 40 characters. With more than 4 options use kind "input" with an empty "options" list instead (never
+  drop options to fit); the verbatim_span must still contain the whole question and its options.
 - input: the user must type information or an open answer (a name, a value, a free-form decision).
 
 Rules:
@@ -1016,9 +1017,12 @@ def extract(reply: str, open_steps: list[dict], user_msg: str, llm: Optional[LLM
     titles = _elsewhere_titles(elsewhere)
     dropped: list[str] = []
     reasons: list[dict] = []
+    model_diag: dict = {}  # what the model stage produced before an exception forced the regex fallback
     if llm is not None:
         try:
             d = _parse_json(llm(SYSTEM, build_prompt(reply, open_steps, user_msg, titles)))
+            _rs = d.get("steps")
+            model_diag.update(raw_steps=len(_rs) if isinstance(_rs, list) else 0, raw_steps_type=type(_rs).__name__)
             resolved = [str(x) for x in (d.get("resolved") or []) if str(x) in ids]
             raw = d.get("repeats")
             repeats = [{"id": str(x["id"]), "verbatim_span": str(x["verbatim_span"])}
@@ -1040,12 +1044,14 @@ def extract(reply: str, open_steps: list[dict], user_msg: str, llm: Optional[LLM
         except Exception as exc:  # fall back to the regex detector; resolution then only comes from buttons
             err = f"{type(exc).__name__}: {exc}"[:200]
             dropped.clear()
+            if model_diag:
+                model_diag["reasons"] = list(reasons)
             reasons.clear()
             raw_steps = regex_steps(reply)
             steps = validate(raw_steps, reply, open_steps, dropped, continuity=continuity, reasons=reasons)
             return {"steps": steps, "resolved": [], "source": "regex", "error": err, "dropped": dropped,
                     "diag": {"raw_steps": len(raw_steps), "raw_steps_type": "list", "validated": len(steps),
-                             "reasons": reasons}}
+                             "reasons": reasons, **({"model": model_diag} if model_diag else {})}}
     raw_steps = regex_steps(reply)
     steps = validate(raw_steps, reply, open_steps, dropped, continuity=continuity, reasons=reasons)
     return {"steps": steps, "resolved": [], "source": "regex", "dropped": dropped,
@@ -1553,7 +1559,11 @@ def _process_reply(reply: str, session_id: str, *, user_msg: str, llm: Optional[
             for candidate, prior in matches:
                 block = locate(text, candidate["verbatim_span"])
                 if held or candidate in suppressed or block is None:
-                    if block is None and not held and candidate not in suppressed:
+                    if candidate in suppressed:
+                        pass  # already reported as retired_action_hold
+                    elif held:
+                        drop("held_with_retired_action", candidate)  # other candidates die with the held draft
+                    else:
                         drop("span_not_located", candidate)
                     continue
                 key, span = ask_key(candidate.get('text')), ask_key(candidate.get('verbatim_span'))
@@ -1619,7 +1629,8 @@ def _process_reply(reply: str, session_id: str, *, user_msg: str, llm: Optional[
             "diagnostics": {"raw_steps": diag.get("raw_steps"), "raw_steps_type": diag.get("raw_steps_type"),
                             "validated": diag.get("validated", len(res["steps"])),
                             "validation_drops": diag.get("reasons") or [],
-                            "publication_drops": pub_drops, "published": len(published)},
+                            "publication_drops": pub_drops, "published": len(published),
+                            **({"model": diag["model"]} if diag.get("model") else {})},
             **({"card_asks": [e["id"] for _, e in restated]} if restated else {}),
             **({"error": res["error"]} if res.get("error") else {})}
 
