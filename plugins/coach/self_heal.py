@@ -2866,6 +2866,20 @@ class LaneState:
         with self._locked():
             return self._apply(fp, kw)
 
+    def retain_backlog(self, fp: str, detection: dict) -> dict:
+        """Retain evidence with the lifecycle owner before removing a queue row.
+
+        Admission and drain may overlap a pending fold; the lane lock serializes
+        this evidence merge with lifecycle receipts without changing their status.
+        """
+        with self._locked():
+            cur = self.read().get(fp) or {}
+            old = cur.get("backlog_evidence")
+            evidence = fold_payloads(old, detection) if old else dict(detection)
+            evidence["backlog_stats"] = _backlog_stats(evidence)
+            evidence.setdefault("occurrence_count", len(evidence.get("occurrences") or [evidence]))
+            return self._apply(fp, {"backlog_evidence": evidence})
+
     def transition(self, fp: str, expect: dict, **kw) -> Optional[dict]:
         """update() only while the entry still holds every `expect` field; None (nothing written) otherwise.
         For a writer that decided from an earlier read: reconcile walks a snapshot for minutes, and a receipt
@@ -3198,14 +3212,24 @@ def _backlog_fold_stats(a: dict, b: dict, oa: list, ob: list) -> dict:
             "complaint": sa["complaint"] or sb["complaint"]}
 
 
+def _backlog_number(value, default: float, low: float = 0.0, high: Optional[float] = None) -> float:
+    import math
+    try:
+        value = float(value)
+        if not math.isfinite(value):
+            return default
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return max(low, min(high, value) if high is not None else value)
+
+
 def backlog_score(d: dict, now: float, recurrence: bool = False) -> float:
     stats = _backlog_stats(d)
-    p = d.get("p_defect")
-    p = .5 if p is None else max(0.0, min(1.0, float(p)))
-    severity = d.get("backlog_severity", 2)
+    p = _backlog_number(d.get("p_defect"), .5, high=1.0)
+    severity = _backlog_number(d.get("backlog_severity"), 2.0, low=1.0, high=4.0)
     return (severity * _backlog_mass(stats, now) * p * BACKLOG_SOURCE_WEIGHT.get(d.get("source"), .5)
             * (1.5 if stats["complaint"] else 1.0) * (2.0 if recurrence else 1.0)
-            * float(d.get("backlog_bump") or 1.0))
+            * _backlog_number(d.get("backlog_bump"), 1.0, low=1.0))
 
 
 def backlog_priority(d: dict, now: float, recurrence: bool = False) -> tuple:
@@ -6195,6 +6219,16 @@ def _file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now:
                    "component": d.get("component"), "previous": st.get("fix_card"), "why": dec["why"]})
         return {"action": "skip", "why": dec["why"], "held": len(held)}
     if dec["action"] == "skip":
+        if (cfg.get("backlog_ranked", False) and m == "live" and hub
+                and not st.get("suppressed") and (st.get("snooze_until") or 0) <= now
+                and st.get("status") in ("filed", "approved", "proposed")):
+            # In particular, a CAS survivor from the create pass reaches here on
+            # the next drain. Save it before skip can remove it from pending, and
+            # use the existing owner/session/day comment limiter.
+            lane.retain_backlog(fp, d)
+            commented = _dedupe_open_owner(d, fp, st.get("board"), store, runner, now)
+            if commented:
+                return commented
         if (d.get("incident") and m == "live" and hub and not st.get("suppressed")
                 and (st.get("snooze_until") or 0) <= now and st.get("status") in ("filed", "approved", "proposed")):
             return _corruption_comment(d, st, store, runner)
@@ -6299,6 +6333,8 @@ def _file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now:
     elif dec["why"] == "refile":
         kw["refiles"] = int(st.get("refiles") or 0) + 1
     lane.update(fp, **kw)
+    if cfg.get("backlog_ranked", False):
+        lane.retain_backlog(fp, d)
     store.log({"event": "selfheal_filed", "fingerprint": fp, "card": tid, "component": d.get("component"),
                "board": args.get("board"), "recurrence": bool(prev), "scheduled": sched[0] if sched else None,
                "source": d.get("source"), "one_card": bool(args.get("one_card"))})
@@ -8037,6 +8073,46 @@ def backstop(data: Path, store=None, judge: Optional[Callable] = None, now: Opti
     return out
 
 
+def backlog_control(action: str, fp: str, board: str = "default", reason: str = "", store=None) -> dict:
+    """Manual priority/suppression on the hub; no card is created or withdrawn.
+
+    Suppression belongs to LaneState. Bump never undoes prior suppression.
+    """
+    import uuid
+    store = _store(store)
+    if not is_hub():
+        raise ValueError("backlog controls must run on the self-heal hub")
+    if action not in ("bump", "drop"):
+        raise ValueError("expected bump or drop")
+    if not re.fullmatch(r"[a-z0-9_-]+", fp):
+        raise ValueError("invalid fingerprint")
+    if not (Path(store.root) / "selfheal_pending.sqlite").exists():
+        raise ValueError("fingerprint is not in the backlog")
+    with _admission_lock(store, live=True), contextlib.closing(_pending_db(store)) as db:
+        with db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT payload FROM pending WHERE fp=?", (fp,)).fetchone()
+            if not row:
+                raise ValueError("fingerprint is not in the backlog")
+            d = json.loads(row[0])
+            target = card_args(d, inv_key(fp, 1), None, lane_config()).get("board") or "default"
+            if target != board:
+                raise ValueError(f"fingerprint belongs to board {target}, not {board}")
+            if action == "drop":
+                LaneState(store.root).retain_backlog(fp, d)
+                LaneState(store.root).update(fp, status="suppressed", suppressed=True,
+                                            backlog_reason=reason, board=board)
+            else:
+                d["backlog_bump"] = _backlog_number(d.get("backlog_bump"), 1.0, low=1.0) * 2
+                d["backlog_reason"] = reason
+                db.execute("UPDATE pending SET payload=?, version=? WHERE fp=?",
+                           (json.dumps(d), uuid.uuid4().hex, fp))
+    result = {"action": action, "fingerprint": fp, "board": board, "reason": reason,
+              "multiplier": d.get("backlog_bump", 1)}
+    store.log({"event": "selfheal_backlog_control", **result})
+    return result
+
+
 def main(argv=None) -> int:
     import argparse
     import sys
@@ -8059,11 +8135,22 @@ def main(argv=None) -> int:
     b = sub.add_parser("backstop", help="detector over new user turns in the coach digests")
     b.add_argument("--data", default=os.environ.get("COACH_DATA") or str(Path.home() / "code/hermes-coach-data"))
     b.add_argument("--mode", choices=("shadow", "live"))
-    c = sub.add_parser("cron", help="hub pass every 30 min: drain queue, backstop, sync")
+    c = sub.add_parser("cron", help="hub pass every 5 min: hourly ranked backlog, backstop, sync")
     c.add_argument("--data", default=os.environ.get("COACH_DATA") or str(Path.home() / "code/hermes-coach-data"))
+    controls = sub.add_parser("backlog", help="manually prioritize or suppress a pending fingerprint")
+    controls.add_argument("action", choices=("bump", "drop"))
+    controls.add_argument("fp")
+    controls.add_argument("--board", default="default")
+    controls.add_argument("--reason", default="")
     sub.add_parser("status", help="lane state + budget")
     a = ap.parse_args(argv)
-    if a.cmd == "file":
+    if a.cmd == "backlog":
+        try:
+            print(json.dumps(backlog_control(a.action, a.fp, a.board, a.reason)))
+        except ValueError as exc:
+            print(json.dumps({"error": str(exc)}))
+            return 2
+    elif a.cmd == "file":
         d = json.loads(sys.stdin.read())
         filer = (d.get("filed_by") or a.filed_by or os.environ.get("HERMES_KANBAN_TASK")
                  or os.environ.get("HERMES_KANBAN_WORKER_TASK"))

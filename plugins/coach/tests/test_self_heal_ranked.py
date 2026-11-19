@@ -103,6 +103,85 @@ def test_concurrent_fold_survives_drain_delete(ranked):
     assert pending(e)[d["fingerprint"]]["occurrence_count"] == 2
 
 
+def test_concurrent_occurrence_reaches_owner_on_next_drain(ranked):
+    e = ranked
+    d = defect(at=NOW-60)
+    file(e, d)
+    def writer(payload, **kw):
+        result = file(e, payload, backlog_drain=True)
+        sh._defer_investigation({**d, "at": NOW, "session_id": "later-session",
+                                "quote": "additional evidence"},
+                               {"retry_at": sh._iso(NOW)}, e.store)
+        return result
+    sh.retry_deferred(e.store, now=NOW, filer=writer)
+    assert pending(e)[d["fingerprint"]]["occurrence_count"] == 2
+    drain(e, NOW+1)
+    assert not pending(e)
+    assert len(e.board.creates()) == 1
+    assert any("additional evidence" in body for _, body in e.board.comments)
+    retained = sh.LaneState(e.store.root).get(d["fingerprint"])["backlog_evidence"]
+    assert retained["occurrence_count"] == 2
+    assert retained["backlog_stats"]["sessions"] == sorted([d["session_id"], "later-session"])
+
+
+def test_bypass_at_real_full_cap_stays_pending(ranked):
+    e = ranked
+    day = int(NOW)//86400*86400
+    for i in range(5):
+        e.board.add(f"t_existing_{i}", key=f"selfheal:existing-{i}", created_at=day+1)
+    urgent = defect(component="auth", at=day+10)
+    assert file(e, urgent, day+10)["action"] == "queued"
+    drain(e, day+10)
+    assert urgent["fingerprint"] in pending(e)
+    assert not e.board.creates()
+
+
+def test_unreadable_cap_during_drain_retains_row(ranked, monkeypatch):
+    e = ranked
+    d = defect()
+    file(e, d)
+    def fail(*a, **k):
+        raise sqlite3.OperationalError("fixture unavailable")
+    monkeypatch.setattr(sh, "cards_created_today", fail)
+    drain(e, NOW)
+    assert d["fingerprint"] in pending(e)
+    assert not e.board.creates()
+
+
+@pytest.mark.parametrize("value", ["unknown", None, float("nan"), float("inf")])
+def test_invalid_score_inputs_are_neutral(value):
+    d = defect(p_defect=value, backlog_severity=value, backlog_bump=value)
+    neutral = defect(p_defect=.5, backlog_severity=2, backlog_bump=1)
+    assert sh.backlog_score(d, NOW) == sh.backlog_score(neutral, NOW)
+
+
+@pytest.mark.parametrize("budget_field", ["ok_usd", "ok_running"])
+def test_bypass_cannot_escape_lane_budget(ranked, budget_field):
+    e = ranked
+    urgent = defect(component="auth")
+    file(e, urgent)
+    denied = {**OPEN(), budget_field: False, "running": 99, "why": "fixture limit"}
+    out = sh.retry_deferred(e.store, now=NOW, filer=lambda d, **kw:
+        sh.file_defect(d, store=e.store, m="live", now=NOW, runner=e.board,
+                       backlog_drain=True, budget_fn=lambda *a: denied))
+    assert out[0]["action"] == "deferred"
+    assert urgent["fingerprint"] in pending(e)
+    assert not e.board.creates()
+
+
+def test_open_occurrences_keep_history_and_comment_limit(ranked):
+    e = ranked
+    d = defect()
+    file(e, d)
+    drain(e, NOW)
+    for second in (1, 2):
+        assert file(e, {**d, "at": NOW+second}, NOW+second)["action"] == "skip"
+    assert len(e.board.comments) == 1
+    retained = sh.LaneState(e.store.root).get(d["fingerprint"])["backlog_evidence"]
+    assert retained["occurrence_count"] == 3
+    assert sh.backlog_score(retained, NOW+2) > sh.backlog_score(d, NOW+2)
+
+
 def test_unreadable_cap_fails_closed(ranked, monkeypatch):
     def fail(*a, **k):
         raise sqlite3.OperationalError("fixture unavailable")
@@ -119,6 +198,51 @@ def test_placement_refusal_stops_ranked_pass(ranked):
     sh.retry_deferred(e.store, now=NOW, filer=lambda d, **kw: seen.append(d) or
                      {"action": "error", "placement_refused": True})
     assert len(seen) == 1 and len(pending(e)) == 3
+
+
+def test_fixed_history_reopens_after_grace(ranked):
+    e = ranked
+    d = defect(at=NOW)
+    fp = d["fingerprint"]
+    lane = sh.LaneState(e.store.root)
+    lane.update(fp, status="fixed", fixed_at=NOW-8*3600, fix_card="t_prior",
+                card="t_prior", cards=["t_prior"], gen=1, fix_shas=[])
+    assert file(e, d)["action"] == "queued"
+    assert drain(e, NOW)[0]["action"] == "filed"
+    state = lane.get(fp)
+    assert state["status"] == "filed" and state["recurrences"] == 1
+    assert state["gen"] == 2 and "t_prior" in state["cards"]
+    assert any(status == "fixed" for _, status in state["history"])
+
+
+def test_fixed_grace_stays_authoritative(ranked):
+    e = ranked
+    d = defect(at=NOW)
+    sh.LaneState(e.store.root).update(d["fingerprint"], status="fixed", fixed_at=NOW-60,
+                                    fix_card="t_prior", fix_shas=[])
+    assert file(e, d)["action"] == "skip"
+    assert not pending(e) and not e.board.creates()
+    assert sh.LaneState(e.store.root).get(d["fingerprint"])["held"]
+
+
+def test_backlog_cli_bump_drop_and_board_check(ranked, monkeypatch, capsys):
+    e = ranked
+    d = defect()
+    file(e, d)
+    monkeypatch.setattr(sh, "_store", lambda store=None: e.store)
+    fp = d["fingerprint"]
+    before = pending(e)[fp]
+    assert sh.main(["backlog", "bump", fp, "--board", "other"]) == 2
+    assert pending(e)[fp] == before
+    assert sh.main(["backlog", "bump", fp, "--reason", "operator priority"]) == 0
+    assert pending(e)[fp]["backlog_bump"] == 2
+    assert sh.main(["backlog", "drop", fp, "--reason", "not actionable"]) == 0
+    state = sh.LaneState(e.store.root).get(fp)
+    assert state["suppressed"] is True and state["status"] == "suppressed"
+    assert state["backlog_evidence"]["symptom"] == d["symptom"]
+    drain(e, NOW)
+    assert not e.board.creates()
+    assert sh.main(["backlog", "bump", "unknown-fingerprint"]) == 2
 
 
 def test_hourly_gate(ranked):
