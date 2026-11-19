@@ -457,3 +457,12 @@ def test_slider_move_on_a_manual_level_is_unchanged(tmp_path):
                                                               "set_at": NOW}
     T.set_level(tmp_path, {"percent": 0.0, "cap_per_s": None, "set_at": 0.0, "source": None}, 0, NOW + 1)
     assert json.loads(T.level_path(tmp_path).read_text()) == {"percent": 0.0, "cap_per_s": None, "set_at": NOW + 1}
+
+
+def test_slider_move_on_an_expired_budget_level_returns_to_manual(tmp_path):
+    _auto(tmp_path, percent=0, cap=1000.0, pools={"anthropic": 0.0}, budget_at=NOW - T.BUDGET_EXPIRE_S - 60)
+    level = T.effective(tmp_path, None, NOW)
+    T.set_level(tmp_path, level, 30, NOW, reference=2000.0)
+    data = json.loads(T.level_path(tmp_path).read_text())
+    assert "mode" not in data and "pool_caps" not in data
+    assert data["percent"] == 30.0 and data["cap_per_s"] == pytest.approx(1400.0)

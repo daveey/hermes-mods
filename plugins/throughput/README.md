@@ -168,7 +168,8 @@ and a body that is not a JSON object a 422, and neither changes anything.
     and rewrite on every pass, alternating forever.
   - **Turning it off**: after `budget_publish` is set false the last auto level stays in force (stale after 20
     minutes, expired after 60: then no budget cap) until it expires or the slider moves; 100 % still holds every
-    throttled call and card start, expired or not. A slider move on it keeps it a budget level (above).
+    throttled call and card start, expired or not. A slider move keeps a live budget level a budget level (above);
+    once the budget has expired, a slider move writes a manual level, which is the way back to manual mode.
   - **Rollout order**: deploy this plugin fleet-wide and restart the workers (and every long-lived Hermes process)
     before enabling `budget_publish`. An older plugin reads an auto record's `cap_per_s` as an unscaled manual cap
     (and ignores `pool_caps`), and a gateway on a hub client older than 1.9.55 receives the record without `mode`,

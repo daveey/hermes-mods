@@ -188,8 +188,12 @@ def set_level(root: Path, level: dict, percent, now: float, reference: Optional[
     """The slider: store ``percent`` at ``now``. When ``level`` (the one in force) is a budget level, the new level
     keeps its ``mode``, ``cap_per_s``, ``pool_caps`` and ``budget_at`` and changes only ``percent`` and ``set_at``:
     a manual level there would drop every pool cap, reserve holds included, fleet-wide until the publisher folds it
-    back in. Otherwise it is a slider level against ``reference`` (``write_level``)."""
-    if level.get("mode") != AUTO:
+    back in. Otherwise, or when that budget level has expired (no publisher is refreshing it, e.g.
+    ``budget_publish`` was turned off), it is a slider level against ``reference`` (``write_level``): the slider is
+    the way back to manual mode."""
+    budget_at = level.get("budget_at")
+    expired = not isinstance(budget_at, (int, float)) or now - budget_at > BUDGET_EXPIRE_S
+    if level.get("mode") != AUTO or expired:
         return write_level(root, percent, now, reference)
     value = clamp(percent)
     _write_json(level_path(root), {"mode": AUTO, "percent": value, "cap_per_s": level.get("cap_per_s"),
