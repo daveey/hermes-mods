@@ -35,7 +35,28 @@ def retain_connections(monkeypatch, request):
     return connections, retained_connect
 
 
-def test_connection_spy_leaves_foreign_thread_connections_alone(tmp_path, monkeypatch, request):
+@contextmanager
+def constructor_connections(monkeypatch, connect):
+    """Close only this thread's constructor handles before inode replacement.
+
+    sqlite3.connect is process-global: unrelated background work must neither
+    mutate this ExitStack nor have its handles closed from the constructor thread.
+    """
+    owner = threading.get_ident()
+    with ExitStack() as stack, monkeypatch.context() as patch:
+        def scoped_connect(*args, **kwargs):
+            conn = connect(*args, **kwargs)
+            if threading.get_ident() == owner:
+                stack.enter_context(closing(conn))
+            return conn
+        patch.setattr(sqlite3, 'connect', scoped_connect)
+        yield
+
+
+@pytest.mark.parametrize('constructor_scope', [False, True])
+def test_connection_spy_leaves_foreign_thread_connections_alone(
+    tmp_path, monkeypatch, request, constructor_scope,
+):
     # Regression: a connect() on another thread during the spy's lifetime was retained
     # and then closed by the finalizer on the wrong thread (sqlite3.ProgrammingError).
     # The creator thread stays alive until the finalizer has run, then verifies and
@@ -66,11 +87,20 @@ def test_connection_spy_leaves_foreign_thread_connections_alone(tmp_path, monkey
             if conn is not None:
                 conn.close()
 
+    scope = ExitStack()
+    if constructor_scope:
+        scope.enter_context(constructor_connections(monkeypatch, connect))
+    # Exercise the process-global patch, including its nested constructor wrapper.
+    connect = sqlite3.connect
     worker = threading.Thread(target=creator, name='foreign-creator', daemon=True)
     worker.start()
     try:
         assert created.wait(timeout=10), 'creator thread never connected'
         own = connect(tmp_path / 'own.sqlite3')
+        scope.close()
+        if constructor_scope:
+            with pytest.raises(sqlite3.ProgrammingError, match='closed'):
+                own.execute('SELECT 1')
         finalizers[0]()  # must close ours and must not touch the foreign-thread handle
         assert connections == [own]
         with pytest.raises(sqlite3.ProgrammingError, match='closed'):
@@ -112,10 +142,7 @@ def test_schema_setup_is_one_real_write_transaction_per_store_inode(tmp_path, mo
     def new_store(path):
         # Close constructor-owned handles before moving either database. Moving
         # just the main file with live WAL/SHM is not an isolated inode test.
-        with ExitStack() as stack, monkeypatch.context() as patch:
-            def connect(*args, **kwargs):
-                return stack.enter_context(closing(retained_connect(*args, **kwargs)))
-            patch.setattr(sqlite3, 'connect', connect)
+        with constructor_connections(monkeypatch, retained_connect):
             return core.ActionStore(path)
 
     store = new_store(tmp_path / 'actions.sqlite3')
