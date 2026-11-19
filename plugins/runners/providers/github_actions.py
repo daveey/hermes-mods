@@ -307,7 +307,10 @@ class GitHubActions:
         status = response.status
         if metadata and status == 301:
             return response  # canonical.py validates the only admissible next path
-        if status == 301 and redirect and re.fullmatch(r'/repos/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/actions/runners\?per_page=100&page=[1-9][0-9]*', path):
+        # Installation grants name exact repositories; numeric aliases are not
+        # authorized by that allowlist. Fall through to the scope-local moved
+        # cooldown, rather than poisoning the installation bucket on refusal.
+        if status == 301 and redirect and credential.quota_kind != 'installation' and re.fullmatch(r'/repos/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/actions/runners\?per_page=100&page=[1-9][0-9]*', path):
             url = response.body.get('url') if type(response.body) is dict else None
             suffix = path[path.index('/actions/'):]
             match = re.fullmatch(re.escape(self.ENDPOINT) + r'/repositories/([1-9][0-9]*)' + re.escape(suffix), url) if type(url) is str else None
