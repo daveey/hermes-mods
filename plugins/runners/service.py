@@ -118,21 +118,27 @@ class _Result:
     """A memoized inventory. ``shared`` is never handed to a caller that may mutate it: copies are unpickled
     from ``blob``, pickled on the first such request (a fleet panel that only reads never pays for it)."""
 
-    __slots__ = ('key', 'built_at', 'until', 'shared', 'blob', 'lock', 'carry')
+    __slots__ = ('key', 'built_at', 'until', 'shared', 'blob', 'lock', 'carry', 'cache_epochs')
 
     def __init__(self, key, built_at, until, shared, carry=None):
         self.key, self.built_at, self.until, self.shared = key, built_at, until, shared
         self.carry = carry
+        # Parse once per memo generation, never once per scope on every panel read.
+        epochs = {}
+        self.cache_epochs = []
+        for row in shared['meta'].get('inventory_cache', ()):
+            stamp = row['fetched_at']
+            if stamp not in epochs:
+                epochs[stamp] = datetime.fromisoformat(stamp).timestamp() if stamp is not None else None
+            self.cache_epochs.append((row, epochs[stamp]))
         self.blob = None
         self.lock = threading.Lock()
 
     def view(self, shared, now):
         fresh = dict(request_id=ident('request'), generated_at=iso(now))
         if 'inventory_cache' in self.shared['meta']:
-            fresh['inventory_cache'] = [dict(row, age_s=(
-                max(0, now-datetime.fromisoformat(row['fetched_at']).timestamp())
-                if row['fetched_at'] is not None else None))
-                for row in self.shared['meta']['inventory_cache']]
+            fresh['inventory_cache'] = [dict(row, age_s=max(0, now-epoch) if epoch is not None else None)
+                                        for row, epoch in self.cache_epochs]
         if shared:
             return dict(self.shared, meta=dict(self.shared['meta'], **fresh))
         with self.lock:

@@ -33,6 +33,29 @@ def test_cache_age_advances_on_memo_reads_and_failure_preserves_fetch(tmp_path, 
     assert adapter.calls == 2
 
 
+@pytest.mark.parametrize('shared', [False, True])
+def test_memo_age_does_not_reparse_timestamps(tmp_path, monkeypatch, shared):
+    from plugins.runners import service as module
+    path = tmp_path / 'state.sqlite'
+    with Store(path) as store:
+        Collector(store, config(), Adapter(), clock=lambda: 1000).tick()
+    response = Service(path, config(), clock=lambda: 1001).inventory(shared=shared)
+    memo = module._Result(('test',), 1001, 1010, response)
+    first = memo.view(shared, 1001)
+
+    class NoParsing:
+        @staticmethod
+        def fromisoformat(value):
+            pytest.fail('memo hit reparsed a fetched timestamp')
+
+    monkeypatch.setattr(module, 'datetime', NoParsing)
+    for at in (1002, 1003, 1004):
+        result = memo.view(shared, at)
+        assert result['meta']['inventory_cache'][0]['age_s'] == at - 1000
+        validate('InventoryResponse', result)
+    assert first['meta']['inventory_cache'][0]['age_s'] == 1
+
+
 def test_cache_never_fetched_is_explicitly_incomplete(tmp_path):
     with Store(tmp_path / 'missing.sqlite') as store:
         Collector(store, config(), Adapter(), clock=lambda: 1000)
