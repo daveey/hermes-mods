@@ -8,7 +8,7 @@ export const React = require('react')
 const { JSDOM } = require('jsdom')
 const dom = new JSDOM('<html><body></body></html>', { url: 'http://localhost/', pretendToBeVisual: true })
 for (const key of ['window', 'document', 'HTMLElement', 'Element', 'Node', 'MutationObserver', 'getComputedStyle',
-  'CustomEvent', 'NodeFilter', 'HTMLInputElement', 'HTMLButtonElement', 'MouseEvent', 'KeyboardEvent', 'DOMRect'])
+  'CustomEvent', 'NodeFilter', 'HTMLInputElement', 'HTMLButtonElement', 'MouseEvent', 'KeyboardEvent', 'DOMRect', 'CSS'])
   globalThis[key] = dom.window[key]
 globalThis.localStorage = dom.window.localStorage
 Object.defineProperty(globalThis, 'navigator', { value: dom.window.navigator, configurable: true })
@@ -25,6 +25,7 @@ const sdk = {
   useQueryClient: query.useQueryClient,
   STATUSBAR_AREAS: { right: 'statusBar.right' },
   PALETTE_AREA: 'palette',
+  // Deliberately no TOP_STRIP_AREA: older SDKs lack the named export; the plugin must still load.
   Popover: P.Root,
   PopoverTrigger: P.Trigger,
   PopoverContent: P.Content
