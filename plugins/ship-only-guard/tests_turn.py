@@ -298,6 +298,7 @@ def test_exact_head_rejection_yields_without_deleting_ticket(gh):
 
 
 def test_unrefreshed_drifted_holder_yields_after_grace(gh, monkeypatch):
+    monkeypatch.setattr(g, "_WAITING_WRITER_ENABLED", False)
     fake = gh({n: pr(n, H2563, ["hermes-sync"]) for n in (2563, 2579)}, compare=delta(["hermes-sync"]))
     seed_turn(fake, 2563, NOW - 60)
     assert "PR #2563 holds" in merge(2579, H2563)
@@ -334,6 +335,7 @@ def test_drift_timestamp_unreadable_never_yields(gh, date):
 
 
 def test_initial_stale_base_grace_starts_at_acquisition(gh, monkeypatch):
+    monkeypatch.setattr(g, "_WAITING_WRITER_ENABLED", False)
     fake = gh({n: pr(n, H2563, ["hermes-sync"]) for n in (1, 2)},
               compare=delta(["hermes-sync"], when=NOW - 5000))
     seed_turn(fake, 1, NOW - 899)
