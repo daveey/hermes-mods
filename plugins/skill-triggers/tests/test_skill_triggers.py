@@ -415,3 +415,67 @@ def test_budgets_404_row_shipped_section_resolves():
     assert r["skill"] == "github-ci-wait" and r["file"] == BUDGET_REF
     inj = st.build_injection(r, dirs=[REPO / "skills"])
     assert inj and "does NOT mean no budget" in inj and BUDGET_REF in inj
+
+
+# Defect agent-7dd79a5984: a hub chat read a MacBook-homed card's heartbeats from the Board replica
+# (kanban/sync-shadow/default.db), found none for 25 min and told the card the run had stalled. The Mac was asleep
+# and running in short DarkWakes; its heartbeats reached the replica later in a batch. The rule that a replica row is
+# only as fresh as its home gateway's newest event now rides on the first such read in a session.
+RED_SWEEP = REPO / "skills" / "devops" / "kanban-red-sweep"
+FRESH_REF = "references/replica-freshness.md"
+# The incident's own read (hub state.db message 1321863), trimmed.
+# Inert hook input, never executed: split the historical URI flag so the SQLite
+# reader guard does not mistake this preserved command text for a live reader.
+REPLICA_CODE = (
+    "import sqlite3, os\n"
+    "c = sqlite3.connect('file:' + os.path.expanduser('~/.hermes/kanban/sync-shadow/default.db') + '?mode=" "ro', uri=True)\n"
+    "hb = c.execute(\"select count(*), max(created_at) from task_events where task_id=? and kind='heartbeat'\", (tid,))\n"
+    "print('macbook last event', c.execute(\"select max(created_at) from task_events where origin_gateway='macbook'\"))\n")
+REPLICA_CMD = ("sqlite3 -readonly ~/.hermes/kanban/sync-shadow/default.db \"select last_heartbeat_at, status from tasks "
+               "where id='t_x'\"")
+
+
+@pytest.fixture
+def rs_home(env):
+    d = env / "skills" / "devops" / "kanban-red-sweep"
+    (d / "references").mkdir(parents=True)
+    (d / "SKILL.md").write_text((RED_SWEEP / "SKILL.md").read_text())
+    (d / FRESH_REF).write_text((RED_SWEEP / FRESH_REF).read_text())
+    return env
+
+
+def _fresh_note(out):
+    text = (json.loads(out).get(st.FIELD, "") if out and out.startswith("{") else out) or ""
+    return "home gateway's newest event" in text and "unknown" in text
+
+
+@pytest.mark.parametrize("tool,args", [
+    ("execute_code", {"code": REPLICA_CODE}),
+    ("terminal", {"command": REPLICA_CMD}),
+])
+def test_replica_heartbeat_read_row_fires(rs_home, tool, args):
+    out = run(tool, args, "READ_AT 00:07:22Z\nheartbeats n=0 last=None")
+    assert _fresh_note(out), out
+    assert FRESH_REF in out and "tailnet_exec" in out
+    assert run(tool, args, "again") is None  # once per session
+
+
+@pytest.mark.parametrize("cmd", [
+    "sqlite3 -readonly ~/.hermes/kanban/sync-shadow/default.db 'select status from tasks where id=\"t_x\"'",
+    "sqlite3 -readonly ~/.hermes/kanban.db \"select max(created_at) from task_events where kind='heartbeat'\"",
+])
+def test_replica_heartbeat_row_negatives(rs_home, cmd):
+    assert run("terminal", {"command": cmd}) is None
+
+
+def test_replica_heartbeat_row_suppressed_after_reference_view(rs_home):
+    run("skill_view", {"name": "kanban-red-sweep", "file_path": FRESH_REF}, "reference text")
+    assert run("execute_code", {"code": REPLICA_CODE}) is None
+
+
+def test_replica_heartbeat_row_shipped_section_resolves():
+    rows = {r["id"]: r for r in st.load_rows(user_path=P / "nonexistent.yaml")}
+    r = rows["replica-heartbeat-read"]
+    assert r["skill"] == "kanban-red-sweep" and r["file"] == FRESH_REF
+    inj = st.build_injection(r, dirs=[REPO / "skills"])
+    assert inj and _fresh_note(inj) and FRESH_REF in inj

@@ -55,6 +55,32 @@ def test_broker_grammar_fence_accepts_quoted_prose_control(tmp_path):
     assert guard.refuse_reason(BROKER, str(tmp_path)) is None
 
 
+@pytest.mark.parametrize('identity', [
+    pytest.param("'GIT_AUTHOR_NAME=Example'", id='single-quoted-command'),
+    pytest.param('"GIT_AUTHOR_NAME=Example"', id='double-quoted-command'),
+])
+def test_wholly_quoted_git_identity_is_not_assignment(tmp_path, identity):
+    # Classify only: the quoted first word is an executable name, not a shell
+    # assignment. Its unknown argv must not inherit the broker prose exemption.
+    command = (
+        identity + " token-broker exec --scope user/github "
+        "--reason 'alias stash pop' -- env "
+        "/absolute/hermes-core-wt ship slug --review-reply 'ok'"
+    )
+    reason = guard.refuse_reason(command, str(tmp_path))
+    assert reason is not None, command
+    assert 'stash pop' in reason
+
+
+def test_unquoted_git_identity_assignment_allows_broker_prose(tmp_path):
+    command = (
+        "GIT_AUTHOR_NAME=Example token-broker exec --scope user/github "
+        "--reason 'alias stash pop' -- env "
+        "/absolute/hermes-core-wt ship slug --review-reply 'ok'"
+    )
+    assert guard.refuse_reason(command, str(tmp_path)) is None
+
+
 IDENTITY = (
     'GIT_AUTHOR_NAME="Example User" GIT_AUTHOR_EMAIL=you@example.com '
     'GIT_COMMITTER_NAME="Example User" GIT_COMMITTER_EMAIL=you@example.com '

@@ -254,6 +254,14 @@ look for its `mods-reload: ... ok (stash-worktree-guard)` activation receipt or 
 
 ## Explicit out-of-scope compositions
 
+Programs defined on the filesystem are outside the guard's static model: executable
+scripts (such as `./s.sh`), Makefile targets, custom `git --exec-path` helpers, and
+renamed symlinks (such as a symlink to `xargs` under another name). The guard does not
+read their program contents or resolve symlink targets to discover what they execute.
+This boundary applies both unwrapped and under wrappers whose parsing fails; a
+wrapper does not bring filesystem-defined behavior into scope. Such programs can
+execute `git stash pop` even when the guard allows their invocation.
+
 The following are **known unblocked cross-branch restore paths**, not covered restore
 controls. Each remains out of scope; documenting them does not make them safe. Encoded
 payloads below mean base64 text whose decoded contents perform a restore. `WT` denotes
@@ -274,14 +282,20 @@ another linked worktree and `R` a scratch directory.
    filesystem effects. We deliberately do not taint aliases after *every* non-inert
    program: that would also make ordinary sequences such as `npm test; git lg`
    uncertain without evidence of a config change.
-3. **Dynamic Git subcommands inside `env -S` strings.** The split-string form is not
-   interpreted with env's splitting rules. In particular,
-   `env -S "git -C WT $(echo c3Rhc2g= | base64 -d) pop"` can escape both argv analysis
-   and the textual fallback. The fallback's dynamic-subcommand pattern requires a
-   character before the expansion marker; it is not a complete detector for a word
-   beginning with `$` after `git`/`git -C`. Direct ordinary Git argv analysis is a
-   separate path. This is a known parser/fallback coverage gap, not a claim that
-   split-string support could not be implemented.
+3. **Bounded GNU `env -S` support.** Literal split strings are decoded with GNU
+   separators, quoting, escapes, comments and `\\c` termination. Separate/attached
+   `-S`/`--split-string` operands and short clusters (`-iS`, `-vS`) are recognized
+   after bounded `-i`/`-v`/`-0`, `-u`/`-C`/`-a` options and their long spellings.
+   Option operands are skipped by arity; command operands and `--` end the scan.
+   Earlier options conservatively make the child's repository/environment unknown,
+   without changing the caller's state. Decoding is bounded to 16 KiB and existing
+   recursion/step budgets; decoded argv is quoted as data, never executed by the
+   guard. Literal quoted data and refspecs remain data. Shell single/double quotes
+   preserve GNU escapes. Unknown shell expansions, GNU `${VAR}` expansion and
+   unsupported split-string syntax are explicitly refused as uncertain argv,
+   even without recognizable stash text (they may be harmless at runtime).
+   Unknown env option grammars still use the general wrapper fallback; this is
+   bounded analysis, not a complete GNU getopt or shell implementation.
 4. **Execute a generated script, including one named like a wrapper.** Decoding a
    script to `R/nice`, making it executable and invoking `R/nice -n 5 true` does not
    cause the analyzer to inspect its contents or verify that it is the system `nice`.

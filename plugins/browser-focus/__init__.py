@@ -14,6 +14,7 @@ The agent's Chrome is found as a Chrome process whose --user-data-dir lives unde
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -224,6 +225,75 @@ def _unattended(session_id: str = "") -> bool:
     return bool(os.environ.get("HERMES_KANBAN_TASK")) or str(session_id or "").startswith("cron_")
 
 
+HANDOFF_PREFIX = "user-handoff."
+_OWNER_MAX = 80   # core's _safe_task_key cuts ledger owners at 80 chars; a longer stem would never be reaped
+
+
+def _tab_ledger_dir() -> str | None:
+    """Core's agent-tab ledger dir as turn-end cleanup (cleanup_browser -> close_agent_tabs) resolves it."""
+    try:
+        from tools import browser_use_cli as bu
+        return str(bu._tab_ledger_path(bu._base_subprocess_env(), "x").parent)
+    except Exception as e:
+        log.debug("browser-focus: no tab ledger dir: %s", e)
+        return None
+
+
+def _write_json(path: str, data: dict) -> None:
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+    os.replace(tmp, path)
+
+
+def hold_for_user(target_id: str, ledger_dir: str | None = None, now: float | None = None) -> str | None:
+    """Keep a tab the user was just handed open across turn ends (agent-7390286fc7).
+
+    Core closes every tab in the session's agent-tab ledger when the TURN ends, and the ask to the user is always the
+    turn's last reply, so a sign-in tab the agent opened was closed seconds after the user was sent to it. Move the
+    tab into its own ``user-handoff.<owner>`` ledger with a fresh last_used: the session's turn-end close skips it and
+    core's idle reaper (``browser.agent_tab_idle_s``) still closes it once the handoff is abandoned. Returns the
+    handoff ledger's owner, or None when no ledger holds the tab."""
+    d = ledger_dir if ledger_dir is not None else _tab_ledger_dir()
+    if not d or not target_id or not os.path.isdir(d):
+        return None
+    now = time.time() if now is None else now
+    for name in sorted(os.listdir(d)):
+        if not name.endswith(".json"):
+            continue
+        src = os.path.join(d, name)
+        try:
+            data = json.load(open(src, encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            continue
+        tabs = data.get("tabs") if isinstance(data, dict) else None
+        if not isinstance(tabs, dict) or target_id not in tabs:
+            continue
+        stem = name[:-5]
+        dest_stem = stem if stem.startswith(HANDOFF_PREFIX) else re.sub(
+            r"[^A-Za-z0-9._-]+", "_", HANDOFF_PREFIX + stem)[:_OWNER_MAX]
+        dest = os.path.join(d, dest_stem + ".json")
+        try:
+            if dest != src:
+                held = {"owner": dest_stem, "last_used": now, "tabs": {}}
+                with contextlib.suppress(OSError, ValueError):
+                    old = json.load(open(dest, encoding="utf-8-sig"))
+                    if isinstance(old, dict) and isinstance(old.get("tabs"), dict):
+                        held["tabs"] = old["tabs"]
+                held["tabs"][target_id] = tabs.pop(target_id)
+                held.update(owner=dest_stem, last_used=now)
+                _write_json(dest, held)   # write the hold first: a crash in between never loses the tab
+                _write_json(src, data)
+            else:
+                data.update(owner=dest_stem, last_used=now)
+                _write_json(src, data)
+        except OSError as e:
+            log.debug("browser-focus: holding tab %s failed: %s", target_id, e)
+            return None
+        return dest_stem
+    return None
+
+
 def focus(match: str | None = None, require_login: bool = False, kinds: tuple[str, ...] = ()) -> dict:
     """Show the agent Chrome and raise it.
     - match: tab URL/title substring. A match that hits no tab raises NOTHING and returns focused=false with the
@@ -275,10 +345,17 @@ def focus(match: str | None = None, require_login: bool = False, kinds: tuple[st
     app = activate_app(pid) if pid else False
     if not activated and tab:
         tab = None   # never claim a tab is in front when the activate call failed
+    held = None
+    if tab:
+        try:
+            held = hold_for_user(str(tab["id"]))
+        except Exception as e:   # bookkeeping must never fail the focus itself
+            log.debug("browser-focus: hold failed: %s", e)
     if shown and tab and port and _LOGIN_URL.search(str(tab.get("url", ""))):
         _watch_login(port, tab["id"])
     return {"focused": bool(app or tab), "app_activated": app, "pid": pid, "shown_on_main_display": shown,
             "visible_to_user": bool(app or tab) and _visible(pid, shown, app, base),
+            "held_for_user": bool(held),
             "tab": {"title": tab.get("title"), "url": str(tab.get("url", ""))[:200]} if tab else None}
 
 

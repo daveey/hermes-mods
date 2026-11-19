@@ -216,7 +216,11 @@ def _expand_word(raw: str, variables: dict) -> Optional[str]:
             i += 1
             if i == len(raw):
                 return None
-            out.append(raw[i])
+            if quote == '"' and raw[i] not in '$`"\\\n':
+                # Double quotes preserve backslashes before ordinary characters.
+                out.append("\\")
+            if raw[i] != "\n":
+                out.append(raw[i])
         elif char == "$" and quote != "'":
             match = re.match(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))", raw[i:])
             if not match:
@@ -239,6 +243,32 @@ def _expand_word(raw: str, variables: dict) -> Optional[str]:
             out.append(char)
         i += 1
     return None if quote else "".join(out)
+
+
+def _fixed_basename(raw: str) -> Optional[str]:
+    """Last path component of a command word whose directory part alone is unknown.
+
+    ``~/bin/tool`` (HOME unknown), ``~user/x`` and ``"$D"/bin/python3`` stay one word after
+    expansion (tilde and double-quoted expansions never split or glob), so the program is the
+    literal last component. None when that component is not a plain literal, or when the
+    directory part may split or glob (an unquoted ``$X``, ``*``, braces, a substitution).
+    """
+    match = re.fullmatch(r"(.+)/([A-Za-z0-9_.+-]+)", raw, re.S)
+    if not match or _splittable(match[1]):
+        return None
+    quote = None
+    i, prefix = 0, match[1]
+    while i < len(prefix):  # the directory part must close every quote it opens
+        c = prefix[i]
+        if c == "\\" and quote != "'":
+            i += 2
+            continue
+        if c in "\"'" and (quote is None or quote == c):
+            quote = c if quote is None else None
+        i += 1
+    if quote is not None or i > len(prefix):
+        return None
+    return match[2]
 
 
 def _config_runs(key: str) -> bool:
@@ -302,6 +332,37 @@ def _glob_bracket(raw: str, i: int) -> bool:
     literal, so neither makes the word unknown.
     """
     return "]" in raw[i + 1:]
+
+
+_DEFERRING = RUNNERS | _INTERPRETERS | {"source", ".", "eval"}
+
+
+def _defers_unseen(words, st=None) -> bool:
+    """True if a word of ``words`` may name a program that runs input the guard cannot see.
+
+    Inside a hypothetical argv suffix the guard does not split again, so a nested runner
+    (``xargs -a FILE git``, ``parallel``, ``flock M …``) or an interpreter reading a script
+    file never has its own argv suffixes, appended words or file analyzed. Scoping the
+    uncertainty of such an argv locally would drop exactly the evidence it hides.
+
+    With ``st`` each word is classified by the value command dispatch would see, expanded
+    through the same scalar state (``X=xargs; … "$X" -a args git``), not only by its literal
+    spelling. A word naming a shell function counts too: its body is not analyzed at this
+    depth. A word whose value is unknown is not classified here; the caller's Git reading of
+    the argv handles an unknown command or subcommand position.
+    """
+    for w in words:
+        values = {_literal(w) or ""}
+        if st is not None:
+            values.add(_expand_word(w, st.vars) or "")
+        for value in values:
+            name = os.path.basename(value)
+            base = re.sub(r"[\d.]+$", "", name) or name
+            if base in _DEFERRING or name in _DEFERRING:
+                return True
+            if st is not None and value and value in st.funcs:
+                return True
+    return False
 
 
 def _splittable(raw: str) -> bool:
@@ -1269,8 +1330,117 @@ def _command_lookup_only(args: list[str]) -> bool:
     return lookup
 
 
+def _env_split(text: str) -> list[str]:
+    """Bounded literal GNU env -S grammar (not shell syntax or shlex).
+
+    Parameter expansion needs the child's environment and is deliberately unsupported.
+    Decoded words must be shell-quoted before entering the shell analyzer again.
+    """
+    if len(text) > 16384:
+        raise _ParseError("env split-string budget")
+    out, word = [], []
+    quote, started, i = "", False, 0
+    escapes = {"f": "\f", "n": "\n", "r": "\r", "t": "\t", "v": "\v",
+               "#": "#", "$": "$", "\\": "\\", "'": "'", '"': '"'}
+    while i < len(text):
+        ch = text[i]
+        i += 1
+        if ch == "\\" and (quote != "'" or
+                i < len(text) and text[i] in "\\'"):
+            if i == len(text):
+                raise _ParseError("trailing env escape")
+            ch = text[i]
+            i += 1
+            if ch == "c" and not quote:
+                break
+            if ch == "_":
+                if quote:
+                    word.append(" ")
+                    started = True
+                elif started:
+                    out.append("".join(word))
+                    word, started = [], False
+                continue
+            if ch not in escapes:
+                raise _ParseError("unsupported env escape")
+            word.append(escapes[ch])
+            started = True
+        elif ch == "$" and quote != "'":
+            raise _ParseError("dynamic env split-string")
+        elif ch in "\"'" and (not quote or quote == ch):
+            quote = "" if quote else ch
+            started = True
+        elif not quote and ch in " \t\n\r\v\f":
+            if started:
+                out.append("".join(word))
+                word, started = [], False
+        elif not quote and ch == "#" and not started:
+            break
+        else:
+            word.append(ch)
+            started = True
+    if quote:
+        raise _ParseError("unclosed env quote")
+    if started:
+        out.append("".join(word))
+    return out
+
+
+def _env_split_spec(words: list[str]):
+    """Locate a split-string operand without treating option values as options.
+
+    Return (option index, attached-value offset); an offset at the end of the
+    option means the next word is the operand. Stop at env's command boundary.
+    Unknown option grammars retain the existing wrapper fallback.
+    """
+    i = 1
+    while i < len(words):
+        word = words[i]
+        if word in {"--", "-"} or not word.startswith("-"):
+            return None
+        if word.startswith("--"):
+            # GNU getopt_long accepts unique prefixes. Optional signal operands
+            # are attached only; consuming the next word would hide its -S.
+            name, sep, _ = word[2:].partition("=")
+            options = {
+                "split-string": "split", "unset": "required",
+                "chdir": "required", "argv0": "required",
+                "ignore-environment": "none", "debug": "none", "null": "none",
+                "block-signal": "optional", "default-signal": "optional",
+                "ignore-signal": "optional", "list-signal-handling": "none",
+                "help": "exit", "version": "exit",
+            }
+            matches = ([name] if name in options else
+                       [key for key in options if key.startswith(name)])
+            if not name or len(matches) != 1:
+                return None  # unknown/ambiguous options fail in env itself
+            kind = options[matches[0]]
+            if kind == "exit" or (sep and kind == "none"):
+                return None
+            if kind == "split":
+                return i, len(name) + 2 + bool(sep)
+            i += 2 if kind == "required" and not sep else 1
+            continue
+        j = 1
+        while j < len(word):
+            flag = word[j]
+            if flag == "S":
+                return i, j + 1
+            if flag in "uCa":
+                i += int(j + 1 == len(word))
+                break
+            if flag not in "iv0":
+                return None
+            j += 1
+        i += 1
+    return None
+
+
 def _skip_wrappers(words: list[str], external_time: Optional[list] = None) -> list[str]:
     while words:
+        if (os.path.basename(words[0]) == "env" and len(words) > 1
+                and _env_split_spec(words) is not None):
+            return words  # simple() owns this argv-changing grammar boundary
         if os.path.basename(words[0]) == "time":
             # This is the external program; the shell keyword was parsed as a pipeline.
             if external_time is not None:
@@ -1337,7 +1507,8 @@ _STASH_ARG_OPTS = {"-m", "--message", "--pathspec-from-file"}
 _DYNAMIC_OP = re.compile(
     r"\bstash(?:\s+(?:-m|--message|--pathspec-from-file)\s+[^\s;&|]+"
     r"|\s+-(?!(?:m|-message|-pathspec-from-file)(?:\s|$))[^\s;&|]*)*\s+[^\s;&|]*[$`{*?\[]")
-_DYNAMIC_SUB = re.compile(r"\bgit(?:\s+-C\s+[^\s;&|]+)*\s+[^\s;&|-][^\s;&|]*?[$`{*?\[]")
+# `git` as a command word: never an option (`diff --git`) or a path component (`.git`).
+_DYNAMIC_SUB = re.compile(r"(?<![\w.-])git(?:\s+-C\s+[^\s;&|]+)*\s+[^\s;&|-][^\s;&|]*?[$`{*?\[]")
 
 
 def _ansi_c_decode(body: str) -> str:
@@ -1402,6 +1573,9 @@ class _Analyzer:
         self.alias_evidence = bool(_restore_evidence(text) or re.search(
             r"\b(?:stash|pop|apply)\b|\.git/config|git\s+config|alias\.|\[alias\]|include|GIT_CONFIG",
             text, re.IGNORECASE))
+        # Stash/restore text anywhere in the command: where an unknown Git subcommand may
+        # take its value from.
+        self.restore_text = bool(_restore_evidence(text) or re.search(r"\bstash\b", text, re.I))
         self.calls: list = []
         self.source = ""
         self.steps = 0
@@ -1426,6 +1600,14 @@ class _Analyzer:
         self.child_alias_source: Optional[str] = None
         self.config_repo = False  # a preceding write may rewire core.worktree
         self.child_alias = False  # inherited only while analyzing a Git runner child
+        # (node, stdin text or None) of the hypothetical suffix command shadow_argv analyzes
+        self.suffix: Optional[tuple] = None
+        # Use the exact fallback classifier, including decoded shared mutations and
+        # ref writes. This is only a predicate for an unknown command-position argv;
+        # these text matches must not themselves become reported calls.
+        self._text_evidence(text, git_words=False)
+        self.restore_text = self.restore_text or bool(self.calls)
+        self.calls.clear()
 
     def record(self, repo, sub, args, note: Optional[str] = None):
         """``note``: the unresolved shell word that alone made this a possible restore."""
@@ -1457,7 +1639,7 @@ class _Analyzer:
 
     def shadow_argv(self, words: list, st: _State, depth: int, as_git: bool = False,
                     tail: bool = False, unknown_command: Optional[str] = None,
-                    git_assigns: Optional[list] = None):
+                    git_assigns: Optional[list] = None, redirs: Optional[list] = None):
         """Unsupported wrapper or unknown command name: any suffix may be the real command.
 
         Each suffix of the argv is analyzed as a command with unknown repo (and, for an
@@ -1470,21 +1652,49 @@ class _Analyzer:
         self.splitting = True
         self.shadow += 1
         extra = [_UNKNOWN_WORD] if tail else []
+        saved = self.suffix
         try:
             for k in range(1, len(words)):
-                self.simple(("simple", [], words[k:] + extra, []), st, depth, nested=True)
+                node = ("simple", [], words[k:] + extra, [])
+                # The suffix runs with the real command's stdin: earlier pipeline output and
+                # here-doc/here-string bodies are text it may read (`echo stash pop | xargs "$G"`).
+                # None: stdin is a file the guard does not read.
+                stdin = [self.pipe_text or ""]
+                for op, target, body, _quoted in redirs or ():
+                    if op in ("<<", "<<-"):
+                        stdin.append(body or "")
+                    elif op == "<<<":
+                        stdin.append(target)
+                    elif op in ("<", "<>", "<&"):
+                        stdin = None
+                        break
+                self.suffix = (node, None if stdin is None else " ".join(stdin))
+                self.simple(node, st, depth, nested=True)
+            self.suffix = saved
             if as_git:
                 self.simple(("simple", git_assigns or [], ["git", *words[1:]], []), st, depth, nested=True,
                             unknown_command=unknown_command)
         finally:
+            self.suffix = saved
             self.shadow -= 1
             self.splitting = False
+
+    def local_evidence(self, text: str):
+        """Restore/mutation evidence in ``text`` alone, without whole-command uncertainty.
+
+        For uncertainty confined to one argv whose boundaries the parser established: the
+        caller analyzed everything else, so only this text may hide a stash operation.
+        """
+        self._text_evidence(text, git_words=False)
 
     def fail_closed(self, text: str, git_words: bool = False):
         """Analysis gave up on ``text``: any restore it may contain runs in an unknown repo."""
         self.uncertain = True
         if not git_words:
             self.unanalyzed += 1
+        self._text_evidence(text, git_words)
+
+    def _text_evidence(self, text: str, git_words: bool):
         for op in _restore_evidence(text or ""):
             self.record(None, "stash", [op])
         # Mutation evidence is separate from restore/alias diagnostics. This is
@@ -1729,6 +1939,13 @@ class _Analyzer:
             # states (`A="$A x"` grows forever; HOME and cwd do not) and accept the widened
             # state only if one more iteration from it stays within it (a post-fixpoint).
             # Otherwise every value is lost, as before.
+            # First widen per value of the variables this loop leaves alone (an enclosing
+            # `for f in a b` value): joining states across them would make `$f` unknown,
+            # and an unknown command word reads as a possible `git stash pop`.
+            wides = self._partition_widen(pre, out, once)
+            if wides is not None:
+                out = _union(out, wides)
+                return out, out
             wide = _widen(out)
             if wide is not None:
                 exit3, after3 = once([wide])
@@ -1737,6 +1954,39 @@ class _Analyzer:
                     return out, out
             out = _union(out, [_unknown(out)])
         return out, out
+
+    @staticmethod
+    def _partition_widen(pre, out, once) -> Optional[list]:
+        """Widened states, one per value of the loop-invariant variables, or None.
+
+        A variable is loop-invariant when the states after the iterations hold exactly the
+        known values the entry states held. Each partition is widened on its own; the
+        result is accepted only as a post-fixpoint (one more iteration from the widened
+        states stays within them), so it never claims more than the plain join would.
+        """
+        names = set().union(*(s.vars for s in out))
+        stable = sorted(
+            n for n in names
+            if None not in {s.vars.get(n) for s in out}
+            and {s.vars.get(n) for s in out} == {s.vars.get(n) for s in pre}
+            and len({s.vars.get(n) for s in out}) > 1)
+        if not stable:
+            return None
+        parts: dict = {}
+        for st in out:
+            parts.setdefault(tuple(st.vars.get(n) for n in stable), []).append(st)
+        if len(parts) > MAX_STATES:
+            return None
+        wides = []
+        for group in parts.values():
+            wide = _widen(group)
+            if wide is None:
+                return None
+            wides.append(wide)
+        exit3, after3 = once(wides)
+        if all(any(_within(st, w) for w in wides) for st in _union(exit3, after3)):
+            return wides
+        return None
 
     @staticmethod
     def loop_values(keyword, var, words, st) -> list:
@@ -1853,8 +2103,27 @@ class _Analyzer:
             kept = _skip_wrappers(wrapper_words, external_time)
         except _ParseError:
             # Expanded words carry scalar evidence that the raw text may only hold split.
-            self.fail_closed(" ".join(words + wrapper_words))
-            self.shadow_argv(words, st, depth)
+            if (self.suffix and self.suffix[0] is node and self.suffix[1] is not None
+                    and not _defers_unseen(words, st)):
+                # The parser established this argv's boundaries. Failure to resolve a
+                # hypothetical wrapper suffix is local, not a failed shell parse: it
+                # cannot turn quoted data elsewhere into an executable Git operation.
+                # Its stdin (pipe, here-doc, here-string text) is input it may run as
+                # Git words, so it is part of the local evidence. Unread stdin (`< file`),
+                # or a later word naming a program that runs input the guard never sees at
+                # this depth (xargs/parallel/find appending words, perhaps from `-a file`; a
+                # nested runner; an interpreter's script file), stays fail-closed.
+                expanded = [_expand_word(w, st.vars) for w in words]
+                # Every literal, single-token suffix is analyzed by shadow_argv's
+                # outer loop. Bag-of-words evidence must not invent `stash push`
+                # from `git push ... HEAD:fix/stash-topic`. Keep text fallback for
+                # unknown expansions, code strings and stdin the suffix may run.
+                if (self.suffix[1] or any(w is None or re.search(r"\s", w)
+                                          for w in expanded)):
+                    self.local_evidence(" ".join(words + wrapper_words) + "\n" + self.suffix[1])
+            else:
+                self.fail_closed(" ".join(words + wrapper_words))
+            self.shadow_argv(words, st, depth, redirs=redirs)
             if os.path.basename(wrapper_words[0] or "") in EXTERNAL_WRAPPERS:
                 # A wrapper program runs its argv in a child process: only that argv is
                 # uncertain (analyzed above), never the caller's cwd, variables or functions.
@@ -1875,13 +2144,91 @@ class _Analyzer:
         if not lit:
             return [st], [st]
         name = _expand_word(raw[0], st.vars)
+        fixed = _fixed_basename(raw[0]) if name is None else None
+        if fixed is not None and not any(f.endswith("/" + fixed) for f in st.funcs):
+            # Only the directory is unknown (`~/bin/tool` with HOME unknown, `"$D"/python3`):
+            # the word cannot split, so it runs the program named by its last component
+            # (unless a slash-named function of that name may match the expanded word).
+            name = "/<unresolved>/" + fixed
         if name is None:
             # Unknown command name: it may be git itself, or a wrapper of a later word.
+            suffix = self.suffix if self.suffix and self.suffix[0] is node else None
+            if (suffix and suffix[1] is not None and not _splittable(raw[0])
+                    and not _defers_unseen(raw[1:], st)):
+                # A hypothetical suffix of a known program's argv (`grep -- "$l" "$f"` read
+                # as if grep ran "$f"), headed by a word that stays one word: the uncertainty
+                # is this argv's alone, and the rest of the command was parsed and analyzed,
+                # so it never widens to whole-text evidence. Widening let git-looking data
+                # anywhere else (an awk regex `/^diff --git a\//`) become a phantom
+                # `stash pop` with no Git argv at command position. An unquoted unknown head
+                # may split into a whole command built elsewhere: that keeps failing closed.
+                # The head may still be git itself (`flock l "$G" "$S" "$O"`): this argv alone
+                # is analyzed as a Git argv. A literal subcommand there is decided as usual. An
+                # unknown one (`"$S"`) gets its value from somewhere in this command or from
+                # outside it; it is refused when the command anywhere holds stash/restore text
+                # (`S=$(printf stash)`), the same text evidence the whole-command fallback used,
+                # but no longer turned into a phantom call when no Git argv may run.
+                # The head may also be consumed by the enclosing wrapper (`env "$A" …` with
+                # A=X=1, `flock "$A" …`), making the rest of this argv the real command. Its
+                # suffix reading is analyzed, but not split again: when that rest names a
+                # runner or interpreter (`xargs -a args git`), its input is unseen, so the
+                # argv keeps the whole-command fallback below (_defers_unseen).
+                self.local_evidence(" ".join(words) + "\n" + suffix[1])
+                saved = self.suffix, self.splitting
+                self.suffix, self.splitting = None, True  # already a suffix: not split again
+                self.shadow += 1
+                mark = len(self.calls)
+                uncertain, unanalyzed = self.uncertain, self.unanalyzed
+                try:
+                    self.simple(("simple", assigns, ["git", *raw[1:]], []), st, depth, nested=True,
+                                unknown_command=" ".join(assigns + raw))
+                finally:
+                    self.shadow -= 1
+                    self.suffix, self.splitting = saved
+                if not self.restore_text:
+                    # No stash text anywhere: a stash call here could only be inferred from
+                    # unknown words of this hypothetical reading. Drop it, and the
+                    # whole-command uncertainty the reading's unknown words would set.
+                    self.calls[mark:] = [
+                        call for call in self.calls[mark:]
+                        if call[1] != "stash" or isinstance(call[3], _AliasUncertainty)]
+                    self.uncertain, self.unanalyzed = uncertain, unanalyzed
+                return [st], [st]
             self.fail_closed(" ".join(words))
-            self.shadow_argv(raw, st, depth, as_git=True,
+            self.shadow_argv(raw, st, depth, as_git=True, redirs=redirs,
                              unknown_command=" ".join(assigns + raw), git_assigns=assigns)
             return [st], [st]
         cmd = os.path.basename(name)
+        split_spec = _env_split_spec(kept) if cmd == "env" else None
+        if split_spec is not None:
+            index, offset = split_spec
+            option = _expand_word(raw[index], st.vars)
+            separate = offset == len(kept[index]) and not (
+                kept[index].startswith("--") and "=" in kept[index])
+            value = (_expand_word(raw[index + 1], st.vars)
+                     if index + 1 < len(raw) else None) if separate else (
+                         option[offset:] if option is not None else None)
+            try:
+                if value is None or depth >= MAX_DEPTH:
+                    raise _ParseError("unresolved env split-string")
+                decoded = _env_split(value)
+            except _ParseError:
+                # This operand becomes argv, not inert shell data. Text evidence
+                # cannot bound expansion (even an empty ${VAR} changes word edges).
+                self.record(None, "stash", ["pop"], _EvidenceNote(
+                    f"matched command `{' '.join(raw)}`: unresolved env split-string "
+                    "may construct a stash operation; refusing conservatively"))
+            else:
+                # Earlier env options may change cwd/environment. Do not claim a
+                # known repository, and never propagate child uncertainty to caller.
+                child = _unknown([st]) if index > 1 or (
+                    not kept[index].startswith("--") and offset > 2) else st.copy()
+                # Re-quote decoded argv so literal $, spaces and ; remain data.
+                child_words = ["env", *map(shlex.quote, decoded),
+                               *raw[index + (2 if separate else 1):]]
+                self.simple(("simple", assigns, child_words, redirs), child, depth + 1,
+                            nested=True)
+            return [st], [st]
         if cmd == "alias":
             for word in raw[1:]:
                 value = _expand_word(word, st.vars)
@@ -1990,7 +2337,7 @@ class _Analyzer:
                     self.shadow -= 1
             return [st], [st]
         if cmd in RUNNERS:
-            self.shadow_argv(raw, st, depth, tail=cmd in _APPENDING_RUNNERS)
+            self.shadow_argv(raw, st, depth, tail=cmd in _APPENDING_RUNNERS, redirs=redirs)
             self.shadow += 1
             try:  # `su -c 'cmd'`, `watch 'cmd'`, `script -c 'cmd'` run a shell string
                 for word in raw[1:]:
@@ -2049,12 +2396,16 @@ class _Analyzer:
             # command it runs (`prlimit git …`, `nix develop -c git …`, `busybox sh -c …`).
             # An unknown word counts when this command made it unknown (a substitution, a
             # variable it assigned, a positional); inherited terminal state is out of scope.
-            for w in raw[1:]:
+            for index, w in enumerate(raw[1:], 1):
                 word = _expand_word(w, st.vars)
                 base = os.path.basename(word) if word is not None else None
-                if (base in SHELLS or (base is not None and re.fullmatch(r"git(?:-[\w-]+)?", base))
+                env_split = (base == "env" and _env_split_spec([
+                    _expand_word(part, st.vars) or _literal(part)
+                    for part in raw[index:]]) is not None)
+                if (base in SHELLS or env_split
+                        or (base is not None and re.fullmatch(r"git(?:-[\w-]+)?", base))
                         or (base is None and _command_unknown(w, st))):
-                    self.shadow_argv(raw, st, depth)
+                    self.shadow_argv(raw, st, depth, redirs=redirs)
                     break
             # A string argument may be shell code it runs (`tmux new 'git …'`,
             # `make --eval`, `vim -c '!…'`, `npx -c`).
@@ -2069,7 +2420,7 @@ class _Analyzer:
         # names. Use the expanded executable, not its basename: even when data text
         # triggered conservative remapping evidence, /usr/bin/python3 is not git.
         if _CMDS in st.exported and "/" not in name and cmd not in BUILTINS_NOT_HASHED:
-            self.shadow_argv(raw, st, depth, as_git=True)  # BASH_CMDS may map it to git
+            self.shadow_argv(raw, st, depth, as_git=True, redirs=redirs)  # BASH_CMDS may map it to git
         if ((re.sub(r"[\d.]+$", "", cmd) in _INTERPRETERS
              and (not is_awk or awk_runs_commands)) or (cmd == "sed" and any(
                 re.search(r"(?:^|[;\n{}])\s*e(?:\s|;|$)|^s(.).*\1.*\1[gpwIiMm0-9]*e", w)

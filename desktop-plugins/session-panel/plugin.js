@@ -33,7 +33,7 @@ import { useEffect, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'session-panel'
-const VERSION = 'session-panel-v3-board-status'
+const VERSION = 'session-panel-v4-reported-closed'
 export const STUCK_CARD_S = 2 * 3600 // running card with no event this long
 export const STUCK_SUB_MS = 30 * 60_000 // sub-agent with no new tool call this long
 const DONE_POLL_MS = 30_000
@@ -262,7 +262,7 @@ const NO_OBSERVATIONS = 'producer_sent_no_observations'
 const legacyLive = (c, ev) => (ev?.reason === NO_OBSERVATIONS || ev?.reason === REPLICA_REASON) && c?.kind === 'kanban' && c.look !== 'needs-you' && LEGACY_LIVE.has(str(c.state))
 export function classify(chips, { nowMs = Date.now(), silence = new Map(), isAsked = () => false, presentationFor = () => null, evidence = () => null } = {}) {
   const now = nowMs / 1000
-  const out = { active: [], stuck: [], waiting: [], ready: [], queued: [], unasked: [], lastActivity: 0 }
+  const out = { active: [], stuck: [], waiting: [], ready: [], queued: [], unasked: [], reported: [], lastActivity: 0 }
   const seen = at => { if (Number(at) > out.lastActivity) out.lastActivity = Number(at) }
   for (const c of chips || []) {
     if (!c || !c.key) continue
@@ -287,6 +287,14 @@ export function classify(chips, { nowMs = Date.now(), silence = new Map(), isAsk
     // A stale chip is session-tasks' last-known copy after a failed read: the card may have been answered,
     // re-blocked or archived since, so it is never stuck (no nudge) or needs-you, only "status unknown".
     if (c.stale) { out.waiting.push({ ...item(c), detail: `status unknown · last known: ${c.look === 'needs-you' ? 'needs you' : c.state || 'unknown'}${last ? ` (${ago(last, nowMs)})` : ''}; the card could not be re-read` }); continue }
+    // A closed card on another gateway that its owner never confirmed to this chat (session-tasks `reported`): say
+    // what the owner reported, in its own group. It is not waiting on anything and asks nothing, and it is never
+    // counted as done. Chat 20261110_185031_4f5f4b listed 198 such cards of retired workers under Waiting as
+    // "status unknown (missing qualified identity)" four days after they finished.
+    if (c.state === 'unknown' && (c.reported === 'done' || c.reported === 'archived')) {
+      out.reported.push({ ...item(c), detail: `reported ${c.reported} by ${c.gateway || c.gatewayId || 'another gateway'} · not confirmed by its owner` })
+      continue
+    }
     if (c.look === 'needs-you') {
       // A finished, archived or cancelled card asks nothing, whatever wait it last reported.
       if (!TERMINAL.has(str(c.state))) {
@@ -341,7 +349,7 @@ export function classify(chips, { nowMs = Date.now(), silence = new Map(), isAsk
  *  step or an agent issue. Done/archived cards never count as open work; history has its own disclosure. */
 export function hasOpenWork(sorted, { asks = 0, steps = [], issues = [] } = {}) {
   const open = list => (list || []).some(i => !(i.kind === 'kanban' && TERMINAL.has(str(i.chip?.state))))
-  return !!(asks || sorted.unasked.length || open(sorted.active) || open(sorted.stuck) || open(sorted.waiting) || open(sorted.ready) || open(sorted.queued) ||
+  return !!(asks || sorted.unasked.length || open(sorted.active) || open(sorted.stuck) || open(sorted.waiting) || open(sorted.ready) || open(sorted.queued) || (sorted.reported || []).length ||
     (Array.isArray(steps) && steps.some(s => s?.id && (s.status || 'open') === 'open')) || (Array.isArray(issues) && issues.length))
 }
 
@@ -714,6 +722,7 @@ export function Panel() {
   const [, setTick] = useState(0)
   const [collapsedKeys, setCollapsedState] = useState(readCollapsed)
   const [finishedScopes, setFinishedScopes] = useState(() => new Set())
+  const [reportedScopes, setReportedScopes] = useState(() => new Set())
   const focused = useValue(host.state.focusedSessionId)
   const stored = useValue(host.state.focusedStoredSessionId)
   const busy = useValue(host.state.busy)
@@ -756,6 +765,14 @@ export function Panel() {
     else next.add(scope)
     return next
   })
+  const reported = sorted.reported
+  const reportedOpen = reportedScopes.has(scope)
+  const toggleReported = () => setReportedScopes(previous => {
+    const next = new Set(previous)
+    if (next.has(scope)) next.delete(scope)
+    else next.add(scope)
+    return next
+  })
   // A legacy card listed above as an unasked row is the same exact qualified card the strip's "Earlier asks"
   // would show again: hand those identities to the strip so each card renders once. Exact identity only.
   const legacy = US?.Strip ? jsx(US.Strip, { hideCards: sorted.unasked.map(i => i.chip) }, 'legacy') : null
@@ -779,6 +796,7 @@ export function Panel() {
   const summaryParts = PIP_ORDER.filter(k => n[k]).map(k => ({ k, text: `${n[k]} ${LABEL[k]}` }))
   // Rows whose source evidence is unknown (expired, missing from an older producer, or SDK projector absent) are
   // counted apart: they are neither green nor zero.
+  if (reported.length) summaryParts.push({ k: 'reported', text: `${reported.length} reported finished, unconfirmed` })
   if (evidenceUnknown) summaryParts.push({ k: 'evidence', text: `${evidenceUnknown} evidence unknown` })
   // Same chrome as the composer status stack's sections (StatusSection): a full-width disclosure row with a caret,
   // a glyph and a muted label. The caret is the minimize toggle; folded, only this row (and waiting one-liners)
@@ -806,9 +824,13 @@ export function Panel() {
       ...sorted.active.map(i => jsx(Row, { i, k: 'running' }, i.key)),
       sorted.waiting.length > 0 && jsx('h3', { 'data-section': 'waiting', style: heading('var(--muted-foreground)'), children: `Waiting · ${sorted.waiting.length}` }),
       ...sorted.waiting.map(i => jsx(Row, { i, k: 'waiting' }, i.key)),
-      (finished?.length || sorted.ready.length || sorted.queued.length) ? jsxs('div', { style: { borderTop: '1px solid color-mix(in srgb, var(--border) 60%, transparent)', marginTop: 10, paddingTop: 4 }, children: [
+      (finished?.length || reported.length || sorted.ready.length || sorted.queued.length) ? jsxs('div', { style: { borderTop: '1px solid color-mix(in srgb, var(--border) 60%, transparent)', marginTop: 10, paddingTop: 4 }, children: [
         jsx(Fold, { label: `Ready · ${sorted.ready.length}`, items: sorted.ready, k: 'ready' }),
         jsx(Fold, { label: `Not started · ${sorted.queued.length}`, items: sorted.queued, k: 'queued' }),
+        reported.length > 0 && jsxs('div', { 'data-reported-cards': '', children: [
+          jsx('button', { type: 'button', 'data-reported-toggle': '', 'aria-expanded': reportedOpen, onClick: toggleReported, title: 'Cards on another gateway that reported closing but were never confirmed to this chat (for example, a worker that was retired)', style: { ...btn, ...muted }, children: `${reported.length} reported finished, not confirmed` }),
+          reportedOpen && reported.map(i => jsx(Row, { i, k: 'done' }, i.key))
+        ] }),
         finished?.length > 0 && jsxs('div', { 'data-finished-cards': '', children: [
           jsx('button', { type: 'button', 'data-finished-toggle': '', 'aria-expanded': finishedOpen, onClick: toggleFinished, style: { ...btn, ...muted }, children: `${finished.length} finished` }),
           finishedOpen && finished.map(d => jsx(Row, { i: { key: d.key, label: d.label, detail: d.archived ? 'archived' : d.at ? `finished ${ago(d.at, now)}` : '' }, k: 'done' }, d.key))

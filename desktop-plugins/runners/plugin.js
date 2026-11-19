@@ -381,7 +381,17 @@ export function merge(sources, now = Date.now()) {
     if (best.error) return { ...best, state: 'stale', reason: `last update ${ago(now - best.at)} · ${best.error}` }
     return best
   }
-  return { gateways: withOwnCaps(pick('gateways'), sources), ci: pick('ci'), at: now }
+  return { gateways: withEvents(withOwnCaps(pick('gateways'), sources), sources), ci: pick('ci'), at: now }
+}
+
+// Only the gateway on the autoscaler's host has lifecycle events; every other one answers []. Take them from
+// the freshest route that has any, so the timeline does not come and go with whichever gateway answered last.
+function withEvents(section, sources) {
+  const has = (g) => Array.isArray(g?.events) && g.events.length > 0
+  if (has(section)) return section
+  const from = sources.filter((s) => has(s.body?.gateways)).sort((a, b) => (b.at || 0) - (a.at || 0))[0]
+  if (!from) return section
+  return { ...section, events: from.body.gateways.events, events_since: from.body.gateways.events_since }
 }
 
 // A gateway knows its own dispatcher cap; others only see the registry. Take each machine's
@@ -406,8 +416,9 @@ export function ago(ms) {
 
 const isHub = (m) => m.name === 'hub' || (m.labels || []).includes('machine:hub')
 
-export function summarize(view) {
-  const g = view.gateways.machines || [], c = view.ci.machines || []
+export function summarize(view, throttle = null) {
+  // A stopped machine (held and off) has no capacity: it is left out of every slot total.
+  const g = (view.gateways.machines || []).filter((m) => m.state !== 'stopped'), c = view.ci.machines || []
   const gBusy = g.reduce((n, m) => n + m.running.length, 0)
   const gSlots = g.reduce((n, m) => n + (m.slots ?? m.running.length), 0)
   const slots = c.flatMap((m) => m.slots)
@@ -420,9 +431,12 @@ export function summarize(view) {
   // without a slot cap (pinned-only Macs) has no capacity to fill, so it is left out.
   const capped = g.filter((m) => typeof m.slots === 'number' && m.slots > 0)
   const hub = capped.filter(isHub), workers = capped.filter((m) => !isHub(m))
+  // `usable`: slots a token or pacing limit leaves startable (all of them when no limit is known).
+  // Present only with throttle data, so a view without the throughput plugin keeps its old shape.
   const meter = (ms) => ({
     busy: ms.reduce((n, m) => n + m.running.length, 0),
-    slots: ms.reduce((n, m) => n + m.slots, 0)
+    slots: ms.reduce((n, m) => n + m.slots, 0),
+    ...(throttle ? { usable: ms.reduce((n, m) => n + (slotLimit(m, limitRow(throttle, m.name))?.allowed ?? m.slots), 0) } : {})
   })
   return {
     gBusy, gSlots, gWaiting, cBusy, cSlots: slots.length, cOffline, lost,
@@ -431,12 +445,72 @@ export function summarize(view) {
   }
 }
 
+// ── token throttle and pacing: slots a limit will not let run ────────────────────────────────────────────
+// GET/PUT /api/plugins/throughput/v1/throttle (plugins/throughput: throttle.py, slots.py). `slots.gateways[name]`
+// carries each gateway's token cost per slot and `allowed`, the slots its share of the token cap pays for.
+// Slots beyond `allowed` are crossed out; pacing shows as text (pools paced, card starts held), not as slots. Without the throughput plugin (or with an
+// older one) there is no `slots` and nothing is crossed out.
+export const THROTTLE_PATH = '/api/plugins/throughput/v1/throttle'
+
+function bridge(path, opts = {}) {
+  const api = typeof window !== 'undefined' ? window.hermesDesktop?.api : null
+  if (!api) return Promise.reject(new Error('Hermes desktop bridge unavailable'))
+  let connectionId
+  try { connectionId = host.activeConnectionId?.() || host.state?.connectionId?.get?.() || undefined } catch { connectionId = undefined }
+  return api({ path, timeoutMs: REQUEST_TIMEOUT_MS, ...opts, ...(connectionId ? { connectionId } : {}) })
+}
+
+export const limitRow = (throttle, name) => throttle?.slots?.gateways?.[name] || null
+
+export function fmtTokens(n) {
+  if (typeof n !== 'number' || !isFinite(n)) return '–'
+  return n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${Math.round(n / 1e3)}k` : String(Math.round(n))
+}
+
+// How many of a machine's slots its share of the token cap pays for. null = the throttle limits nothing here.
+// The pacing governor is not turned into slots: its per-machine limits are not published (plugins/throughput/slots.py).
+export function slotLimit(m, row) {
+  if (!row || typeof row.allowed !== 'number' || typeof m.slots !== 'number') return null
+  const allowed = Math.max(0, Math.min(m.slots, Math.floor(row.allowed)))
+  const why = `token throttle allows ${allowed} of ${m.slots} slots here: ${fmtTokens((row.cap_per_s || 0) * 60)} tok/min share ÷ ${fmtTokens((row.tokens_per_slot_per_s || 0) * 60)} per slot`
+  return { allowed, throttled: Math.max(0, m.slots - allowed), why }
+}
+
+export function throttleLine(throttle) {
+  if (!throttle) return ''
+  const p = Math.round(throttle.percent ?? 0)
+  const cap = typeof throttle.cap_per_s === 'number' ? ` · cap ${fmtTokens(throttle.cap_per_s * 60)} tok/min` : ''
+  const rate = typeof throttle.rate_per_s === 'number' ? ` · fleet ${fmtTokens(throttle.rate_per_s * 60)} tok/min` : ''
+  const paced = (throttle.pools || []).filter((x) => x.pacing === 'paced' || x.pacing === 'held')
+    .map((x) => `${x.provider} ${x.pacing}${x.pacing === 'paced' && typeof x.pacing_factor === 'number' ? ` ${Math.round(x.pacing_factor * 100)}%` : ''}`)
+  const held = throttle.slots?.pacing?.held_starts
+  const holds = typeof held === 'number' && held > 0
+    ? ` · ${held} card start${held === 1 ? '' : 's'} held by pacing in the last ${Math.round((throttle.slots.pacing.window_s || 300) / 60)} min` : ''
+  return `Throttle ${p === 0 ? 'off' : `${p}%`}${p > 0 && p < 100 ? cap : p >= 100 ? ' · holding every call' : ''}${rate}${paced.length ? ` · pacing: ${paced.join(', ')}` : ''}${holds}`
+}
+
+export function ThrottleBar({ throttle, onThrottle, error }) {
+  const [draft, setDraft] = useState(null)
+  if (!throttle) return null
+  const percent = draft == null ? Math.round(throttle.percent ?? 0) : draft
+  const commit = () => { const p = draft; setDraft(null); if (p != null && p !== Math.round(throttle.percent ?? 0)) onThrottle?.(p) }
+  return h('div', { className: 'hermes-fleet-throttle', 'data-slot': 'runners-throttle' },
+    h('input', {
+      type: 'range', min: 0, max: 100, step: 1, value: percent, disabled: !onThrottle, 'aria-label': 'Token throttle percent',
+      onChange: (e) => setDraft(Number(e.target.value)), onMouseUp: commit, onTouchEnd: commit, onKeyUp: commit, onBlur: commit
+    }),
+    h('span', { className: 'hermes-fleet-throttle-text', 'data-throttle': String(percent) },
+      draft == null ? throttleLine(throttle) : `Throttle ${draft}% (release to set)`),
+    error ? h('span', { className: 'hermes-fleet-warning' }, `⚠ ${text(error)}`) : null)
+}
+
 const SLOT_TITLE = { busy: 'busy', idle: 'free', offline: 'offline', unknown: 'state unknown' }
 
-function Slot({ state, title, onClick, onMouseEnter, slotId }) {
+function Slot({ state, title, onClick, onMouseEnter, slotId, throttled }) {
   return h(onClick ? 'button' : 'span', {
     type: onClick ? 'button' : undefined,
-    className: `hermes-fleet-slot is-${state}`,
+    className: `hermes-fleet-slot is-${state}${throttled ? ' is-throttled' : ''}`,
+    'data-throttled': throttled ? 'true' : undefined,
     title, 'aria-label': title, onClick, onMouseEnter,
     'data-runner-slot': slotId || undefined
   })
@@ -484,6 +558,7 @@ const GW_COLS = [
   ['waiting', 'Waiting', 'Unleased ready cards that match this machine and need a slot here'],
   ['ineligible', "Can't run", 'Unleased ready cards whose placement, skills or pins do not match this machine'],
   ['cpu', 'CPU', '1-min load ÷ cores'], ['ram', 'RAM', 'Memory in use'], ['disk', 'Disk free'],
+  ['tok', 'Tok/slot', 'In+out tokens per busy slot per minute, last 15 min'],
   ['count', 'Busy'], ['info', '']
 ]
 
@@ -504,18 +579,24 @@ function MeterCell({ k, v }) {
     h('span', { className: 'hermes-fleet-num' }, value))
 }
 
-function GatewayRow({ m, now }) {
+function GatewayRow({ m, now, limit }) {
+  const lim = slotLimit(m, limit)
+  const over = (i) => !!lim && i >= lim.allowed
   const free = m.slots == null ? 0 : Math.max(0, m.slots - m.running.length)
   const freeState = m.state === 'active' ? 'idle' : m.state === 'draining' ? 'draining' : 'unknown'
   const v = loadParts(m.load, now)
-  const drainNote = m.state === 'draining'
+  // A held machine that is still up or still holds a card. Once it is off ('stopped') it has no row: StoppedNote.
+  const held = m.state === 'draining'
+  const holdTail = 'finishes running cards, takes no new ones'
+  const drainNote = held
     ? m.hold_reason === undefined
-      ? 'draining: reason unavailable (dashboard older than hold metadata); finishes running cards, takes no new ones'
-      : `draining: ${m.hold_reason ? text(m.hold_reason) : 'no reason recorded'} (held by ${m.hold_owner ? text(m.hold_owner) : m.hold_by ? text(m.hold_by) : 'unknown'}, ${typeof m.hold_at === 'number' ? ago(now - m.hold_at) : 'time unknown'}); finishes running cards, takes no new ones`
+      ? `${m.state}: reason unavailable (dashboard older than hold metadata); ${holdTail}`
+      : `${m.state}: ${m.hold_reason ? text(m.hold_reason) : 'no reason recorded'} (held by ${m.hold_owner ? text(m.hold_owner) : m.hold_by ? text(m.hold_by) : 'unknown'}, ${typeof m.hold_at === 'number' ? ago(now - m.hold_at) : 'time unknown'}); ${holdTail}`
     : null
   const meta = [
     m.pinned_only ? 'pinned only' : null,
     m.slots == null ? 'slots not set' : m.slots_source === 'local' ? 'slots from local cap' : null,
+    lim && lim.throttled ? `${lim.throttled} slot(s) crossed out: ${lim.why}` : null,
     drainNote || m.reason,
     v ? (v.stale ? `load ${v.stale}` : null) : 'load not reported'
   ].filter(Boolean).join(' · ')
@@ -523,17 +604,26 @@ function GatewayRow({ m, now }) {
   // (native title tooltips do not show inside the Desktop popover).
   return h('div', { className: `hermes-fleet-row is-${m.state}`, 'data-machine': m.name },
     h('span', { className: 'hermes-fleet-name' }, h('span', { className: 'hermes-fleet-machine-name' }, text(m.name)),
-      drainNote ? h('span', { className: 'hermes-fleet-drain-label', title: drainNote }, 'draining') : null),
+      drainNote ? h('span', { className: 'hermes-fleet-drain-label', title: drainNote }, m.state) : null),
     h('span', { className: 'hermes-fleet-slots' },
-      ...m.running.map((r) => h(Slot, {
-        key: `${r.board}/${r.task}`, state: m.state === 'lost' ? 'lost' : 'busy',
-        title: `${r.task} · ${text(r.title)}\nboard ${r.board}${r.started_at ? ` · running ${ago(now - r.started_at * 1000)}` : ''}`,
+      ...m.running.map((r, i) => h(Slot, {
+        key: `${r.board}/${r.task}`, state: m.state === 'lost' ? 'lost' : 'busy', throttled: over(i),
+        title: `${r.task} · ${text(r.title)}\nboard ${r.board}${r.started_at ? ` · running ${ago(now - r.started_at * 1000)}` : ''}${over(i) ? `\nover the limit: ${lim.why}` : ''}`,
         onClick: () => openCard(r)
       })),
-      ...Array.from({ length: free }, (_, i) => h(Slot, { key: `free-${i}`, state: freeState, title: drainNote || SLOT_TITLE[freeState] }))),
+      ...Array.from({ length: free }, (_, i) => {
+        const x = over(m.running.length + i)
+        return h(Slot, { key: `free-${i}`, state: freeState, throttled: x, title: drainNote || (x ? `cannot start: ${lim.why}` : SLOT_TITLE[freeState]) })
+      })),
     h('span', { className: 'hermes-fleet-cell hermes-fleet-waiting', title: m.waiting != null ? `${m.waiting} unleased ready card(s) for gateway-dispatched profiles match placement labels (including skill labels) on ${m.name}. Need a slot here; portable cards can also fit other machines. Does not include transient admission limits or machine availability.` : undefined }, m.waiting != null ? `${m.waiting}` : ''),
     h('span', { className: 'hermes-fleet-cell hermes-fleet-ineligible', title: m.ineligible != null ? `${m.ineligible} unleased ready card(s) for gateway-dispatched profiles cannot run here: placement labels, skill labels, machine pins or pinned-only policy do not match ${m.name}, or the card is another gateway's default-placement card that ${m.name} never picks up.` : undefined }, m.ineligible != null ? `${m.ineligible}` : ''),
     h(MeterCell, { k: 'cpu', v }), h(MeterCell, { k: 'ram', v }), h(MeterCell, { k: 'disk', v }),
+    h('span', {
+      className: `hermes-fleet-cell hermes-fleet-tok${limit?.cost_source === 'measured' ? '' : ' is-none'}`,
+      title: typeof limit?.tokens_per_slot_per_s === 'number'
+        ? (limit.cost_source === 'measured' ? 'measured on this machine, last 15 min' : 'fleet median: too little run time here to measure')
+        : 'not measured'
+    }, typeof limit?.tokens_per_slot_per_s === 'number' ? fmtTokens(limit.tokens_per_slot_per_s * 60) : '–'),
     h('span', { className: 'hermes-fleet-count' },
       m.slots == null ? `${m.running.length}` : `${m.running.length}/${m.slots}`),
     meta ? h('span', { className: 'hermes-fleet-info', role: 'img', tabIndex: 0, 'data-tip': meta, 'aria-label': `${text(m.name)}: ${meta}` }, 'i')
@@ -690,17 +780,137 @@ function SectionNote({ section }) {
   return h('div', { className: 'hermes-fleet-note', role: 'status' }, msg)
 }
 
-export function Panel({ view, now, repairClient }) {
-  const s = summarize(view)
+// ── worker lifecycle timeline ────────────────────────────────────────────────────────────────────────────
+// `gateways.events` (plugins/runners fleet.worker_events: the autoscaler's ledger, last 24 h, `at` in epoch
+// seconds). One tick per event on a 24 h axis ending now. Absent (older gateway) or empty: nothing is drawn.
+export const TIMELINE_WINDOW_MS = 24 * 3600 * 1000
+export const TIMELINE_LANES = 4
+// Closest two ticks of one lane may sit, as a share of the axis: ~5 px of the 680 px minimum panel.
+export const TIMELINE_GAP = 0.008
+export const EVENT_WORDS = { launched: 'launched', ready: 'ready for scheduling', draining: 'draining', removed: 'removed' }
+const LANE_PX = 10
+
+// Share of the axis (0 = window start, 1 = now), or null outside the window.
+export function timelineX(atMs, now, windowMs = TIMELINE_WINDOW_MS) {
+  const x = (atMs - (now - windowMs)) / windowMs
+  return Number.isFinite(x) && x >= 0 && x <= 1 ? x : null
+}
+
+// Local wall-clock HH:MM.
+export function clockTime(ms) {
+  const d = new Date(ms)
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+}
+
+// "worker-3 · draining · consolidating spare capacity · 03:41"
+export function eventTip(e) {
+  return [text(e.worker), EVENT_WORDS[e.kind] || text(e.kind), text(e.reason).trim(), clockTime(e.at * 1000)].filter(Boolean).join(' · ')
+}
+
+// Events -> ticks `{key, worker, kind, at, x, pos, lane, tip}`, oldest first. `x` is the event's time on the
+// axis; `pos` is where the tick is drawn. A worker keeps one lane for the whole window, so its life reads left
+// to right. Workers are placed in order of their first event (then name), each in the lane where fewest of its
+// ticks land within `gap` of a tick already there (lowest lane on a tie): workers acting at the same moment
+// stack instead of covering each other. Ticks still closer than `gap` in one lane (one worker launched and
+// ready within minutes, or more busy workers than lanes) are drawn `gap` apart, later ones moved right, so
+// every tick keeps its own hover target. Same input, same output.
+export function timelineTicks(events, now, { windowMs = TIMELINE_WINDOW_MS, lanes = TIMELINE_LANES, gap = TIMELINE_GAP } = {}) {
+  if (!Array.isArray(events)) return []
+  const ticks = []
+  events.forEach((e, i) => {
+    if (!e || typeof e.at !== 'number' || typeof e.worker !== 'string' || !e.worker.trim() || !(e.kind in EVENT_WORDS)) return
+    const x = timelineX(e.at * 1000, now, windowMs)
+    if (x == null) return
+    ticks.push({ key: `${e.at}:${e.worker}:${e.kind}:${i}`, worker: e.worker, kind: e.kind, at: e.at, x, pos: x, lane: 0, tip: eventTip(e), i })
+  })
+  ticks.sort((a, b) => a.at - b.at || a.i - b.i)
+  const byWorker = new Map()
+  for (const t of ticks) byWorker.set(t.worker, [...(byWorker.get(t.worker) || []), t])
+  const order = [...byWorker.keys()].sort((a, b) => byWorker.get(a)[0].at - byWorker.get(b)[0].at || (a < b ? -1 : a > b ? 1 : 0))
+  const placed = Array.from({ length: Math.max(1, lanes) }, () => [])
+  for (const worker of order) {
+    const mine = byWorker.get(worker)
+    const clashes = placed.map((xs) => mine.filter((t) => xs.some((x) => Math.abs(x - t.x) < gap)).length)
+    const lane = clashes.indexOf(Math.min(...clashes))
+    for (const t of mine) t.lane = lane
+    placed[lane].push(...mine.map((t) => t.x))
+  }
+  for (let lane = 0; lane < placed.length; lane++) {
+    const row = ticks.filter((t) => t.lane === lane)
+    for (let i = 1; i < row.length; i++) row[i].pos = Math.max(row[i].x, row[i - 1].pos + gap)
+    // Pushed past "now": pull the tail back from the right edge instead.
+    if (row.length && row[row.length - 1].pos > 1) {
+      row[row.length - 1].pos = 1
+      for (let i = row.length - 2; i >= 0; i--) row[i].pos = Math.max(0, Math.min(row[i].pos, row[i + 1].pos - gap))
+    }
+  }
+  return ticks.map(({ i, ...t }) => t)
+}
+
+// Hour labels at local round hours, every `stepHours`: [{x, label}].
+export function timelineAxis(now, windowMs = TIMELINE_WINDOW_MS, stepHours = 6) {
+  const start = now - windowMs, d = new Date(start), out = []
+  d.setMinutes(0, 0, 0)
+  if (d.getTime() < start) d.setHours(d.getHours() + 1)
+  for (let guard = 0; d.getHours() % stepHours && guard < 24; guard++) d.setHours(d.getHours() + 1)
+  for (let guard = 0; d.getTime() <= now && guard < 48; guard++, d.setHours(d.getHours() + stepHours))
+    out.push({ x: timelineX(d.getTime(), now, windowMs), label: clockTime(d.getTime()) })
+  return out.filter((a) => a.x != null)
+}
+
+const pct = (x) => `${(x * 100).toFixed(3)}%`
+
+export function Timeline({ events, now }) {
+  const ticks = timelineTicks(events, now)
+  if (!ticks.length) return null
+  const lanes = Math.max(...ticks.map((t) => t.lane)) + 1
+  const axis = timelineAxis(now)
+  return h('div', {
+    className: 'hermes-fleet-timeline', 'data-timeline': ticks.length, role: 'group',
+    'aria-label': `Worker lifecycle, last 24 hours: ${ticks.length} event${ticks.length === 1 ? '' : 's'}`
+  },
+    h('div', { className: 'hermes-fleet-tl-track', 'data-lanes': lanes, style: { height: `${lanes * LANE_PX}px` } },
+      ...axis.map((a) => h('i', { key: `g${a.x}`, className: 'hermes-fleet-tl-grid', 'aria-hidden': 'true', style: { left: pct(a.x) } })),
+      ...ticks.map((t) => h('span', {
+        key: t.key, className: `hermes-fleet-tl-tick is-${t.kind}`, role: 'img', title: t.tip, 'aria-label': t.tip,
+        'data-kind': t.kind, 'data-worker': t.worker, 'data-lane': t.lane,
+        style: { left: pct(t.pos), top: `${t.lane * LANE_PX + 1}px` }
+      }))),
+    // The label slides from left-aligned at the window start to right-aligned at now, so none is cut off.
+    h('div', { className: 'hermes-fleet-tl-axis', 'aria-hidden': 'true' },
+      ...axis.map((a) => h('span', { key: `l${a.x}`, style: { left: pct(a.x), transform: `translateX(-${pct(a.x)})` } }, a.label))),
+    h('div', { className: 'hermes-fleet-tl-legend', 'data-legend': 'worker-events' },
+      ...Object.keys(EVENT_WORDS).map((k) => h('span', { key: k, 'data-kind': k },
+        h('i', { className: `hermes-fleet-tl-key is-${k}`, 'aria-hidden': 'true' }), EVENT_WORDS[k]))))
+}
+
+// Machines that were shut down on purpose get one line under the grid, not a row each: a row of
+// dotted slots and hours-old CPU/RAM numbers for a machine that is off reads as "still there".
+function StoppedNote({ machines, now }) {
+  if (!machines.length) return null
+  return h('div', { className: 'hermes-fleet-note hermes-fleet-stopped', 'data-stopped': machines.length },
+    `${machines.length} off: `,
+    ...machines.flatMap((m, i) => [i ? ', ' : null, h('span', {
+      key: m.name, 'data-machine': m.name,
+      title: `stopped: ${m.hold_reason ? text(m.hold_reason) : 'no reason recorded'} (held by ${m.hold_owner ? text(m.hold_owner) : m.hold_by ? text(m.hold_by) : 'unknown'}, ${typeof m.hold_at === 'number' ? ago(now - m.hold_at) : 'time unknown'}); machine is off (${text(m.reason)})`
+    }, text(m.name))]))
+}
+
+export function Panel({ view, now, repairClient, throttle = null, onThrottle, throttleError }) {
+  const s = summarize(view, throttle)
+  const stopped = view.gateways.machines.filter((m) => m.state === 'stopped')
   return h('div', { className: 'hermes-fleet' },
     h('div', { className: 'hermes-fleet-head' },
       h('span', null, 'Gateway workers'),
       h('span', null, `${s.gBusy} / ${s.gSlots} slots busy`,
         s.gWaiting != null ? h('span', { title: 'Unleased ready cards assigned to gateway-dispatched profiles, counted once across board replicas. Excludes non-dispatched assignees; some cards cannot run on every machine.' }, ` · ${s.gWaiting} waiting`) : null)),
     h(SectionNote, { section: view.gateways }),
+    h(ThrottleBar, { throttle, onThrottle, error: throttleError }),
     h('div', { className: 'hermes-fleet-gw' },
       h(GatewayHead),
-      ...view.gateways.machines.map((m) => h(GatewayRow, { key: m.name, m, now }))),
+      ...view.gateways.machines.filter((m) => m.state !== 'stopped').map((m) => h(GatewayRow, { key: m.name, m, now, limit: limitRow(throttle, m.name) }))),
+    h(Timeline, { events: view.gateways.events, now }),
+    h(StoppedNote, { machines: stopped, now }),
     h('div', { className: 'hermes-fleet-head' },
       h('span', null, 'CI workers (GitHub Actions)'),
       h('span', null, `${s.cBusy} / ${s.cSlots} busy${s.cOffline ? ` · ${s.cOffline} offline` : ''}`)),
@@ -736,15 +946,18 @@ function useNow(active) {
 // Track = capacity, fill = scheduled. Green while there is room, red once every slot is taken.
 export function meterTone(m) {
   if (!m.slots) return 'none'
-  return m.busy >= m.slots ? 'full' : 'ok'
+  return m.busy >= Math.min(m.slots, m.usable ?? m.slots) ? 'full' : 'ok'
 }
 
 function Meter({ name, m }) {
   const tone = meterTone(m)
   const pct = m.slots ? Math.min(100, Math.round((m.busy / m.slots) * 100)) : 0
-  return h('span', { className: 'hermes-fleet-chipmeter', 'data-meter': name.toLowerCase(), 'data-tone': tone },
+  // The right end of the track is hatched for slots a token or pacing limit will not let start.
+  const cut = m.slots && typeof m.usable === 'number' ? Math.max(0, Math.min(100, Math.round(((m.slots - m.usable) / m.slots) * 100))) : 0
+  return h('span', { className: 'hermes-fleet-chipmeter', 'data-meter': name.toLowerCase(), 'data-tone': tone, 'data-throttled': cut ? String(m.slots - m.usable) : undefined },
     h('span', null, name),
-    h('span', { className: `hermes-fleet-chipbar is-${tone}` }, h('span', { style: { width: `${pct}%` } })))
+    h('span', { className: `hermes-fleet-chipbar is-${tone}` }, h('span', { style: { width: `${pct}%` } }),
+      cut ? h('i', { className: 'hermes-fleet-chipcut', style: { width: `${cut}%` } }) : null))
 }
 
 // The React Query cache keeps the last view across refetches (no flicker, no spinner);
@@ -771,12 +984,33 @@ export function Runners({ ctx }) {
   useEffect(() => { if (open && visible) query.refetch() }, [open])
   const now = useNow(open && visible)
   const view = query.data
-  const s = view ? summarize(view) : null
+  // The token throttle and per-gateway slot limits (throughput plugin). Absent or failing: nothing is crossed out.
+  const [throttleError, setThrottleError] = useState(null)
+  const tq = useQuery({
+    queryKey: ['runners', 'throttle'],
+    queryFn: async () => { try { return await bridge(THROTTLE_PATH) } catch { return null } },
+    refetchInterval: visible ? POLL_OPEN_MS : false,
+    refetchIntervalInBackground: false,
+    refetchOnWindowFocus: false,
+    retry: false,
+    staleTime: 5000
+  })
+  const throttle = tq.data && typeof tq.data === 'object' && 'percent' in tq.data ? tq.data : null
+  const onThrottle = async (percent) => {
+    try {
+      await bridge(THROTTLE_PATH, { method: 'PUT', body: { percent } })
+      setThrottleError(null)
+    } catch (e) {
+      setThrottleError(`throttle not set: ${e?.message || e}`)
+    }
+    tq.refetch()
+  }
+  const s = view ? summarize(view, throttle) : null
   const label = s
     ? `Runners · hub ${s.hub.busy}/${s.hub.slots} · workers ${s.workers.busy}/${s.workers.slots}`
     : 'Runners …'
   const title = s
-    ? `Hub ${s.hub.busy}/${s.hub.slots} slots scheduled · Workers ${s.workers.busy}/${s.workers.slots} · CI ${s.cBusy}/${s.cSlots} busy${s.gWaiting ? ` · ${s.gWaiting} waiting` : ''}${s.lost ? ` · ${s.lost} machine lost` : ''}`
+    ? `Hub ${s.hub.busy}/${s.hub.slots} slots scheduled · Workers ${s.workers.busy}/${s.workers.slots}${typeof s.workers.usable === 'number' && s.workers.usable < s.workers.slots ? ` (${s.workers.slots - s.workers.usable} throttled)` : ''} · CI ${s.cBusy}/${s.cSlots} busy${s.gWaiting ? ` · ${s.gWaiting} waiting` : ''}${s.lost ? ` · ${s.lost} machine lost` : ''}`
     : 'Loading runners'
   return h(Popover, { open, onOpenChange: setOpen },
     h(PopoverTrigger, { asChild: true },
@@ -823,11 +1057,11 @@ const CSS = `
 .hermes-fleet-group-meta{font-size:11px;color:var(--ui-text-tertiary);white-space:nowrap}
 .hermes-fleet-chev{color:var(--ui-text-tertiary);font-size:10px}
 .hermes-fleet-group>.hermes-fleet-row{padding-left:18px}
-.hermes-fleet-gw{display:grid;grid-template-columns:repeat(7,max-content) minmax(max-content,1fr) max-content;row-gap:3px}
+.hermes-fleet-gw{display:grid;grid-template-columns:repeat(8,max-content) minmax(max-content,1fr) max-content;row-gap:3px}
 .hermes-fleet-gw>.hermes-fleet-row,.hermes-fleet-cols{display:grid;grid-column:1/-1;grid-template-columns:subgrid;column-gap:16px;align-items:center;white-space:nowrap}
 .hermes-fleet-gw>.hermes-fleet-row>*{grid-row:1}
 .hermes-fleet-cols{font-size:10px;text-transform:uppercase;letter-spacing:.04em;color:var(--ui-text-tertiary)}
-.hermes-fleet-cols>[data-col=waiting],.hermes-fleet-cols>[data-col=ineligible],.hermes-fleet-cols>[data-col=count]{text-align:right}
+.hermes-fleet-cols>[data-col=waiting],.hermes-fleet-cols>[data-col=ineligible],.hermes-fleet-cols>[data-col=count],.hermes-fleet-cols>[data-col=tok]{text-align:right}
 .hermes-fleet-gw .hermes-fleet-name{grid-column:1;max-width:150px;display:flex;align-items:center;gap:6px}
 .hermes-fleet-machine-name{min-width:0;overflow:hidden;text-overflow:ellipsis}
 .hermes-fleet-drain-label{flex-shrink:0;font-size:10px;opacity:.75}
@@ -841,11 +1075,13 @@ const CSS = `
 .hermes-fleet-gw .hermes-fleet-meter[data-meter=disk]{grid-column:7}
 .hermes-fleet-gw .hermes-fleet-meter.is-stale,.hermes-fleet-gw .hermes-fleet-meter.is-none{color:var(--ui-text-tertiary)}
 .hermes-fleet-gw .hermes-fleet-num{flex:1;text-align:right}
-.hermes-fleet-gw .hermes-fleet-info{grid-column:9;margin-left:-8px;position:relative;box-sizing:border-box;width:13px;height:13px;border:1px solid var(--ui-text-tertiary);border-radius:50%;display:inline-flex;align-items:center;justify-content:center;font:italic 600 9px/1 Georgia,serif;color:var(--ui-text-secondary);cursor:help}
+.hermes-fleet-gw .hermes-fleet-info{grid-column:10;margin-left:-8px;position:relative;box-sizing:border-box;width:13px;height:13px;border:1px solid var(--ui-text-tertiary);border-radius:50%;display:inline-flex;align-items:center;justify-content:center;font:italic 600 9px/1 Georgia,serif;color:var(--ui-text-secondary);cursor:help}
 .hermes-fleet-gw .hermes-fleet-info.is-empty{visibility:hidden}
 .hermes-fleet-gw .hermes-fleet-info:hover::after,.hermes-fleet-gw .hermes-fleet-info:focus-visible::after{content:attr(data-tip);position:absolute;right:-2px;top:calc(100% + 5px);z-index:5;padding:3px 7px;border:1px solid var(--ui-stroke-secondary);border-radius:5px;background:var(--ui-bg,#1b1b1f);color:var(--ui-text-primary,inherit);font:normal 400 11px/1.4 system-ui,sans-serif;white-space:normal;width:max-content;max-width:min(480px,calc(100vw - 32px));overflow-wrap:anywhere;box-shadow:0 2px 8px rgba(0,0,0,.35);pointer-events:none}
 .hermes-fleet-gw .hermes-fleet-info:hover,.hermes-fleet-gw .hermes-fleet-info:focus-visible{border-color:var(--ui-text-secondary);color:inherit;outline:none}
-.hermes-fleet-gw .hermes-fleet-count{grid-column:8}
+.hermes-fleet-gw .hermes-fleet-count{grid-column:9}
+.hermes-fleet-gw .hermes-fleet-tok{grid-column:8;margin:0;text-align:right}
+.hermes-fleet-gw .hermes-fleet-tok.is-none{color:var(--ui-text-tertiary)}
 .hermes-fleet-note,.hermes-fleet-foot{font-size:11px;color:var(--ui-text-tertiary)}
 .hermes-fleet-foot{margin-top:8px}
 .hermes-fleet-pop{grid-column:1/-1;display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:2px 0 4px;padding:6px;border:1px solid var(--ui-stroke-secondary);border-radius:6px;background:var(--ui-bg)}
@@ -854,11 +1090,31 @@ const CSS = `
 .hermes-fleet-pop button:disabled{opacity:.55}
 .hermes-fleet-slot{display:inline-block;width:10px;height:10px;border-radius:2px;border:1px solid var(--ui-text-tertiary);padding:0;background:transparent}
 button.hermes-fleet-slot{cursor:pointer}
+.hermes-fleet-slot.is-throttled{position:relative;border-color:#d08a1e;background-image:linear-gradient(45deg,transparent calc(50% - .6px),#d08a1e calc(50% - .6px),#d08a1e calc(50% + .6px),transparent calc(50% + .6px)),linear-gradient(-45deg,transparent calc(50% - .6px),#d08a1e calc(50% - .6px),#d08a1e calc(50% + .6px),transparent calc(50% + .6px))}
+.hermes-fleet-slot.is-busy.is-throttled{background-color:var(--ui-accent);border-color:var(--ui-accent);background-image:linear-gradient(45deg,transparent calc(50% - .6px),var(--ui-bg,#fff) calc(50% - .6px),var(--ui-bg,#fff) calc(50% + .6px),transparent calc(50% + .6px)),linear-gradient(-45deg,transparent calc(50% - .6px),var(--ui-bg,#fff) calc(50% - .6px),var(--ui-bg,#fff) calc(50% + .6px),transparent calc(50% + .6px))}
+.hermes-fleet-throttle{display:flex;align-items:center;gap:8px;font-size:11px;color:var(--ui-text-secondary);margin:2px 0 4px}
+.hermes-fleet-throttle input[type=range]{width:120px;flex-shrink:0}
+.hermes-fleet-chipbar{position:relative}
+.hermes-fleet-chipcut{position:absolute;right:0;top:0;height:100%;background:repeating-linear-gradient(45deg,transparent 0 2px,#d08a1e 2px 3px)}
 .hermes-fleet-slot.is-busy{background:var(--ui-accent);border-color:var(--ui-accent)}
 .hermes-fleet-slot.is-offline,.hermes-fleet-slot.is-unknown{border-style:dotted;opacity:.6}
 .hermes-fleet-slot.is-draining{background:repeating-linear-gradient(45deg,transparent 0 2px,var(--ui-text-tertiary) 2px 3px)}
 .hermes-fleet-slot.is-lost{background:#d64545;border-color:#d64545}
 .hermes-fleet-row.is-asleep .hermes-fleet-name,.hermes-fleet-row.is-unknown .hermes-fleet-name{color:var(--ui-text-tertiary)}
+.hermes-fleet-timeline{margin-top:6px;font-size:10px;color:var(--ui-text-tertiary)}
+.hermes-fleet-tl-track{position:relative;margin:0 2px;border-bottom:1px solid var(--ui-stroke-secondary)}
+.hermes-fleet-tl-grid{position:absolute;top:0;bottom:0;border-left:1px dotted var(--ui-stroke-secondary)}
+.hermes-fleet-tl-tick{position:absolute;width:4px;height:8px;margin-left:-2px;border-radius:1px;cursor:help}
+.hermes-fleet-tl-tick:hover{z-index:1;outline:1px solid var(--ui-text-primary,currentColor);outline-offset:1px}
+.hermes-fleet-timeline .is-launched{background:#d4a72c}
+.hermes-fleet-timeline .is-ready{background:#2ea043}
+.hermes-fleet-timeline .is-draining{background:#388bfd}
+.hermes-fleet-timeline .is-removed{background:#d64545}
+.hermes-fleet-tl-axis{position:relative;height:13px;margin:1px 2px 0;font-variant-numeric:tabular-nums}
+.hermes-fleet-tl-axis>span{position:absolute;top:0;white-space:nowrap}
+.hermes-fleet-tl-legend{display:flex;justify-content:flex-end;flex-wrap:wrap;gap:2px 10px}
+.hermes-fleet-tl-legend>span{display:inline-flex;align-items:center;gap:4px;white-space:nowrap}
+.hermes-fleet-tl-key{display:inline-block;width:4px;height:8px;border-radius:1px}
 `
 
 export default {

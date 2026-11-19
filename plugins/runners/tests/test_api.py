@@ -525,6 +525,51 @@ def test_fleet_route_reports_each_section_and_isolates_failures(disk_api, monkey
     assert 'machines' in body['ci']
 
 
+def test_fleet_route_gateway_section_carries_worker_events_from_the_scaler_ledger(disk_api, monkeypatch, tmp_path):
+    """REST path: the real ``_gateway_section`` reads the autoscaler ledger named by the environment."""
+    import sqlite3, time
+    module, client, _, _, _, _ = disk_api
+    module.FLEET_CACHE_S = 0
+    module.FLEET_STALE_MAX_S = 0
+    ksc = types.ModuleType('hermes_cli.kanban_sync_client')
+    ksc.shadow_path = lambda board: tmp_path / 'replicas' / f'{board}.db'
+    node = types.ModuleType('hermes_cli.kanban_worker_node')
+    node.registry = lambda: dict(me='hub', machines=dict(hub=dict(name='hub', state='active', last_seen=time.time() * 1000)))
+    node._REGISTRY = dict(at=time.monotonic())
+    node.eligible = lambda *args: None
+    monkeypatch.setitem(sys.modules, 'hermes_cli.kanban_sync_client', ksc)
+    monkeypatch.setitem(sys.modules, 'hermes_cli.kanban_worker_node', node)
+    try:
+        import hermes_cli as core
+    except ImportError:  # no core checkout: a bare package so the two fakes above resolve
+        core = types.ModuleType('hermes_cli')
+        core.__path__ = []
+        monkeypatch.setitem(sys.modules, 'hermes_cli', core)
+    monkeypatch.setattr(core, 'kanban_sync_client', ksc, raising=False)
+    monkeypatch.setattr(core, 'kanban_worker_node', node, raising=False)
+    monkeypatch.setattr(module, '_local_cap', lambda: 4)
+    monkeypatch.setattr(module, '_waiting_cards', lambda fleet, shadow_dir: None)
+    ledger = tmp_path / 'worker-scaler.db'
+    monkeypatch.setenv('HERMES_WORKER_SCALER_LEDGER', str(ledger))
+    now = time.time()
+    gateways = client.get(PREFIX + '/fleet', headers=TOKEN).json()['gateways']
+    assert gateways['state'] == 'ready' and gateways['events'] == []  # no ledger on this host
+    assert now - 24 * 3600 - 5 <= gateways['events_since'] <= time.time() - 24 * 3600
+    assert not ledger.exists()
+    db = sqlite3.connect(ledger)
+    db.execute('CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, at REAL NOT NULL, slot TEXT NOT NULL, '
+               'iid TEXT, kind TEXT NOT NULL, reason TEXT NOT NULL)')
+    db.executemany('INSERT INTO events (at, slot, iid, kind, reason) VALUES (?,?,?,?,?)', [
+        (now - 120, 'worker-2', 'i-0b', 'launched', '6 cards waiting'), (now - 60, 'worker-2', 'i-0b', 'ready', 'bootstrapped'),
+        (now - 30 * 3600, 'worker-1', None, 'removed', 'older than a day')])
+    db.commit()
+    db.close()
+    gateways = client.get(PREFIX + '/fleet', headers=TOKEN).json()['gateways']
+    assert [(e['worker'], e['kind'], e['reason'], e['instance']) for e in gateways['events']] == [
+        ('worker-2', 'launched', '6 cards waiting', 'i-0b'), ('worker-2', 'ready', 'bootstrapped', 'i-0b')]
+    assert gateways['machines'][0]['name'] == 'hub'
+
+
 def test_fleet_route_without_runner_config_still_serves_gateways(disk_api, monkeypatch):
     module, client, path, _, _, _ = disk_api
     path.unlink()

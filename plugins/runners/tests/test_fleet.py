@@ -50,6 +50,20 @@ def test_held_machine_keeps_hold_metadata_from_registry():
     assert reg['machines']['spare']['hold_reason'] == 'disk cleanup'  # never mutate registry
 
 
+def test_held_machine_unseen_with_nothing_running_is_stopped_not_draining():
+    held = dict(hold=True, hold_reason='shutdown', hold_by='admin', hold_owner='session:s@hub', hold_at=NOW - 500 * MIN)
+    reg = _registry(hub={}, off=dict(held, last_seen=NOW - 500 * MIN), busy=dict(held, last_seen=NOW - 500 * MIN),
+                    recent=dict(held, last_seen=NOW - 5 * MIN), never=dict(held, last_seen=None))
+    lease = dict(holder='busy', board='default', task='t_a', title='Card A', started_at=100)
+    m = {r['name']: r for r in fleet.gateway_workers(reg, [lease], NOW)['machines']}
+    assert (m['off']['state'], m['off']['reason']) == ('stopped', 'stopped: held, not seen for 500 min')
+    # The hold metadata still explains why it is off.
+    assert (m['off']['hold_reason'], m['off']['hold_owner'], m['off']['hold_at']) == ('shutdown', 'session:s@hub', NOW - 500 * MIN)
+    assert m['busy']['state'] == 'draining'  # still holds a card: not finished
+    assert m['recent']['state'] == 'draining'  # still seen: not off yet
+    assert m['never']['state'] == 'draining'  # no liveness evidence: do not claim it is off
+
+
 def test_held_machine_reports_hold_owner_only_while_draining():
     reg = _registry(hub={}, spare=dict(hold=True, hold_reason='roll', hold_by='admin', hold_owner='card:t_01a1ce31e56561be',
                                        hold_at=NOW - MIN),
@@ -254,3 +268,145 @@ def test_ci_machine_categories_for_the_panel_groups():
     assert c('tfgar-probe', True, ['Linux']) == 'Ephemeral'
     assert c('machine', False, ['self-hosted']) == 'Other'
     assert c('macaroni-box', False, ['Linux']) == 'EC2 Linux'
+
+
+# ── worker lifecycle events (the autoscaler's ledger) ────────────────────────────────────────────
+
+NOW_S = NOW / 1000
+HOUR = 3600
+
+
+def _ledger(path, rows, schema=None):
+    db = sqlite3.connect(path)
+    db.execute(schema or 'CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, at REAL NOT NULL, '
+               'slot TEXT NOT NULL, iid TEXT, kind TEXT NOT NULL, reason TEXT NOT NULL)')
+    db.executemany('INSERT INTO events (at, slot, iid, kind, reason) VALUES (?,?,?,?,?)', rows)
+    db.commit()
+    db.close()
+    return path
+
+
+def _untouched(path):
+    stat = path.stat()
+    return path.read_bytes(), stat.st_mtime_ns, sorted(p.name for p in path.parent.iterdir())
+
+
+def test_worker_events_in_window_oldest_first_known_kinds_only(tmp_path):
+    path = _ledger(tmp_path / 'scaler.db', [
+        (NOW_S - 2 * HOUR, 'worker-2', 'i-0b', 'ready', 'bootstrap finished'),
+        (NOW_S - 3 * HOUR, 'worker-2', 'i-0b', 'launched', '6 cards waiting'),
+        (NOW_S - 30 * HOUR, 'worker-1', 'i-0a', 'launched', 'before the window'),
+        (NOW_S - HOUR, 'worker-2', None, 'draining', 'consolidating spare capacity'),
+        (NOW_S - HOUR / 2, 'worker-2', '', 'removed', 'drained'),
+        (NOW_S - HOUR, 'worker-3', 'i-0c', 'rebooted', 'a kind this view does not know'),
+        (NOW_S + HOUR, 'worker-3', 'i-0c', 'ready', 'after now'),
+        (NOW_S - 24 * HOUR, 'worker-1', 'i-0a', 'removed', 'exactly at the window start')])
+    before = _untouched(path)
+    out = fleet.worker_events(path, NOW_S - 24 * HOUR, NOW_S)
+    assert out == [
+        dict(at=NOW_S - 24 * HOUR, worker='worker-1', kind='removed', reason='exactly at the window start', instance='i-0a'),
+        dict(at=NOW_S - 3 * HOUR, worker='worker-2', kind='launched', reason='6 cards waiting', instance='i-0b'),
+        dict(at=NOW_S - 2 * HOUR, worker='worker-2', kind='ready', reason='bootstrap finished', instance='i-0b'),
+        dict(at=NOW_S - HOUR, worker='worker-2', kind='draining', reason='consolidating spare capacity', instance=None),
+        dict(at=NOW_S - HOUR / 2, worker='worker-2', kind='removed', reason='drained', instance=None)]
+    assert all(isinstance(e['at'], float) for e in out)
+    assert _untouched(path) == before  # read-only: same bytes, same mtime, no new files beside it
+
+
+def test_worker_events_limit_keeps_the_newest(tmp_path):
+    path = _ledger(tmp_path / 'scaler.db', [(NOW_S - 100 + i, f'worker-{i}', None, 'ready', f'r{i}') for i in range(10)])
+    out = fleet.worker_events(path, NOW_S - HOUR, NOW_S, limit=3)
+    assert [e['worker'] for e in out] == ['worker-7', 'worker-8', 'worker-9']  # newest three, oldest first
+    assert len(fleet.worker_events(path, NOW_S - HOUR, NOW_S)) == 10
+    assert fleet.worker_events(path, NOW_S - HOUR, NOW_S, limit=0) == []
+    assert fleet.worker_events(path, NOW_S - HOUR, NOW_S, limit='many') == []
+
+
+def test_worker_events_missing_file_or_table_is_no_events_and_creates_nothing(tmp_path):
+    missing = tmp_path / 'state' / 'worker-scaler.db'
+    assert fleet.worker_events(missing, 0, NOW_S) == []
+    assert not missing.exists() and not missing.parent.exists()
+    assert fleet.worker_events(tmp_path, 0, NOW_S) == []  # a directory
+    assert fleet.worker_events(None, 0, NOW_S) == []
+    db = sqlite3.connect(tmp_path / 'old.db')  # the ledger before the scaler writes events
+    db.execute('CREATE TABLE launches (id INTEGER)')
+    db.commit()
+    db.close()
+    before = _untouched(tmp_path / 'old.db')
+    assert fleet.worker_events(tmp_path / 'old.db', 0, NOW_S) == []
+    assert _untouched(tmp_path / 'old.db') == before
+    (tmp_path / 'junk.db').write_bytes(b'not a sqlite database')
+    assert fleet.worker_events(tmp_path / 'junk.db', 0, NOW_S) == []
+    assert (tmp_path / 'junk.db').read_bytes() == b'not a sqlite database'
+    # An events table of another shape (a column this reader selects is absent).
+    db = sqlite3.connect(tmp_path / 'shape.db')
+    db.execute('CREATE TABLE events (id INTEGER PRIMARY KEY, at REAL, slot TEXT, iid TEXT, kind TEXT)')
+    db.execute("INSERT INTO events (at, slot, kind) VALUES (?, 'worker-1', 'ready')", (NOW_S - 5,))
+    db.commit()
+    db.close()
+    assert fleet.worker_events(tmp_path / 'shape.db', 0, NOW_S) == []
+
+
+def test_worker_events_malformed_rows_are_no_events(tmp_path):
+    loose = 'CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, at, slot, iid, kind, reason)'
+    bad = [('yesterday', 'worker-1', None, 'ready', 'text time'), (None, 'worker-1', None, 'ready', 'no time'),
+           (NOW_S - 5, None, None, 'ready', 'no worker'), (NOW_S - 5, '  ', None, 'ready', 'blank worker'),
+           (NOW_S - 5, 7, None, 'ready', 'numeric worker'), (NOW_S - 5, 'worker-1', None, 'ready', None),
+           (NOW_S - 5, 'worker-1', None, None, 'no kind'), (NOW_S - 5, 'worker-1', None, b'ready', 'blob kind')]
+    path = _ledger(tmp_path / 'bad.db', bad, schema=loose)
+    assert fleet.worker_events(path, NOW_S - HOUR, NOW_S) == []
+    # Beside well-formed rows only the malformed ones are left out; a non-text instance id is dropped, not the event.
+    mixed = _ledger(tmp_path / 'mixed.db', bad + [(NOW_S - 9, 'worker-2', 12, 'launched', 'ok')], schema=loose)
+    assert fleet.worker_events(mixed, NOW_S - HOUR, NOW_S) == [
+        dict(at=NOW_S - 9, worker='worker-2', kind='launched', reason='ok', instance=None)]
+
+
+def test_worker_events_locked_ledger_is_no_events_within_about_a_second(tmp_path):
+    import time
+    path = _ledger(tmp_path / 'scaler.db', [(NOW_S - 5, 'worker-1', None, 'ready', 'up')])
+    writer = sqlite3.connect(path, isolation_level=None)
+    writer.execute('BEGIN EXCLUSIVE')
+    try:
+        started = time.monotonic()
+        assert fleet.worker_events(path, NOW_S - HOUR, NOW_S) == []
+        assert time.monotonic() - started < 1.5
+    finally:
+        writer.execute('ROLLBACK')
+        writer.close()
+    assert [e['worker'] for e in fleet.worker_events(path, NOW_S - HOUR, NOW_S)] == ['worker-1']  # released: read again
+
+
+def test_worker_events_survive_a_failed_mode_ro_open_without_writing(tmp_path, monkeypatch):
+    path = _ledger(tmp_path / 'scaler.db', [(NOW_S - 5, 'worker-1', None, 'ready', 'up')])
+    before = _untouched(path)
+    real = sqlite3.connect
+
+    def connect(target, *a, **kw):
+        if 'mode=ro' in str(target):
+            raise sqlite3.OperationalError('unable to open database file')
+        return real(target, *a, **kw)
+    monkeypatch.setattr(sqlite3, 'connect', connect)
+    assert [e['kind'] for e in fleet.worker_events(path, NOW_S - HOUR, NOW_S)] == ['ready']
+    assert fleet.worker_events(tmp_path / 'missing.db', 0, NOW_S) == [] and not (tmp_path / 'missing.db').exists()
+    assert _untouched(path) == before
+
+
+def test_gateway_section_carries_events_and_the_window_start(tmp_path):
+    path = _ledger(tmp_path / 'scaler.db', [
+        (NOW_S - 25 * HOUR, 'worker-1', None, 'launched', 'older than the window'),
+        (NOW_S - 60, 'worker-1', 'i-0a', 'draining', 'idle for 20 min')])
+    section = fleet.gateway_workers(_registry(hub={}), [], NOW)
+    out = fleet.with_worker_events(section, path, NOW_S)
+    assert out['events_since'] == NOW_S - fleet.EVENTS_WINDOW_S == NOW_S - 24 * HOUR
+    assert out['events'] == [dict(at=NOW_S - 60, worker='worker-1', kind='draining', reason='idle for 20 min', instance='i-0a')]
+    assert {k: v for k, v in out.items() if k not in ('events', 'events_since')} == section  # nothing else changes
+    assert 'events' not in section  # a new dict, not a mutation
+    none = fleet.with_worker_events(section, tmp_path / 'absent.db', NOW_S)
+    assert (none['events'], none['events_since']) == ([], NOW_S - 24 * HOUR)
+
+
+def test_scaler_ledger_path_env_override_else_home_state(tmp_path):
+    from pathlib import Path
+    assert fleet.scaler_ledger_path({'HERMES_WORKER_SCALER_LEDGER': str(tmp_path / 'x.db')}) == tmp_path / 'x.db'
+    assert fleet.scaler_ledger_path({}) == Path.home() / '.hermes' / 'state' / 'worker-scaler.db'
+    assert fleet.scaler_ledger_path({'HERMES_WORKER_SCALER_LEDGER': ''}) == fleet.scaler_ledger_path({})

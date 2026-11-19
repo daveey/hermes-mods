@@ -131,3 +131,21 @@ boundary; their existing activation paths still apply.
 Regression coverage: `tests/test_guard_decision_reload.py` at the repository root
 loads temporary plugin copies and exercises the registered pre-tool hook across
 allowed-to-refused edits, syntax errors, recovery and same-second/same-size edits.
+
+## SQLite build check (2026-11-18)
+
+Hermes holds its databases with SQLite 3.53.1 (the managed Python). SQLite 3.7.0-3.51.2 has the WAL-reset bug
+(https://sqlite.org/wal.html#walresetbug): with two connections on one WAL database, a write racing a checkpoint can
+corrupt it. Ubuntu 24.04's `/usr/bin/sqlite3` and `python3` link 3.45.1, macOS's 3.51.0. On 2026-11-18 the hub's
+`state.db` search index was found with pages referenced twice while such a process held it.
+
+So any command that would open a live database (reads and `-readonly` included) with a `sqlite3` binary,
+`python -c` or `python -m sqlite3` whose SQLite is affected is refused. The program's SQLite is asked by running
+it (`sqlite3 --version`, or the interpreter's `sqlite3.sqlite_version`) only when it is a root-owned, non-writable
+binary in a system directory, with an empty environment, `cwd=/`, a 5 s limit and its process group killed on
+timeout; a bare name is looked up on the system directories only. Anything else (a relative path, a binary in a
+user directory, no answer) is unknown and not blocked: the guard never runs a program an agent wrote. Answers are
+remembered per binary within one process (each Claude Code hook call is a new process). The refusal names
+`~/.hermes/bin/hermes-core-python -m sqlite3 <db> "<sql>"` (managed SQLite), which the write and maintenance rules
+above judge like `sqlite3`; a raw Kanban write gets the board refusal first. Not inspected: script files run by an
+affected `python3`, `bash -c`/`xargs` wrappers, `uv run`, and Python heredocs.

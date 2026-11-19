@@ -187,11 +187,43 @@ def write_texts(tool_name: str, args: Any) -> list[str]:
     if name == "delegate_task":
         return [] if str(args.get("action") or "spawn").lower() in ("list", "stop") else [json.dumps(args, default=str)]
     if name in SHELL_TOOLS:
-        cmd = " ; ".join(str(args.get(k) or "") for k in ("command", "input", "data"))
-        return [cmd] if _SHELL_WRITE_RE.search(cmd) else []
+        command = " ; ".join(str(args[key]) for key in ("command", "input", "data") if args.get(key))
+        # Process input is interpreted by an existing consumer, not necessarily
+        # a fresh shell. Only a terminal's command-only field can prove inertness.
+        if name in {'terminal', 'run_in_user_terminal'} and not any(args.get(k) for k in ('input', 'data')):
+            return shell_write_texts(command)
+        return [command] if _SHELL_WRITE_RE.search(command) else []
     if name == "execute_code":
         code = str(args.get("code") or "")
         return [code] if _SHELL_WRITE_RE.search(code) or "kanban_" in code else []
+    return []
+
+
+def shell_write_texts(command: str) -> list[str]:
+    # Use the same executable-position classifier as comment/acceptance gates.
+    try:
+        from . import core
+    except ImportError:
+        import importlib.util
+        import sys
+        key = "kanban_honest_done_core"
+        core = sys.modules.get(key)
+        if core is None:
+            spec = importlib.util.spec_from_file_location(key, Path(__file__).with_name("core.py"))
+            assert spec is not None and spec.loader is not None
+            core = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(core)
+            core = sys.modules.setdefault(key, core)
+    shell = core._shell_commands()
+    if not shell.within_inert_grammar(command):
+        # Consent's main detector is a raw regex, not the core argv detector.
+        # Preserve its entire text (including all targets), even when one parsed
+        # segment already exposes another write. Only whole-input G may exempt.
+        return [command] if _SHELL_WRITE_RE.search(command) else []
+    # A literal hermes command is executable, including chat prompts and stdin.
+    # Preserve main's raw match and all targets rather than narrowing to a verb.
+    if any(seg and seg[0] == 'hermes' for seg in core._segments(command)):
+        return [command] if _SHELL_WRITE_RE.search(command) else []
     return []
 
 

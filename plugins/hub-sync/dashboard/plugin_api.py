@@ -30,7 +30,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, Body, HTTPException
 from fastapi.responses import Response
@@ -355,10 +355,10 @@ async def get_status() -> Dict[str, Any]:
 
 @router.get("/sessions")
 async def get_sessions(gateway: Optional[str] = None, exclude: Optional[str] = None, archived: int = 0,
-                       limit: int = 500) -> Dict[str, Any]:
+                       limit: int = 500, projection: Optional[Literal["prefetch"]] = None) -> Dict[str, Any]:
     excluded = _split(exclude)
-    key = ("sessions", gateway, tuple(excluded), bool(archived), limit)
-    return _respond(await _poll(key, lambda: _read("sessions", gateway, excluded, bool(archived), limit)))
+    key = ("sessions", gateway, tuple(excluded), bool(archived), limit, projection)
+    return _respond(await _poll(key, lambda: _read("sessions", gateway, excluded, bool(archived), limit, projection)))
 
 
 @router.get("/inbox")

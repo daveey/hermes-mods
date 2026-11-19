@@ -27,6 +27,10 @@ PREFLIGHT_TIMEOUT = 18.0
 _PREFLIGHT_DEADLINE: ContextVar[float | None] = ContextVar("ship_preflight_deadline", default=None)
 _PREFLIGHT_STAGE = ContextVar("ship_preflight_stage", default="command inspection")
 _TURN_READ_ONLY = ContextVar("ship_turn_read_only", default=False)
+_WAITING_RECEIPT: ContextVar[dict | None] = ContextVar("ship_waiting_receipt", default=None)
+# Provisional own eligibility is valid ONLY inside merge's speculative hold:
+# successful approval plus the final fresh drift read must still admit it.
+_MERGE_OWN_ELIGIBILITY = ContextVar("ship_merge_own_eligibility", default=False)
 
 
 
@@ -50,14 +54,17 @@ def bounded_preflight(check, *args, **kwargs):
     parent = _PREFLIGHT_DEADLINE.get()
     deadline = time.monotonic() + PREFLIGHT_TIMEOUT
     token = _PREFLIGHT_DEADLINE.set(min(parent, deadline) if parent is not None else deadline)
+    receipt = _WAITING_RECEIPT.set({}) if _WAITING_RECEIPT.get() is None else None
     try:
         result = check(*args, **kwargs)
         _remaining()
         return result
     except _PreflightExpired as exc:
-        return str(exc)
+        return _with_waiting_receipt(str(exc))
     finally:
         _PREFLIGHT_DEADLINE.reset(token)
+        if receipt is not None:
+            _WAITING_RECEIPT.reset(receipt)
 
 
 def _stage(name, fn, *args):
@@ -112,6 +119,28 @@ REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 ASSIGN = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=(.*)", re.S)
 
 
+def _policy_path(env):
+    home = Path(env.get("HERMES_HOME", str(Path.home() / ".hermes")))
+    policy = home / "ship-only-guard.json"
+    # A configured profile inherits the host policy when it has no override.
+    if not policy.exists() and home.parent.name == "profiles":
+        policy = home.parent.parent / "ship-only-guard.json"
+    return policy
+
+
+def load_reference_repos(env=None):
+    """Host policy `reference_repos`: local clones whose object stores a carry fetch may borrow
+    (`_CarryObjects._borrow`). Any unreadable or odd value yields []."""
+    env = os.environ if env is None else env
+    try:
+        data = json.loads(_policy_path(env).read_text()).get("reference_repos", [])
+    except (OSError, ValueError, AttributeError, TypeError):
+        return []
+    if not isinstance(data, list) or not all(isinstance(x, str) and x for x in data):
+        return []
+    return [os.path.expanduser(x) for x in data]
+
+
 def load_repos(env=None):
     env = os.environ if env is None else env
     try:
@@ -119,12 +148,7 @@ def load_repos(env=None):
         if override is not None:
             data = json.loads(override)
         else:
-            home = Path(env.get("HERMES_HOME", str(Path.home() / ".hermes")))
-            policy = home / "ship-only-guard.json"
-            # A configured profile inherits the host policy when it has no override.
-            if not policy.exists() and home.parent.name == "profiles":
-                policy = home.parent.parent / "ship-only-guard.json"
-            data = json.loads(policy.read_text())["repos"]
+            data = json.loads(_policy_path(env).read_text())["repos"]
         if not isinstance(data, list) or not all(isinstance(x, str) and REPO.fullmatch(x) for x in data):
             return set()
         return {x.lower() for x in data}
@@ -793,8 +817,10 @@ class _CarryObjects:
     least _FETCH_DEPTH of history below each of them, as a per-merge fetch had. Needing no chain, the fetch
     starts with the ancestry walk instead of after it."""
 
-    def __init__(self, repo, env, shas, chain=False):
+    def __init__(self, repo, env, shas, chain=False, cwd=None):
         self.repo, self.shas = repo, list(dict.fromkeys(shas))
+        # Candidate local object stores (t_01a1dfacf4785131): the command's cwd, then host policy.
+        self.references = [c for c in [cwd, *load_reference_repos(env)] if isinstance(c, str) and c]
         self.chain = chain                # shas = the carry head: the walk's merges sit within _CARRY_MERGES
         self.depth = _FETCH_DEPTH + (_CARRY_MERGES if chain else 0)
         run_env = {k: v for k, v in {**os.environ, **env}.items() if not k.startswith("GIT_")}
@@ -839,20 +865,122 @@ class _CarryObjects:
             if self._tmp is None:       # a retry after an expired attempt reuses (and so still removes) it
                 cache = Path(self.env.get("HERMES_HOME", str(Path.home() / ".hermes"))) / "cache"
                 cache.mkdir(parents=True, exist_ok=True)
-                self._tmp = tempfile.TemporaryDirectory(prefix="ship-carry-", dir=cache,
-                                                        ignore_cleanup_errors=True)
+                # ignore_cleanup_errors exists only on Python 3.10+, and gh-shim can run the guard under
+                # Apple's /usr/bin/python3 3.9 (t_01a1e2f9c67ad78b); close() tolerates a failed cleanup anyway.
+                if sys.version_info >= (3, 10):
+                    self._tmp = tempfile.TemporaryDirectory(prefix="ship-carry-", dir=cache,
+                                                            ignore_cleanup_errors=True)
+                else:
+                    self._tmp = tempfile.TemporaryDirectory(prefix="ship-carry-", dir=cache)
                 self.path = self._tmp.name
         except OSError as e:
             return f"git cache could not complete ({type(e).__name__})"
         try:
             self.git("init", "--bare", "--template=", "-q")
+            self._borrow()
             # Fetch full blobs: avoids lazy fetch subprocesses inside merge-tree and
             # their separate auth/timeouts. Depth and wall time bound the attempt.
             self.git("fetch", "--quiet", "--no-tags", "--no-recurse-submodules", f"--depth={self.depth}",
                      "https://github.com/" + self.repo + ".git", *self.shas)
         except _Unreadable as e:
             return str(e)
+        self._lift_cuts()
         return ""
+
+    def _lift_cuts(self):
+        """Un-cut each shallow boundary commit whose parents are all present (t_01a1e3427f6574fc).
+
+        The fetch stops `self.depth` commits below its tips, so git lists each boundary commit in `shallow`
+        and grafts its parents away. A state PR refreshed after state moved more commits past its merge base
+        than that depth then had its carry refused by `_base` ("fetch depth cuts history before the merge
+        base") even when a borrowed store held every commit below the cut, and each refresh needed a fresh
+        review. Now a cut is lifted only when every parent named in its raw object (`cat-file commit`, which
+        the graft does not touch) exists here as a commit; any other cut stays. That is sound: a present
+        parent either came from a store that `_borrow` validated as non-shallow and non-partial (expected
+        complete ancestry), or the fetch brought it within depth, so its ancestry is present or still cut.
+        If needed ancestry is missing anyway, git fails, `_Unreadable` propagates and the carry refuses.
+        A failed cut read or parent probe keeps that cut; independently validated cuts may still lift.
+        A failed shallow-file read or rewrite leaves the whole file unchanged. Runs
+        inside `fetch()`, under its lock and before `_settled`, so no reader sees a half-lifted store."""
+        shallow = Path(self.path, "shallow")
+        try:
+            if not shallow.exists():
+                return
+            cuts = shallow.read_text().split()
+        except (OSError, UnicodeError):
+            return
+        if not cuts or not all(_SHA.fullmatch(c) for c in cuts):
+            return
+        kept = [c for c in cuts if not self._parents_present(c)]
+        if len(kept) == len(cuts):
+            return
+        try:
+            if kept:
+                staged = Path(self.path, "shallow.lift")
+                staged.write_text("".join(c + "\n" for c in kept))
+                os.replace(staged, shallow)     # atomic: `shallow` is the old list or the new one
+            else:
+                shallow.unlink()
+        except OSError:
+            pass    # `shallow` is unchanged: every cut stands and `_base` refuses as before
+
+    def _parents_present(self, cut):
+        """True when every parent the raw commit `cut` names exists as a commit (fetched or borrowed)."""
+        try:
+            raw = self.git("cat-file", "commit", cut)
+        except _Unreadable:
+            return False                        # unreadable (or undecodable) counts as absent: the cut stays
+        parents = []
+        for line in raw.split("\n"):
+            if not line:
+                break                           # end of the header; the message follows
+            if line.startswith("parent "):
+                parents.append(line[len("parent "):])
+        if not all(_SHA.fullmatch(p) for p in parents):
+            return False
+        for parent in parents:
+            try:
+                self.git("cat-file", "-e", parent + "^{commit}")
+            except _Unreadable:
+                return False
+        return True
+
+    def _borrow(self):
+        """Borrow validated local object stores as read-only `objects/info/alternates` (t_01a1dfacf4785131).
+
+        On a landing host the shallow full-blob fetch of a state PR head moved a ~20 MiB pack and took 16-44 s
+        (GitHub builds the shallow pack), so the carry ran out of the 18 s preflight. With the host's state clone
+        borrowed, the same fetch (same URL, shas and depth) negotiates with its refs and moves only the objects
+        that clone lacks (~6 s). Objects are content-addressed: a borrowed object is the object the fetch would
+        have downloaded, a missing one is still fetched, and a broken store makes git fail, which refuses. The
+        trust is the local `git` binary's. `GIT_*` stays stripped: only this explicit list is consulted. Each
+        candidate must be a non-shallow repository with an objects directory; anything else, including a
+        probe that fails or times out, is skipped (an expired deadline still raises on the next git call)."""
+        stores = []
+        for ref in self.references:
+            if not _maybe_repo(ref):    # no git child for a cwd that cannot be a repository
+                continue
+            try:
+                out = self.git("-C", ref, "rev-parse", "--path-format=absolute", "--git-common-dir",
+                               "--is-shallow-repository").split("\n")
+            except _Unreadable:
+                continue
+            if len(out) != 2 or out[1].strip() != "false":
+                continue
+            objects = os.path.join(out[0].strip(), "objects")
+            if not os.path.isabs(objects) or not os.path.isdir(objects) or objects in stores:
+                continue
+            if _partial_clone(out[0].strip()):
+                continue
+            stores.append(objects)
+        if not stores:
+            return
+        try:
+            info = Path(self.path, "objects", "info")
+            info.mkdir(parents=True, exist_ok=True)
+            (info / "alternates").write_text("".join(o + "\n" for o in stores))
+        except OSError:
+            pass                        # no alternates: the fetch downloads everything, as before
 
     def settle(self):
         """No fetch is coming (the authoritative proofs are done): release waiting prefilter reads."""
@@ -945,7 +1073,40 @@ class _CarryObjects:
     def close(self):
         self._settled.set()
         if self._tmp is not None:
-            self._tmp.cleanup()
+            try:
+                self._tmp.cleanup()
+            except OSError:
+                pass        # a leftover cache dir is harmless; never turn a finished check into a crash
+
+
+def _partial_clone(common_dir):
+    """True when a repository may lack objects its refs reach (a promisor/partial clone), or it cannot tell.
+
+    Borrowed as alternates, such a store's commits become fetch "haves", so the server leaves out blobs the
+    store never downloaded and the fetch fails `missing blob object` (t_01a1de17dd481488: the hub's
+    blob:none core checkout). Promisor packs mark lazily-filled history; the config keys mark a partial
+    clone that has not fetched one yet. Unreadable means unknown, and unknown is not borrowed."""
+    try:
+        if any(Path(common_dir, "objects", "pack").glob("*.promisor")):
+            return True
+        config = Path(common_dir, "config").read_text(errors="replace")
+    except OSError:
+        return True
+    return re.search(r"^\s*(partialclone(filter)?|promisor)\s*=", config, re.I | re.M) is not None
+
+
+def _maybe_repo(path):
+    """Cheap filter before `_CarryObjects._borrow`'s git probe: `path` is a bare repository or lies in a
+    work tree (a `.git` entry in it or an ancestor). git itself still decides; this only skips the child."""
+    try:
+        here = Path(path).resolve()
+        if not here.is_dir():
+            return False
+        if (here / "objects").is_dir() and (here / "HEAD").is_file():
+            return True
+        return any((d / ".git").exists() for d in (here, *here.parents))
+    except (OSError, RuntimeError, ValueError):
+        return False
 
 
 def _git_merge_tree_refusal(merge, ours, theirs, repo, cwd, env, objects=None):
@@ -956,7 +1117,7 @@ def _git_merge_tree_refusal(merge, ours, theirs, repo, cwd, env, objects=None):
         return "merge-tree inputs are unreadable"
     own = objects is None
     if own:
-        objects = _CarryObjects(repo, env, (merge, ours, theirs))
+        objects = _CarryObjects(repo, env, (merge, ours, theirs), cwd=cwd)
     try:
         return objects.fetch() or objects.verify(merge, ours, theirs)
     finally:
@@ -983,7 +1144,7 @@ def _carried_approval(head, data, repo, cwd, env):
     first = ""
     candidates = _earlier_approvals(data, head)
     # One fetch of the head serves every candidate: each earlier head is an ancestor of it (t_01a1dadbf711c31c).
-    objects = (_CarryObjects(repo, env, (head,), chain=True)
+    objects = (_CarryObjects(repo, env, (head,), chain=True, cwd=cwd)
                if _SHA.fullmatch(head) and any(not blocked for _, blocked in candidates) else None)
     try:
         for (_, h0), blocked in candidates:
@@ -1004,7 +1165,7 @@ def _carry_one(head, h0, blocked, repo, cwd, env, objects=None):
     if not _SHA.fullmatch(head):
         return False, f"{lead}: the head sha is unreadable"
     if objects is None:
-        objects = _CarryObjects(repo, env, (head,), chain=True)
+        objects = _CarryObjects(repo, env, (head,), chain=True, cwd=cwd)
         try:
             return _carry_one(head, h0, blocked, repo, cwd, env, objects)
         finally:
@@ -1402,14 +1563,14 @@ def _attribute_hits(repo, names, window, subject, cwd, env):
 # scripts/state-push-guard pre-push) a direct non-sync push. The turn only ever adds refusals; any error
 # reading it refuses: an incomplete snapshot cannot establish turn order.
 _TURN_PREFIX = "land-turn/pr-"
-TURN_PROTOCOL = 2          # effective acquisition order + eligibility, shared by state pre-push
+TURN_PROTOCOL = 3          # waiting-safe readers + retained refs + fenced non-force generations
 _TURN_TTL = 5400             # one refreshed CI cycle (#2563: 10-45 min) plus the merge attempt, with slack
 _TURN_REFRESH_GRACE = 900    # refresh the drifted acquisition head within 15 minutes
 _TURN_BUDGET = 10            # acquisition write budget; reads never silently truncate
 _TURN_CALL_TIMEOUT = 5
 _TURN_SUBJECT = "land-turn pr="
-# After a turn expires its PR cannot take another until a further _TURN_TTL has passed (the cooling ref is
-# kept for that and then deleted by the next reader), so a PR whose area keeps drifting through exports never
+# After a turn expires its PR cannot take another until a further _TURN_TTL has passed. The cooling ref
+# is retained for safe linear rearm, so a PR whose area keeps drifting through exports never
 # holds its area for more than half of the time.
 
 
@@ -1455,6 +1616,7 @@ def parse_turn(message):
               and isinstance(rec.get("head"), str) and re.fullmatch(r"[0-9a-f]{40}", rec["head"])
               and 0 < rec["expires"] < 4_102_444_800 and isinstance(rec.get("files"), list) and rec["files"]
               and all(isinstance(f, str) and f for f in rec["files"])
+              and ("waiting" not in rec or isinstance(rec["waiting"], bool))
               and ("acquired" not in rec or (isinstance(rec["acquired"], (int, float))
                    and not isinstance(rec["acquired"], bool) and 0 < rec["acquired"] < rec["expires"]
                    and rec["expires"] - rec["acquired"] <= _TURN_TTL)))
@@ -1505,6 +1667,7 @@ def _live_turns(repo, cwd, env, own_number=None):
     """
     cache = _cache()
     objects = cache.setdefault("obj", {})          # commit sha -> {"message": ...} | None, immutable
+    cache.pop("turn_snapshot", None)
     deadline = time.monotonic() + 20
     eligibility = _ELIGIBILITY_DEADLINE.get()
     if eligibility is not None:
@@ -1513,11 +1676,17 @@ def _live_turns(repo, cwd, env, own_number=None):
                          cwd, env, timeout=_TURN_CALL_TIMEOUT)
     if rc != 0 or not isinstance(pages, list) or not all(isinstance(p, list) for p in pages):
         raise _Unreadable("cannot list complete state land turns")
+    # Match the observer's full-inventory ceiling. Count retained/expired and
+    # nonnumeric rows too: truncating before selection can hide a live holder.
+    cache["turn_inventory_count"] = sum(len(page) for page in pages)
+    if cache["turn_inventory_count"] > 4096:
+        raise _Unreadable("state land-turn inventory exceeds 4096; leased maintenance required")
     refs = [r for page in pages for r in page if _turn_number(r) >= 0]
     cache.pop(("own", own_number), None)
     if own_number is not None:
         cache[("own", own_number)] = None            # complete listing: no ref of the owner unless seen below
     if not refs:
+        cache["turn_snapshot"] = []
         return []
     owner, name = repo.split("/", 1)
     shas = []
@@ -1545,18 +1714,23 @@ def _live_turns(repo, cwd, env, own_number=None):
             if f"t{i}" not in batch:
                 raise _Unreadable(f"{sha[:10]}: missing state land-turn object response")
             objects[sha] = batch[f"t{i}"]
-    out, now, cleaned = [], _now(), 0
+    out, now, expired = [], _now(), []
+
+    def record(ref, sha):
+        obj = objects[sha]
+        # A missing object is null and a tree/blob target is {} in GraphQL, not an API error.
+        # Both release on PR closure; only a real commit can be rearmed by its owner.
+        rec = parse_turn(obj.get("message")) if isinstance(obj, dict) else None
+        return rec if rec is not None and rec["pr"] == _turn_number(ref) else None
+    # Malformed peer records need their holder's state: read those concurrently, not one 3.7 s round each.
+    _prefetch_holders([_turn_number(ref) for ref, sha in zip(refs, shas)
+                       if record(ref, sha) is None and _turn_number(ref) != own_number], repo, cwd, env)
     for ref, sha in zip(refs, shas):
         if time.monotonic() >= deadline:
             raise _Unreadable("state land-turn record deadline exceeded; retry complete snapshot")
-        obj = objects[sha]
-        # A missing object is null and a tree/blob target is {} in GraphQL, not an API error. Apply
-        # the same owner-repair/closed-holder recovery as malformed messages.
-        rec = parse_turn(obj.get("message")) if isinstance(obj, dict) else None
-        if rec is not None and rec["pr"] != _turn_number(ref):
-            rec = None
+        rec = record(ref, sha)
         if _turn_number(ref) == own_number:
-            cache[("own", own_number)] = (rec,)       # (None,) = malformed own record
+            cache[("own", own_number)] = (rec, sha)   # retain observed OID for non-force replacement
         if rec is None:
             # An invalid own ticket cannot hold its owner; ordinary acquisition
             # repairs it after checking all OTHER holders. Never edit a peer's
@@ -1569,10 +1743,11 @@ def _live_turns(repo, cwd, env, own_number=None):
             raise _Unreadable(f"{ref['ref']}: malformed record; owner must retry acquisition or close its PR")
         if rec["expires"] > now:
             out.append((ref["ref"], rec))
-        elif rec["expires"] + _TURN_TTL <= now and cleaned < 2:
-            _turn_delete(ref['ref'], repo, cwd, env)
-            cleaned += 1
-    return sorted(out, key=lambda item: _turn_order(item[1]))
+        elif rec["expires"] + _TURN_TTL <= now and len(expired) < 2:
+            expired.append(ref["ref"])
+    _turn_delete_all(expired, repo, cwd, env)
+    cache["turn_snapshot"] = sorted(out, key=lambda item: _turn_order(item[1]))
+    return cache["turn_snapshot"]
 
 
 def turn_blocks(turn_files, files):
@@ -1606,13 +1781,14 @@ def _turn_holder_data(number, repo, cwd, env):
 
 def _turn_yielded(rec, data, repo, cwd, env):
     cache = _cache()
-    key = ("yield", rec["pr"], rec["head"], rec["expires"], rec.get("acquired"), data.get("headRefOid"))
+    key = ("yield", rec["pr"], rec["head"], rec["expires"], rec.get("acquired"),
+           rec.get("waiting", False), data.get("headRefOid"))
     if key not in cache:
         cache[key] = _turn_yielded_uncached(rec, data, repo, cwd, env)
     return cache[key]
 
 
-def _turn_yielded_uncached(rec, data, repo, cwd, env):
+def _turn_yielded_uncached(rec, data, repo, cwd, env, *, defer_own_drift=False):
     head = data.get("headRefOid")
     if (not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head)
             or not isinstance(data.get("reviews"), list) or not isinstance(data.get("comments"), list)
@@ -1623,6 +1799,13 @@ def _turn_yielded_uncached(rec, data, repo, cwd, env):
         raise _Unreadable(f"cannot order verdicts for turn #{rec['pr']}")
     if verdicts and sorted(verdicts)[-1][1] == "block":
         return True
+    if rec.get("waiting") is True and head != rec["head"]:
+        # Queue age belongs to the admitted patch, not a newly approved rewrite.
+        # Reuse the authoritative update-branch identity proof from its original
+        # head even when the new head has a fresh exact approval.
+        identical, _ = _carry_one(head, rec["head"], False, repo, cwd, env)
+        if not identical:
+            return True
     # Retain the ticket, not an unconditional reservation. A refreshed head keeps its priority exactly when the
     # merge gate would still admit it: `_approval_refusal` (exact-head approval, or the existing patch-identical
     # update-branch carry; its policy is unchanged here). An unreviewed content change, or a head whose carry
@@ -1631,6 +1814,12 @@ def _turn_yielded_uncached(rec, data, repo, cwd, env):
         return True
     # Ticket age is not drift age: new drift gets a full refresh window even during long CI.
     if _now() - _turn_order(rec)[0] >= _TURN_REFRESH_GRACE:
+        if defer_own_drift:
+            # No yield-cache entry: acquisition/observers still need full fairness.
+            # If final drift refuses, resolve this only via --land-turn's budget,
+            # not speculative history work inside the 18-second hook.
+            _cache()[("deferred-own-drift", rec["pr"])] = True
+            return False
         drift = _base_drift_refusal(rec["pr"], repo, data, cwd, env, attribute=False, fresh=False)
         if drift:
             if "state commit(s) landed since then" not in drift:
@@ -1884,11 +2073,14 @@ def _turn_hold_refusal(number, data, repo, cwd, env):
             _ELIGIBILITY_DEADLINE.reset(token)
 
 
+_HOLDER_BATCH = 8           # holder views read concurrently per round
+
+
 def _prefetch_holders(numbers, repo, cwd, env):
-    """Read the open-holder PRs concurrently (one thread each, at most 8) into the cache; a failure surfaces
-    later, and only if that holder turns out to matter."""
+    """Read the open-holder PRs concurrently (one thread each, at most _HOLDER_BATCH) into the cache; a failure
+    surfaces later, and only if that holder turns out to matter."""
     import threading
-    todo = [n for n in dict.fromkeys(numbers) if ("holder", n) not in _cache()][:8]
+    todo = [n for n in dict.fromkeys(numbers) if ("holder", n) not in _cache()][:_HOLDER_BATCH]
     if len(todo) < 2:
         return
 
@@ -1902,6 +2094,26 @@ def _prefetch_holders(numbers, repo, cwd, env):
         t.start()
     for t in threads:
         t.join()      # every call inside is capped by the shared deadline
+
+
+def _turn_delete_all(refs, repo, cwd, env):
+    """Best-effort cleanup of released refs, concurrently (one round, not one 3.7 s call each) and only after
+    the decision it serves; a spent budget skips it instead of turning a decided snapshot into a refusal."""
+    import threading
+    refs = list(dict.fromkeys(refs))
+    if not refs or _TURN_READ_ONLY.get():
+        return
+
+    def one(ref):
+        try:
+            _turn_delete(ref, repo, cwd, env)
+        except (_Unreadable, _PreflightExpired):
+            pass
+    threads = [threading.Thread(target=contextvars.copy_context().run, args=(one, r), daemon=True) for r in refs]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
 
 
 def effective_turns(turns, eligible, check):
@@ -1925,6 +2137,105 @@ def effective_turns(turns, eligible, check):
             yield ref, rec
 
 
+# Bounded peer eligibility (t_01a1e1107d705388). Deciding whether ANOTHER PR's ticket yielded used the full
+# `_turn_yielded`: a refreshed head's approval carry (`_carried_approval`: git fetch, compare/tree/blob/patch-id
+# reads) and, past the refresh grace, the drift-start walk (push activity plus one compare per push). At 3.7 s
+# per gh read (worker token vending) one such peer cost ~40 reads, past the 30 s eligibility allowance, and every
+# overlapping merge refused "snapshot unreadable" until that ticket expired (#3314 behind #3207, 2026-11-15).
+# A peer is now judged from its turn record and ONE holder view; a yield that needs a content walk is
+# undecided, and an undecided ticket blocks (as if it held) but never suppresses a younger one (as if it
+# yielded), so the guard never admits a merge the full rule refuses. The holder's OWN ticket keeps the full rule
+# (its data is in hand and its carry/drift reads are its own preflight's). Cost of the bound: a stale peer's
+# drift-yield or carry-yield no longer frees waiters early; they wait for it to merge, close, get an exact-head
+# verdict, or expire (_TURN_TTL).
+class _Undecided:
+    """Eligibility of a peer ticket that the bounded read cannot decide; deliberately has no truth value."""
+    __slots__ = ("reason",)
+
+    def __init__(self, reason):
+        self.reason = reason
+
+    def __bool__(self):
+        raise TypeError("undecided land-turn eligibility has no truth value")
+
+
+def peer_eligibility(rec, data):
+    """True (holds), False (yielded) or _Undecided for ANOTHER PR's live ticket `rec`, from its OPEN holder
+    view `data` alone (no read). Wherever it decides, it agrees with `not _turn_yielded(rec, data, ...)`."""
+    head = data.get("headRefOid")
+    if (not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head)
+            or not isinstance(data.get("reviews"), list) or not isinstance(data.get("comments"), list)
+            or len(data["reviews"]) >= 100 or len(data["comments"]) >= 100):
+        raise _Unreadable(f"cannot read complete verdict for turn #{rec['pr']}")
+    verdicts = _head_verdicts(data, head)
+    if any(t is None for t, _ in verdicts):
+        raise _Unreadable(f"cannot order verdicts for turn #{rec['pr']}")
+    if verdicts and sorted(verdicts)[-1][1] == "block":
+        return False
+    if (head != rec.get("head") and not verdicts
+            and not any(not blocked for _, blocked in _earlier_approvals(data, head))):
+        return False  # no possible approval carry, including for a changed waiting record
+    if rec.get("waiting") is True and head != rec.get("head"):
+        return _Undecided("its original admitted patch identity needs the carry content walk; a new exact-head "
+                          "approval does not establish that identity")
+    if head != rec.get("head") and not verdicts:
+        # `_carried_approval` refuses without any read when no unblocked earlier approval exists.
+        if not any(not blocked for _, blocked in _earlier_approvals(data, head)):
+            return False
+        return _Undecided(f"its refreshed head {head[:10]} has no exact-head verdict and whether an earlier "
+                          "approval carries to it needs the carry content walk; an exact-head verdict can "
+                          "resolve that carry uncertainty")
+    if _now() - _turn_order(rec)[0] >= _TURN_REFRESH_GRACE:
+        return _Undecided("its ticket is past the refresh grace and whether drift on its areas went "
+                          "unrefreshed that long needs the drift-start walk; a blocking exact-head verdict "
+                          "releases the ticket, but an approval does not resolve this drift uncertainty")
+    return True
+
+
+def possible_turns(turns, eligible, check):
+    """Yield (ref, rec, why) for every ticket that is effective under SOME outcome of the undecided ones, without
+    IO; `why` is None when it is effective under every outcome, else why it may not be.
+
+    `eligible` returns True, False or an _Undecided. A ticket overlapping a definitely effective older one is
+    suppressed; one overlapping only possibly effective older ones stays possible. With boolean eligibility this
+    is exactly `effective_turns` (every `why` None). Exceptions propagate, as there."""
+    definite, maybe = [], []
+    for ref, rec in sorted(turns, key=lambda item: _turn_order(item[1])):
+        check()
+        if any(turn_blocks(r["files"], rec["files"]) or turn_blocks(rec["files"], r["files"]) for r in definite):
+            continue
+        active = eligible(ref, rec)
+        check()
+        if isinstance(active, _Undecided):
+            why = active.reason
+        elif active is True:
+            behind = next((r for r in maybe
+                           if turn_blocks(r["files"], rec["files"]) or turn_blocks(rec["files"], r["files"])), None)
+            why = None if behind is None else f"it waits behind PR #{behind['pr']}, whose turn is undecided"
+        elif active is False:
+            continue
+        else:
+            raise TypeError(f"land-turn eligibility must be True, False or undecided, not {active!r}")
+        (definite if why is None else maybe).append(rec)
+        yield ref, rec, why
+
+
+class _DefiniteTurnHold(str):
+    """Readable definite overlap, distinct from undecided/unreadable refusals.
+
+    String compatibility keeps existing CLI consumers unchanged. Only the hold
+    selector constructs this evidence; display text is never an admission token.
+    """
+    ref: str
+    holder: dict
+
+    def __new__(cls, message, ref, holder):
+        result = super().__new__(cls, message)
+        result.ref = ref
+        result.holder = dict(holder)
+        return result
+
+
 def _turn_hold_refusal_scoped(number, data, repo, cwd, env):
     deadline = _ELIGIBILITY_DEADLINE.get() or time.monotonic() + 30
     files = [f["path"] for f in data.get("files") or [] if isinstance(f, dict) and isinstance(f.get("path"), str)]
@@ -1943,41 +2254,64 @@ def _turn_hold_refusal_scoped(number, data, repo, cwd, env):
                 relevant.add(rec["pr"])
                 areas.append(rec["files"])
                 changed = True
-    # A live own ticket bounds the ordering search: younger eligibility cannot
-    # affect admission before we reach it. Keep the full connected component
-    # (including indirect older blockers), but do not spend its budget on younger
-    # speculative reads. If our ticket yields, the loop still reads later holders.
-    older = []
-    for _, rec in turns:
-        if rec["pr"] == int(number):
-            break
-        if rec["pr"] in relevant:
-            older.append(rec["pr"])
-    _prefetch_holders(older, repo, cwd, env)
+    # Peer holder views are read in concurrent batches, oldest first. A live own ticket bounds a batch:
+    # younger eligibility cannot affect admission before we reach it, so no batch spends the budget on
+    # younger speculative reads until our own ticket turned out not definitely effective.
+    order = [rec["pr"] for _, rec in turns if rec["pr"] in relevant]
+    own = order.index(int(number)) if int(number) in order else len(order)
+    released = []
+
     def check():
         if time.monotonic() >= deadline:
             raise _Unreadable("state land-turn eligibility deadline exceeded; retry complete snapshot")
         _elig_cap(1)
 
+    def holder_of(n):
+        if ("holder", n) not in _cache():
+            at = order.index(n)
+            batch = [m for m in order[at:own if at < own else len(order)] if m != int(number)]
+            _prefetch_holders(batch, repo, cwd, env)
+        return _turn_holder_data(n, repo, cwd, env)
+
     def eligible(ref, rec):
-        holder = data if rec["pr"] == int(number) else _turn_holder_data(rec["pr"], repo, cwd, env)
+        own_ticket = rec["pr"] == int(number)
+        holder = data if own_ticket else holder_of(rec["pr"])
         check()
         if holder.get("state") != "OPEN":
-            _turn_delete(ref, repo, cwd, env)
+            released.append(ref)
             return False
-        return not _turn_yielded(rec, holder, repo, cwd, env)
+        if own_ticket:
+            if (_MERGE_OWN_ELIGIBILITY.get()
+                    and _now() - _turn_order(rec)[0] >= _TURN_REFRESH_GRACE):
+                return not _turn_yielded_uncached(rec, holder, repo, cwd, env, defer_own_drift=True)
+            return not _turn_yielded(rec, holder, repo, cwd, env)
+        return peer_eligibility(rec, holder)                          # another PR's ticket: bounded
 
     selected = ((ref, rec) for ref, rec in turns if rec["pr"] in relevant)
-    for ref, rec in effective_turns(selected, eligible, check):
+    refusal = None
+    for ref, rec, why in possible_turns(selected, eligible, check):
         if rec["pr"] == int(number):
-            return None
+            if why is None:
+                break
+            continue
         hit = turn_blocks(rec["files"], files) or turn_blocks(files, rec["files"])
+        if hit and why is None:
+            refusal = (f"[ship-only-guard] Refused state merge of PR #{number}: PR #{rec['pr']} holds the state "
+                       f"land turn until {_until(rec['expires'])} ({ref}); this PR waits behind that older turn "
+                       f"({hit[1]} ~ {hit[0]}). Refresh now if drift is reported below; retry when the older "
+                       "holder merges, yields, or expires. Do not park on the hold instead of refreshing.")
+            refusal = _DefiniteTurnHold(refusal, ref, rec)
+            break
         if hit:
-            return (f"[ship-only-guard] Refused state merge of PR #{number}: PR #{rec['pr']} holds the state land "
-                    f"turn until {_until(rec['expires'])} ({ref}); this PR waits behind that older turn "
-                    f"({hit[1]} ~ {hit[0]}). Refresh now if drift is reported below; retry when the older "
-                    "holder merges, yields, or expires. Do not park on the hold instead of refreshing.")
-    return None
+            refusal = (f"[ship-only-guard] Refused state merge of PR #{number}: PR #{rec['pr']} may still hold "
+                       f"the state land turn until {_until(rec['expires'])} ({ref}); this PR waits behind that "
+                       f"older turn ({hit[1]} ~ {hit[0]}). Undecided here because {why}: the bounded turn check "
+                       "never walks another PR's carry or drift history. Refresh now if drift is reported below; "
+                       f"retry when PR #{rec['pr']} merges, closes, yields, or its turn "
+                       "expires. Do not park on the hold instead of refreshing.")
+            break
+    _turn_delete_all(released, repo, cwd, env)
+    return refusal
 
 
 def _turn_acquire(number, data, repo, cwd, env, prechecked=False):
@@ -1990,7 +2324,47 @@ def _turn_acquire(number, data, repo, cwd, env, prechecked=False):
         return _turn_acquire_scoped(number, data, repo, cwd, env, prechecked)
 
 
-def _turn_acquire_scoped(number, data, repo, cwd, env, prechecked):
+# Rollout fence: enable only after all state readers AND old writers are replaced.
+# No command environment override: a caller cannot opt out of the deployment fence.
+_WAITING_WRITER_ENABLED = False
+
+
+def _turn_wait(number, data, repo, cwd, env, hold):
+    """Record ordering, never permission. Called only after the full approval/CI preflight."""
+    if not _WAITING_WRITER_ENABLED or not isinstance(hold, _DefiniteTurnHold):
+        return ""
+    with _scope():
+        return _turn_acquire_scoped(number, data, repo, cwd, env, True, waiting_hold=hold)
+
+
+def _waiting_receipt(rec, retained=False):
+    state = "waiting record retained" if retained else "waiting place recorded"
+    timing = (f"expired at {_until(rec['expires'])}; cooling until {_until(rec['expires'] + _TURN_TTL)}"
+              if rec["expires"] <= _now() else f"until {_until(rec['expires'])}")
+    message = (f"PR #{rec['pr']} {state} {timing} (refs/{_TURN_PREFIX}{rec['pr']}); "
+               "this is not merge permission. Retry the full preflight; the fixed place expires "
+               "even if the older holder has not finished.")
+    if retained:
+        message += (" There is no active waiting place during cooldown." if rec["expires"] <= _now()
+                    else " The unchanged record alone does not establish eligibility or an effective place.")
+    receipt = _WAITING_RECEIPT.get()
+    if receipt is not None:
+        receipt["message"] = message
+    turn_only = _TURN_ONLY.get()
+    if turn_only is not None:
+        turn_only["waiting"] = message
+    return message
+
+
+def _with_waiting_receipt(result):
+    message = (_WAITING_RECEIPT.get() or {}).get("message")
+    return message + "\n" + str(result) if message and message not in str(result) else str(result)
+
+
+def _turn_acquire_scoped(number, data, repo, cwd, env, prechecked, waiting_hold=None):
+    waiting = isinstance(waiting_hold, _DefiniteTurnHold)
+    if waiting and (int(_now()), int(number)) <= _turn_order(waiting_hold.holder):
+        return ""  # never backdate priority or manufacture a future acquisition under clock skew
     if not prechecked:
         refusal = _turn_safe(_turn_hold_refusal, number, data, repo, cwd, env)
         if refusal:
@@ -2010,8 +2384,10 @@ def _turn_acquire_scoped(number, data, repo, cwd, env, prechecked):
             _cache()["turn_missed"] = True     # the caller names the out-of-hook follow-up instead
         return missed
     seen = _cache().get(("own", int(number))) if prechecked else None
+    previous = None
     if seen is not None:
         rec = seen[0]                        # the hold snapshot's own ref (None: malformed, to be repaired)
+        previous = seen[1] if len(seen) > 1 else None
     elif prechecked and ("own", int(number)) in _cache():
         rec = None                           # complete listing had no ref of this PR
     else:
@@ -2019,11 +2395,31 @@ def _turn_acquire_scoped(number, data, repo, cwd, env, prechecked):
         rec = None
         if rc == 0 and isinstance(cur, dict):
             sha = cur.get("object", {}).get("sha") if isinstance(cur.get("object"), dict) else None
+            previous = sha if isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{40}", sha) else None
             rc2, obj = _gh_call([f"repos/{repo}/git/commits/{sha}"], cwd, env, timeout=_TURN_CALL_TIMEOUT) if sha else (-1, None)
             rec = parse_turn(obj.get("message")) if rc2 == 0 and isinstance(obj, dict) else None
             if rec and rec["pr"] != int(number):
                 rec = None
+    if not previous and _cache().get("turn_inventory_count", 0) >= 4096:
+        return ("[ship-only-guard] Refused state merge: land-turn inventory is full; "
+                "no new ref published. Leased maintenance required.")
+    if previous:
+        # A malformed message on a commit is repairable; a tree/blob/missing
+        # target cannot be the sole parent of a new ticket. Never fall back to
+        # the PR head, which would discard the concurrency fence.
+        obj = _cache().get("obj", {}).get(previous)
+        if obj is None or not isinstance(obj, dict) or not isinstance(obj.get("message"), str):
+            rc_old, obj = _gh_call([f"repos/{repo}/git/commits/{previous}"], cwd, env,
+                                   timeout=_TURN_CALL_TIMEOUT)
+            if rc_old != 0 or not isinstance(obj, dict) or not isinstance(obj.get("message"), str):
+                return ("[ship-only-guard] Refused state merge: existing land-turn target is not a readable commit; "
+                        "no replacement attempted. Repair requires fenced maintenance or close the owning PR.")
+
+    if waiting and previous and rec is None:
+        return "[ship-only-guard] Waiting admission refused: existing own record is malformed; no replacement attempted."
     if rec is not None:
+        if waiting and rec["expires"] + _TURN_TTL > _now():
+            return _waiting_receipt(rec, retained=True) if rec.get("waiting") else ""
         if rec and rec["expires"] > _now():
             if _turn_yielded(rec, data, repo, cwd, env):
                 return ""
@@ -2040,27 +2436,53 @@ def _turn_acquire_scoped(number, data, repo, cwd, env, prechecked):
     expires = int(_now()) + _TURN_TTL
     rec = {"pr": int(number), "head": head, "acquired": expires - _TURN_TTL,
            "expires": expires, "files": files, **_turn_owner(env)}
+    if waiting:
+        rec["waiting"] = True
+        if _turn_order(rec) <= _turn_order(waiting_hold.holder):
+            return ""  # clock moved backwards during the read
+        snapshot = _cache().get("turn_snapshot")
+        if snapshot is None or any(
+                other["pr"] != int(number) and _turn_order(rec) <= _turn_order(other)
+                and (turn_blocks(files, other["files"]) or turn_blocks(other["files"], files))
+                for _, other in snapshot):
+            return "[ship-only-guard] Waiting admission refused: cannot order after the published overlap snapshot (including possibly released records); retry a complete snapshot after clock convergence or record expiry."
     rc, made = _gh_call([f"repos/{repo}/git/commits"], cwd, env, timeout=_TURN_CALL_TIMEOUT, payload={
         "message": f"{_TURN_SUBJECT}{int(number)}\n\n{json.dumps(rec, sort_keys=True)}\n",
-        "tree": tree, "parents": [head]})
+        "tree": tree, "parents": [previous or head]})
     sha = made.get("sha") if rc == 0 and isinstance(made, dict) else None
     if not isinstance(sha, str):
         _cache()["turn_missed"] = True
         return ""
     # Commits are immutable: the post-write re-list need not read back the record this call just wrote.
     _cache().setdefault("obj", {})[sha] = {"message": f"{_TURN_SUBJECT}{int(number)}\n\n{json.dumps(rec, sort_keys=True)}\n"}
-    rc, _ = _gh_call([f"repos/{repo}/git/refs"], cwd, env, timeout=_TURN_CALL_TIMEOUT, payload={"ref": f"refs/{ref}", "sha": sha})
+    if previous:
+        # Sibling generations share a sole parent: only one can fast-forward.
+        # This is not general REST CAS; never join histories or force updates.
+        rc, _ = _gh_call(["-X", "PATCH", f"repos/{repo}/git/refs/{ref}"], cwd, env,
+                         timeout=_TURN_CALL_TIMEOUT, payload={"sha": sha, "force": False})
+    else:
+        rc, _ = _gh_call([f"repos/{repo}/git/refs"], cwd, env, timeout=_TURN_CALL_TIMEOUT,
+                         payload={"ref": f"refs/{ref}", "sha": sha})
     if rc != 0:
-        rc, _ = _gh_call(["-X", "PATCH", f"repos/{repo}/git/refs/{ref}"], cwd, env, timeout=_TURN_CALL_TIMEOUT,
-                         payload={"sha": sha, "force": True})
-    if rc != 0:
+        # A failed create can mean another caller admitted this PR after our
+        # snapshot, or that GitHub accepted our write but lost the response.
+        # Never overwrite that winner with a younger order/deadline.
         _cache()["turn_missed"] = True
-        return ""
+        return ("[ship-only-guard] Refused state merge: land-turn publication conflicted or was unreadable; "
+                "retry a complete snapshot. No forced replacement was attempted; the write may have succeeded.")
+    # Preserve publication evidence BEFORE any fallible post-write read.
+    message = _waiting_receipt(rec) if waiting else ""
     # Concurrent writers can publish records, but only the oldest is effective.
     try:
-        return _turn_hold_refusal(number, data, repo, cwd, env) or _until(expires)
+        post_hold = _turn_hold_refusal(number, data, repo, cwd, env)
+        if waiting:
+            return message + ("\n" + post_hold if post_hold else "")
+        return post_hold or _until(expires)
     except Exception as exc:
         # The ref is already published: say so, so the agent does not believe no turn was recorded.
+        if waiting:
+            return message + (f"\nOrdering unreadable after writing ({type(exc).__name__}: {str(exc)[:240]}); "
+                              "no merge is permitted from partial reads.")
         return (f"[ship-only-guard] Refused state merge: land-turn snapshot unreadable after writing "
                 f"({type(exc).__name__}: {str(exc)[:240]}). PR #{int(number)}'s turn record was written "
                 f"(refs/{ref}) and may be in force until {_until(expires)}; the ordering check could not be "
@@ -2085,16 +2507,20 @@ def _turn_safe(fn, *args):
 
 
 def _turn_delete(ref, repo, cwd, env):
-    if not _TURN_READ_ONLY.get():
-        _gh_call(["-X", "DELETE", f"repos/{repo}/git/{ref}"], cwd, env, timeout=_TURN_CALL_TIMEOUT)
+    # REST DELETE has no expected-OID fence. A reader's expired/closed snapshot
+    # may already have been replaced, so cleanup would erase a newer admission.
+    # Retain the bounded one-ref-per-PR history until a leased collector exists.
+    return None
 
 
 def _turn_hold_read_only(*args):
     # Speculation must not delete refs before the approval gate has succeeded.
     token = _TURN_READ_ONLY.set(True)
+    own = _MERGE_OWN_ELIGIBILITY.set(_TURN_ONLY.get() is None)
     try:
         return _turn_safe(_turn_hold_refusal, *args)
     finally:
+        _MERGE_OWN_ELIGIBILITY.reset(own)
         _TURN_READ_ONLY.reset(token)
 
 
@@ -2108,10 +2534,12 @@ LAND_TURN_TIMEOUT = 60.0
 _TURN_ONLY: ContextVar[dict | None] = ContextVar("ship_turn_only", default=None)
 
 
-def _turn_follow_up(number, repo, sha):
+def _turn_follow_up(number, repo, sha, deferred=False):
     cmd = shlex.join(["python3", str(Path(__file__)), "--land-turn", str(int(number)), "--repo", repo,
                       "--match-head-commit", sha])
-    return (f"This check had no time left to record PR #{int(number)}'s land turn, so first run `{cmd}` "
+    reason = (f"This hook deferred PR #{int(number)}'s old-ticket drift eligibility to the acquisition budget"
+              if deferred else f"This check had no time left to record PR #{int(number)}'s land turn")
+    return (f"{reason}, so first run `{cmd}` "
             f"(it re-runs this preflight under its own {int(LAND_TURN_TIMEOUT)} s budget, records "
             f"refs/{_TURN_PREFIX}{int(number)} and never merges); without the turn the next state commit "
             "drifts this PR again.")
@@ -2124,7 +2552,8 @@ def _own_live_turn(number, data):
     rec = seen[0] if seen else None
     if not rec or rec["expires"] <= _now():
         return None
-    key = ("yield", rec["pr"], rec["head"], rec["expires"], rec.get("acquired"), data.get("headRefOid"))
+    key = ("yield", rec["pr"], rec["head"], rec["expires"], rec.get("acquired"),
+           rec.get("waiting", False), data.get("headRefOid"))
     return _until(rec["expires"]) if _cache().get(key) is False else None
 
 
@@ -2144,6 +2573,9 @@ def land_turn(number, repo, sha, cwd=None, env=None):
     finally:
         _PREFLIGHT_DEADLINE.reset(deadline)
         _TURN_ONLY.reset(only)
+    if out.get("waiting"):
+        message = out["waiting"]
+        return 1, str(result) if message in str(result) else message + "\n" + str(result)
     until = out.get("until")
     if until and not until.startswith("[ship-only-guard]"):
         return 0, f"PR #{number} holds the state land turn until {until} (refs/{_TURN_PREFIX}{number}).\n{result}"
@@ -2159,6 +2591,7 @@ def _state_merge(words, repo, cwd, env):
     """One shared monotonic budget (`PREFLIGHT_TIMEOUT`, set by `bounded_preflight`) covers every
     read and write of the preflight; see `_state_merge_scoped` for the rules."""
     outer_deadline = _PREFLIGHT_DEADLINE.get()
+    receipt = _WAITING_RECEIPT.set({}) if _WAITING_RECEIPT.get() is None else None
     try:
         with _scope():
             return _state_merge_scoped(words, repo, cwd, env)
@@ -2166,8 +2599,11 @@ def _state_merge(words, repo, cwd, env):
         # A nested owner must see the original stage, not a late-result check
         # after _stage reset its context. Standalone public callers get a refusal.
         if outer_deadline is not None:
-            raise
-        return str(exc)
+            raise _PreflightExpired(_with_waiting_receipt(str(exc))) from exc
+        return _with_waiting_receipt(str(exc))
+    finally:
+        if receipt is not None:
+            _WAITING_RECEIPT.reset(receipt)
 
 
 def _state_merge_scoped(words, repo, cwd, env):
@@ -2290,10 +2726,19 @@ def _state_merge_scoped(words, repo, cwd, env):
         # report independent drift so waiters refresh instead of parking.
         drift = _stage("drift check", _base_drift_refusal, number, repo, data, cwd, env)
         if hold:
-            return hold + ("\nAlso: " + drift if drift else "")
+            queued = ""
+            if (isinstance(hold, _DefiniteTurnHold)
+                    and (not drift or "state commit(s) landed since then" in drift)):
+                queued = _stage("waiting-place admission", _turn_safe, _turn_wait,
+                                number, data, repo, cwd, env, hold)
+                if not queued and _cache().get("turn_missed"):
+                    queued = (_turn_follow_up(number, repo, sha) if _TURN_ONLY.get() is None else
+                              "Waiting admission exhausted its budget; no new waiting record was confirmed. Retry after network/CI recovery.")
+            return str(hold) + ("\n" + queued if queued else "") + ("\nAlso: " + drift if drift else "")
         if drift and "state commit(s) landed since then" in drift:
             remaining = _remaining()
-            reached = remaining is None or remaining > _TURN_BUDGET
+            reached = ((remaining is None or remaining > _TURN_BUDGET)
+                       and not _cache().get(("deferred-own-drift", int(number))))
             until = (_stage("land-turn acquisition", _turn_safe, _turn_acquire,
                             number, data, repo, cwd, env, True)
                      if reached else _own_live_turn(number, data))
@@ -2305,7 +2750,8 @@ def _state_merge_scoped(words, repo, cwd, env):
             if not until and turn_only is None and (not reached or _cache().get("turn_missed")):
                 # The carried PRs that drift are exactly the ones whose turn the hook budget cannot reach
                 # (t_01a1da82d9dfdebd): name the bounded follow-up that records it, ahead of update-branch.
-                follow = _turn_follow_up(number, repo, sha)
+                follow = _turn_follow_up(number, repo, sha,
+                                         deferred=bool(_cache().get(("deferred-own-drift", int(number)))))
                 anchor = "Run `gh api -X PUT"
                 drift = (drift.replace(anchor, follow + "\nThen r" + anchor[1:], 1) if anchor in drift
                          else drift + "\n" + follow)
@@ -2319,7 +2765,9 @@ def _state_merge_scoped(words, repo, cwd, env):
     except _Unreadable as e:
         return failed(f"{e}; nothing was approved or written late")
     except (ValueError, TypeError) as e:
-        return failed(f"`gh pr view {number}` returned an unexpected shape ({type(e).__name__})")
+        # Every stage after the view (review replies, approval/carry, land turn, drift) can raise these: name
+        # the error instead of blaming the view's shape for it (t_01a1e2f9c67ad78b).
+        return failed(" ".join(f"preflight raised {type(e).__name__}: {e}".split())[:160])
 
 
 SYNC_REQUIRED_CHECK = "All required checks pass (v2)"
@@ -2486,9 +2934,20 @@ def _push(words, cwd, repos, config):
     return None
 
 
+def _depth_refusal(repos, env):
+    """An exhausted inspection budget is uncertainty, not permission to execute."""
+    if repos is None:
+        repos = load_repos(os.environ if env is None else env)
+    if repos:
+        return "ship-only-guard: inspection depth limit exceeded; simplify nested wrappers and retry."
+    return None
+
+
 def check_argv(argv, cwd=None, repos=None, env=None, _depth=0):
     """Check a literal executable argv, with optional cwd/environment snapshot."""
-    if _depth > 12 or not isinstance(argv, (list, tuple)) or not all(isinstance(x, str) for x in argv):
+    if _depth > 12:
+        return _depth_refusal(repos, env)
+    if not isinstance(argv, (list, tuple)) or not all(isinstance(x, str) for x in argv):
         return None
     env = dict(os.environ if env is None else env)
     repos = load_repos(env) if repos is None else {x.lower() for x in repos}
@@ -2615,7 +3074,7 @@ def _source_nodes(node):
 def check_python(code, cwd=None, repos=None, env=None, _depth=0):
     """Inspect literal subprocess/os.system/terminal/tool_call calls, not prose."""
     if _depth > 12:
-        return None
+        return _depth_refusal(repos, env)
     env = dict(os.environ if env is None else env)
     repos = load_repos(env) if repos is None else repos
     try:
@@ -2658,7 +3117,9 @@ def check_python(code, cwd=None, repos=None, env=None, _depth=0):
 
 
 def check_tool(name, args, cwd=None, repos=None, env=None, _depth=0):
-    if _depth > 12 or not isinstance(args, dict):
+    if _depth > 12:
+        return _depth_refusal(repos, env)
+    if not isinstance(args, dict):
         return None
     name = name.rsplit("__", 1)[-1].rsplit(".", 1)[-1]
     cwd = args.get("workdir") or cwd

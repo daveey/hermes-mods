@@ -65,6 +65,9 @@ class GitHub:
             return {'check_runs': copy.deepcopy(self.runs)}
         if '/statuses?' in endpoint:
             return self.statuses
+        if endpoint == 'graphql':
+            return {'data': {'repository': {'pullRequest': {'reviewThreads': {
+                'nodes': [], 'pageInfo': {'hasNextPage': False, 'endCursor': None}}}}}}
         if endpoint == 'user':
             return {'login': 'lander'}
         raise AssertionError(args)

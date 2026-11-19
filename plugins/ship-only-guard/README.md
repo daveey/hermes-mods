@@ -19,10 +19,34 @@ its own copied context with the same deadline, and is joined before return.
 Independent carry patch reads, blob reads, and the two clean-merge checks run in
 parallel. Both the API tree/content prefilter and authoritative Git merge-tree
 must still pass. Approval and a **read-only** land-turn scan overlap; that scan
-never deletes refs speculatively. Non-speculative turn readers retain cleanup.
+never deletes refs speculatively. All turn readers retain physical refs to avoid
+stale-snapshot deletion of a newer admission.
 The mutable base-drift read stays **last**, after approval/hold checks, so the
 optimization does not widen the final base-read race. Optional turn acquisition
 starts only when its budget fits; lack of time never changes a refusal to allow.
+
+The merge-only speculative scan omits the merging PR's **own old-ticket drift
+history**, not its verdict validation or changed-head approval/carry policy.
+This provisional result is not stored as full eligibility. Admission still needs
+approval and the final **fresh** compare: for a clean final snapshot the omitted
+drift-yield predicate is false; an overlapping or unreadable final snapshot
+refuses regardless of turn selection. Earlier/indirect peers and nontransitive
+ordering are unchanged. This is not an unconditional own-ticket reservation.
+If final drift refuses and own eligibility was deferred, the hook directs the
+caller to `--land-turn` instead of speculatively resolving history/acquisition.
+Standalone readers, acquisition and `--land-turn` retain the full yield rule.
+
+`tests_own_ticket_budget.py` exercises the full command hook with six tickets:
+old own clean admission takes four causal subprocess rounds (14.8 seconds at
+3.7 seconds/read) within the unchanged deadline; old own overlap reports
+update-branch guidance. It covers admission equivalence, fresh own drift,
+standalone fairness, cache isolation, held-waiter drift, timeout/late-result
+refusal and no late writes. `tests_turn.SimClock` honors subprocess timeouts,
+starts nested children at their parent's dispatch time and propagates completion
+on join. A waiter needing five serial rounds at 3.7 seconds/read genuinely
+exhausts 18 seconds and must still fail closed; best-effort attribution cannot
+repair an already-exhausted canonical compare. `tests_final_drift_order.py`
+proves a state push during parallel work defeats an earlier cached clean compare.
 
 Preflights taking at least one second log elapsed time and allowed/refused status,
 without logging submitted commands. `tests_budget.py` and `tests_parallel.py`
@@ -45,6 +69,15 @@ replaces the file's list, for isolated fixtures and private shim bootstrapping.
 Configuration is read on each check, not cached at plugin activation.
 
 ## Behavior
+
+Inspection uses a bounded nesting budget (depth 0–12). With any protected repo
+configured, exceeding it **fails closed** with an `inspection depth limit`
+refusal: simplify the shell/Python/tool-call wrappers and retry. This applies even
+to otherwise read-only commands when the guard cannot finish inspecting them;
+an explicitly empty repository set still disables the guard. Exec-wrapper
+fallbacks consume one step just like other recursive inspection paths.
+`tests_wrapper_unwrap.py` covers the public terminal boundary, a protected merge,
+a read-only control, and nested Python/tool-call exhaustion without running commands.
 
 The `pre_tool_call` hook checks `terminal`, `execute_code`, and nested `tool_call`
 (including qualified tool names). On a configured repository it refuses:
@@ -166,6 +199,43 @@ twice-updated state PR under the worker gh shim). Multiple merge bases, shallow 
 base, failed fetches, unsupported Git versions and odd output all refuse;
 the scratch repository is removed on exit. No carry is inferred from the
 path-wise approximation alone.
+**Local object stores for the carry fetch (t_01a1dfacf4785131).** On a landing
+host the full-blob `--depth=131` fetch of a state PR head moved a ~20 MiB pack
+and took 16-44 s, so every state-PR merge preflight ran out of the 18 s budget
+in the carry stages. The scratch repository now borrows local object stores
+through `objects/info/alternates`: the command's cwd and the host policy's
+optional `"reference_repos": ["~/code/hermes"]` list in
+`ship-only-guard.json`. Each candidate needs a `.git` entry (or a bare layout)
+and then one `git rev-parse --git-common-dir --is-shallow-repository` under the
+same stripped environment and deadline; only non-shallow repositories with an
+objects directory are used, anything else is skipped. The fetch URL, shas and
+depth are unchanged; it moves only the objects the store lacks (measured: 6357
+objects / 20.6 MiB without, 10 loose objects / 80 KiB with a state clone, same
+carry verdict). Objects are content-addressed, missing ones are fetched, and a
+broken store makes git fail, which refuses; the store is trusted like the local
+`git` binary. An expired deadline during the probe still fails closed.
+Tests: `tests_carry_reference.py`.
+**Lifting shallow cuts whose parents are present (t_01a1e3427f6574fc).** The
+depth bound assumed each merge base sits within 128 commits of its merge's
+tips. State moves about 300 commits a day, so a state PR refreshed after
+sitting approved for most of a day had its carry refused ("fetch depth cuts
+history before the merge base") even when the borrowed store held every
+commit below the cut, and each refresh needed a fresh review. Right after the
+fetch, still under its lock and before any reader runs, each commit the fetch
+recorded in `shallow` is lifted only when every parent named in its raw
+object (`git cat-file commit`, which the graft does not hide) exists as a
+commit (`git cat-file -e <parent>^{commit}`). `shallow` is rewritten
+atomically with the cuts that stay, or removed when none stay. A present
+parent came either from a store `_borrow` validated as non-shallow and
+non-partial (expected complete ancestry) or from the fetch within depth (its
+own ancestry present or still cut). Missing needed ancestry makes git fail,
+which refuses. A cut with any absent parent or failed cut read/parent probe
+stays; independently validated cuts may still lift. A failed shallow-file
+read or rewrite leaves the whole file unchanged. The fetch, the
+merge-base rules and every refusal text are unchanged. Measured on PR #3381's
+refresh merge (its merge base 322 commits below the merged state tip): with
+`~/code/hermes` borrowed, the carry verdict went from the depth refusal to
+clean in 6.0 s. Tests: `tests_carry_lift.py`, `tests_carry_credentials.py`.
 Any failed or odd read refuses with the
 reason; a blocking verdict on H itself is never overridden. Base drift is
 checked separately and still applies. Why: #1812, #1837 and #2438 were refused
@@ -273,7 +343,7 @@ fails GitHub's rebase merge. hermes-sync pushes live skill edits straight to
 Skill prose next to code (`home/skills/x/scripts/*.py`) and markdown outside
 the skill trees still overlap.
 
-**Ordered land turns (protocol 2).** A drift refusal of a green, approved PR
+**Ordered land turns (protocol 3).** A drift refusal of a green, approved PR
 may record `refs/land-turn/pr-<N>`, pointing at a commit with subject
 `land-turn pr=<N>` and one JSON line containing `pr`, `head`, `acquired`,
 `expires`, and `files`. The lifetime is 90 minutes; repeat refusals and changed
@@ -283,6 +353,44 @@ non-overlapping holders are effective. Younger overlapping tickets wait and
 never refuse the older holder. Acquisition checks that same ordering before
 and after publication. A waiting ticket cannot reserve an extra area against
 otherwise independent PRs. This is a preflight, not an atomic merge lock.
+
+**Waiting admission prototype (writer OFF).** `_WAITING_WRITER_ENABLED = False`
+is a code rollout fence, not an environment override. Before enabling it, deploy
+compatible state-push and urgency-observer readers and retire every legacy
+force-update/delete writer. With the fence enabled in tests, a green, approved PR
+refused by a definite readable overlapping holder records `waiting: true` through
+the same create-only / non-force sole-parent generation writer. An uncertain
+hold never authorizes admission. Publication must order strictly after the holder
+and every already-published overlapping live snapshot record; clock skew that
+prevents that ordering refuses rather than backdating or inventing a future time.
+A concurrent publication still requires the post-write complete ordering read.
+
+The receipt says **waiting place recorded, not merge permission**, including when
+the post-write read or deadline fails. The CLI exits 1 while queued. Promotion is
+derived from the next complete snapshot, not a write that resets age or requires
+a fresh review. The original `head`, `files`, `acquired`, and `expires` stay fixed.
+A clean update-branch refresh keeps the original approval and place only after
+the authoritative Git carry proves the original admitted patch unchanged. A new
+exact approval of an authored rewrite cannot reuse that older waiting priority.
+Real-Git tests in `tests_waiting_refresh.py` exercise fetch, patch-id, content merge,
+and native merge-tree; relocating a hunk or editing it yields even with new approval.
+
+This is **bounded priority, not an unconditional next-turn guarantee**. The original
+90-minute expiry runs while queued; expiry removes the active place, the existing
+90-minute cooldown prevents immediate renewal, and only then may a non-force
+sole-parent rearm create a new place with a new age. No refresh extends those
+bounds. A holder that outlives a waiter's lease can therefore reopen the race;
+receipt text is not a promise of indefinite service. Within the live eligible
+window, closing the holder promotes the waiting entrant ahead of later overlapping
+newcomers. These boundaries are exercised in `tests_turn_waiting.py`.
+
+Broad overlap remains unchanged and is nontransitive: with A{x}, B{x,y}, C{y},
+definitely eligible A suppresses B, leaving A and C effective. If A's eligibility
+is undecidable, the bounded `possible_turns` reader conservatively retains all
+three as possible; none can suppress another on uncertain evidence. A refreshed
+waiting peer is undecidable until its original-patch walk is done by its own
+preflight (a new exact approval alone is not that proof). This can delay peers,
+but cannot admit a merge that the full rule would refuse.
 
 Optional `owner_task` and `owner_board` fields preserve the runtime Kanban identity
 (`HERMES_KANBAN_TASK`, else `HERMES_KANBAN_WORKER_TASK`; `HERMES_KANBAN_BOARD`).
@@ -378,12 +486,29 @@ not page number, for at most five pages of 100 events. GitHub does not document
 activity retention. A base outside the available chain/page bound fails closed;
 its holder cannot yield on drift age and may retain priority until ticket expiry.
 
-After expiry there is a further 90-minute cooldown before reacquisition. Cleanup
-is limited to two past-cooldown records per snapshot. A malformed open peer
-record names its ref and refuses; the owner can repair its own record through
-normal acquisition (after checking other holders), or close/merge its PR.
+After expiry there is a further 90-minute cooldown before reacquisition. Readers
+never delete refs: REST deletion has no expected-OID fence, and an expired
+snapshot can already have been replaced. Retention is one ref per participating
+PR, not globally bounded storage. A complete listing above 4096 rows fails closed
+before reading objects; at 4096, acquisition refuses to add another ref. Concurrent
+admissions can still cross this ceiling; the post-write complete read then refuses.
+This bounds accepted inventory, not `gh --slurp` response memory or server storage.
+Recovery needs maintenance with an exact-OID lease and retired old writers; do not
+substitute a GET followed by an unfenced DELETE. No automated collector is supplied.
+
+Create conflict never force-overwrites a winner. Rearm uses the observed ticket OID
+as its sole parent and non-force PATCH: sibling generations cannot fast-forward
+over each other. This relies on retiring old force-update/delete writers before
+rollout; it is not general REST compare-and-swap. An ambiguous write refuses and
+reports that publication may have succeeded; retry reads the original age/deadline.
+
+A malformed open peer record names its ref and refuses. The owner can repair a
+malformed message on a real commit through normal acquisition after checking other
+holders. Missing/tree/blob targets cannot become commit parents: acquisition refuses
+without replacing the ref. Close/merge the owning PR to release its semantic hold,
+or use fenced maintenance to repair the ref; never force-patch it as recovery.
 Malformed closed records do not block. No peer's live malformed ref is edited
-or deleted as recovery. State pre-push requires protocol 2 and invokes this same
+or deleted as recovery. State pre-push requires protocol 3 and invokes this same
 reader and selector for direct non-export pushes, instead of reconstructing
 eligibility from a recorded tree. Deploy the plugin before the state wrapper.
 

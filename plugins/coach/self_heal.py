@@ -20,6 +20,7 @@ full card it would file) to coach log.jsonl; live files the investigation card o
 README's "Self-heal lane" section). Fail-open everywhere.
 """
 from __future__ import annotations
+import unicodedata
 
 import contextlib
 import hashlib
@@ -101,8 +102,18 @@ _HERMES_TAG_RE = (r"\[(?:" + "|".join(re.escape(t) for t in sorted(HERMES_TAGS, 
                   + r")(?=[\] :_,]|\s)")
 SYNTHETIC_RE = re.compile(
     r"^\s*(?:" + CROSS_SESSION_RE + r"|" + _HERMES_TAG_RE + r"|"
-    r"[\u2100-\u2bff\U0001F300-\U0001FAFF\ufe0f]{1,3}\s+(?:\[[^\]\n]+\]\s*)?(?:@\S+\s+)?Kanban\s+t_[0-9a-f]+\b|"
-    r"\[[A-Z][A-Za-z -]{2,40}(?::|\]| —)|(?i:\[coach\])|You've reached the maximum|[✔✓✗✖⚠] )")
+    r"[\u2100-\u2bff\U0001F300-\U0001FAFF\ufe0f]{1,3}\s+(?:\[[^\]\n]+\]\s*)?(?:@\S+\s+)?Kanban\s+t_\w+\b|"
+    r"\[[A-Z][A-Za-z -]{2,40}(?::|\]| —)|(?i:\[coach\])|You've reached the maximum)")
+
+_NOTICE_TAIL = re.compile(r"\ufe0f?\s*\[")
+_BRACKET_NOTICE = re.compile(r"^\[(?:kanban\b|IMPORTANT:|System note:|chat-closeout\b|owner-wake\b)", re.I)
+
+
+def synthetic(text: str) -> bool:
+    """Runtime envelopes plus legacy machine prompts, not bare human emoji."""
+    s = (text or "").lstrip()
+    return bool(SYNTHETIC_RE.match(s) or re.match(r"^(?:[✔✓✗✖] |⚠\ufe0f?\s+subagent\b)", s) or _BRACKET_NOTICE.match(s) or (s and
+        (unicodedata.category(s[0]) == "So" or s[0] == "ℹ") and _NOTICE_TAIL.match(s, 1)))
 # Any Kanban watcher notice ("<symbol> [board] @assignee Kanban t_x ...", gateway/kanban_watchers_notifier.py + the
 # gateway.kanban.ping locale strings: ⏳ chat-wait/quota/parent-unclaimed, ⏸ blocked, ⏱ timed out, 👀 review, 🛑 triage,
 # ⛔ gave up, 🔄 status, ℹ) is gateway-written, not David's words. Listing one symbol at a time (⏸, then ⏳ in e002e0f0)
@@ -474,7 +485,7 @@ def synthetic_user_row(d: dict) -> bool:
     if (d or {}).get("source") not in ("backstop", "complaint"):
         return False
     q = clean_user(d.get("quote") or "")
-    return bool(q) and not PROBE_RE.match(q) and bool(SYNTHETIC_RE.match(q))
+    return bool(q) and not PROBE_RE.match(q) and synthetic(q)
 
 
 def prefilter(user_text) -> bool:
@@ -482,7 +493,7 @@ def prefilter(user_text) -> bool:
     (The v1 complaint regex missed corrections like "you buy the credits" and nudges like "whats going on"; one cheap
     judge call per real user turn is the price of recall.)"""
     t = clean_user(user_text)[:2000]
-    if not t or SYNTHETIC_RE.match(t):
+    if not t or synthetic(t):
         return False
     return not ACK_RE.match(t[:200])
 
@@ -2011,7 +2022,8 @@ def handoff_nudge_counts(root: Optional[Path] = None, now: Optional[float] = Non
 # reply_check rules whose nudges get a reply_nudge_outcome (same as signals.OUTCOME_RULES).
 OUTCOME_RULES = ("handoff", "confirm", "unverified", "unwatched", "report_only", "status_only", "denied_ask",
                  "credit_ask", "laptop_job", "skipped_live", "merge_forecast", "pr_state_claim", "future_clock",
-                 "claimed_mutation", "restart_scope_claim")
+                 "claimed_mutation", "restart_scope_claim", "deploy_claim", "setting_claim", "quota_claim",
+                 "hold_lift_forecast")
 
 
 def _unconfirmed_outcome(o: dict) -> bool:
@@ -5641,7 +5653,68 @@ def _file_defect(d: dict, store=None, m: Optional[str] = None, runner=None, now:
     if prev:
         store.log({"event": "selfheal_recurrence", "fingerprint": fp, "card": tid,
                    "previous": prev.get("fix_card"), "component": d.get("component")})
+    if st.get("status") == "fixed":  # recurrence or a different error: the recorded fix did not hold on its own
+        notify_superseded(fp, f"it came back at {_iso(_detected_at(d) or now)} after the earlier fix; new card {tid}",
+                          list(st.get("fix_shas") or []) or _logged_fix_shas(store, fp), [], tid, {tid}, store, runner)
     return {"action": "filed", "card": tid, "key": args["idempotency_key"], "scheduled": sched}
+
+
+SUPERSEDED_OPEN = ("todo", "ready", "scheduled", "blocked", "running", "review", "triage")
+SUPERSEDED_MAX = 10
+
+
+def _open_cards_naming(fp: str, exclude, home: Optional[Path] = None) -> list:
+    """Open cards on this host's boards whose title or body names ``fp``: verifiers and follow-ups of an earlier fix
+    round the lane never recorded (an agent-made `Verify ... live` child). -> [(board, id)], at most SUPERSEDED_MAX."""
+    import sqlite3
+    out: list = []
+    for board, path in _board_dbs(Path(home or _kanban_home())):
+        if not path.exists() or _board_in_recovery(path):
+            continue
+        try:
+            con = _ro_state(path)
+            try:
+                marks = ",".join("?" * len(SUPERSEDED_OPEN))
+                rows = con.execute(f"SELECT id FROM tasks WHERE status IN ({marks}) AND "
+                                   "(instr(coalesce(title, ''), ?) > 0 OR instr(coalesce(body, ''), ?) > 0) ORDER BY id",
+                                   (*SUPERSEDED_OPEN, fp, fp)).fetchall()
+            finally:
+                con.close()
+        except sqlite3.Error:
+            continue
+        out += [(board, i) for (i,) in rows if i not in exclude]
+    return out[:SUPERSEDED_MAX]
+
+
+def notify_superseded(fp: str, why: str, old_shas, new_shas, owner: str, exclude, store, runner=None,
+                      home: Optional[Path] = None) -> list:
+    """Tell every open card naming ``fp`` that the fix set it may be checking was superseded (agent-10bd14a55a:
+    t_01a1c3a618a8b74b re-measured cron-7c04faf754's first fix 687b316b for five days after the fingerprint came back
+    and was refixed, then cited that sha's presence as its evidence). Advisory: never fails the caller."""
+    try:
+        cards = _open_cards_naming(fp, set(c for c in exclude if c), home)
+    except Exception:  # health: allow BLE001 -- advisory notice; a board read error must not block the lane
+        return []
+    if not cards:
+        return []
+    old = " ".join(s[:12] for s in old_shas) or "(none recorded)"
+    new = " ".join(s[:12] for s in new_shas) or f"pending on {owner}"
+    body = (f"self-heal: the fix set for `{fp}` was superseded: {why}.\n"
+            f"- earlier fix: {old}\n- current fix: {new} (owner {owner})\n"
+            "If this card checks the earlier fix, that sha's presence is no longer evidence that the symptom is fixed: "
+            "verify every current fix sha where it runs plus the symptom's own log line, or complete this card as "
+            f"superseded by {owner}.")
+    sent = []
+    for board, card in cards:
+        try:
+            rc, _, _ = _run(_kanban_board_argv(board) + ["comment", card, body], runner)
+        except Exception:  # health: allow BLE001 -- NO_EXEC or a CLI failure: log what was not delivered
+            rc = 1
+        if rc == 0:
+            sent.append(card)
+    store.log({"event": "selfheal_superseded_notice", "fingerprint": fp, "owner": owner, "why": why[:200],
+               "cards": sent, "failed": [c for _, c in cards if c not in sent]})
+    return sent
 
 
 def _logged_fix_shas(store, fp: str) -> list:
@@ -6243,8 +6316,12 @@ def record_event(kind: str, fp: str, card: str = "", note: str = "", store=None,
                    "card": owner, "duplicate_card": card, "note": note[:300]})
     if kind == "proposed":
         kw["proposed_at"] = now
+    superseded: list = []
     if kind == "fixed":
         kw.update(fixed_at=now, fix_card=card or st.get("fix_card"), held=[], fix_shas=fix_shas(note))
+        earlier = list(st.get("fix_shas") or []) or _logged_fix_shas(store, fp)
+        if earlier and kw["fix_shas"] and set(earlier) != set(kw["fix_shas"]):
+            superseded = earlier
     if kind in ("not_defect", "declined"):
         kw["closed_at"] = now
     e = lane.update(fp, **kw)
@@ -6257,6 +6334,10 @@ def record_event(kind: str, fp: str, card: str = "", note: str = "", store=None,
                **({"result_file": result_path} if result_path else {})})
     if kind == "not_defect":
         admission_negative(fp, e, note, store=store, now=now, runner=runner, late_adopt=late)
+    if superseded:
+        owner = card or e.get("fix_card") or e.get("card") or "?"
+        notify_superseded(fp, f"fixed again by {owner}", superseded, e.get("fix_shas") or [], owner,
+                          {card, st.get("card"), st.get("fix_card"), st.get("verify_card")}, store, runner)
     return e
 
 
@@ -6834,14 +6915,48 @@ def _adoption_log_records(store, fps: set) -> dict:
 ADOPT_RECHECK_S = 3600  # an owner whose text could not be read is re-judged at most hourly, not every 5-min pass
 
 
-def _owner_card_text(card: str, board: Optional[str], runner=None) -> Optional[dict]:
+def _replica_task_text(card: str, board: Optional[str], hub_db: Optional[Path]) -> Optional[dict]:
+    """The text of a card that lives on another gateway, from this host's hermes-hub replica (read-only), whatever its
+    status: a revalidation judges an owner that may long since be done (_replica_card_text drops non-adoptable
+    statuses, which is right for picking a new owner and wrong for re-judging an old one). None when the board names
+    no gateway, the replica is absent/unreadable, or it holds no titled record of this card from that gateway."""
+    import sqlite3
+    gw = str(board or "").partition(":")[0]
+    if not gw or ":" not in str(board) or hub_db is None or not Path(hub_db).exists():
+        return None
+    try:
+        con = _ro_state(Path(hub_db))
+    except sqlite3.Error:
+        return None
+    try:
+        rows = con.execute("SELECT data FROM replica WHERE gw = ? AND coll = 'tasks' AND key LIKE ?",
+                           (gw, "%/" + card)).fetchall()
+    except sqlite3.Error:
+        return None
+    finally:
+        con.close()
+    for (raw,) in rows:
+        try:
+            t = json.loads(raw)
+        except ValueError:
+            continue
+        if isinstance(t, dict) and t.get("id") == card and t.get("gateway") == gw and t.get("title"):
+            return {"id": card, **{k: t.get(k) for k in ("title", "body", "idempotency_key", "status", "created_at",
+                                                         "completed_at")}}
+    return None
+
+
+def _owner_card_text(card: str, board: Optional[str], runner=None, hub_db: Optional[Path] = None) -> Optional[dict]:
     """The owner card's title/body/key/created/completed via `hermes kanban show --json`; None when unreadable or
     when the board's answer carries no title (a reply that cannot be judged is not a refusal). The board is resolved
     by lane_owner: a digest lane's '<gateway>:<board>' is shown on this host's board part first; another gateway's
-    card that is not there reads as unreadable (kept, re-judged later), never as a refusal."""
+    card that is not there is read from the hub replica (`_replica_task_text`), and only a card the replica cannot
+    describe either reads as unreadable (kept, re-judged later), never as a refusal. Before the replica fallback an
+    owner on the MacBook was unreadable on every pass, so an old-rule adoption was never re-judged (11-13..11-18:
+    eight lanes, 106 passes each, all `ok: None`) and still drew its VERIFY card (agent-9b12cb8ed8)."""
     own = lane_owner(card, board, runner)
     if own["argv"] is None:
-        return None
+        return _replica_task_text(card, board, hub_db if hub_db is not None else _lookup_sources(runner)[1])
     task = own["task"] if own["shown"] else _show_task(own["argv"], card, runner)[0]
     if not isinstance(task, dict) or "title" not in task:
         return None

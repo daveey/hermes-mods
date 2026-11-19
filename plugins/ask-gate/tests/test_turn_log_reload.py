@@ -6,9 +6,28 @@ package and re-executes it, so a module-level TurnLog started empty, pre_llm_cal
 anyway) does not run again until the next turn, and every explicit human_request of the rest of the turn was
 refused as "human_request.evidence matches no tool call made this turn" although the turn had made the calls.
 """
+import importlib.util
 import json
+import sys
 
-from conftest import _load, llm_returning
+import pytest
+
+from conftest import HERE, _load, llm_returning
+
+
+def _reload_package(monkeypatch):
+    """Purge a real package generation, leaving only the external shared-state registry alive."""
+    name = "ask_gate_home_reload_test"
+    for key in list(sys.modules):
+        if key == name or key.startswith(name + "."):
+            monkeypatch.delitem(sys.modules, key)
+    spec = importlib.util.spec_from_file_location(name, HERE / "__init__.py",
+                                                submodule_search_locations=[str(HERE)])
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, name, mod)
+    spec.loader.exec_module(mod)
+    return mod
 
 EVIDENCE = ("Second and final U14e hosted run 43605081473 (head df76b2bd) stopped at P0 in the hosted Runner "
             "identity step before the executor: `identity-single-run`, inferred by deterministic replay.")
@@ -43,6 +62,51 @@ def test_next_turn_still_starts_with_an_empty_log(gate):
     reloaded = _load()
     reloaded.pre_llm_call(session_id="s1", user_message="next", conversation_history=[], platform="cli")
     assert reloaded.LOG.get("s1") == [] and gate.LOG.get("s1") == []
+
+
+@pytest.mark.parametrize("operation", ["calls", "users", "reset"])
+def test_reload_keeps_same_session_isolated_between_homes(gate, tmp_path, monkeypatch, operation):
+    """Reload shares a home's state, never another home's identically named session."""
+    home_a = gate.core.home()
+    session = "s1"  # Deliberately identical: different IDs would hide a process-global home bucket.
+    gate.LOG.add(session, "terminal", "echo home-a", "home-a evidence")
+    gate.LOG.set_users(session, ["home-a approval"])
+    calls_a = gate.LOG.get(session)
+
+    home_b = tmp_path / "home-b"
+    home_b.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home_b))
+    monkeypatch.setenv("ASK_GATE_LEDGER", str(home_b / "state" / "ask-ledger.sqlite"))
+    other = _reload_package(monkeypatch)
+    reloaded_b = _reload_package(monkeypatch)
+    assert other is not reloaded_b and other.core is not reloaded_b.core
+    assert reloaded_b.core.home() != home_a
+
+    # Separate cases make the exact all-homes mutation fail for each observable, including reset.
+    if operation == "calls":
+        assert reloaded_b.LOG.get(session) == []
+    elif operation == "users":
+        assert reloaded_b.LOG.users(session) == []
+    else:
+        reloaded_b.LOG.reset(session)
+        assert gate.LOG.get(session) == calls_a
+
+    reloaded_b.LOG.add(session, "web_search", "home-b query", "home-b evidence")
+    reloaded_b.LOG.set_users(session, ["home-b approval"])
+    calls_b = reloaded_b.LOG.get(session)
+    assert other.LOG.get(session) == calls_b
+    assert other.LOG.users(session) == ["home-b approval"]
+
+    monkeypatch.setenv("HERMES_HOME", str(home_a))
+    monkeypatch.setenv("ASK_GATE_LEDGER", str(home_a / "state" / "ask-ledger.sqlite"))
+    reloaded_a = _reload_package(monkeypatch)
+    assert reloaded_a is not gate and reloaded_a.core is not gate.core
+    assert reloaded_a.LOG.get(session) == calls_a
+    assert reloaded_a.LOG.users(session) == ["home-a approval"]
+    reloaded_a.LOG.reset(session)
+    assert gate.LOG.get(session) == []
+    assert other.LOG.get(session) == calls_b == reloaded_b.LOG.get(session)
+    assert other.LOG.users(session) == ["home-b approval"]
 
 
 def test_evidence_quoted_from_the_middle_of_a_long_result_matches(gate):

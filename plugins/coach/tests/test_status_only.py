@@ -277,6 +277,32 @@ def test_human_question_quoting_a_notice_stays_a_human_ask():
     assert rc.status_only(ask, "Checked it; it's still waiting on review.", BLOCKED_LOG)
 
 
+def test_symbol_prefixed_human_kanban_question_requires_a_card_id_for_a_notice():
+    ask = "📌 Kanban looks stuck — why are we still waiting?"
+    assert not rc.notice_turn(ask)
+    assert rc.status_only(ask, "Checked it; it's still waiting on review.", BLOCKED_LOG)
+
+
+def test_wall_after_first_150_chars_but_inside_opening_window_is_exempt():
+    wall = "A choice only you can make is needed. "
+    reply = ("Checked the card. " * 30) + wall + ("Still waiting on review. " * 150)
+    assert len(reply) > 3000
+    assert 200 < reply.index(wall) < 1400
+    assert not rc.WALL_RE.search(reply[:150])
+    assert not rc.WALL_RE.search(reply[-1500:])
+    assert rc.status_only("why are we still waiting?", reply, BLOCKED_LOG) is None
+
+
+def test_wall_just_past_opening_window_does_not_exempt_status_only():
+    wall = "A choice only you can make is needed. "
+    reply = "Checked the card. ".ljust(1501) + wall + ("Still waiting on review. " * 150)
+    assert len(reply) > 3000
+    assert reply.index(wall) == 1501
+    assert not rc.WALL_RE.search(reply[:1500])
+    assert not rc.WALL_RE.search(reply[-1500:])
+    assert rc.status_only("why are we still waiting?", reply, BLOCKED_LOG)
+
+
 def test_quiet_when_a_long_reply_names_the_wall_in_its_opening():
     """status_plain asks for the one thing stopping it in the first paragraph; status_only must read that opening."""
     ask = "why are we still waiting on the hub CPU work?"

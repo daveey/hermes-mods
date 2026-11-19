@@ -2,6 +2,7 @@
 watchdog. No Hermes imports at module level; everything that touches Hermes is passed in or imported lazily, so the
 tests run on throwaway SQLite files."""
 from __future__ import annotations
+import unicodedata
 
 import contextlib
 from collections import OrderedDict
@@ -28,7 +29,15 @@ MAX_WAKES_PER_HOUR = 2        # hard cap per chat, whatever the cards do
 STALE_S = 1800.0              # watchdog: unseen results / missing close-out older than this
 WATCHDOG_EVERY_S = 900.0
 STUCK_S = 24 * 3600.0         # watchdog: a pending row with nothing found working, this long
-NOTICE_RE = re.compile(r"^\s*(?:[✔⏸✖⏱🔄]\s*\[|\[chat-closeout\])")
+NOTICE_RE = re.compile(r"^\s*\[chat-closeout\]")
+_NOTICE_TAIL = re.compile(r"\ufe0f?\s*\[")
+_BRACKET_NOTICE = re.compile(r"^\[(?:kanban\b|IMPORTANT:|System note:|chat-closeout\b|owner-wake\b)", re.I)
+
+
+def runtime_notice(text: str) -> bool:
+    s = (text or "").lstrip()
+    return bool(NOTICE_RE.match(s) or _BRACKET_NOTICE.match(s) or (s and
+        (unicodedata.category(s[0]) == "So" or s[0] == "ℹ") and _NOTICE_TAIL.match(s, 1)))
 TAG = "[chat-closeout]"
 
 
@@ -1106,6 +1115,32 @@ def settle_unlinked(row: dict[str, Any], succeeded: bool, now: float) -> tuple[d
     return out, retry
 
 
+def named_unlinked(row: dict[str, Any]) -> set[str]:
+    """Removed entries a close-out brief named (``briefed``): a successful end of that turn retires them."""
+    return {k for k, v in (row.get("unlinked") or {}).items()
+            if isinstance(v, dict) and "removed" in v and "briefed" in v}
+
+
+def retire_listed(retired: dict, listed: set[str], cards: dict[str, dict[str, Any]], named: set[str],
+                  now: float) -> tuple[dict, set[str]]:
+    """Turn-end upkeep of entries the automatic unlink retired: ``(retired, held)``, ``held`` = listed entries
+    kept out of the batch.
+
+    A card archived on its owner without completion is never republished, yet core keeps listing its last stale row
+    among the chat's open cards (``open_card_ids``). Re-adding it at each turn end restarts its 24 h clock and wakes
+    the chat for the same close-out every day. So an entry a successful close-out named (``named``) stays retired
+    while the chat lists it and nothing new is known: missing, stale, uncertain or finished without settling
+    (``is_unresolved``) all hold it out. Only a fresh, resolvable row of an earlier retirement is work again: it
+    rejoins and its tombstone goes. A tombstone the chat no longer lists is dropped, since only that listing could
+    bring the entry back."""
+    out = {k: v for k, v in (retired or {}).items() if isinstance(v, dict)}
+    out.update({k: {"at": now} for k in named if k not in out})
+    uncertain = getattr(cards, "uncertain", frozenset())
+    revived = {k for k in out if k not in uncertain and cards.get(k) is not None and not is_unresolved(cards.get(k))}
+    keep = {k: v for k, v in out.items() if k in listed and k not in revived}
+    return keep, set(keep)
+
+
 # ---- one-time upgrade: shepherd rows that finished before they could settle ------------------------------------
 UPGRADE_SHEPHERD_KEY = "upgrade:shepherd-settle-v1"            # set once every snapshot entry was observed
 UPGRADE_CUTOFF_KEY = "upgrade:shepherd-settle-v1:cutoff"       # wall time of the first upgrade pass
@@ -1452,8 +1487,11 @@ _MIGRATE = (("covered", "TEXT NOT NULL DEFAULT '[]'"), ("closing", "TEXT"),
             ("relayed", "TEXT NOT NULL DEFAULT '[]'"),
             ("retry_after", "REAL"), ("failure_since", "REAL"),
             # {key: missing-entry clock, or {"removed": at} until a close-out names it} (track_unlinked)
-            ("unlinked", "TEXT NOT NULL DEFAULT '{}'"))
+            ("unlinked", "TEXT NOT NULL DEFAULT '{}'"),
+            # {key: {"at": retired at}}: unlinked entries a close-out named, kept out of the batch (retire_listed)
+            ("retired", "TEXT NOT NULL DEFAULT '{}'"))
 _JSON_SETS = ("batch", "open", "covered", "relayed")
+_JSON_DICTS = ("unlinked", "retired")
 
 
 class Ledger:
@@ -1516,7 +1554,7 @@ class Ledger:
     def write(self, sid: str, **fields: Any) -> None:
         enc = {k: (json.dumps(sorted(v)) if k in _JSON_SETS else
                    json.dumps(list(v)) if k in ("closing", "wakes") and v is not None else
-                   json.dumps(dict(v or {}), sort_keys=True) if k == "unlinked" else v)
+                   json.dumps(dict(v or {}), sort_keys=True) if k in _JSON_DICTS else v)
                for k, v in fields.items()}
         cols = ", ".join(enc)
         sets = ", ".join(f"{k}=excluded.{k}" for k in enc)
@@ -1790,10 +1828,11 @@ def _row(r) -> Optional[dict[str, Any]]:
         d["closing"] = json.loads(d["closing"]) if d.get("closing") else None
     except ValueError:
         d["closing"] = None
-    try:
-        d["unlinked"] = dict(json.loads(d.get("unlinked") or "{}"))
-    except (ValueError, TypeError):
-        d["unlinked"] = {}
+    for k in _JSON_DICTS:
+        try:
+            d[k] = dict(json.loads(d.get(k) or "{}"))
+        except (ValueError, TypeError):
+            d[k] = {}
     return d
 
 
@@ -1812,10 +1851,20 @@ def record_turn_end(ledger: Ledger, sid: str, open_ids: Iterable[str], read: Cal
     keeps them for another close-out (``settle_unlinked``)."""
     now = time.time() if now is None else now
     row = ledger.get(sid) or {}
-    open_now = set(open_ids)
+    listed = set(open_ids)
+    open_now = set(listed)
+    closing = bool(observed_sig) or row.get("closing") is not None
     # Old-lineage cards (compression rotated the id) are still in the batch: keep them open until settled.
     batch = set(row.get("batch") or []) | open_now
     cards = canonical_view(read(sorted(batch))) if batch else {}
+    # Entries the unlink retired stay out while the chat merely keeps listing them (``retire_listed``). An entry
+    # back in the batch by another path is tracked there again, so its tombstone goes.
+    prior_retired = row.get("retired") or {}
+    named = named_unlinked(row) if closing and succeeded else set()
+    retired, held = retire_listed({k: v for k, v in prior_retired.items() if k not in (row.get("batch") or [])},
+                                  listed - set(row.get("batch") or []), cards, named, now)
+    open_now -= held
+    batch -= held
     view = {**row, "batch": sorted(batch)}
     fix = reconcile(view, cards)
     view.update(fix)
@@ -1826,7 +1875,6 @@ def record_turn_end(ledger: Ledger, sid: str, open_ids: Iterable[str], read: Cal
     fields.update({k: fix[k] for k in ("done_sig", "claim_sig", "relayed") if k in fix})
     if key and key != row.get("settled_sig"):
         fields.update(settled_sig=key, settled_at=now)  # the watchdog's "settled since" clock
-    closing = bool(observed_sig) or row.get("closing") is not None
     if closing:
         # The waker covered the batch before the turn, so its key was stamped. Only trust that stamp while the whole
         # batch is still settled: a card reopened during the turn (reviewer -> running) makes the stamp stale, and
@@ -1848,6 +1896,8 @@ def record_turn_end(ledger: Ledger, sid: str, open_ids: Iterable[str], read: Cal
         if retry:  # the mention was not delivered: another close-out, after a shared backoff
             fields.update(done_sig=None, claim_sig=None, retry_after=now + UNLINK_RETRY_S)
     fields["batch"], fields["covered"] = batch, covered
+    if retired != prior_retired:
+        fields["retired"] = retired
     if not batch and not row:
         return {"open": [], "batch": []}
     ledger.write(sid, **fields)
@@ -2195,7 +2245,7 @@ def last_user_at(state_dbs: Iterable[Path], ids: Iterable[str], pool: Optional[R
             ph = ",".join("?" for _ in ids)
             for r in conn.execute(f"SELECT content, timestamp FROM messages WHERE role='user' AND session_id IN ({ph}) "
                                   f"{dk} ORDER BY timestamp DESC LIMIT 20", ids):
-                if NOTICE_RE.match(str(r["content"] or "")):
+                if runtime_notice(str(r["content"] or "")):
                     continue
                 best = max(best, float(r["timestamp"] or 0))
                 break

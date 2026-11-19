@@ -797,3 +797,18 @@ test('chips carry the card human_request on local and hub-replica paths', () => 
   const [none] = m.sessionTaskChips([{ id: 't_n', status: 'blocked' }], { connectionId: 'C1', profile: 'default' })
   assert.equal(none.humanRequest, null)
 })
+
+test('an unreleased closed remote card keeps what its owner reported (done or archived), state stays unknown', () => {
+  const row = { id: 't_r', gateway: 'worker-5', profile: 'default', board: 'default', title: 'Review', unfinished: true, released: false, source: 'replica', remote: true }
+  const pending = m.sessionTaskChips([{ ...row, status: 'done_pending_release', reported_status: 'done' }])[0]
+  assert.equal(pending.state, 'unknown')
+  assert.equal(pending.reported, 'done')
+  // The origin-ledger reader labels the same obligation `unknown` and carries the report beside it.
+  assert.equal(m.sessionTaskChips([{ ...row, status: 'unknown', reported_status: 'done' }])[0].reported, 'done')
+  assert.equal(m.sessionTaskChips([{ ...row, status: 'unknown', reported_status: 'archived' }])[0].reported, 'archived')
+  // No report, an open report, or a stale read reports nothing.
+  assert.equal(m.sessionTaskChips([{ ...row, status: 'unknown' }])[0].reported, null)
+  assert.equal(m.sessionTaskChips([{ ...row, status: 'unknown', reported_status: 'running' }])[0].reported, null)
+  assert.equal(m.sessionTaskChips([{ ...row, status: 'unknown', reported_status: 'done', stale: true }])[0].reported, null)
+  assert.equal(m.sessionTaskChips([{ ...row, status: 'scheduled', reported_status: 'scheduled' }])[0].reported, null)
+})

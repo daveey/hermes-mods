@@ -576,6 +576,7 @@ class Mirror:
                     entry.memo[memo_key] = bound
                 parts.append(("store", entry.gen, version))
             session_ids = set()
+            subscriber_ids = set()
             for board, path in sorted(self.boards.items()):
                 ids = [t for b, t in bound if b == board]
                 held = []
@@ -591,13 +592,16 @@ class Mirror:
                         entry.memo[memo_key] = digest
                 parts.append((board, digest[0]))
                 session_ids.update(digest[1])
+                subscriber_ids.update(digest[2])
             with _kept(self.core._state_db()) as c:
-                # Unrelated worker sessions cannot affect an ask. Keep the user-session
-                # shape (including new user owners) and exact rows for every creating
-                # session/local subscriber, even custom-source legacy subscribers.
+                # Include subscriber sources so custom-source compression descendants
+                # invalidate on insert/delete. Creator sources must NOT expand this
+                # shape: a kanban creator would key unrelated worker-session churn.
                 parts.append(tuple(c.execute(
                     "SELECT MAX(rowid), COUNT(*) FROM sessions "
-                    "WHERE source IN ('desktop','cli','tui','web')").fetchone()))
+                    "WHERE source IN ('desktop','cli','tui','web') OR source IN "
+                    "(SELECT source FROM sessions WHERE id IN (SELECT value FROM json_each(?)))",
+                    (json.dumps(sorted(subscriber_ids)),)).fetchone()))
                 parts.append([tuple(r) for r in c.execute(
                     "SELECT id,parent_session_id,end_reason,source FROM sessions "
                     "WHERE id IN (SELECT value FROM json_each(?)) ORDER BY id",
@@ -630,8 +634,9 @@ class Mirror:
                      if x in have]
         session_ids = {r[positions.index("session_id")] for r in rows
                        if "session_id" in positions and r[positions.index("session_id")]}
-        session_ids.update(r[1] for r in (subs or []) if r[1])
-        return _digest([rows, subs]), tuple(sorted(session_ids))
+        subscriber_ids = {r[1] for r in (subs or []) if r[1]}
+        session_ids.update(subscriber_ids)
+        return _digest([rows, subs]), tuple(sorted(session_ids)), tuple(sorted(subscriber_ids))
 
     def _reconcile(self, owner, fenced):
         """One full pass. False when anything was deferred (the next pass must not be skipped)."""

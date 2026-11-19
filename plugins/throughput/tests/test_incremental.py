@@ -388,15 +388,15 @@ def test_range_query_reads_the_rowid_range_not_a_session_index(tmp_path):
 
 
 def test_failed_persistence_does_not_publish_the_incremental_baseline(env, monkeypatch):
-    """A record_delta failure (sqlite locked) must leave baselines and cursors untouched: the retry recovers the
-    interval's scalar and model deltas instead of falling back to a +600 s full read that loses them."""
+    """A record_delta failure preserves absolute baselines, not the mutable read cursors.
+    The still-hot session lets the retry recover scalar/model deltas despite cursor advancement."""
     import sqlite3
     root, db, clock, smp, spy = env
     db.turn("s1", 100, 10)
     step(smp, clock, 0)  # baseline: a full read
     snap_before = {d: dict(v) for d, v in smp._snap.items()}
     msnap_before = {d: {s: dict(m) for s, m in v.items()} for d, v in smp._msnap.items()}
-    cursors_before = dict(smp._cursors)
+    cursors_before = {d: (cur.msg_wm, cur.srow, cur.scount) for d, cur in smp._cursors.items()}
     db.turn("s1", 30, 3, model="m2")
     real = smp.store.record_delta
     calls = {"n": 0}
@@ -409,7 +409,12 @@ def test_failed_persistence_does_not_publish_the_incremental_baseline(env, monke
     step(smp, clock, 1)  # the pass fails after reading the +30 incrementally
     assert calls["n"] == 1 and spy.inc == 1
     assert smp._snap == snap_before and smp._msnap == msnap_before and smp._snap_minute == M
-    assert smp._cursors == cursors_before
+    assert cursors_before  # value snapshots, not aliases of mutable DbCursor objects
+    for d, cur in smp._cursors.items():
+        wm, srow, scount = cursors_before[d]
+        assert cur.msg_wm > wm
+        assert (cur.srow, cur.scount) == (srow, scount)
+        assert 's1' in cur.hot
     monkeypatch.setattr(smp.store, "record_delta", real)
     step(smp, clock, 2)
     assert rows(smp.store) == {"": 30, "m2": 30}

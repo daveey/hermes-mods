@@ -361,8 +361,47 @@ def list_runs(repo: Path, branch: str, workflows: list[str], slug: str | None = 
 
 
 def is_checkout(path: Path) -> bool:
-    out = subprocess.run(["git", "-C", str(path), "rev-parse", "--is-inside-work-tree"], capture_output=True, text=True)
-    return out.returncode == 0 and out.stdout.strip() == "true"
+    """A git repository the wait can run in: a working tree, or a bare repository (agent-7861ec636f).
+
+    Every git call of the wait (fetch with an explicit refspec, rev-parse, merge-base, tag, remote get-url) works in
+    a bare repository, and a scratch `git clone --bare` is the cheap way to wait without touching a live checkout.
+    Refusing it made a correct wait exit 1 ("not a git checkout"), or with --gh-repo silently swapped in another
+    checkout. The inside of a `.git` directory is still refused: `--is-bare-repository` is false there."""
+    out = subprocess.run(["git", "-C", str(path), "rev-parse", "--is-inside-work-tree", "--is-bare-repository"],
+                         capture_output=True, text=True)
+    return out.returncode == 0 and "true" in out.stdout.split()
+
+
+def durable_checkout(path: Path) -> Path:
+    """The main checkout when `path` lies in a linked worktree (`git worktree add`), else `path` unchanged.
+
+    A linked worktree shares its main checkout's objects, refs, config and remotes, so every git and gh call of
+    the wait reads the same there, and the main checkout outlives the PR worktree a wait was started in: a waiter
+    whose worktree was removed mid-wait died on its next call with FileNotFoundError. Read from git's own files
+    (the worktree's `.git` file names its admin dir, whose `commondir` names the shared repository), so it starts
+    no process. A main checkout, a submodule, a bare repository's worktree or anything unreadable is returned as
+    is; the one exception is a bare repository kept as `<dir>/.git`, whose worktrees map to `<dir>`, where git
+    finds that same repository, so every call of the wait still works there."""
+    try:
+        here = Path(path).resolve()
+        for d in (here, *here.parents):
+            dotgit = d / ".git"
+            if dotgit.is_dir():
+                return path
+            if dotgit.is_file():
+                text = dotgit.read_text().strip()
+                if not text.startswith("gitdir:"):
+                    return path
+                admin = (d / text[len("gitdir:"):].strip()).resolve()
+                common = (admin / (admin / "commondir").read_text().strip()).resolve()
+                if common.name != ".git" or not common.is_dir():
+                    return path
+                print(f"{path} is a linked worktree; waiting from its main checkout {common.parent}",
+                      file=sys.stderr, flush=True)
+                return common.parent
+    except (OSError, ValueError, RuntimeError):
+        pass
+    return path
 
 
 def checkout_for(slug: str) -> Path | None:
@@ -501,6 +540,8 @@ def wait_runs(a, run_ids: list[str], expects: dict[str, dict[str, str]]) -> int:
     else:
         repo = resolve_repo(a.repo, None)
         slug = gh_repo(repo)
+    # Every poll runs `gh run view` with this as its cwd: a PR worktree removed mid-wait must not kill the waiter.
+    repo = durable_checkout(repo)
     deadline = time.monotonic() + a.timeout_min * 60
     last, errors = "", 0
     while True:
@@ -589,6 +630,7 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         return wait_runs(a, run_ids, expects)
     repo = resolve_repo(a.repo, a.gh_repo)
+    durable = durable_checkout(repo)  # read now, while a worktree --repo surely still exists
     slug = a.gh_repo or gh_repo(repo)
 
     def fetch():
@@ -598,6 +640,9 @@ def main(argv: list[str] | None = None) -> int:
 
     fetch()
     shas = [git(repo, "rev-parse", "--verify", f"{s}^{{commit}}") for s in a.shas]
+    # The shas are resolved where they were named (HEAD is that worktree's HEAD); everything after reads shared
+    # objects, refs and remotes, so it runs from the main checkout, which outlives a removed PR worktree.
+    repo = durable
     contains = make_contains(repo)
     for sha in shas:
         if not contains(f"origin/{a.branch}", sha):

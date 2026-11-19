@@ -14,7 +14,8 @@ metadata:
 # Machine investigate
 
 You run ON the machine being investigated (the card was placed there). The card body has the panel's numbers
-at click time. Script: `scripts/collect.py` in this skill (stdlib only).
+at click time. Script: `scripts/collect.py` in this skill (stdlib only). From a chat on another host, pipe it in:
+`ssh <host> 'python3 - report --no-du' < <skill>/scripts/collect.py`.
 A hung job (results stopped, almost no CPU) doesn't show in load numbers: follow `references/stuck-jobs.md`.
 
 ## Procedure
@@ -41,7 +42,11 @@ A hung job (results stopped, almost no CPU) doesn't show in load numbers: follow
    `ps %cpu` snapshots. Re-measure the same PIDs (check identity/start time) the same way after a fix.
 4. A long-lived process is not a leftover just because it is old. Find its owner first: `OWNER.md` in its cwd
    or an ancestor process's cwd, `HERMES_OWNER_CARD` in its env, and open cards on every board and gateway
-   (MacBook, hub, mini in a three-host fleet) naming its label, script or directory. Read the owner card with
+   (MacBook, hub, pool workers, mini) naming its label, script or directory. Work a card started over ssh from
+   another host carries neither marker (`owner` empty): read the chain root's cwd (task scratch dirs are named
+   `t_<hex>-…`) and `SSH_CONNECTION` in `/proc/<root pid>/environ`, and name the source with `tailscale status`. A
+   `chain` of dozens of identical python parents is a test re-spawning itself until its outer timeout: attribute the
+   root (the chain's last entry), not the leaves. Read the owner card with
    `kanban_show`, not a shell board command. Follow the chain to the launchd job (`launchctl list`,
    `launchctl print gui/$UID/<label>` for its interval), systemd unit, or cron (`crontab -l`,
    `~/.hermes/cron/jobs.json`). Any ask to stop an owned service goes on its owner card, with measured cost.
@@ -65,6 +70,7 @@ that isn't the hot path. To attribute CPU to code, record instead:
 `sudo -n py-spy record --nonblocking --pid <pid> --duration 15 --rate 40 --format raw -o <f>` (each line is
 `frame;frame;… count`), then rank functions by their inclusive share of samples (count each function once per stack).
 To measure time a thread spends blocked on a lock or event, add `--idle`: without it py-spy drops sleeping threads' samples, so lock waits never show up.
+For a bounded sync-loop profile, filter raw stacks to the exact sync thread before ranking: detached link-repair and watcher threads can share module names and otherwise dominate the wrong envelope. Preserve sampler error/lag counts and treat an offline one-pair query speedup as a candidate estimate, not a validated end-to-end forecast. Do not infer historical row-volume causes from aggregate counters without row identities.
 Use the profile to locate code, not to convert sample counts directly into CPU utilization: thread filtering,
 missed samples and nonblocking reads affect that estimate. Cross-check against the step 3 CPU-time delta.
 `<f>` may be owned by root after `sudo`; inspect ownership and use `sudo -n` to read/delete it if needed.
@@ -76,6 +82,8 @@ its fail-open discovery and lexical limits are not permission to bypass it.
 ## Heap attribution coverage
 
 For loop-watch owner censuses, check both deadline and owner-label coverage before choosing a retainer to fix. `truncated: false` alone does not mean attribution is complete: a saturated owner table can hide the largest structures in `<other owners>`. Require `labels_truncated: false` on newer reports; on older reports inspect the owner count against the implementation's cap. Keep Python shallow-object bytes distinct from physical footprint (native buffers and allocator slack are excluded), and do not rerun a consumed one-shot by clearing its lifetime sentinel. Use natural process replacement for the next live scan.
+
+On macOS, inspect the allocator before predicting what a cut saves: `python3 <skill>/scripts/alloc_split.py <pid>` reads `vmmap --summary` (which can suspend the target; use only an authorized diagnostic process). Physical footprint can include memory retained by malloc after objects are freed. The helper reports malloc in-use bytes and a free-memory estimate from zone fragmentation plus dirty and swapped pages of empty malloc regions; this is not an exact additive decomposition of footprint. The Untagged row may include pymalloc arenas but is not uniquely attributable to Python. Never book a footprint difference between runs as retained objects, or treat a zero from `malloc_zone_pressure_relief` as proof that no freed memory remains. Compare the same workload and object census alongside allocator statistics; an A/B with `MallocSpaceEfficient=1` set at process start can test allocator effects, not prove their exclusivity. `heap <pid>` can provide a native malloc size histogram beyond a Python-object census. The helper fails on command errors or missing required tables rather than reporting false zeros; `scripts/test_alloc_split.py` exercises parsing, units, PID validation and error handling.
 
 ## Remote backend timeouts: separate compute from transport
 

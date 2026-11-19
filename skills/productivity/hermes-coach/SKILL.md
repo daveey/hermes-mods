@@ -146,17 +146,16 @@ Undone notices are always plain cards.
 
 ## Done means
 
+- [ ] Before classifying an `ask-gate-weekly` hit as a detector miss, did you inspect exact historical log events matching its quote, session and incident scope, allowing live detection without a retained lane owner and recording missing evidence as unknown rather than a miss?
+- [ ] For each frozen weekly ask-gate candidate, did you inspect raw envelopes and earlier product replies before deciding human authorship, rather than treating API ingestion metadata or session source as proof?
 - [ ] Before calling an ask-gate hit a miss, checked every `<data>/*/selfheal-seen.json` plus local `coach/selfheal.json` with `detection_for`, and, when testing the cross-host path on the hub, removed same-session hub fingerprints only from a scratch home copy so local detections cannot mask the cross-host result?
 
 ## Pitfalls
 
 - Exercise the coach worker's startup and request routing separately. An inherited class-selector model must not be pinned to the worker's historical Anthropic default before the judge model is known. Keep explicit selector/provider conflicts visible. Price the resolved concrete route and freeze its model/provider in every runner (including transcript/dictionary judge paths) before reserving budget; otherwise another pooled worker can select a different route after pricing. Run `scripts/test-all -k hermes-coach` from a complete checkout: copying only scripts loses sibling-plugin fixtures and Git-based repository guards. Require a budget-reserved real judge response before calling a startup repair complete; all-None results are INCOMPLETE.
 
-- Keep weekly regex candidates separate from adjudicated human corrections. An explicit one-shot reviewer opener,
-  a stamped Subagent relay, or a generated Kanban warning is not a correction; appended `[System: ...]` text must
-  not supply the matching words. Keep ambiguous legacy operator stamps for review. A session-level detection or
-  nearby commit does not prove exact-defect ownership or repair: match the complaint quote, then check the fix's
-  scope and live evidence. Regression coverage: `scripts/test_askgate_weekly_noise.py`.
+- Before weekly provenance/legacy withdrawal changes, read `references/weekly-provenance.md`: source identity,
+  ambiguous raw evidence, and cold file-path consumer tests. Local import-order success never waives red CI.
 
 - xAI `x_search` via the Responses API (outside research scout): send `"tool_choice": "required"` and use
   `grok-4.5`, or the model often answers `[]` from memory without searching (`usage.num_server_side_tools_used: 0`).

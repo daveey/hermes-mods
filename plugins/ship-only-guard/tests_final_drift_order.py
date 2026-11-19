@@ -9,14 +9,18 @@ def test_final_drift_must_observe_push_during_parallel_approval(gh, monkeypatch)
     fake = gh({1: pr(1, H2563, ['hermes-sync'])})
     seed_turn(fake, 1, NOW - 1800)
     read = threading.Event()
-    original = g._turn_yielded
+    original = g._turn_hold_read_only
 
-    def yielded(*args):
-        result = original(*args)
+    def hold(number, data, repo, cwd, env):
+        result = original(number, data, repo, cwd, env)
+        # Seed a real earlier mutable compare, as a peer/carry reader may do.
+        # Own eligibility no longer needs that compare; the final gate must
+        # still ignore a cached result from any parallel reader.
+        assert g._base_drift_refusal(number, repo, data, cwd, env, fresh=False) is None
         read.set()
         return result
 
-    monkeypatch.setattr(g, '_turn_yielded', yielded)
+    monkeypatch.setattr(g, '_turn_hold_read_only', hold)
     original_approval = g._approval_refusal
 
     def approval(*args):

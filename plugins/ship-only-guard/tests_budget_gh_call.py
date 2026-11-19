@@ -111,5 +111,5 @@ def test_turn_acquire_never_writes_after_preflight_expiry(guard, monkeypatch, tm
         assert writes == [], "land-turn writes escaped after the aggregate deadline"
         assert "deadline exceeded" in result
     else:
-        assert [call[0] for call in writes] == ["POST", "POST", "PATCH"]
-        assert "UTC" in result
+        assert [call[0] for call in writes] == ["POST", "POST"]
+        assert "publication conflicted or was unreadable" in result

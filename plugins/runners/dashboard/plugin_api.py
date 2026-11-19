@@ -211,7 +211,9 @@ def _gateway_section():
     section = fleet.gateway_workers(registry, leases, now_ms, registry_age_s=age,
                                     local_cap=_local_cap(), eligible=node.eligible,
                                     waiting=_waiting_cards(fleet, ksc.shadow_path('x').parent))
-    return section
+    # Worker lifecycle events for the panel's timeline: a read-only look at the autoscaler's ledger,
+    # [] on every host that has none.
+    return fleet.with_worker_events(section, fleet.scaler_ledger_path(), now_ms / 1000)
 
 
 # (path, signature) -> parsed ``kanban.max_in_progress``. The cap is machine-wide, so one entry

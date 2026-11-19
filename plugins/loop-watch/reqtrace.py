@@ -483,7 +483,7 @@ _IDLE_TAILS = ("sleep", "serve_forever", "wait_closed", "_accept_connection", "r
 # Executor threads that run request work: anyio's (sync FastAPI handlers and dependencies), asyncio's
 # default executor (run_in_executor(None) / to_thread), and plugin pools (hub-sync). A request parked on
 # ``run_sync_in_worker_thread`` is waiting on one of these; their stacks say what the handler is doing.
-_WORKER_PREFIXES = ("AnyIO worker", "asyncio_", "ThreadPoolExecutor", "hub-sync")
+_WORKER_PREFIXES = ("AnyIO worker", "asyncio_", "ThreadPoolExecutor", "hub-sync", "hermes-gateway-default")
 # Innermost frames of an executor thread waiting for work (not running any).
 _IDLE_WORKER_TAILS = {"_worker", "run", "get", "wait", "acquire", "_wait_for_tstate_lock"}
 
@@ -515,7 +515,8 @@ def _worker_stacks(depth: int = 10) -> Counter:
         if all(any(m in x for m in ("threading.py", "queue.py", "thread.py", "to_thread", "_asyncio.py"))
                for x in st) and st[-1].rsplit(" ", 1)[-1] in _IDLE_WORKER_TAILS:
             continue
-        pool = name.rsplit("_", 1)[0] if name.startswith("asyncio_") else name.split(" ")[0]
+        pool = (name.rsplit("_", 1)[0]
+                if name.startswith(("asyncio_", "hermes-gateway-default_")) else name.split(" ")[0])
         out[(pool, st)] += 1
     return out
 

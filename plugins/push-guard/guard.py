@@ -805,9 +805,42 @@ def cancel_message(what: str) -> str:
 
 # PR-only repository policy: deliberately NOT part of load_guards/direct-push rules.
 MODS_REPO = "daveey/hermes-mods"
+
+
+def _policy_entry_present(path):
+    # exists() follows symlinks and suppresses errors (including EACCES on newer
+    # Python). Only a genuinely absent entry may fall back to another policy.
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def landing_repos(home=None):
+    """PR-only policy, inherited by profiles; never redirects core/state ship paths.
+
+    No override environment variable: this is host policy, not command input.
+    Missing policy retains the built-in repo; unreadable/malformed policy raises
+    so merge classification and the landing helper both fail closed.
+    """
+    home = Path(home) if home is not None else Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
+    policy = home / "ship-only-guard.json"
+    if not _policy_entry_present(policy) and home.parent.name == "profiles":
+        policy = home.parent.parent / "ship-only-guard.json"
+    if not _policy_entry_present(policy):
+        return {MODS_REPO}
+    data = json.loads(policy.read_text())
+    repos = data.get("pr_landing_repos", []) if isinstance(data, dict) else None
+    if (not isinstance(repos, list) or any(not isinstance(r, str) or
+            not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", r) for r in repos)):
+        raise ValueError("Invalid ship-only-guard.json repos list")
+    return {MODS_REPO, *(r.lower() for r in repos)}
+
+
 MODS_LANDING = (
-    "PUSH GUARD: blocked: raw hermes-mods PR merges (including auto/API) lack the reviewed landing gate. "
-    "Use `python3 ~/code/hermes-mods/plugins/push-guard/land.py --pr <number> --head <40-hex-sha>` "
+    "PUSH GUARD: blocked: raw PR merges for a reviewed-landing repository (including auto/API) lack the gate. "
+    "Use `python3 ~/code/hermes-mods/plugins/push-guard/land.py --repo <owner/repo> --pr <number> --head <40-hex-sha>` "
     "with independent current-head GitHub approval, or add `--review-task <done-review-card> "
     "--implementation-task <implementation-card>`. It checks required CI (ALL checks when none configured), "
     "independent exact-head review, and merges immediately with a server-side head pin. "
@@ -870,23 +903,23 @@ def _mods_merge_checked(cmd: str, cwd: str, python: bool = False, depth: int = 0
     for d, sel, repo, _ in _gh_merges(cmd, cwd):
         if not repo and not (sel and "/pull/" in sel):
             assigned = re.findall(r"GH_REPO=[\"']?([^\s;\"']+)", cmd)
-            if any(_slug(value) == MODS_REPO for value in [*assigned, os.environ.get("GH_REPO", "")]):
+            if any(_slug(value) in landing_repos() for value in [*assigned, os.environ.get("GH_REPO", "")]):
                 return MODS_LANDING
-        if _merge_repo(d, sel, repo) == MODS_REPO:
+        if _merge_repo(d, sel, repo) in landing_repos():
             return MODS_LANDING
     for _, slug, _, _, _ in _api_merges(cmd, cwd):
-        if slug == MODS_REPO:
+        if slug in landing_repos():
             return MODS_LANDING
     if python and re.search(r"[\"']PUT[\"']|\.put\(", cmd, re.I):
         for url in PY_REST_URL.findall(cmd):
             match = REST_MERGE.match(url)
-            if match and _slug('/'.join(match.groups()[:2])) == MODS_REPO:
+            if match and _slug('/'.join(match.groups()[:2])) in landing_repos():
                 return MODS_LANDING
     if GQL_MERGE.search(cmd) and GQL_CALL.search(cmd):
-        slug = _gql_repo(cmd, [{"remote": MODS_REPO}])
+        slug = _gql_repo(cmd, [{"remote": repo} for repo in sorted(landing_repos())])
         if slug is None:
             return "PUSH GUARD: blocked: cannot identify GraphQL merge target. " + MODS_LANDING
-        if slug == MODS_REPO:
+        if slug in landing_repos():
             return MODS_LANDING
     return None
 

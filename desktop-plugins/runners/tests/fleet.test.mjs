@@ -94,7 +94,7 @@ test('waiting: header counts dispatched cards; rows split placement fit with too
   assert.deepEqual(['waiting', 'ineligible'].map((k) => mini.querySelector(`.hermes-fleet-${k}`).textContent), ['0', '90'])
   // The units are in the column header, once.
   assert.deepEqual([...ui.container.querySelectorAll('.hermes-fleet-cols > span')].map((e) => e.textContent),
-    ['Machine', 'Slots', 'Waiting', "Can't run", 'CPU', 'RAM', 'Disk free', 'Busy', ''])
+    ['Machine', 'Slots', 'Waiting', "Can't run", 'CPU', 'RAM', 'Disk free', 'Tok/slot', 'Busy', ''])
   await ui.close()
   const old = await render(P.merge([{ route, body: fleet(), at: NOW }], NOW))  // older gateway: no count
   assert.doesNotMatch(old.container.textContent, /waiting/)
@@ -420,6 +420,29 @@ test('draining: hover text carries the hold reason, holder and age; the row show
   await ui.close()
 })
 
+test('stopped: a held machine that is off has no row and no slots, only a name in the off line', async () => {
+  const body = fleet()
+  const off = (name) => ({ name, state: 'stopped', reason: 'stopped: held, not seen for 500 min', labels: [], pinned_only: false, slots: 10, slots_source: 'registry', running: [], waiting: 8, ineligible: 3, load: { at: NOW - 500 * 60000, cpu_pct: 18 }, hold_reason: 'shutdown', hold_by: 'admin', hold_owner: 'session:s@hub', hold_at: NOW - 2 * 3600000 })
+  const up = { name: 'worker-1', state: 'active', reason: null, labels: [], pinned_only: false, slots: 10, slots_source: 'registry', running: [] }
+  body.gateways.machines = [up, off('worker-2'), off('worker-5')]
+  const view = P.merge([{ route, body, at: NOW }], NOW)
+  const s = P.summarize(view)
+  assert.equal(s.gSlots, 10)
+  assert.equal(s.workers.slots, 10)
+  const ui = await render(view)
+  try {
+    assert.equal(ui.container.querySelectorAll('.hermes-fleet-row[data-machine="worker-2"], .hermes-fleet-row[data-machine="worker-5"]').length, 0)
+    assert.ok(ui.container.querySelector('.hermes-fleet-row[data-machine="worker-1"]'))
+    const note = ui.container.querySelector('.hermes-fleet-stopped')
+    assert.equal(note.textContent, '2 off: worker-2, worker-5')
+    assert.equal(note.querySelector('[data-machine="worker-5"]').title, 'stopped: shutdown (held by session:s@hub, 2h ago); machine is off (stopped: held, not seen for 500 min)')
+    assert.equal(note.querySelectorAll('.hermes-fleet-slot').length, 0)
+  } finally { await ui.close() }
+  body.gateways.machines = [up]
+  const none = await render(P.merge([{ route, body, at: NOW }], NOW))
+  try { assert.equal(none.container.querySelector('.hermes-fleet-stopped'), null) } finally { await none.close() }
+})
+
 test('draining: hover names the hold_owner card/session, falling back to hold_by', async () => {
   const body = fleet()
   const held = { state: 'draining', reason: 'draining', labels: [], pinned_only: false, slots: 2, slots_source: 'registry', running: [] }
@@ -445,7 +468,7 @@ test('gateway rows: one grid line each in a shared column grid, no Investigate c
   assert.deepEqual(rows.map((r) => r.dataset.machine), ['hub', 'worker-1', 'mini'])
   for (const r of rows) {
     assert.deepEqual([...r.children].map((c) => c.className.split(' ')[0]),
-      ['hermes-fleet-name', 'hermes-fleet-slots', 'hermes-fleet-cell', 'hermes-fleet-cell', 'hermes-fleet-cell', 'hermes-fleet-cell', 'hermes-fleet-cell', 'hermes-fleet-count', 'hermes-fleet-info'])
+      ['hermes-fleet-name', 'hermes-fleet-slots', 'hermes-fleet-cell', 'hermes-fleet-cell', 'hermes-fleet-cell', 'hermes-fleet-cell', 'hermes-fleet-cell', 'hermes-fleet-cell', 'hermes-fleet-count', 'hermes-fleet-info'])  // + Tok/slot
     assert.equal(r.children.length, ui.container.querySelectorAll('.hermes-fleet-cols > span').length, 'one cell per header column')
   }
   // Flags are hover text on the (i): a row with nothing to say keeps an empty, hidden placeholder so columns hold.
@@ -463,4 +486,199 @@ test('gateway rows: one grid line each in a shared column grid, no Investigate c
   assert.match(css, /\n\.hermes-fleet-gw>\.hermes-fleet-row,\.hermes-fleet-cols\{[^}]*grid-template-columns:subgrid[^}]*white-space:nowrap/)
   assert.match(css, /\n\.hermes-fleet-gw>\.hermes-fleet-row>\*\{grid-row:1\}/)
   await ui.close()
+})
+
+test('the chip opens the runners popover, whatever other panels are loaded', async () => {
+  const ctx = ctxWith([fleet(), fleet(), fleet()])
+  const ui = await mount(React.createElement(P.Runners, { ctx }))
+  let shown = 0
+  const onLanes = () => { shown += 1 }
+  window.addEventListener('hermes-show-lanes', onLanes)
+  try {
+    await ui.click(document.querySelector('[data-slot="runners-chip"]'))
+    assert.ok(document.querySelector('[data-machine="worker-1"]'), 'runners popover is open')
+    assert.equal(shown, 0, 'the runners chip never opens the lanes panel')
+  } finally {
+    window.removeEventListener('hermes-show-lanes', onLanes)
+    await ui.close()
+  }
+})
+
+// ── worker lifecycle timeline (gateways.events) ──────────────────────────────────────────────────
+const NOW_S = NOW / 1000
+const H = 3600
+const ev = (hoursAgo, worker, kind, reason = `${kind} reason`) => ({ at: NOW_S - hoursAgo * H, worker, kind, reason, instance: null })
+const withEvents = (events, over = {}) => {
+  const body = fleet()
+  body.gateways = { ...body.gateways, events, events_since: NOW_S - 24 * H, ...over }
+  return P.merge([{ route, body, at: NOW }], NOW)
+}
+const tickEls = (ui) => [...ui.container.querySelectorAll('.hermes-fleet-tl-track > .hermes-fleet-tl-tick')]
+
+test('timeline: one tick per event, four kinds with four distinct colours, each with an accessible label', async () => {
+  const ui = await render(withEvents([
+    ev(20, 'worker-1', 'launched'), ev(15, 'worker-1', 'ready'), ev(10, 'worker-1', 'draining'), ev(5, 'worker-1', 'removed')]))
+  try {
+    const ticks = tickEls(ui)
+    assert.deepEqual(ticks.map((t) => t.dataset.kind), ['launched', 'ready', 'draining', 'removed'])
+    assert.deepEqual(ticks.map((t) => [...t.classList].filter((c) => c.startsWith('is-'))), [['is-launched'], ['is-ready'], ['is-draining'], ['is-removed']])
+    for (const t of ticks) {
+      assert.equal(t.getAttribute('role'), 'img')
+      assert.equal(t.getAttribute('aria-label'), t.title)
+      assert.ok(t.title.includes('worker-1'))
+    }
+    const timeline = ui.container.querySelector('.hermes-fleet-timeline')
+    assert.equal(timeline.getAttribute('role'), 'group')
+    assert.equal(timeline.getAttribute('aria-label'), 'Worker lifecycle, last 24 hours: 4 events')
+    // Under the machine grid, above the "N off" line and the CI section.
+    assert.equal(timeline.previousElementSibling, ui.container.querySelector('.hermes-fleet-gw'))
+  } finally { await ui.close() }
+  // The plugin's stylesheet: yellow launched, green ready, blue draining, red removed.
+  let style
+  const before = new Set(document.head.querySelectorAll('style'))
+  const disposers = []
+  P.default.register({ register() {}, onDispose: (f) => disposers.push(f) })
+  try {
+    style = [...document.head.querySelectorAll('style')].find((s) => !before.has(s)).textContent
+  } finally { disposers.forEach((f) => f()) }
+  const colour = (kind) => style.match(new RegExp(`\\.hermes-fleet-timeline \\.is-${kind}\\{background:(#[0-9a-f]{6})\\}`))[1]
+  const rgb = (hex) => [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16))
+  const hues = Object.fromEntries(Object.keys(P.EVENT_WORDS).map((k) => [k, rgb(colour(k))]))
+  assert.equal(new Set(Object.values(hues).map(String)).size, 4)
+  const [yr, yg, yb] = hues.launched
+  assert.ok(yr > 180 && yg > 140 && yb < 90, 'launched is yellow')
+  assert.ok(hues.ready[1] > hues.ready[0] && hues.ready[1] > hues.ready[2], 'ready is green')
+  assert.ok(hues.draining[2] > hues.draining[0] && hues.draining[2] > hues.draining[1], 'draining is blue')
+  assert.ok(hues.removed[0] > 2 * hues.removed[1] && hues.removed[0] > 2 * hues.removed[2], 'removed is red')
+})
+
+test('timeline: tick position is proportional to time in the last 24 h; events outside it are not drawn', async () => {
+  assert.equal(P.timelineX(NOW - 24 * H * 1000, NOW), 0)
+  assert.equal(P.timelineX(NOW - 6 * H * 1000, NOW), 0.75)
+  assert.equal(P.timelineX(NOW, NOW), 1)
+  assert.equal(P.timelineX(NOW - 24 * H * 1000 - 1, NOW), null)
+  assert.equal(P.timelineX(NOW + 1, NOW), null)
+  const ui = await render(withEvents([
+    ev(25, 'worker-9', 'launched'), ev(24, 'worker-1', 'launched'), ev(18, 'worker-1', 'ready'), ev(12, 'worker-1', 'draining'),
+    ev(0, 'worker-1', 'removed'), ev(-1, 'worker-9', 'ready'),
+    { at: 'soon', worker: 'worker-9', kind: 'ready', reason: 'x' }, { at: NOW_S - H, worker: 'worker-9', kind: 'rebooted', reason: 'x' },
+    { at: NOW_S - H, worker: '', kind: 'ready', reason: 'x' }, null]))
+  try {
+    const ticks = tickEls(ui)
+    assert.ok(ticks.every((t) => t.style.left.endsWith('%')))
+    assert.deepEqual(ticks.map((t) => parseFloat(t.style.left)), [0, 25, 50, 100])  // oldest at the left edge, now at the right
+    assert.ok(ticks.every((t) => t.dataset.worker === 'worker-1'))
+    assert.equal(ui.container.querySelector('.hermes-fleet-timeline').dataset.timeline, '4')
+    // Hour labels: local round hours every 6 h, at their place on the same axis.
+    const labels = [...ui.container.querySelectorAll('.hermes-fleet-tl-axis > span')]
+    const axis = P.timelineAxis(NOW)
+    assert.ok(axis.length >= 3 && axis.length <= 5)
+    assert.deepEqual(labels.map((l) => l.textContent), axis.map((a) => a.label))
+    for (const [i, a] of axis.entries()) {
+      const at = new Date(NOW - (1 - a.x) * 24 * H * 1000)
+      assert.equal(at.getMinutes(), 0)
+      assert.equal(at.getHours() % 6, 0)
+      assert.match(a.label, /^\d\d:00$/)
+      assert.ok(Math.abs(parseFloat(labels[i].style.left) - a.x * 100) < 0.001)
+    }
+  } finally { await ui.close() }
+})
+
+test('timeline: hover text is worker id, what happened in words, the reason and the local time', async () => {
+  const at = NOW_S - 3 * H - 19 * 60
+  const local = new Date(at * 1000)
+  const hhmm = `${String(local.getHours()).padStart(2, '0')}:${String(local.getMinutes()).padStart(2, '0')}`
+  assert.equal(P.clockTime(at * 1000), hhmm)
+  assert.equal(P.eventTip({ at, worker: 'worker-3', kind: 'draining', reason: 'consolidating spare capacity (4 cards finishing)' }),
+    `worker-3 · draining · consolidating spare capacity (4 cards finishing) · ${hhmm}`)
+  assert.equal(P.eventTip({ at, worker: 'worker-3', kind: 'ready', reason: 'bootstrap finished' }), `worker-3 · ready for scheduling · bootstrap finished · ${hhmm}`)
+  assert.equal(P.eventTip({ at, worker: 'worker-3', kind: 'launched', reason: '6 cards waiting' }), `worker-3 · launched · 6 cards waiting · ${hhmm}`)
+  assert.equal(P.eventTip({ at, worker: 'worker-3', kind: 'removed', reason: '' }), `worker-3 · removed · ${hhmm}`)
+  const ui = await render(withEvents([{ at, worker: 'worker-3', kind: 'draining', reason: 'consolidating spare capacity (4 cards finishing)', instance: 'i-0abc' }]))
+  try {
+    const [tick] = tickEls(ui)
+    assert.equal(tick.title, `worker-3 · draining · consolidating spare capacity (4 cards finishing) · ${hhmm}`)
+    assert.equal(tick.getAttribute('aria-label'), tick.title)
+  } finally { await ui.close() }
+})
+
+test('timeline: overlapping workers stack in lanes, one worker stays in one lane, every tick keeps its own place', async () => {
+  const events = [
+    ev(20, 'worker-1', 'launched'), ev(20, 'worker-2', 'launched'), ev(20, 'worker-3', 'launched'),
+    ev(19.98, 'worker-1', 'ready'), ev(19.98, 'worker-2', 'ready'),  // ~1 min later: under the gap
+    ev(8, 'worker-1', 'draining'), ev(8, 'worker-2', 'draining'), ev(2, 'worker-1', 'removed'), ev(1, 'worker-3', 'removed')]
+  const ticks = P.timelineTicks(events, NOW)
+  assert.equal(ticks.length, events.length)
+  const laneOf = (w) => [...new Set(ticks.filter((t) => t.worker === w).map((t) => t.lane))]
+  assert.deepEqual([laneOf('worker-1'), laneOf('worker-2'), laneOf('worker-3')], [[0], [1], [2]])
+  // Same lane: never closer than the gap, the true time kept beside the drawn place.
+  for (const a of ticks) for (const b of ticks) {
+    if (a === b || a.lane !== b.lane) continue
+    assert.ok(Math.abs(a.pos - b.pos) >= P.TIMELINE_GAP - 1e-9, `${a.key} covers ${b.key}`)
+  }
+  const ready = ticks.find((t) => t.worker === 'worker-1' && t.kind === 'ready')
+  const launched = ticks.find((t) => t.worker === 'worker-1' && t.kind === 'launched')
+  assert.ok(Math.abs(ready.pos - (launched.pos + P.TIMELINE_GAP)) < 1e-9 && ready.x < ready.pos)
+  assert.equal(ticks.find((t) => t.kind === 'draining').pos, ticks.find((t) => t.kind === 'draining').x)  // spaced: untouched
+  // Deterministic: the order the events arrive in does not matter.
+  const plain = (list) => list.map(({ key, ...t }) => t)
+  assert.deepEqual(plain(P.timelineTicks([...events].reverse(), NOW)).sort((a, b) => a.at - b.at || a.worker.localeCompare(b.worker)),
+    plain(ticks).sort((a, b) => a.at - b.at || a.worker.localeCompare(b.worker)))
+  assert.deepEqual(P.timelineTicks(events, NOW), ticks)
+  // More simultaneous workers than lanes: at most TIMELINE_LANES lanes, and still no tick on top of another.
+  const crowd = P.timelineTicks(Array.from({ length: 7 }, (_, i) => ev(6, `worker-${i}`, 'launched')), NOW)
+  assert.deepEqual([...new Set(crowd.map((t) => t.lane))].sort(), [0, 1, 2, 3])
+  assert.equal(new Set(crowd.map((t) => `${t.lane}:${t.pos.toFixed(6)}`)).size, 7)
+  // At the right edge the crowd is pulled back inside the axis, not pushed past "now".
+  const edge = P.timelineTicks([ev(0, 'worker-1', 'launched'), ev(0, 'worker-1', 'ready'), ev(0, 'worker-1', 'draining')], NOW)
+  assert.deepEqual(edge.map((t) => +t.pos.toFixed(6)), [1 - 2 * P.TIMELINE_GAP, 1 - P.TIMELINE_GAP, 1].map((v) => +v.toFixed(6)))
+  const ui = await render(withEvents(events))
+  try {
+    const els = tickEls(ui)
+    assert.equal(els.length, events.length)
+    const lane = (w) => [...new Set(els.filter((t) => t.dataset.worker === w).map((t) => t.dataset.lane))]
+    assert.deepEqual([lane('worker-1'), lane('worker-2'), lane('worker-3')], [['0'], ['1'], ['2']])
+    assert.equal(new Set(els.map((t) => t.style.top)).size, 3)
+    assert.equal(new Set(els.map((t) => `${t.style.left}/${t.style.top}`)).size, events.length)
+    assert.equal(ui.container.querySelector('.hermes-fleet-tl-track').dataset.lanes, '3')
+  } finally { await ui.close() }
+})
+
+test('timeline: no events, or an older gateway without the field, draws nothing; with events there is a legend', async () => {
+  for (const view of [
+    P.merge([{ route, body: fleet(), at: NOW }], NOW),                 // older backend: field absent
+    withEvents([]),                                                     // no events
+    withEvents([ev(30, 'worker-1', 'launched')]),                       // none in the window
+    withEvents(null), withEvents('nope')]) {
+    const ui = await render(view)
+    try {
+      assert.equal(ui.container.querySelector('.hermes-fleet-timeline'), null)
+      assert.equal(ui.container.querySelector('[class*="hermes-fleet-tl-"]'), null)
+      assert.doesNotMatch(ui.container.textContent, /ready for scheduling/)
+      assert.ok(ui.container.querySelector('[data-machine="hub"]'))  // the rest of the panel is unaffected
+    } finally { await ui.close() }
+  }
+  const ui = await render(withEvents([ev(3, 'worker-1', 'ready')]))
+  try {
+    const legend = ui.container.querySelector('.hermes-fleet-timeline .hermes-fleet-tl-legend')
+    assert.deepEqual([...legend.children].map((c) => [c.dataset.kind, c.textContent, c.querySelector('i').className]), [
+      ['launched', 'launched', 'hermes-fleet-tl-key is-launched'], ['ready', 'ready for scheduling', 'hermes-fleet-tl-key is-ready'],
+      ['draining', 'draining', 'hermes-fleet-tl-key is-draining'], ['removed', 'removed', 'hermes-fleet-tl-key is-removed']])
+    assert.equal(tickEls(ui).length, 1)  // legend keys are not ticks
+  } finally { await ui.close() }
+})
+
+test('timeline: events come from the gateway that has them, whichever gateway answered last', () => {
+  const hub = fleet()
+  hub.gateways = { ...hub.gateways, events: [ev(2, 'worker-1', 'ready')], events_since: NOW_S - 24 * H }
+  const mac = fleet()
+  mac.gateways = { ...mac.gateways, events: [], events_since: NOW_S - 24 * H + 5 }
+  const other = { ...route, connectionId: 'other' }
+  const view = P.merge([{ route, body: hub, at: NOW - 10000 }, { route: other, body: mac, at: NOW }], NOW)
+  assert.equal(view.gateways.connectionId, 'other')  // the freshest ready section still leads
+  assert.deepEqual(view.gateways.events, hub.gateways.events)
+  assert.equal(view.gateways.events_since, NOW_S - 24 * H)
+  const none = P.merge([{ route: other, body: mac, at: NOW }], NOW)
+  assert.deepEqual(none.gateways.events, [])
+  assert.equal('events' in P.merge([{ route, body: fleet(), at: NOW }], NOW).gateways, false)
 })

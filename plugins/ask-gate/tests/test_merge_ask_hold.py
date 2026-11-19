@@ -140,6 +140,73 @@ def test_hold_is_bounded_then_released(gate, tmp_path):
     assert _events(tmp_path, "merge_ask_released")
 
 
+@pytest.mark.parametrize("why", ["CI is red", "not approved", "someone else"])
+def test_each_limit_releases_independently(gate, why):
+    assert gate.merge_ask.hit({"action": "Merge PR 1", "why_human": why}) is None
+
+
+@pytest.mark.parametrize("why", [
+    "CI is not green: 2 required checks failed at the exact head.",
+    "CI is not green", "CI is not passing", "checks are not green",
+    "checks are not passing", "check is not passing", "checks failed",
+])
+def test_negative_ci_status_releases_hold(gate, why):
+    assert gate._merge_ask_gate("s1", "kanban_block", {
+        "task_id": "t_example", "human_request": {"action": "Merge PR 1", "why_human": why},
+    }) is None
+
+
+@pytest.mark.parametrize("why", ["CI is green", "checks are passing", "checks passed"])
+def test_successful_ci_still_holds(gate, why):
+    assert gate.merge_ask.hit({"action": "Merge PR 1", "why_human": why}) is not None
+
+
+def test_merge_in_unblock_tail_is_not_the_ask(gate):
+    assert gate.merge_ask.hit({"action": "Approve the budget. Unblock = merge PR 1"}) is None
+
+
+def test_input_question_is_not_merge_approval(gate):
+    assert gate.merge_ask.action_request_hit({
+        "kind": "input", "title": "Which merge strategy for PR 1?",
+    }) is None
+
+
+def test_action_request_reads_limit_in_plan(gate):
+    assert gate.merge_ask.action_request_hit({
+        "kind": "approval", "title": "Merge PR 1", "scope": {"markdown": "CI is red"},
+    }) is None
+
+
+def test_human_request_reads_limit_in_scope(gate):
+    assert gate.merge_ask.hit({"action": "Merge PR 1", "scope": "CI is red"}) is None
+
+
+def test_merged_pr_deployment_confirmation_is_not_merge_ask(gate):
+    assert gate.merge_ask.hit({"action": "Confirm the merged PR 1 is deployed"}) is None
+
+
+def test_blocked_create_is_held(gate):
+    result = gate._merge_ask_gate("s1", "kanban_create", {
+        "initial_status": "blocked", "title": "Land change", "human_request": BLOCK_REQUEST,
+    })
+    assert result and result["action"] == "block"
+    assert "merge_ask_hold" in result["message"]
+
+
+def test_cards_have_independent_hold_budgets(gate):
+    for card in ("t_1111111111111111", "t_2222222222222222"):
+        args = {"task_id": card, "human_request": BLOCK_REQUEST}
+        for _ in range(gate.merge_ask.MAX_HOLDS):
+            result = gate._merge_ask_gate("s1", "kanban_block", args)
+            assert result and "merge_ask_hold" in result["message"]
+        assert gate._merge_ask_gate("s1", "kanban_block", args) is None
+
+
+# Mutation A7 (dropping the withdraw skip) is equivalent for valid tool inputs:
+# action_request rejects request + withdraw together upstream. Do not fabricate
+# that invalid combination merely to kill the defensive-branch mutation.
+
+
 def test_gate_error_fails_open(gate, tmp_path, monkeypatch):
     def broken(_request):
         raise RuntimeError("regex exploded")

@@ -200,6 +200,15 @@ AUTH_EXC_RE = re.compile(r"(?:^|\.)(AuthenticationError|PermissionDeniedError)$"
 STATUS_RE = re.compile(r"Error code: (\d{3})\b")
 PROVIDER_MSG_RE = re.compile(r"""['"]message['"]:\s*['"]([^'"]*)['"]""")
 AUTH_STORM_N, AUTH_STORM_S = 3, 600
+# A hub-minted (relay) row's token is revoked by every hub refresh; core's relay re-pull (credential_relay_repull.py)
+# answers that 401 by pulling and adopting the pushed token, logged at INFO in agent.log (agent-f9f6ed4f38, 2026-11-18:
+# a MacBook woke 55 min after its last pull and 3 resuming sessions each took one, all designed recovery). So a
+# revoked 401 counts toward the storm only once RELAY_SETTLE_S (core's 120 s repull_wait_s plus the pull) has passed
+# with no adoption in its own session. A re-pull that found no token is the real ~2 min stall: its WARNING files.
+RELAY_LOGGER = "run_agent"
+RELAY_ADOPTED_RE = re.compile(r"^OAuth relay: adopted the pushed token for pool entry \S+ after [\d.]+s$")
+RELAY_STALL_RE = re.compile(r"^OAuth relay: no new token for pool entry \S+ within (\d+)s of a revoked 401$")
+RELAY_SETTLE_S = 150
 # The guard warnings core commit e0a5909348 added around 401 recovery. They carry no traceback, so the traceback
 # path never saw them; "persists after N refreshes" and "moved off pool entry" are the detection-level signal that
 # the pinned-account 401 loop came back. Pool entry ids are left out of the fingerprint (one defect, any entry).
@@ -348,6 +357,32 @@ def read_new(path: Path, cur: dict, key: str, now: float, span: Optional[list] =
     return lines
 
 
+def read_relay_lines(path: Path, cur: dict, key: str, now: float) -> List[str]:
+    """Recover the previous inode's unread .1 tail before reading the active log.
+
+    Keep this relay-only: read_new callers with byte spans need a single-file range.
+    Each file retains the MAX_READ tail cap; older rotations are not backfilled.
+    """
+    lines = []
+    c = cur.get(key) or {}
+    try:
+        if c.get("ino") is not None and path.stat().st_ino != c["ino"]:
+            with path.with_name(path.name + ".1").open("rb") as f:
+                st = os.fstat(f.fileno())  # verify the opened file, not a racy path stat
+                off = int(c.get("off") or 0)
+                if st.st_ino == c["ino"] and 0 <= off <= st.st_size:
+                    start = max(off, st.st_size - MAX_READ)
+                    f.seek(start)
+                    data = f.read(st.st_size - start)
+                    end = data.rfind(b"\n") + 1
+                    lines = data[:end].decode("utf-8", "replace").splitlines()
+                    if start > off and lines:
+                        lines = lines[1:]  # cap may start mid-record
+    except OSError:
+        pass  # missing/unreadable .1 must not prevent reading the current log
+    return lines + read_new(path, cur, key, now)
+
+
 def seed_only_first_sight(path: Path, cur: dict, key: str) -> bool:
     """For logs whose lines carry no timestamp: on first sight (no cursor for `key`) set the cursor at the end of
     `path` and return True, so the caller files nothing. A backlog read on first sight (new host, new profile,
@@ -411,6 +446,13 @@ def _provider_of(exc_type: str, msg: str = "") -> str:
 # looked like the earlier offline case "came back"). Matched on the innermost frame AND that source line, so any
 # other exception raised inside execute still files.
 SESSION_CRON_REWRAP_SRC = "raise RuntimeError(result[3]"
+# cron/scheduler.py `_apply_monitor_gate` logs a failed monitor source as one ERROR with no exc_info; the message is
+# the script's output, so a traceback in it is the monitor script's (a sleeping laptop's DNS failure, a 502), quoted.
+# The same tick is re-logged by the gateway (SESSION_CRON_REWRAP_SRC) and booked on the job (last_error_kind="gate"),
+# so the cron lane files it once its failure streak holds (agent-95944cb790: both records filed one daily alarm).
+# MONITOR_SOURCE_FAILED_SRC is core's exact call; test_monitor_source_failed_line_matches_core pins it.
+MONITOR_SOURCE_FAILED_SRC = "logger.error(\"Job '%s': monitor source failed: %s\", job_id, _mon.error)"
+MONITOR_SOURCE_FAILED_RE = re.compile(r"^Job '[^']+': monitor source failed: ")
 
 
 def _session_cron_rewrap(block: List[str], frames: list, exc_type: str) -> bool:
@@ -481,6 +523,11 @@ def parse_errors(lines: List[str], reconnects: Optional[list] = None, auth: Opti
             recs.append(cur)
         elif cur is not None:
             cur["cont"].append(ln)
+    return _classify_error_records(recs, reconnects, auth, host, prof)
+
+
+def _classify_error_records(recs, reconnects=None, auth=None, host="", prof="default"):
+    """Shared classifier for collection and deferred single-record replay."""
     held = _cron_held_failures(recs)
     lease_lines: dict = {}  # session -> its latest selection_lease_missing record (agent-235b66c443)
     left_pool: dict = {}  # (session, entry id) -> when core logged that entry left the pool (agent-47adfc1ed2)
@@ -503,7 +550,7 @@ def parse_errors(lines: List[str], reconnects: Optional[list] = None, auth: Opti
         if (stalled and r["level"] == "ERROR"
                 and r["logger"] == "hermes_plugins.slack_workspace.follow"):
             eid, fingerprint, count, rc = stalled.groups()
-            out.append({"kind": "errors", "component": "plugin", "at": r["at"],
+            out.append({"recheck": errors_recheck(r, host=host, prof=prof), "kind": "errors", "component": "plugin", "at": r["at"],
                         "session_id": r["sid"], "profile": prof,
                         "symptom": f"Slack follower {eid} stalled: {count} identical failures rc={rc}; backing off",
                         "details": home_tilde("\n".join([r["msg"]] + r["cont"]))[:1500],
@@ -519,12 +566,20 @@ def parse_errors(lines: List[str], reconnects: Optional[list] = None, auth: Opti
                         "details": home_tilde(r["msg"])[:1500],
                         "fp": fp("plugin", "hook", hook, cb, re.sub(r"\d+", "N", exc))})
             continue
+        stall = RELAY_STALL_RE.match(r["msg"]) if r["logger"] == RELAY_LOGGER else None
+        if stall:
+            out.append({"recheck": errors_recheck(r, host=host, prof=prof), "kind": "errors", "component": "agent", "at": r["at"], "session_id": r["sid"],
+                        "symptom": f"relay re-pull found no new token on {host or 'this host'}: a revoked "
+                                   f"hub-minted row stalled the turn {stall.group(1)}s",
+                        "details": home_tilde(f"{r['level']} {r['logger']}: {r['msg']}")[:1500],
+                        "fp": fp("agent", "relay-repull-stall")})
+            continue
         guard = next(((k, m) for k, rx in GUARD_RES for m in [rx.search(r["msg"])] if m), None)
         if guard:
             gkind, gm = guard
             prov = ((gm.group(1) or "").lower() if gkind == "moved-off-entry" and gm.group(1)
                     else _provider_of("", r["msg"]))
-            out.append({"kind": "errors", "component": "agent", "at": r["at"], "session_id": r["sid"],
+            out.append({"recheck": errors_recheck(r, host=host, prof=prof), "kind": "errors", "component": "agent", "at": r["at"], "session_id": r["sid"],
                         "symptom": f"credential guard {gkind} ({prov}): {r['msg'][:160]}",
                         "details": home_tilde("\n".join([f"{r['level']} {r['logger']}: {r['msg']}"]
                                                         + r["cont"]))[:1500],
@@ -533,7 +588,7 @@ def parse_errors(lines: List[str], reconnects: Optional[list] = None, auth: Opti
         am = ATTENTION_RE.match(r["msg"])
         if am:
             key, hours, attempts = am.groups()
-            out.append({"kind": "errors", "component": "gateway", "at": r["at"], "session_id": "",
+            out.append({"recheck": errors_recheck(r, host=host, prof=prof), "kind": "errors", "component": "gateway", "at": r["at"], "session_id": "",
                         "symptom": f"{key} NEEDS_ATTENTION on {host or 'this host'} ({prof}): failing/reconnecting "
                                    f"continuously for {hours} hours ({attempts} attempts)",
                         "details": home_tilde(f"{r['level']} {r['logger']}: {r['msg']}")[:1500],
@@ -542,7 +597,7 @@ def parse_errors(lines: List[str], reconnects: Optional[list] = None, auth: Opti
         bm = ADMISSION_BUSY_RE.match(r["msg"])
         if bm:
             what, secs = bm.groups()
-            out.append({"kind": "errors", "component": "agent", "at": r["at"], "session_id": r["sid"],
+            out.append({"recheck": errors_recheck(r, host=host, prof=prof), "kind": "errors", "component": "agent", "at": r["at"], "session_id": r["sid"],
                         "symptom": f"{what} refused: update admission lock busy for {secs}s with no update hold "
                                    f"on {host or 'this host'} ({prof})",
                         "details": home_tilde(f"{r['level']} {r['logger']}: {r['msg']}")[:1500],
@@ -551,7 +606,7 @@ def parse_errors(lines: List[str], reconnects: Optional[list] = None, auth: Opti
         qm = QUOTA_NOT_HELD_RE.match(r["msg"]) if r["logger"] == "cron.scheduler" else None
         if qm:
             job, exc_name = qm.groups()
-            out.append({"kind": "errors", "component": "cron", "at": r["at"], "session_id": r["sid"],
+            out.append({"recheck": errors_recheck(r, host=host, prof=prof), "kind": "errors", "component": "cron", "at": r["at"], "session_id": r["sid"],
                         "symptom": f"cron quota failure not held on {host or 'this host'} ({prof}): {exc_name} "
                                    f"maps to no hold, so job '{job}' re-fires into a closed provider window",
                         "details": home_tilde(f"{r['level']} {r['logger']}: {r['msg']}")[:1500],
@@ -559,7 +614,7 @@ def parse_errors(lines: List[str], reconnects: Optional[list] = None, auth: Opti
             continue
         dns = PROVIDER_DNS_RE.fullmatch(r["msg"])
         if dns and r["level"] == "ERROR" and OWN_LOGGER_RE.match(r["logger"]):
-            out.append({"kind": "errors", "component": "agent", "at": r["at"], "session_id": r["sid"],
+            out.append({"recheck": errors_recheck(r, host=host, prof=prof), "kind": "errors", "component": "agent", "at": r["at"], "session_id": r["sid"],
                         "symptom": f"provider host does not resolve while network is up: {dns.group(1)}",
                         "details": home_tilde(f"{r['level']} {r['logger']}: {r['msg']}")[:1500],
                         "fp": fp("agent", "provider-dns", dns.group(1))})
@@ -569,7 +624,7 @@ def parse_errors(lines: List[str], reconnects: Optional[list] = None, auth: Opti
                 and not NONRETRYABLE_PROVIDER_RE.match(nr.group(1))):
             why = nr.group(1).strip()
             ctx = [lease_lines[r["sid"]]] if r["sid"] and r["sid"] in lease_lines else []
-            out.append({"kind": "errors", "component": "agent", "at": r["at"], "session_id": r["sid"],
+            out.append({"recheck": errors_recheck(r, host=host, prof=prof), "kind": "errors", "component": "agent", "at": r["at"], "session_id": r["sid"],
                         "symptom": f"turn failed on a Hermes refusal: {why[:160]}",
                         "details": home_tilde("\n".join(ctx + [f"{r['level']} {r['logger']}: {r['msg']}"]
                                                         + r["cont"]))[:1500],
@@ -577,8 +632,25 @@ def parse_errors(lines: List[str], reconnects: Optional[list] = None, auth: Opti
             continue
         if not any(l.startswith("Traceback (most recent call last)") for l in r["cont"]):
             continue
+        if r["logger"] == "cron.scheduler" and MONITOR_SOURCE_FAILED_RE.match(r["msg"]):
+            continue  # the cron job's own source failure, its stderr quoted: the cron lane files a failing streak
         # the last exception of the printed chain; a traceback quoted inside a message is message text
-        start = _chain_heads(r["cont"])[-1]
+        heads = _chain_heads(r["cont"])
+        owner = _quote_owner(r["cont"], heads)
+        if owner is not None:
+            # A quoted CHAINED stderr puts separators inside the message, so its headers look like chain members
+            # (agent-95944cb790: google-auth's `raise new_exc from caught_exc` in a cron monitor's stderr filed as
+            # "TransportError in __call__"). When the quoting member is the gateway's cron re-raise, the rest is
+            # that script's stderr (core logs that RuntimeError unwrapped): the cron lane files it. Any other quoting
+            # member keeps the last header, so a real outer exception (`raise X from exc`) still files.
+            ob = r["cont"][owner:next((h for h in heads if h > owner), len(r["cont"]))]
+            oe = _traceback_end(ob, 0)
+            otb = ob if oe is None else ob[:oe]
+            oframes = [FRAME_RE.match(l).groups() for l in otb if FRAME_RE.match(l)]
+            om = EXC_RE.match(ob[oe]) if oe is not None else None
+            if _session_cron_rewrap(otb, oframes, (om.group(1) if om else "") or "Exception"):
+                continue  # the cron run's own failure, re-raised by the gateway: the cron lane files it
+        start = heads[-1]
         block = r["cont"][start:]
         ei = _traceback_end(block, 0)
         tb = block if ei is None else block[:ei]
@@ -622,12 +694,12 @@ def parse_errors(lines: List[str], reconnects: Optional[list] = None, auth: Opti
             tag = f"{status or 'auth'} {reason}"
             sym = (f"{exc_type.split('.')[-1]} [{tag}] in {where}" + (f" [{plug}]" if plug else "")
                    + f": {r['msg'][:90]}")
-            out.append({"kind": "errors", "component": comp, "at": r["at"], "session_id": r["sid"], "symptom": sym,
+            out.append({"recheck": errors_recheck(r, host=host, prof=prof), "kind": "errors", "component": comp, "at": r["at"], "session_id": r["sid"], "symptom": sym,
                         "details": details[-1500:],
                         "fp": fp(comp, "tb", exc_type, tag, *[f"{a}:{b}" for a, b in inner])})
             continue
         sym = f"{exc_type.split('.')[-1]} in {where}" + (f" [{plug}]" if plug else "") + f": {r['msg'][:90]}"
-        out.append({"kind": "errors", "component": comp, "at": r["at"], "session_id": r["sid"], "symptom": sym,
+        out.append({"recheck": errors_recheck(r, host=host, prof=prof), "kind": "errors", "component": comp, "at": r["at"], "session_id": r["sid"], "symptom": sym,
                     "details": details[-1500:],
                     "fp": fp(comp, "tb", exc_type, *_reason_code(exc_line), *_git_step(r["msg"]),
                           *[f"{a}:{b}" for a, b in inner])})
@@ -666,44 +738,77 @@ def reconnect_storms(cur: dict, prof: str, recs: List[dict], now: float, host: s
     return out
 
 
-def auth_storms(cur: dict, recs: List[dict], now: float, host: str) -> List[dict]:
+def _relay_pending(e: dict) -> bool:
+    return e.get("reason") == "revoked" and e.get("status") == "401"
+
+
+def auth_storms(cur: dict, recs: List[dict], now: float, host: str,
+                adopted: Optional[List[dict]] = None) -> List[dict]:
     """Keep this host's recent stream 401/403s in the cursor (a storm spans passes); AUTH_STORM_N of them within
     AUTH_STORM_S files one auth-failure storm. The fingerprint carries provider, status and reason classes, so a
-    revoked-token storm and an expired-token storm are different defects."""
+    revoked-token storm and an expired-token storm are different defects. A revoked 401 that core's relay re-pull
+    answered (an `adopted` record in the same session within RELAY_SETTLE_S) is recovered and never counts; one with
+    no adoption yet counts only after RELAY_SETTLE_S, so the adoption may land in a later pass."""
     st = cur.get("auth") or {}
-    evs = [e for e in st.get("ev") or [] if e.get("at", 0) >= now - BACKFILL_S]
     filed = float(st.get("filed") or 0)
-    out = []
-    for r in sorted((r for r in recs if r["at"] >= now - BACKFILL_S), key=lambda r: r["at"]):
-        evs = [e for e in evs if e["at"] > r["at"] - AUTH_STORM_S] + [
-            {k: r[k] for k in ("at", "sid", "status", "reason", "provider")}]
-        if len(evs) >= AUTH_STORM_N and filed <= r["at"] - AUTH_STORM_S:
-            filed = r["at"]
-            reasons = ",".join(sorted({e["reason"] for e in evs}))
-            statuses = ",".join(sorted({e["status"] for e in evs}))
-            provs = ",".join(sorted({e["provider"] for e in evs}))
-            sids = ", ".join(sorted({e["sid"] for e in evs if e["sid"]}))
-            out.append({"kind": "errors", "component": "agent", "at": r["at"], "session_id": r["sid"],
-                        "profile": r.get("profile") or "default",
-                        "symptom": f"auth-failure storm on {host or 'this host'}: {len(evs)} {provs} {statuses} "
+    keep = now - AUTH_STORM_S - RELAY_SETTLE_S
+    # Match against every adoption read (newly read backfill too: a first or delayed sweep reads hour-old 401s and
+    # their adoptions together); prune only what is persisted. A retained event is newer than `keep`, so any
+    # adoption that can still clear it is newer than `keep` as well.
+    ad = [a for a in (st.get("adopt") or []) + list(adopted or []) if a.get("sid") and a.get("at")]
+    evs = [e for e in st.get("ev") or [] if e.get("at", 0) >= now - BACKFILL_S]
+    evs += [{k: r.get(k) for k in ("at", "sid", "status", "reason", "provider", "profile", "details")}
+            for r in recs if r["at"] >= now - BACKFILL_S]
+    evs = [e for e in evs if e["at"] > filed and not (
+        _relay_pending(e) and e.get("sid")
+        and any(a["sid"] == e["sid"] and e["at"] <= a["at"] <= e["at"] + RELAY_SETTLE_S for a in ad))]
+    evs.sort(key=lambda e: e["at"])
+    out, win = [], []
+    for e in evs:
+        if _relay_pending(e) and now < e["at"] + RELAY_SETTLE_S:
+            continue  # its re-pull may still adopt; judged on a later pass
+        win = [x for x in win if x["at"] > e["at"] - AUTH_STORM_S] + [e]
+        if len(win) >= AUTH_STORM_N and filed <= e["at"] - AUTH_STORM_S:
+            filed = e["at"]
+            reasons = ",".join(sorted({x["reason"] for x in win}))
+            statuses = ",".join(sorted({x["status"] for x in win}))
+            provs = ",".join(sorted({x["provider"] for x in win}))
+            sids = ", ".join(sorted({x["sid"] for x in win if x["sid"]}))
+            out.append({"kind": "errors", "component": "agent", "at": e["at"], "session_id": e["sid"],
+                        "profile": e.get("profile") or "default",
+                        "symptom": f"auth-failure storm on {host or 'this host'}: {len(win)} {provs} {statuses} "
                                    f"({reasons}) stream errors in {AUTH_STORM_S // 60} min",
-                        "details": (f"{len(evs)} provider {statuses} errors ({reasons}) logged as 'Streaming failed "
+                        "details": (f"{len(win)} provider {statuses} errors ({reasons}) logged as 'Streaming failed "
                                     f"before delivery' within {AUTH_STORM_S // 60} min; one alone is handled by the "
                                     f"retry loop's refresh/rotation. Sessions: {sids}\nLatest:\n"
-                                    f"{r['details']}")[:1500],
+                                    f"{e.get('details') or ''}")[:1500],
                         "fp": fp("agent", "auth-storm", provs, statuses, reasons)})
-            evs = []
-    evs = [e for e in evs if e["at"] > now - AUTH_STORM_S]
+            win = []
+    evs = [e for e in evs if e["at"] > max(filed, keep)]
+    ad = [a for a in ad if a["at"] > keep]
     if evs or filed > now - AUTH_STORM_S:
-        cur["auth"] = {"ev": evs, "filed": filed}
+        cur["auth"] = {"ev": evs, "filed": filed, **({"adopt": ad} if ad else {})}
     else:
         cur.pop("auth", None)
+    return out
+
+
+def relay_adoptions(lines: List[str]) -> List[dict]:
+    """core's `OAuth relay: adopted the pushed token ...` INFO records (agent.log) -> [{"at", "sid"}]."""
+    out = []
+    for ln in lines:
+        if "OAuth relay: adopted" not in ln:
+            continue
+        m = REC_RE.match(ln)
+        if m and m.group(3) and m.group(4) == RELAY_LOGGER and RELAY_ADOPTED_RE.match(m.group(5)):
+            out.append({"at": _ts(m.group(1)), "sid": m.group(3)})
     return out
 
 
 def collect_errors(home: Path, cur: dict, now: float, host: str = "") -> List[dict]:
     out = []
     auth: List[dict] = []
+    adopted: List[dict] = []
     for prof, h in homes(home):
         lines = read_new(h / "logs" / "errors.log", cur, f"errors:{prof}", now)
         recs: List[dict] = []
@@ -713,8 +818,9 @@ def collect_errors(home: Path, cur: dict, now: float, host: str = "") -> List[di
                 s["profile"] = prof
                 out.append(s)
         auth += [dict(a, profile=prof) for a in prof_auth]
+        adopted += relay_adoptions(read_relay_lines(h / "logs" / "agent.log", cur, f"relay:{prof}", now))
         out += reconnect_storms(cur, prof, recs, now, host)
-    out += auth_storms(cur, auth, now, host)
+    out += auth_storms(cur, auth, now, host, adopted)
     return out
 
 
@@ -878,7 +984,10 @@ def _chain_heads(blk: List[str], skip=()) -> List[int]:
     the first header, and each one whose nearest non-blank line above is CPython's chain separator. Any other
     header sits inside an exception message (a child's stderr quoted by `RuntimeError(stderr)`), so it is message
     text, not the exception that was raised (agent-2dc9a44cfa: a cron script's HTTPError quoted in the gateway's
-    re-raise defeated _session_cron_rewrap). Headers at indexes in `skip` are ignored."""
+    re-raise defeated _session_cron_rewrap). A quoted stderr can hold its own chain, separators included, and a
+    separator after quoted text can as well start a real outer exception (`raise LookupError(..) from exc`): the
+    text cannot tell them apart, so such headers count as chain members here and `_quote_owner` names the member
+    whose message holds the quote. Headers at indexes in `skip` are ignored."""
     heads = []
     for i, l in enumerate(blk):
         if i in skip or not l.startswith("Traceback (most recent call last)"):
@@ -887,6 +996,16 @@ def _chain_heads(blk: List[str], skip=()) -> List[int]:
         if not heads or CHAIN_SEP_RE.match(prev):
             heads.append(i)
     return heads
+
+
+def _quote_owner(blk: List[str], heads: List[int], skip=()) -> Optional[int]:
+    """The chain head whose exception message quotes a traceback (the last head before the first header that is
+    not a chain head), or None when nothing in `blk` is quoted."""
+    q = next((i for i, l in enumerate(blk) if i not in skip and i not in heads
+              and l.startswith("Traceback (most recent call last)")), None)
+    if q is None:
+        return None
+    return max((h for h in heads if h < q), default=None)
 
 
 def parse_worker_crashes(lines: List[str]) -> List[dict]:
@@ -923,7 +1042,9 @@ def parse_worker_crashes(lines: List[str]) -> List[dict]:
                 or provider_5xx(exc, blk[ei], _exc_body(blk[tbs[-1]:ei + 1 + EXC_BODY_LINES], blk[ei]))):
             continue
         body = [l for k, l in enumerate(blk[ei + 1:ei + 1 + EXC_BODY_LINES], ei + 1) if k not in noise]
-        crash = {"pid": pid, "exc": exc, "msg": msg, "block": blk[tbs[-1]:ei + 1] + body}
+        crash = {"pid": pid, "exc": exc, "msg": msg, "block": blk[tbs[-1]:ei + 1] + body,
+                 "recheck": errors_recheck({"logger": "managed-worker", "msg": "", "cont": blk,
+                                            "level": "ERROR", "at": 0, "sid": ""}, worker=True)}
         if pid in stamps:
             crash["t"], crash["core"] = stamps[pid]
         out.append(crash)
@@ -975,7 +1096,8 @@ def worker_storms(cur: dict, crashes: List[dict], now: float, host: str) -> List
                                       f"{span_s // 60} min (logs/managed-worker.log). pids: "
                                       f"{', '.join(pids)}\n{when}{_span_note(c)}"
                                       f"Latest (pid {c['pid']}):\n{tb}")[:1500],
-                    "fp": fp("kanban", "worker-storm", c["exc"], norm)})
+                    "fp": fp("kanban", "worker-storm", c["exc"], norm),
+                    **({"recheck": c["recheck"]} if "recheck" in c else {})})
     if evs or filed:
         cur["worker_storm"] = {"ev": evs[-200:], "filed": filed}
     else:
@@ -1516,13 +1638,15 @@ HANDOFF_GRACE_S = 15 * 60  # a nudge waits this long for its reply_nudge_outcome
 NUDGE_OPEN_S = 3 * 3600
 NUDGE_DELIVERY = ("reply_nudge_delivered", "reply_nudge_undelivered", "reply_nudge_abandoned")
 NUDGE_OUTCOME = ("reply_nudge_outcome", "nudge_outcome_lost", "nudge_outcome_subagent", "nudge_outcome_untracked",
-                 "nudge_outcome_missing", "nudge_outcome_unconfirmed", "nudge_outcome_unjudged")
+                 "nudge_outcome_missing", "nudge_outcome_unconfirmed", "nudge_outcome_unjudged",
+                 "nudge_outcome_peer_mail")
 # report_only outcome verdicts that may file (reply_check.STRONG_REPORT_ONLY_SRC; a test pins the match).
 STRONG_REPORT_ONLY_SRC = ("confirm", "closed_owner", "unverified_owner")
 # reply_check rules whose nudges get a reply_nudge_outcome (same as reply_check.RULES; a test pins the match).
 OUTCOME_RULES = ("handoff", "confirm", "unverified", "unwatched", "report_only", "status_only", "denied_ask",
                  "credit_ask", "laptop_job", "skipped_live", "merge_forecast", "pr_state_claim", "future_clock",
-                 "claimed_mutation", "restart_scope_claim")
+                 "claimed_mutation", "restart_scope_claim", "deploy_claim", "setting_claim", "quota_claim",
+                 "hold_lift_forecast")
 # The backend identity core.Store.log stamps on each reply_nudge (agent-a8d0c8c1ed); see backend_gone.
 BACKEND_KEYS = ("pid", "host", "proc_start")
 NUDGE_WHAT = {"handoff": "agent handed the user a step it could do itself"}
@@ -1603,7 +1727,9 @@ def _handoff_signal(r: dict, why: str) -> dict:
             "symptom": symptom,
             "details": (details + (f"; revised reply: {reply}" if reply else ""))[:1500],
             "fp": (fp("agent", rule, r.get("session_id") or "", key) if key is not None
-                   else fp("agent", rule, r.get("session_id") or ""))}
+                   else fp("agent", rule, r.get("session_id") or "")),
+            **({"recheck": {**r["recheck"], "fingerprint": fp("agent", rule, r.get("session_id") or "", key)}}
+               if key is not None and rule == "pr_state_claim" and isinstance(r.get("recheck"), dict) else {})}
 
 
 def unjudged_outcome(o: dict) -> str:
@@ -1778,6 +1904,18 @@ def subagent_session(home: Path, n: dict) -> bool:
     return False
 
 
+# agent-df378b15af: a hermes-mail peer turn's reply goes back to the requesting agent (reply_check.peer_mail_turn), so
+# its report_only/status_only nudges are no user-facing defect either. The nudge record keeps the ask's first 40
+# chars (`ask_head`, whitespace-collapsed), which carry the envelope's opening; other rules still file.
+PEER_MAIL_HEAD = "[PEER MESSAGE from "
+PEER_MAIL_EXEMPT_RULES = ("report_only", "status_only")  # = reply_check.SUBAGENT_EXEMPT_RULES (a test pins it)
+
+
+def peer_mail_nudge(n: dict) -> bool:
+    return (str(n.get("rule") or "") in PEER_MAIL_EXEMPT_RULES
+            and str(n.get("ask_head") or "").lstrip().startswith(PEER_MAIL_HEAD))
+
+
 # Core's failed-turn boundary rows (agent/turn_failure_copy.py): the Hermes-authored assistant row closing a turn that
 # died with no reply, typed messages.display_kind='failed_turn' (older rows untyped: exact text, as core's own
 # untyped_failed_turn_display_kind reads them). agent-c46bf512ae: a nudged turn died on one and filed as ignored.
@@ -1919,7 +2057,8 @@ NOTICE_JUDGING_RULES = {"report_only"}
 # and close-out turns are where real PR forecasts cluster (agent-372c9408b8). Static copy for a broken reply_check;
 # tests keep it equal to the live set.
 _REPLY_ONLY_FALLBACK = frozenset({"denied_ask", "credit_ask", "laptop_job", "skipped_live", "merge_forecast",
-                                  "pr_state_claim", "future_clock", "claimed_mutation", "restart_scope_claim"})
+                                  "pr_state_claim", "future_clock", "claimed_mutation", "restart_scope_claim",
+                                  "deploy_claim", "setting_claim", "quota_claim", "hold_lift_forecast"})
 _RELAY_HEAD = "[message from another hermes session"
 _rc_mod = None
 
@@ -2008,10 +2147,59 @@ def _cron_failure_exempt(r: dict) -> Optional[str]:
     return None
 
 
+ERROR_RECHECK_LINES = 128
+ERROR_RECHECK_CHARS = 65536
+
+
+def errors_recheck(r: dict, host: str = "", prof: str = "default", worker: bool = False) -> dict:
+    """Retain bounded classifier input, never trust a clipped record to prove absence."""
+    cont, remaining = [], ERROR_RECHECK_CHARS
+    for line in r["cont"][:ERROR_RECHECK_LINES]:
+        cont.append(line[:remaining])
+        remaining -= len(cont[-1])
+        if remaining == 0:
+            break
+    result = {"kind": "errors_record", "logger": r["logger"][:256], "msg": r["msg"][:8192],
+              "cont": cont, "level": r["level"], "at": r["at"], "sid": r["sid"][:256],
+              "host": host[:256], "profile": prof[:256], "worker": worker}
+    result["truncated"] = (cont != r["cont"] or result["msg"] != r["msg"]
+                           or result["logger"] != r["logger"] or result["sid"] != r["sid"]
+                           or result["host"] != host or result["profile"] != prof)
+    return result
+
+
+def _errors_record_exempt(r: dict) -> Optional[str]:
+    """Re-run the actual classifier; incomplete/malformed evidence cannot withdraw a defect."""
+    import math
+    try:
+        if r.get("truncated", False) is not False or type(r.get("worker", False)) is not bool:
+            return None
+        for key, cap in (("logger", 256), ("msg", 8192), ("sid", 256), ("host", 256), ("profile", 256)):
+            if not isinstance(r.get(key), str) or len(r[key]) > cap:
+                return None
+        if not r["logger"] or r.get("level") not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
+            return None
+        if type(r.get("at")) not in (int, float) or not math.isfinite(r["at"]):
+            return None
+        cont = r.get("cont")
+        if (not isinstance(cont, list) or len(cont) > ERROR_RECHECK_LINES
+                or any(not isinstance(line, str) for line in cont)
+                or sum(map(len, cont)) > ERROR_RECHECK_CHARS):
+            return None
+        if r.get("worker", False):
+            found = parse_worker_crashes([f"[pid 1] {line}" for line in cont])
+        else:
+            found = _classify_error_records([r], host=r["host"], prof=r["profile"])
+        return None if found else "error record no longer fires (current classifier)"
+    except Exception:  # malformed/unknown evidence must fail open to filing
+        return None
+
+
 # Detector re-checks for deferred signals (t_01a1d5815b28b08b): a signal carries {"kind": <key>, ...} as "recheck";
 # self_heal.retry_deferred calls recheck_exempts before filing and withdraws the row when the detector, on the code
 # running now, would not fire. A new detector kind adds its collector's own skip predicate here.
 RECHECKS: Dict[str, Callable[[dict], Optional[str]]] = {
+    "errors_record": _errors_record_exempt,
     "template_hold": lambda r: _template_hold_exempt(str(r.get("rule") or ""), str(r.get("head") or "")),
     "cron_failure": _cron_failure_exempt,
     "held_wall": lambda r: (f"held wall: {str(r.get('line') or '')[-120:]} (a pin's designed short-wall hold)"
@@ -2022,6 +2210,8 @@ RECHECKS: Dict[str, Callable[[dict], Optional[str]]] = {
 
 def recheck_exempts(recheck: dict) -> Optional[str]:
     """Why the detector named by recheck["kind"] would not fire now, or None (fires, or unknown kind: fail open)."""
+    if recheck.get("kind") == "coach_outcome":
+        return _outcome_recheck_module().exempts(recheck)
     fn = RECHECKS.get(str((recheck or {}).get("kind") or ""))
     return fn(recheck) if fn else None
 
@@ -2037,11 +2227,23 @@ _CRON_DETAILS_RE = re.compile(r"^(?:\(seen \d+x this pass\)\n)?job \S+ \(([^\n]*
                               r" filed: [^\n]*\nscript=[^\n]*\n")
 
 
+def _outcome_recheck_module():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("_coach_outcome_recheck", SELF_DIR / "outcome_recheck.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def defect_recheck(d: dict) -> Optional[dict]:
     """The recheck of a self-heal defect: its own field, else (rows deferred before the field existed) one rebuilt from a
     template-hold symptom or cron failure details, trusted only when it reproduces the row's fingerprint."""
     if isinstance(d.get("recheck"), dict):
+        if d["recheck"].get("kind") == "coach_outcome" and d["recheck"].get("fingerprint") != d.get("fingerprint"):
+            return None
         return d["recheck"]
+    if "coach pr_state_claim check:" in str(d.get("symptom") or ""):
+        return _outcome_recheck_module().legacy(d, _handoff_signal, _ro)
     m = _TEMPLATE_SYMPTOM_RE.match(str(d.get("symptom") or ""))
     if m and fp("agent", "template-hold", m.group(1), m.group(2).lower()) == d.get("fingerprint"):
         return template_recheck(m.group(1), m.group(2))
@@ -2281,14 +2483,19 @@ def collect_coach(home: Path, cur: dict, now: float, host: str = "") -> List[dic
                         "fp": fp("agent", "fixloop", r.get("session_id") or "", issue[:80])})
         elif r.get("event") == "reply_nudge" and rule in OUTCOME_RULES and (rule == "handoff" or r.get("outcome")):
             pending.append({**{k: r.get(k) for k in ("session_id", "rule", "p", "evidence", "draft_id", "platform",
-                                                     "nudge_id", "item_ids") + BACKEND_KEYS},
+                                                     "nudge_id", "item_ids", "ask_head") + BACKEND_KEYS},
                             "ts": at})
         elif r.get("event") == "reply_nudge_outcome" and rule in OUTCOME_RULES:
             n = next((n for n in pending if _outcome_matches(n, r)), None)
             if n is None:
                 continue
             pending.remove(n)
-            if r.get("resolved") is not True and subagent_session(home, n):
+            if r.get("resolved") is not True and peer_mail_nudge(n):
+                _coach_log(home, {"ts": now, "event": "nudge_outcome_peer_mail", "session_id": n.get("session_id") or "",
+                                  "rule": rule, "nudge_ts": n.get("ts"), "draft_id": n.get("draft_id"),
+                                  **_nid(n)})
+                _mark(opened, n, "o")
+            elif r.get("resolved") is not True and subagent_session(home, n):
                 _coach_log(home, {"ts": now, "event": "nudge_outcome_subagent", "session_id": n.get("session_id") or "",
                                   "rule": rule, "nudge_ts": n.get("ts"), "draft_id": n.get("draft_id"),
                                   **_nid(n)})
@@ -2321,7 +2528,11 @@ def collect_coach(home: Path, cur: dict, now: float, host: str = "") -> List[dic
             elif r.get("resolved") is not True:  # only an explicit "resolved" clears it
                 still = "still handed off" if rule == "handoff" else f"still failed {rule}"
                 why = f"the revised reply {still} (outcome p={r.get('p')})"
-                rec = {**n, "reply": r.get("reply") or "",
+                replay = r.get("recheck")
+                if (not isinstance(replay, dict) or replay.get("nudge_id") != n.get("nudge_id")
+                        or replay.get("session_id") != r.get("session_id")):
+                    replay = None
+                rec = {**n, "reply": r.get("reply") or "", "recheck": replay,
                        # a judged failure names its own item; resolved=None carries a status text, not an item
                        "outcome_evidence": str(r.get("evidence") or "") if r.get("resolved") is False else "",
                        # ...but whatever resolved is, its words reach the signal (agent-614ed52ae7)
@@ -2341,6 +2552,12 @@ def collect_coach(home: Path, cur: dict, now: float, host: str = "") -> List[dic
     keep = []
     for n in pending:
         if now - float(n.get("ts") or 0) > HANDOFF_GRACE_S:
+            if peer_mail_nudge(n):
+                _coach_log(home, {"ts": now, "event": "nudge_outcome_peer_mail", "reason": "no_outcome",
+                                  "session_id": n.get("session_id") or "", "rule": n.get("rule"),
+                                  "nudge_ts": n.get("ts"), "draft_id": n.get("draft_id"), **_nid(n)})
+                _mark(opened, n, "o")
+                continue
             if subagent_session(home, n):
                 # agent-ee1b1162bc: a subagent's report to its parent agent is not a user-facing defect (any rule)
                 _coach_log(home, {"ts": now, "event": "nudge_outcome_subagent", "reason": "no_outcome",

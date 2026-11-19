@@ -24,6 +24,26 @@ closing answer. Core already delivers completion notices into unloaded chats (th
 | Watchdog (every 15 min, one process) | Kanban card (default board, assignee `default`, idempotency key = the incident flag key, so one card per incident) + `WARNING` log line for a chat with unseen kanban results > 30 min, a settled batch with no close-out > 30 min, or a row **stuck** for 24 h: nothing it waits on is found and still working by status (`core.is_working`: readable, not settled, not done/archived), and at least one entry is unresolved (`core.is_unresolved`: missing, unknown or stale, or done/archived yet unable to settle, e.g. an origin row without its binding or an owner that never attested the close), so no close-out can ever run (key `chat-closeout:stuck:<chat>:<first seen>`, one card per row episode; wall age >= 24 h plus 30 min of this process's monotonic observation, so a lid sleep alone never files it and a backend restart does not postpone it a day; a row whose entries are all found and settled, e.g. covered human asks, is resting, not stuck; an entry whose unlink clock (`core.track_unlinked`, below) is still advancing (not removed, last observed within 2 x `UNLINK_MAX_GAP_S`) is owned by the automatic unlink and is not counted, since that clock counts only healthy observed time and a sleeping laptop's wall clock passes 24 h first; a clock that stopped advancing, an uncertain entry or one with no clock still counts, and a stopped clock starts a new stuck episode; `tests/test_stuck_watchdog.py`). Age needs both the persisted wall stamp and 30 min of this process's monotonic observation, so a lid sleep never fakes a stuck pipeline. The flag is recorded only after the card is filed; after 3 failed filings for one key it logs one `ERROR` and stops retrying until the condition changes (`tests/test_watchdog_real_card.py` runs the real default route against a temp board). When a flagged incident's condition clears (unseen count 0, `done_sig` matched / `settled_sig` actually changed / ledger row or chat gone, a stuck row with a found working entry or an emptied batch, a handoff delivery receipt, or the ask failure episode changed), the next tick closes its own card: unblocks it if blocked, claims and completes it with a summary naming the key, the first observed-clear time (persisted across restarts) and the evidence; a card with a live run gets one comment and is retried next tick. Then the flag is cleared, so a recurrence files a new card. Card text names agent routes (cross_session send, the close-out waker), never "resume the chat" (`tests/test_watchdog_resolution.py`). Agent-fixable state never goes to the Inbox, which refuses poster `chat-closeout`. Each tick reads the remote inventory once for all pending rows (`tests/test_waiting_source.py`). A **deleted** chat (a Hermes-format chat id that every state.db reads cleanly without; e.g. a worker's throwaway live-test chat) is never flagged: its notices can never be handed over, so the waker drops its ledger row and the watchdog skips its unseen/no-close-out conditions. An unreadable store or a non-local id is unknown, never deleted (`tests/test_deleted_chat.py`, `tests/test_deleted_chat_watchdog.py`). |
 | Host lease (`run_pass`, every 30 s tick) | One process per Hermes home holds core `hermes_cli.host_loop_lease` `chat-closeout` (gateway > Desktop serve > dashboard) and runs the host pass: the full ledger scan (reconcile, close-out wakes, ask relays), owner wake and the watchdog's candidate scan, with `lease.beat()` per pass. Every other backend runs a residual pass: only the ledger rows of chats live in it (core `kanban_unloaded.live_session_ids`, read by key via `Ledger.pending_for`; nothing is read when none is pending), since only that backend can start their turns. A holder wake refused because the chat is live elsewhere does not hold that residual pass off (`claim(over_foreign_refusal=True)`; a process's own refusal still backs off), and a refused owner wake is posted to `owner-wake.db` `relays` for the residual pass of the process holding the chat (`take_relays`: CAS, expires with the claim TTL; a busy relayed wake drops the relay and releases its claims, so the next host pass re-checks the card is still due). The holder's host pass treats its own live chats the same way (retries them over a refusal another process recorded, takes relays posted for them), so a lease handoff does not wait out the old holder's 600 s backoff. A plugin unload (`ctx.on_unload`) or a reload that stops the old waker thread releases that module's lease at once, instead of leaving it to core's watchdog (~90 s). Older core (no lease module), the lease kill switch, or unreadable live ids: every process runs the full pass, as before (`tests/test_host_lease.py`). The watchdog's `Ledger.lease("watchdog")` posting gate stays. |
 
+## Host row invalidation
+
+The full host pass filters stable rows **before** constructing the union card reader. Coverage-checked
+per-task board/shadow cursors retain unchanged tails across sibling writes; unknown coverage, schema/file
+replacement and cursor regression fall back to the broad content key. A row's key includes its normalized
+ledger input, own transcript lineage and effective unseen count, own-tail replica/board/shadow inputs,
+global inventory-health and freshness verdicts, scope, origin ledger, live-owner membership and the existing
+floor bucket. Quiet/not-due rows reuse their verdict only until their own deadline. Active unlink rows run
+only the existing durable observation-clock update; a removal or other non-clock fix re-reads that row.
+Whole-host shortcuts include those clock siblings even when another row needed judgment. Injected and
+residual passes neither adopt nor invalidate full-host memos. No threshold or clock representation changes.
+Replica input keys for the full host and its rows share one tick-local snapshot: scope freshness and metadata
+verdicts are evaluated once, while each row retains its own task/owner digest. The portable key values, freshness
+boundaries and invalidation rules are unchanged; this does not introduce a cross-tick cache or TTL.
+
+`tests/test_host_siblings.py` exercises sibling card/transcript/ledger/unseen changes, individual deadlines,
+shared inventory-health transitions and residual isolation. `bench/idle_host_bench.py --sibling-churn`
+compares per-tick ledger digests and wakes with simultaneous sibling-card and transcript activity; synthetic
+CPU numbers are not live idle-CPU evidence.
+
 ## Reader lifetime
 
 Board and shadow structural reads borrow core's process-wide `cached_ro` connection exclusively when
@@ -156,7 +176,13 @@ one close-out; a batch with cards still working waits for its own. The mention i
 close-out turn whose last assistant message is a successful final reply (text, no tool calls, `finish_reason`
 stop/end_turn, the transcript ack rule); a failed wake, or a briefed turn that failed, keeps it, and a failed turn
 retries after a shared 600 s backoff subject to the existing hourly wake cap; failure never acknowledges delivery. A found entry
-forgets its missing time (`tests/test_unlink.py`, `tests/test_contract_edges.py`).
+forgets its missing time (`tests/test_unlink.py`, `tests/test_contract_edges.py`). A successful close-out retires the
+entries it named (ledger `retired`): a card archived on its owner without completion is never republished, yet core
+keeps listing its last stale row among the chat's open cards, so a later turn end would put it back in the batch and
+start a new 24 h clock and a new close-out every day. A retired entry the chat still lists stays out while it is
+missing, stale, uncertain or finished without settling; a fresh, resolvable row (the owner published it again) is
+work again and rejoins; a tombstone the chat no longer lists is dropped. Any other card a turn hands work to joins
+the batch as before (`tests/test_unlink_retired.py`).
 
 A missing four-part `gateway/profile/board/id` additionally requires a fresh full Board shadow
 (`kanban/sync-shadow/<board>.db`, matching board identity and `pulled_at` within 120 seconds).

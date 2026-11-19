@@ -106,6 +106,24 @@ def test_same_draft_rechecked_is_not_a_continuation(coach):
     assert d == []
 
 
+def test_pr_outcome_captures_complete_replay_inputs(coach, monkeypatch):
+    monkeypatch.setenv("COACH_REPLY_RULES", "pr_state_claim")
+    c, hooks, events = coach
+    hooks["pre_llm_call"](session_id="pr-replay", user_message="What is the PR status?")
+    _nudge(hooks, "pr-replay", text="PR #1851 is still open.")
+    hooks["post_tool_call"](session_id="pr-replay", tool_name="terminal",
+                            args={"command": "gh pr view 1851 --json state"},
+                            result={"exit_code": 0, "output": "OPEN"})
+    revised = "Context. " * 45 + "PR #1851 is still open."
+    hooks["pre_verify"](session_id="pr-replay", platform="cli", attempt=1,
+                        final_response=revised, changed_paths=[])
+    [outcome] = events("reply_nudge_outcome")
+    assert outcome["recheck"]["reply"] == revised
+    assert outcome["recheck"]["complete"] is True
+    assert outcome["recheck"]["nudge_id"] == outcome["nudge_id"]
+    assert outcome["recheck"]["tool_log"] == c.turn_context("pr-replay")[1]
+
+
 def test_notice_supersedes_the_continuation(coach):
     """A notice turn starts before the continuation is checked, and that turn never reaches pre_verify."""
     _c, hooks, events = coach

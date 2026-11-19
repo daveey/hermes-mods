@@ -69,6 +69,13 @@ class Kpi(unittest.TestCase):
         r = ro.compute([turn(1), turn(2)], {"t1": lab("report_only")})
         self.assertEqual(r["all"], {"n": 1, "report_only": 1, "rate": 1.0})
 
+    def test_an_unstarted_no_go_plan_counts_as_report_only(self):
+        # agent-7abafd6255: "the next step is X. That is agent work, not another approval needed from you." then stop
+        r = ro.compute([turn(1), turn(2), turn(3)], {"t1": lab("planned"), "t2": lab("proposed"), "t3": lab("fixed")})
+        self.assertEqual(r["all"]["report_only"], 1)
+        self.assertEqual(ro.parse_labels('[{"id":"t1","outcome":"planned"}]', {"t1"}), {"t1": {"id": "t1", "outcome": "planned"}})
+        self.assertIn('"planned"', ro.RUBRIC)
+
     def test_verdict_against_targets(self):
         over = {"human-question": {"n": 20, "report_only": 3, "rate": 0.15}, "event": {"n": 20, "report_only": 4, "rate": 0.2}}
         self.assertEqual(ro.verdict(over), {"human-question": "OVER TARGET", "event": "ok"})

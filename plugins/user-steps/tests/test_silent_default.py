@@ -7,6 +7,8 @@ import importlib.util
 import logging
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location('silent_default_core', ROOT / 'core.py')
 core = importlib.util.module_from_spec(spec)
@@ -81,6 +83,42 @@ def test_optional_offer_default_clause_span_not_minted():
         assert core.validate([step], _offer_reply(sentence), []) == [], sentence
 
 
+@pytest.mark.parametrize('invitation', [
+    'say if you prefer a higher one.',
+    'say so if you prefer a higher one.',
+    "say if you'd rather have a higher one.",
+    'say if you would rather have a higher one.',
+])
+def test_unlabelled_say_if_default_only_span_not_minted(invitation, caplog):
+    # No Optional label or tell-me branch may mask the say-if branch. Cite only
+    # the default: a whole-sentence span would be independently rejected by _NOT_ASK.
+    span = "I'll keep the old cap"
+    reply = f'{span}; {invitation}'
+    step = {'text': 'Approve the cap', 'kind': 'approve', 'verbatim_span': span, 'options': []}
+    dropped = []
+    with caplog.at_level(logging.INFO, logger='user-steps'):
+        assert core.validate([step], reply, [], dropped) == []
+    assert dropped == ['silent_default: Approve the cap']
+    assert any('silent_default_suppressed' in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize('blocking', [
+    'Should I raise the cap?',
+    'Reply yes or no.',
+])
+def test_unlabelled_say_if_default_only_span_with_blocking_ask_still_mints(blocking):
+    # Keep the exact same default-only candidate; a blocking ask in its paragraph
+    # must override silent-default suppression rather than dropping every such span.
+    span = "I'll keep the old cap"
+    reply = f'{span}; say if you prefer a higher one. {blocking}'
+    step = {'text': 'Approve the cap', 'kind': 'approve', 'verbatim_span': span, 'options': []}
+    dropped = []
+    accepted = core.validate([step], reply, [], dropped)
+    assert len(accepted) == 1
+    assert accepted[0]['verbatim_span'] == span
+    assert dropped == []
+
+
 def test_optional_offer_regex_path_not_minted():
     for sentence in OPTIONAL_OFFERS:
         for smart in (False, True):
@@ -113,6 +151,34 @@ def test_blocking_asks_still_mint_on_both_paths():
         assert len(core.validate([step], reply, [])) == 1, sentence
         if regex_covers:
             assert len(core.regex_steps(reply)) >= 1, sentence
+
+
+@pytest.mark.parametrize('sentence', (
+    "Optional: I'll keep the old cap.",
+    "Optional: I’ll keep the old cap.",
+    "- Optional: I will keep the old cap.",
+))
+def test_optional_label_alone_suppresses_llm_candidate(sentence):
+    # No objection invitation: only the Optional-labelled default branch applies.
+    # This is an LLM candidate-validation case, not a regex-fallback extraction claim.
+    step = {'text': 'Approve the cap', 'kind': 'approve',
+            'verbatim_span': sentence, 'options': []}
+    dropped = []
+    assert core.validate([step], _offer_reply(sentence), [], dropped) == []
+    assert dropped and dropped[0].startswith('silent_default')
+
+
+@pytest.mark.parametrize('question', (
+    'Should I also cap retries?',
+    'Reply yes or no.',
+))
+def test_optional_label_default_with_blocking_ask_retains_llm_candidate(question):
+    sentence = f"Optional: I'll keep the old cap. {question}"
+    step = {'text': 'Approve the cap', 'kind': 'approve',
+            'verbatim_span': sentence, 'options': []}
+    kept = core.validate([step], _offer_reply(sentence), [])
+    assert len(kept) == 1
+    assert kept[0]['kind'] == 'approve'
 
 
 def test_optional_offer_with_explicit_question_still_mints():

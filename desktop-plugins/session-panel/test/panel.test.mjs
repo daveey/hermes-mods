@@ -590,3 +590,38 @@ test('warmRecent: one failing source never stops the pass; the recent list is ca
   assert.equal(done.length, m.WARM_RECENT, 'every recent chat attempted despite failures')
   delete document.hidden
 })
+
+test('a closed remote card whose owner never confirmed it is listed as reported, not as waiting', () => {
+  const rep = (id, reported, extra = {}) => card(id, 'unknown', { gateway: 'worker-5', reported, boardStatus: { state: 'unknown', readAt: NOW, source: 'replica' }, ...extra })
+  const chips = [rep('t_d', 'done'), rep('t_a', 'archived'), rep('t_ask', 'done', { look: 'needs-you' }), rep('t_stale', 'done', { stale: true }), card('t_u', 'unknown', { boardStatus: { state: 'unknown', readAt: NOW, source: 'replica' } }), card('t_park', 'scheduled', { look: 'waiting', waitingOn: 'a timer' })]
+  const out = m.classify(chips, { nowMs: NOW })
+  const ids = list => list.map(i => i.key)
+  assert.deepEqual(ids(out.reported), ['kb:t_d', 'kb:t_a', 'kb:t_ask'])
+  assert.equal(out.reported[0].detail, 'reported done by worker-5 · not confirmed by its owner')
+  assert.equal(out.reported[1].detail, 'reported archived by worker-5 · not confirmed by its owner')
+  assert.deepEqual(ids(out.waiting), ['kb:t_stale', 'kb:t_u', 'kb:t_park'], 'a stale read or a card with no report stays status unknown under Waiting')
+  assert.deepEqual(out.unasked, [], 'a card its owner reports closed asks nothing')
+  assert.equal(m.counts(out).waiting, 3)
+  assert.equal(m.counts(out, { done: 0 }).done, 0, 'a reported card is never counted as done')
+  assert.equal(m.annotateEvidence(out, NOW), 0, 'reported rows are not counted as evidence unknown')
+  assert.equal(m.hasOpenWork({ ...m.classify([rep('t_d', 'done')], { nowMs: NOW }) }), true, 'an unconfirmed card keeps the panel shown')
+})
+
+test('reported cards render collapsed under their own count and expand on click', async () => {
+  window.localStorage.clear()
+  m.resetDoneCacheForTests()
+  host.state.focusedStoredSessionId.value = 'reported-A'
+  window.__userSteps = { openAskCount: () => 0 }
+  const rep = id => card(id, 'unknown', { gateway: 'worker-5', reported: 'done', boardStatus: { state: 'unknown', readAt: Date.now(), source: 'replica' } })
+  window.__sessionTasks = { snapshot: { stored: 'reported-A', chips: [rep('t_1'), rep('t_2')] }, lineageIds: async s => new Set([s]) }
+  await show(J.jsx(m.Panel, {}))
+  assert.equal(el().querySelector('[data-section="waiting"]'), null)
+  assert.match(el().querySelector('[data-status-summary]').textContent, /2 reported finished, unconfirmed/)
+  assert.doesNotMatch(el().textContent, /status unknown|evidence unknown/)
+  const button = el().querySelector('[data-reported-toggle]')
+  assert.equal(button.textContent, '2 reported finished, not confirmed')
+  assert.equal(el().querySelectorAll('[data-reported-cards] [data-panel-row]').length, 0)
+  await React.act(async () => { button.click(); await flush() })
+  assert.equal(el().querySelectorAll('[data-reported-cards] [data-panel-row]').length, 2)
+  assert.match(el().querySelector('[data-reported-cards]').textContent, /reported done by worker-5 · not confirmed by its owner/)
+})

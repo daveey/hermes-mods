@@ -25,6 +25,27 @@ def free_port():
     return port
 
 
+def free_ports(count):
+    """Return `count` distinct free ports.
+
+    Separate free_port() calls close their socket before the next bind, so the
+    kernel may hand back the same ephemeral port twice. Holding every socket
+    open until all are bound makes the ports distinct.
+    """
+    socks = []
+    try:
+        for _ in range(count):
+            sock = socket.socket()
+            socks.append(sock)
+            sock.bind(('127.0.0.1', 0))
+        ports = [sock.getsockname()[1] for sock in socks]
+    finally:
+        for sock in socks:
+            sock.close()
+    assert not set(ports) & {9333, 9334}
+    return ports
+
+
 def _log_tail(handle, limit=800):
     handle.flush()
     try:

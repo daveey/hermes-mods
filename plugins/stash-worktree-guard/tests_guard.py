@@ -37,8 +37,14 @@ def _load(name, file):
 plugin = _load("stash_worktree_guard_plugin", "__init__.py")
 guard = plugin.guard
 
+# The restore proofs run real bash, so they must not depend on how the suite was started. Debian/Ubuntu bash
+# (built with SSH_SOURCE_BASHRC), started with SSH_CLIENT set and no SHLVL, takes itself for a shell run by sshd:
+# it sources ~/.bashrc and returns before reading BASH_ENV. The pre-push gate run over ssh on hermes-hub
+# (2026-11-17) reached the BASH_ENV proof in exactly that state, so `git stash pop` restored in main, not wt,
+# and the case failed on every run there while passing in cards, CI and direct test-all runs.
+_SSHD_MARKERS = ("SSH_CLIENT", "SSH2_CLIENT")
 GIT_ENV = {
-    **os.environ,
+    **{k: v for k, v in os.environ.items() if k not in _SSHD_MARKERS},
     "GIT_AUTHOR_NAME": "t",
     "GIT_AUTHOR_EMAIL": "t@example.com",
     "GIT_COMMITTER_NAME": "t",

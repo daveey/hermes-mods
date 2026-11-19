@@ -21,7 +21,7 @@ log = logging.getLogger("coach")
 # Nudge record events (see build(): one delivery and one outcome record per reply_nudge, by nudge_id).
 _DELIVERY_EVENTS = ("reply_nudge_delivered", "reply_nudge_undelivered", "reply_nudge_abandoned")
 _OUTCOME_EVENTS = ("reply_nudge_outcome", "nudge_outcome_lost", "nudge_outcome_subagent", "nudge_outcome_untracked",
-                   "nudge_outcome_missing")
+                   "nudge_outcome_missing", "nudge_outcome_peer_mail")
 # signals.collect_coach may close a nudge from HANDOFF_GRACE_S (15 min) on; an in-process close of a nudge older than
 # this first checks the log for that record, so a nudge never gets two.
 _NUDGE_LATE_S = 14 * 60
@@ -255,7 +255,9 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             coach.check_empty_wait(session_id, tool_name, args, result)
             coach.check_cleanup_sweeper(session_id, tool_name, args, result)
             coach.check_metric_split(session_id, tool_name, args)
+            coach.check_card_claim(session_id, tool_name, args)
             coach.check_search_cap(session_id, tool_name, args, result)
+            coach.check_gated_dispatch(session_id, tool_name, args, result)
             hint = coach.take(session_id) if isinstance(result, str) else None
             return rules.attach_hint(result, hint) if hint else None
         except Exception as exc:
@@ -478,6 +480,8 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
 
     # session -> this user turn's long_wait_pending_reply record (long_wait.py; self-heal agent-f1f8b24e9d)
     wait_turns: dict = shared.setdefault("long_wait_turns", {})
+    # (session, job) whose kill scheduled_kill already held once (scheduled_kill.py; self-heal agent-d483b8fda1)
+    sched_kill_held: set = shared.setdefault("scheduled_kill_held", set())
 
     def _wait_turn(session_id, user_message, platform="", parent_session_id=""):
         try:
@@ -488,6 +492,12 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
         except Exception as exc:
             wait_turns.pop(session_id, None)  # unknown turn: the rule stays quiet
             log.debug("coach long_wait turn: %s", exc)
+            return
+        try:  # stop/answer demand or plain question: answer before more tool work (answer_first.py)
+            _load("answer_first").arm(wait_turns, session_id, rules.request_text(user_message),
+                                      wait_turns[session_id]["live"])
+        except Exception as exc:
+            log.debug("coach answer_first turn: %s", exc)
 
     def on_interim_message(session_id="", text="", **_):
         coach.hint_report(session_id, text)
@@ -512,6 +522,14 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                 return {"action": "block", "message": steer.MESSAGE}
         except Exception as exc:
             log.debug("coach steer_receipt_guard: %s", exc)
+        try:  # the live user said stop/answer, or a question has waited too long (answer_first.py)
+            msg = _load("answer_first").check(wait_turns, session_id, tool_name, args, store.log,
+                                              persisted_reply=_load("long_wait").persisted_reply)
+        except Exception as exc:
+            log.debug("coach answer_first: %s", exc)
+            msg = None
+        if msg:
+            return {"action": "block", "message": msg}
         msg = _future_clock(session_id, tool_name, args)
         if msg:
             return {"action": "block", "message": msg}
@@ -522,6 +540,13 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             msg = msg or lw.check_stale(wait_turns, session_id, tool_name, args, store.log)
         except Exception as exc:
             log.debug("coach long_wait: %s", exc)
+            msg = None
+        if msg:
+            return {"action": "block", "message": msg}
+        try:  # first kill of a job still sleeping toward its scheduled run (scheduled_kill.py; agent-d483b8fda1)
+            msg = _load("scheduled_kill").check(sched_kill_held, session_id, tool_name, args, store.log)
+        except Exception as exc:
+            log.debug("coach scheduled_kill: %s", exc)
             msg = None
         if msg:
             return {"action": "block", "message": msg}
@@ -1117,7 +1142,9 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
             only = list(cfg["rules"]) + (["unverified"] if repos and "unverified" not in cfg["rules"] else [])
             # agent-ee1b1162bc: a subagent reports to its parent agent, whose own final reply is judged; report_only
             # (incl. unverified_owner) and status_only don't hold the child. Its other rules still run.
-            sub = platform == "subagent" or rc.is_subagent(session_id)
+            # agent-df378b15af: a hermes-mail peer turn's reply goes back to the requesting agent the same way.
+            peer = rc.peer_mail_turn(ask)
+            sub = platform == "subagent" or rc.is_subagent(session_id) or peer
             if sub:
                 only = [r for r in only if r not in rc.SUBAGENT_EXEMPT_RULES]
             if not only:
@@ -1194,7 +1221,8 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                 store.log({"event": "reply_checked", "session_id": session_id, "platform": platform,
                            "candidates": rc.prefilter(final_response, log_lines), "ask_len": len(ask or ""),
                            **({"elapsed_s": _el} if _el is not None else {}),
-                           **({"guard": guard} if guard else {}), **({"subagent": True} if sub else {}),
+                           **({"guard": guard} if guard else {}),
+                           **({"peer_mail": True} if peer else {"subagent": True} if sub else {}),
                            **({"park": _park} if guard == "lifecycle_park" and (_park := rc.run_end_tool(log_lines))
                               else {})})
                 return None
@@ -1317,6 +1345,9 @@ def build(store=None, checkout=None, selfheal_sync=False, selfheal_llm=None, sel
                 out_ids = []
             _log_outcome(session_id, n, "reply_nudge_outcome", p=res["p"], resolved=res["resolved"],
                          judged=res["judged"], evidence=res["evidence"], reply=(final_response or "")[:300],
+                         **({"recheck": _load("outcome_recheck").capture(n.get("nudge_id"), session_id,
+                                                                      final_response, log_lines)}
+                            if rule == "pr_state_claim" else {}),
                          **({"item_ids": out_ids} if out_ids else {}),
                          **({"asks": res["asks"]} if "asks" in res else {}),
                          **({"src": res["src"]} if "src" in res else {}),

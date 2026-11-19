@@ -177,11 +177,15 @@ class WallClockShim(FakeShim):
         try:
             if seconds is not None:
                 time.sleep(seconds * SCALE)
-            done = 0.0
+            # Meter the elapsed time, not the requested TICK: a host whose short sleeps overshoot (macOS
+            # timer slack, ~0.5 ms of 2 ms) would otherwise stretch every METER by a quarter (t_01a1e13f02725e97).
+            done, last = 0.0, time.monotonic()
             while done < work:
                 time.sleep(TICK)
                 with self.lock:
-                    done += TICK / SCALE / self.active
+                    now = time.monotonic()
+                    done += (now - last) / SCALE / self.active
+                    last = now
         finally:
             with self.lock:
                 self.active -= 1

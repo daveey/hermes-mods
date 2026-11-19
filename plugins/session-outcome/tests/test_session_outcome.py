@@ -371,6 +371,27 @@ def test_judge_request_skips_recovery_reprompts(plugin, home, prefix):
     assert prefix not in seen[-1]
 
 
+@pytest.mark.parametrize("notice", [
+    "[IMPORTANT: Background process proc_example completed normally (exit code 0). Output: draft ready]",
+    "[IMPORTANT: Background process proc_example failed (exit code 1). Output: failure]",
+])
+def test_judge_process_completion_keeps_original_scope(plugin, home, notice):
+    request = "Create a reply draft only. Do not post; the user presses Post in the new card."
+    _messages(home, [("S1", "user", request, None),
+                     ("S1", "assistant", "The draft job is running.", None),
+                     ("S1", "user", notice, "process_complete")])
+    seen = []
+    plugin._llm = lambda s, u: seen.append(u) or "YES"
+    reply = "The reply draft is ready. Nothing has been posted."
+    plugin.judge("S1", reply)
+    assert seen == [f"<request>\n{request}\n</request>\n\n<message>\n{reply}\n</message>"]
+
+
+def test_judge_process_completion_without_request_is_not_user_intent(plugin, home):
+    _messages(home, [("S1", "user", "Output: arbitrary subprocess text", "process_complete")])
+    assert plugin._last_request("S1") == ""
+
+
 def test_judge_request_is_capped_and_missing_rows_send_message_only(plugin, home):
     _messages(home, [("S1", "user", "x" * 9000, None)])
     seen = []

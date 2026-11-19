@@ -26,6 +26,7 @@ def _load(name, file):
 
 plugin = _load("sqlite_live_guard_plugin", "__init__.py")
 swap_db = _load("sqlite_live_guard_swap", "swap_db.py")
+_REAL_PROBE = plugin.guard.program_sqlite_version
 
 
 @pytest.fixture(autouse=True)
@@ -34,6 +35,8 @@ def _home(monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", "/home/u")
     monkeypatch.delenv("HERMES_HOME", raising=False)
     monkeypatch.setenv("HERMES_SQLITE_GUARD_LOG", str(tmp_path / "guard.log"))  # never the real log
+    # The host's own sqlite3/python3 builds must not decide these tests (macOS /usr/bin/sqlite3 is 3.51.0, affected).
+    monkeypatch.setattr(plugin.guard, "program_sqlite_version", lambda word, kind: None)
 
 
 def blocked(tool, **args):
@@ -884,3 +887,128 @@ def test_keyword_named_variable_run_refused_at_hook(shape):
 def test_keyword_words_in_quotes_stay_allowed_at_hook(shape):
     command = shape.format(c="rm -f ~/.hermes/state.db")
     assert plugin._pre_tool_call(tool_name="terminal", args={"command": command}) is None, command
+
+
+# ---- 2026-11-18: SQLite build of the program that opens a live database
+# The hub's state.db search index was found damaged while a process on SQLite 3.45.1 (WAL-reset bug) held it next
+# to Hermes on 3.53.1. Agents' sqlite3 CLI is /usr/bin/sqlite3: 3.45.1 on Ubuntu 24.04, 3.51.0 on macOS.
+
+@pytest.fixture
+def versions(monkeypatch):
+    table = {}
+    monkeypatch.setattr(plugin.guard, "program_sqlite_version", lambda word, kind: table.get((os.path.basename(word), kind)))
+    return table
+
+
+@pytest.mark.parametrize("version,affected", [
+    ((3, 6, 23), False), ((3, 7, 0), True), ((3, 44, 5), True), ((3, 44, 6), False), ((3, 45, 1), True),
+    ((3, 50, 6), True), ((3, 50, 7), False), ((3, 51, 0), True), ((3, 51, 3), False), ((3, 53, 1), False),
+])
+def test_wal_reset_rule_matches_core(version, affected):
+    assert plugin.guard.wal_reset_vulnerable(version) is affected
+
+
+@pytest.mark.parametrize("cmd", [
+    "sqlite3 ~/.hermes/state.db 'select count(*) from messages'",
+    "sqlite3 -readonly ~/.hermes/state.db 'select 1'",
+    "nice sqlite3 -readonly $HOME/.hermes/kanban.db 'select id from tasks limit 1'",
+    "/usr/bin/sqlite3 /home/u/.hermes/profiles/alpha/state.db .tables",
+    "sqlite3 'file:/home/u/.hermes/state.db?mode=ro' 'select 1'",
+    "python3 -c \"import sqlite3; print(sqlite3.connect('/home/u/.hermes/state.db').execute('select 1').fetchone())\"",
+    "python3 -m sqlite3 ~/.hermes/state.db 'select 1'",
+])
+def test_affected_build_may_not_open_a_live_database(versions, cmd):
+    versions.update({("sqlite3", "cli"): (3, 45, 1), ("python3", "python"): (3, 45, 1)})
+    why = plugin.guard.check_shell(cmd)
+    assert why and plugin.guard.WAL_RESET_MARK in why and "hermes-core-python -m sqlite3" in why
+    assert "WAL-reset" in plugin.guard.message(why)
+
+
+@pytest.mark.parametrize("cmd", [
+    "sqlite3 ~/.hermes/state.db 'select count(*) from messages'",
+    "python3 -m sqlite3 ~/.hermes/state.db 'select 1'",
+    "python3 -c \"import sqlite3; sqlite3.connect('/home/u/.hermes/state.db')\"",
+])
+def test_fixed_build_reads_as_before(versions, cmd):
+    versions.update({("sqlite3", "cli"): (3, 54, 0), ("python3", "python"): (3, 53, 1)})
+    assert plugin.guard.check_shell(cmd) is None
+
+
+def test_unknown_build_does_not_block_and_other_files_are_not_judged(versions):
+    assert plugin.guard.check_shell("sqlite3 ~/.hermes/state.db 'select 1'") is None  # version unknown
+    versions[("sqlite3", "cli")] = (3, 45, 1)
+    assert plugin.guard.check_shell("sqlite3 /tmp/scratch.db 'select 1'") is None
+    assert plugin.guard.check_shell("sqlite3 ~/.hermes/backups/state.db.snapshot 'select 1'") is None
+
+
+def test_managed_cli_is_allowed_but_still_judged_for_writes(versions):
+    versions[("sqlite3", "cli")] = (3, 45, 1)
+    assert plugin.guard.check_shell("~/.hermes/bin/hermes-core-python -m sqlite3 ~/.hermes/state.db 'select 1'") is None
+    why = plugin.guard.check_shell("~/.hermes/bin/hermes-core-python -m sqlite3 ~/.hermes/kanban.db "
+                                   "\"update tasks set status='done' where id='t_1'\"")
+    assert why and "Kanban board" in why
+
+
+def test_terminal_tool_call_is_blocked(versions):
+    versions[("sqlite3", "cli")] = (3, 51, 0)
+    assert blocked("terminal", command="sqlite3 -readonly ~/.hermes/state.db 'pragma quick_check'")
+
+
+def test_real_probe_reads_a_trusted_system_interpreter():
+    if not plugin.guard._trusted("/usr/bin/python3"):
+        pytest.skip("no root-owned /usr/bin/python3 here")
+    out = subprocess.run(["/usr/bin/python3", "-I", "-c", "import sqlite3; print(sqlite3.sqlite_version)"],
+                         capture_output=True, text=True, cwd="/").stdout.strip()
+    assert _REAL_PROBE("/usr/bin/python3", "python") == tuple(int(x) for x in out.split("."))
+    assert _REAL_PROBE("/nonexistent/sqlite3", "cli") is None
+
+
+def test_untrusted_or_relative_binaries_are_never_run(tmp_path, monkeypatch):
+    marker = tmp_path / "ran"
+    evil = tmp_path / "evil" / "sqlite3"
+    evil.parent.mkdir()
+    evil.write_text(f"#!/bin/sh\ntouch {marker}\necho 3.45.1\n")
+    evil.chmod(0o755)
+    monkeypatch.chdir(tmp_path)
+    for word in (str(evil), "./evil/sqlite3", "evil/sqlite3"):
+        assert _REAL_PROBE(word, "cli") is None
+    assert not marker.exists()
+
+
+def test_bare_name_is_resolved_on_system_directories_only(tmp_path, monkeypatch):
+    shadow = tmp_path / "bin" / "sqlite3"
+    shadow.parent.mkdir()
+    shadow.write_text("#!/bin/sh\necho 3.45.1\n")
+    shadow.chmod(0o755)
+    monkeypatch.setenv("PATH", str(shadow.parent) + os.pathsep + os.environ.get("PATH", ""))
+    resolved = plugin.guard._resolve("sqlite3")
+    assert resolved is None or not resolved.startswith(str(tmp_path))
+
+
+def test_trusted_system_probe_runs_with_an_empty_environment(monkeypatch):
+    monkeypatch.setenv("FAKE_SECRET_API_KEY", "s3cret")
+    seen = {}
+    real_popen = plugin.guard.subprocess.Popen
+    def spy(argv, **kw):
+        seen.update(kw)
+        return real_popen(argv, **kw)
+    monkeypatch.setattr(plugin.guard.subprocess, "Popen", spy)
+    monkeypatch.setattr(plugin.guard, "_VERSION_CACHE", {})
+    v = _REAL_PROBE("/bin/sh", "cli")  # trusted, answers no version: unknown
+    assert v is None and seen.get("cwd") == "/" and "FAKE_SECRET_API_KEY" not in seen.get("env", {})
+    assert seen.get("start_new_session") is True
+
+
+def test_kanban_write_by_an_affected_build_gets_the_board_refusal(versions):
+    versions[("sqlite3", "cli")] = (3, 45, 1)
+    why = plugin.guard.check_shell("sqlite3 ~/.hermes/kanban.db \"update tasks set status='done' where id='t_1'\"")
+    assert "Kanban board" in why and plugin.guard.WAL_RESET_MARK not in why
+
+
+def test_trusted_directory_match_needs_a_path_boundary(monkeypatch):
+    monkeypatch.setattr(plugin.guard.os, "stat", lambda p: os.stat_result((0o100755, 0, 0, 1, 0, 0, 0, 0, 0, 0)))
+    monkeypatch.setattr(plugin.guard.os, "access", lambda p, m: True)
+    monkeypatch.setattr(plugin.guard.os.path, "realpath", lambda p: p)
+    assert plugin.guard._trusted("/usr/bin/sqlite3")
+    assert not plugin.guard._trusted("/usr/binx/sqlite3")
+    assert not plugin.guard._trusted("/binaries/sqlite3")

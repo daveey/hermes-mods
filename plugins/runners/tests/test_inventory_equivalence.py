@@ -26,9 +26,11 @@ def setup_fleet(tmp_path):
     path = svc.path
     base, state = snap['runners'][0], snap['states'][snap['runners'][0]['id']]
     for i in range(1, RUNNERS):  # unbound rows on the same host, so host changes reach them too
-        rid = base['id'][:-4] + f'{i:04x}'
+        rid = base['id'][:-4] + f'{i + 1:04x}'
         snap['runners'].append(dict(base, id=rid, provider_runner_id=str(100 + i)))
         snap['states'][rid] = dict(state, at=1000 - 7 * i)
+    # Duplicate IDs intentionally disable carry; this fleet must exercise reuse.
+    assert len(snap['runners']) == len({row['id'] for row in snap['runners']}) == RUNNERS
     with sqlite3.connect(path) as c:
         c.execute('CREATE TABLE IF NOT EXISTS repair_domain_maintenance (entity_id TEXT PRIMARY KEY, payload TEXT NOT NULL)')
     return cfg, path, snap

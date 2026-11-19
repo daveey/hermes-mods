@@ -227,6 +227,111 @@ def test_session_cron_rewrap_quoting_the_script_traceback_files_nothing():
     assert sg.parse_errors(rec) == []
 
 
+# The MacBook monitor record behind agent-95944cb790 (2026-11-17, allie_mail_monitor.sh with DNS down): the script's
+# stderr quotes a CHAINED traceback (google-auth's `raise new_exc from caught_exc`), so a chain separator sits inside
+# the quoted message and its second header used to look like the raised exception ("TransportError in __call__").
+_V = "/home/you/.hermes/installs/x/venv/lib/python3.14/site-packages"
+CHAINED_SCRIPT_STDERR = [
+    "stderr:",
+    "Traceback (most recent call last):",
+    f'  File "{_V}/urllib3/connection.py", line 198, in _new_conn',
+    "    sock = connection.create_connection(",
+    "socket.gaierror: [Errno 8] nodename nor servname provided, or not known",
+    "",
+    "The above exception was the direct cause of the following exception:",
+    "",
+    "Traceback (most recent call last):",
+    f'  File "{_V}/google/oauth2/_client.py", line 198, in _token_endpoint_request_no_throw',
+    "    response = request(",
+    f'  File "{_V}/google/auth/transport/requests.py", line 280, in __call__',
+    "    raise new_exc from caught_exc",
+    "google.auth.exceptions.TransportError: HTTPSConnectionPool(host='oauth2.googleapis.com', port=443): Max retries "
+    "exceeded with url: /token (Caused by NameResolutionError(\"Failed to resolve 'oauth2.googleapis.com' ([Errno 8] "
+    "nodename nor servname provided, or not known)\"))",
+    "mail monitor: invalid search JSON: Expecting value: line 1 column 1 (char 0)",
+]
+
+
+def test_session_cron_rewrap_quoting_a_chained_script_traceback_files_nothing():
+    rec = SESSION_CRON_TB + ["RuntimeError: Script exited with code 1"] + CHAINED_SCRIPT_STDERR
+    assert sg.parse_errors(rec) == []
+
+
+def test_scheduler_monitor_source_failure_is_left_to_the_cron_lane():
+    # cron.scheduler's own ERROR for the same tick (no exc_info): the traceback is the monitor script's, quoted.
+    rec = ["2026-11-17 18:00:18,000 ERROR cron.scheduler: Job 'f58038cae3fb': monitor source failed: "
+           "Script exited with code 1"] + CHAINED_SCRIPT_STDERR
+    assert sg.parse_errors(rec) == []
+    # another cron.scheduler record quoting the same traceback still files
+    other = ["2026-11-17 18:00:18,000 ERROR cron.scheduler: Job 'f58038cae3fb' delivery failed"] + CHAINED_SCRIPT_STDERR
+    assert len(sg.parse_errors(other)) == 1
+
+
+def test_monitor_source_failed_line_matches_core():
+    # Detection guard: the skip keys on core's exact log call; a core rewording must break this test.
+    import os
+    root = Path(os.environ.get("HERMES_TEST_CORE") or Path.home() / ".hermes/hermes-agent")
+    src = root / "cron/scheduler.py"
+    if not src.exists():
+        if os.environ.get("HERMES_TEST_CORE"):
+            raise AssertionError(f"HERMES_TEST_CORE set but {src} is missing")
+        pytest.skip("Hermes core checkout not found")
+    lines = [l.strip() for l in src.read_text().splitlines()]
+    assert lines.count(sg.MONITOR_SOURCE_FAILED_SRC) == 1
+    assert sg.MONITOR_SOURCE_FAILED_RE.match("Job '%s': monitor source failed: %s" % ("f58038cae3fb", "x"))
+
+
+def _quoted_then_outer(explicit: bool, chained_child: bool) -> list:
+    """Real CPython output: a RuntimeError quoting a child's formatted traceback, then caught and wrapped by an
+    outer LookupError (`raise .. from exc` or implicit context). PR 275 review: the outer one is the raised one."""
+    import traceback
+    try:
+        try:
+            try:
+                raise ValueError("child issue")
+            except ValueError as inner:
+                if not chained_child:
+                    raise
+                raise KeyError("child wrap") from inner
+        except Exception:
+            child = traceback.format_exc()
+        try:
+            raise RuntimeError("child failed\nstderr:\n" + child)
+        except RuntimeError as exc:
+            if explicit:
+                raise LookupError("actual final failure") from exc
+            raise LookupError("actual final failure")
+    except LookupError:
+        return traceback.format_exc().splitlines()
+
+
+@pytest.mark.parametrize("explicit", [True, False])
+@pytest.mark.parametrize("chained_child", [True, False])
+def test_real_outer_exception_after_a_quoted_traceback_files_the_outer_exception(explicit, chained_child):
+    lines = _quoted_then_outer(explicit, chained_child)
+    sigs = sg.parse_errors(["2026-11-17 18:00:00,000 ERROR gateway.run: helper failed"] + lines)
+    assert len(sigs) == 1 and sigs[0]["symptom"].startswith("LookupError in "), sigs
+    got = sg.parse_worker_crashes([f"[pid 54] {l}" for l in lines])
+    assert [(c["exc"], c["msg"]) for c in got] == [("LookupError", "actual final failure")]
+
+
+def _formatted_chained_child() -> list:
+    import traceback
+    try:
+        try:
+            raise ValueError("child issue")
+        except ValueError as inner:
+            raise KeyError("child wrap") from inner
+    except KeyError:
+        return traceback.format_exc().splitlines()
+
+
+def test_session_cron_rewrap_quoting_a_real_formatted_chain_files_nothing():
+    # Control: the cron re-raise quoting a real CPython-formatted chained child is still the cron lane's.
+    rec = SESSION_CRON_TB + ["RuntimeError: Script exited with code 1", "stderr:"] + _formatted_chained_child()
+    assert sg.parse_errors(rec) == []
+
+
 def test_chained_exception_files_the_last_exception_in_the_chain():
     rec = ["2026-11-03 13:00:00,000 ERROR gateway.run: handler failed",
            "Traceback (most recent call last):",
@@ -1711,6 +1816,152 @@ def test_each_e0a5909348_guard_warning_files_a_signal(tmp_path):
     # and through the real collector
     h = _auth_home(tmp_path, list(GUARD_LINES.values()))
     assert len([s for s in sg.collect(h, {}, "macbook", _ts("2026-10-28 13:25:00")) if s["kind"] == "errors"]) == 3
+
+
+# ── agent-f9f6ed4f38 (came back): a Mac waking after a hub refresh; core's relay re-pull recovers each 401 ────────
+# 2026-11-18 02:04:39-:51Z the MacBook woke after 55 min with no pull (hub sshd); the hub had refreshed 3 accounts
+# meanwhile, so 3 resuming sessions each took one revoked 401, which core's relay re-pull (credential_relay_repull.py)
+# answers by pulling and adopting the pushed token. Those are recovered, not a storm. A re-pull that finds no new
+# token is the real stall (the 4-min chat stalls of the first occurrence) and files on its own.
+RELAY_SIDS = ("20261026_170127_f07c32", "20261027_134353_5ab65c", "local-e58d06dba8f0d490")
+
+
+def adopted_line(ts, sid, entry="d1076b", after="4.2"):
+    return (f"{ts},500 INFO [{sid}] run_agent: OAuth relay: adopted the pushed token for pool entry {entry} "
+            f"after {after}s")
+
+
+def _relay_home(tmp_path, err_lines, agent_lines):
+    h = _auth_home(tmp_path, err_lines)
+    (h / "logs" / "agent.log").write_text("\n".join(agent_lines) + ("\n" if agent_lines else ""))
+    return h
+
+
+def _wake_401s():
+    return (auth_rec("2026-11-18 02:04:39", "revoked", RELAY_SIDS[0])
+            + auth_rec("2026-11-18 02:04:45", "revoked", RELAY_SIDS[1])
+            + auth_rec("2026-11-18 02:04:51", "revoked", RELAY_SIDS[2]))
+
+
+def _errs(sigs):
+    return [s for s in sigs if s["kind"] == "errors"]
+
+
+def test_relay_recovered_revoked_401s_after_wake_are_not_a_storm(tmp_path):
+    adopted = [adopted_line("2026-11-18 02:04:44", RELAY_SIDS[0]), adopted_line("2026-11-18 02:04:49", RELAY_SIDS[1]),
+               adopted_line("2026-11-18 02:04:56", RELAY_SIDS[2], "df70c1")]
+    h = _relay_home(tmp_path, _wake_401s(), adopted)
+    assert _errs(sg.collect(h, {}, "macbook", _ts("2026-11-18 02:10:00"))) == []
+
+
+@pytest.mark.parametrize("rotation", ["matching", "unrelated", "missing"])
+def test_relay_adoptions_in_unread_rotated_tail(tmp_path, rotation):
+    h = _relay_home(tmp_path, _wake_401s(), ["already consumed"])
+    path = h / "logs" / "agent.log"
+    cur = {"relay:default": {"ino": path.stat().st_ino, "off": path.stat().st_size}}
+    with path.open("a") as f:
+        f.write("\n".join(adopted_line("2026-11-18 02:04:56", s) for s in RELAY_SIDS) + "\n")
+    path.rename(path.with_name("agent.log.1"))
+    path.write_text("new log\n")
+    if rotation == "unrelated":
+        cur["relay:default"]["ino"] = -1
+    elif rotation == "missing":
+        path.with_name("agent.log.1").unlink()
+    sigs = _errs(sg.collect(h, cur, "macbook", _ts("2026-11-18 03:10:00")))
+    assert len(sigs) == (0 if rotation == "matching" else 1)
+    assert cur["relay:default"] == {"ino": path.stat().st_ino, "off": path.stat().st_size}
+
+
+def test_relay_rotated_reader_consumes_only_unread_complete_lines(tmp_path):
+    path = tmp_path / "agent.log"
+    path.write_bytes(b"consumed\n")
+    cur = {"relay": {"ino": path.stat().st_ino, "off": path.stat().st_size}}
+    with path.open("ab") as f:
+        f.write(b"adopted old\nunfinished")
+    path.rename(tmp_path / "agent.log.1")
+    path.write_bytes(b"adopted new\npartial")
+    assert sg.read_relay_lines(path, cur, "relay", NOW) == ["adopted old", "adopted new"]
+    assert sg.read_relay_lines(path, cur, "relay", NOW) == []
+    with path.open("ab") as f:
+        f.write(b" completed\n")
+    assert sg.read_relay_lines(path, cur, "relay", NOW) == ["partial completed"]
+
+
+def test_revoked_401_counts_unless_its_own_session_adopted(tmp_path):
+    """Adoption in another session, or long after the 401, does not excuse it: still one storm."""
+    adopted = [adopted_line("2026-11-18 02:04:44", RELAY_SIDS[0]), adopted_line("2026-11-18 02:04:50", "other_sid"),
+               adopted_line("2026-11-18 02:09:30", RELAY_SIDS[2])]
+    h = _relay_home(tmp_path, _wake_401s() + auth_rec("2026-11-18 02:05:30", "revoked", "fourth_sid"), adopted)
+    sigs = _errs(sg.collect(h, {}, "macbook", _ts("2026-11-18 02:12:00")))
+    assert len(sigs) == 1 and "3 anthropic 401 (revoked)" in sigs[0]["symptom"]
+    assert sigs[0]["fp"] == sg.fp("agent", "auth-storm", "anthropic", "401", "revoked")
+
+
+def test_revoked_401_waits_for_the_relay_repull_across_passes(tmp_path):
+    """The adoption line lands seconds after the 401, often in the next sweep pass: a revoked 401 counts only once
+    the re-pull window has passed without an adoption in its session."""
+    h = _relay_home(tmp_path, _wake_401s(), [])
+    agent = h / "logs" / "agent.log"
+    cur = {}
+    assert _errs(sg.collect(h, cur, "macbook", _ts("2026-11-18 02:04:55"))) == []
+    agent.write_text("\n".join(adopted_line("2026-11-18 02:04:5%d" % (6 + i), s) for i, s in enumerate(RELAY_SIDS))
+                     + "\n")
+    assert _errs(sg.collect(h, cur, "macbook", _ts("2026-11-18 02:05:30"))) == []
+    assert _errs(sg.collect(h, cur, "macbook", _ts("2026-11-18 02:12:00"))) == []
+    # the same three with no adoption: one storm once the window passed, not before
+    h2 = _relay_home(tmp_path / "b", _wake_401s(), [])
+    cur2 = {}
+    assert _errs(sg.collect(h2, cur2, "macbook", _ts("2026-11-18 02:05:00"))) == []
+    late = _errs(sg.collect(h2, cur2, "macbook", _ts("2026-11-18 02:08:00")))
+    assert len(late) == 1 and "auth-failure storm" in late[0]["symptom"]
+    assert _errs(sg.collect(h2, cur2, "macbook", _ts("2026-11-18 02:09:00"))) == []
+
+
+@pytest.mark.parametrize("delay", [600, 3600, 6 * 3600])
+def test_recovered_401s_first_seen_by_a_delayed_sweep_are_not_a_storm(tmp_path, delay):
+    """A first sweep, cursor reset or a sweep delayed by sleep reads hour-old 401s and their adoptions together;
+    the adoptions must clear them even though they are older than the persisted-adoption retention (PR 274 review)."""
+    adopted = [adopted_line("2026-11-18 02:04:56", s) for s in RELAY_SIDS]
+    h = _relay_home(tmp_path, _wake_401s(), adopted)
+    assert _errs(sg.collect(h, {}, "macbook", _ts("2026-11-18 02:04:56") + delay)) == []
+
+
+@pytest.mark.parametrize("delay", [600, 3600])
+def test_unrecovered_401s_first_seen_by_a_delayed_sweep_still_file(tmp_path, delay):
+    """Control: the same delayed first sight with no adoption (or only another session's) is one storm."""
+    h = _relay_home(tmp_path, _wake_401s(), [adopted_line("2026-11-18 02:04:56", "other_sid")])
+    sigs = _errs(sg.collect(h, {}, "macbook", _ts("2026-11-18 02:04:56") + delay))
+    assert len(sigs) == 1 and "3 anthropic 401 (revoked)" in sigs[0]["symptom"]
+
+
+def test_persisted_adoptions_are_pruned_after_the_window(tmp_path):
+    h = _relay_home(tmp_path, _wake_401s(), [adopted_line("2026-11-18 02:04:56", s) for s in RELAY_SIDS[:2]])
+    cur = {}
+    assert _errs(sg.collect(h, cur, "macbook", _ts("2026-11-18 02:05:00"))) == []
+    assert len(cur["auth"]["adopt"]) == 2 and len(cur["auth"]["ev"]) == 1  # third 401 still pending
+    assert _errs(sg.collect(h, cur, "macbook", _ts("2026-11-18 03:05:00"))) == []  # 1 unrecovered: no storm
+    assert not (cur.get("auth") or {}).get("adopt")
+
+
+NO_NEW_TOKEN = ("2026-11-12 23:36:21,004 WARNING [20261026_170127_f07c32] run_agent: OAuth relay: no new token for "
+                "pool entry d88ec8 within 121s of a revoked 401")
+
+
+def test_relay_repull_with_no_new_token_files_a_stall_signal(tmp_path):
+    """Detection guard for the first agent-f9f6ed4f38 cause (dead/duplicate hub rows): the re-pull waited out its
+    budget, a chat stalled ~2 min. Files every time, one fingerprint per provider-free defect (entry ids left out)."""
+    rows = sg.parse_errors([NO_NEW_TOKEN])
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["component"] == "agent" and r["session_id"] == "20261026_170127_f07c32"
+    assert "no new token" in r["symptom"] and "121s" in r["symptom"]
+    assert r["fp"] == sg.parse_errors([NO_NEW_TOKEN.replace("d88ec8", "765d1c")])[0]["fp"]
+    # through the real collector, from errors.log; a line that only quotes the phrase (another logger) does not file
+    quoted = ("2026-11-12 23:40:00,000 WARNING [x] agent.tool_executor: Tool terminal returned error: grep "
+              "'OAuth relay: no new token for pool entry'")
+    h = _auth_home(tmp_path, [NO_NEW_TOKEN, quoted])
+    sigs = _errs(sg.collect(h, {}, "macbook", _ts("2026-11-12 23:45:00")))
+    assert len(sigs) == 1 and "macbook" in sigs[0]["symptom"]
 
 
 LEFT_POOL = ("2026-10-28 13:19:40,500 WARNING [20261028_130956_a12ab0] agent.client_lifecycle: Anthropic pool entry "

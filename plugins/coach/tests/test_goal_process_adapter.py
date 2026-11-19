@@ -30,6 +30,10 @@ def owned(consumer, tmp_path, monkeypatch):
     monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", lambda: "default")
     monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", lambda *a, **k: [])
     health, registry, session, _, _, complete = consumer
+    import time
+    # The borrowed core fixture has no activity timestamp; the real reaper then
+    # treats its lease as idle since the epoch during a longer suite run.
+    session["last_active"] = time.time()
     complete()
     wait_until(lambda: health.available(tmp_path, "origin", registry.ownership_generation), timeout=5)
     agent = session["agent"]
@@ -138,6 +142,10 @@ def test_public_gate_accepts_then_keeps_existing_hold_on_stopped_consumer(
     events = []
     monkeypatch.setattr(gd, "settings", lambda: {"mode": "enforce"})
     def judge(*args):
+        import time
+        from tui_gateway import server
+        # Exercise the background reaper deterministically inside the proof window.
+        server._release_idle_session_leases(time.time())
         checkpoint_during_gate()
         return owned[0]
     monkeypatch.setattr(gd, "aux_judge", judge)

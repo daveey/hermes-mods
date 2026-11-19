@@ -228,6 +228,8 @@ unavailable, while any returned rows remain inspectable. Never infer idleness
 from absent job rows.
 
 Dashboard discovery mounts `/api/plugins/runners/v1`: GET `/fleet` (machines and slots for the Desktop panel;
+its `gateways` section also carries `events`, the last 24 h of worker lifecycle events read read-only from the
+autoscaler's ledger by `fleet.worker_events`, and `events_since`;
 see `desktop-plugins/runners/README.md`), GET `/enrollment`, GET
 `/inventory`, GET `/runners/{id}`, POST `/refresh`. Enrollment returns the explicit
 profile, enrollment flag and observe capabilities without opening the database or

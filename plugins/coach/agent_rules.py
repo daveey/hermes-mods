@@ -26,6 +26,12 @@ from collections import deque
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+_pr_script_spec = importlib.util.spec_from_file_location(
+    '_coach_pr_script_reads', Path(__file__).with_name('pr_script_reads.py'))
+assert _pr_script_spec and _pr_script_spec.loader
+_pr_script_reads = importlib.util.module_from_spec(_pr_script_spec)
+_pr_script_spec.loader.exec_module(_pr_script_reads)
+
 REPEAT_FAILS = 3          # same command failing N times -> stop and debug
 POLL_WINDOW = 10          # last N tool calls ...
 POLL_HITS = 3             # ... with this many sleep/poll calls -> background + notify
@@ -98,12 +104,20 @@ HINTS = {
     "metric_split": ("{where} reports {hits} with no split. Name the split and metric with every score (\"1.787 val "
                      "BPB\", \"test acc 91.3%\"), reading it from the source table or README, so the next reader "
                      "doesn't assume one and table a val score beside test baselines. {fix}"),
+    "card_claim": ("{where} states {hits} as fact. A fleet-wide claim needs a readback per host, compared with "
+                   "GitHub (`git ls-remote`), not a scratch clone's origin. An absence claim needs the trigger read "
+                   "first (a workflow's `on:` schedule, a cron's interval): a missing run may be expected. Cite the "
+                   "readback in the text or mark the clause unverified. {fix}"),
     "search_cap": ("This GitHub read printed a count of exactly 1000 (`{shown}`). GitHub search (REST search/*, "
                    "GraphQL `search`, `gh search`, `merged:` queries) and Actions run lists stop at 1000 results, and "
                    "`--paginate` ends there without an error, so the list is almost certainly truncated. Before any "
                    "\"none\"/\"all\" claim from it, select `issueCount` (GraphQL) or `total_count` (REST) and split the "
                    "window until each part is under 1000; PRs merged in a window: "
                    "github-ci-wait `scripts/merged_since.py` (exits 3 at the cap)."),
+    "gated_dispatch": ("Helper {delegation} is dispatched, not started: its goal makes the work conditional on an "
+                       "admission, reservation, slot or pacing hold it has not obtained yet (\"{gate}\"). Until its "
+                       "result shows it got one, report it as dispatched and conditional (\"starts only if "
+                       "admitted\"), never \"started\" or \"underway\", and say what you will do if it is refused."),
 }
 
 # plan_first: a new build ask (a build verb plus a real spec), not a fix/bug report and not already a go.
@@ -1650,6 +1664,40 @@ def metric_split_texts(tool: str, args: Any) -> list[str]:
     return out
 
 
+# ---- card_claim (agent-2bdd943d68) ----------------------------------------------------------------------------------
+# A chat wrote on cards that a lane had "stopped reporting" (the workflow was cron/dispatch-only) and that "every host
+# had" the new PRs (compared against a scratch clone's lagging origin). A card text stating a fleet-wide state or an
+# absence as fact gets a hint naming the readback it needs, never a refusal. Plans, conditions and targets
+# (once/until/if/when/should/must/will/verify/next) and clauses marked unverified/hypothesis stay quiet.
+_CC_FLEET_NOUN = r"(?:hosts?|machines?|workers?|gateways?|boxes|nodes|macs|runners?)"
+CARD_FLEET_RE = re.compile(
+    rf"\b(?:every|each|all(?:\s+\d+)?(?:\s+of\s+the)?(?:\s+\d+)?)\s+(?:\w+\s+)?{_CC_FLEET_NOUN}\s+"
+    r"(?:has|have|had|is|are|was|were|runs|ran|shows?|showed|carr(?:y|ies|ied)|now\s+\w+)\b(?:\s+\w+){0,3}", re.I)
+CARD_ABSENCE_RE = re.compile(
+    r"\b(?:stopped\s+(?:reporting|running|firing|posting|publishing|syncing|sending)"
+    r"|went\s+(?:silent|quiet|dark)"
+    r"|(?:has|have)(?:n't|\s+not)\s+(?:reported|fired|posted|synced)\s+(?:since|in|for))\b", re.I)
+CARD_CLAIM_SKIP_RE = re.compile(
+    r"\b(?:once|until|if|when|whenever|should|must|will|would|could|might|verify|confirm|check|ensure|next|"
+    r"by\s+design|unverified|unconfirmed|hypothesis|not\s+verified|to\s+be)\b", re.I)
+
+
+def card_claims(text: Any) -> list[str]:
+    """Fleet-wide state or absence claims stated as fact in `text`, as written ("every host has the newer PRs")."""
+    if not isinstance(text, str) or not text:
+        return []
+    out: list[str] = []
+    for clause in METRIC_CLAUSE_RE.split(text):
+        if CARD_CLAIM_SKIP_RE.search(clause):
+            continue
+        for rx in (CARD_FLEET_RE, CARD_ABSENCE_RE):
+            for m in rx.finditer(clause):
+                shown = " ".join(m.group(0).split())
+                if shown not in out:
+                    out.append(shown)
+    return out
+
+
 # ---- hub_ssh_heavy (agent-24dac018a6) --------------------------------------------------------------------------------
 # A non-hub session running a test suite or CI wait on the hub over raw ssh (or hub-admin): that skips the hub's CPU
 # admission gate. Hub names: hermes-hub, hub, plus COACH_HUB_HOSTS (space/comma separated); a bare IP counts when one
@@ -1853,6 +1901,56 @@ def search_cap(tool: str, args: dict, result: Any) -> Optional[str]:
     end = out.find("\n", m.end())
     line = out[start:end if end >= 0 else len(out)].strip()
     return line[:120] or "1000"
+
+
+# gated_dispatch (agent-376c3d93de): a background delegate_task whose goal makes the work conditional on admission
+# ("Obtain supported sole-writer reservation before editing; if pacing expressly bars execution report exact wall
+# instead") came back `dispatched`, and the agent told the user "The correction is started". The helper got no
+# reservation and changed nothing. The dispatch result now carries one hint per delegation saying it is not a start.
+_GATE_NOUN = r"(?:reservation|admission|admitted|slot|lease|pacing|quota|capacity|dispatcher|execution\s+grant)"
+GATED_GOAL_RE = re.compile(
+    # obtain/acquire ... <gate noun> ... before <editing|any edit|changing|starting>
+    r"\b(?:obtain|get|acquire|secure|hold|wait\s+for)\w*\b[^.;\n]{0,60}?\b" + _GATE_NOUN + r"\b[^.;\n]{0,40}?"
+    r"\bbefore\s+(?:any\s+|making\s+|starting\s+)?(?:edit|chang|writ|fix|implement|start|work)\w*"
+    # if <gate noun> ... bars/refuses/denies/blocks/holds ...
+    r"|\bif\b[^.;\n]{0,40}?\b" + _GATE_NOUN + r"\b[^.;\n]{0,40}?\b(?:bar|refuse|den(?:y|ie)|block|hold|forbid)s?\b"
+    # only if/once/after ... admitted / a reservation / a slot
+    r"|\b(?:only|once)\s+(?:if|when|after|once)\b[^.;\n]{0,30}?\b" + _GATE_NOUN + r"\b",
+    re.I)
+
+
+def _dispatch_goals(a: dict, d: dict) -> list:
+    """The goal texts of a delegate_task spawn: its args' tasks (or single goal) and the result's `goals` echo."""
+    raw = a.get("tasks")
+    tasks: list = raw if isinstance(raw, list) else [{"goal": a.get("goal")}]
+    goals = [str(t.get("goal") or "") for t in tasks if isinstance(t, dict)]
+    echo = d.get("goals")
+    return goals + [g for g in (echo if isinstance(echo, list) else []) if isinstance(g, str)]
+
+
+def gated_dispatch(tool: str, args: Any, result: Any) -> Optional[str]:
+    """The delegation id (or "helper") of a background delegate_task spawn whose result says `dispatched` and whose
+    goal is gated on admission/reservation/pacing, else None."""
+    if (tool or "").rsplit("__", 1)[-1] != "delegate_task":
+        return None
+    a = args if isinstance(args, dict) else {}
+    if str(a.get("action") or "spawn") != "spawn":
+        return None
+    d = _as_dict(result)
+    if d is None or str(d.get("status") or "") != "dispatched":
+        return None
+    if not any(GATED_GOAL_RE.search(g) for g in _dispatch_goals(a, d)):
+        return None
+    return str(d.get("delegation_id") or "helper")
+
+
+def gated_phrase(args: Any, result: Any) -> str:
+    """The gate clause gated_dispatch matched, for the hint."""
+    for g in _dispatch_goals(args if isinstance(args, dict) else {}, _as_dict(result) or {}):
+        m = GATED_GOAL_RE.search(g)
+        if m:
+            return " ".join(m.group(0).split())[:120].replace("{", "(").replace("}", ")").replace('"', "'")
+    return ""
 
 
 _HEAVY_EXEC = {"pytest", "py.test", "run_tests.sh", "test-all", "vitest", "wait_for_ci.py"}
@@ -2563,6 +2661,100 @@ PR_READ_RE = re.compile(
 PR_READ_HELP_RE = re.compile(r"(?:^|\s)(?:--help|-h)(?:\s|\)|$)")
 TURN_LOG_ARG_CAP = 140
 PR_READ_LINES_MAX = 3
+# agent-56a1fd1512: a deployment read (`merge-base --is-ancestor <sha> HEAD` per host) usually sits behind a `cd ~;
+# date; C=$(readlink -f ...)` preamble, past the 140-char `->` cut, so reply_check.deploy_claim would not see it. Each
+# such read past the cut gets its own `   <- DEPLOY read: ...` line. Same pattern as reply_check._DC_READ_RE (a test
+# keeps them equal).
+DEPLOY_READ_RE = re.compile(
+    r"\bmerge-base\s+--is-ancestor\b|\b(?:branch|tag)\s+(?:-[\w-]+\s+)*--contains\b|\bhermes\s+(?:--)?version\b"
+    r"|\bgit\b[^\n;|&]*?\b(?:rev-parse|describe)\b|\bgit\b[^\n;|&]*?\blog\s+(?:--\S+\s+)*(?:-1|-n\s*1)\b"
+    r"|hermes-sync\.log\b|\bcmp\s+\S|\bsha256sum\b|<- DEPLOY read:", re.I)
+
+
+def deploy_read_lines(arg: str, cap: int = TURN_LOG_ARG_CAP) -> list[str]:
+    """`   <- DEPLOY read: <the read>` for each deployment read in `arg` that ends past the `->` line's `cap` chars."""
+    out: list[str] = []
+    if not isinstance(arg, str) or len(arg) <= cap:
+        return out
+    for m in DEPLOY_READ_RE.finditer(arg):
+        if m.end() <= cap:
+            continue
+        line = f"   <- DEPLOY read: {arg[m.start():m.start() + 160].split(chr(10), 1)[0]}"
+        if line not in out:
+            out.append(line)
+        if len(out) >= PR_READ_LINES_MAX:
+            break
+    return out
+
+
+# agent-efa717f56e: a per-host config read (`hub-worker-exec all -- 'hermes config get <key>'`) also sits past the cut,
+# so reply_check.setting_claim gets `   <- SETTING read: ...` lines. Same pattern as reply_check._SC_READ_RE (a test
+# keeps them equal).
+SETTING_READ_RE = re.compile(
+    r"\bhermes\s+config\s+(?:get|show|list|set|check)\b|\bconfig\.ya?ml\b|\bshared-config\.json\b|<- SETTING read:",
+    re.I)
+
+
+def setting_read_lines(arg: str, cap: int = TURN_LOG_ARG_CAP) -> list[str]:
+    """`   <- SETTING read: <the read>` for each config read in `arg` that ends past the `->` line's `cap` chars."""
+    out: list[str] = []
+    if not isinstance(arg, str) or len(arg) <= cap:
+        return out
+    for m in SETTING_READ_RE.finditer(arg):
+        if m.end() <= cap:
+            continue
+        line = f"   <- SETTING read: {arg[m.start():m.start() + 160].split(chr(10), 1)[0]}"
+        if line not in out:
+            out.append(line)
+        if len(out) >= PR_READ_LINES_MAX:
+            break
+    return out
+
+
+# agent-f547b2a420: a quota read (`hermes-pool-llm check`, `hermes auth list`, provider_walls.json) also sits behind a
+# `date; sqlite3 ...` preamble past the cut, so reply_check.quota_claim gets `   <- QUOTA read: ...` lines. Same pattern
+# as reply_check._QC_READ_RE (a test keeps them equal).
+QUOTA_READ_RE = re.compile(
+    r"provider_walls|hermes-pool-llm|\bpool_llm\b|\bhermes\s+auth\s+(?:list|status)\b|\bllm_paced\b|kanban\s+pacing"
+    r"|\bdispatch_skipped\b|account[-_]usage|anthropic-pool-status|oauth/usage|\bauth\.json\b|<- QUOTA read:", re.I)
+
+
+def quota_read_lines(arg: str, cap: int = TURN_LOG_ARG_CAP) -> list[str]:
+    """`   <- QUOTA read: <the read>` for each quota read in `arg` that ends past the `->` line's `cap` chars."""
+    out: list[str] = []
+    if not isinstance(arg, str) or len(arg) <= cap:
+        return out
+    for m in QUOTA_READ_RE.finditer(arg):
+        if m.end() <= cap:
+            continue
+        line = f"   <- QUOTA read: {arg[m.start():m.start() + 160].split(chr(10), 1)[0]}"
+        if line not in out:
+            out.append(line)
+        if len(out) >= PR_READ_LINES_MAX:
+            break
+    return out
+
+
+# agent-823488ec97: a read whose command names no quota source can still return the quota state: a card's task_events
+# (`select ... from task_events where task_id=...`) or kanban_show carry the dispatcher's llm_paced rows with each
+# account's 5h/7d percentage. Only the data shapes count (an llm_paced row with its providers payload, or a
+# `<window> <pct>% +<rate>%/min` account reading), never a bare word, so a grep of code or docs naming llm_paced is not
+# a read. Successful calls only.
+QUOTA_RESULT_RE = re.compile(
+    r"\bllm_paced\b[^\n]{0,80}?\bproviders\b|\b(?:5h|7d)\s+\d{1,3}(?:\.\d+)?%\s*[+-]\d+(?:\.\d+)?%/min\b")
+QUOTA_RESULT_TOOLS = ("terminal", "execute_code", "kanban_show")
+
+
+def quota_result_lines(tool: str, result: Any) -> list[str]:
+    """One `   <- QUOTA read: result <excerpt>` line when a successful call's output shows provider pacing state."""
+    if tool not in QUOTA_RESULT_TOOLS or result is None:
+        return []
+    text = (result if isinstance(result, str) else json.dumps(result, default=str)).replace('\\"', '"')
+    m = QUOTA_RESULT_RE.search(text)  # (unescaped: terminal output arrives JSON-escaped)
+    if not m:
+        return []
+    excerpt = " ".join(text[m.start():m.start() + 140].split())
+    return [f"   <- QUOTA read: result {excerpt}"]
 
 # agent-521fd3b5d4: core resumes a turn the backend cut (planned update pause, crash) with a user-role note, so the
 # coach starts a new turn and, in a gateway that booted after the cut, has none of its calls in memory. turn_start then
@@ -4171,6 +4363,7 @@ class AgentCoach:
             s["plan_due"] = False
         s["turn_tools"] = 0
         s["turn_log"].clear()
+        s.pop("pr_read_scripts", None)
         s["turn_rich"].clear()
         s.pop("turn_commits", None)
         s.pop("turn_linked", None)
@@ -4399,6 +4592,16 @@ class AgentCoach:
             self._fire(self._s(sid), sid, "search_cap", "session",
                        shown=shown.replace("{", "(").replace("}", ")").replace("`", "'"))
 
+    def check_gated_dispatch(self, sid: str, tool: str, args: Any, result: Any) -> None:
+        """gated_dispatch rule (once per delegation): a background helper dispatched with an admission-gated goal.
+        Run from transform_tool_result so the hint lands on the dispatch result itself."""
+        if not sid:
+            return
+        deleg = gated_dispatch(tool, args, result)
+        if deleg:
+            self._fire(self._s(sid), sid, "gated_dispatch", deleg, delegation=deleg,
+                       gate=gated_phrase(args, result))
+
     def check_metric_split(self, sid: str, tool: str, args: Any) -> None:
         """metric_split rule (once per number per session): a kanban_complete/comment/create text with a metric score
         and no val/test split. Also run from transform_tool_result so the hint lands on the handoff call itself."""
@@ -4414,6 +4617,29 @@ class AgentCoach:
         self._fire_metric_split(sid, "This handoff", hits,
                                 "The card is closed: post a kanban_comment with the labelled numbers." if closed
                                 else "Post a corrected comment or edit before the next step.")
+
+    def check_card_claim(self, sid: str, tool: str, args: Any) -> None:
+        """card_claim rule (once per claim per session): a kanban_complete/comment/create text stating a fleet-wide
+        state or an absence as fact. Also run from transform_tool_result so the hint lands on the card call itself."""
+        if not sid:
+            return
+        hits = [h for t in metric_split_texts(tool, args) for h in card_claims(t)]
+        if not hits:
+            return
+        s = self._s(sid)
+        new = [h for h in dict.fromkeys(hits) if f"card_claim:{h.lower()}" not in s["fired"]]
+        if not new:
+            return
+        for h in new[1:]:
+            s["fired"].add(f"card_claim:{h.lower()}")
+        names = [(tool or "").rsplit("__", 1)[-1]]
+        if names[0] == "tool_call" and isinstance(args, dict):
+            names = [str(c.get("name") or "") for c in args.get("calls") or [] if isinstance(c, dict)]
+        fix = ("The card is closed: post a kanban_comment correcting or sourcing it." if
+               any(n.endswith("kanban_complete") for n in names) else
+               "Post a corrected comment before the next step.")
+        shown = ", ".join(f"\"{h}\"" for h in new[:3]).replace("{", "(").replace("}", ")")
+        self._fire(s, sid, "card_claim", new[0].lower(), where="This card text", hits=shown, fix=fix)
 
     def _fire_metric_split(self, sid: str, where: str, hits: list, fix: str) -> None:
         """One hint per new bare number: numbers already hinted this session stay quiet."""
@@ -4470,9 +4696,12 @@ class AgentCoach:
         s["turn_log"].append(f"-> {tool}({arg[:TURN_LOG_ARG_CAP]})")
         s.setdefault("turn_rich", deque(maxlen=60)).append(rich_tool_line(tool, args, arg))
         if tool in ("terminal", "execute_code"):
-            for line in pr_read_lines(arg):
+            for line in pr_read_lines(arg) + deploy_read_lines(arg) + setting_read_lines(arg) + quota_read_lines(arg):
                 s["turn_log"].append(line)
                 s["turn_rich"].append(line)
+        for line in _pr_script_reads.observe(s, tool, args, result, not failed(tool, result, status)):
+            s["turn_log"].append(line)
+            s["turn_rich"].append(line)
         if tool == "terminal" and "commit" in arg and "git" in arg:
             s.setdefault("turn_commits", deque(maxlen=20)).append(f"-> terminal({arg[:8000]})")
         if failed(tool, result, status) and not wait_check_not_yet(tool, args, result):
@@ -4508,6 +4737,13 @@ class AgentCoach:
             if waited:
                 s["turn_log"].append(waited)
                 s.setdefault("turn_rich", deque(maxlen=60)).append(waited)
+            try:  # quota state in the output of a read that names no quota source (agent-823488ec97)
+                quota = quota_result_lines(tool, result)
+            except Exception:
+                quota = []
+            for line in quota:
+                s["turn_log"].append(line)
+                s.setdefault("turn_rich", deque(maxlen=60)).append(line)
         try:  # which named cards a board write changed or was refused (reply_check.claimed_mutation)
             mut = mutation_result_line(tool, args, result, status)
         except Exception:
@@ -4556,6 +4792,7 @@ class AgentCoach:
         self.check_empty_wait(sid, tool, args, result)
         self.check_cleanup_sweeper(sid, tool, args, result, status)
         self.check_metric_split(sid, tool, args)
+        self.check_card_claim(sid, tool, args)
         self.check_search_cap(sid, tool, args, result)
         # plan_first (once per session). A clarify the user answered showed them the plan: that counts as a reply.
         if tool == "clarify":

@@ -19,9 +19,18 @@ from pathlib import Path
 
 RULE = "long_wait_pending_reply"
 MIN_S = 60.0
+# Self-heal kanban-33c561189f: refused a process_manage wait(300) on a rehome dry-run that finished 14 s later with
+# every move refused; the forced reply said the cards "are moving to the hub". Both texts now say how to report work
+# that is still running, and the process one offers the short wait (< MIN_S, never refused) that returns the result.
+_PENDING = ("Name anything still running as still running with its result unknown, never as done or as working; when "
+            "its result lands, report it and correct any earlier claim it contradicts.")
 MESSAGE = ("[coach long_wait_pending_reply] The user is waiting and has had no reply this turn. Reply now with what "
            "you know, then run the wait with terminal(background=true, notify=true) and report the rest when it "
-           "lands. (This long foreground wait was not run.)")
+           "lands. " + _PENDING + " (This long foreground wait was not run.)")
+PROCESS_MESSAGE = ("[coach long_wait_pending_reply] The user is waiting and has had no reply this turn. If this job "
+                   f"may finish within a minute, a process_manage wait with timeout under {int(MIN_S)} s is allowed: "
+                   "use it to report the actual result. Otherwise reply now with what you know; its completion "
+                   "notification brings the result. " + _PENDING + " (This long wait was not run.)")
 
 _SLEEP = re.compile(r"\bsleep\s+(\d+(?:\.\d+)?)([smhd]?)\b")
 _UNIT = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}
@@ -188,4 +197,4 @@ def check(turns: dict, session_id: str, tool: str, args, log) -> str | None:
         return None
     t["held"] = True
     log({"event": "agent_block", "rule": RULE, "session_id": session_id, "tool": name, "secs": secs})
-    return MESSAGE
+    return PROCESS_MESSAGE if name == "process_manage" else MESSAGE

@@ -31,6 +31,7 @@ import json
 import math
 import os
 import re
+import unicodedata
 import time
 from typing import Any, Callable, Optional
 from pathlib import Path
@@ -1379,7 +1380,16 @@ def status_only(user_ask: str, reply: str, tool_log: Optional[list] = None) -> O
 # row, a cron run, a subagent or a Kanban worker) gets one advisory hint per turn. It never holds a reply.
 # Off switch: env COACH_STATUS_PLAIN=off, or config plugins.entries.coach.settings.status_plain: false.
 SYNTHETIC_USER_RE = re.compile(
-    r"^\s*(?:[\u2714\u2713\u2716\u2717\u23f8\u26a0\u2757]|\[(?!image|screenshot)[^\]\n]{1,80}[\]:])", re.I)
+    r"^\s*\[(?!image|screenshot|OUT-OF-BAND USER MESSAGE)[^\]\n]{1,80}[\]:]", re.I)
+
+
+def synthetic_user_turn(text: str) -> bool:
+    """Status exclusions include legacy unbracket receipts, but not a human warning."""
+    s = (text or "").lstrip()
+    return bool(notice_turn(s) or SYNTHETIC_USER_RE.match(s) or
+                re.match(r"^(?:[✔✓✖✗⏸❗]|⚠\ufe0f?\s+subagent\b)", s))
+
+
 PROBE_TAG_RE = re.compile(r"^\s*\[selfheal-probe\]\s*", re.I)
 STATUS_PLAIN_HINT = (
     "[coach] status_plain: the user asked about progress (\"{ask}\"). Open with the state of their original ask in "
@@ -1466,7 +1476,7 @@ def status_plain_hint(user_ask: str, platform: str = "", parent_session_id: str 
         return None
     # a `[selfheal-probe]` live test stands in for a person (self_heal._NOT_HERMES_TAGS); it is not a Hermes row
     ask = PROBE_TAG_RE.sub("", user_ask[:ASK_HEAD], count=1)
-    if automation_prompt(ask) or SYNTHETIC_USER_RE.match(ask) or not PLAIN_STATUS_ASK_RE.search(ask):
+    if automation_prompt(ask) or synthetic_user_turn(ask) or not PLAIN_STATUS_ASK_RE.search(ask):
         return None
     if not status_plain_enabled():
         return None
@@ -2039,18 +2049,98 @@ def pr_state_claim(reply: str, tool_log: Optional[list] = None) -> Optional[str]
     """The sentence claiming a PR's present state (unmerged/open, or approved/checks green/queued) when this turn
     read no PR state, else None (code
     spans, quotes, `>` lines, questions, conditions, reported speech and replies naming pr_state_claim are ignored)."""
-    text = _CODE_QUOTE.sub(" ", reply or "")
+    # Inline repository and PR identifiers carry scope, not quoted claims.
+    # Keep complete identifier spans, including bare numbers in PR lists;
+    # still discard whole code claims, fenced examples and block quotes.
+    text = _CODE_QUOTE.sub(
+        lambda m: m[0][1:-1] if re.fullmatch(
+            r"`(?:(?:https://github\.com/)?[\w.-]+/[\w.-]+(?:#[1-9]\d*|/pull/[1-9]\d*)?"
+            r"|\s*(?:(?:PRs?|pull\s+requests?)\s*(?:-\s*|number\s+)?)?#?\d+\s*)`",
+            m[0], re.I) else " ",
+        reply or "")
     text = _QUOTED_RE.sub(" ", text)
     if _PSC_META_RE.search(text) or not _MF_PR_RE.search(text):
         return None
+    # Script reads are authenticated by the observer and scoped to exact PR IDs.
+    # Never treat their output marker as a generic read of every PR in the reply.
+    script_reads = {(m[1], m[2]) for line in tool_log or []
+                    if (m := re.fullmatch(r"   <- PR state result: ([\w.-]+/[\w.-]+)#([1-9]\d*)", line or ""))}
+    script_ids = {n for _, n in script_reads}
+    # Scope is independent of claim-wording sanitization: quotes/code and
+    # sentence punctuation must never erase an explicit repository qualifier.
+    # Conservatively require every repository in the raw reply to match. Mixed
+    # or ambiguous scopes may nudge, but cannot grant a number-only exemption.
+    raw = reply or ""
+    # Typed prose fields are not repository qualifiers. Mask only the value
+    # spans of recognized counters/status fields, never arbitrary numeric repo
+    # names, quoted identifiers, or an entire footer (which can contain claims).
+    raw = re.sub(r"(\btests?\s+pass(?:ed)?\s+)\d+/\d+(?=\.(?:\s|$)|[,;\s]|$)", r"\1COUNT", raw, flags=re.I)
+    raw = re.sub(r"(^Done means \([^\n)]+\): )\d+/\d+(?= first pass|, \d+ fix rounds)",
+                 r"\1COUNT", raw, flags=re.M)
+    raw = re.sub(r"(^Done means \([^\n)]+\): [^\n]*?; )n/a(?=:)", r"\1NOT_APPLICABLE", raw, flags=re.M)
+    raw = re.sub(r"(^Done means \([^\n)]+\): [^\n]*?; NOT_APPLICABLE: missing-credential, )"
+                 r"[45]\d\d/[45]\d\d(?=\.$|$)", r"\1HTTP_STATUS", raw, flags=re.M)
+    # A word boundary truncates legal trailing '-' or '.' characters. Consume
+    # the entire identifier alphabet; ambiguous prose punctuation stays scoped
+    # conservatively rather than becoming evidence for a different repository.
+    github_repo = r"(?:https?://)?github\.com/([\w.-]+/[\w.-]+)(?![\w.-])"
+    context_repos = {m[1].lower() for m in re.finditer(github_repo, raw, re.I)}
+    without_urls = re.sub(github_repo + r"[^\s<>\"'`]*", " ", raw, flags=re.I)
+    context_repos |= {m[1].lower() for m in re.finditer(
+        r"(?<![\w/:.-])([\w.-]+/[\w.-]+)(?![\w.-])", without_urls)}
+    ambiguous_short_ref = bool(re.search(r"(?<![\w/.-])[\w.-]+#[1-9]\d*\b", without_urls))
     hit = None
+    context_ids = set()
     for s in _SENTENCE_END.split(text):
+        # Use the claim detector's PR grammar, including its bare PR/request
+        # matches, then consume an attached number (PR-42, PR number 42).
+        mentions = list(_MF_PR_RE.finditer(s))
+        # Qualified repo#N can follow a word character, which the claim
+        # grammar's standalone # alternative deliberately does not match.
+        refs = set(re.findall(r"#([1-9]\d*)\b", s))
+        unresolved = False
+        for mention in mentions:
+            number = re.search(r"([1-9]\d*)$", mention[0])
+            end = mention.end()
+            if not number:
+                number = re.match(r"\s*(?:-\s*|number\s+)?#?([1-9]\d*)\b",
+                                  s[end:], re.I)
+                if number:
+                    end += number.end()
+            if number:
+                refs.add(number[1])
+                # Natural-language list connectors are open-ended. Fail closed
+                # on subsequent standalone integers, irrespective of size or
+                # connective, instead of crediting only a parsed prefix.
+                # Underscores are Markdown delimiters, not identifier letters.
+                # Preserve only narrowly typed read times and count metadata.
+                rest = re.sub(r"\b\d{1,2}:\d{2}(?::\d{2})?Z?\b", "TIME", s[end:])
+                rest = re.sub(r"(\btests?\s+pass(?:ed)?\s+)\d+/\d+\b",
+                              r"\1COUNT", rest, flags=re.I)
+                rest = re.sub(r"(?<![\w#])\d(?=\s+(?:checks?|runs?|tests?|minutes?)\b)",
+                              "COUNT", rest, flags=re.I)
+                refs.update(re.findall(r"(?<![^\W_])\d+(?![^\W_])", rest))
+            elif not re.search(r"\b(?:this|that|the)\s+$", s[:mention.start()], re.I):
+                unresolved = True
+        if refs:
+            context_ids = refs
+        elif unresolved:
+            context_ids = set()
+        # Explicitly contrasting subjects cannot inherit even when a prior
+        # sentence provided a read PR. This also rejects 'the other PR'.
+        if re.search(r"\b(?:other|another)\s+(?:PRs?|pull\s+requests?)\b", s, re.I):
+            context_ids = set()
+
         if s.rstrip(" *_").endswith("?"):
             continue
         m = _PSC_CLAIM_RE.search(s)
         if not m or _PSC_HEDGE_RE.search(s[:m.start()]):
             continue
         if _PSC_IT_RE.search(s) or (_MF_PR_RE.search(s) and not _psc_only_merged_refs(s)):
+            if (context_ids and context_ids <= script_ids and not ambiguous_short_ref
+                    and (not context_repos or all((repo, n) in script_reads
+                         for repo in context_repos for n in context_ids))):
+                continue
             hit = s
             break
     if not hit:
@@ -2058,6 +2148,322 @@ def pr_state_claim(reply: str, tool_log: Optional[list] = None) -> Optional[str]
     if any(_PSC_READ_RE.search(l or "") and not _PSC_HELP_RE.search(l or "") for l in (tool_log or [])):
         return None
     return hit.strip(" -*\t")
+
+
+# ---- deploy_claim: the reply says a change runs on named hosts, but this turn read nothing that shows it -------------
+# (self-heal agent-56a1fd1512: at 01:26Z a chat told David "The fix, core PR #3115, is merged as b7523ba7aa and running
+# on the hub and all eight workers." The turn had only counted dispatch skips and claims per host, which were zero
+# because the governor was disabled fleet-wide; its own `merge-base --is-ancestor` read five minutes later showed the
+# hub and workers 2, 5, 7 and 8 without the fix. Merged is not deployed: hosts pull on their own schedule and the hub
+# batches core updates.) Deterministic, before the judge: a sentence (outside code and quotes, not a question, not a
+# condition, negation, forecast or past tense) whose subject is a fix/change/commit/PR and which says it is
+# running/installed/deployed/live on or across named hosts (hub, workers, machines, Macs, mini, fleet), live
+# everywhere, or that hosts now have/run it, while the turn's tool log has no deployment read (ancestry, `--contains`,
+# `hermes version`, `rev-parse`/`describe`/`log -1` of a checkout, the hermes-sync log, or agent_rules' `<- DEPLOY
+# read:` line for a read past the `->` cut; agent_rules.DEPLOY_READ_RE is kept equal by a test).
+_DC_HOST = (r"(?:hub|worker-\d+|workers?|machines?|hosts?|gateways?|Macs?|MacBooks?|minis?|fleet|boxes|nodes|"
+            r"servers?|instances?)")
+_DC_DET = (r"(?:(?:the|all|every|each|both|other|remaining|our|these|those|pool|\d+|one|two|three|four|five|six|seven|"
+           r"eight|nine|ten|of)\s+){0,4}")
+_DC_CLAIM_RE = re.compile(
+    r"\b(?:live|running|installed|deployed|rolled\s+out|active|loaded)\s+(?:now\s+)?(?:on|to|across|in)\s+"
+    + _DC_DET + _DC_HOST + r"\b"
+    r"|\b(?:live|running|installed|deployed|rolled\s+out)\s+(?:now\s+)?everywhere\b"
+    r"|\b" + _DC_DET + _DC_HOST + r"\s+(?:[\w-]+\s+){0,3}?(?:now\s+|already\s+|all\s+)?(?:has|have|runs?|"
+    r"(?:is|are)\s+running|picked\s+up|loaded)\s+(?:it|the\s+(?:fix|change|new\s+code|update|commit|patch|guard))\b",
+    re.I)
+# The sentence's subject must be a change, nearer the claim than any card/run noun ("Card t_… is running on worker-3"
+# and "the review is running on worker-2" are about work, not code).
+_DC_FIX_RE = re.compile(r"\b(?:fix(?:es)?|changes?|commits?|PRs?|patch(?:es)?|version|update|code|release|guard|"
+                        r"rule|plugin|revision)\b|\B#\d{2,}\b|\b[0-9a-f]{7,40}\b", re.I)
+_DC_WORK_RE = re.compile(r"\b(?:cards?|t_[0-9a-f]{8,}|tasks?|jobs?|(?:re-?)?reviews?|rework|process(?:es)?|sessions?|"
+                         r"chats?|subagents?|lanes?|daemons?|services?|timers?|crons?|probes?|tests?|suites?|builds?|"
+                         r"land(?:ing)?\s+steps?|landing|merges?|watch(?:es)?|re-?measure|apply|status)\b", re.I)
+# "running on worker-3" alone is where a card runs, not what code a host has: a single-worker "running"/"active" claim
+# is skipped; "installed/live/deployed on worker-4" still counts.
+_DC_ONE_WORKER_RUN_RE = re.compile(r"^(?:running|active|loaded)\s+(?:now\s+)?(?:on|in)\s+(?:the\s+)?worker-\d+$", re.I)
+_DC_NEG_RE = re.compile(r"(?:\b(?:not|never|no\s+longer|yet\s+to|neither|nor)\b|n[\u2019']t\b)[^.;:!?]{0,40}$"
+                        r"|\b(?:will|would|should|could|might|may|can|must|to|was|were|had\s+been|be|"
+                        r"I[\u2019']ll|it[\u2019']ll|we[\u2019']ll|they[\u2019']ll)\s+(?:(?:now|already|also|then|"
+                        r"soon)\s+)?(?:be\s+)?$"
+                        r"|\b(?:get|gets|getting|make|makes|making|have|having)\s+(?:[\w#()-]+\s+){0,5}$"
+                        r"|\b(?:go|goes|going|went|come|comes|coming)\s+$"
+                        r"|\b(?:checks?|checking|verif(?:y|ies|ying)|watch(?:es|ing)?|ensures?|expects?|expected|"
+                        r"confirm(?:s|ed|ing)?|until|whether)\b[^.;:!?]{0,80}$", re.I)
+_DC_READ_RE = re.compile(
+    r"\bmerge-base\s+--is-ancestor\b|\b(?:branch|tag)\s+(?:-[\w-]+\s+)*--contains\b|\bhermes\s+(?:--)?version\b"
+    r"|\bgit\b[^\n;|&]*?\b(?:rev-parse|describe)\b|\bgit\b[^\n;|&]*?\blog\s+(?:--\S+\s+)*(?:-1|-n\s*1)\b"
+    r"|hermes-sync\.log\b|\bcmp\s+\S|\bsha256sum\b|<- DEPLOY read:", re.I)
+_DC_META_RE = re.compile(r"\bdeploy_claim\b", re.I)
+# Fleet scope only: several hosts ("the hub and all eight workers", "workers 1-8", "both Macs"), every/each/all of them,
+# the fleet, or everywhere. Hosts pull on their own schedules, so one card's readback never covers a fleet claim; a
+# single-host claim ("live on the hub") usually relays that host's card readback, and holding those too was ~46
+# no-read holds a day in a 4-day hub backtest (2026-11-11..15) against ~6 fleet ones.
+_DC_PLURAL_HOST_RE = re.compile(r"\b(?:workers|machines|hosts|gateways|Macs|MacBooks|minis|nodes|boxes|servers|"
+                                r"instances|fleet|everywhere)\b|\b(?:every|each|all|both)\s+(?:the\s+|of\s+the\s+)?"
+                                + _DC_HOST + r"\b", re.I)
+_DC_ONE_HOST = r"(?:hub|worker-\d+|mini|Mac(?:Book)?(?:[\u2019']s\s+core)?)"
+_DC_TWO_HOSTS_RE = re.compile(r"\b" + _DC_ONE_HOST + r"\s+and\s+(?:(?:on|in|to)\s+)?(?:(?:the|your)\s+)?"
+                              + _DC_ONE_HOST + r"\b", re.I)
+
+
+def _dc_fleet_scope(window: str) -> bool:
+    """True when `window` (the claim plus the rest of its clause) names more than one host or a fleet."""
+    window = re.split(r"\s(?:but|except|while|though|although)\s", window, maxsplit=1)[0]
+    return bool(_DC_PLURAL_HOST_RE.search(window) or _DC_TWO_HOSTS_RE.search(window))
+DEPLOY_CLAIM_NUDGE = (
+    "[coach] deploy_claim: your reply says a change is running on named hosts (\"{evidence}\"), but this turn read "
+    "nothing that shows what those hosts run. Merged is not deployed: each host pulls on its own schedule (the hub "
+    "batches core updates), and an outcome metric (zero skips, cards moving) can have another cause. Read it per host "
+    "now (`git -C <checkout> merge-base --is-ancestor <sha> HEAD` on the hub and on each worker, e.g. through "
+    "`hub-worker-exec all --`) and report which hosts have it and which do not yet, with the time of the read.")
+
+
+def deploy_claim(reply: str, tool_log: Optional[list] = None) -> Optional[str]:
+    """The sentence claiming a fix/change is running, installed, deployed or live on named hosts when this turn's
+    tool log shows no deployment read, else None (code spans, quotes, `>` lines, questions, conditions, negations,
+    forecasts, past tense, sentences about cards/runs and replies naming deploy_claim are ignored)."""
+    text = _CODE_QUOTE.sub(" ", reply or "")
+    text = _QUOTED_RE.sub(" ", text)
+    if _DC_META_RE.search(text):
+        return None
+    hit = None
+    for s in _SENTENCE_END.split(text):
+        if s.rstrip(" *_").endswith("?"):
+            continue
+        for m in _DC_CLAIM_RE.finditer(s):
+            pre = s[:m.start()]
+            if _PSC_HEDGE_RE.search(pre) or _DC_NEG_RE.search(pre) or _DC_ONE_WORKER_RUN_RE.match(m.group(0)):
+                continue
+            fixes = [f.end() for f in _DC_FIX_RE.finditer(pre)] or [f.end() for f in _DC_FIX_RE.finditer(m.group(0))]
+            if not fixes:
+                continue
+            works = [w.end() for w in _DC_WORK_RE.finditer(pre)]
+            if works and max(works) > max(fixes) and not _DC_FIX_RE.search(m.group(0)):
+                continue
+            if not _dc_fleet_scope(s[m.start():m.end() + 80].split(";", 1)[0].split(":", 1)[0]):
+                continue
+            hit = s
+            break
+        if hit:
+            break
+    if not hit:
+        return None
+    if any(_DC_READ_RE.search(l or "") for l in (tool_log or [])):
+        return None
+    return hit.strip(" -*\t")
+
+
+# ---- setting_claim: the reply says a setting is on/off across hosts, but this turn read no config -------------------
+# (self-heal agent-efa717f56e: at 05:49Z a hub chat told David "The run limits are back on across all nine machines."
+# Another chat had switched kanban.llm_pacing off fleet-wide at 05:45Z; an independent read at 05:46:55Z said
+# enabled=False. The turn had read only the re-enable card's body and last comment, so it restated that card's goal as
+# live state; it corrected itself 9 minutes later.) deploy_claim covers code on hosts; this is the sibling for config:
+# settings are flipped by other chats and cards between turns. Deterministic, before the judge: a sentence (outside
+# code and quotes, not a question, condition, negation, forecast or past tense) whose subject is a setting, limit, flag,
+# switch or governor and which says it is/stays (back) on, off, enabled, disabled, paused or in force, with fleet scope
+# (several hosts, every/all hosts, fleet-wide, everywhere: deploy_claim's _dc_fleet_scope), while the turn's tool log
+# has no config read (`hermes config get|show|list|set`, config.yaml, shared-config.json, or agent_rules'
+# `<- SETTING read:` line for a read past the `->` cut; agent_rules.SETTING_READ_RE is kept equal by a test).
+_SC_NOUN_RE = re.compile(
+    r"\b(?:(?:run|rate|concurrency|spend|token|usage)[- ])?(?:limits?|caps?|pacing|governors?|throttl(?:e|es|ing)|"
+    r"flags?|settings?|(?:kill[- ])?switch(?:es)?|toggles?|options?|config(?:uration)?|quotas?|admission|"
+    r"feature[- ]flags?)\b|\b[a-z][a-z0-9]*\.[a-z][a-z0-9_]*_[a-z0-9_.]*\b", re.I)
+_SC_STATE = (r"(?:back\s+)?(?:on|off|enabled|disabled|paused|unpaused|active|inactive|in\s+(?:force|effect|place)|"
+             r"switched\s+(?:back\s+)?(?:on|off)|turned\s+(?:back\s+)?(?:on|off)|re-?enabled)")
+_SC_CLAIM_RE = re.compile(
+    r"\b(?:is|are|remains?|stays?)\s+(?:(?:now|still|again|already|all|currently)\s+)*" + _SC_STATE
+    + r"(?=\s|[.,;:!)]|$)", re.I)
+_SC_FLEETWIDE_RE = re.compile(r"\bfleet[- ]wide\b", re.I)
+_SC_READ_RE = re.compile(
+    r"\bhermes\s+config\s+(?:get|show|list|set|check)\b|\bconfig\.ya?ml\b|\bshared-config\.json\b|<- SETTING read:",
+    re.I)
+_SC_META_RE = re.compile(r"\bsetting_claim\b", re.I)
+SETTING_CLAIM_NUDGE = (
+    "[coach] setting_claim: your reply says a setting is on or off across hosts (\"{evidence}\"), but this turn read "
+    "no config. Other chats and cards flip these between turns, and a card's goal or an earlier read is not the live "
+    "value. Read it per host now (`hermes config get <key>` on the hub and on each worker, e.g. through "
+    "`hub-worker-exec all --`) and report what each host has, with the time of the read.")
+
+
+def setting_claim(reply: str, tool_log: Optional[list] = None) -> Optional[str]:
+    """The sentence claiming a setting/limit/flag is on/off/enabled/disabled across several hosts when this turn's
+    tool log shows no config read, else None (code spans, quotes, `>` lines, questions, conditions, negations,
+    forecasts, past tense and replies naming setting_claim are ignored)."""
+    text = _CODE_QUOTE.sub(" ", reply or "")
+    text = _QUOTED_RE.sub(" ", text)
+    if _SC_META_RE.search(text):
+        return None
+    hit = None
+    for s in _SENTENCE_END.split(text):
+        if s.rstrip(" *_").endswith("?"):
+            continue
+        for m in _SC_CLAIM_RE.finditer(s):
+            pre = s[:m.start()]
+            if _PSC_HEDGE_RE.search(pre) or _DC_NEG_RE.search(pre):
+                continue
+            # Only the claim's own clause names its subject ("One option is yours: <account> ... is disabled").
+            clause = re.split(r"[:;]", pre)[-1]
+            nouns = list(_SC_NOUN_RE.finditer(clause))
+            if not nouns:
+                continue
+            # The setting must be the subject, nearer the claim than any card/run noun ("The card that turns the
+            # limits back on everywhere is queued" is about a card).
+            works = [w.end() for w in _DC_WORK_RE.finditer(clause)]
+            if works and max(works) > nouns[-1].end():
+                continue
+            window = re.split(r",?\s+(?:so|because|since|which|and\s+so)\s", s[m.start():m.end() + 80],
+                              maxsplit=1)[0].split(";", 1)[0]
+            if not (_dc_fleet_scope(window) or _SC_FLEETWIDE_RE.search(window)):
+                continue
+            hit = s
+            break
+        if hit:
+            break
+    if not hit:
+        return None
+    if any(_SC_READ_RE.search(l or "") for l in (tool_log or [])):
+        return None
+    return hit.strip(" -*\t")
+
+
+# ---- quota_claim: the reply says model quota is out or accounts are capped, but this turn read no quota state ------
+# (self-heal agent-f547b2a420: at 18:47Z a hub chat read the pool and rightly said OpenAI was out on all 3 accounts. By
+# 22:34Z two ChatGPT accounts had been added and a third cleared, so 3 of 5 had headroom; two turns whose only calls
+# were user-step receipts then told David "That leaves only waiting for the weekly quota to come back." David: "there
+# is chatgpt quota".) deploy_claim/setting_claim cover code and config; this is the sibling for provider capacity:
+# accounts are added, reset, cleared and re-enabled between turns, so an earlier read is not the live value.
+# Deterministic, before the judge: a sentence (outside code and quotes, not a question, condition, negation, forecast
+# or past tense) that says the fleet is waiting for quota/caps to come back or reset, has run out of quota, is out or
+# capped on all/every account, or whose own clause names model quota/accounts/a provider and says it is/stays out,
+# capped, exhausted, rate-limited, held or at its cap, or has hit its cap; while the turn's tool log has no quota read
+# (provider_walls.json, hermes-pool-llm, `hermes auth list`, llm_paced events, the kanban pacing log, account-usage,
+# oauth usage, auth.json, or agent_rules' `<- QUOTA read:` line for a read past the `->` cut; agent_rules.QUOTA_READ_RE
+# is kept equal by a test). GitHub/API-budget sentences are another rule's business.
+_QC_NOUN_RE = re.compile(
+    r"\b(?:quotas?|(?:weekly|daily|5-?h(?:our)?|usage|rate)[- ](?:caps?|limits?)|allowance|accounts?|subscriptions?|"
+    r"OpenAI|ChatGPT|Codex|Claude|Anthropic|GPT[-\w.]*|Opus|Sonnet|Gemini|providers?|model\s+capacity|pool)\b", re.I)
+_QC_STATE = (r"(?:out(?!\s+of\s+(?!quota|allowance|capacity))|capped|exhausted|used\s+up|rate[- ]limited|maxed(?:\s+out)?|"
+             r"walled|held|spent|out\s+of\s+(?:quota|allowance|capacity)|"
+             r"at\s+(?:the\s+|their\s+|its\s+)?(?:weekly\s+|5-?h(?:our)?\s+)?(?:caps?|limits?)|at\s+100\s*%)")
+_QC_CLAIM_RE = re.compile(
+    r"\bwaiting\s+(?:for|on)\s+(?:the\s+|their\s+|its\s+)?(?:[\w.@-]+\s+){0,2}?(?:quotas?|caps?|limits?|allowance|"
+    r"capacity|accounts?)\s+to\s+(?:come\s+back|reset|refill|return|recover|clear)\b"
+    r"|\b(?:has|have|is|are)\s+(?:all\s+)?(?:run|running)\s+out\s+of\s+(?:[\w-]+\s+){0,2}?(?:quota|allowance|capacity)\b"
+    r"|\b(?:out|capped|exhausted|used\s+up|rate[- ]limited|maxed(?:\s+out)?|walled)\s+on\s+(?:all|every|each|both)\b"
+    r"|\b(?:is|are|stays?|remains?)\s+(?:(?:still|now|all|currently|again)\s+)*" + _QC_STATE + r"(?=\s|[.,;:!)]|$)"
+    r"|\b(?:has|have)\s+(?:all\s+|now\s+)*hit\s+(?:the|their|its)\s+(?:weekly\s+|daily\s+|5-?h(?:our)?\s+)?"
+    r"(?:caps?|limits?|quotas?)\b"
+    r"|\bno\s+(?:[\w-]+\s+)?(?:quota|allowance|capacity)\s+(?:left|available|remaining)\b", re.I)
+# The noun is inside these claims already ("waiting for the weekly quota", "run out of quota", "out on all accounts").
+_QC_SELF_NOUN_RE = re.compile(r"^(?:waiting|has|have|is\s+run|are\s+run|no\s|out|capped|exhausted|used|rate|maxed|"
+                              r"walled)", re.I)
+_QC_OTHER_RE = re.compile(r"\b(?:GitHub|gh|installation|GraphQL|Slack|AWS|EC2|disk|GPU|spend(?:ing)?)\b", re.I)
+_QC_READ_RE = re.compile(
+    r"provider_walls|hermes-pool-llm|\bpool_llm\b|\bhermes\s+auth\s+(?:list|status)\b|\bllm_paced\b|kanban\s+pacing"
+    r"|\bdispatch_skipped\b|account[-_]usage|anthropic-pool-status|oauth/usage|\bauth\.json\b|<- QUOTA read:", re.I)
+_QC_META_RE = re.compile(r"\bquota_claim\b", re.I)
+# Relative clauses and hypotheticals describe a rule or a scenario, not the live pool ("cards pinned to a model whose
+# quota is out", "answered by Astra while Claude is exhausted", "Codex would run out ... and stay out").
+_QC_HEDGE_RE = re.compile(r"\b(?:whose|while|would|could|might|never)\b[^.;:!?]{0,80}$", re.I)
+QUOTA_CLAIM_NUDGE = (
+    "[coach] quota_claim: your reply says model quota is out or accounts are capped (\"{evidence}\"), but this turn "
+    "read no quota state. Accounts are added, reset, cleared and re-enabled between turns, and an earlier read or a "
+    "card's title is not the live value. Read it now (`hermes auth list`, `~/.hermes/plugins/pool-llm/bin/"
+    "hermes-pool-llm check`, `cat ~/.hermes/provider_walls.json`) and report which accounts have headroom, with the "
+    "time of the read.")
+
+
+def quota_claim(reply: str, tool_log: Optional[list] = None) -> Optional[str]:
+    """The sentence claiming model quota is out / accounts are capped / the fleet waits for quota to come back when
+    this turn's tool log shows no quota read, else None (code spans, quotes, `>` lines, questions, conditions,
+    negations, forecasts, past tense, sentences about cards or GitHub budgets and replies naming quota_claim are
+    ignored)."""
+    text = _CODE_QUOTE.sub(" ", reply or "")
+    text = _QUOTED_RE.sub(" ", text)
+    if _QC_META_RE.search(text):
+        return None
+    hit = None
+    for s in _SENTENCE_END.split(text):
+        if s.rstrip(" *_").endswith("?") or _QC_OTHER_RE.search(s):
+            continue
+        for m in _QC_CLAIM_RE.finditer(s):
+            pre = s[:m.start()]
+            if _PSC_HEDGE_RE.search(pre) or _DC_NEG_RE.search(pre) or _QC_HEDGE_RE.search(pre):
+                continue
+            clause = re.split(r"[:;,]", pre)[-1]
+            works = [w.end() for w in _DC_WORK_RE.finditer(clause)]
+            if _QC_SELF_NOUN_RE.match(m.group(0)):
+                # "The card that is waiting for the quota to come back" is about a card.
+                if works and re.match(r"\s*(?:that|which)\s*$", clause[max(works):]):
+                    continue
+            else:
+                # The quota noun must be the subject, nearer the claim than any card/run noun.
+                nouns = list(_QC_NOUN_RE.finditer(clause))
+                if not nouns or (works and max(works) > nouns[-1].end()):
+                    continue
+            hit = s
+            break
+        if hit:
+            break
+    if not hit:
+        return None
+    if any(_QC_READ_RE.search(l or "") for l in (tool_log or [])):
+        return None
+    return hit.strip(" -*\t")
+
+
+# ---- hold_lift_forecast: the reply says waiting cards start when a provider comes back / resets / its hold lifts -----
+# (self-heal agent-2f71681b0b: at 12:41Z a hub chat read anthropic `held` until 14:00Z (6:00 AM PT) with 7 of 8
+# accounts at 7d 100% and one 5-hour window due to reset, then told David three times that cards 9th-31st in line
+# "start when a Codex slot frees up or Claude comes back at 6:00 AM PT". The reset window ran 4 cards from the head of
+# the queue in a minute and anthropic re-held until 7:00.) A hold's `until` is when the hold ends, not when a given
+# card starts: the release admits only what the reset accounts' headroom sustains, in DISPATCH_ORDER. quota_claim
+# gates on a quota read; this turn had one, so this rule is wording-only. Deterministic, before the judge: a sentence
+# (outside code and quotes, not a question) naming a provider/quota/account that comes back, resets, resumes or whose
+# pause/hold ends or lifts, plus a start/run/claim verb and a when/once/after/at/from frame; hedged (may/might/could/if/
+# only N/headroom), negated or past-tense sentences pass. Backtest (hub, 7 days): 10 unique hits, 9 of them such
+# forecasts.
+_HL_PROV = (r"(?:Claude|Anthropic|Codex|OpenAI|ChatGPT|Grok|xAI|Gemini|Opus|Sonnet|GPT[-\w.]*|"
+            r"(?:the\s+)?(?:provider|quota|pool|account)s?)")
+_HL_LIFT = (r"(?:comes?\s+back|(?:is|are)\s+back|returns?|resumes?|recovers?|un-?pauses?|resets?|"
+            r"(?:pause|hold|cap|limit|wall)s?\s+(?:ends?|lifts?|expires?|clears?|is\s+over))")
+_HL_LIFT_RE = re.compile(r"\b" + _HL_PROV + r"(?:[\u2019']s)?\s+(?:[\w-]+\s+){0,2}?" + _HL_LIFT + r"\b", re.I)
+_HL_START_RE = re.compile(
+    r"\b(?:starts?|start\s+(?:running|work)|begins?|runs?|gets?\s+(?:a\s+)?(?:worker|slot|claimed|picked\s+up)|"
+    r"(?:is|are|gets?|get)\s+(?:claimed|picked\s+up)|picks?\s+(?:it|them|up)|claims?\s+(?:it|them)|moves?|"
+    r"(?:should|will|[\u2019']ll)\s+(?:start|run|begin|move|land|get|be\s+(?:claimed|picked))|can\s+(?:start|run))\b",
+    re.I)
+_HL_WHEN_RE = re.compile(r"\b(?:when|once|after|as\s+soon\s+as|by\s+the\s+time|at|around|from|whichever)\b", re.I)
+_HL_HEDGE_RE = re.compile(
+    r"\b(?:may|might|could|would|if|unless|possibly|probably|perhaps|headroom|won[\u2019']t|doesn[\u2019']t|"
+    r"didn[\u2019']t|wouldn[\u2019']t|can[\u2019']t|cannot|not|never|started|ran|was|were|no\s+start\s+time|"
+    r"only\s+(?:a\s+few|\d+|one|two|three|four))\b", re.I)
+_HL_META_RE = re.compile(r"\bhold_lift_forecast\b", re.I)
+HOLD_LIFT_FORECAST_NUDGE = (
+    "[coach] hold_lift_forecast: your reply says waiting cards start when a provider comes back, resets or lifts its "
+    "pacing hold (\"{evidence}\"). A held provider's `until` is when the hold ends, not when a given card starts: the "
+    "release admits only what the reset accounts' headroom sustains, in dispatch order (DISPATCH_ORDER), and it can "
+    "re-hold minutes later. Say which accounts reset at that time and how much weekly room they have left, and give "
+    "the card's position among the ready cards a worker can take. State the time the hold lifts, but don't promise a "
+    "start unless the card is within what that headroom admits (claude-usage-diagnostics, "
+    "references/pacing-governor.md, \"Report\").")
+
+
+def hold_lift_forecast(reply: str, tool_log: Optional[list] = None) -> Optional[str]:
+    """The sentence forecasting that cards start when a provider comes back / resets / its hold lifts, else None
+    (code spans, quotes, `>` lines, questions, hedged/negated/past-tense sentences and replies naming
+    hold_lift_forecast are ignored). `tool_log` is unused: a quota read does not make the forecast right."""
+    text = _CODE_QUOTE.sub(" ", reply or "")
+    text = _QUOTED_RE.sub(" ", text)
+    if _HL_META_RE.search(text):
+        return None
+    for s in _SENTENCE_END.split(text):
+        if s.rstrip(" *_").endswith("?"):
+            continue
+        if _HL_LIFT_RE.search(s) and _HL_START_RE.search(s) and _HL_WHEN_RE.search(s) and not _HL_HEDGE_RE.search(s):
+            return s.strip(" -*\t")
+    return None
 
 
 # ---- future_clock: a past-tense Pacific time stamp that has not happened yet -------------------------------------------
@@ -2453,17 +2859,19 @@ def restart_scope_claim_nudge(evidence: str, skew: Optional[tuple]) -> str:
 
 RULES = ("handoff", "confirm", "unverified", "unwatched", "report_only", "status_only", "denied_ask", "credit_ask",
          "laptop_job", "skipped_live", "merge_forecast", "pr_state_claim", "future_clock", "claimed_mutation",
-         "restart_scope_claim")
+         "restart_scope_claim", "deploy_claim", "setting_claim", "quota_claim",
+         "hold_lift_forecast")
 # Every rule is classified by whether its check reads the user turn (agent-372c9408b8). A reply-only rule judges the
 # reply (and tool log or board) alone, so many holds under one user-turn opening say nothing about the rule firing on
 # a template: close-out turns are where chats report PR state. signals.template_holds skips these rules.
 # tests/test_signals.py fails CI for a rule in neither set, or a "reply-only" check that takes the ask.
 REPLY_ONLY_RULES = frozenset({"denied_ask", "credit_ask", "laptop_job", "skipped_live", "merge_forecast",
-                              "pr_state_claim", "future_clock", "claimed_mutation", "restart_scope_claim"})
+                              "pr_state_claim", "future_clock", "claimed_mutation", "restart_scope_claim",
+                              "deploy_claim", "setting_claim", "quota_claim", "hold_lift_forecast"})
 USER_TURN_RULES = frozenset({"handoff", "confirm", "unverified", "unwatched", "report_only", "status_only"})
 DEFAULT_RULES = ("handoff", "confirm", "unwatched", "report_only", "status_only", "denied_ask", "credit_ask",
                  "laptop_job", "skipped_live", "merge_forecast", "pr_state_claim", "future_clock", "claimed_mutation",
-                 "restart_scope_claim")
+                 "restart_scope_claim", "deploy_claim", "setting_claim", "quota_claim", "hold_lift_forecast")
 # Per-rule judge thresholds (COACH_REPLY_THRESHOLDS overrides; other rules use COACH_REPLY_THRESHOLD).
 # report_only: tuned on the training split of the 2026-10-27 labeled set (README, "report_only").
 # report_only_capped: the screen alone when a second opinion was due but unavailable (daily cap hit, error); confirms
@@ -2843,6 +3251,13 @@ def report_only_guard(user_ask: str, reply: str, tool_log: Optional[list] = None
     "lifecycle_park"), else None. `now` dates the board read (replays)."""
     if scope_limited(user_ask):
         return "scope_limited"
+    # The dispatcher explicitly forbids a chat takeover during admission holds.
+    # Honor its closing instruction before deterministic queue/relay pressure too.
+    # Require a notice and its exact suffix: quoted policy or a new user request
+    # must not exempt unrelated work (agent-62d180590b).
+    if notice_turn(user_ask) and (user_ask or "").rstrip().endswith(
+            "Do not run its work outside the dispatcher."):
+        return "dispatcher_scope"
     if scheduled_wait_status(user_ask, reply):
         return "scheduled_wait"
     if continued_run(tool_log):
@@ -2923,6 +3338,21 @@ def _ro_connect(path, timeout=10):
 # agent-ee1b1162bc: a subagent's final reply is a report to its parent agent, which reads and acts on it. Holding it
 # as report_only/status_only pushes the child outside its brief and files defects for a handoff the brief asked for.
 SUBAGENT_EXEMPT_RULES = ("report_only", "status_only")
+
+# agent-df378b15af: hermes-mail runs a peer agent's prompt as a one-shot with `-t file,web,skills,inbox,todo --source
+# tool` (no terminal, Kanban, cross_session or delegation), wrapped in this envelope. Its final answer is the mailbox
+# reply to the requesting agent, which holds those tools and is judged on its own gateway: the subagent shape, so the
+# same rules are exempt. Keyed on the envelope (what the turn is), not the source tag, which other tools share.
+PEER_MAIL_OPEN = "[PEER MESSAGE from "
+PEER_MAIL_CLOSE = "[END PEER MESSAGE]"
+
+
+def peer_mail_turn(user_ask) -> bool:
+    """True when the turn's ask is a hermes-mail peer envelope: it opens with PEER_MAIL_OPEN and carries the close.
+    Core's resume preamble(s) are stripped first (strip_preamble), as the nudge record's ask_head is: a resumed peer
+    turn is still one (PR 282 review)."""
+    text = strip_preamble(str(user_ask or "").lstrip()).lstrip()
+    return text.startswith(PEER_MAIL_OPEN) and PEER_MAIL_CLOSE in text
 
 
 def is_subagent(session_id: str) -> bool:
@@ -3269,7 +3699,8 @@ Return ONLY one JSON object:
 - outcome (pick the best fit for the unresolved problem the reply is mainly about):
   "fixed": the agent itself fixed or changed the thing during this turn (edited code/config, ran the command that resolves it), even if final verification is pending.
   "started": the agent started a concrete fix that is now in progress and says so (spawned/assigned a worker, card, subagent or background job specifically to fix it, opened a PR). A Kanban worker that checkpointed its own card with kanban_continue this turn has started the leftovers that checkpoint carries to the card's next run. """ + STALLED_OWNER + """ Such a card (failed start attempts, parked on quota or "No eligible deep routes", "starts by itself" after a reset) is "report_only", not "started", unless the agent did the work this turn or re-placed it on a gateway that can run it. A Kanban worker's own kanban_block(kind=dependency) behind such a card is not a started fix either. """ + UNLINKED_WAIT + """
-  "proposed": no fix yet, but the reply proposes a concrete solution or plan (what would change and how), possibly asking for a go-ahead.
+  "proposed": no fix yet, but the reply proposes a concrete solution or plan (what would change and how) that genuinely waits on the user's go: it asks for a go-ahead or a choice, and the step is new scope, a change to acceptance/safety/permissions/budget, spend, or otherwise a decision only the user can make.
+  "planned": no fix yet, and the reply names the concrete next step the agent itself should take, but no go-ahead is needed (the reply says it is agent work / needs nothing from the user / "the next step is ...", or it is a fix inside work the user already approved), and the turn ended without doing or starting it. A plan nobody has to approve is not a proposal.
   "offered": only a vague offer ("want me to fix it?", "I can look into it") with no concrete solution.
   "report_only": the reply describes or diagnoses the problem, or says it is not fixed / can be ignored / is owned by an existing task / was relayed to someone, WITHOUT fixing it, starting a new fix, or proposing a concrete solution.
   "na": no unresolved problem in the reply (a pure answer, finished work, chit-chat).
@@ -3392,7 +3823,45 @@ NOT_NOTICES = {
 
 def notice_turn(user_ask: str) -> bool:
     """Only anchored automation envelopes, never a human question mentioning a notice."""
-    return bool(NOTICE_RE.search(user_ask or ""))
+    s = (user_ask or "").lstrip()
+    # Preserve known human lookalikes of the runtime's IMPORTANT batch headers: core's count-led headers state a
+    # fact ("3 Kanban task updates arrived", "2 background processes completed"); a count-led question is typed.
+    # Resume wrappers carry the human's interrupted request, not a job result: keep them out of the generic
+    # bracket fallback so strip_preamble can unwrap them (all four core openings, fresh and stale pause alike).
+    if HUMAN_IMPORTANT_LOOKALIKE.match(s) or _resume_request(s):
+        return False
+    return bool(NOTICE_RE.search(s) or _BRACKET_NOTICE.match(s) or (s and
+        (unicodedata.category(s[0]) == "So" or s[0] == "ℹ") and _NOTICE_TAIL.match(s, 1)))
+
+
+_NOTICE_TAIL = re.compile(r"\ufe0f?\s*\[")
+HUMAN_IMPORTANT_LOOKALIKE = re.compile(r"^\[IMPORTANT: (?:Background processes\b|\d+ [A-Za-z][A-Za-z -]{0,40}\?)")
+_BRACKET_NOTICE = re.compile(r'^\[(?:kanban\b|IMPORTANT:(?! The ["\u201c]| The user launched)|System note:|chat-closeout\b|owner-wake\b)', re.I)
+
+# Core's resume preambles (crash auto-continue tui_gateway/session_history.py, update pause tui_gateway/update_pause.py,
+# gateway restart recovery gateway/run.py, gateway/run_auto_continue_noise.py): a "[System note: …]" that carries the
+# user's own request after it. Such a turn is a human ask, not a "[System note:" notice (agent-6b76c58161). Only these
+# four openings: any other note stays a notice, and a note with nothing after it (or that never closes) stays whole.
+_SYSTEM_RESUME_NOTE_RE = re.compile(r"\[System note: (?:Your previous turn|The previous turn was interrupted by"
+                                    r"|A turn of yours paused for a|A new message)")
+
+
+def _note_end(text: str) -> int:
+    """Index of the "]" closing the leading "[…]" (nested brackets balanced), or -1 when it never closes."""
+    depth = 0
+    for i, ch in enumerate(text):
+        depth += (ch == "[") - (ch == "]")
+        if depth == 0:
+            return i
+    return -1
+
+
+def _resume_request(text: str) -> str:
+    """The request after a leading core resume note, or "" (not a resume note, never closes, nothing follows)."""
+    if not _SYSTEM_RESUME_NOTE_RE.match(text):
+        return ""
+    end = _note_end(text)
+    return text[end + 1:].strip() if end > 0 else ""
 
 
 def automation_prompt(user_ask: str) -> bool:
@@ -3419,12 +3888,7 @@ def strip_preamble(ask: str) -> str:
     for _ in range(4):  # a resumed turn that is interrupted again stacks a second note
         if not text.startswith(PREAMBLE_OPEN):
             break
-        depth, end = 0, -1
-        for i, ch in enumerate(text):
-            depth += (ch == "[") - (ch == "]")
-            if depth == 0:
-                end = i
-                break
+        end = _note_end(text)
         rest = text[end + 1:].lstrip() if end > 0 else ""
         if not rest:
             return ask
@@ -3520,7 +3984,7 @@ def prev_turn_section(prev_turn: Optional[dict], tool_log: list[str]) -> str:
             f"PREVIOUS TURN'S FINAL MESSAGE (head):\n{head}\n\n")
 
 
-CONFIRM_POSITIVE = ("report_only", "offered")
+CONFIRM_POSITIVE = ("report_only", "offered", "planned")
 CONFIRM_NEGATIVE = ("fixed", "started", "proposed", "na")
 
 
@@ -3529,7 +3993,10 @@ def parse_confirm(raw: str) -> Optional[tuple]:
 
     "offered" counts (agent-fdfab26745): a vague "I can run a deeper live check next" on a fixable leftover is the
     report_only stall the screen rule names ("a vague 'want me to look into it?' is not a proposal"). Scored 0.1 it
-    vetoed a 0.99 screen and the user had to type "resume" two days later. Every label CONFIRM_SYS offers is in
+    vetoed a 0.99 screen and the user had to type "resume" two days later. "planned" counts for the same reason
+    (agent-7abafd6255): "The next meaningful step is to reconcile ... fix it if still present ... That is agent work,
+    not another approval needed from you." was labelled "proposed" 2 of 3 replays, vetoing a 0.9 screen, and the user
+    had to ask "so are you doing it?". "proposed" now means a plan that waits on the user's go. Every label CONFIRM_SYS offers is in
     CONFIRM_POSITIVE or CONFIRM_NEGATIVE (test_every_confirm_outcome_label_is_classified)."""
     m = re.search(r"\{.*\}", raw or "", re.S)
     if not m:
@@ -4032,7 +4499,8 @@ def handoff_outcome(reply: str, user_ask: str, tool_log: list[str], llm: Callabl
 STRONG_REPORT_ONLY_SRC = ("confirm", "closed_owner", "unverified_owner")
 
 
-NEW_CLAIM_RULES = ("merge_forecast", "pr_state_claim")
+NEW_CLAIM_RULES = ("merge_forecast", "pr_state_claim", "deploy_claim", "setting_claim", "quota_claim",
+                   "hold_lift_forecast")
 
 
 def outcome_error(exc: BaseException, judge_error: bool, judged: bool) -> dict:
@@ -4073,7 +4541,8 @@ def nudge_outcome(rule: str, reply: str, user_ask: str, tool_log: list[str], llm
                         kanban_down=kanban_down, human_asks=human_asks, prev_turn=prev_turn, confirm=confirm,
                         confirm_floor=confirm_floor, human_confirm_floor=human_confirm_floor,
                         report_only_fallback=report_only_fallback)
-    fns = {"merge_forecast": merge_forecast, "pr_state_claim": pr_state_claim}
+    fns = {"merge_forecast": merge_forecast, "pr_state_claim": pr_state_claim, "deploy_claim": deploy_claim,
+           "setting_claim": setting_claim, "quota_claim": quota_claim, "hold_lift_forecast": hold_lift_forecast}
     for r in (NEW_CLAIM_RULES if extra_rules is None else extra_rules):
         if r == rule or r not in fns:
             continue
@@ -4295,6 +4764,30 @@ def check(reply: str, user_ask: str, tool_log: list[str], llm: Callable[[str, st
             return {"rule": "pr_state_claim", "p": 1.0, "evidence": phrase, "reason": "pr_state_claim",
                     "verdict": {"pr_state_claim": 1.0, "evidence": phrase},
                     "nudge": PR_STATE_CLAIM_NUDGE.format(evidence=phrase[:160])}
+    if not only or "deploy_claim" in only:
+        phrase = deploy_claim(reply, tool_log)
+        if phrase:  # deterministic: a fix claimed running on named hosts with no deployment read (agent-56a1fd1512)
+            return {"rule": "deploy_claim", "p": 1.0, "evidence": phrase, "reason": "deploy_claim",
+                    "verdict": {"deploy_claim": 1.0, "evidence": phrase},
+                    "nudge": DEPLOY_CLAIM_NUDGE.format(evidence=phrase[:160])}
+    if not only or "setting_claim" in only:
+        phrase = setting_claim(reply, tool_log)
+        if phrase:  # deterministic: a setting claimed on/off across hosts with no config read (agent-efa717f56e)
+            return {"rule": "setting_claim", "p": 1.0, "evidence": phrase, "reason": "setting_claim",
+                    "verdict": {"setting_claim": 1.0, "evidence": phrase},
+                    "nudge": SETTING_CLAIM_NUDGE.format(evidence=phrase[:160])}
+    if not only or "quota_claim" in only:
+        phrase = quota_claim(reply, tool_log)
+        if phrase:  # deterministic: model quota claimed out/capped with no quota read this turn (agent-f547b2a420)
+            return {"rule": "quota_claim", "p": 1.0, "evidence": phrase, "reason": "quota_claim",
+                    "verdict": {"quota_claim": 1.0, "evidence": phrase},
+                    "nudge": QUOTA_CLAIM_NUDGE.format(evidence=phrase[:160])}
+    if not only or "hold_lift_forecast" in only:
+        phrase = hold_lift_forecast(reply, tool_log)
+        if phrase:  # deterministic: cards forecast to start when a provider's hold lifts / resets (agent-2f71681b0b)
+            return {"rule": "hold_lift_forecast", "p": 1.0, "evidence": phrase, "reason": "hold_lift_forecast",
+                    "verdict": {"hold_lift_forecast": 1.0, "evidence": phrase},
+                    "nudge": HOLD_LIFT_FORECAST_NUDGE.format(evidence=phrase[:160])}
     if not only or "future_clock" in only:
         phrase = future_clock(reply, now=now)
         if phrase:  # deterministic: a past-tense Pacific stamp later than the real clock (agent-748d257889)
@@ -4597,6 +5090,10 @@ BACKTEST_RULES: dict = {"credit_ask": lambda r: credit_ask(r, []), "laptop_job":
                         "skipped_live": lambda r: skipped_live(r, []),
                         "merge_forecast": lambda r: merge_forecast(r, []),
                         "pr_state_claim": lambda r: pr_state_claim(r, []),
+                        "deploy_claim": lambda r: deploy_claim(r, []),
+                        "setting_claim": lambda r: setting_claim(r, []),
+                        "quota_claim": lambda r: quota_claim(r, []),
+                        "hold_lift_forecast": lambda r: hold_lift_forecast(r, []),
                         "future_clock": lambda r, at=None: future_clock(r, now=at),
                         "claimed_mutation": lambda r: (claimed_mutation(r, []) or {}).get("evidence"),
                         # wording only (an upper bound): a backtest can't know each reply's backend skew

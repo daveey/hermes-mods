@@ -9,7 +9,10 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import posixpath
 import re
+import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -120,6 +123,369 @@ class PluginSuitesWorkflow(unittest.TestCase):
         self.assertNotIn("--hermes-core", self.text)
         self.assertNotIn("continue-on-error", self.text)
 
+    def test_failure_uploads_full_suite_logs_only(self):
+        run = self.text.split("      - name: Run selected suites", 1)[1].split("      - name: Upload", 1)[0]
+        self.assertRegex(run, r'--output-dir "\$logs"')
+        self.assertIn('logs="${RUNNER_TEMP}/suite-logs"', run)
+        step = self.text.split("      - name: Upload full suite logs", 1)[1]
+        self.assertRegex(step, r"(?m)^        if: failure\(\)$")
+        self.assertIn("uses: actions/upload-artifact@v4", step)
+        self.assertIn("name: suite-logs-${{ matrix.python }}", step)
+        self.assertIn("path: ${{ runner.temp }}/suite-logs", step)
+        self.assertRegex(step, r"(?m)^          retention-days: \d+$")
+        self.assertNotIn("continue-on-error", step)
+        # Never a way to turn the red job green: the upload step is the last step and the run step still exits $rc.
+        self.assertIn("exit $rc", run)
+
+
+WORKFLOWS = ROOT / ".github" / "workflows"
+
+
+def _workflow_code(text):
+    """Workflow text without YAML comments (`#` at line start or after whitespace)."""
+    return "\n".join(re.sub(r"(^|\s)#.*$", "", line) for line in text.splitlines())
+
+
+def _is_root_working_directory(value):
+    """True unless a step working-directory literally names a directory below the repository root."""
+    value = value.strip()
+    if value[:1] in "|>":  # Block scalar: not resolved; over-report rather than mask a root test run.
+        return True
+    value = re.sub(r"^\$\{\{\s*github\.workspace\s*\}\}(?=/|$)", ".",
+                   value.strip("\"'"), flags=re.I)
+    # Only simple literal relative paths are understood. Unknown Actions expressions, YAML tags,
+    # anchors/aliases, shell variables and absolute runner paths cannot prove a plugin-local cwd.
+    # Deliberately over-report even quoted constructs rather than interpreting YAML or shell syntax.
+    if not re.fullmatch(r"[A-Za-z0-9_./-]*", value) or value.startswith('/'):
+        return True
+    normalized = posixpath.normpath(value or ".")
+    return normalized in (".", "..") or normalized.startswith('../')
+
+
+def _tests_dir_runs(code):
+    """Offsets for the supported runner spellings; deliberately not a YAML/shell parser."""
+    # A literal step-local working-directory makes `pytest tests` plugin-local.
+    # Preserve offsets while masking those steps; this is only the repository's text shape,
+    # not general YAML job/defaults or shell-cd analysis.
+    direct_code = code
+    position = 0
+    while step := re.compile(r"(?m)^( +)- [\w-]+:").search(code, position):
+        # A step ends at the next line indented no deeper than its dash: the next step, or a dedent out
+        # of the step list (including the next job's defaults). Deeper `- key:` items stay inside it.
+        indent = len(step.group(1))
+        boundary = re.compile(r"(?m)^ {0," + str(indent) + r"}\S").search(code, step.end())
+        end = boundary.start() if boundary else len(code)
+        position = end
+        # Only the step's own key: on the dash line or at its key column, not a nested input or list item.
+        # The value stays on the key's line: `[ \t]*`, not `\s*`, so an empty value never reads the next key.
+        cwd = re.search(r"(?m)^(?: {%d}- | {%d})working-directory:[ \t]*([^\n]*)" % (indent, indent + 2),
+                        code[step.start():end])
+        if cwd and not _is_root_working_directory(cwd.group(1)):
+            direct_code = direct_code[:step.start()] + " " * (end - step.start()) + direct_code[end:]
+    # Join shell continuation lines without changing offsets used by provisioning checks.
+    direct_code = direct_code.replace("\\\n", "  ")
+    return ([match.start() for match in re.finditer(r"scripts/test-all\b", code)] +
+            [match.start() for match in re.finditer(
+                r"\b(?:unittest[ \t]+discover|pytest)[ \t]+[^\n]*?"
+                r"(?<!\S)(?:\./)?tests/?(?=\s|$|[\"'])", direct_code, re.M)])
+
+
+class GitleaksHistoryScope(unittest.TestCase):
+    def test_missing_binary_fails_in_ci(self):
+        with patch.dict(os.environ, {"CI": "true"}), patch.object(shutil, "which", return_value=None):
+            try:
+                with self.assertRaisesRegex(AssertionError, "CI must provision"):
+                    self.test_checked_out_history_and_unignored_branch_controls()
+            except unittest.SkipTest as exc:
+                # SkipTest escapes assertRaisesRegex, so a fail->skip change would otherwise report OK (skipped=1).
+                self.fail(f"missing gitleaks under CI=true must fail, not skip: {exc}")
+
+    def test_missing_binary_skips_outside_ci(self):
+        with patch.dict(os.environ, {"CI": ""}), patch.object(shutil, "which", return_value=None):
+            with self.assertRaises(unittest.SkipTest):
+                self.test_checked_out_history_and_unignored_branch_controls()
+
+    def test_every_workflow_running_tests_dir_provisions_the_verified_archive(self):
+        # tests/ runs in repo-guards.yml directly and in every workflow that runs scripts/test-all (it adds the
+        # repo-guards suite to each -k run). Each must put the archive gitleaks.yml pins on PATH before its tests.
+        scan = (WORKFLOWS / "gitleaks.yml").read_text()
+        version = re.search(r"/download/v([0-9.]+)/", scan)
+        digest = re.search(r"\b([0-9a-f]{64})  gitleaks\.tar\.gz", scan)
+        assert version and digest, scan
+        runners = {path.name for pattern in ("*.yml", "*.yaml") for path in WORKFLOWS.glob(pattern)
+                   if _tests_dir_runs(_workflow_code(path.read_text()))}
+        self.assertLessEqual({"plugin-suites.yml", "repo-guards.yml", "skill-tests.yml"}, runners)
+        for name in sorted(runners):
+            with self.subTest(workflow=name):
+                code = _workflow_code((WORKFLOWS / name).read_text())
+                pinned = code.find(digest.group(1))
+                self.assertGreaterEqual(pinned, 0, f"{name} does not pin the gitleaks.yml archive sha256")
+                assigned = re.search(r"\bgl_version=([0-9.]+)", code)  # plugin-suites.yml's variable form
+                expanded = code.replace("${gl_version}", assigned.group(1)) if assigned else code
+                self.assertIn(f"/gitleaks/gitleaks/releases/download/v{version.group(1)}/", expanded)
+                self.assertIn("sha256sum -c -", code)
+                self.assertIn('>> "$GITHUB_PATH"', code)
+                runs = _tests_dir_runs(code)
+                self.assertTrue(runs, f"{name} runs no tests")
+                # Match the gitleaks tools directory, not browser-harness's earlier PATH export.
+                extraction = re.search(r'tar -xzf [^\n]+ -C "\$\{RUNNER_TEMP\}/tools" gitleaks', code)
+                path_export = re.search(r'echo "\$\{RUNNER_TEMP\}/tools" >> "\$GITHUB_PATH"', code)
+                self.assertIsNotNone(extraction, f"{name} does not extract gitleaks into the tools directory")
+                self.assertIsNotNone(path_export, f"{name} does not export the gitleaks tools directory")
+                assert extraction and path_export
+                for label, offset in (("pin", pinned), ("digest check", code.find("sha256sum -c -")),
+                                      ("extraction", extraction.start()), ("PATH export", path_export.start())):
+                    self.assertLess(offset, min(runs), f"{name} {label} after its tests start")
+
+    def test_checked_out_history_and_unignored_branch_controls(self):
+        binary = shutil.which("gitleaks")
+        if binary is None:
+            if os.environ.get("CI", "").lower() == "true":
+                self.fail("CI must provision the workflow-pinned gitleaks binary")
+            self.skipTest("install the workflow-pinned gitleaks binary")
+        workflow = (ROOT / ".github/workflows/gitleaks.yml").read_text()
+        version_match = re.search(r"/download/v([0-9.]+)/", workflow)
+        assert version_match, workflow
+        version = version_match.group(1)
+        self.assertEqual(subprocess.check_output([binary, "version"], text=True).strip(), version)
+        command = re.findall(r"(?m)^\s+(\./gitleaks git .+)$", workflow)
+        self.assertEqual(len(command), 1)
+        argv = shlex.split(command[0])
+        # Run the workflow's exact argv, including its relative binary/config paths.
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+            env.update(GIT_AUTHOR_NAME="fixture", GIT_AUTHOR_EMAIL="fixture@example.com",
+                       GIT_COMMITTER_NAME="fixture", GIT_COMMITTER_EMAIL="fixture@example.com")
+
+            def git(*args):
+                return subprocess.check_output(["git", "-C", directory, *args],
+                                               env=env, stderr=subprocess.STDOUT, text=True).strip()
+
+            def commit(message):
+                git("add", ".")
+                git("-c", "core.hooksPath=/dev/null", "commit", "-qm", message)
+
+            def scan(expected):
+                result = subprocess.run(argv, cwd=repo, env=env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+
+            git("init", "-q", "-b", "main")
+            # Deterministic synthetic rule: no real credential or entropy-dependent fixture.
+            (repo / ".gitleaks.toml").write_text(
+                '[[rules]]\nid = "fixture"\ndescription = "scope fixture"\n'
+                'regex = "SCOPE_TEST_[A-Z]+"\n')
+            (repo / ".gitleaksignore").write_text("")
+            (repo / ".gitignore").write_text("gitleaks\n")
+            (repo / "gitleaks").symlink_to(binary)
+            commit("base")
+            git("branch", "branch-b")
+            (repo / "main.txt").write_text("SCOPE_TEST_MAIN\n")
+            # Path/rule/line fingerprints allow the ignore and finding in the same commit.
+            (repo / ".gitleaksignore").write_text("main.txt:fixture:1\n")
+            commit("main finding and matching ignore")
+            main = git("rev-parse", "HEAD")
+            scan(0)
+            git("checkout", "-q", "branch-b")
+            self.assertNotIn(main, git("rev-list", "HEAD").splitlines())
+            self.assertIn(main, git("rev-list", "--all").splitlines())
+            scan(0)  # RED with implicit --all: unrelated main finding, old ignore tree.
+            (repo / "branch.txt").write_text("SCOPE_TEST_BRANCH\n")
+            commit("unignored branch finding")
+            scan(1)  # push-shaped HEAD must still detect a real branch finding.
+            git("merge", "--no-ff", "-qm", "pull request merge", "main")
+            scan(1)  # merge-shaped PR HEAD must detect it too.
+
+
+class GitleaksProvisionTripwireMutants(unittest.TestCase):
+    """Exercise the text tripwire against isolated workflow mutations, not the live tree."""
+
+    def check_workflows(self, workflows):
+        case = GitleaksHistoryScope(
+            "test_every_workflow_running_tests_dir_provisions_the_verified_archive")
+        result = unittest.TestResult()
+        with patch.dict(globals(), WORKFLOWS=workflows):
+            case.run(result)
+        self.assertFalse(result.errors, result.errors)
+        return result
+
+    def test_unprovisioned_consumers_fail(self):
+        for filename, command in (
+            ("future.yaml", "scripts/test-all"),
+            ("future.yml", "python -m unittest discover -s tests"),
+            ("future.yml", "pytest -q tests/"),
+            ("future.yaml", "python -m pytest ./tests"),
+        ):
+            with self.subTest(filename=filename, command=command), tempfile.TemporaryDirectory() as directory:
+                workflows = Path(directory) / "workflows"
+                shutil.copytree(WORKFLOWS, workflows)
+                (workflows / filename).write_text(
+                    "name: future\non: push\njobs:\n  tests:\n    runs-on: ubuntu-latest\n"
+                    f"    steps:\n      - run: {command}\n")
+                result = self.check_workflows(workflows)
+                self.assertEqual(len(result.failures), 1, result.failures)
+                self.assertIn(filename, result.failures[0][1])
+                self.assertIn("does not pin", result.failures[0][1])
+
+    def test_late_provisioning_fails(self):
+        for fragment in ('tar -xzf', 'echo "${RUNNER_TEMP}/tools" >> "$GITHUB_PATH"', 'sha256sum -c -'):
+            with self.subTest(fragment=fragment), tempfile.TemporaryDirectory() as directory:
+                workflows = Path(directory) / "workflows"
+                shutil.copytree(WORKFLOWS, workflows)
+                path = workflows / "skill-tests.yml"
+                lines = path.read_text().splitlines()
+                moved = next(line for line in lines if fragment in line)
+                lines.remove(moved)
+                lines.extend(['      - name: Too late', '        run: |', moved])
+                path.write_text("\n".join(lines) + "\n")
+                result = self.check_workflows(workflows)
+                self.assertEqual(len(result.failures), 1, result.failures)
+                self.assertIn("after its tests start", result.failures[0][1])
+
+    def test_step_local_directory_does_not_hide_later_root_consumer(self):
+        local = ('      - name: Plugin tests\n'
+                 '        working-directory: plugins/example\n'
+                 '        run: python -m pytest tests\n')
+        self.assertEqual(_tests_dir_runs(local), [])
+        for cwd in (".", "./", "${{ github.workspace }}"):
+            root = (f'      - name: Root tests\n        working-directory: "{cwd}"\n'
+                    '        run: python -m unittest discover -s tests\n')
+            with self.subTest(cwd=cwd):
+                offsets = _tests_dir_runs(local + root)
+                self.assertEqual(offsets, [(local + root).index("unittest discover")])
+
+    def check_root_step_after_local(self, first_key):
+        local = ('      - name: Plugin tests\n'
+                 '        working-directory: plugins/example\n'
+                 '        run: python -m pytest tests\n')
+        code = local + first_key + '        run: python -m unittest discover -s tests\n'
+        self.assertEqual(_tests_dir_runs(code), [code.index('unittest discover')])
+
+    def test_id_first_root_step(self):
+        self.check_root_step_after_local('      - id: root\n')
+
+    def test_if_first_root_step(self):
+        self.check_root_step_after_local('      - if: always()\n')
+
+    def test_env_first_root_step(self):
+        self.check_root_step_after_local('      - env:\n          EXAMPLE: value\n')
+
+    def test_later_job_defaults_do_not_mask_final_root_step(self):
+        code = ('jobs:\n  root:\n    steps:\n'
+                '      - run: python -m unittest discover -s tests\n'
+                '  plugin:\n    defaults:\n      run:\n'
+                '        working-directory: plugins/example\n'
+                '    steps:\n      - run: echo example\n')
+        self.assertEqual(_tests_dir_runs(code), [code.index('unittest discover')])
+
+    def test_continued_pytest_command_is_root_consumer(self):
+        code = ('      - run: |\n'
+                '          pytest -q ' + '\\\n' +
+                '            tests\n')
+        self.assertEqual(_tests_dir_runs(code), [code.index('pytest')])
+
+    def test_nested_list_does_not_split_local_step(self):
+        local = ('      - name: Plugin tests\n'
+                 '        working-directory: plugins/example\n'
+                 '        with:\n'
+                 '          items:\n'
+                 '            - key: value\n'
+                 '        run: python -m pytest tests\n')
+        self.assertEqual(_tests_dir_runs(local), [])
+
+    def test_root_run_after_nested_list_is_consumer(self):
+        code = ('      - name: Root tests\n'
+                '        with:\n'
+                '          items:\n'
+                '            - key: value\n'
+                '            - working-directory: plugins/example\n'
+                '        run: python -m unittest discover -s tests\n')
+        self.assertEqual(_tests_dir_runs(code), [code.index('unittest discover')])
+
+    def test_working_directory_first_local_step(self):
+        local = ('      - working-directory: plugins/example\n'
+                 '        run: python -m pytest tests\n')
+        self.assertEqual(_tests_dir_runs(local), [])
+
+    def test_working_directory_first_root_step_is_consumer(self):
+        for cwd in (".", "./", "${{ github.workspace }}"):
+            code = (f'      - working-directory: "{cwd}"\n'
+                    '        run: python -m unittest discover -s tests\n')
+            with self.subTest(cwd=cwd):
+                self.assertEqual(_tests_dir_runs(code), [code.index('unittest discover')])
+
+    def test_action_input_working_directory_does_not_mask_root_step(self):
+        # `with: working-directory:` is an action input two columns below the step key, not the step's cwd.
+        # Pins the key-column match: widening it to "that column or deeper" would hide this root run.
+        code = ('      - name: Root tests\n'
+                '        with:\n'
+                '          working-directory: plugins/example\n'
+                '        run: python -m unittest discover -s tests\n')
+        self.assertEqual(_tests_dir_runs(code), [code.index('unittest discover')])
+
+    def test_root_equivalent_working_directory_is_consumer(self):
+        for cwd in ('./.', '"./."', "'./.'", './', '././', '"${{ github.workspace }}/"',
+                    '${{github.workspace}}', '"${{ github.workspace }}/."', '""', ''):
+            code = (f'      - name: Root tests\n        working-directory: {cwd}\n'
+                    '        run: python -m unittest discover -s tests\n')
+            with self.subTest(cwd=cwd):
+                self.assertEqual(_tests_dir_runs(code), [code.index('unittest discover')])
+
+    def test_block_scalar_working_directory_is_treated_as_root(self):
+        # Block scalars are not resolved here; over-report rather than mask a genuine root test run.
+        for indicator in ('>-', '|', '>', '|-', '|2'):
+            for value in ('.', 'plugins/example'):
+                code = (f'      - name: Root tests\n        working-directory: {indicator}\n'
+                        f'          {value}\n'
+                        '        run: python -m unittest discover -s tests\n')
+                with self.subTest(indicator=indicator, value=value):
+                    self.assertEqual(_tests_dir_runs(code), [code.index('unittest discover')])
+
+    def test_unresolved_or_nonrelative_directories_are_consumers(self):
+        # Do not evaluate YAML, Actions contexts, shell variables or runner-specific absolute paths.
+        for cwd in ('${{ GITHUB.WORKSPACE }}', '${{ GiThUb.WoRkSpAcE }}/.',
+                    '${{ env.ROOT }}', '${{ inputs.dir }}',
+                    'plugins/${{ inputs.dir }}', '${{ env.ROOT }}/plugins/example',
+                    '!!str .', '*root', '&root .', '!custom plugins/example',
+                    '/home/runner/work/example/example', '/home/runner/work/example/example/plugins/example',
+                    'C:\\actions\\example', '\\\\server\\share',
+                    '$GITHUB_WORKSPACE', '${GITHUB_WORKSPACE}/plugins/example',
+                    '$GITHUB_WORKSPACE/plugins/example', 'plugins/$SUBDIR',
+                    '../example', 'plugins/../../example'):
+            for quoted in (cwd, '"' + cwd + '"', "'" + cwd + "'"):
+                code = (f'      - working-directory: {quoted}\n'
+                        '        run: python -m pytest tests\n')
+                with self.subTest(cwd=quoted):
+                    self.assertEqual(_tests_dir_runs(code), [code.index('pytest')])
+
+    def test_live_consumer_inventory_is_exact(self):
+        self.assertEqual(
+            {path.name for pattern in ('*.yml', '*.yaml') for path in WORKFLOWS.glob(pattern)
+             if _tests_dir_runs(_workflow_code(path.read_text()))},
+            {'plugin-suites.yml', 'repo-guards.yml', 'skill-tests.yml'})
+
+    def test_plugin_local_spellings_stay_masked(self):
+        for cwd in ('plugins/example', './plugins/example', 'plugins/example/../example',
+                    '"plugins/example"', "'plugins/example'",
+                    '"${{ github.workspace }}/plugins/example"',
+                    '"${{ GITHUB.WORKSPACE }}/plugins/example"'):
+            local = (f'      - name: Plugin tests\n        working-directory: {cwd}\n'
+                     '        run: python -m pytest tests\n')
+            with self.subTest(cwd=cwd):
+                self.assertEqual(_tests_dir_runs(local), [])
+
+    def test_comments_and_other_test_directories_are_not_consumers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workflows = Path(directory) / "workflows"
+            shutil.copytree(WORKFLOWS, workflows)
+            (workflows / "not-a-consumer.yaml").write_text(
+                "# scripts/test-all\n# python -m unittest discover -s tests\n"
+                "# pytest tests\n"
+                "      - run: pytest plugins/example/tests # pytest tests\n"
+                "      - run: python -m unittest discover -s tests_other\n")
+            result = self.check_workflows(workflows)
+            self.assertTrue(result.wasSuccessful(), result.failures)
+
 
 class SuiteSelection(unittest.TestCase):
     @classmethod
@@ -170,8 +536,28 @@ class SuiteSelection(unittest.TestCase):
         # ci_run_cancel.py since c89ec6c6) is selected with it.
         picked = self.pick("skills/devops/github-ci-wait/SKILL.md")
         self.assertIn("skills/devops/github-ci-wait", picked)
-        self.assertNotIn("plugins/ask-gate", picked)
+        # ask-gate now references push-guard, which references this skill: it is a
+        # legitimate transitive dependent, not a stable unrelated-suite control.
+        self.assertIn("plugins/push-guard", picked)
+        self.assertIn("plugins/ask-gate", picked)
         self.assertIn("plugins/inbox", self.pick("desktop-plugins/inbox/plugin.js"))
+
+    def test_skill_dependency_closure_excludes_unrelated_suite(self):
+        # Keep negative coverage independent of the evolving repository graph.
+        suites = ["skills/devops/example", "plugins/direct", "plugins/transitive",
+                  "plugins/unrelated", "repo-guards", "tests"]
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            for suite, source in {
+                "plugins/direct": 'SKILL = "skills/devops/example/scripts/check.py"',
+                "plugins/transitive": 'DEPENDENCY = "plugins/direct/helper.py"',
+                "plugins/unrelated": 'VALUE = 1',
+            }.items():
+                directory = root / suite
+                directory.mkdir(parents=True)
+                (directory / "helper.py").write_text(source)
+            picked, _ = self.mod.select(root, suites, ["skills/devops/example/SKILL.md"])
+            self.assertEqual(picked, suites[:3])
 
 
 class ChangedPaths(unittest.TestCase):
@@ -232,6 +618,32 @@ class Summary(unittest.TestCase):
                 {"name": "plugins/a", "status": "PASS", "passed": 1, "failed": 0, "errors": 0, "skipped": 0}]}))
             with redirect_stdout(StringIO()):
                 self.assertEqual(mod.summary(res), 0)
+
+    def test_failing_suite_names_its_failed_test_ids_and_log(self):
+        # pytest's 4,500 skip rows push FAILED rows out of test-all's tail; the receipt carries them instead.
+        mod = _load_selector()
+        with tempfile.TemporaryDirectory() as d:
+            res = Path(d, "r.json")
+            res.write_text(json.dumps({"python": "3.14.10", "suites": [
+                {"name": "plugins/coach", "status": "FAIL", "passed": 3067, "failed": 2, "errors": 1, "skipped": 4560,
+                 "failed_ids": ["FAILED plugins/coach/tests/test_a.py::T::test_one",
+                                "ERROR plugins/coach/tests/test_b.py::test_two"],
+                 "log_path": "/x/plugins_coach-abc.log", "log_sha256": "f" * 64}]}))
+            out = StringIO()
+            with patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(Path(d, "summary.md"))}), \
+                    redirect_stdout(out):
+                self.assertEqual(mod.summary(res), 1)
+            text = out.getvalue()
+            self.assertIn("::error title=plugins/coach failed test on Python 3.14.10::"
+                          "FAILED plugins/coach/tests/test_a.py::T::test_one", text)
+            self.assertIn("ERROR plugins/coach/tests/test_b.py::test_two", text)
+            self.assertIn("plugins_coach-abc.log sha256 " + "f" * 64, text)
+            self.assertIn("- `FAILED plugins/coach/tests/test_a.py::T::test_one`", Path(d, "summary.md").read_text())
+            # A pre-existing receipt without failed_ids still summarizes.
+            res.write_text(json.dumps({"python": "3.14.10", "suites": [
+                {"name": "plugins/coach", "status": "FAIL", "passed": 1, "failed": 1, "errors": 0, "skipped": 0}]}))
+            with redirect_stdout(StringIO()):
+                self.assertEqual(mod.summary(res), 1)
 
 
 if __name__ == "__main__":

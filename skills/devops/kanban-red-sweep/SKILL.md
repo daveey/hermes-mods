@@ -53,10 +53,11 @@ of `{"argv": ["approved-reader", "..."]}`. Each authorized unattended reader mus
 `red_cards.py list --local-json` from that gateway. Discover the full gateway roster before
 configuring it; include offline gateways, not only currently reachable ones. Never add SSH
 credentials or enable a transport to evade an approval. Missing configuration and failed
-readers print `unreachable ...`; neither means zero cards. Replicas can lag and do not prove
+readers print `unreachable ...`; neither means zero cards: read those gateways directly (and set up
+managed-worker readers) per `references/remote-homed-cards.md`. Replicas can lag and do not prove
 owner reachability. Check the roster against configured readers each sweep; an omitted gateway
 is a coverage gap. A live local non-red row takes precedence over its stale replica.
-For managed workers, check the monitor host's already-authorized instance-role SSM route before leaving a placeholder unreachable reader. Discover running instances by exact configured identity, require a unique match, and use GetCommandInvocation (ListCommandInvocations may be intentionally denied). A bounded read-only snapshot can ship a reviewed pinned collector when the worker's installed CLI is older. Keep the whole reader below the inventory caller timeout, bound delivery/execution too, compress stdout to stay within SSM's response cap, and fail closed on truncated output. Never grant new IAM access or restart a worker to make inventory green. Record gateway-local blocked-event IDs: replica event IDs are not owner event IDs.
+Record gateway-local blocked-event IDs: replica event IDs are not owner event IDs.
 
 Classify decision-session items alongside cards. Re-test stale `us_*` premises and withdraw
 through the supported user-steps/action_request withdrawal route; never edit `state.db`.
@@ -79,7 +80,8 @@ did not end with `end_reason='startup_orphan_reap'`. Report **unlinked** (no lin
 **reaped-only** cards separately: no chat will ever pick them up.
 
 Then for each card read the latest ~6 `task_events` and the last 2 `task_comments`. The latest comment often
-already says "resolved", "green again" or "replacement found". The block reason alone is stale evidence.
+already says "resolved", "green again" or "replacement found". The block reason alone (newest `blocked` event payload, not a `tasks`
+column) is stale evidence.
 For a card from a recurring reporter, also list newer cards with the same title or `created_by`: a done sibling
 may have settled the question. Then read the files it claims on disk, since a redeploy from the tracked source
 can revert a worker's local edit after the card reported it.
@@ -88,6 +90,7 @@ can revert a worker's local edit after the card reported it.
 
 | Finding | Action |
 |---|---|
+| Card owns an open core PR (base `main`, published by it), in any red or triage state | Spare it before any row below: never archive it; on its home board `hermes kanban spend-budget <id> --exempt --reason "<user's words>"`, then `promote` it if spend-triaged. The PR's fate stays with its owner (the user ruled core PR owners are never culled: an archived or spend-held owner orphans a written PR). The guard freeze bars new guard cards, not this. Find orphaned PRs from the full `gh pr list --base main --state open`, not from the cards that mention them: an owner that finished `done` without landing orphans its PR too |
 | Comment or live check shows the ask is already satisfied (PR merged, CI green, cert present, host back) | Verify the artifact yourself, comment the evidence, then `kanban_complete`/`hermes kanban complete`, or unblock so the owner finishes |
 | Premise is false: account suspended or renamed, repo moved, PR closed, host retired, work superseded by a newer owner | Comment the evidence, archive it (superseded), or unblock it so the owner re-plans |
 | Silent-default decision (`human_request` says "no answer = X") older than a few days | Apply the default: comment "silence = default X", then archive or complete as the card says |
@@ -108,15 +111,13 @@ gave (Gate G). A rejected guard is never bypassed with another writer.
 
 ## Prevent the decision block in the worker
 
-Carry this rule into worker skills and card templates, not only the sweep: when evidence supports a recommended option inside the card's limits and normal review and landing gates, apply it rather than asking. Comment the pick and how to reverse it, then continue. Never bypass review or required CI.
-
-Reserve a human block for real money above standing envelopes; permissions or credentials; other people; safety or privacy consent; hard-to-reverse effects; changing a fixed test, threshold or target after its result; or genuinely toss-up options with no evidence of the user's preference. A recommended choice is not permission to cross those boundaries. A block-time warning is advisory: a successful block still ends the run, and must not be followed by another lifecycle call.
-
-Prevent acceptance-change surprises at card creation instead (slug `acceptance-waiver-owner-decision`): a card with a numeric gate states each threshold and preregisters, before execution and with independent review of the plan, one `IF FAIL <check>: <next step>` line per gate (re-measure once on fresh seeds, report FAIL and stop, file the decision card with options). A branch decides the next step; it never waives or passes the check. The worker then reports `metadata.acceptance_results` honestly (`fail` + the `branch` it followed) and the kanban-honest-done plugin's Gate G refuses a waived or guessed pass. When no branch fits, the honest outcome is a needs_input block naming the changed limit ("waives check 4", "lowers the 25% target"); that ask is legitimate, not avoidable.
+Read `references/prevent-decision-blocks.md` (apply-the-recommendation rule, `IF FAIL` branches at creation).
 
 ## 3. Act
 
 - Unblock: `kanban_unblock` (or `hermes kanban unblock <id>` for triage/scheduled), always after a comment that says what changed.
+  A `triage` card with a `spend_budget_triaged` event needs `hermes kanban promote <id>` after a re-scope comment:
+  `unblock` prints "released", then the next tick silently re-triages it. Read back status a tick later.
   Any card comment (unblock, move, correction) cites only facts you checked this turn. Another card's "PR landed" is a
   self-report until `gh pr view <N> -R <repo> --json state,mergedAt` shows it merged, and the owner acts on your comment as fact.
 - A PR completion contract runs `pr_acceptance` with the **assignee profile's** `gh` login, not yours, so wrapping
@@ -125,7 +126,7 @@ Prevent acceptance-change surprises at card creation instead (slug `acceptance-w
 - `complete` is also checked against the card's acceptance. When it's refused because the acceptance still has open
   steps (live checks, a PR on a moved repo), comment the corrected premise and unblock so the owner finishes. Don't force it.
 - A child can't complete before its blocked parent. When you've done the parent's work yourself, complete the parent first.
-- Cards whose dependents wait on them: unblocking or completing promotes the children. Check them, queue position
+- Cards whose dependents wait on them: unblocking, completing or archiving promotes the children. When you drop a parent and its waiting child together, archive the child first: a pool worker claims a promoted card within seconds, and the archive then waits on its live lease. Check them, queue position
   included: a promoted card keeps its old low priority and sits behind the queue you just cleared for its parent.
   A child that is paused by decision and was only parked behind this card as a makeshift hold would restart: give
   it its own hold first (`hermes kanban schedule <child> --wake-check 'test -f <approval marker>' --check-every 3600
@@ -165,16 +166,7 @@ Prevent acceptance-change surprises at card creation instead (slug `acceptance-w
   (`journalctl -k | grep -i 'out of memory'`) and the last log file in the card's workspace, find the surviving
   worktree, and comment cause, worktree path and a capped first command for the next run, then bump.
 - `no such task ... not imported here; last pickup skip: ...` on the hub means the card lives on the gateway that
-  created it (a worker's run filed it pinned to the hub). `hermes kanban edit` here fails with "unknown id" and a
-  plain twin `kanban_create` is refused `create_overlap`. Reach the origin box (`cross_task` read names the
-  gateway; `aws ssm send-command` with `sudo -u ubuntu -i bash -lc "hermes kanban ..."`, instance role,
-  us-west-2). A priority raise there is not enough when the skip count keeps climbing (top priority still sat
-  unimported for an hour): replace the card. Create a hub-local twin (`placement='local'`,
-  `distinct_from=[<id>]`, `distinct_reason` = it cannot import and is archived this turn, body = run the
-  original's body with all its limits, first step = stop if the original started), then comment and
-  `hermes kanban archive <id>` on the origin box and read back `archived`, so one owner remains.
-  A hub card parented on such an unimported card sits `todo` forever (`parent_missing` in its events, parent
-  absent from the hub's `tasks`): `kanban_unlink` it once its own acceptance is met or the twin exists.
+  created it: read `references/remote-homed-cards.md` (reach the origin box, or replace it with a hub-local twin).
 - A `ready` card that already ran and has an open PR: before bumping it, read `hermes kanban show <id>`
   Diagnostics and the PR (`gh pr view <N> --json state,mergeStateStatus,statusCheckRollup`). A hold of
   `respawn_guarded: active_pr` keeps the card from restarting until its PR merges or closes, so no priority
@@ -247,22 +239,23 @@ and the final response.
 
 ## Pitfalls
 
+- A remote-homed card's replica row (`kanban/sync-shadow/`) is only as fresh as its home gateway's newest event: a
+  sleeping Mac's heartbeats arrive late in a batch. Check that age first, then the host's own board, and report
+  "unknown" rather than "stalled" when it is stale (`references/replica-freshness.md`).
 - `gh` on the hub default profile is not logged in. Use `token-broker exec --scope user/github -- gh ...`.
 - `gh pr edit` can fail on a deprecated-Projects GraphQL error and change nothing. Use REST and read it back:
   `gh api -X PATCH repos/<o>/<r>/pulls/<N> --input body.json`, `gh api -X POST repos/<o>/<r>/issues/<N>/labels -f 'labels[]=<l>'`.
 - Released links (`released=1`) look linked in a raw join. Filter `released=0`.
-- A session ended by `startup_orphan_reap` still shows as unarchived but will never act. Treat it as no owner.
-- The Desktop "For you" panel lists asks from every gateway. Cards that live on another gateway's board are read
-  with `cross_task`, not this host's sqlite.
+- A `startup_orphan_reap` session owns no chat work, yet still wakes on its cards' notices and publishes For-you
+  asks. A `decision_session` row with choices for a card means the user can answer it any second: leave that card to him
+  unless he told you to decide; then write only behind a guard that aborts on any event or comment since the ask.
+  The row vanishes once the owner session starts another turn (outcome `running`), yet the ask stays open until the
+  card leaves `blocked` (archive logs `request_withdrawn`): `decision_sessions=0` does not mean no live ask.
 - Don't publish the "may I sweep?" question as an approval tile first: this skill is the approval.
 - Write the sweep report as plain markdown. A `::user-step{...}` directive in a reply publishes its text as a
   For-you request, so a status table inside one becomes a fake ask that has to be withdrawn.
-- "No red cards" from the hub's sqlite is not "no red chats". The sidebar paints a chat red from
-  `sessions.outcome_json` kind `decision` (hub `state.db`), fed by blocked cards on any gateway (the MacBook board
-  alone can hold many) and by chat-level asks (`us_*` item ids) that are not cards. `red_cards.py list`
-  covers both; remote cards are commented and unblocked on their own host, `cross_task` only reads and comments.
-  Macs: `tailnet_exec` with the tailnet host (`mbp`, `mini`), not the gateway name. Workers:
-  `~/.hermes/bin/hub-worker-exec worker-N -- bash -lc "hermes kanban comment <id> -- '...' && hermes kanban unblock <id>"`.
+- "No red cards" from the hub's sqlite is not "no red chats", and a remote card is acted on on its own host. Before
+  reading or writing another host's cards or hand-running its `wake_check`, read `references/remote-homed-cards.md`.
 - A chat still painted red after its cards finished: run `hermes sessions outcome <id> --refresh` on its gateway. It
   re-derives the outcome from live cards, so a decision about a done card becomes `done`. Never edit `state.db`.
 - Chat-level asks (`us_*` extracted user-steps, For-you requests) can only be withdrawn by the chat that owns them;
@@ -270,9 +263,6 @@ and the final response.
   `cross_session send` that quotes the user's delegation and names the exact asks; it re-tests and withdraws. Read the reply.
 - The For-you list injected at turn start can lag a withdrawal. The `withdraw` result's `state`/`withdrawal.at` is the
   live answer; check it before re-withdrawing or telling the user something waits on him.
-- Priority-cap rollout (#1137): an upgraded host stores at most 1000 (`kanban edit --priority 60100` prints `Edited`
-  and stores 1000), while un-migrated lanes still hold old values up to 60000+. A capped card can't get ahead there:
-  move it to an idle machine (`kanban move --runs-on`); never raise it through an uncapped writer. Read back every edit.
 - `kanban_create`/`move` refuse a machine on Board hold (`machine_held`). `hermes-mail admin machine-audit <m>` on the
   hub shows the hold reason and release time. A hold is deliberate, so never clear it to place a card.
 - A sequential core rollout (one worker at a time) moves its hold to the next worker minutes after the last one
@@ -291,10 +281,7 @@ and the final response.
   approved PR's card, intersect `git diff --name-only $(git merge-base HEAD origin/main) HEAD` with the same diff
   against `origin/main`. On overlap, the card needs a rebase plus a new review, so review custody no longer pins it to
   the old host: move it to a worker with free slots, and have the new review pinned to that worker.
-- To find a PR's owner card, start from the review card the notice names: the owner is usually its child link
-  (`cross_task read <review id>`, or the Mac's `kanban/sync-shadow/*.db`). Otherwise match its branch name
-  (`headRefName`, e.g. `wt/<slug>`) and the card ids in the PR body against card bodies and comments on every host.
-  Searching only for `PR<n>`/`#<n>` misses owners that published the PR after their body was written.
+- Finding a PR's owner card, the open-PR owner census and restoring an archived owner: `references/pr-owner-cards.md`.
 - Count a worker's free slots before moving cards to it: `max_in_progress` minus running, and check
   `kanban_pickup_skips` for recent `budget_exhausted` rows. One free slot with several contenders is not capacity.
 - A burst of `rate_limited` runs (`HTTP 429 ... quota unavailable for openai-codex/...`) is not an outage by itself.
@@ -311,16 +298,19 @@ and the final response.
   giving a reason that names the owning surface, so the user isn't asked twice.
 - An old ask missing what unblock and archive mean: amend it in place with `hermes kanban block <id> "<same reason>"
   --human-request "$(cat hr.json)" --metadata-only` (prints `Classified ... (metadata only; remains parked)`). Read the
-  current human_request and block reason first (tasks row or last block event payload), so only the action changes.
-- Before saying an ask is still blocked, re-read it: the user may have answered on another surface since the last read.
+  current human_request and block reason first (newest `blocked` event payload), so only the action changes.
+- Re-read each card's status and new events inside the script that writes to it; skip it if another chat changed it.
+
+- Before re-parking a linked card for days or ending a sweep chat, read `references/sweep-chat-status.md` (why the chat stays grey).
 
 ## Done means
+- [ ] If this chat created a cron or re-parked a linked card, does `hermes sessions outcome <id> --refresh --json` show no cron it still owns and no long-parked card it waits on (or the reply says which one and until when)?
 - [ ] Scope matched his words (step 0): a not-ready/Todo/Scheduled ask got the `waiting` audit at the top of the reply, not a red sweep?
 - [ ] Every board was inventoried, and the count per board and status was reported?
 - [ ] Each red card was classified with a live premise check, not from the block reason alone?
-- [ ] Every agent-clearable card was completed, archived or unblocked, each with an evidence comment?
+- [ ] Every agent-clearable card was completed, archived or unblocked, each with an evidence comment, and every open core PR (bots aside) still has a live owner card that isn't spend-triaged, by a census that read archived rows too (`references/pr-owner-cards.md`)?
 - [ ] Each decision card was either unblocked on your recommendation (comment says it is a guess under the standing rule) or asked because you were really unsure?
 - [ ] Cards still waiting on the user are linked via `notify-subscribe --platform tui`, read back `released=0`?
 - [ ] The remaining asks went out as no-timeout `clarify` batches (recommended first, Skip last, no card ids), each answer recorded on its card, and stale For-you requests withdrawn?
-- [ ] The report names the unlinked and reaped-only cards that still need the user?
+- [ ] The report names the unlinked and reaped-only cards that still need the user, and every status and count in it was read on its home board this turn (he may have answered since), earlier-turn writes worded as earlier (coach `claimed_mutation` rejects older write claims)?
 - [ ] Every red card has a `red_cards.py log` line with class, action, avoidable and a prevention slug, and any slug at 3+ in `stats` has its one prevention card?
