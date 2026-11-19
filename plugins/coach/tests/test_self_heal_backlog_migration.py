@@ -233,6 +233,104 @@ def test_apply_provenance_idempotent(tmp_path):
     assert first["queued"]
 
 
+def test_prune_count_and_provenance_fail_closed(tmp_path):
+    st = store(tmp_path)
+    for prunes in ({"rows": []}, {"rows": [{"fingerprint": FP}]}):
+        with pytest.raises(mig.DigestMigrationError, match="manual-prune provenance"):
+            mig.migrate_digest_backlog(sh, st, inventory=inventory([comment(1)]),
+                                      prunes=prunes, expected_prune_count=1)
+    assert not list(st.root.iterdir())
+
+
+def test_cli_defaults_readonly_then_explicit_apply(tmp_path, monkeypatch, capsys):
+    st = store(tmp_path)
+    inv = tmp_path / "inventory.json"
+    prunes = tmp_path / "prunes.json"
+    inv.write_text(json.dumps(inventory([comment(1)])))
+    prunes.write_text(json.dumps({"rows": []}))
+    monkeypatch.setattr(sh, "is_hub", lambda: True)
+    monkeypatch.setattr(sh, "_store", lambda _: st)
+    args = ["backlog-migrate", "--inventory", str(inv), "--prunes", str(prunes), "--expected-prunes", "0"]
+    assert sh.main(args) == 0
+    assert json.loads(capsys.readouterr().out)["dry_run"] is True
+    assert not pending_rows(st)
+    assert sh.main(args + ["--apply"]) == 0
+    assert json.loads(capsys.readouterr().out)["dry_run"] is False
+    assert FP in pending_rows(st)
+    monkeypatch.setattr(sh, "is_hub", lambda: False)
+    assert sh.main(args + ["--apply"]) == 2
+
+
+def test_concurrent_pending_change_fails_closed(tmp_path, monkeypatch):
+    import contextlib
+    st = store(tmp_path)
+    real = sh._admission_lock
+
+    @contextlib.contextmanager
+    def racing(*a, **kw):
+        db = sh._pending_db(st)
+        try:
+            with db:
+                db.execute("INSERT INTO pending VALUES (?, ?, ?, ?)",
+                           (FP, json.dumps(detection(quote="concurrent")), NOW, "new"))
+        finally:
+            db.close()
+        with real(*a, **kw):
+            yield
+
+    monkeypatch.setattr(sh, "_admission_lock", racing)
+    with pytest.raises(mig.DigestMigrationError, match="snapshot changed"):
+        mig.migrate_digest_backlog(sh, st, inventory=inventory([comment(1)]),
+                                  prunes={"rows": []}, dry_run=False, now=NOW)
+    assert pending_rows(st)[FP]["quote"] == "concurrent"
+    assert mig._read_provenance(sh, st) == set()
+
+
+def test_history_failure_replays_without_loss_or_double_count(tmp_path, monkeypatch):
+    st = store(tmp_path)
+    sh.LaneState(st.root).update(FP, status="fixed", card="t_owner")
+    inv = inventory([comment(i, detection(at=NOW-i, quote=f"observation {i}")) for i in range(45)])
+    real = sh.LaneState._apply
+    calls = []
+
+    def fail_once(lane, fp, kw):
+        result = real(lane, fp, kw)
+        calls.append(fp)
+        if len(calls) == 30:
+            raise OSError("simulated interrupted history write")
+        return result
+
+    monkeypatch.setattr(sh.LaneState, "_apply", fail_once)
+    with pytest.raises(OSError, match="interrupted"):
+        mig.migrate_digest_backlog(sh, st, inventory=inv, prunes={"rows": []}, dry_run=False, now=NOW)
+    assert not mig._read_provenance(sh, st)
+    monkeypatch.setattr(sh.LaneState, "_apply", real)
+    mig.migrate_digest_backlog(sh, st, inventory=inv, prunes={"rows": []}, dry_run=False, now=NOW)
+    lane = sh.LaneState(st.root).get(FP)
+    assert lane["status"] == "fixed"
+    assert lane["backlog_evidence"]["occurrence_count"] == 45
+    assert not pending_rows(st)
+    before = (st.root / "selfheal_lane.json").read_bytes()
+    mig.migrate_digest_backlog(sh, st, inventory=inv, prunes={"rows": []}, dry_run=False, now=NOW)
+    assert (st.root / "selfheal_lane.json").read_bytes() == before
+
+
+def test_canonical_import_preserves_existing_key_and_original_backup(tmp_path, monkeypatch):
+    st = store(tmp_path)
+    canonical = "agent-canonical"
+    monkeypatch.setattr(sh, "canonicalize", lambda d: {
+        **d, "fingerprint": canonical, "canon_fingerprint": canonical,
+        "raw_fingerprint": d["fingerprint"]})
+    inv = inventory([comment(1), comment(2, detection(fingerprint="agent-alias", quote="other"))])
+    mig.migrate_digest_backlog(sh, st, inventory=inv, prunes={"rows": []}, dry_run=False, now=NOW)
+    assert list(pending_rows(st)) == [canonical]
+    backup = (st.root / "selfheal_pending.sqlite.bak").read_bytes()
+    inv["cards"][0]["comments"].append(comment(3, detection(fingerprint="agent-third", quote="third")))
+    mig.migrate_digest_backlog(sh, st, inventory=inv, prunes={"rows": []}, dry_run=False, now=NOW)
+    assert pending_rows(st)[canonical]["fingerprint"] == canonical
+    assert (st.root / "selfheal_pending.sqlite.bak").read_bytes() == backup
+
+
 def test_board_inventory_uses_ro_helper(tmp_path, monkeypatch):
     db = tmp_path / "kanban.db"
     con = sqlite3.connect(db)

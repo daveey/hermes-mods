@@ -8172,9 +8172,35 @@ def main(argv=None) -> int:
     controls.add_argument("fp")
     controls.add_argument("--board", default="default")
     controls.add_argument("--reason", default="")
+    migration = sub.add_parser("backlog-migrate", help="import historical digest evidence; read-only by default")
+    migration.add_argument("--inventory", default="board")
+    migration.add_argument("--prunes", required=True, help="complete manual-prune provenance JSON")
+    migration.add_argument("--expected-prunes", required=True, type=int)
+    migration.add_argument("--board", choices=("default",), default="default")
+    migration_mode = migration.add_mutually_exclusive_group()
+    migration_mode.add_argument("--apply", action="store_true")
+    migration_mode.add_argument("--dry-run", action="store_true")
     sub.add_parser("status", help="lane state + budget")
     a = ap.parse_args(argv)
-    if a.cmd == "backlog":
+    if a.cmd == "backlog-migrate":
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("coach_backlog_migration", Path(__file__).with_name("backlog_migration.py"))
+        assert spec is not None and spec.loader is not None
+        migration_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(migration_mod)
+        try:
+            if not is_hub():
+                raise ValueError("backlog migration must run on the hub")
+            if a.expected_prunes < 0:
+                raise ValueError("expected-prunes must be nonnegative")
+            report = migration_mod.migrate_digest_backlog(
+                sys.modules[__name__], _store(None), inventory=a.inventory, prunes=a.prunes,
+                expected_prune_count=a.expected_prunes, dry_run=not a.apply, board=a.board)
+            print(json.dumps(report))
+        except ValueError as exc:
+            print(json.dumps({"error": str(exc)}))
+            return 2
+    elif a.cmd == "backlog":
         try:
             print(json.dumps(backlog_control(a.action, a.fp, a.board, a.reason)))
         except ValueError as exc:
