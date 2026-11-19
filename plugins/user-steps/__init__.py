@@ -467,7 +467,7 @@ def transform_llm_output(response_text: str = "", session_id: str = "", platform
         _trace(hook="transform", session=session_id, platform=platform, source=out.get("source"),
                new=[s["id"] for s in out.get("steps", [])], resolved=out.get("resolved"),
                framed=out.get("text") is not None, error=out.get("error"), card_asks=out.get("card_asks"),
-               dropped_terminal=out.get("dropped") or None)
+               dropped_terminal=out.get("dropped") or None, diagnostics=out.get("diagnostics"))
         return out.get("text")
     except Exception as exc:
         _trace(hook="transform", session=session_id, platform=platform, exception=repr(exc)[:300])

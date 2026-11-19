@@ -1226,16 +1226,17 @@ function requestNeedsReadback(scope, r) {
   return !!(op?.decision || r.resolution?.operationId || recoverIntent(key, r))
 }
 /** Open asks for the focused chat that need the user (agent-pending and dismissed ones excluded). */
-export function openAskCount() {
+export function openAskCount() { return openAskKeys().length }
+export function openAskKeys() {
   const scope = routeKey(decisionRoute())
-  if (!decisionRoute().session || canonical.scope !== scope) return 0
+  if (!decisionRoute().session || canonical.scope !== scope) return []
   return canonical.requests.filter(r => {
     const key = `${scope}:${requestKey(r)}`, op = operations.get(key)
     // Terminal backend state is durable confirmation, not a new ask on reload.
     // Still read it back when the expanded queue mounts, and retain local failures.
     if (['resolved','superseded','cancelled'].includes(r.state) && r.resolution?.revision === r.revision && !op?.decision && !recoverIntent(key, r)) return false
     return requestNeedsReadback(scope, r) || (!r.resolution && ['open','needs_context'].includes(r.state) && !agentPending(r) && !isRequestDismissed(r))
-  }).length
+  }).map(r => `${scope}:${requestKey(r)}:${r.revision}`).sort()
 }
 
 /** Queue membership before search/minimize; shared with card-status dedup. */
@@ -1374,7 +1375,7 @@ export default {
     ctx.register({ id: 'decision-list-directive', area: TRANSCRIPT_DIRECTIVE_AREA, data: { name: 'decision-list', render: props => jsx(DecisionList, props) } })
     const onVis = () => { if (typeof document !== 'undefined' && document.hidden) return; void refresh(); void refreshRequests() }
     if (typeof document !== 'undefined') document.addEventListener('visibilitychange', onVis)
-    if (typeof window !== 'undefined') window.__userSteps = { version: VERSION, ownsComposer: true, get snapshot() { return snapshot }, refresh, refreshRequests, warm, subscribe: fn => { canonicalSubs.add(fn); return () => canonicalSubs.delete(fn) }, requestForSource: source => canonical.scope === routeKey(decisionRoute()) ? requestForSource(canonical.requests, source) : null, presentationForSource, hasQueuePresentation, ActionQueue, Strip, openAskCount }
+    if (typeof window !== 'undefined') window.__userSteps = { version: VERSION, ownsComposer: true, get snapshot() { return snapshot }, refresh, refreshRequests, warm, subscribe: fn => { canonicalSubs.add(fn); return () => canonicalSubs.delete(fn) }, requestForSource: source => canonical.scope === routeKey(decisionRoute()) ? requestForSource(canonical.requests, source) : null, presentationForSource, hasQueuePresentation, ActionQueue, Strip, openAskCount, openAskKeys }
     signalDecisionChanges()
     return () => {
       if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onVis)
