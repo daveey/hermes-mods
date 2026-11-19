@@ -11,6 +11,18 @@ export async function resolve(spec, ctx, next) {
 }`))
 const m = await import('../plugin.js')
 
+test('local blocked upstream passes through; older rows omit it', async () => {
+  const blocked_upstream = { id: 'parent', status: 'blocked' }
+  globalThis.window = { hermesDesktop: { api: async () => ({ tasks: [
+    { id: 'held', status: 'todo', blocked_upstream }, { id: 'plain', status: 'todo' }
+  ] }) } }
+  try {
+    const chips = await m.loadKanban(new Set(['upstream']))
+    assert.deepEqual(chips.find(c => c.id === 'held').blockedUpstream, blocked_upstream)
+    assert.equal('blockedUpstream' in chips.find(c => c.id === 'plain'), false)
+  } finally { delete globalThis.window }
+})
+
 // Successful reader fixtures need a resolved route; undefined now means unknown.
 beforeEach(async () => {
   const { host } = await import('@hermes/plugin-sdk')

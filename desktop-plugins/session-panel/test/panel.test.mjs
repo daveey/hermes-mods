@@ -73,6 +73,53 @@ test('finished disclosure combines done and archived and remembers expansion onl
 const NOW = Date.parse('2026-10-29T15:00:00Z'), S = NOW / 1000
 const card = (id, state, extra = {}) => ({ key: `kb:${id}`, kind: 'kanban', id, state, label: `Card ${id}`, connectionId: 'C1', profile: 'default', board: 'default', gateway: 'G1', since: S - 600, activityAt: S - 60, ...extra })
 
+test('blocked upstream is a distinct open bucket with precedence controls', () => {
+  const blockedUpstream = { id: 'parent', status: 'triage' }
+  const out = m.classify([
+    card('held', 'todo', { blockedUpstream, runMachine: 'hub' }),
+    card('plain', 'todo'),
+    card('ask', 'blocked', { blockedUpstream, look: 'needs-you' }),
+    card('stale', 'todo', { blockedUpstream, stale: true }),
+    card('done', 'done', { blockedUpstream }),
+    card('stall', 'scheduled', { blockedUpstream, look: 'stalled' })
+  ], { nowMs: NOW })
+  assert.deepEqual(out.blockedUpstream.map(i => i.id), ['held'])
+  assert.equal(out.blockedUpstream[0].detail, 'waiting on blocked parent parent (triage)')
+  assert.deepEqual(out.queued.map(i => i.id), ['plain'])
+  assert.deepEqual(out.unasked.map(i => i.id), ['ask'])
+  assert.deepEqual(out.stuck.map(i => i.id), ['stall'])
+  assert.deepEqual(out.waiting.map(i => i.id), ['stale'])
+  assert.equal(m.counts(out).blockedUpstream, 1)
+  assert.equal(m.hubCounts(out).blockedUpstream, 1)
+  const only = m.classify([card('held', 'todo', { blockedUpstream })])
+  assert.equal(m.hasOpenWork(only), true)
+  m.annotateEvidence(only, NOW)
+  assert.ok(only.blockedUpstream[0].evidenceText)
+})
+
+test('panel renders pink unfilled upstream pip and its own section', async () => {
+  window.localStorage.clear()
+  m.resetDoneCacheForTests()
+  host.state.focusedStoredSessionId.value = 'pink'
+  window.__userSteps = { openAskCount: () => 0 }
+  window.hermesDesktop = { api: async () => ({ tasks: [] }) }
+  window.__sessionTasks = { snapshot: { stored: 'pink', chips: [card('held', 'todo', {
+    blockedUpstream: { id: 'parent', status: 'blocked' },
+    boardStatus: { state: 'todo', readAt: Date.now(), source: 'owner' }
+  })] } }
+  try {
+    await show(J.jsx(m.Panel, {}))
+    const pip = el().querySelector('[data-pip="blockedUpstream"]')
+    assert.ok(pip)
+    assert.equal(m.C.blockedUpstream, '#db61a2')
+    assert.equal(pip.style.border, '1.5px solid rgb(219, 97, 162)')
+    assert.equal(pip.style.background, '')
+    assert.equal(el().querySelector('[data-section="blocked-upstream"]').style.color, 'rgb(219, 97, 162)')
+    assert.match(el().querySelector('[data-status-summary]').textContent, /1 blocked upstream/)
+    assert.match(el().textContent, /waiting on blocked parent parent \(blocked\)/)
+  } finally { await show(null); host.state.focusedStoredSessionId.value = 'S1' }
+})
+
 test('classify sorts cards, sub-agents and processes into sections', () => {
   const memory = new Map()
   const sub = { key: 'sub:a', kind: 'sub', label: 'Drain queue', toolCount: 3, lastTool: 'terminal', since: S - 3600 }
@@ -100,7 +147,7 @@ test('classify sorts cards, sub-agents and processes into sections', () => {
   assert.match(out.stuck[0].detail, /^running, no progress since \d\d:\d\d \(2 h ago\) · last event: heartbeat$/)
   assert.match(out.waiting[0].detail, /^waiting on a timer since \d\d:\d\d$/)
   assert.match(out.waiting[1].detail, /unknown \(sdk projector unavailable\)/)
-  assert.deepEqual(m.counts(out, { asks: 1, done: 4 }), { done: 4, running: 2, needsYou: 2, stuck: 2, waiting: 3, ready: 0, queued: 1 },
+  assert.deepEqual(m.counts(out, { asks: 1, done: 4 }), { done: 4, running: 2, needsYou: 2, stuck: 2, blockedUpstream: 0, waiting: 3, ready: 0, queued: 1 },
     'sub-agents and processes count like the rows listed under each section')
 })
 
@@ -481,7 +528,7 @@ test('hub-scheduled running and waiting cards carry an H in their box; worker ca
   const pips = [...el().querySelectorAll('[data-pip]')].map(x => [x.dataset.pip, x.hasAttribute('data-pip-hub'), x.textContent])
   assert.deepEqual(pips, [['running', true, 'H'], ['running', false, ''], ['ready', true, 'H'], ['waiting', true, 'H'], ['queued', false, '']])
   assert.equal(el().querySelector('[data-progress-pips]').getAttribute('aria-label'), '2 running (1 on hub), 1 ready (1 on hub), 1 waiting (1 on hub), 1 not started')
-  assert.deepEqual(m.hubCounts(m.classify(window.__sessionTasks.snapshot.chips)), { running: 1, stuck: 0, waiting: 1, ready: 1, queued: 0 })
+  assert.deepEqual(m.hubCounts(m.classify(window.__sessionTasks.snapshot.chips)), { running: 1, stuck: 0, blockedUpstream: 0, waiting: 1, ready: 1, queued: 0 })
   const colour = k => window.getComputedStyle(el().querySelector(`[data-pip="${k}"]`))
   assert.equal(m.C.ready, '#3fb950', 'green = ready')
   assert.equal(m.C.needsYou, '#f85149', 'red = blocked on me')

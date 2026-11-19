@@ -262,7 +262,7 @@ const NO_OBSERVATIONS = 'producer_sent_no_observations'
 const legacyLive = (c, ev) => (ev?.reason === NO_OBSERVATIONS || ev?.reason === REPLICA_REASON) && c?.kind === 'kanban' && c.look !== 'needs-you' && LEGACY_LIVE.has(str(c.state))
 export function classify(chips, { nowMs = Date.now(), silence = new Map(), isAsked = () => false, presentationFor = () => null, evidence = () => null } = {}) {
   const now = nowMs / 1000
-  const out = { active: [], stuck: [], waiting: [], ready: [], queued: [], unasked: [], reported: [], lastActivity: 0 }
+  const out = { active: [], stuck: [], blockedUpstream: [], waiting: [], ready: [], queued: [], unasked: [], reported: [], lastActivity: 0 }
   const seen = at => { if (Number(at) > out.lastActivity) out.lastActivity = Number(at) }
   for (const c of chips || []) {
     if (!c || !c.key) continue
@@ -317,6 +317,10 @@ export function classify(chips, { nowMs = Date.now(), silence = new Map(), isAsk
     // legacy fields still say (a cached running card must not read as running). An older producer (no
     // observations array at all) cannot prove live or queued work either: its running/review/ready/todo card is
     // explicit unknown with its last known state; its waits and asks keep their sections.
+    if (c.blockedUpstream && c.look !== 'stalled') {
+      out.blockedUpstream.push({ ...item(c), detail: `waiting on blocked parent ${c.blockedUpstream.id} (${c.blockedUpstream.status})` })
+      continue
+    }
     const ev = evidence(c)
     // A parked card has a board lifecycle but need not have an execution generation.
     // Keep the independent execution verdict below (including unknown progress); never
@@ -349,14 +353,14 @@ export function classify(chips, { nowMs = Date.now(), silence = new Map(), isAsk
  *  step or an agent issue. Done/archived cards never count as open work; history has its own disclosure. */
 export function hasOpenWork(sorted, { asks = 0, steps = [], issues = [] } = {}) {
   const open = list => (list || []).some(i => !(i.kind === 'kanban' && TERMINAL.has(str(i.chip?.state))))
-  return !!(asks || sorted.unasked.length || open(sorted.active) || open(sorted.stuck) || open(sorted.waiting) || open(sorted.ready) || open(sorted.queued) || (sorted.reported || []).length ||
+  return !!(asks || sorted.unasked.length || open(sorted.active) || open(sorted.stuck) || open(sorted.blockedUpstream) || open(sorted.waiting) || open(sorted.ready) || open(sorted.queued) || (sorted.reported || []).length ||
     (Array.isArray(steps) && steps.some(s => s?.id && (s.status || 'open') === 'open')) || (Array.isArray(issues) && issues.length))
 }
 
 /** Attach each work row's evidence line (projected at `nowMs`, never cached); returns how many rows have SOURCE evidence that is unknown (rows with none show their own explicit unknown line). */
 export function annotateEvidence(sorted, nowMs, opts) {
   let unknown = 0
-  for (const list of [sorted.active, sorted.stuck, sorted.waiting, sorted.queued, sorted.unasked]) {
+  for (const list of [sorted.active, sorted.stuck, sorted.blockedUpstream || [], sorted.waiting, sorted.queued, sorted.unasked]) {
     for (const i of list) {
       if (!['kanban', 'bg', 'sub'].includes(i.kind)) continue
       const v = chipObservation(i.chip, nowMs / 1000, opts)
@@ -413,6 +417,7 @@ export function counts(sorted, { asks = 0, done = null } = {}) {
     running: sorted.active.length,
     needsYou: asks + sorted.unasked.length,
     stuck: sorted.stuck.length,
+    blockedUpstream: (sorted.blockedUpstream || []).length,
     waiting: sorted.waiting.length,
     ready: (sorted.ready || []).length,
     queued: sorted.queued.length
@@ -605,22 +610,22 @@ function writeCollapsed(keys) {
 // green = ready, red = blocked on the user, grey = done, yellow = not ready (waiting on something / not started).
 export const C = {
   needsYou: '#f85149', ready: '#3fb950', done: '#8b949e', waiting: '#d29922', queued: '#d29922',
-  running: '#3b82f6', stuck: '#f0883e'
+  running: '#3b82f6', stuck: '#f0883e', blockedUpstream: '#db61a2'
 }
-const LABEL = { done: 'done', running: 'running', needsYou: 'needs you', stuck: 'stuck', ready: 'ready', waiting: 'waiting', queued: 'not started' }
+const LABEL = { done: 'done', running: 'running', needsYou: 'needs you', stuck: 'stuck', blockedUpstream: 'blocked upstream', ready: 'ready', waiting: 'waiting', queued: 'not started' }
 const muted = { color: 'var(--muted-foreground)', fontSize: 12 }
 const heading = color => ({ margin: '12px 0 6px', fontSize: 12, fontWeight: 600, color })
 const btn = { minHeight: 32, padding: '4px 10px', borderRadius: 6, border: '1px solid var(--border)', background: 'transparent', color: 'var(--foreground)', font: 'inherit', fontSize: 12.5, cursor: 'pointer' }
 
 // One small box per card, in the header beside the status: a full-width bar spent a whole row to say "1 waiting".
 // Shape carries state as well as colour: open work is filled, waiting is an outline, not started is dashed.
-const PIP_ORDER = ['needsYou', 'stuck', 'running', 'ready', 'waiting', 'queued', 'done']
+const PIP_ORDER = ['needsYou', 'stuck', 'blockedUpstream', 'running', 'ready', 'waiting', 'queued', 'done']
 export const PIPS_MAX = 24 // boxes drawn before the rest fold into "+N"
 // A hub-scheduled card's box is a little larger and carries an "H" (running and waiting work alike).
 const pipStyle = (k, hub = false) => {
   const base = { width: 9, height: 9, borderRadius: 2, boxSizing: 'border-box', flex: 'none' }
   const h = hub ? { width: 12, height: 12, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', fontSize: 8.5, fontWeight: 700, lineHeight: 1 } : {}
-  if (k === 'waiting') return { ...base, ...h, border: `1.5px solid ${C.waiting}`, color: C.waiting }
+  if (k === 'waiting' || k === 'blockedUpstream') return { ...base, ...h, border: `1.5px solid ${C[k]}`, color: C[k] }
   if (k === 'queued') return { ...base, ...h, border: `1.5px dashed ${C.queued}`, color: C.queued }
   return { ...base, ...h, background: C[k], color: 'var(--card, #fff)' }
 }
@@ -629,7 +634,7 @@ const pipStyle = (k, hub = false) => {
 const onHub = i => i.kind === 'kanban' && i.chip?.runMachine === 'hub'
 export function hubCounts(sorted) {
   const on = list => (list || []).filter(onHub).length
-  return { running: on(sorted.active), stuck: on(sorted.stuck), waiting: on(sorted.waiting), ready: on(sorted.ready), queued: on(sorted.queued) }
+  return { running: on(sorted.active), stuck: on(sorted.stuck), blockedUpstream: on(sorted.blockedUpstream), waiting: on(sorted.waiting), ready: on(sorted.ready), queued: on(sorted.queued) }
 }
 
 export function Pips({ n, hub = {} }) {
@@ -785,8 +790,9 @@ export function Panel() {
   // "2 waiting" reads as a card running when none is.
   const status = busy ? 'Agent replying in this chat' : sorted.lastActivity ? `Idle · last activity ${ago(sorted.lastActivity, now)}` : 'Idle'
   // Collapsed, a bare "2 waiting" left the user asking "on what?": keep one short line per waiting card.
-  const waitLines = sorted.waiting.slice(0, WAIT_LINES_COLLAPSED)
-  const waitMore = sorted.waiting.length - waitLines.length
+  const waitingRows = [...sorted.blockedUpstream, ...sorted.waiting]
+  const waitLines = waitingRows.slice(0, WAIT_LINES_COLLAPSED)
+  const waitMore = waitingRows.length - waitLines.length
   const needsYou = [
     (asks > 0 || sorted.unasked.length > 0) && jsx('h3', { 'data-section': 'needs-you', style: heading(C.needsYou), children: `Needs you · ${asks + sorted.unasked.length}` }, 'h-needs-you'),
     US?.ActionQueue && jsx(US.ActionQueue, { embedded: true }, 'queue'),
@@ -820,6 +826,8 @@ export function Panel() {
       ...needsYou,
       sorted.stuck.length > 0 && jsx('h3', { 'data-section': 'stuck', style: heading(C.stuck), children: `Stuck · ${sorted.stuck.length}` }),
       ...sorted.stuck.map(i => jsx(StuckCard, { i, session: route.session, now }, i.key)),
+      sorted.blockedUpstream.length > 0 && jsx('h3', { 'data-section': 'blocked-upstream', style: heading(C.blockedUpstream), children: `Blocked upstream · ${sorted.blockedUpstream.length}` }),
+      ...sorted.blockedUpstream.map(i => jsx(Row, { i, k: 'blockedUpstream' }, i.key)),
       sorted.active.length > 0 && jsx('h3', { 'data-section': 'in-progress', style: heading('var(--muted-foreground)'), children: `In progress · ${sorted.active.length}` }),
       ...sorted.active.map(i => jsx(Row, { i, k: 'running' }, i.key)),
       sorted.waiting.length > 0 && jsx('h3', { 'data-section': 'waiting', style: heading('var(--muted-foreground)'), children: `Waiting · ${sorted.waiting.length}` }),
