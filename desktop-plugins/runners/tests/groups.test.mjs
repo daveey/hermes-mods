@@ -32,7 +32,7 @@ export function staleBackendFixture() {
 const P = await loadPlugin()
 export const NOW = Date.parse('2026-11-20T04:23:25Z')
 
-test('real stale backend retains display activity without upgrading authoritative slots or hiding unknown elastic', async () => {
+test('real stale backend keeps display activity and finished history; only never-read slots are unobserved', async () => {
   const ci = staleBackendFixture()
   assert.ok(ci.machines.every((m) => m.slots.every((s) => s.state === 'unknown')))
   const model = P.ciModel(ci, NOW)
@@ -40,8 +40,9 @@ test('real stale backend retains display activity without upgrading authoritativ
   assert.equal(model.sections[0].fixed.length, 3)
   assert.equal(model.sections[0].busy, 1)
   assert.equal(model.sections[0].online.length, 2)
-  assert.equal(model.sections[1].unobserved, 4)
-  assert.equal(model.hidden, 0)
+  assert.equal(model.sections[0].unobserved, 0)
+  assert.equal(model.sections[1].unobserved, 2)
+  assert.equal(model.hidden, 2)
   assert.equal(model.stale, true)
   assert.equal(model.tone, 'warn')
   const ui = await mount(React.createElement(P.CiChip, { model }))
@@ -101,7 +102,13 @@ for (const state of ['now', 'quiet', 'full', 'trouble', 'stale']) test(`CI board
     assert.equal(ui.container.querySelector('[data-ci-tone]')?.dataset.ciTone, state === 'trouble' ? 'bad' : state === 'stale' ? 'warn' : undefined)
     assert.equal(ui.container.querySelectorAll('.hermes-ci-pip.is-warn').length, state === 'trouble' ? 1 : 0)
     assert.match(model.title, /Mac: .*self-hosted busy.*offline.*\nLinux:/)
-    if (state === 'stale') assert.match(model.title, /CI data 14 min old/)
+    if (state === 'stale') {
+      const now = P.ciModel(fixture('now').ci, NOW)
+      assert.equal(model.title, `${now.title}\nCI data 14 min old`)
+      assert.equal(model.hidden, 676)
+      assert.equal(model.hidden, now.hidden)
+      assert.deepEqual(model.sections.map((s) => s.unobserved), [0, 5])
+    }
     if (state === 'now') assert.match(model.title, /Blacksmith 84 running/)
   } finally { await ui.close() }
 })

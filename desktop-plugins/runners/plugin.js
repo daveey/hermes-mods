@@ -782,11 +782,8 @@ export function ciModel(ci, now = Date.now()) {
       for (const raw of m.slots || []) {
         const slot = displaySlot(raw)
         if (!['busy', 'idle', 'offline'].includes(slot.state)) { section.unobserved++; continue }
-        if (slot.state !== 'busy') {
-          if (raw.state === 'idle' || raw.state === 'offline') hidden++
-          else section.unobserved++
-          continue
-        }
+        // Idle/offline, current or last observed, is finished history; only a slot never read is unobserved.
+        if (slot.state !== 'busy') { hidden++; continue }
         pool.busy++
         if (dim.size) pool.sizes[dim.size] = (pool.sizes[dim.size] || 0) + 1
       }
