@@ -300,8 +300,29 @@ class CredentialHealthBody(BaseModel):
     credential_id: str = Field(min_length=1, max_length=128, pattern=r'^[A-Za-z0-9][A-Za-z0-9_-]*$')
 
 
+def _health_tools():
+    """Read-only (load_pool, identity_for, STATUS_DEAD, is_disabled|None) for a health readback.
+
+    Rows come from the persisted pool, never core's ``load_pool``: that loader can seed, heal
+    (Anthropic single-use grant forks) and save auth.json, and a readback must change nothing."""
+    from agent.account_usage_cache import _identity_id_for
+    from agent.credential_pool import STATUS_DEAD, PooledCredential
+    from hermes_cli.auth import read_credential_pool
+    try:
+        from agent.credential_pool_disabled import is_credential_disabled
+    except ImportError:
+        is_credential_disabled = None
+
+    def load_pool(provider):
+        rows = read_credential_pool(provider)
+        entries = [PooledCredential.from_dict(provider, r) for r in (rows if isinstance(rows, list) else [])
+                   if isinstance(r, dict)]
+        return SimpleNamespace(entries=lambda: entries)
+    return load_pool, _identity_id_for, STATUS_DEAD, is_credential_disabled
+
+
 def credential_health(provider: str, credential_id: str, tools=None) -> Dict[str, Any]:
-    """What one stored pool row looks like now, by its row id. No refresh, no network.
+    """What one stored pool row looks like now, by its row id. No refresh, no network, no write.
 
     A sign-in that replaced a row in place keeps the row id but can change the wire account id
     (an Anthropic id is a token fingerprint). The panel asks by row id after such a sign-in and
@@ -311,7 +332,7 @@ def credential_health(provider: str, credential_id: str, tools=None) -> Dict[str
     if provider not in RECONNECT_PROVIDERS:
         raise HTTPException(400, detail=f'Reconnect is not supported for {provider}')
     try:
-        load_pool, identity_for, status_dead, is_disabled = _unpack_pool_tools(tools)
+        load_pool, identity_for, status_dead, is_disabled = _unpack_pool_tools(tools or _health_tools())
         row = next((e for e in load_pool(provider).entries() if str(getattr(e, 'id', '') or '') == credential_id), None)
         account_id = identity_for(provider, row) if row is not None else None
         disabled = bool(row is not None and is_disabled and is_disabled(provider, row))

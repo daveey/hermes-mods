@@ -58,7 +58,9 @@ const ctx={onDispose(){},setTimeout(){},setInterval(){},os:{openExternal:async u
   return {ok:true,renewed:1,status:'renewed',needs_sign_in:false}
  }
  // The stored row by its row id: after the sign-in it carries a new account id.
- if(path==='/credential-health') return window.fixture.claudeRevived
+ if(path==='/credential-health') return window.fixture.claudeHealth
+  ? {found:true,provider:'anthropic',credential_id:opts.body.credential_id,account_id:'inventory-claude-new',status:window.fixture.claudeHealth}
+  : window.fixture.claudeRevived
   ? {found:true,provider:'anthropic',credential_id:opts.body.credential_id,account_id:'inventory-claude-new',status:'ok'}
   : {found:true,provider:'anthropic',credential_id:opts.body.credential_id,account_id:'inventory-claude-dead',status:'needs_sign_in'}
  let result=row(id)

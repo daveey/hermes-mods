@@ -218,6 +218,84 @@ test('a transient refresh failure, quota or a renewed grant never opens a termin
   }
 })
 
+// After the recovery command the backend's row status decides what may be said. Only `ok` plus a
+// healthy usage row for the row's current account id is "Reconnected"; a stale ready usage row, or a
+// usage panel that has not loaded the new id yet, never turns quota, disabled or unknown into
+// "Reconnected", and never turns quota or disabled into a sign-in offer.
+test('only backend status ok can become Reconnected: quota, disabled and unknown keep their own state with ready or missing usage', async t => {
+  const READY = [{ id: 'fp:new', label: 'me', state: 'ready' }]
+  const QUOTA = [{ id: 'fp:new', label: 'me', state: 'limited', limit_kind: 'quota', reason: 'usage_limit' }]
+  const MISSING = [DEAD]
+  const quota = { done: true, error: undefined, needsSignIn: undefined, message: 'Signed in · out of quota until it resets' }
+  const disabled = { done: undefined, error: true, needsSignIn: undefined, message: 'Account is disabled' }
+  const unknown = { done: undefined, error: true, needsSignIn: true, message: 'Could not confirm the account — check again' }
+  for (const [status, usage, groupsAfter, want] of [
+    ['quota', 'ready', READY, quota], ['quota', 'missing', MISSING, quota], ['quota', 'quota', QUOTA, quota],
+    ['disabled', 'ready', READY, disabled], ['disabled', 'missing', MISSING, disabled],
+    ['unknown', 'ready', READY, unknown], ['unknown', 'missing', MISSING, unknown],
+    [undefined, 'ready', READY, unknown], ['renewed', 'ready', READY, unknown],
+    ['ok', 'ready', READY, { done: true, error: undefined, needsSignIn: undefined, message: 'Reconnected' }]
+  ]) await t.test(`backend ${status} + usage ${usage}`, async () => {
+    const term = fakeTerminal()
+    let groups = [{ slug: 'anthropic', accounts: [DEAD] }]
+    const { mod, store } = await setup({ term, groups: () => groups,
+      rest: path => path === '/reconnect' ? deadGrant() : { found: true, account_id: 'fp:new', ...(status ? { status } : {}) } })
+    const flow = store.signIn('anthropic', DEAD, ROUTE)
+    await tick(); await tick(); await tick()
+    groups = [{ slug: 'anthropic', accounts: groupsAfter }]
+    term.end(0); await flow
+    const st = store.$state.get()[store.key('anthropic', 'fp:old')]
+    const name = `backend ${status} + usage ${usage}`
+    assert.deepEqual({ done: st.done, error: st.error, needsSignIn: st.needsSignIn, message: st.message }, want, name)
+    if (status !== 'ok') assert.notEqual(st.message, 'Reconnected', name)
+    if (status === 'quota' || status === 'disabled') assert.equal(st.resolvedId, 'fp:new', name)
+    if ((status === 'quota' || status === 'disabled') && usage === 'missing') {
+      // Not a sign-in problem. The usage panel still lists the old id as signed out: that row
+      // shows the backend's answer and a re-check, never "Sign in again" or "Reconnect".
+      const state = store.$state.get()
+      const line = controls(mod.ReconnectLine({ g: { slug: 'anthropic' }, a: DEAD, reconnectStore: store, reconnectState: state }))
+      assert.deepEqual(line.map(x => x[1]), ['Check sign-in for me', want.message], name)
+      assert.equal(mod.signInConfirmed(DEAD, state[store.key('anthropic', 'fp:old')], 'anthropic'), false, name)
+      assert.deepEqual(mod.authCounts({ slug: 'anthropic', accounts: [DEAD] }, state), { signIn: 0, disconnected: 0 }, name)
+    }
+  })
+})
+
+test('a settled answer belongs to the row it was given for: the new account id dying later offers sign-in again', async () => {
+  const term = fakeTerminal()
+  let groups = [{ slug: 'anthropic', accounts: [DEAD] }]
+  const { mod, store } = await setup({ term, groups: () => groups,
+    rest: path => path === '/reconnect' ? deadGrant() : { found: true, account_id: 'fp:new', status: 'quota' } })
+  const flow = store.signIn('anthropic', DEAD, ROUTE)
+  await tick(); await tick(); await tick()
+  term.end(0); await flow
+  const later = { id: 'fp:new', label: 'me', state: 'unavailable', reason: 'auth' }
+  const state = store.$state.get()
+  assert.equal(mod.signInConfirmed(later, mod.rowFix(state, 'anthropic', later), 'anthropic'), true)
+  const line = controls(mod.ReconnectLine({ g: { slug: 'anthropic' }, a: later, reconnectStore: store, reconnectState: state }))
+  assert.equal(line[0][1], 'Sign in to me again')
+})
+
+test('Check again after an unconfirmed readback applies the same rule', async () => {
+  const term = fakeTerminal()
+  let groups = [{ slug: 'anthropic', accounts: [DEAD] }], status = 'unknown'
+  const { store } = await setup({ term, groups: () => groups,
+    rest: path => path === '/reconnect' ? deadGrant() : { found: true, account_id: 'fp:new', status } })
+  const k = store.key('anthropic', 'fp:old')
+  const flow = store.signIn('anthropic', DEAD, ROUTE)
+  await tick(); await tick(); await tick()
+  groups = [{ slug: 'anthropic', accounts: [{ id: 'fp:new', label: 'me', state: 'ready' }] }]
+  term.end(0); await flow
+  assert.equal(store.$state.get()[k].check, true)
+  status = 'disabled'
+  await store.check('anthropic', DEAD, ROUTE)
+  assert.equal(store.$state.get()[k].message, 'Account is disabled'); assert.notEqual(store.$state.get()[k].done, true)
+  // A settled row can be re-checked: once the backend reports it healthy, it is Reconnected.
+  status = 'ok'
+  await store.check('anthropic', DEAD, ROUTE)
+  assert.equal(store.$state.get()[k].message, 'Reconnected'); assert.equal(store.$state.get()[k].settled, undefined)
+})
+
 test('terminal text helpers: plain text only, bounded, https links only', async () => {
   const { mod } = await setup({ term: null, groups: () => [], rest: () => ({}) })
   assert.equal(mod.appendOutput('', '\x1b]0;title\x07a\x1b[31mb\x1b[0m\r\nc\x08\x00'), 'ab\nc')

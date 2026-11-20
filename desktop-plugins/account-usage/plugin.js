@@ -286,6 +286,8 @@ export function needsReconnect(account, slug) {
 // that one is only "disconnected".
 export function signInConfirmed(account, st, slug) {
   if (!needsReconnect(account, slug)) return false
+  // The backend answered for this exact row that it is out of quota or disabled, not signed out.
+  if (st && st.settled && st.id === account.id) return false
   return account.state === 'unavailable' || !!account.signedOut || !!(st && st.needsSignIn)
 }
 
@@ -313,7 +315,9 @@ export function authCounts(g, reconnectState = {}) {
   let signIn = 0, disconnected = 0
   for (const a of (g && g.accounts) || []) {
     if (!needsReconnect(a, g.slug)) continue
-    if (signInConfirmed(a, reconnectState[reconnectKey(g.slug, a.id)], g.slug)) signIn++
+    const st = reconnectState[reconnectKey(g.slug, a.id)]
+    if (st && st.settled && st.id === a.id) continue // quota or disabled per the backend: no auth problem to count
+    if (signInConfirmed(a, st, g.slug)) signIn++
     else disconnected++
   }
   return { signIn, disconnected }
@@ -869,6 +873,23 @@ export function createReconnectStore(ctx, onDone = () => {}) {
       put({ ...keep, ...(cancelled ? { cancelled: true } : { error: true }), message: cancelled ? 'Sign-in cancelled' : 'Sign-in did not finish — nothing was saved' })
       return
     }
+    // The backend's row status decides what may be said. Quota and disabled are that row's own
+    // state, whatever the usage panel shows (it may still hold the old account id, or a stale
+    // "ready"): they are reported as such and are not a sign-in problem (`settled`).
+    if (seen.status === 'quota' || seen.status === 'disabled') {
+      try { await onDone() } catch { /* the row's state is already known; the refresh is best-effort */ }
+      if (!live()) return
+      const settled = { settled: true, check: true, authFlow: 'terminal', signInRoute: bound,
+        ...(seen.account_id !== account.id ? { resolvedId: seen.account_id } : {}) }
+      put(seen.status === 'quota' ? { ...settled, done: true, message: HEALTH.quota.message }
+        : { ...settled, error: true, message: 'Account is disabled' })
+      return
+    }
+    // Anything but `ok` (unknown, a status this panel does not know) confirms nothing.
+    if (seen.status !== 'ok') {
+      put({ ...keep, error: true, unverified: true, check: true, message: 'Could not confirm the account — check again' })
+      return
+    }
     // The backend vouched for this row and its account id; a panel that has not loaded that
     // account yet is waiting for usage, not looking at a different account.
     const report = st => put(st.removed && !st.done
@@ -1117,7 +1138,10 @@ export function ReconnectLine({ g, a, reconnectStore, reconnectState }) {
   const seen = rowFix(reconnectState, g.slug, a)
   const wanted = needsReconnect(a, g.slug)
   // A finished result is spent once the row needs action again (the grant died later in the session).
-  const st = seen.done && wanted ? {} : seen
+  // A settled answer (the backend said this exact row is out of quota or disabled) is not spent by a
+  // usage panel that still lists the row as signed out: it shows that answer and a re-check.
+  const settled = !!seen.settled && seen.id === a.id
+  const st = seen.done && wanted && !settled ? {} : seen
   if (!wanted && !st.message) return null
   const route = ownerRoute()
   const name = a.label || a.id
@@ -1145,6 +1169,10 @@ export function ReconnectLine({ g, a, reconnectStore, reconnectState }) {
     if (st.verificationUrl) children.push(jsx('button', { type: 'button', 'aria-label': `Open sign-in page for ${name}`,
       onClick: () => reconnectStore.openPage(st.verificationUrl), children: 'Open sign-in page' }))
     if (st.message) say(st.message)
+  } else if (settled) {
+    children.push(jsx('button', { type: 'button', 'aria-label': `Check sign-in for ${name}`, disabled: !!st.busy,
+      onClick: () => reconnectStore.check(g.slug, a), children: st.busy ? 'Checking…' : 'Check again' }))
+    say(st.message, st.done ? COLORS.ready : COLORS.limited)
   } else if (st.done) {
     say(st.message, COLORS.ready)
   } else {
@@ -1178,6 +1206,9 @@ export function AccountRow({ g, a, open, onToggle, selectionStore, selectionStat
   const fix = rowFix(reconnectState, g.slug, a)
   const details = hasDetails(g, a)
   const signIn = needsReconnect(a, g.slug)
+  // The backend answered for this exact row (quota or disabled, not signed out): a usage panel that
+  // still lists it as signed out must not label it so.
+  const settled = !!fix.settled && fix.id === a.id
   const confirmed = signInConfirmed(a, fix, g.slug)
   const shown = (details && (open || signIn)) || !!fix.message || !!(disableStore && disableState[disableStore.key(g.slug, a.id)]?.message)
   const cue = t === 'ready' || t === 'unknown' ? undefined : COLORS[t]
@@ -1192,7 +1223,7 @@ export function AccountRow({ g, a, open, onToggle, selectionStore, selectionStat
         jsx(Dot, { t, mark: a.id === g.markId ? g.mark : null }),
         jsxs('span', { style: { display: 'flex', alignItems: 'center', minWidth: 0, fontSize: 11.5, fontWeight: a.id === g.markId ? 600 : undefined }, children: [
           jsx('span', { style: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, children: name }), a.id === g.markId ? jsx(MarkBadge, { g }) : null,
-          signIn ? jsx('span', { className: confirmed ? 'hermes-au-signin' : 'hermes-au-disc', 'data-auth': confirmed ? 'sign-in' : 'disconnected',
+          signIn && !settled ? jsx('span', { className: confirmed ? 'hermes-au-signin' : 'hermes-au-disc', 'data-auth': confirmed ? 'sign-in' : 'disconnected',
             title: confirmed ? 'The saved sign-in is dead: sign in again' : 'Benched for an auth error: Reconnect renews it if the saved sign-in is still good',
             children: confirmed ? 'sign-in needed' : 'disconnected' }) : null,
           selectionState.selection?.state === 'pending' && selectionState.selection.provider === g.slug && selectionState.selection.account_id === a.id
@@ -1207,7 +1238,7 @@ export function AccountRow({ g, a, open, onToggle, selectionStore, selectionStat
         : jsx('span', { className: 'hermes-au-gap' })
     ] }),
     shown ? jsxs('div', { className: 'hermes-au-details', 'data-account': name, style: { '--au-c': cue }, children: [
-      why ? jsx('span', { className: 'hermes-au-why', 'data-tone': t, style: { color: cue }, children: why }) : null,
+      why && !settled ? jsx('span', { className: 'hermes-au-why', 'data-tone': t, style: { color: cue }, children: why }) : null,
       g.statusOnly ? jsx('span', { style: { opacity: 0.8 }, children: statusHint(g, a) }) : null,
       a.disabled ? null : jsx(ReconnectLine, { g, a, reconnectStore, reconnectState }),
       a.signedOut ? null : jsx(DisableLine, { g, a, disableStore, disableState })
