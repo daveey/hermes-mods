@@ -243,7 +243,8 @@ export function providerRow(pool, throttle, now = Date.now() / 1000) {
   const why = state === 'used' ? 'every account has used its week'
     : state === 'held' ? `quota pacing holds card starts${pool.pacing_until ? ` until ${timeLabel(pool.pacing_until, '7d')}` : ''}; chats still run`
     : state === 'tight' ? 'runs out before the next refill' : state === 'paced' ? 'quota pacing starts fewer cards' : null
-  return { provider: pool.provider, name, accounts, lasts, refill, state, why }
+  const short = pool.runway_s == null ? '\u2013' : scale === 0 ? 'paused' : fmtDuration(runway)
+  return { provider: pool.provider, name, accounts, lasts, refill, state, why, usable, total: n, short }
 }
 
 // This gateway's card slots under the limit (the start gate's numbers); null without them.
@@ -550,17 +551,14 @@ export function BurstControl({ throttle, budget, pick, setPick, onStart, onEnd, 
   const proj = budget?.projection
   const fresh = proj && proj.factor === pick.factor && proj.hours === pick.hours
   const rows = fresh ? Object.entries(proj.pools || {}).map(([p, pr]) => [p, projectionText(p, pr, proj.factor)]) : []
+  const warns = rows.flatMap(([, r]) => [r.warn, r.warn5h].filter(Boolean))
+  const tip = fresh ? rows.map(([, r]) => [r.text, r.warn, r.warn5h].filter(Boolean).join(' ⚠ ')).join('\n') : 'Costing this raise…'
   return h('div', { className: 'hermes-tp-burst', 'data-slot': 'burst' },
     h('div', { className: 'hermes-tp-trow' },
-      h('span', { className: 'hermes-tp-lbl' }, 'Raise for a while'),
       h(Seg, { label: 'Raise factor', value: pick.factor, options: BURST_FACTORS, onPick: (f) => setPick({ ...pick, factor: f }), render: fmtFactor }),
       h(Seg, { label: 'Raise duration', value: pick.hours, options: BURST_HOURS, onPick: (hrs) => setPick({ ...pick, hours: hrs }), render: fmtHours }),
-      h('button', { type: 'button', className: 'hermes-tp-btn', disabled: !fresh, onClick: () => onStart(pick) },
-        `Raise ${fmtFactor(pick.factor)} for ${fmtHours(pick.hours)}`)),
-    fresh ? null : h('div', { className: 'hermes-tp-lbl', role: 'status' }, 'Costing this raise…'),
-    rows.map(([p, r]) => h('div', { key: p, className: 'hermes-tp-runway', 'data-projection': p },
-      r.text, r.warn ? h('span', { className: 'hermes-tp-warn', 'data-warn': p }, ` ⚠ ${r.warn}`) : null,
-      r.warn5h ? h('span', { className: 'hermes-tp-warn', 'data-warn5h': p }, ` ⚠ ${r.warn5h}`) : null)),
+      h('button', { type: 'button', className: 'hermes-tp-btn', disabled: !fresh, onClick: () => onStart(pick), title: tip, 'data-raise-tip': tip },
+        `Raise ${fmtFactor(pick.factor)}`, warns.length ? h('span', { className: 'hermes-tp-warn', 'data-warn-count': String(warns.length) }, ' ⚠') : null)),
     error ? h('div', { className: 'hermes-tp-note', role: 'alert' }, `Raise not changed: ${error}`) : null)
 }
 
@@ -573,7 +571,8 @@ export function ForecastSection({ budget, throttle, pick, now = Date.now() / 100
   const preview = !burst && throttle?.mode === 'auto' ? pick : null
   const opts = { burst, preview, now }
   return h('details', { className: 'hermes-tp-budget', 'data-slot': 'forecast' },
-    h('summary', null, h('h3', null, 'Forecast · 7 days'),
+    h('summary', null, h('h3', null, 'Forecast · 7 days')),
+    h('div', { className: 'hermes-tp-chead' },
       h('span', { className: 'hermes-tp-blegend' },
         [['spent', 'used', BUDGET_COLORS.spent, false], ['plan', 'planned', BUDGET_COLORS.spent, true], ['capacity', 'available', BUDGET_COLORS.capacity, false],
           ['reset', 'refill', BUDGET_COLORS.reset], ['reset_early', 'early refill', BUDGET_COLORS.reset_early], ['account_added', 'account added', BUDGET_COLORS.account_added], ['burst', 'raise', BUDGET_COLORS.burst_start]]
@@ -584,6 +583,7 @@ export function ForecastSection({ budget, throttle, pick, now = Date.now() / 100
 }
 
 const MODES = [['budget', 'Budget'], ['limit', 'Limit'], ['no_limit', 'No limit']]
+const MODE_TIP = { budget: 'The subscription budget decides', limit: 'Your number, thousands of tokens per minute; the lower of it and the budget applies', no_limit: 'Nothing limits spend, the budget included' }
 
 // What a person chose (the server's `chosen`), whatever caps the fleet now; an older payload: read from limitMode.
 export function chosenMode(throttle) {
@@ -621,54 +621,45 @@ export function LimitControl({ throttle, onSet }) {
     h('div', { className: 'hermes-tp-seg', role: 'group', 'aria-label': 'What limits token spend' },
       MODES.map(([m, label]) => h('button', {
         key: m, type: 'button', 'data-mode': m, className: m === shown ? 'is-on' : '', 'aria-pressed': m === shown,
-        disabled: !onSet, onClick: () => choose(m)
+        disabled: !onSet, onClick: () => choose(m), title: MODE_TIP[m]
       }, label))),
     shown === 'limit' ? h('label', { className: 'hermes-tp-limit' },
       h('input', {
         type: 'text', inputMode: 'decimal', size: 6, value,
         placeholder: current === 'limit' && userPS == null ? 'above budget' : 'e.g. 150', disabled: !onSet,
-        'aria-label': 'Limit, thousands of tokens per minute', 'aria-invalid': bad ? 'true' : undefined,
+        'aria-label': 'Limit, thousands of tokens per minute', 'aria-invalid': bad ? 'true' : undefined, title: 'thousands of tokens per minute',
         onChange: (e) => setDraft(e.target.value),
         onKeyDown: (e) => { if (e.key === 'Enter') commit(); if (e.key === 'Escape') { setDraft(null); setPick(null); setBad(false) } }
-      }), 'k tok/min',
+      }), 'k/min',
       draft != null ? h('button', { type: 'button', className: 'hermes-tp-btn', onClick: commit }, 'Set') : null) : null,
-    bad ? h('span', { className: 'hermes-tp-warn', role: 'alert' }, 'Type thousands of tokens per minute, e.g. 150 or 1.5m') : null,
-    h('span', { className: 'hermes-tp-lbl' },
-      shown === 'budget' ? 'the subscription budget decides' : shown === 'no_limit' ? 'nothing is limited, the budget included'
-        : 'the lower of this and the budget applies'))
+    bad ? h('span', { className: 'hermes-tp-warn', role: 'alert' }, 'e.g. 150 or 1.5m') : null)
 }
 
-// Token spend, top of the panel: what the fleet spends now against what limits it, the control, a raise, each
-// subscription's state, and this gateway's open slots.
+// Token spend, top of the panel. Row 1: what the fleet spends now, of what limit, and a status dot, over a meter.
+// Row 2: the limit control and a raise. Row 3: one chip per subscription. Everything else is hover text.
 export function SpendSection({ throttle, onSet, error, unit, budget, pick, setPick, onBurst, onEndBurst, burstError, now = Date.now() / 1000 }) {
   if (!throttle) return null
   const hd = spendHeadline(throttle, unit)
-  const slots = slotLine(throttle)
+  const tip = [STATE_LABEL[hd.state], hd.by, slotLine(throttle), scopeText(throttle)].filter(Boolean).join('\n')
+  const of = hd.state === 'holding' ? 'holding every call' : hd.cap == null ? 'no limit' : `of ${fmt(hd.cap)}`
   return h('section', { className: 'hermes-tp-spend', 'data-slot': 'spend', 'data-state': hd.state },
-    h('div', { className: 'hermes-tp-chead' },
-      h('h3', null, 'Token spend'),
-      h('span', { className: 'hermes-tp-now' },
-        h('span', { className: 'hermes-tp-big', 'data-spend-rate': '' }, fmt(hd.rate)),
-        h('span', { className: 'hermes-tp-lbl' }, `tok/${unit}`)),
-      h('span', { className: 'hermes-tp-ttext', 'data-limit': hd.mode || '' }, hd.limit, hd.by ? h('span', { className: 'hermes-tp-lbl' }, ` · ${hd.by}`) : null),
-      h('span', { className: `hermes-tp-badge is-${hd.state}`, 'data-spend-state': hd.state }, STATE_LABEL[hd.state])),
+    h('div', { className: 'hermes-tp-shead', title: tip, 'data-spend-tip': tip },
+      h('span', { className: `hermes-tp-dot is-${hd.state}`, 'data-spend-state': hd.state, 'aria-label': STATE_LABEL[hd.state] }),
+      h('span', { className: 'hermes-tp-big', 'data-spend-rate': '' }, fmt(hd.rate)),
+      h('span', { className: 'hermes-tp-of', 'data-limit': hd.mode || '' }, `${of} tok/${unit}`)),
     hd.fill == null ? null : h('div', { className: 'hermes-tp-meter', role: 'meter', 'aria-valuemin': 0, 'aria-valuemax': 100, 'aria-valuenow': Math.round(hd.fill * 100), 'aria-label': 'Spend against the limit' },
       h('span', { style: { width: `${(hd.fill * 100).toFixed(1)}%` } })),
-    h(LimitControl, { key: chosenMode(throttle), throttle, onSet }),
+    h('div', { className: 'hermes-tp-srow' },
+      h(LimitControl, { key: chosenMode(throttle), throttle, onSet }),
+      onBurst && (hd.mode === 'budget' || hd.mode === 'limit') ? h(BurstControl, { throttle, budget, pick, setPick, onStart: onBurst, onEnd: onEndBurst, error: burstError, now }) : null),
     error ? h('div', { className: 'hermes-tp-note', role: 'alert' }, `Limit not saved: ${error}`) : null,
-    onBurst && (hd.mode === 'budget' || hd.mode === 'limit') ? h(BurstControl, { throttle, budget, pick, setPick, onStart: onBurst, onEnd: onEndBurst, error: burstError, now }) : null,
-    (throttle.pools || []).length ? h('table', { className: 'hermes-tp-subs', 'aria-label': 'Subscriptions' },
-      h('tbody', null, throttle.pools.map((pool) => {
+    (throttle.pools || []).length ? h('div', { className: 'hermes-tp-chips', role: 'list', 'aria-label': 'Subscriptions' },
+      throttle.pools.map((pool) => {
         const r = providerRow(pool, throttle, now)
-        return h('tr', { key: r.provider, 'data-pool': r.provider, 'data-pool-state': r.state },
-          h('th', { scope: 'row' }, r.name),
-          h('td', null, r.accounts ?? '–'),
-          h('td', null, r.lasts),
-          h('td', null, r.refill ?? ''),
-          h('td', null, h('span', { className: `hermes-tp-badge is-${r.state}`, title: r.why || undefined }, POOL_STATE_LABEL[r.state])))
-      }))) : null,
-    h('div', { className: 'hermes-tp-lbl hermes-tp-slots' },
-      [slots, scopeText(throttle)].filter(Boolean).join(' · ')))
+        const title = [`${r.name}: ${POOL_STATE_LABEL[r.state]}`, r.why, r.accounts, r.lasts, r.refill].filter(Boolean).join('\n')
+        return h('span', { key: r.provider, role: 'listitem', className: `hermes-tp-chip is-${r.state}`, 'data-pool': r.provider, 'data-pool-state': r.state, title },
+          h('b', null, r.name), r.total == null ? null : ` ${r.usable}/${r.total}`, ` · ${r.short}`)
+      })) : null)
 }
 
 // `payload` is the selected range's data, or null while it loads / after it failed (`status` says which); the
@@ -902,6 +893,17 @@ export const CSS = `
 .hermes-tp-capl{fill:#ef4444}
 .hermes-tp-spend{display:flex;flex-direction:column;gap:6px;padding:8px 10px;margin:6px 0 10px;border:1px solid var(--ui-stroke-secondary);border-radius:8px;font-size:11px}
 .hermes-tp-spend .hermes-tp-chead{flex-wrap:wrap}
+.hermes-tp-shead{display:flex;align-items:baseline;gap:8px}
+.hermes-tp-shead .hermes-tp-big{font-size:22px}
+.hermes-tp-of{color:var(--ui-text-secondary);font-size:12px}
+.hermes-tp-dot{width:8px;height:8px;border-radius:50%;align-self:center;background:var(--ui-green,#1f8a65)}
+.hermes-tp-dot.is-at{background:var(--ui-orange,#d9822b)}.hermes-tp-dot.is-holding{background:var(--ui-red,#dc3545)}.hermes-tp-dot.is-unlimited{background:var(--ui-text-tertiary,#8a909c)}
+.hermes-tp-srow{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
+.hermes-tp-chips{display:flex;gap:6px;flex-wrap:wrap}
+.hermes-tp-chip{padding:1px 8px;border-radius:10px;border:1px solid var(--ui-stroke-secondary);color:var(--ui-text-secondary);font-variant-numeric:tabular-nums}
+.hermes-tp-chip b{font-weight:600;color:var(--ui-text-primary,inherit)}
+.hermes-tp-chip.is-tight,.hermes-tp-chip.is-paced{border-color:var(--ui-orange,#d9822b)}
+.hermes-tp-chip.is-used,.hermes-tp-chip.is-held{border-color:var(--ui-red,#dc3545);opacity:.75}
 .hermes-tp-meter{height:6px;border-radius:3px;background:var(--ui-stroke-secondary,#2a2f39);overflow:hidden}
 .hermes-tp-meter>span{display:block;height:100%;background:var(--ui-blue,#3b82f6)}
 .hermes-tp-spend[data-state=at] .hermes-tp-meter>span{background:var(--ui-orange,#d9822b)}
