@@ -1377,7 +1377,31 @@ def _into_directory(args: list[str], ops: list[str], in_home: bool) -> Optional[
     return None
 
 
+_SHELL_CONTEXT = None
+
+
 def check_shell(cmd: str, cwd: str = "") -> Optional[str]:
+    # Preserve the existing policy and refusal text, then analyze execution scopes.
+    why = _check_shell_base(cmd, cwd)
+    if why:
+        return why
+    import importlib.util
+    from types import SimpleNamespace
+    global _SHELL_CONTEXT
+    if _SHELL_CONTEXT is None:
+        try:
+            spec = importlib.util.spec_from_file_location("sqlite_shell_context", Path(__file__).with_name("shell_context.py"))
+            if spec is None or spec.loader is None:
+                raise ImportError("missing shell context loader")
+            context = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(context)
+            _SHELL_CONTEXT = context  # publish only a fully initialized module
+        except (ImportError, OSError, SyntaxError):
+            return "live-database shell safety analyzer unavailable; refusing unchecked execution"
+    return _SHELL_CONTEXT.check(cmd or "", SimpleNamespace(**globals()), cwd)
+
+
+def _check_shell_base(cmd: str, cwd: str = "") -> Optional[str]:
     in_home = bool(cwd) and os.path.realpath(os.path.expanduser(cwd)) == _home()
     for seg in _segments(_tokens(cmd or "")):
         why = _check_redirects(seg, in_home)
