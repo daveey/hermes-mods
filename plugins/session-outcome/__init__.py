@@ -783,10 +783,25 @@ def _clip(text: str) -> str:
     return f"{text[:half]}\n\n[... middle of the message omitted ...]\n\n{text[-half:]}"
 
 
-def _last_request(session_id: str) -> str:
-    """The user's latest real message in this chat (compression lineage, newest first), or "" when unknown.
-    Skips auto-continue rows, this plugin's own nudge and kanban notices older than a real message; a kanban
-    notice newer than every real message started the judged turn and is returned, labeled as automatic."""
+def _message_text(content: Any) -> str:
+    """Normalize persisted text/list content consistently with core before comparing or judging it."""
+    if isinstance(content, str) and content.lstrip().startswith("["):
+        try:
+            parts = json.loads(content)
+            if isinstance(parts, list):
+                content = "\n".join(str(p.get("text") or "") for p in parts if isinstance(p, dict))
+        except (ValueError, TypeError):
+            pass
+    return _text(content)
+
+
+def _last_request(session_id: str, reply: Optional[str] = None, *, pending: bool = False) -> str:
+    """The request answered by ``reply``, not a later notice appended without a turn.
+
+    A refresh judges the latest persisted assistant; bound its request scan to that row across compression
+    lineage. The pre-final gate judges an unsaved candidate, so it uses current intent even if its text happens
+    to equal an older reply. Legacy schemas and callers without a persisted reply retain the current-request
+    fallback. Informational/completion notes never start a request (core's completion-note contract)."""
     us = _user_steps()
     if us is None or not session_id:
         return ""
@@ -794,16 +809,36 @@ def _last_request(session_id: str) -> str:
         ids = us.lineage(session_id) or [session_id]
         c = us._ro_connect(us._state_db(), timeout=2)
         try:
-            for sid in ids:
-                try:
-                    rows = c.execute("select content, display_kind from messages where session_id=? and role='user' "
-                                     "order by id desc limit 20", (sid,)).fetchall()
-                except sqlite3.OperationalError:  # an older schema without display_kind
-                    rows = [(r[0], None) for r in c.execute(
-                        "select content from messages where session_id=? and role='user' order by id desc limit 20",
-                        (sid,)).fetchall()]
-                for content, kind in rows:
-                    text = _text(content).strip()
+            columns = {r[1] for r in c.execute("pragma table_info(messages)")}
+            active = " and active=1" if "active" in columns else ""
+            kind_col = "display_kind" if "display_kind" in columns else "NULL"
+            meta_col = "display_metadata" if "display_metadata" in columns else "NULL"
+            boundary = None
+            if reply is not None and not pending:
+                for index, sid in enumerate(ids):
+                    last = c.execute("select id, content from messages where session_id=? and role='assistant'"
+                                     + active + " order by id desc limit 1", (sid,)).fetchone()
+                    if last is not None:
+                        if _message_text(last[1]) == _message_text(reply):
+                            boundary = (index, last[0])
+                        break
+            for index, sid in enumerate(ids):
+                if boundary is not None and index < boundary[0]:
+                    continue
+                bound = " and id<?" if boundary is not None and index == boundary[0] else ""
+                params = (sid, boundary[1]) if bound else (sid,)
+                rows = c.execute(f"select content, {kind_col}, {meta_col} from messages "
+                                 "where session_id=? and role='user'" + active + bound + " order by id desc", params)
+                for content, kind, metadata in rows:
+                    if isinstance(metadata, str):
+                        try:
+                            metadata = json.loads(metadata)
+                        except (ValueError, TypeError):
+                            metadata = None
+                    if isinstance(metadata, dict) and (metadata.get("completion_note") or
+                            (kind == "kanban_notice" and metadata.get("outcome_informational") is True)):
+                        continue
+                    text = _message_text(content).strip()
                     if (not text or TAG in text or (kind or "") == "auto_continue"
                             or text.startswith(RECOVERY_PREFIXES)):
                         continue
@@ -868,9 +903,9 @@ def judge(session_id: str, last_assistant_text: str, *, source: Optional[str] = 
     src = str(source or "").strip().lower() or _row_source(session_id)
     if src in BACKGROUND:
         return None
-    request = _last_request(session_id)
-    key = (session_id, hashlib.sha1(f"{request}\0{text}".encode("utf-8", "replace")).hexdigest())
     scope = _GATE_SCOPE.get()
+    request = _last_request(session_id, text, pending=scope is not None)
+    key = (session_id, hashlib.sha1(f"{request}\0{text}".encode("utf-8", "replace")).hexdigest())
     if key in _JUDGED:
         verdict = _JUDGED[key]
         if verdict is None and scope is not None:

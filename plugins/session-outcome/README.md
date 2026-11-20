@@ -85,11 +85,16 @@ not claimed by this plugin section.
   The bare one-token fast-tier answer called clear reports NO ("I posted the reply: <url>", a review ending in its
   verdict); the fast tier reasoning first, or as a majority of 3, still flipped borderline replies, while the
   standard tier got every live replay case 3/3 at 1.4-3.6 s. Thinking is off because adaptive thinking spent the
-  whole token budget and calls came back empty. The judge sees the user's latest real request (`<request>`, capped at 2,000 characters; kanban
-  notices, auto-continue rows, this plugin's nudge and recovery re-prompts (`[False-stop recovery]`,
-  `[Session babysitter]`, which only replay the event above them) are skipped) and the reply (`<message>`): without the
-  request it judged a finished answer to "what should I ask?" as "a question". YES → True, NO → False, anything else,
-  any error or a timeout → None (core falls back to its heuristic). Verdicts are cached per (session, text).
+  whole token budget and calls came back empty. The judge sees the request answered by the persisted reply
+  (`<request>`, capped at 2,000 characters), not a newer row appended after that reply. It follows active rows
+  across compression lineage and normalizes multipart text. Unsaved pre-final candidates use current intent,
+  even when their text equals a prior reply. Informational notices (`outcome_informational: true`) and completion
+  notes never start a request; an actionable kanban notice that actually started the turn is labeled automatic.
+  Auto-continue rows, process-completion output, this plugin's nudge and recovery re-prompts
+  (`[False-stop recovery]`, `[Session babysitter]`, which replay the event above them) are skipped.
+  Without the request it judged a finished answer to "what should I ask?" as "a question". YES → True,
+  NO → False, anything else, any error or a timeout → None (core preserves a prior verdict on the same message
+  before falling back to its heuristic). Verdicts are cached per (session, request, text).
   The judge reads the whole reply up to 12,000 characters, else its head and tail around an omission marker:
   never only the tail, which hides a long report's answer and gets a finished report judged NO.
   Things the reply only describes as happening later on their own (a cron's next runs, a card that finishes by

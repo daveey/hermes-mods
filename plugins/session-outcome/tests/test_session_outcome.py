@@ -434,6 +434,69 @@ def test_judge_process_completion_without_request_is_not_user_intent(plugin, hom
     assert plugin._last_request("S1") == ""
 
 
+@pytest.mark.parametrize("reply", ["Shipped the layout change; all checks passed.",
+                                   "Shipped.\n\nAll checks passed.", "Done  twice spaced."])
+@pytest.mark.parametrize("multipart", [False, True])
+@pytest.mark.parametrize("metadata", [{"outcome_informational": True, "stale": True},
+                                      {"completion_note": True}, {}])
+def test_judge_context_stops_at_the_persisted_reply(plugin, home, metadata, multipart, reply):
+    stored = json.dumps([{"type": "text", "text": reply}]) if multipart else reply
+    _messages(home, [("S1", "user", "Move the lane panel above the tabs.", None),
+                     ("S1", "assistant", stored, None),
+                     ("S1", "user", "Unrelated blocked card: choose a recovery.", "kanban_notice")])
+    with sqlite3.connect(home / "state.db") as db:
+        db.execute("alter table messages add column display_metadata text")
+        db.execute("update messages set display_metadata=? where id=3", (json.dumps(metadata),))
+    seen = []
+    plugin._llm = lambda s, u: seen.append(u) or "YES"
+    assert plugin.judge("S1", reply) is True
+    assert seen == [plugin._judge_input(reply, "Move the lane panel above the tabs.")]
+
+
+@pytest.mark.parametrize("metadata", [{"outcome_informational": True}, {"completion_note": True}])
+def test_pending_reply_skips_informational_notices_and_inactive_requests(plugin, home, metadata):
+    _messages(home, [("S1", "user", "Draft only; do not post.", None),
+                     ("S1", "user", "A completed background card.", "kanban_notice"),
+                     ("S1", "user", "Post it now.", None)])
+    with sqlite3.connect(home / "state.db") as db:
+        db.execute("alter table messages add column display_metadata text")
+        db.execute("alter table messages add column active integer default 1")
+        db.execute("update messages set display_metadata=? where id=2", (json.dumps(metadata),))
+        db.execute("update messages set active=0 where id=3")
+    seen = []
+    plugin._llm = lambda s, u: seen.append(u) or "YES"
+    reply = "The draft is ready; nothing was posted."
+    assert plugin.judge("S1", reply) is True
+    assert seen == [plugin._judge_input(reply, "Draft only; do not post.")]
+
+
+def test_persisted_reply_context_follows_compression_lineage(plugin, home, monkeypatch):
+    reply = "The layout is deployed and checked."
+    _messages(home, [("S1", "user", "Move the panel.", None),
+                     ("S1", "assistant", reply, None),
+                     ("TIP", "user", "Later unrelated notice", "kanban_notice")])
+    monkeypatch.setattr(plugin._user_steps(), "lineage", lambda sid: ["TIP", "S1"])
+    seen = []
+    plugin._llm = lambda s, u: seen.append(u) or "YES"
+    assert plugin.judge("TIP", reply, source="desktop") is True
+    assert seen == [plugin._judge_input(reply, "Move the panel.")]
+
+
+def test_pending_identical_reply_uses_current_request_not_old_reply(plugin, home):
+    reply = "Done."
+    _messages(home, [("S1", "user", "Old request", None),
+                     ("S1", "assistant", reply, None),
+                     ("S1", "user", "Current request", None)])
+    seen = []
+    plugin._llm = lambda s, u: seen.append(u) or "YES"
+    token = plugin._GATE_SCOPE.set({})
+    try:
+        assert plugin.judge("S1", reply) is True
+    finally:
+        plugin._GATE_SCOPE.reset(token)
+    assert seen == [plugin._judge_input(reply, "Current request")]
+
+
 def test_judge_request_is_capped_and_missing_rows_send_message_only(plugin, home):
     _messages(home, [("S1", "user", "x" * 9000, None)])
     seen = []

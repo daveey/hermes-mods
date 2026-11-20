@@ -198,6 +198,32 @@ def test_gate_against_real_core(real, monkeypatch):
     assert gate(plugin, "Hmm?")["hold"]
 
 
+def test_negative_verdict_survives_informational_tail_and_judge_outage(real, monkeypatch):
+    from hermes_state import SessionDB
+
+    so, plugin = real
+    plugin.PLUGINS = ROOT.parent
+    monkeypatch.setattr(so, "_live_turn", lambda *a: False)
+    monkeypatch.setattr(so, "_live_work", lambda *a: ([], [], False))
+    plugin._llm = lambda *a: "NO"
+    db = SessionDB()
+    try:
+        db.append_message("chat", role="assistant", content=SUMMARY)
+        initial = so.refresh_outcome("chat", trigger="manual", db=db)
+        assert initial["reason"] == "no_summary" and initial["judged"]
+        db.append_message("chat", role="user", content="An unrelated completed card.",
+                          display_kind="kanban_notice",
+                          display_metadata={"outcome_informational": True, "stale": True})
+        plugin._JUDGED.clear()
+        def unavailable(*a):
+            raise RuntimeError("subscription pool unavailable")
+        plugin._llm = unavailable
+        out = so.refresh_outcome("chat", trigger="manual", db=db)
+        assert out["reason"] == "no_summary" and out["judged_msg"] == initial["judged_msg"]
+    finally:
+        db.close()
+
+
 def test_open_step_makes_real_core_say_decision(real, monkeypatch):
     so, plugin = real
     plugin._llm = lambda s, u: "NO"
