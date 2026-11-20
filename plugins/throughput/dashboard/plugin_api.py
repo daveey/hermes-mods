@@ -4,7 +4,7 @@ subscription pools' runway (../runway.py). PUT body ``{"percent": 0..100}``.
 PUT / DELETE /api/plugins/throughput/v1/throttle/burst: start a burst on the budget level (body ``{"factor": 1 < f <= 4,
 "hours": 0 < h <= 24}``; 409 on a manual or expired level) or end it now.
 PUT /api/plugins/throughput/v1/throttle/pacing: the budget pacing switch (body ``{"on": true|false}``, anything else a
-400); answers with the GET /v1/throttle payload, whose ``pacing`` is ``{state, publisher}``.
+400); answers with the GET /v1/throttle payload, whose ``pacing`` is ``{state, publisher, budget_seen}``.
 GET /api/plugins/throughput/v1/budget[?factor=&hours=[&projection_only=1]]: this host's capacity model, the measured
 spend per provider over 7 days (cached a minute per process) and the current burst, plus the cost of the given burst
 (../budget_view.py); ``projection_only`` returns just the burst and its cost.

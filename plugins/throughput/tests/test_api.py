@@ -396,7 +396,7 @@ def test_pacing_route_switches_budget_pacing_off_and_on(api, tmp_path, monkeypat
     level = {"mode": "auto", "percent": 20.0, "cap_per_s": 1000.0, "pool_caps": {"anthropic": 0.0},
              "budget_at": now - 60, "set_at": now - 30, "burst": {"factor": 2.0, "until": now + 3000, "set_at": now - 30}}
     throttle._write_json(throttle.level_path(root), level)
-    assert c.get("/p/v1/throttle").json()["pacing"] == {"state": "on", "publisher": "hub"}
+    assert c.get("/p/v1/throttle").json()["pacing"] == {"state": "on", "publisher": "hub", "budget_seen": True}
     before = throttle.level_path(root).read_text()
     for bad in ({}, {"on": "false"}, {"on": 1}, {"on": 0}, {"on": None}):
         got = c.put("/p/v1/throttle/pacing", json=bad)
@@ -409,7 +409,7 @@ def test_pacing_route_switches_budget_pacing_off_and_on(api, tmp_path, monkeypat
     stored = json.loads(throttle.level_path(root).read_text())
     assert set(stored) == {"mode", "percent", "cap_per_s", "set_at"} and stored["mode"] == "manual"
     assert stored["percent"] == 20.0 and stored["set_at"] > level["set_at"]
-    assert off["pacing"] == {"state": "off", "publisher": None} and off["mode"] == "manual"
+    assert off["pacing"] == {"state": "off", "publisher": None, "budget_seen": True} and off["mode"] == "manual"
     assert off["burst"] is None and off["budget"] is None and off["gateways"] == [{"name": "hub", "seen": True}]
     assert c.put("/p/v1/throttle/burst", json={"factor": 2, "hours": 1}).status_code == 409
     moved = c.put("/p/v1/throttle", json={"percent": 50}).json()
@@ -420,7 +420,7 @@ def test_pacing_route_switches_budget_pacing_off_and_on(api, tmp_path, monkeypat
     on = c.put("/p/v1/throttle/pacing", json={"on": True}).json()
     stored = json.loads(throttle.level_path(root).read_text())
     assert "mode" not in stored and stored["percent"] == 50.0 and stored["set_at"] > again["set_at"]
-    assert on["pacing"] == {"state": "pending", "publisher": None}
+    assert on["pacing"] == {"state": "pending", "publisher": None, "budget_seen": False}
 
 
 def test_budget_view_endpoint_shape(api, tmp_path, monkeypatch):

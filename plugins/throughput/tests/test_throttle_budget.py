@@ -534,18 +534,19 @@ def test_set_pacing_off_then_on_round_trips_through_the_publisher(tmp_path):
     assert level["mode"] == "auto" and level["percent"] == 20.0
     stamp = T.set_pacing(tmp_path, level, False, NOW + 20, reference=2000.0)
     assert stamp == NOW + 20
-    assert json.loads(T.level_path(tmp_path).read_text()) == {"mode": "manual", "percent": 20.0,
-                                                              "cap_per_s": pytest.approx(1600.0), "set_at": NOW + 20}
+    # the absolute cap in force is kept (20 % held back of a 1000 tokens/s budget), not 20 % of the 2000 reference
+    assert json.loads(T.level_path(tmp_path).read_text()) == {"mode": "manual", "percent": pytest.approx(20.0),
+                                                              "cap_per_s": pytest.approx(800.0), "set_at": NOW + 20}
     level = T.effective(tmp_path, None, NOW + 21)
     assert T.pacing_off(level) and T.set_pacing(tmp_path, level, False, NOW + 21) is None  # already off: no write
     assert T.publish_budget(tmp_path, None, pacing, NOW + 80) is False
     gate, _ = _gate(tmp_path, db)
     plan = gate.plan(NOW + 80, "anthropic")  # no pool caps: the reserve hold is gone, the manual cap paces
-    assert plan[0] == "pace" and len(plan) == 3 and plan[1] == pytest.approx(T.DEFAULT_CALL_TOKENS / 1600.0)
+    assert plan[0] == "pace" and len(plan) == 3 and plan[1] == pytest.approx(T.DEFAULT_CALL_TOKENS / 800.0)
     assert T.status(tmp_path, db, NOW + 80)["pacing"]["state"] == "off"
     stamp = T.set_pacing(tmp_path, T.effective(tmp_path, None, NOW + 90), True, NOW + 90, reference=2000.0)
-    assert json.loads(T.level_path(tmp_path).read_text()) == {"percent": 20.0, "cap_per_s": pytest.approx(1600.0),
-                                                              "set_at": NOW + 90}
+    assert json.loads(T.level_path(tmp_path).read_text()) == {"percent": pytest.approx(20.0),
+                                                              "cap_per_s": pytest.approx(1600.0), "set_at": NOW + 90}
     assert stamp == NOW + 90 and T.status(tmp_path, db, NOW + 95)["pacing"]["state"] == "pending"
     assert T.set_pacing(tmp_path, T.effective(tmp_path, None, NOW + 95), True, NOW + 95) is None  # already on its way
     assert T.publish_budget(tmp_path, None, pacing, NOW + 100) is True
@@ -553,7 +554,7 @@ def test_set_pacing_off_then_on_round_trips_through_the_publisher(tmp_path):
     assert level["mode"] == "auto" and level["percent"] == pytest.approx(20.0)
     assert level["pool_caps"] == {"anthropic": 0.0, "openai-codex": 600.0} and level["set_at"] == NOW + 90.001
     assert gate.plan(NOW + 131, "anthropic") == ("hold",)  # the reserve hold is back
-    assert T.status(tmp_path, db, NOW + 100)["pacing"] == {"state": "on", "publisher": "hub"}
+    assert T.status(tmp_path, db, NOW + 100)["pacing"] == {"state": "on", "publisher": "hub", "budget_seen": True}
     assert T.set_pacing(tmp_path, level, True, NOW + 110) is None  # on a live budget level: nothing to do
 
 
@@ -598,19 +599,24 @@ def test_a_persons_cap_set_while_pacing_is_on_is_marked_for_the_fold(tmp_path):
 def test_status_pacing_states(tmp_path):
     db = _series(tmp_path)
     pacing = lambda now: T.status(tmp_path, db, now)["pacing"]  # noqa: E731
-    assert pacing(NOW) == {"state": "unavailable", "publisher": None}  # never set: no budget level anywhere
+    # never set: no budget level anywhere (the panel hides the switch)
+    assert pacing(NOW) == {"state": "unavailable", "publisher": None, "budget_seen": False}
     _auto(tmp_path)
-    assert pacing(NOW) == {"state": "on", "publisher": "hub"}
+    assert pacing(NOW) == {"state": "on", "publisher": "hub", "budget_seen": True}
     _auto(tmp_path, budget_at=NOW - 30 * 60)
-    assert pacing(NOW) == {"state": "on", "publisher": "hub"}  # stale: its caps are kept
+    assert pacing(NOW) == {"state": "on", "publisher": "hub", "budget_seen": True}  # stale: its caps are kept
     _auto(tmp_path, budget_at=NOW - T.BUDGET_EXPIRE_S - 1)
-    assert pacing(NOW) == {"state": "unavailable", "publisher": None}  # the publisher stopped
+    # the publisher stopped; it existed within the last day
+    assert pacing(NOW) == {"state": "unavailable", "publisher": None, "budget_seen": True}
+    _auto(tmp_path, budget_at=NOW - T.BUDGET_SEEN_S - 1)
+    assert pacing(NOW)["budget_seen"] is False
     T._write_json(T.level_path(tmp_path), {"mode": "manual", "percent": 0, "cap_per_s": None, "set_at": NOW - 9000})
-    assert pacing(NOW) == {"state": "off", "publisher": None}  # off for good, however old
+    assert pacing(NOW) == {"state": "off", "publisher": None, "budget_seen": True}  # off for good, however old
     for record in ({"percent": 10, "cap_per_s": None}, {"mode": "manual", "percent": 10, "pool_caps": {}}):
         T._write_json(T.level_path(tmp_path), {**record, "set_at": NOW - 60})
-        assert pacing(NOW) == {"state": "pending", "publisher": None}
-        assert pacing(NOW + T.PENDING_S) == {"state": "unavailable", "publisher": None}  # nothing folded it in
+        assert pacing(NOW) == {"state": "pending", "publisher": None, "budget_seen": False}
+        # nothing folded it in, and no budget was ever seen
+        assert pacing(NOW + T.PENDING_S) == {"state": "unavailable", "publisher": None, "budget_seen": False}
 
 
 def test_status_pacing_names_the_publisher_and_waits_longer_while_one_is_seen(tmp_path):
@@ -619,10 +625,79 @@ def test_status_pacing_names_the_publisher_and_waits_longer_while_one_is_seen(tm
     budget = {"mode": "auto", "percent": 0, "cap_per_s": 1000.0, "pool_caps": {"anthropic": 400.0},
               "budget_at": NOW - 60, "set_at": NOW - 100}
     hub_db = _replica(tmp_path / "hub.db", {"hub": budget, "laptop": {**budget, "budget_at": NOW - 600}})
-    assert T.status(worker, db, NOW, hub_db)["pacing"] == {"state": "on", "publisher": "hub"}
+    assert T.status(worker, db, NOW, hub_db)["pacing"] == {"state": "on", "publisher": "hub", "budget_seen": True}
     T._write_json(T.level_path(worker), {"mode": "manual", "percent": 0, "cap_per_s": None, "set_at": NOW - 50})
-    assert T.status(worker, db, NOW, hub_db)["pacing"] == {"state": "off", "publisher": "hub"}
+    assert T.status(worker, db, NOW, hub_db)["pacing"] == {"state": "off", "publisher": "hub", "budget_seen": True}
     T._write_json(T.level_path(worker), {"percent": 0, "cap_per_s": None, "set_at": NOW - 50})
     later = NOW - 50 + T.PENDING_S + 60  # past PENDING_S, a live publisher seen: the link may still be carrying it
-    assert T.status(worker, db, later, hub_db)["pacing"] == {"state": "pending", "publisher": "hub"}
+    assert T.status(worker, db, later, hub_db)["pacing"] == {"state": "pending", "publisher": "hub",
+                                                            "budget_seen": True}
     assert T.status(worker, db, NOW - 50 + T.PENDING_MAX_S, hub_db)["pacing"]["state"] == "unavailable"
+
+
+def test_on_after_more_than_an_hour_off_stays_pending_while_the_fold_travels(tmp_path):
+    """Pacing was off for two hours (switched off on a laptop): the hub's last budget level has expired. A click on On
+    on a worker stays pending for PENDING_MAX_S, the time a fold can take over the link, not PENDING_S."""
+    worker = tmp_path / "w"
+    db = _series(worker, me="worker-1")
+    off_at = NOW - 2 * 3600
+    budget = {"mode": "auto", "percent": 0, "cap_per_s": 1000.0, "pool_caps": {"anthropic": 400.0},
+              "budget_at": off_at - 60, "set_at": off_at - 30}
+    off = {"mode": "manual", "percent": 0, "cap_per_s": None, "set_at": off_at}
+    hub_db = _replica(tmp_path / "hub.db", {"hub": budget, "laptop": off})
+    assert T.status(worker, db, NOW, hub_db)["pacing"] == {"state": "off", "publisher": None, "budget_seen": True}
+    assert T.set_pacing(worker, T.effective(worker, hub_db, NOW), True, NOW) == NOW
+    for t in (NOW + 60, NOW + T.PENDING_S + 1, NOW + 8 * 60, NOW + T.PENDING_MAX_S - 1):
+        assert T.status(worker, db, t, hub_db)["pacing"]["state"] == "pending", t
+    assert T.status(worker, db, NOW + T.PENDING_MAX_S, hub_db)["pacing"]["state"] == "unavailable"
+    # the same On where no budget (nor an Off) was seen in the last day: unavailable after PENDING_S
+    alone = tmp_path / "alone"
+    db2 = _series(alone, me="solo")
+    T.set_pacing(alone, {"mode": "manual", "percent": 0.0, "cap_per_s": None, "set_at": NOW - 2 * T.BUDGET_SEEN_S},
+                 True, NOW)
+    assert T.status(alone, db2, NOW + T.PENDING_S - 1)["pacing"]["state"] == "pending"
+    assert T.status(alone, db2, NOW + T.PENDING_S)["pacing"] == {"state": "unavailable", "publisher": None,
+                                                                 "budget_seen": False}
+
+
+def test_off_without_a_reference_paces_at_this_gateways_own_reference(tmp_path):
+    bucket = (END - 6 * 3600) // 900 * 900
+    db = _series(tmp_path, [("hub", bucket, 1_800_000.0)])  # 24-hour peak: 2000 tokens/s
+    T.set_pacing(tmp_path, {"percent": 40.0, "cap_per_s": None, "set_at": NOW - 20, "mode": "manual",
+                            "pool_caps": {}}, False, NOW - 10, reference=None)  # set where nothing was measured
+    stored = json.loads(T.level_path(tmp_path).read_text())
+    assert stored["mode"] == "manual" and stored["percent"] == 40.0 and stored["cap_per_s"] is None
+    level = T.effective(tmp_path, None, NOW)
+    assert T.pacing_off(level) and T.limit_of(level, 2000.0, NOW) == pytest.approx(1200.0)
+    gate, _ = _gate(tmp_path, db)
+    plan = gate.plan(NOW, "anthropic")
+    assert plan[0] == "pace" and plan[1] == pytest.approx(T.DEFAULT_CALL_TOKENS / 1200.0)
+    assert T.status(tmp_path, db, NOW)["cap_per_s"] == pytest.approx(1200.0)
+    T._write_json(T.level_path(tmp_path), {"mode": "manual", "percent": 0.0, "cap_per_s": None, "set_at": NOW - 5})
+    assert gate.plan(NOW + 31, "anthropic") == ("pass",)  # 0 %: still no cap
+    # a person's "no cap" (write_cap None: 0 %, no cap_per_s) is unchanged: no cap
+    T.write_cap(tmp_path, None, NOW, None)
+    assert T.limit_of(T.read_record(tmp_path), 2000.0, NOW) is None
+
+
+def test_off_keeps_the_persons_absolute_cap_in_force(tmp_path):
+    # elsewhere: a budget level whose percent folds in a person's 250 tokens/s cap; a running burst is not kept
+    _auto(tmp_path, percent=75.0, cap=1000.0, burst={"factor": 2.0, "until": NOW + 3600, "set_at": NOW - 10})
+    T.set_pacing(tmp_path, T.effective(tmp_path, None, NOW), False, NOW, reference=50_000.0)
+    data = json.loads(T.level_path(tmp_path).read_text())
+    assert data == {"mode": "manual", "percent": pytest.approx(75.0), "cap_per_s": pytest.approx(250.0), "set_at": NOW}
+    # the publish host: a person's cap above the budget (published at 0 %) is its recorded cap, not "no cap"
+    host = tmp_path / "hub"
+    pacing = _pacing_file(host, _v2())
+    T.write_cap(host, 2000.0, NOW)
+    assert T.publish_budget(host, None, pacing, NOW + 10)
+    level = T.effective(host, None, NOW + 20)
+    assert level["mode"] == "auto" and level["percent"] == 0.0
+    T.set_pacing(host, level, False, NOW + 20, reference=50_000.0)
+    data = json.loads(T.level_path(host).read_text())
+    assert data["cap_per_s"] == pytest.approx(2000.0) and 0 < data["percent"] < 1  # older code still enforces it
+    assert T.limit_of(T.read_record(host), 50_000.0, NOW + 20) == pytest.approx(2000.0)
+    # no person's cap at all: Off from a 0 % budget level is no cap
+    _auto(tmp_path / "plain")
+    T.set_pacing(tmp_path / "plain", T.effective(tmp_path / "plain", None, NOW), False, NOW, reference=50_000.0)
+    assert json.loads(T.level_path(tmp_path / "plain").read_text())["cap_per_s"] is None

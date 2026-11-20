@@ -109,7 +109,7 @@ def test_status(tmp_path):
                                            "cap_per_s": None, "rate_per_s": pytest.approx(800.0), "holding": False,
                                            "set_at": None, "set_by": None, "mode": "manual",
                                            "budget": None, "burst": None, "user_cap_per_s": None,
-                                           "pacing": {"state": "unavailable", "publisher": None}}  # never set, by no one
+                                           "pacing": {"state": "unavailable", "publisher": None, "budget_seen": False}}  # never set
     T.write_level(tmp_path, 10)
     assert T.status(tmp_path, db, NOW)["cap_per_s"] == pytest.approx(900.0)
     assert T.status(tmp_path, db, NOW)["holding"] is False

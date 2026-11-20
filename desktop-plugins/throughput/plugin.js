@@ -10,7 +10,7 @@
 // Budget pacing switch: PUT /v1/throttle/pacing {on}. Off = an explicit manual level the hub's publisher leaves alone
 // (the slider is then a plain manual cap and there is no burst); `pacing.state` is on, off, pending or unavailable.
 import { useQuery, useQueryClient, STATUSBAR_AREAS, PALETTE_AREA, Popover, PopoverTrigger, PopoverContent } from '@hermes/plugin-sdk'
-import { createElement as h, useState, useEffect, useMemo, useRef } from 'react'
+import { createElement as h, useState, useEffect, useMemo, useRef, useId } from 'react'
 
 export const POLL_MS = 30000
 export const REQUEST_TIMEOUT_MS = 20000 // the hub answers in 0.3-10 s under load
@@ -594,11 +594,17 @@ export function BudgetSection({ budget, throttle, pick, setPick, onStart, onEnd,
     pools.map((p) => h(BudgetChart, { key: p, id: p, title: poolName(p), series: chartSeries(budget, p, opts) })))
 }
 
-// The budget pacing On/Off switch with its one-line note. `onPacing(on)` saves; hidden on an older backend.
+// The budget pacing On/Off switch with its one-line note. `onPacing(on)` saves; hidden on an older backend, and on a
+// fleet that has no budget publisher (unavailable, and no budget level or Off seen in the last day).
+export const showPacing = (throttle) => {
+  const state = pacingState(throttle)
+  return !!state && !(state === 'unavailable' && throttle?.pacing?.budget_seen === false)
+}
 export function PacingSwitch({ throttle, onPacing, error }) {
   const state = pacingState(throttle)
   const [busy, setBusy] = useState(false)
-  if (!state || !onPacing) return null
+  const labelId = useId() // one per panel instance
+  if (!showPacing(throttle) || !onPacing) return null
   const on = state !== 'off'
   const note = pacingNote(throttle)
   const flip = async () => {
@@ -607,14 +613,14 @@ export function PacingSwitch({ throttle, onPacing, error }) {
   }
   return h('div', { className: 'hermes-tp-pacing', 'data-slot': 'pacing', 'data-pacing': state },
     h('div', { className: 'hermes-tp-trow' },
-      h('span', { className: 'hermes-tp-lbl hermes-tp-plabel', id: 'hermes-tp-pacing-label' }, 'Budget pacing'),
+      h('span', { className: 'hermes-tp-lbl hermes-tp-plabel', id: labelId }, 'Budget pacing'),
       h('button', {
-        type: 'button', role: 'switch', 'aria-checked': on, 'aria-labelledby': 'hermes-tp-pacing-label',
+        type: 'button', role: 'switch', 'aria-checked': on, 'aria-labelledby': labelId,
         className: 'hermes-tp-switch', disabled: busy, onClick: flip,
         title: on ? 'Turn budget pacing off: the fleet keeps a plain manual cap' : 'Turn budget pacing on: the hub publishes the budget as the cap'
       }, h('span', { className: 'hermes-tp-knob', 'aria-hidden': true })),
-      h('span', { className: 'hermes-tp-ttext', 'data-pacing-value': '' }, on ? 'On' : 'Off'),
-      note ? h('span', { className: 'hermes-tp-lbl', 'data-pacing-note': state }, note) : null),
+      h('span', { className: 'hermes-tp-ttext', 'data-pacing-value': '' }, on ? 'On' : 'Off')),
+    note ? h('div', { className: 'hermes-tp-lbl hermes-tp-pnote', 'data-pacing-note': state }, note) : null,
     error ? h('div', { className: 'hermes-tp-note', role: 'alert' }, `Budget pacing not changed: ${error}`) : null)
 }
 
@@ -905,6 +911,7 @@ export const CSS = `
 .hermes-tp-warn{color:var(--ui-orange,#c2410c)}
 .hermes-tp-pacing{display:flex;flex-direction:column;gap:2px;margin-bottom:2px}
 .hermes-tp-plabel{color:var(--ui-text-secondary)}
+.hermes-tp-pnote{white-space:normal;overflow-wrap:anywhere}
 .hermes-tp-switch{position:relative;flex-shrink:0;width:28px;height:16px;padding:0;border:1px solid var(--ui-stroke-secondary,#8a909c);border-radius:8px;background:transparent;cursor:pointer}
 .hermes-tp-switch[aria-checked=false]:hover:not(:disabled){background:var(--chrome-action-hover)}
 .hermes-tp-switch:focus-visible{outline:2px solid var(--ui-blue,#3b82f6);outline-offset:1px}

@@ -918,7 +918,7 @@ test('panel: budget pacing switch, burst hidden and slider a manual cap while of
 
 test('panel: no hub publishing says so; an older backend without pacing shows no switch', async () => {
   P.saveView(V())
-  const ui = await mount(React.createElement(P.Throughput, { ctx: ctxWith(withThrottle({ value: throttle({ mode: 'manual', pacing: { state: 'unavailable', publisher: null } }) })) }))
+  const ui = await mount(React.createElement(P.Throughput, { ctx: ctxWith(withThrottle({ value: throttle({ mode: 'manual', pacing: { state: 'unavailable', publisher: null, budget_seen: true } }) })) }))
   try {
     await ui.click(button('Show throughput'))
     assert.equal(document.querySelector('[data-slot="pacing"] button[role=switch]').getAttribute('aria-checked'), 'true')
@@ -943,4 +943,35 @@ test('pacing switch CSS: theme variables with fallbacks, checked state distinct 
   assert.match(rule('.hermes-tp-switch[aria-checked=true]'), /background:var\(--ui-green,#1f8a65\)/)
   assert.match(rule('.hermes-tp-switch[aria-checked=true] .hermes-tp-knob'), /background:var\(--ui-bg,#fff\)/)
   assert.match(rule('.hermes-tp-knob'), /background:var\(--ui-text-tertiary,#8a909c\)/)
+})
+
+test('pacing switch: hidden on a fleet that never published a budget; one label id per panel; the note wraps', async () => {
+  const never = throttle({ mode: 'manual', pacing: { state: 'unavailable', publisher: null, budget_seen: false } })
+  assert.equal(P.showPacing(never), false)
+  assert.equal(P.showPacing(throttle({ mode: 'manual', pacing: { state: 'pending', publisher: null, budget_seen: false } })), true)
+  assert.equal(P.showPacing(throttle({ mode: 'manual', pacing: { state: 'unavailable', publisher: null } })), true, 'older payload: shown')
+  P.saveView(V())
+  const ui = await mount(React.createElement(P.Throughput, { ctx: ctxWith(withThrottle({ value: never })) }))
+  try {
+    await ui.click(button('Show throughput'))
+    assert.ok(document.querySelector('[data-slot="throttle"] input[type=range]'))
+    assert.equal(document.querySelector('[data-slot="pacing"]'), null)
+  } finally {
+    await ui.close()
+  }
+  const off = throttle({ mode: 'manual', percent: 20, cap_per_s: 16, pacing: { state: 'off', publisher: 'hub', budget_seen: true } })
+  const row = () => React.createElement(P.ThrottleRow, { throttle: off, draft: null, setDraft: () => {}, onCommit: () => {}, unit: 'm', onPacing: async () => {} })
+  const ui2 = await mount(React.createElement(React.Fragment, null, row(), row()))
+  try {
+    const ids = [...document.querySelectorAll('[data-slot="pacing"] button[role=switch]')].map((b) => b.getAttribute('aria-labelledby'))
+    assert.equal(ids.length, 2)
+    assert.notEqual(ids[0], ids[1])
+    for (const id of ids) assert.equal(document.getElementById(id).textContent, 'Budget pacing')
+    const note = document.querySelector('[data-pacing-note="off"]')
+    assert.equal(note.tagName, 'DIV', 'the note is its own line under the switch, not squeezed into the row')
+    assert.ok(note.className.includes('hermes-tp-pnote'))
+    assert.match(P.CSS.split('\n').find((l) => l.startsWith('.hermes-tp-pnote{')), /white-space:normal/)
+  } finally {
+    await ui2.close()
+  }
 })

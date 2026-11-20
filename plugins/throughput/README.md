@@ -206,11 +206,18 @@ and a body that is not a JSON object a 422, and neither changes anything.
     pacing" On/Off). The hub link carries only `percent, cap_per_s, set_at, mode, budget_at, pool_caps, burst`, so
     the switch is a level like any other and wins fleet-wide by newest `set_at` (stamped like the slider, `max(now,
     set_at in force + 2 ms)`).
-    - **Off** writes `{"mode": "manual", "percent": <current>, "cap_per_s": cap(percent, reference), "set_at"}`: an
-      explicit manual level **without `pool_caps`** (`pacing_off`). While it is the level in force the publisher
-      writes nothing, however long it stays (no budget level, no fold into `user-cap.json`). Otherwise it is an
-      ordinary manual level: `(1 - percent/100) x reference`, no pool caps (reserve holds end), the start gate's rate
-      rule, 100 % holds everything. A burst is dropped when it is written and ignored on it (the burst route answers
+    - **Off** writes `{"mode": "manual", "percent", "cap_per_s", "set_at"}`: an explicit manual level **without
+      `pool_caps`** (`pacing_off`). While it is the level in force the publisher writes nothing, however long it
+      stays (no budget level, no fold into `user-cap.json`). Otherwise it is an ordinary manual level: its cap, no
+      pool caps (reserve holds end), the start gate's rate rule, 100 % holds everything. **The cap**: from a live
+      budget level, the absolute cap in force is kept (a budget level's percent is a person's cap the publisher folded
+      in, relative to the budget; re-deriving it against this gateway's 24-hour reference would loosen or tighten
+      it): on the publish host the cap it recorded in `user-cap.json` (including a cap above the budget), elsewhere
+      `budget x (1 - percent/100)`, never the burst; stored like a person's cap (percent strictly between 0 and 100,
+      so older code enforces it; none at 0 %, 0 at 100 %). From any other level, `cap(percent, reference)` with the
+      current percent. A manual level stored without `cap_per_s` (an Off set where no reference was measured yet)
+      caps at this gateway's own `(1 - percent/100) x reference`, as a level without `mode` does. The slider on an
+      Off level then sets `(1 - percent/100) x reference`, so its first move re-derives the cap from the reference. A burst is dropped when it is written and ignored on it (the burst route answers
       409). The slider on it keeps `mode: "manual"` (no pool caps), so moving the slider never turns pacing back on,
       and a person's cap set while it is off carries no `pool_caps` either and keeps it off.
     - **On** writes `{"percent", "cap_per_s", "set_at"}` without `mode` (the current percent): the publisher folds it
@@ -223,16 +230,32 @@ and a body that is not a JSON object a 422, and neither changes anything.
     - **`pacing`** in the payload is `{state, publisher}` (`pacing_status`, from the levels already read):
       `on` = the level in force is a budget level whose budget has not expired (fresh or stale); `off` = it is an
       explicit manual level without `pool_caps`; `pending` = it is a level the publisher folds in (no `mode`, or a
-      person's cap with `pool_caps`) set under 3 minutes ago, or under 10 minutes ago while a live budget level is
-      seen (the link takes up to about 4 minutes each way); `unavailable` = anything else: an expired budget, or a
-      level nothing folded in, i.e. no publisher is running or reaching this gateway. `publisher` is the gateway
+      person's cap with `pool_caps`) set under 3 minutes ago, or under 10 minutes ago while `budget_seen` (the link
+      takes up to about 4 minutes each way, so a fold can take 8-9 minutes to come back); `unavailable` = anything
+      else: an expired budget, or a level nothing folded in, i.e. no publisher is running or reaching this gateway.
+      `budget_seen` is true when any level read here (its own or a published one) is a budget level with `budget_at`
+      in the last 24 hours, expired or not (after a long Off the publisher's last budget level has expired but is
+      still there), or an Off set in the last 24 hours (an Off set on the publish host replaces its budget level).
+      The panel hides the switch on `unavailable` with `budget_seen` false: that fleet has no budget publisher. `publisher` is the gateway
       whose unexpired budget level is newest by `budget_at` (then `set_at`) among this gateway's own and every
       published one, or null; a slider or burst set on another gateway copies the budget level there, so that
       gateway can be named until the publisher's next write.
-    - **Rollout**: the publisher host must run this version first; an older publisher folds an off level back in.
-      Other gateways obey an off level as a manual cap on any version.
+    - **Rollout and mixed versions**:
+      - The publisher host must run this version first; an older publisher folds an Off level back in.
+      - An older plugin's `write_cap` (a person's cap from an older panel or CLI) set while no live budget level is in
+        force writes `mode: "manual"` without `pool_caps`. This version reads that as Off, and it sticks: the
+        publisher stops until someone turns pacing On. Update every host that sets caps before relying on the switch.
+      - An Off set on a gateway whose hub client is older than 1.9.55 is published without `mode`, so every other
+        gateway (and the publisher) reads it as a plain level and folds it back to On. Set Off only on gateways with
+        hub client 1.9.55 or newer.
+      - Newest `set_at` wins: a slider move, cap or burst set on a gateway that has not yet received an Off (link lag,
+        up to a few minutes) is stamped after the level that gateway sees, a budget level, and writes a level the
+        publisher folds in again, so it turns pacing back On fleet-wide. Wait until the panel shows Off on the gateway
+        you change things from.
+      - Other gateways obey an Off level as a manual cap on any version.
     - Tests: `tests/test_throttle_budget.py` (publisher skip and legacy fold, off set on another gateway, round trip,
-      slider and person's cap while off, `pacing` states), `tests/test_throttle_burst.py` (burst dropped and ignored),
+      slider and person's cap while off, `pacing` states, On after more than an hour Off, Off without a reference,
+      Off keeping a person's absolute cap), `tests/test_throttle_burst.py` (burst dropped and ignored),
       `tests/test_api.py::test_pacing_route_switches_budget_pacing_off_and_on` (REST, validation), panel
       `desktop-plugins/throughput/tests/throughput.test.mjs`. **Not tested**: an off level travelling through two
       real hub links.
@@ -357,7 +380,8 @@ contrast on white and on near-black, so the charts read in light and dark themes
 Above the slider, a **Budget pacing** On/Off switch (`role="switch"`, shown when the backend sends `pacing`) puts
 `/v1/throttle/pacing`. Off: the burst control is hidden, the slider is labelled "Manual cap N%", and one line says
 budget pacing is off. Pending: "Budget pacing is turning on…". Unavailable: "No hub is publishing a budget". On: which
-gateway publishes it. The switch uses `--ui-stroke-secondary`, `--ui-green`, `--ui-bg` and `--ui-text-tertiary` with
+gateway publishes it. The note sits on its own line and wraps; the switch's label id is unique per panel. The switch
+is not shown on a fleet that has no budget publisher (`unavailable` with `budget_seen` false). The switch uses `--ui-stroke-secondary`, `--ui-green`, `--ui-bg` and `--ui-text-tertiary` with
 fallbacks, so it reads in light and dark themes.
 
 ## Sampler

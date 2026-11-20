@@ -62,7 +62,7 @@
   so the publisher still folds it in; set while pacing is off it carries none and pacing stays off. The hub link
   carries only ``percent, cap_per_s, set_at, mode, budget_at, pool_caps, burst``, so the marker has to be one of them.
   Turning it on writes a level without ``mode``, which the publisher folds into a budget level on its next pass.
-  ``status()["pacing"]`` = ``{state: on|off|pending|unavailable, publisher}`` (``pacing_status``).
+  ``status()["pacing"]`` = ``{state: on|off|pending|unavailable, publisher, budget_seen}`` (``pacing_status``).
 """
 from __future__ import annotations
 
@@ -113,7 +113,8 @@ BURST_MAX_FACTOR = 4.0  # a burst multiplies the budget caps by 1 < factor <= th
 BURST_MAX_S = 24 * 3600.0  # ... for at most this long after it was set
 PROVIDER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}")  # a pool key: the hub client's rule too
 PENDING_S = 180.0  # a level set to be folded in reads "pending" this long after it was set ...
-PENDING_MAX_S = 600.0  # ... and up to this long while a live publisher is seen (link lag: up to ~4 min each way)
+PENDING_MAX_S = 600.0  # ... and up to this long while a budget was seen (link lag: up to ~4 min each way)
+BUDGET_SEEN_S = 24 * 3600.0  # a budget level (or an Off) this recent means the fleet has a budget publisher
 
 
 def level_path(root: Path) -> Path:
@@ -339,13 +340,34 @@ def set_level(root: Path, level: dict, percent, now: float, reference: Optional[
     return value
 
 
+def _off_cap(root: Path, level: dict, now: float) -> tuple[float, Optional[float]]:
+    """``(percent, cap_per_s)`` for an Off set from the live budget level ``level``: the person's absolute cap in force.
+    On the publish host, when ``level`` is its own last write, the cap it recorded (``user-cap.json``, which also
+    keeps a cap above the budget); elsewhere the budget scaled by the level's percent, without any burst
+    (``person_cap``). Stored like ``write_cap`` stores a cap, so older code enforces it too: None (no cap) at 0 %, 0 at
+    100 %, any other cap at a percent strictly between 0 and 100."""
+    recorded = read_user_cap(root)
+    value = (recorded["cap_per_s"] if recorded["published_set_at"] is not None
+             and recorded["published_set_at"] == level["set_at"] else person_cap(level, now))
+    if level["percent"] >= 100:
+        value = 0.0
+    if value is None:
+        return 0.0, None
+    if value <= 0:
+        return 100.0, 0.0
+    return min(99.999, max(MANUAL_MIN_PERCENT, percent_for(value, level.get("cap_per_s")))), value
+
+
 def set_pacing(root: Path, level: dict, on, now: float, reference: Optional[float] = None) -> Optional[float]:
     """The budget pacing switch. ``level`` is the one in force; the new level is stamped like the slider's,
     ``max(now, level set_at + 2 ms)``, so it wins fleet-wide. Returns that stamp, or None when nothing was written.
 
-    * ``on=False``: ``{"mode": "manual", "percent", "cap_per_s": cap(percent, reference), "set_at"}`` with the
-      current percent; any burst and pool caps are dropped. The publisher writes nothing while it is in force.
-      Nothing is written when pacing is already off.
+    * ``on=False``: ``{"mode": "manual", "percent", "cap_per_s", "set_at"}``; any burst and pool caps are dropped.
+      The publisher writes nothing while it is in force. Nothing is written when pacing is already off. From a live
+      budget level the absolute cap in force is kept (``_off_cap``): a budget level's percent is a person's cap folded
+      in by the publisher, relative to the budget, and re-deriving it against this gateway's 24-hour reference would
+      loosen (or tighten) it. Otherwise (an expired budget, a level to fold) ``cap_per_s = cap(percent,
+      reference)`` with the current percent; ``limit_of`` falls back to that when it is None.
     * ``on=True``: ``{"percent", "cap_per_s", "set_at"}`` without ``mode``, which the publisher folds into a budget
       level on its next pass (the percent then holds back that share of the budget). Written only when pacing is off:
       any other level is already one the publisher folds in (or its budget), and rewriting a live budget level as a
@@ -360,6 +382,8 @@ def set_pacing(root: Path, level: dict, on, now: float, reference: Optional[floa
     set_at = stamp(max(now, (_number(level.get("set_at")) or 0.0) + 0.002))  # 2 ms: stamps round to 1 ms
     data = {"percent": percent, "cap_per_s": cap(percent, reference), "set_at": set_at}
     if not on:
+        if level.get("mode") == AUTO and not _budget_expired(level, now):
+            data["percent"], data["cap_per_s"] = _off_cap(root, level, now)
         data = {"mode": MANUAL, **data}
     _write_json(level_path(root), data)
     return set_at
@@ -577,15 +601,18 @@ def budget(level: dict, now: float) -> Optional[dict]:
 
 def limit_of(level: dict, reference: Optional[float], now: Optional[float] = None) -> Optional[float]:
     """The cap in tokens/s a level means: the one stored with it, else (a level stored without one) the cap against
-    this gateway's own reference. A budget level: its scaled global budget (None when expired or unknown), and 0 at
-    100 %."""
+    this gateway's own reference (a manual level too: an Off stored where no reference was measured yet). A budget
+    level: its scaled global budget (None when expired or unknown), and 0 at 100 %."""
     percent = level["percent"]
     if level.get("mode") == AUTO:
         if percent >= 100:
             return 0.0
         return budget(level, time.time() if now is None else now)["cap_per_s"]
     if level.get("mode") == MANUAL:
-        return 0.0 if percent >= 100 else level.get("cap_per_s")
+        if percent >= 100:
+            return 0.0
+        # stored without a cap (an Off set where no reference was measured yet): this gateway's own, as below
+        return level["cap_per_s"] if level.get("cap_per_s") is not None else cap(percent, reference)
     if 0 < percent < 100 and level.get("cap_per_s") is not None:
         return level["cap_per_s"]
     return cap(percent, reference)
@@ -657,19 +684,33 @@ def pacing_status(root: Path, level: dict, records: dict, now: float, me: Option
     * ``on``: the level in force is a budget level whose budget has not expired (fresh or stale).
     * ``off``: it is ``pacing_off`` (an explicit manual level without pool caps).
     * ``pending``: it is a level the publisher folds in (no ``mode``, or a person's cap carrying ``pool_caps``) set
-      under ``PENDING_S`` ago, or under ``PENDING_MAX_S`` ago while a live publisher is seen (the hub link takes up to
-      about four minutes each way).
+      under ``PENDING_S`` ago, or under ``PENDING_MAX_S`` ago while ``budget_seen`` (the hub link takes up to about
+      four minutes each way, so a fold can take 8-9 minutes to come back).
     * ``unavailable``: anything else: an expired budget level, or a level to fold that no budget level replaced in
       time. No publisher is running (or reaching this gateway).
+
+    ``budget_seen``: a publisher existed within ``BUDGET_SEEN_S``: some level read here (this gateway's own or a
+    published one) is a budget level with ``budget_at`` in that window, expired or not (after a long Off the
+    publisher's last budget level has expired but is still there), or an explicit Off set in that window (someone
+    switched pacing off, so there was a budget to switch off; this also covers an Off set on the publisher host
+    itself, which replaced its budget level). The panel hides the switch when it is false and the state is
+    ``unavailable``: that fleet has no budget publisher.
 
     ``publisher`` is the gateway whose budget level (``mode: "auto"``, ``budget_at`` under ``BUDGET_EXPIRE_S`` old) is
     the newest by ``budget_at`` then ``set_at`` among this gateway's own level (named ``me``) and every published
     one; None when there is none. A slider or burst set on another gateway copies the budget level there, so that
     gateway can be named until the publisher's next write (about a minute)."""
-    best, best_key = None, None
+    best, best_key, seen = None, None, False
     candidates = [(me, read_record(root))] + [(gw, _record(e.get("throttle"))) for gw, e in sorted(records.items())]
     for gw, rec in candidates:
-        if rec is None or rec.get("mode") != AUTO or _budget_expired(rec, now) or rec["set_at"] > now + FUTURE_SLACK_S:
+        if rec is None or rec["set_at"] > now + FUTURE_SLACK_S:
+            continue
+        if pacing_off(rec) and 0 <= now - rec["set_at"] <= BUDGET_SEEN_S:
+            seen = True
+        at = rec.get("budget_at") if rec.get("mode") == AUTO else None
+        if isinstance(at, (int, float)) and now - at <= BUDGET_SEEN_S:
+            seen = True
+        if rec.get("mode") != AUTO or _budget_expired(rec, now):
             continue
         key = (rec["budget_at"], rec["set_at"])
         if best_key is None or key > best_key:
@@ -681,8 +722,8 @@ def pacing_status(root: Path, level: dict, records: dict, now: float, me: Option
         state = "off"
     else:
         age = now - level["set_at"]
-        state = "pending" if age < PENDING_S or (best_key is not None and age < PENDING_MAX_S) else "unavailable"
-    return {"state": state, "publisher": publisher}
+        state = "pending" if age < PENDING_S or (seen and age < PENDING_MAX_S) else "unavailable"
+    return {"state": state, "publisher": publisher, "budget_seen": seen}
 
 
 def status(root: Path, series_db: Path, now: Optional[float] = None, hub_db: Optional[Path] = None,
@@ -961,7 +1002,8 @@ class Gate:
             if level.get("mode") == AUTO:
                 return self._budget_plan(level, now, provider)
             if level.get("mode") == MANUAL:
-                limit = limit_of(level, None, now)
+                limit = limit_of(level, None if level.get("cap_per_s") is not None or not 0 < percent < 100
+                                 else reference_rate(self.series_db, now), now)
                 if limit is not None and limit <= 0:
                     return ("hold",)
                 carried_at = level.get("budget_at")
