@@ -207,3 +207,11 @@ def test_burst_set_on_another_gateway_is_folded_in_by_the_publisher(tmp_path):
     assert T.publish_budget(tmp_path, hub, _pacing_file(tmp_path), NOW) is True
     data = json.loads(T.level_path(tmp_path).read_text())
     assert data["burst"]["factor"] == 3.0 and data["set_at"] == pytest.approx(NOW - 10 + 0.001)
+
+
+def test_full_length_burst_from_a_clock_slightly_ahead_still_applies(tmp_path):
+    # a 24 h burst set on a host whose clock runs 200 s ahead: within FUTURE_SLACK_S, so the publisher keeps it
+    _auto(tmp_path, burst=_burst(factor=2.0, set_at=NOW + 200, until=NOW + 200 + 86400), budget_at=NOW - 60)
+    level = T.effective(tmp_path, None, NOW)
+    assert T.burst_active(level, NOW) is not None
+    assert T.budget(level, NOW)["cap_per_s"] == pytest.approx(2000.0)

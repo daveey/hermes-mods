@@ -166,8 +166,9 @@ def burst_active(level: dict, now: float) -> Optional[dict]:
     BURST_MAX_S``; else None."""
     burst = level.get("burst") if level.get("mode") == AUTO else None
     # ``burst_of`` bounds until - set_at; also bound until - now, so a burst stamped under a clock far behind (or
-    # crafted with an old set_at) never runs for more than BURST_MAX_S from here.
-    return burst if isinstance(burst, dict) and 0 < burst["until"] - now <= BURST_MAX_S + 0.001 else None
+    # crafted with an old set_at) never runs for more than BURST_MAX_S from here; FUTURE_SLACK_S tolerates the same
+    # clock skew a published level stamp does, so a full-length burst set on a host whose clock is ahead survives.
+    return burst if isinstance(burst, dict) and 0 < burst["until"] - now <= BURST_MAX_S + FUTURE_SLACK_S else None
 
 
 def burst_status(level: dict, now: float) -> Optional[dict]:
