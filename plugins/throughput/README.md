@@ -367,7 +367,9 @@ no limit; orange at the limit) and this gateway's card slots (running / open, fr
 **Budget / Limit / No limit**: Budget clears an own cap and switches budget pacing on (`PUT /v1/throttle
 {"cap_per_min": null}`, then `PUT /v1/throttle/pacing {"on": true}` when it was off); Limit sends a number in
 thousands of tokens per minute on Enter or Set (`{"cap_per_min": N}`; with pacing on the lower of it and the budget
-applies); No limit clears the cap and switches pacing off. Budget is offered only where a budget publisher exists.
+applies); No limit clears the cap and switches pacing off where a budget exists (never on a fleet without a publisher, where an
+Off would fake one). Budget is offered only where a budget publisher exists; while it starts the limit tile says
+so. One change at a time: the controls are disabled while it saves, and each change reads the limit afresh first.
 Beside it **Raise 2× · 1 h** (the burst, only on a live budget level; "…" picks factor and duration; the cost per
 pool is the hover text, a reserve or 5-hour warning one line). Then one row per subscription: a block per account
 (filled = still usable), "3 of 7 · 9.4 d" (at the limit or this pace) and the state colour (tight, paced, held, used
