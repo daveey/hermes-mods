@@ -80,10 +80,14 @@ RATE_MINUTES = 3  # the fleet rate is the mean of the sampled minutes among the 
 POLL_S = 5.0
 START_GATE_TTL_S = 15.0  # the dispatcher asks per candidate card, every tick: answer from a cached read
 START_GATE_REASON = "token_throttle"
+SLOT_GATE_REASON = "token_slots"  # held: this gateway runs every slot its share of the cap pays for
 PACE_FILE = "throttle-pace.json"
 EVEN_SHARE = 0.25  # this much of the cap is split evenly (so an idle gateway can start); the rest follows use
 SHARE_WINDOW_S = 15 * 60  # shares and tokens-per-call are measured over the last 15 minutes
 PLAN_TTL_S = 30.0  # a process re-reads its share and tokens-per-call this often
+WAIT_KEEP_S = 3600.0  # held slot-seconds per card and minute are kept this long in the pace file
+MANUAL = "manual"  # a level whose ``cap_per_s`` is a person's absolute cap (``write_cap``), not a slider's
+USER_CAP_FILE = "user-cap.json"  # the budget-publish host's record of the newest person-set cap
 DEFAULT_CALL_TOKENS = 20_000.0  # before this gateway has measured one paced call
 MIN_CALL_TOKENS, MAX_CALL_TOKENS = 500.0, 2_000_000.0
 MAX_INTERVAL_S = 600.0  # a gateway with a sliver of the cap still gets one call every ten minutes
@@ -194,6 +198,8 @@ def _record(data) -> Optional[dict]:
         burst = burst_of(data.get("burst"))
         if burst is not None:
             rec["burst"] = burst
+    elif data.get("mode") == MANUAL:
+        rec["mode"] = MANUAL
     return rec
 
 
@@ -239,6 +245,29 @@ def _write_auto(root: Path, level: dict, percent: float, set_at: float, burst: O
     if burst is not None:
         data["burst"] = dict(burst)
     _write_json(level_path(root), data)
+
+
+def cap_value(cap_per_s) -> Optional[float]:
+    """A person's cap in tokens/s: a finite number >= 0, or None (no cap of their own: the budget alone, or no
+    throttle without one). Raises ValueError on anything else."""
+    if cap_per_s is None:
+        return None
+    number = _number(cap_per_s)
+    if number is None or number < 0:
+        raise ValueError("cap must be a number of tokens >= 0, or null for no cap")
+    return number
+
+
+def write_cap(root: Path, cap_per_s, now: float) -> Optional[float]:
+    """A person sets the fleet's token cap (tokens/s, None = no cap of their own): a ``mode: "manual"`` level. Every
+    gateway obeys it as an absolute cap; the budget-publish host folds it into its budget level as the lower of the
+    two (``publish_budget``). A cap of 0 is stored at 100 %, so older gateways hold every call too."""
+    value = cap_value(cap_per_s)
+    record = {"mode": MANUAL, "percent": 100.0 if value == 0 else 0.0, "set_at": stamp(now)}
+    if value is not None:
+        record["cap_per_s"] = value
+    _write_json(level_path(root), record)
+    return value
 
 
 def set_level(root: Path, level: dict, percent, now: float, reference: Optional[float] = None) -> float:
@@ -475,6 +504,8 @@ def limit_of(level: dict, reference: Optional[float], now: Optional[float] = Non
         if percent >= 100:
             return 0.0
         return budget(level, time.time() if now is None else now)["cap_per_s"]
+    if level.get("mode") == MANUAL:
+        return 0.0 if percent >= 100 else level.get("cap_per_s")
     if 0 < percent < 100 and level.get("cap_per_s") is not None:
         return level["cap_per_s"]
     return cap(percent, reference)
@@ -559,7 +590,22 @@ def status(root: Path, series_db: Path, now: Optional[float] = None, hub_db: Opt
                                      and governed_rate > governed_cap)
     return {"percent": percent, "reference_per_s": reference, "cap_per_s": limit, "rate_per_s": rate,
             "holding": holding, "set_at": level["set_at"] or None, "set_by": level["source"],
-            "mode": level.get("mode") or "manual", "budget": b, "burst": burst_status(level, now)}
+            "mode": level.get("mode") or "manual", "budget": b, "burst": burst_status(level, now),
+            "user_cap_per_s": shown_user_cap(root, level, now)}
+
+
+def shown_user_cap(root: Path, level: dict, now: float) -> Optional[float]:
+    """The cap a person set, as far as this gateway can tell: a ``manual`` level's own; on a budget level the
+    publish host's record when this is that host, else the budget scaled by its percent when the person's cap is
+    the lower one (None: no cap of theirs, or theirs is above the budget)."""
+    if level.get("mode") == MANUAL:
+        return limit_of(level, None, now)
+    if level.get("mode") != AUTO:
+        return person_cap(level, now)
+    recorded = read_user_cap(root)
+    if recorded["set_at"] > 0:
+        return recorded["cap_per_s"]
+    return person_cap(level, now)
 
 
 def pace_path(root: Path) -> Path:
@@ -711,6 +757,33 @@ class Pacer:
         throttle is engaged."""
         self._locked(lambda state: self._count(state, now, now))
 
+    def note_wait(self, now: float, task: str, seconds: float) -> None:
+        """Count ``seconds`` a card's model call spent held by the throttle, in the minute of ``now``. Per card
+        and minute the total is capped at 60 s, so parallel calls of one card waiting together count one slot.
+        Kept for ``WAIT_KEEP_S``: the slot estimate (slotgate.py) subtracts held slot-seconds from busy ones."""
+        if not task or seconds <= 0:
+            return
+
+        def add(state):
+            floor = int(now - WAIT_KEEP_S) // 60
+            waits = {str(m): {str(t): float(s) for t, s in (v or {}).items() if _number(s) is not None}
+                     for m, v in (state.get("waits") or {}).items()
+                     if str(m).lstrip("-").isdigit() and int(m) >= floor and isinstance(v, dict)}
+            minute = waits.setdefault(str(int(now) // 60), {})
+            minute[task] = min(60.0, minute.get(task, 0.0) + seconds)
+            state["waits"] = waits
+        self._locked(add)
+
+    def waited(self, minute_start: int) -> float:
+        """Held slot-seconds counted in the minute starting at epoch second ``minute_start`` (reads without the
+        lock; a missing or odd file is 0)."""
+        state = _read_json(self.path)
+        waits = state.get("waits") if isinstance(state, dict) else None
+        cell = waits.get(str(int(minute_start) // 60)) if isinstance(waits, dict) else None
+        if not isinstance(cell, dict):
+            return 0.0
+        return sum(min(60.0, float(s)) for s in cell.values() if _number(s) is not None and s > 0)
+
     def passes(self, now: float) -> int:
         """Calls counted in the minutes of the last ``SHARE_WINDOW_S`` up to now (reads without the lock)."""
         state = _read_json(self.path)
@@ -734,13 +807,18 @@ class Gate:
 
     def __init__(self, root: Path, series_db: Path, *, hub_db: Optional[Path] = None,
                  sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.time,
-                 beat: Optional[Callable[[float], None]] = None):
+                 beat: Optional[Callable[[float], None]] = None,
+                 running: Optional[Callable[[], Optional[int]]] = None):
         self.root, self.series_db, self._sleep, self._clock = Path(root), Path(series_db), sleep, clock
         self.hub_db, self._beat = (None if hub_db is None else Path(hub_db)), beat
         self._lock = threading.Lock()
         self._pacer = Pacer(self.root)
         self._rate: Optional[tuple[float, float, float]] = None  # (taken at, share, tokens per call)
-        self._start: Optional[tuple[float, bool]] = None  # (taken at, holding card starts)
+        self._start: Optional[dict] = None  # the start gate's last read (``_read_start``)
+        if running is None:
+            from . import slotgate
+            running = slotgate.active_runs
+        self._running = running
 
     def _share_and_tokens(self, now: float) -> tuple[float, float]:
         with self._lock:
@@ -764,6 +842,14 @@ class Gate:
             percent = level["percent"]
             if level.get("mode") == AUTO:
                 return self._budget_plan(level, now, provider)
+            if level.get("mode") == MANUAL:
+                limit = limit_of(level, None, now)
+                if limit is None:
+                    return ("pass",)  # a person removed their cap and no budget host folds it: no throttle
+                if limit <= 0:
+                    return ("hold",)
+                share, tokens = self._share_and_tokens(now)
+                return ("pace", min(MAX_INTERVAL_S, tokens / (share * limit)), level["set_at"])
             if percent <= 0:
                 return ("pass",)
             if percent >= 100:
@@ -794,6 +880,16 @@ class Gate:
         if allowed <= 0:
             return ("hold",)
         return ("pace", min(MAX_INTERVAL_S, tokens / allowed), level["set_at"], provider)
+
+    def _note_wait(self, now: float, seconds: float) -> None:
+        """Count a card's held seconds for the slot estimate (best effort; cron and chats are not card slots)."""
+        task = next((os.environ.get(name) for name in CARD_ENV if os.environ.get(name)), None)
+        if not task:
+            return
+        try:
+            self._pacer.note_wait(now, task, seconds)
+        except Exception:  # counting is best effort
+            log.debug("throughput throttle: wait count failed", exc_info=True)
 
     def holding(self) -> bool:
         """True while every call waits (100 %); a paced level is not a hold."""
@@ -839,8 +935,11 @@ class Gate:
                         report(now - started)  # tell the host this turn is waiting, not dead
                     except Exception:  # a liveness report must never fail the call it protects
                         log.debug("throughput throttle: liveness report failed", exc_info=True)
+            before = self._clock()
             self._sleep(nap)
-            waited = self._clock() - started
+            after = self._clock()
+            self._note_wait(after, after - before)
+            waited = after - started
             if (max_s is not None and waited >= max_s) or (stop is not None and _true(stop)):
                 log.info("throughput throttle: wait ended after %.0fs before its start", waited)
                 return waited
@@ -849,24 +948,39 @@ class Gate:
             log.info("throughput throttle: released after %.0fs", waited)
         return waited
 
+    def _read_start(self, now: float) -> dict:
+        """What the start gate decides from for ``START_GATE_TTL_S``: this gateway's slot limit (slotgate.py) and
+        running card count, or, when either is unknown, the fleet rate over the cap (the rule before slots)."""
+        from . import slotgate
+        st = status(self.root, self.series_db, now, self.hub_db)
+        slots = slotgate.local(self.root, self.series_db, st["cap_per_s"], now)
+        running = self._running()
+        return {"at": now, "allowed": slots["allowed"], "running": running, "granted": 0,
+                "rate_hold": bool(st["holding"])}
+
     def start_gate(self, **_card) -> Optional[dict]:
-        """``kanban_start_gate``: hold a card start while the fleet's token rate is over the cap (or the level is
-        100 %). Pacing slows the model calls of running cards; without this the dispatcher keeps starting cards
-        whose calls then only queue, filling worker slots with runs that wait. Cached for ``START_GATE_TTL_S``;
-        any failed read starts the card."""
+        """``kanban_start_gate``: hold a card start while this gateway already runs the card slots its share of the
+        token cap pays for (``slotgate``): its running cards plus the starts let through since the last read reach
+        the allowed count. Without a slot limit (no cap) or a card count, the older rule holds: the fleet's token
+        rate over the cap (or 100 %). Read every ``START_GATE_TTL_S``; any failed read starts the card."""
         now = self._clock()
         with self._lock:
             hit = self._start
-        if hit is None or not 0 <= now - hit[0] < START_GATE_TTL_S:
+        if hit is None or not 0 <= now - hit["at"] < START_GATE_TTL_S:
             try:
-                held = bool(status(self.root, self.series_db, now, self.hub_db)["holding"])
+                hit = self._read_start(now)
             except Exception:  # fail open: a broken read must never stop the dispatcher starting cards
                 log.debug("throughput throttle: start gate read failed", exc_info=True)
-                held = False
-            hit = (now, held)
+                hit = {"at": now, "allowed": None, "running": None, "granted": 0, "rate_hold": False}
             with self._lock:
                 self._start = hit
-        return {"hold": True, "reason": START_GATE_REASON} if hit[1] else None
+        with self._lock:
+            if hit["allowed"] is None or hit["running"] is None:
+                return {"hold": True, "reason": START_GATE_REASON} if hit["rate_hold"] else None
+            if hit["running"] + hit["granted"] >= hit["allowed"]:
+                return {"hold": True, "reason": SLOT_GATE_REASON}
+            hit["granted"] += 1  # counted until the next read sees it running
+            return None
 
     def _exempt(self, platform) -> bool:
         """A chat call is never held: it is counted (so it still shows in tokens-per-call) and goes ahead without
@@ -949,19 +1063,73 @@ def _moved(old: Optional[float], new: Optional[float]) -> bool:
     return abs(new - old) > BUDGET_MOVE * abs(old) if old else new != 0
 
 
+def user_cap_path(root: Path) -> Path:
+    return Path(root) / "cache" / "throughput" / USER_CAP_FILE
+
+
+def read_user_cap(root: Path) -> dict:
+    """``{cap_per_s, set_at}``: the newest cap a person set, as the budget-publish host recorded it (no cap, never
+    set, when the file is missing or unreadable)."""
+    data = _read_json(user_cap_path(root))
+    if not isinstance(data, dict):
+        return {"cap_per_s": None, "set_at": 0.0, "published_set_at": None}
+    try:
+        value = cap_value(data.get("cap_per_s"))
+    except ValueError:
+        value = None
+    published = _number(data.get("published_set_at"))
+    return {"cap_per_s": value, "set_at": stamp(data.get("set_at")),
+            "published_set_at": None if published is None else stamp(published)}
+
+
+def person_cap(level: dict, now: float, budget_per_s: Optional[float] = None) -> Optional[float]:
+    """The cap (tokens/s) a level a person set means: a ``manual`` level's own cap; an older panel's slider on a
+    budget level, its percent against that level's budget; a plain slider level, its percent against
+    ``budget_per_s`` (what the slider showed on a budget fleet), else its stored cap. 0 % = no cap of their own."""
+    if level.get("mode") == MANUAL:
+        return limit_of(level, None, now)
+    percent = level["percent"]
+    if percent <= 0:
+        return None
+    if percent >= 100:
+        return 0.0
+    if level.get("mode") != AUTO and budget_per_s is not None:
+        return budget_per_s * (1.0 - percent / 100.0)
+    return limit_of(level, None, now)
+
+
+def percent_for(user: Optional[float], budget_per_s: Optional[float]) -> float:
+    """The budget level's ``percent`` that makes its cap the lower of a person's cap and the budget: every gateway
+    (older ones too) scales the budget and each pool cap by ``1 - percent/100``."""
+    if user is None:
+        return 0.0
+    if user <= 0:
+        return 100.0
+    if budget_per_s is None or budget_per_s <= 0 or user >= budget_per_s:
+        return 0.0
+    return round(100.0 * (1.0 - user / budget_per_s), 4)
+
+
 def publish_budget(root: Path, hub_db: Optional[Path], pacing_file: Path, now: Optional[float] = None) -> bool:
-    """Write the budget into this host's level file (``mode: "auto"``); True when it wrote. Keeps the fleet's
-    ``percent`` (the newest level any gateway set). Rewrites only when the level it obeys is not its own budget
-    (a slider moved somewhere), any cap moved by more than ``BUDGET_MOVE``, or ``BUDGET_REWRITE_S`` passed since
-    the last write. A missing or malformed ``v2`` writes nothing. ``set_at`` is the obeyed level's plus 1 ms, not
-    the clock: a newer slider setting on another gateway then still outranks this write until it is folded in. An
-    active ``burst`` on the obeyed budget level is kept; an expired one is dropped."""
+    """Write the budget into this host's level file (``mode: "auto"``); True when it wrote. A level a person set
+    since the last fold (``write_cap`` anywhere, or a slider) becomes the recorded person cap (``user-cap.json``),
+    and the written ``percent`` makes the cap the lower of that and the budget (``percent_for``). Rewrites only
+    when the level it obeys is not its own budget, the percent or any cap moved by more than ``BUDGET_MOVE``, or
+    ``BUDGET_REWRITE_S`` passed since the last write. A missing or malformed ``v2`` writes nothing. ``set_at`` is
+    the obeyed level's plus 1 ms, not the clock: a newer setting on another gateway then still outranks this write
+    until it is folded in. An active ``burst`` on the obeyed budget level is kept; an expired one is dropped."""
     now = time.time() if now is None else now
     data = _read_json(pacing_file)
     new = budget_of_v2(data.get("v2") if isinstance(data, dict) else None)
     if new is None:
         return False
     level = effective(root, hub_db, now)
+    user = read_user_cap(root)
+    own = level["source"] is None and level.get("mode") == AUTO and level["set_at"] == user.get("published_set_at")
+    if not own and level["set_at"] > user["set_at"]:
+        user = {"cap_per_s": person_cap(level, now, new["cap_per_s"]), "set_at": level["set_at"]}
+        _write_json(user_cap_path(root), user)
+    percent = percent_for(user["cap_per_s"], new["cap_per_s"])
     path = level_path(root)
     if level["source"] is None and level.get("mode") == AUTO:
         try:
@@ -970,15 +1138,18 @@ def publish_budget(root: Path, hub_db: Optional[Path], pacing_file: Path, now: O
             age = BUDGET_REWRITE_S
         old = level.get("pool_caps") or {}
         moved = (_moved(level.get("cap_per_s"), new["cap_per_s"]) or set(old) != set(new["pool_caps"])
-                 or any(_moved(old[p], v) for p, v in new["pool_caps"].items()))
+                 or any(_moved(old[p], v) for p, v in new["pool_caps"].items())
+                 or abs(level["percent"] - percent) > 0.5)
         if not moved and age < BUDGET_REWRITE_S:
             return False
     set_at = stamp(level["set_at"] + 0.001) if level["set_at"] > 0 else stamp(now)
-    data = {"mode": AUTO, "percent": level["percent"], "cap_per_s": new["cap_per_s"],
+    data = {"mode": AUTO, "percent": percent, "cap_per_s": new["cap_per_s"],
             "pool_caps": new["pool_caps"], "budget_at": round(new["budget_at"], 3), "set_at": set_at}
     if burst_active(level, now) is not None:  # a running burst rides on: only its expiry ends it
         data["burst"] = dict(level["burst"])
     _write_json(path, data)
+    _write_json(user_cap_path(root), {"cap_per_s": user["cap_per_s"], "set_at": user["set_at"],
+                                      "published_set_at": set_at})
     return True
 
 

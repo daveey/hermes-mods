@@ -439,3 +439,41 @@ def test_budget_view_endpoint_shape(api, tmp_path, monkeypatch):
     (tmp_path / "llm_pacing.json").unlink()  # a host without core's capacity model: empty, never an error
     bare = c.get("/p/v1/budget?factor=2&hours=1").json()
     assert bare["pools"] == {} and bare["curve"] == {} and bare["projection"]["pools"] == {}
+
+
+def test_put_cap_per_min_sets_a_persons_absolute_cap(api, tmp_path, monkeypatch):
+    """PUT /v1/throttle {cap_per_min}: a manual level in tokens/s, the slot gate's limit in the payload, null
+    removes the cap, and bad values are refused without a write."""
+    import importlib
+    import json
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(api, "_registry", lambda: {"me": "hub", "machines": {"hub": {}}})
+    monkeypatch.setattr(api, "_known_machines", lambda: None)
+    api._services()
+    root = api._state["root"]
+    runway = importlib.import_module(api.pkg().__name__ + ".runway")
+    monkeypatch.setattr(runway, "pacing_path", lambda _root: tmp_path / "llm_pacing.json")
+    slotgate = importlib.import_module(api.pkg().__name__ + ".slotgate")
+    monkeypatch.setattr(slotgate, "active_runs", lambda: 4)
+    throttle = importlib.import_module(api.pkg().__name__ + ".throttle")
+    throttle._write_json(slotgate.estimate_path(root), {"per_s": 50.0, "at": time.time() - 30})
+    app = FastAPI()
+    app.include_router(api.router, prefix="/p")
+    c = TestClient(app)
+
+    put = c.put("/p/v1/throttle", json={"cap_per_min": 18_000}).json()  # 300 tokens/s
+    stored = json.loads(throttle.level_path(root).read_text())
+    assert stored["mode"] == "manual" and stored["cap_per_s"] == pytest.approx(300.0) and stored["percent"] == 0
+    assert put["cap_per_s"] == pytest.approx(300.0) and put["user_cap_per_s"] == pytest.approx(300.0)
+    assert put["mode"] == "manual" and put["gateways"] == [{"name": "hub", "seen": True}]
+    gate = put["slot_gate"]
+    assert gate["running"] == 4 and gate["per_slot_per_s"] == 50.0 and gate["source"] == "measured"
+    assert gate["allowed"] == 6  # the only gateway: share 1, floor(300 / 50)
+    assert c.put("/p/v1/throttle", json={"cap_per_min": 0}).json()["slot_gate"]["allowed"] == 0
+    off = c.put("/p/v1/throttle", json={"cap_per_min": None}).json()
+    assert off["cap_per_s"] is None and off["slot_gate"]["allowed"] is None
+    for bad in ({"cap_per_min": -5}, {"cap_per_min": "lots"}, {"cap_per_min": True}, {"cap_per_min": 1e13}):
+        assert c.put("/p/v1/throttle", json=bad).status_code == 400, bad
+    assert c.get("/p/v1/throttle").json()["cap_per_s"] is None  # a refused write changes nothing
