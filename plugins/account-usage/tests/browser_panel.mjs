@@ -20,6 +20,10 @@ try {
  const gptChip=page.locator('.hermes-au-chip[data-provider="openai-codex"]'); await gptChip.waitFor()
  assert.equal(await gptChip.locator('svg').count(),1); assert.equal(await gptChip.locator('.hermes-au-vb').textContent(),'dry in 17h')
  assert.equal(await page.locator('.hermes-au-chip[data-provider="anthropic"] svg').count(),0); evidence.push('Bar: sparkline + verdict with a forecast, dots without')
+ // The verdict stays on one line even when the status bar is squeezed.
+ await page.evaluate(()=>{document.querySelector('.hermes-au-chip').parentElement.style.width='120px'})
+ const vb=await gptChip.locator('.hermes-au-vb').boundingBox(); assert.ok(vb.height<20,`verdict wrapped: ${vb.height}px tall`)
+ await page.evaluate(()=>{document.querySelector('.hermes-au-chip').parentElement.style.width=''}); evidence.push('Verdict never wraps')
  // Hover opens the popover on that provider without a click, and leaving closes it.
  await gptChip.hover(); const pop=page.locator('section[aria-label="Account usage popover"]'); await pop.waitFor()
  assert.equal(await page.locator('.hermes-au-fc tr[data-hl="true"]').getAttribute('data-provider'),'openai-codex')

@@ -54,7 +54,8 @@ const CSS = `
 .hermes-au-details .hermes-au-fix { padding: 0 }
 .hermes-au-pill { justify-self: start; font-size: 10px; padding: 0 5px; border-radius: 3px; border: 1px solid currentColor; color: var(--au-c); white-space: nowrap }
 .hermes-au-next { display: inline-block; white-space: nowrap; color: var(--ui-accent); border: 1px solid currentColor; border-radius: 3px; padding: 0 4px; font-size: 10px; margin-left: 5px }
-.hermes-au-chip { display: inline-flex; align-items: center; gap: 5px; margin-right: 4px; padding: 0 4px; border-radius: 3px }
+.hermes-au-chip { display: inline-flex; align-items: center; gap: 5px; margin-right: 4px; padding: 0 4px; border-radius: 3px; white-space: nowrap; flex: none }
+.hermes-au-tag { font: 600 9.5px/1 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .04em; padding: 2px 3px; border-radius: 3px; border: 1px solid color-mix(in srgb, currentColor 35%, transparent) }
 .hermes-au-chip[data-hl='true'] { background: var(--chrome-action-hover); color: var(--foreground) }
 .hermes-au-fc { width: 100%; border-collapse: collapse; font-size: 11px }
 .hermes-au-fc th { font-weight: 500; text-align: left; opacity: .6; font-size: 10px; padding: 0 6px 4px 3px }
@@ -70,13 +71,13 @@ const CSS = `
 `
 
 const PROVIDERS = [
-  { slug: 'anthropic', name: 'Claude', title: 'Claude Max' },
-  { slug: 'openai-codex', name: 'GPT', title: 'ChatGPT (Codex)' },
+  { slug: 'anthropic', name: 'Claude', tag: 'ANT', title: 'Claude Max' },
+  { slug: 'openai-codex', name: 'GPT', tag: 'GPT', title: 'ChatGPT (Codex)' },
   // xAI publishes no subscription-usage API; the backend reports API access (team_blocked) only.
-  { slug: 'xai-oauth', name: 'Grok', title: 'Grok (xAI)', statusOnly: true },
+  { slug: 'xai-oauth', name: 'Grok', tag: 'GRK', title: 'Grok (xAI)', statusOnly: true },
   // Gemini AI Studio API keys: status only (key valid / rejected). A future Gemini subscription
   // provider gets its own entry here (e.g. slug 'gemini-oauth'), not a change to this one.
-  { slug: 'gemini', name: 'Gemini', title: 'Gemini (AI Studio key)', statusOnly: true, statusOk: 'API key valid · no usage windows (AI Studio has no usage API)', statusBad: 'key rejected', statusBadHint: 'key rejected · check the key at aistudio.google.com/apikey' }
+  { slug: 'gemini', name: 'Gemini', tag: 'GEM', title: 'Gemini (AI Studio key)', statusOnly: true, statusOk: 'API key valid · no usage windows (AI Studio has no usage API)', statusBad: 'key rejected', statusBadHint: 'key rejected · check the key at aistudio.google.com/apikey' }
 ]
 
 const COLORS = { ready: '#3fb950', warn: '#d29922', cooldown: '#e3b341', limited: '#f85149', unknown: 'var(--ui-text-tertiary, #888)', unavailable: 'var(--ui-text-tertiary, #888)', disabled: 'var(--ui-text-tertiary, #888)' }
@@ -707,7 +708,8 @@ function UsageBar({ store, selectionStore, reconnectStore, disableStore }) {
         const tip = `${g.title}: ${g.ready} of ${g.total} ready${g.limited ? ` · ${g.limited} ${g.statusBad || 'out of quota'}` : ''}${g.cooling ? ` · ${g.cooling} cooling down` : ''}${g.disabled ? ` · ${g.disabled} disabled` : ''}${f && !g.statusOnly ? ` · ${leftText(f)} left · ${forecastText(f)}` : ''}${g.markId ? ` · ${g.mark === 'active' ? 'in use' : 'last used'}: ${(g.accounts.find(a => a.id === g.markId) || {}).label} (${since(g.markAt)})` : ''}${g.nextBack ? ` · next back ${fmtReset(g.nextBack)}` : ''}`
         return jsxs('span', { key: g.slug, className: 'hermes-au-chip', 'data-provider': g.slug, 'data-hl': open && g.slug === shown.slug ? 'true' : undefined,
           onMouseEnter: () => show(g.slug, 'hover'), title: open ? undefined : tip, children: [
-          jsx('b', { style: { fontWeight: 600 }, children: g.name }),
+          // Compact provider tag in the bar; the popover table keeps the full name.
+          jsx('b', { className: 'hermes-au-tag', 'aria-label': g.name, children: g.tag || g.name }),
           f && !g.statusOnly ? jsx(Sparkline, { f })
             // No forecast (status-only provider, or a backend without /forecast): the per-account dots.
             : jsx('span', { style: { display: 'inline-flex', gap: 2.5 }, children: g.accounts.map(a => jsx(Dot, { key: a.id, t: tone(a), size: 6, mark: a.id === g.markId ? g.mark : null })) }),
