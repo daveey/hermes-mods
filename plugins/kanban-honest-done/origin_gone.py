@@ -42,6 +42,8 @@ def evidence(refs, replicas, ro_connect):
         # The authenticated /v2/machines endpoint lists active members. Any
         # entry for the gateway vetoes old rehome proof, including re-enrollment.
         active = {m['name'] for m in machines}
+        if not registry.get('me') or registry['me'] not in active:
+            return result
         now = time.time()
         if not hub_path or not hub_path.is_file():
             return result

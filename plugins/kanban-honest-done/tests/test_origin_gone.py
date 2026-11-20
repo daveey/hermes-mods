@@ -40,7 +40,7 @@ def world(tmp_path, monkeypatch):
     with sqlite3.connect(hub) as c:
         c.executescript('CREATE TABLE meta(k TEXT,v TEXT); CREATE TABLE replica(gw TEXT,coll TEXT,key TEXT,data TEXT);')
         c.executemany('INSERT INTO meta VALUES(?,?)', [('last_ok', str(now)), ('cursor', '42'), ('head', '42')])
-    registry = {'machines': []}
+    registry = {'me': 'local-reader', 'machines': [{'name': 'local-reader'}]}
     gone = core._sibling('origin_gone')
     monkeypatch.setattr(gone, 'runtime', lambda: (hub, registry))
     monkeypatch.setattr(core, 'replica_paths', lambda paths: [shadow])
@@ -121,6 +121,18 @@ def test_failed_registry_read_is_unknown(world, monkeypatch, error):
     def fail():
         raise error
     monkeypatch.setattr(core._sibling('origin_gone'), 'runtime', fail)
+    assert check(world)
+
+
+@pytest.mark.parametrize('case', ['missing-me', 'unregistered-me', 'empty-membership'])
+def test_incomplete_registry_is_unknown(world, case):
+    registry = world[3]
+    if case == 'missing-me':
+        registry.pop('me')
+    elif case == 'unregistered-me':
+        registry['me'] = 'not-enrolled'
+    else:
+        registry['machines'] = []
     assert check(world)
 
 
