@@ -88,5 +88,7 @@ def evidence(refs, replicas, ro_connect):
                                            f'server rehomed {uid}; instance {instance}; terminated checked_at={checked}; '
                                            'fresh registry has no active gateway; fresh session replica has no owner')
         return result
-    except (ImportError, OSError, sqlite3.Error, RuntimeError, ValueError, TypeError, KeyError, AttributeError):
+    except Exception:  # health: allow BLE001 -- exception evidence is unknown, never permission
+        # Board Resync and HTTPException need not subclass RuntimeError/OSError.
+        # Do not leak into the outer plugin hook, whose legacy error policy opens.
         return {}

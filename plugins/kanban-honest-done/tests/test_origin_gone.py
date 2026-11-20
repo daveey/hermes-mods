@@ -1,4 +1,5 @@
 """Destroyed gateway exception: notes never replace independent evidence."""
+import http.client
 import importlib.util
 import json
 import sqlite3
@@ -109,9 +110,16 @@ def test_unknown_or_live_still_refuses(world, case):
     assert check(world), case
 
 
-def test_failed_registry_read_is_unknown(world, monkeypatch):
+# Mirrors Board Resync's direct Exception base in public core-free CI.
+class Resync(Exception):
+    pass
+
+
+@pytest.mark.parametrize('error', [RuntimeError('registry unreachable'), Resync('registry reset'),
+                                   http.client.IncompleteRead(b'')])
+def test_failed_registry_read_is_unknown(world, monkeypatch, error):
     def fail():
-        raise RuntimeError('registry unreachable')
+        raise error
     monkeypatch.setattr(core._sibling('origin_gone'), 'runtime', fail)
     assert check(world)
 
