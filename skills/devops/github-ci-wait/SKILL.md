@@ -153,7 +153,7 @@ How to run it from an agent:
 If failed-only rerun is refused, read `references/refused-failed-only-rerun.md` before diagnosing a broken workflow.
 
 ## Done means
-- [ ] The sha was copied from `git`/`gh` output, and `--once` ran with the same arguments before any "waiting on CI"?
+- [ ] The sha was copied from `git`/`gh` output and passed positionally (not `--sha`; `--head-sha` only with `--run-id`), and `--once` ran with the same arguments before any "waiting on CI"?
 - [ ] Ordinary waits use `wait_for_ci.py`; input-specific controls additionally verify exact dispatch/job execution, not a skipped same-head success?
 - [ ] No filter pipe hides the wait's exit status (`| tail`/`| grep` only under `set -o pipefail`)?
 - [ ] The report cites the run URL or tag the script printed, marked "ran on a later commit" when it did?
