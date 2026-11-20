@@ -787,6 +787,7 @@ test('panel: Forecast folded away with a chart per pool and in total; Raise cost
     assert.match(tip(), /^Claude: runs out ~60 min earlier at today’s rate · after the raise the planner slows to 4\.5 tok\/s/)
     assert.match(tip(), /GPT would hit its reserve during the raise/)
     assert.equal(spend().querySelector('[data-warn-count]').dataset.warnCount, '2')  // GPT: reserve and 5-hour cap
+    assert.match(spend().querySelector('[data-raise-warn]').textContent, /^⚠ GPT would hit its reserve during the raise, at .* \(\+1 more on hover\)$/)
     await ui.click(button('3×'))
     await ui.click(button('4 h'))
     assert.match(spend().querySelector('[data-raise-tip]').textContent, /^Raise 3× ⚠$/)

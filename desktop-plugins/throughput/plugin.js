@@ -559,6 +559,7 @@ export function BurstControl({ throttle, budget, pick, setPick, onStart, onEnd, 
       h(Seg, { label: 'Raise duration', value: pick.hours, options: BURST_HOURS, onPick: (hrs) => setPick({ ...pick, hours: hrs }), render: fmtHours }),
       h('button', { type: 'button', className: 'hermes-tp-btn', disabled: !fresh, onClick: () => onStart(pick), title: tip, 'data-raise-tip': tip },
         `Raise ${fmtFactor(pick.factor)}`, warns.length ? h('span', { className: 'hermes-tp-warn', 'data-warn-count': String(warns.length) }, ' ⚠') : null)),
+    warns.length ? h('div', { className: 'hermes-tp-warn', role: 'alert', 'data-raise-warn': '' }, `\u26a0 ${warns[0]}${warns.length > 1 ? ` (+${warns.length - 1} more on hover)` : ''}`) : null,
     error ? h('div', { className: 'hermes-tp-note', role: 'alert' }, `Raise not changed: ${error}`) : null)
 }
 
@@ -644,7 +645,7 @@ export function SpendSection({ throttle, onSet, error, unit, budget, pick, setPi
   const of = hd.state === 'holding' ? 'holding every call' : hd.cap == null ? 'no limit' : `of ${fmt(hd.cap)}`
   return h('section', { className: 'hermes-tp-spend', 'data-slot': 'spend', 'data-state': hd.state },
     h('div', { className: 'hermes-tp-shead', title: tip, 'data-spend-tip': tip },
-      h('span', { className: `hermes-tp-dot is-${hd.state}`, 'data-spend-state': hd.state, 'aria-label': STATE_LABEL[hd.state] }),
+      h('span', { className: `hermes-tp-dot is-${hd.state}`, role: 'img', 'data-spend-state': hd.state, 'aria-label': STATE_LABEL[hd.state] }),
       h('span', { className: 'hermes-tp-big', 'data-spend-rate': '' }, fmt(hd.rate)),
       h('span', { className: 'hermes-tp-of', 'data-limit': hd.mode || '' }, `${of} tok/${unit}`)),
     hd.fill == null ? null : h('div', { className: 'hermes-tp-meter', role: 'meter', 'aria-valuemin': 0, 'aria-valuemax': 100, 'aria-valuenow': Math.round(hd.fill * 100), 'aria-label': 'Spend against the limit' },
@@ -892,7 +893,6 @@ export const CSS = `
 .hermes-tp-num{margin-left:auto;padding-left:12px;font-variant-numeric:tabular-nums}
 .hermes-tp-capl{fill:#ef4444}
 .hermes-tp-spend{display:flex;flex-direction:column;gap:6px;padding:8px 10px;margin:6px 0 10px;border:1px solid var(--ui-stroke-secondary);border-radius:8px;font-size:11px}
-.hermes-tp-spend .hermes-tp-chead{flex-wrap:wrap}
 .hermes-tp-shead{display:flex;align-items:baseline;gap:8px}
 .hermes-tp-shead .hermes-tp-big{font-size:22px}
 .hermes-tp-of{color:var(--ui-text-secondary);font-size:12px}
@@ -907,16 +907,9 @@ export const CSS = `
 .hermes-tp-meter{height:6px;border-radius:3px;background:var(--ui-stroke-secondary,#2a2f39);overflow:hidden}
 .hermes-tp-meter>span{display:block;height:100%;background:var(--ui-blue,#3b82f6)}
 .hermes-tp-spend[data-state=at] .hermes-tp-meter>span{background:var(--ui-orange,#d9822b)}
-.hermes-tp-badge{padding:0 6px;border-radius:9px;font-size:10.5px;white-space:nowrap;border:1px solid currentColor}
-.hermes-tp-badge.is-under,.hermes-tp-badge.is-ok,.hermes-tp-badge.is-unlimited{color:var(--ui-green,#1f8a65)}
-.hermes-tp-badge.is-at,.hermes-tp-badge.is-tight,.hermes-tp-badge.is-paced{color:var(--ui-orange,#c2410c)}
-.hermes-tp-badge.is-holding,.hermes-tp-badge.is-used,.hermes-tp-badge.is-held{color:var(--ui-red,#dc3545)}
 .hermes-tp-limit{display:inline-flex;align-items:center;gap:4px}
 .hermes-tp-limit input{width:64px;font:inherit;padding:1px 4px;border:1px solid var(--ui-stroke-secondary);border-radius:4px;background:transparent;color:inherit}
 .hermes-tp-limit input[aria-invalid=true]{border-color:var(--ui-red,#dc3545)}
-.hermes-tp-subs{border-collapse:collapse;font-variant-numeric:tabular-nums}
-.hermes-tp-subs th{text-align:left;font-weight:600;padding:1px 10px 1px 0}
-.hermes-tp-subs td{padding:1px 10px 1px 0;color:var(--ui-text-secondary)}
 .hermes-tp-budget>summary{display:flex;align-items:center;gap:10px;cursor:pointer;list-style:none}
 .hermes-tp-budget>summary::before{content:'▸';font-size:10px;color:var(--ui-text-tertiary)}
 .hermes-tp-budget[open]>summary::before{content:'▾'}
