@@ -29,6 +29,8 @@ hermes kanban lanes explain <card>       # one card: its lane, where that came f
 
 A lane under its target with `ready: 0` is short of cards, not slots. Say that; changing shares will not help it.
 
+When extending the lanes dashboard, match the CLI's fleet connection selection for both summary and flow reads; close an owned replica even when snapshot generation fails. A flow card's `pr` is its own PR, not its dependency's PR: without explicit blocker evidence, say it waits on an open parent rather than claiming which merge frees it. Test daily-cap writes against an older `set_lane` signature and reject unsupported fields before any write with a clear 409, while preserving share-only writes.
+
 ## When the user asks for a change
 
 Turn the sentence into the smallest set of `set` commands, show them, run them, then show the new `show`.
