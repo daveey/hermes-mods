@@ -18,7 +18,7 @@ try {
  await page.goto(`http://127.0.0.1:${server.address().port}`)
  // Status bar: GPT has a forecast (sparkline + verdict); Claude (no forecast) keeps its account dots.
  const gptChip=page.locator('.hermes-au-chip[data-provider="openai-codex"]'); await gptChip.waitFor()
- assert.equal(await gptChip.locator('svg').count(),1); assert.equal(await gptChip.locator('svg rect').count(),0,'no dry-spell strip in the bar'); assert.equal(await gptChip.locator('.hermes-au-vb').textContent(),'17h')
+ assert.equal(await gptChip.locator('svg').count(),1); assert.equal(await gptChip.locator('svg rect').count(),0,'no dry-spell strip in the bar'); assert.equal(await gptChip.locator('.hermes-au-vb').textContent(),'2 sign-in')
  assert.equal(await page.locator('.hermes-au-chip[data-provider="anthropic"] svg').count(),0); evidence.push('Bar: sparkline + verdict with a forecast, dots without')
  // The verdict stays on one line even when the status bar is squeezed.
  await page.evaluate(()=>{document.querySelector('.hermes-au-chip').parentElement.style.width='120px'})
@@ -115,18 +115,24 @@ try {
  // Panel stays a bounded width and long cause text wraps inside it (no horizontal overflow).
  const box=await page.evaluate(()=>{const sec=document.querySelector('section[aria-label="Account usage popover"]');const r=sec.getBoundingClientRect();return {w:r.width,overflow:sec.scrollWidth-sec.clientWidth,rows:[...sec.querySelectorAll('.hermes-au-why')].map(e=>e.getBoundingClientRect().right<=r.right+0.5)}})
  assert.ok(box.w<=460,`popover width ${box.w}`); assert.equal(box.overflow,0); assert.ok(box.rows.every(Boolean)); evidence.push(`Popover bounded at ${box.w}px; long cause text wraps`)
- // Disconnected accounts show Reconnect inside their details; ready/quota rows do not.
+ // Quota/cooldown stay behind the chevron; sign-in-needed is visible without expanding, and Reconnect is with it.
  assert.equal(await page.getByRole('button',{name:'Reconnect Spent account',exact:true}).count(),0)
  await page.getByRole('button',{name:'Show ChatGPT (Codex) accounts',exact:true}).click()
  assert.equal(await page.getByRole('button',{name:'Reconnect GPT account',exact:true}).count(),0)
- await page.getByRole('button',{name:'Details for Expired account',exact:true}).click()
- await page.getByRole('button',{name:'Details for Dead account',exact:true}).click()
+ assert.equal(await page.locator('.hermes-au-signin').count(),2)
  await page.getByRole('button',{name:'Reconnect Expired account',exact:true}).click()
  await page.getByText('Reconnected',{exact:true}).waitFor(); evidence.push('Reconnect (live refresh token) -> Reconnected')
  await page.getByRole('button',{name:'Reconnect Dead account',exact:true}).click()
  const signIn=page.getByRole('button',{name:'Sign in to Dead account again',exact:true}); await signIn.waitFor()
- await page.getByText('hermes auth add openai-codex --type oauth --label dead',{exact:true}).waitFor()
- await signIn.click(); assert.deepEqual(await page.evaluate(()=>window.__nav),['/settings?tab=providers']); evidence.push('Dead grant -> Sign in again opens Settings › Providers')
+ assert.equal(await page.getByText('hermes auth add').count(),0)
+ await signIn.click()
+ await page.getByText('Code WXYZ-1234',{exact:true}).waitFor({timeout:2000}).catch(()=>{})
+ await page.getByText('Reconnected',{exact:true}).nth(1).waitFor()
+ assert.deepEqual(await page.evaluate(()=>window.__opened),['https://auth.example.com/device'])
+ assert.deepEqual(await page.evaluate(()=>window.__nav||[]),[])
+ const apiCalls=await page.evaluate(()=>window.__api||[])
+ assert.ok(apiCalls.some(c=>String(c.path).includes('/api/providers/oauth/openai-codex/start') && c.connectionId==='local'))
+ evidence.push('Dead grant -> in-app device-code OAuth on the chip gateway; no CLI paste, no Settings dead-end')
  const posts=(await page.evaluate(()=>window.fixture.calls)).filter(c=>c.path==='/reconnect')
  assert.deepEqual(posts.map(c=>[c.method,c.body.provider,c.body.account_id]),[['POST','openai-codex','inventory-expired'],['POST','openai-codex','inventory-dead']])
  await page.screenshot({path:path.join(artifacts,'account-usage-reconnect.png'),fullPage:true})

@@ -143,21 +143,60 @@ test('needsReconnect only flags dead or auth-benched accounts', async () => {
  const {plugin}=await setup()
  assert.equal(plugin.needsReconnect({state:'unavailable',reason:'auth'}),true)
  assert.equal(plugin.needsReconnect({state:'limited',limit_kind:'cooldown',reason:'auth'}),true)
+ assert.equal(plugin.needsReconnect({state:'unavailable',reason:'auth',disabled:true}),false)
  for (const a of [{state:'ready'},{state:'limited',limit_kind:'quota',reason:'usage_limit'},{state:'limited',limit_kind:'cooldown',reason:'rate_limit'},{state:'unknown'}]) assert.equal(plugin.needsReconnect(a),false)
+ assert.equal(plugin.signInCount([{slug:'openai-codex',accounts:[{id:'d',state:'unavailable',reason:'auth'},{id:'q',state:'limited',limit_kind:'quota',reason:'usage_limit'}]}]),1)
 })
 test('reconnect POSTs the account, refreshes on success, offers sign-in when the grant is dead', async () => {
- const {plugin}=await setup(); const calls=[]; let refreshed=0; let reply={ok:true,renewed:1}
+ const {plugin}=await setup(); const calls=[]; let refreshed=0; let reply={ok:true,status:'renewed',renewed:1}
  const ctx={onDispose(){},async rest(path,opts){calls.push({path,...opts});if(reply instanceof Error)throw reply;return reply}}
  const r=plugin.createReconnectStore(ctx,()=>refreshed++)
  await r.reconnect('openai-codex',{id:'acct-1'})
- assert.deepEqual(calls[0],{path:'/reconnect',method:'POST',body:{provider:'openai-codex',account_id:'acct-1'}})
+ assert.equal(calls[0].path,'/reconnect'); assert.equal(calls[0].method,'POST'); assert.deepEqual(calls[0].body,{provider:'openai-codex',account_id:'acct-1'})
  assert.equal(refreshed,1); assert.equal(r.$state.get()[r.key('openai-codex','acct-1')].done,true)
- reply={ok:false,needs_sign_in:true,sign_in_command:'hermes auth add anthropic --type oauth --label x'}
+ reply={ok:false,status:'needs_sign_in',needs_sign_in:true,auth_flow:'device_code'}
  await r.reconnect('anthropic',{id:'acct-2'})
  const st=r.$state.get()[r.key('anthropic','acct-2')]
- assert.equal(st.needsSignIn,true); assert.equal(st.command,'hermes auth add anthropic --type oauth --label x'); assert.equal(refreshed,1)
- reply=new Error('503 pool unavailable'); await r.reconnect('anthropic',{id:'acct-3'})
- assert.match(r.$state.get()[r.key('anthropic','acct-3')].message,/Reconnect failed: 503/)
+ assert.equal(st.needsSignIn,true); assert.equal(st.command,undefined); assert.equal(refreshed,1)
+ reply={ok:false,status:'transient'}; await r.reconnect('anthropic',{id:'acct-3'})
+ assert.match(r.$state.get()[r.key('anthropic','acct-3')].message,/retry/i)
+ reply={ok:false,status:'quota'}; await r.reconnect('anthropic',{id:'acct-4'})
+ assert.match(r.$state.get()[r.key('anthropic','acct-4')].message,/quota/i)
+ assert.equal(r.$state.get()[r.key('anthropic','acct-4')].needsSignIn,undefined)
+ reply=new Error('503 pool unavailable'); await r.reconnect('anthropic',{id:'acct-5'})
+ assert.match(r.$state.get()[r.key('anthropic','acct-5')].message,/Reconnect failed: 503/)
+})
+test('dead grant sign-in launches device-code auth on the account gateway, not Settings', async () => {
+ const {plugin}=await setup(); const apiCalls=[]; const opened=[]
+ let pollStatus='approved'
+ const ctx={onDispose(){}, os:{openExternal:async url=>{opened.push(url); return true}}, api:async req=>{apiCalls.push(req)
+  if(String(req.path).endsWith('/start')) return {flow:'device_code',session_id:'sess-1',verification_url:'https://auth.example.com/device',user_code:'WXYZ'}
+  if(String(req.path).includes('/poll/')) return {status:pollStatus}
+  if(req.method==='DELETE') return {ok:true}
+  throw new Error('unexpected '+req.path)
+ }, async rest(){return {ok:false,status:'needs_sign_in',auth_flow:'device_code'}}}
+ const groups=[{slug:'openai-codex',accounts:[{id:'acct-9',state:'ready'}]}]
+ const r=plugin.createReconnectStore(ctx,async()=>groups)
+ await r.signIn('openai-codex',{id:'acct-9'},{connectionId:'gw-hub',profile:'work'})
+ assert.equal(apiCalls[0].path,'/api/providers/oauth/openai-codex/start')
+ assert.equal(apiCalls[0].connectionId,'gw-hub'); assert.equal(apiCalls[0].profile,'work')
+ assert.ok(apiCalls.some(c=>String(c.path).includes('/poll/') && String(c.path).includes('wait=25')))
+ assert.deepEqual(opened,['https://auth.example.com/device'])
+ assert.equal(r.$state.get()[r.key('openai-codex','acct-9')].done,true)
+ pollStatus='pending'
+ const r2=plugin.createReconnectStore(ctx,async()=>groups)
+ const p=r2.signIn('openai-codex',{id:'acct-8'},{connectionId:'gw-hub',profile:'work'})
+ await new Promise(ok=>setTimeout(ok,20))
+ const mid=r2.$state.get()[r2.key('openai-codex','acct-8')]
+ assert.equal(mid.userCode,'WXYZ'); assert.equal(mid.verificationUrl,'https://auth.example.com/device')
+ await r2.cancelAuth('openai-codex',{id:'acct-8'},{connectionId:'gw-hub',profile:'work'})
+ await p
+ assert.ok(apiCalls.some(c=>c.method==='DELETE' && String(c.path).includes('sess-1')))
+ assert.match(r2.$state.get()[r2.key('openai-codex','acct-8')].message,/cancelled/i)
+ const before=apiCalls.length
+ await r2.signIn('anthropic',{id:'acct-7'})
+ assert.equal(apiCalls.length,before)
+ assert.match(r2.$state.get()[r2.key('anthropic','acct-7')].message,/cannot be re-signed/i)
 })
 test('fmtReset rounds to the minute so a reset at 6:59:59.6 reads 7 AM, not 6 AM', async () => {
  const {plugin}=await setup()

@@ -2,6 +2,16 @@
 import React, {useSyncExternalStore, createContext, useContext} from 'react'
 export function atom(value) { const listeners=new Set(); return {get:()=>value,set(v){value=v;listeners.forEach(f=>f())},subscribe(f){listeners.add(f);f();return()=>listeners.delete(f)}} }
 export const host={navigate(p){(window.__nav||(window.__nav=[])).push(p)},state:Object.fromEntries(Object.entries({focusedSessionId:'runtime-a',focusedSessionOwner:{connectionId:'local',profile:'default'},focusedSessionProfile:'default',connectionId:'local',profile:'default',model:'same-model'}).map(([k,v])=>[k,atom(v)])),request:async()=>({providers:[{slug:'anthropic',usage:{accounts:[{id:'inventory-A',label:'Account A',state:'ready',windows:[{label:'Current session',used_percent:24,resets_at:'2099-01-01T00:00:00Z'},{label:'Current week',used_percent:61,resets_at:'2099-01-03T00:00:00Z'}]},{id:'inventory-B',label:'Account B',state:'ready',windows:[{label:'Current session',used_percent:24,resets_at:'2099-01-01T00:00:00Z'},{label:'Current week',used_percent:61,resets_at:'2099-01-03T00:00:00Z'}]},{id:'inventory-cooling',label:'Cooling account',state:'limited',limit_kind:'cooldown',reason:'rate_limit',cooldown_until:'2099-01-01T00:00:00Z',windows:[{label:'Current session',used_percent:40,resets_at:'2099-01-01T00:00:00Z'}],resets_at:'2099-01-01T00:00:00Z'},{id:'inventory-spent',label:'Spent account',state:'limited',limit_kind:'quota',reason:'quota_window',cooldown_until:null,model_cooldowns:[{model:'claude-fable-5-1',until:'2099-01-02T00:00:00Z'},{model:'claude-opus-5-5',until:'2099-01-02T00:00:00Z'},{model:'claude-sonnet-5-5',until:'2099-01-02T00:00:00Z'}],windows:[{label:'Current session',used_percent:100,resets_at:'2099-01-02T00:00:00Z'}],resets_at:'2099-01-02T00:00:00Z'}]}},{slug:'openai-codex',usage:{accounts:[{id:'inventory-GPT',label:'GPT account',state:'ready',windows:[{label:'Current session',used_percent:24,resets_at:'2099-01-01T00:00:00Z'},{label:'Current week',used_percent:61,resets_at:'2099-01-03T00:00:00Z'}]},{id:'inventory-dead',label:'Dead account',state:'unavailable',reason:'auth',windows:[]},{id:'inventory-expired',label:'Expired account',state:'limited',limit_kind:'cooldown',reason:'auth',cooldown_until:'2099-01-01T00:00:00Z',resets_at:'2099-01-01T00:00:00Z',windows:[]}]}}]})}
+const _request=host.request
+host.request=async (...args)=>{
+ const payload=await _request(...args)
+ if(window.fixture?.reviveDead && payload?.providers){
+  for(const p of payload.providers) for(const a of p.usage?.accounts||[]){
+   if(a.id==='inventory-dead'||a.id==='inventory-expired'){ a.state='ready'; a.reason=null; a.limit_kind=null }
+  }
+ }
+ return payload
+}
 export const useValue=a=>useSyncExternalStore(a.subscribe,a.get)
 export const cn=(...x)=>x.filter(Boolean).join(' ')
 export const STATUSBAR_AREAS={right:'statusBar.right'}

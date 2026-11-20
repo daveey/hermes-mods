@@ -5,8 +5,9 @@
  * that provider highlighted, then its accounts with 5-hour session + weekly bars and reset times.
  * Forecast: REST POST /forecast (plugins/account-usage/forecast.py) from the weekly windows below plus
  * the backend's usage history; an older backend without it just shows no forecast.
- * The popover is a plain table of visual cues; why an account is limited, status
- * hints and Reconnect open from the row's chevron.
+ * The popover is a plain table of visual cues; why an account is limited and status
+ * hints open from the row's chevron. A confirmed sign-in-needed warning stays visible
+ * on the collapsed row and as a bar aggregate; Reconnect launches gateway OAuth.
  *
  * Data: gateway JSON-RPC `model.options` (same payload the model picker uses).
  * Pooled providers carry `usage.accounts[]` = {label, state, windows[], resets_at} plus the
@@ -54,6 +55,7 @@ const CSS = `
 .hermes-au-details .hermes-au-fix { padding: 0 }
 .hermes-au-pill { justify-self: start; font-size: 10px; padding: 0 5px; border-radius: 3px; border: 1px solid currentColor; color: var(--au-c); white-space: nowrap }
 .hermes-au-next { display: inline-block; white-space: nowrap; color: var(--ui-accent); border: 1px solid currentColor; border-radius: 3px; padding: 0 4px; font-size: 10px; margin-left: 5px }
+.hermes-au-signin { display: inline-block; white-space: nowrap; color: #f85149; border: 1px solid currentColor; border-radius: 3px; padding: 0 4px; font-size: 10px; margin-left: 5px }
 .hermes-au-chip { display: inline-flex; align-items: center; gap: 5px; margin-right: 4px; padding: 0 4px; border-radius: 3px; white-space: nowrap; flex: none }
 .hermes-au-tag { font: 600 9.5px/1 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .04em; padding: 2px 3px; border-radius: 3px; border: 1px solid color-mix(in srgb, currentColor 35%, transparent) }
 .hermes-au-chip[data-hl='true'] { background: var(--chrome-action-hover); color: var(--foreground) }
@@ -231,7 +233,32 @@ export function summarize(payload, last = {}, now = Date.now(), disabled = null)
 
 // A disconnected account: dead grant, or benched for an auth error. These get a Reconnect button.
 export function needsReconnect(account) {
-  return !!account && (account.state === 'unavailable' || account.reason === 'auth')
+  return !!account && !account.disabled && (account.state === 'unavailable' || account.reason === 'auth')
+}
+
+export function signInCount(groups) {
+  return (groups || []).reduce((n, g) => n + (g.accounts || []).filter(needsReconnect).length, 0)
+}
+
+export function ownerRoute() {
+  return { connectionId: host.state.connectionId?.get(), profile: host.state.profile?.get() }
+}
+
+export function reconnectOutcome(r) {
+  if (r && r.ok) return 'renewed'
+  if (r && typeof r.status === 'string' && r.status) return r.status
+  if (r && r.needs_sign_in) return 'needs_sign_in'
+  return 'transient'
+}
+
+export function accountHealth(groups, provider, id) {
+  const g = (groups || []).find(row => row.slug === provider)
+  const a = g && (g.accounts || []).find(row => row.id === id)
+  if (!a) return 'missing'
+  if (a.disabled) return 'disabled'
+  if (needsReconnect(a)) return 'needs_sign_in'
+  if (a.state === 'limited' && a.limit_kind !== 'cooldown') return 'quota'
+  return 'ok'
 }
 
 // Status-bar text for a failed model.options read. After a core update the Desktop-owned backend refuses it
@@ -522,27 +549,117 @@ export function createSelectionStore(ctx) {
   return { $state, refresh, select: mutate, cancel: () => mutate() }
 }
 
-// Reconnect = renew the account's OAuth grant in place (backend force-refresh). When the grant is
-// dead the reply says needs_sign_in and the row offers the provider sign-in flow instead.
+// Reconnect = renew the account's OAuth grant in place (backend force-refresh). A dead grant
+// launches supported device-code auth on the gateway that owns the chips, never a CLI command.
 export function createReconnectStore(ctx, onDone = () => {}) {
   const $state = atom({})
   const key = (provider, id) => `${provider}\u0000${id}`
   const put = (k, v) => $state.set({ ...$state.get(), [k]: v })
-  const reconnect = async (provider, account) => {
+  const restOpts = route => route?.connectionId ? { connectionId: route.connectionId, profile: route.profile } : {}
+  const desktopApi = () => (typeof window !== 'undefined' && window.hermesDesktop?.api) || ctx.api
+  const finish = async (k, provider, account, okMessage) => {
+    let groups = null
+    try { groups = await onDone() } catch { groups = null }
+    const health = accountHealth(groups, provider, account.id)
+    if (health === 'ok' || health === 'missing') put(k, { done: true, message: okMessage })
+    else if (health === 'needs_sign_in') put(k, { error: true, needsSignIn: true, message: 'Still needs sign-in' })
+    else put(k, { done: true, message: okMessage })
+  }
+  const reconnect = async (provider, account, route = ownerRoute()) => {
     const k = key(provider, account.id)
     if ($state.get()[k]?.busy) return
     put(k, { busy: true })
     try {
-      const r = await ctx.rest('/reconnect', { method: 'POST', body: { provider, account_id: account.id } })
-      put(k, r && r.ok
-        ? { done: true, message: 'Reconnected' }
-        : { needsSignIn: true, command: r?.sign_in_command || `hermes auth add ${provider} --type oauth`, message: 'Saved sign-in expired — sign in again' })
-      if (r && r.ok) onDone()
+      const r = await ctx.rest('/reconnect', { method: 'POST', body: { provider, account_id: account.id }, ...restOpts(route) })
+      const status = reconnectOutcome(r)
+      if (status === 'renewed') {
+        put(k, { done: true, message: 'Reconnected' })
+        try { await onDone() } catch { /* refresh is best-effort after a confirmed renew */ }
+        return
+      }
+      if (status === 'transient') { put(k, { error: true, retry: true, message: 'Reconnect failed — retry' }); return }
+      if (status === 'quota') { put(k, { error: true, message: 'Out of quota — not a sign-in problem' }); return }
+      if (status === 'disabled') { put(k, { error: true, message: 'Account is disabled' }); return }
+      if (status === 'needs_sign_in') {
+        put(k, { needsSignIn: true, authFlow: r?.auth_flow, message: r?.auth_flow === 'external'
+          ? 'Saved sign-in expired — this provider cannot be re-signed in from the panel'
+          : 'Saved sign-in expired — sign in again' })
+        return
+      }
+      put(k, { error: true, message: 'Reconnect is not available for this account' })
     } catch (err) {
-      put(k, { error: true, message: `Reconnect failed: ${String(err?.message || err)}` })
+      put(k, { error: true, retry: true, message: `Reconnect failed: ${String(err?.message || err)}` })
     }
   }
-  return { $state, key, reconnect }
+  const pollAuth = async (k, provider, account, sessionId, route, expiresIn) => {
+    const api = desktopApi()
+    const deadline = Date.now() + Math.min(Math.max(Number(expiresIn) || 900, 30) * 1000, 15 * 60 * 1000)
+    while (Date.now() < deadline) {
+      if ($state.get()[k]?.cancelled) return
+      const poll = await api({
+        path: `/api/providers/oauth/${encodeURIComponent(provider)}/poll/${encodeURIComponent(sessionId)}?wait=25`,
+        timeoutMs: 45000,
+        connectionId: route?.connectionId, profile: route?.profile
+      })
+      if ($state.get()[k]?.cancelled) return
+      if (poll?.status === 'approved') { await finish(k, provider, account, 'Reconnected'); return }
+      if (poll?.status && poll.status !== 'pending') {
+        put(k, { error: true, needsSignIn: true, message: poll.status === 'cancelled' ? 'Sign-in cancelled' : 'Sign-in did not complete' })
+        return
+      }
+      await new Promise(ok => setTimeout(ok, 50))
+    }
+    if ($state.get()[k]?.cancelled) return
+    try {
+      await api({ path: `/api/providers/oauth/sessions/${encodeURIComponent(sessionId)}`, method: 'DELETE',
+        connectionId: route?.connectionId, profile: route?.profile })
+    } catch { /* timeout cancel is best-effort */ }
+    put(k, { error: true, needsSignIn: true, message: 'Sign-in timed out' })
+  }
+  const signIn = async (provider, account, route = ownerRoute()) => {
+    const k = key(provider, account.id)
+    if ($state.get()[k]?.busy) return
+    const api = desktopApi()
+    if (!api) { put(k, { error: true, message: 'Secure sign-in is unavailable on this Desktop' }); return }
+    if (provider === 'anthropic' || $state.get()[k]?.authFlow === 'external') {
+      put(k, { error: true, needsSignIn: true, authFlow: 'external', message: 'This provider cannot be re-signed in from the panel' })
+      return
+    }
+    put(k, { busy: true, needsSignIn: true, message: 'Starting sign-in…' })
+    try {
+      const start = await api({
+        path: `/api/providers/oauth/${encodeURIComponent(provider)}/start`,
+        method: 'POST', body: {}, connectionId: route?.connectionId, profile: route?.profile
+      })
+      if (start?.flow !== 'device_code' || !start.verification_url || !start.session_id) {
+        put(k, { error: true, message: 'Sign-in is not available in the panel for this provider' })
+        return
+      }
+      const opened = ctx.os?.openExternal ? await ctx.os.openExternal(start.verification_url) : false
+      put(k, { busy: true, needsSignIn: true, launching: true, sessionId: start.session_id, userCode: start.user_code,
+        verificationUrl: start.verification_url, message: opened ? 'Complete sign-in in the browser' : 'Open the sign-in page to continue' })
+      await pollAuth(k, provider, account, start.session_id, route, start.expires_in)
+    } catch (err) {
+      const msg = String(err?.message || err)
+      put(k, /external CLI|Unsupported flow/i.test(msg)
+        ? { error: true, message: 'This provider cannot be re-signed in from the panel' }
+        : { error: true, message: `Sign-in failed: ${msg}` })
+    }
+  }
+  const cancelAuth = async (provider, account, route = ownerRoute()) => {
+    const k = key(provider, account.id)
+    const st = $state.get()[k] || {}
+    put(k, { ...st, cancelled: true, busy: false })
+    const api = desktopApi()
+    if (api && st.sessionId) {
+      try {
+        await api({ path: `/api/providers/oauth/sessions/${encodeURIComponent(st.sessionId)}`, method: 'DELETE',
+          connectionId: route?.connectionId, profile: route?.profile })
+      } catch { /* cancel is best-effort */ }
+    }
+    put(k, { cancelled: true, message: 'Sign-in cancelled' })
+  }
+  return { $state, key, reconnect, signIn, cancelAuth, openPage: url => ctx.os?.openExternal && url ? ctx.os.openExternal(url) : Promise.resolve(false) }
 }
 
 // Disable / Enable one account (every pooled row of it). onDone refreshes the usage store.
@@ -623,21 +740,31 @@ function DisableLine({ g, a, disableStore, disableState }) {
 function ReconnectLine({ g, a, reconnectStore, reconnectState }) {
   const st = reconnectState[reconnectStore.key(g.slug, a.id)] || {}
   if (!needsReconnect(a) && !st.message) return null
+  const route = ownerRoute()
   const children = []
-  if (st.needsSignIn) {
-    children.push(jsx('button', { type: 'button', 'aria-label': `Sign in to ${a.label || a.id} again`,
-      onClick: () => host.navigate('/settings?tab=providers'), children: 'Sign in again…' }))
-    children.push(jsxs('span', { children: [st.message, ' · or run ', jsx('code', { children: st.command })] }))
+  if (st.launching && st.sessionId) {
+    children.push(jsx('button', { type: 'button', 'aria-label': `Cancel sign-in for ${a.label || a.id}`,
+      onClick: () => reconnectStore.cancelAuth(g.slug, a, route), children: 'Cancel sign-in' }))
+    if (st.userCode) children.push(jsx('span', { children: `Code ${st.userCode}` }))
+    if (st.verificationUrl) children.push(jsx('button', { type: 'button', 'aria-label': `Open sign-in page for ${a.label || a.id}`,
+      onClick: () => reconnectStore.openPage(st.verificationUrl), children: 'Open sign-in page' }))
+    if (st.message) children.push(jsx('span', { children: st.message }))
+  } else if (st.needsSignIn && (st.authFlow === 'external' || g.slug === 'anthropic')) {
+    if (st.message) children.push(jsx('span', { children: st.message }))
+  } else if (st.needsSignIn) {
+    children.push(jsx('button', { type: 'button', 'aria-label': `Sign in to ${a.label || a.id} again`, disabled: !!st.busy,
+      onClick: () => reconnectStore.signIn(g.slug, a, route), children: st.busy ? 'Starting…' : 'Sign in again…' }))
+    if (st.message) children.push(jsx('span', { children: st.message }))
   } else {
     if (!st.done) children.push(jsx('button', { type: 'button', 'aria-label': `Reconnect ${a.label || a.id}`, disabled: !!st.busy,
-      onClick: () => reconnectStore.reconnect(g.slug, a), children: st.busy ? 'Reconnecting…' : 'Reconnect' }))
+      onClick: () => reconnectStore.reconnect(g.slug, a, route), children: st.busy ? 'Reconnecting…' : st.retry ? 'Retry' : 'Reconnect' }))
     if (st.message) children.push(jsx('span', { style: { color: st.error ? COLORS.limited : COLORS.ready }, children: st.message }))
   }
   return jsxs('div', { className: 'hermes-au-fix', children })
 }
 
-// The table shows only visual cues (dot colour, bars, dimmed rows, a tinted chevron). Why an
-// account is limited, status hints and the Reconnect action sit behind the row's chevron.
+// Quota/cooldown reasons stay behind the chevron. A confirmed sign-in-needed warning is visible
+// even when the row is collapsed, and the reconnect action is shown with it.
 export function AccountRow({ g, a, open, onToggle, selectionStore, selectionState, reconnectStore, reconnectState, disableStore = null, disableState = {} }) {
   const t = tone(a)
   const name = a.label || a.id
@@ -646,8 +773,8 @@ export function AccountRow({ g, a, open, onToggle, selectionStore, selectionStat
   const refused = a.disabled ? 'disabled' : typeof selectionState.selection?.unavailable === 'string' ? selectionState.selection.unavailable : ''
   const fix = reconnectState[reconnectStore.key(g.slug, a.id)] || {}
   const details = hasDetails(g, a)
-  // A Reconnect outcome stays visible after the click even if the row is collapsed again.
-  const shown = details && (open || !!fix.message || !!(disableStore && disableState[disableStore.key(g.slug, a.id)]?.message))
+  const signIn = needsReconnect(a)
+  const shown = (details && (open || signIn)) || !!fix.message || !!(disableStore && disableState[disableStore.key(g.slug, a.id)]?.message)
   const cue = t === 'ready' || t === 'unknown' ? undefined : COLORS[t]
   return jsxs('div', { children: [
     jsxs('div', { className: 'hermes-au-line', children: [
@@ -660,6 +787,7 @@ export function AccountRow({ g, a, open, onToggle, selectionStore, selectionStat
         jsx(Dot, { t, mark: a.id === g.markId ? g.mark : null }),
         jsxs('span', { style: { display: 'flex', alignItems: 'center', minWidth: 0, fontSize: 11.5, fontWeight: a.id === g.markId ? 600 : undefined }, children: [
           jsx('span', { style: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, children: name }), a.id === g.markId ? jsx(MarkBadge, { g }) : null,
+          signIn ? jsx('span', { className: 'hermes-au-signin', children: 'sign-in needed' }) : null,
           selectionState.selection?.state === 'pending' && selectionState.selection.provider === g.slug && selectionState.selection.account_id === a.id
             ? jsx('span', { className: 'hermes-au-next', children: 'Next to try' }) : null] }),
         ...(g.statusOnly
@@ -750,7 +878,9 @@ function UsageBar({ store, selectionStore, reconnectStore, disableStore }) {
       children:
       groups.filter(chipVisible).map(g => {
         const f = g.forecast
-        const tip = `${g.title}: ${g.ready} of ${g.total} ready${g.limited ? ` · ${g.limited} ${g.statusBad || 'out of quota'}` : ''}${g.cooling ? ` · ${g.cooling} cooling down` : ''}${g.disabled ? ` · ${g.disabled} disabled` : ''}${f && !g.statusOnly ? ` · ${leftText(f)} left · ${forecastText(f)}` : ''}${g.markId ? ` · ${g.mark === 'active' ? 'in use' : 'last used'}: ${(g.accounts.find(a => a.id === g.markId) || {}).label} (${since(g.markAt)})` : ''}${g.nextBack ? ` · next back ${fmtReset(g.nextBack)}` : ''}`
+        const nSignIn = (g.accounts || []).filter(needsReconnect).length
+        const signInLabel = nSignIn > 1 ? `${nSignIn} sign-in` : nSignIn === 1 ? 'sign-in' : ''
+        const tip = `${g.title}: ${g.ready} of ${g.total} ready${nSignIn ? ` · ${nSignIn} need sign-in` : ''}${g.limited ? ` · ${g.limited} ${g.statusBad || 'out of quota'}` : ''}${g.cooling ? ` · ${g.cooling} cooling down` : ''}${g.disabled ? ` · ${g.disabled} disabled` : ''}${f && !g.statusOnly ? ` · ${leftText(f)} left · ${forecastText(f)}` : ''}${g.markId ? ` · ${g.mark === 'active' ? 'in use' : 'last used'}: ${(g.accounts.find(a => a.id === g.markId) || {}).label} (${since(g.markAt)})` : ''}${g.nextBack ? ` · next back ${fmtReset(g.nextBack)}` : ''}`
         return jsxs('span', { key: g.slug, className: 'hermes-au-chip', 'data-provider': g.slug, 'data-hl': open && g.slug === shown.slug ? 'true' : undefined,
           title: open ? undefined : tip, children: [
           // Compact provider tag in the bar; the popover table keeps the full name.
@@ -759,7 +889,8 @@ function UsageBar({ store, selectionStore, reconnectStore, disableStore }) {
             // No forecast (status-only provider, or a backend without /forecast): the per-account dots.
             : jsx('span', { style: { display: 'inline-flex', gap: 2.5 }, children: g.accounts.map(a => jsx(Dot, { key: a.id, t: tone(a), size: 6, mark: a.id === g.markId ? g.mark : null })) }),
           jsx('span', { style: { color: countColor(g) }, children: `${g.ready}/${g.total}` }),
-          f && !g.statusOnly && verdictText(f) ? jsx('span', { className: 'hermes-au-vb', style: { color: VERDICT_COLOR[f.verdict], opacity: VERDICT_COLOR[f.verdict] ? 1 : 0.6 }, children: verdictText(f) }) : null
+          signInLabel ? jsx('span', { className: 'hermes-au-vb', 'data-signin': 'true', style: { color: COLORS.limited }, children: signInLabel })
+            : (f && !g.statusOnly && verdictText(f) ? jsx('span', { className: 'hermes-au-vb', style: { color: VERDICT_COLOR[f.verdict], opacity: VERDICT_COLOR[f.verdict] ? 1 : 0.6 }, children: verdictText(f) }) : null)
         ] })
       })
     }) }),
@@ -801,7 +932,7 @@ export default {
     ctx.onDispose(() => style.remove())
     const store = createStore(ctx)
     const selectionStore = createSelectionStore(ctx)
-    const reconnectStore = createReconnectStore(ctx, () => store.refresh())
+    const reconnectStore = createReconnectStore(ctx, async () => { await store.refresh(); return store.$state.get().groups })
     // Twice: a poll already in flight resolves with the pre-toggle state; the second read is fresh.
     const disableStore = createDisableStore(ctx, async () => { await store.refresh(); await store.refresh() })
     store.refresh()

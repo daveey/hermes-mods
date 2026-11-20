@@ -103,6 +103,15 @@ def delete_selection(session_id: str = Query(min_length=1, max_length=256),
 # ── Reconnect: renew a disconnected account's OAuth grant in place ─────────────
 
 RECONNECT_PROVIDERS = frozenset({'anthropic', 'openai-codex'})
+# Core dashboard OAuth: openai-codex is device_code; anthropic is external (no in-app PKCE).
+AUTH_FLOWS = {'anthropic': 'external', 'openai-codex': 'device_code'}
+_DEAD_MARKERS = ('invalid_grant', 'revoked', 'unauthorized', 'invalid_token', 'expired_token')
+_QUOTA_MARKERS = ('quota', 'rate_limit', 'usage_limit', 'billing', 'exhausted')
+
+
+@router.get('/ping')
+def ping() -> Dict[str, Any]:
+    return {'api': 2, 'features': ['reconnect_status', 'auth_launch']}
 
 
 class ReconnectBody(BaseModel):
@@ -112,23 +121,87 @@ class ReconnectBody(BaseModel):
 
 
 def _pool_tools():
-    """(load_pool, identity_for, STATUS_DEAD) from core; isolated so tests can stub it."""
+    """(load_pool, identity_for, STATUS_DEAD, is_disabled|None) from core; tests stub it."""
     from agent.account_usage_cache import _identity_id_for
     from agent.credential_pool import STATUS_DEAD, load_pool
-    return load_pool, _identity_id_for, STATUS_DEAD
+    try:
+        from agent.credential_pool_disabled import is_credential_disabled
+    except ImportError:
+        is_credential_disabled = None
+    return load_pool, _identity_id_for, STATUS_DEAD, is_credential_disabled
+
+
+def _unpack_pool_tools(tools):
+    """Accept the 3-tuple tests pass, or an optional 4th ``is_disabled(provider, entry)``."""
+    load_pool, identity_for, status_dead, *rest = tools or _pool_tools()
+    return load_pool, identity_for, status_dead, rest[0] if rest else None
+
+
+def _blob(*parts: Any) -> str:
+    return ' '.join(str(p or '').lower() for p in parts)
+
+
+def _looks_dead(text: str) -> bool:
+    return any(m in text for m in _DEAD_MARKERS)
+
+
+def _looks_quota(text: str) -> bool:
+    return any(m in text for m in _QUOTA_MARKERS) and not _looks_dead(text)
+
+
+def classify_refresh(*, refreshed: Any, entry: Any, status_dead: Any, exc: BaseException | None = None) -> str:
+    """Map one credential refresh to a reconnect status. Never echoes secrets."""
+    if exc is not None:
+        text = _blob(type(exc).__name__, exc)
+        if _looks_dead(text):
+            return 'needs_sign_in'
+        if _looks_quota(text):
+            return 'quota'
+        return 'transient'
+    src = refreshed if refreshed is not None else entry
+    status = getattr(src, 'last_status', None)
+    extra = getattr(src, 'extra', None)
+    reason = _blob(
+        getattr(src, 'last_error_reason', None),
+        getattr(src, 'last_error_code', None),
+        extra.get('failure_reason') if isinstance(extra, dict) else None,
+    )
+    code = getattr(src, 'last_error_code', None)
+    if status == status_dead or _looks_dead(reason):
+        return 'needs_sign_in'
+    if refreshed is not None and status != 'exhausted':
+        return 'renewed'
+    if status == 'exhausted':
+        if code in (401, 403):
+            return 'needs_sign_in'
+        if _looks_quota(reason) or code in (429,):
+            return 'quota'
+        return 'transient'
+    if refreshed is None:
+        return 'transient'
+    return 'renewed'
+
+
+def _pick_status(renewed: int, statuses: list[str]) -> str:
+    if renewed:
+        return 'renewed'
+    for name in ('needs_sign_in', 'transient', 'quota', 'disabled'):
+        if name in statuses:
+            return name
+    return 'unsupported'
 
 
 def reconnect_account(provider: str, account_id: str, tools=None) -> Dict[str, Any]:
     """Force-refresh every pooled OAuth credential of one account (the wire ``accounts[].id``).
 
     Same effect as ``hermes auth refresh <provider> <entry>``: a live refresh token mints new
-    tokens and clears the entry's local block. A dead grant can't be renewed here, so the reply
-    says ``needs_sign_in`` and the panel sends the user to the sign-in flow. Never returns tokens,
-    raw errors or entry secrets."""
+    tokens and clears the entry's local block. Distinguishes a dead/revoked grant
+    (``needs_sign_in``), a transient refresh error, quota exhaustion, and a disabled row.
+    Never returns tokens, raw errors, CLI commands or entry secrets."""
     if provider not in RECONNECT_PROVIDERS:
         raise HTTPException(400, detail=f'Reconnect is not supported for {provider}')
     try:
-        load_pool, identity_for, status_dead = tools or _pool_tools()
+        load_pool, identity_for, status_dead, is_disabled = _unpack_pool_tools(tools)
         pool = load_pool(provider)
         matches = [e for e in pool.entries() if identity_for(provider, e) == account_id]
     except HTTPException:
@@ -138,22 +211,34 @@ def reconnect_account(provider: str, account_id: str, tools=None) -> Dict[str, A
     if not matches:
         raise HTTPException(404, detail='Account not found; refresh the panel')
     renewed = 0
-    for entry in matches:
-        if getattr(entry, 'auth_type', None) != 'oauth' or not getattr(entry, 'refresh_token', None):
+    statuses: list[str] = []
+    for item in matches:
+        if getattr(item, 'auth_type', None) != 'oauth' or not getattr(item, 'refresh_token', None):
             continue
+        if is_disabled and is_disabled(provider, item):
+            statuses.append('disabled')
+            continue
+        exc: BaseException | None = None
         try:
-            refreshed = pool.try_refresh_matching(credential_id=entry.id)
-        except Exception:
-            refreshed = None
-        if refreshed is not None and getattr(refreshed, 'last_status', None) != status_dead:
+            refreshed = pool.try_refresh_matching(credential_id=item.id)
+        except Exception as err:  # noqa: BLE001 - classified, never echoed
+            refreshed, exc = None, err
+        current = next((e for e in pool.entries() if getattr(e, 'id', None) == item.id), item)
+        status = classify_refresh(refreshed=refreshed, entry=current, status_dead=status_dead, exc=exc)
+        statuses.append(status)
+        if status == 'renewed':
             renewed += 1
-    sign_in = f'hermes auth add {provider} --type oauth'
-    label = str(getattr(matches[0], 'label', '') or '')
-    if label:
-        import shlex
-        sign_in += f' --label {shlex.quote(label)}'
-    return {'ok': renewed > 0, 'renewed': renewed, 'needs_sign_in': renewed == 0,
-            'sign_in_command': sign_in}
+    overall = _pick_status(renewed, statuses)
+    return {
+        'ok': overall == 'renewed',
+        'status': overall,
+        'renewed': renewed,
+        'needs_sign_in': overall == 'needs_sign_in',
+        'account_id': account_id,
+        'provider': provider,
+        'label': str(getattr(matches[0], 'label', '') or ''),
+        'auth_flow': AUTH_FLOWS.get(provider),
+    }
 
 
 @router.post('/reconnect')
