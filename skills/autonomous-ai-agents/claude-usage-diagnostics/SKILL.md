@@ -35,7 +35,7 @@ The message names the exact bucket:
 - `You've hit your session limit · resets <time>` — 5-hour rolling window, per account.
 - `You've hit your weekly limit · resets <date> <time>` — **per-model** weekly cap; the model is named at the end (`model sent to the API: claude-<model>`).
 - `You've hit your <Model> limit` — that model's weekly bucket.
-- `This request would exceed your account's rate limit. Please try again later.` — ambiguous: capture sanitized response headers before classifying it. Explicit exhausted request-bucket headers identify a short throttle; rejected unified usage-window headers can identify a genuine weekly wall even with this generic text. A long `Retry-After` can therefore be valid; absence of “weekly limit” in logs is not proof of a throttle.
+- `This request would exceed your account's rate limit. Please try again later.` — ambiguous: capture sanitized response headers. Explicit request resets identify short throttles; unified weekly rejection can legitimately carry a long `Retry-After`. For allowed ordinary usage but model rejection, read [model-specific headers](references/model-specific-weekly-headers.md).
 
 The reset time in the user-facing "resets in ~2.6d" message derives from this error — reconcile the two before explaining anything.
 
