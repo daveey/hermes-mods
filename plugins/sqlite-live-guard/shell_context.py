@@ -80,8 +80,14 @@ def _raw_segments(text):
         yield seg
 
 
-def _value(raw, env):
+def _value(raw, env, budget):
     out, quote, i = [], "", 0
+    # Charge every prospective fragment BEFORE join can allocate its result.
+    # Counting raw source/variants alone misses repeated assignment doubling.
+    def append(value):
+        budget.spend(len(value))
+        out.append(value)
+
     while i < len(raw):
         c = raw[i]
         if c in "'\"" and (not quote or quote == c):
@@ -91,16 +97,16 @@ def _value(raw, env):
         if c == "\\" and quote != "'" and i + 1 < len(raw):
             # Within double quotes only these characters are escaped by bash.
             if not quote or raw[i + 1] in '$`"\\\n':
-                out.append(raw[i + 1])
+                append(raw[i + 1])
                 i += 2
                 continue
         match = _VAR.match(raw, i) if quote != "'" else None
         if match:
             name = match.group(1) or match.group(2)
-            out.append(env.get(name, match.group()))
+            append(env.get(name, match.group()))
             i = match.end()
         else:
-            out.append(c)
+            append(c)
             i += 1
     return "".join(out)
 
@@ -209,7 +215,7 @@ def _heredocs(text):
     return "".join(output), bodies
 
 
-def _values(raw, env):
+def _values(raw, env, budget):
     names = sorted({a or b for a, b in _VAR.findall(raw)})
     choices = [env.get(name, frozenset({"$" + name})) for name in names]
     count = 1
@@ -217,7 +223,7 @@ def _values(raw, env):
         count *= len(choice)
     if count > 256:
         raise ValueError("too many possible shell path values")
-    return frozenset(_value(raw, dict(zip(names, combination)))
+    return frozenset(_value(raw, dict(zip(names, combination)), budget)
                      for combination in itertools.product(*choices))
 
 
@@ -307,7 +313,7 @@ def _check(text, guard, cwd, depth, inherited, remote, in_home, budget):
             match = _ASSIGN.match(raw[i])
             if not match:
                 break
-            name, value = match.group(1), _values(match.group(2), local)
+            name, value = match.group(1), _values(match.group(2), local, budget)
             assigned.add(name)
             if raw[0] == "export":
                 exported.add(name)
@@ -321,7 +327,7 @@ def _check(text, guard, cwd, depth, inherited, remote, in_home, budget):
             env = local
             continue
         # Prefix assignments reach the child, not this command's word expansion.
-        choices = [_values(token, env) for token in raw[i:]]
+        choices = [_values(token, env, budget) for token in raw[i:]]
         count = 1
         for choice in choices:
             count *= len(choice)
@@ -369,7 +375,11 @@ def _command(argv, guard, in_home, depth, local, inherited_names, bodies, remote
             for variant in itertools.product(*choices):
                 budget.spend(32 + len(code))
                 values = dict(zip(names, variant))
-                stdin.append(_VAR.sub(lambda m: values[m.group(1) or m.group(2)], code))
+                def replacement(match):
+                    value = values[match.group(1) or match.group(2)]
+                    budget.spend(len(value))
+                    return value
+                stdin.append(_VAR.sub(replacement, code))
     args = [a for a in args if a not in bodies]
     child_env = {name: local[name] for name in inherited_names if name in local}
     if word == "ssh":
