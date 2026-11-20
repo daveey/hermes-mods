@@ -660,6 +660,14 @@ failure/retry and confirmed states share the sheet. A local filter handles many
 requests. Qualified aliases suppress matching blocked-panel controls and task
 chips without conflating unrelated cards. Late responses are guarded by owner and
 session. Failed backend reads preserve text and do not enable authorization.
+Once a resolution is recorded, it leaves the human-attention count immediately,
+including before a slow delivery readback finishes. The session panel shows it in
+the agent-side queue as grey **Delivering to chat…**, retaining **Check status** and
+**Retry** for the same operation. Failed or exhausted delivery never asks for a
+second choice. This is not a delivery or owner-application acknowledgment.
+Coverage: session-panel's composed tests exercise both cold recorded requests and
+live human-to-agent queue moves; the Chromium decision-queue test covers the grey
+pending/failed state and retry without duplicate decisions.
 Queue reads ask for withdrawn rows (`include=withdrawn`) so transcript receipts
 read "No longer needed — <reason>" and their references stay suppressed, but
 withdrawn requests are never shown or counted, and a retry intent left for one is

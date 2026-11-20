@@ -146,12 +146,15 @@ test('real DOM: 640px and 200% zoom, long inline plan, keyboard and many-request
   assert.equal(await page.evaluate(()=>document.activeElement.getAttribute('aria-label')),kept.title,'focus moves to the remaining ask')
   assert.equal(await page.locator('[data-action-queue] h2').innerText(),'For you (1)')
   assert.equal(await page.evaluate(()=>window.posts.length),3,'Not needed records no decision')
-  // Real Chromium: a recorded but failed decision remains visible and counted.
+  // Real Chromium: a recorded but failed decision remains visible as grey agent work.
   const failed={...question,requestId:'00000000-0000-4000-8000-000000000096',title:'Undelivered answer',resolution:{operationId:'pending',choiceId:'json',revision:1}}
   await page.evaluate(async value=>{window.fixtureDispatch='failed';await window.setRequests([value])},failed)
   const failedCard=page.getByRole('article',{name:failed.title})
   await failedCard.getByRole('button',{name:'Retry',exact:true}).waitFor()
-  assert.equal(await page.evaluate(()=>window.askCount()),1)
+  assert.equal(await page.evaluate(()=>window.askCount()),0)
+  assert.equal(await failedCard.getAttribute('data-decision-audience'),'agent')
+  assert.match(await page.locator('[data-action-queue] h2').innerText(),/Waiting on the agent/)
+  assert.match(await failedCard.innerText(),/Delivering to chat…/)
   assert.match(await failedCard.innerText(),/delivery unconfirmed/i)
   if(screenshots)await failedCard.screenshot({path:resolve(screenshots,'failed-retry.png')})
   await page.evaluate(()=>window.fixtureDispatch='delivered')
