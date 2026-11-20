@@ -116,7 +116,17 @@ four of these at once.
 
 ## 3. Clean up the card
 
-Before editing and again before promotion, re-read the newest body, budget events and comments. For a foreign spend-held card, preflight `kanban_supervisor_request` operator `spend_promote` with `dry_run=true` against the current episode before preparing a release. Its `spend_budget_decision_ready.producer` must name this decision card; a producer of `chats` is not delegated by prose in a cleanup card. A `spend_scope` refusal requires disposition by that authenticated managing owner, not ordinary unblock, a new relay card, or a copied approval. Keep prepared state explicitly unapplied until body, attachment and finite allowance are read back on the owner. When concurrent
+Before editing and again before promotion, re-read the newest body, budget events and comments. For a foreign spend-held card, preflight `kanban_supervisor_request` operator `spend_promote` with `dry_run=true` against the current episode before preparing a release. Its `spend_budget_decision_ready.producer` must name this decision card; a producer of `chats` is not delegated by prose in a cleanup card. A `spend_scope` refusal requires disposition by that authenticated managing owner, not ordinary unblock, a new relay card, or a copied approval. Keep prepared state explicitly unapplied until body, attachment and finite allowance are read back on the owner.
+
+**When you are the managing chat, do the release yourself; don't delegate it.** A cleanup card you spawn can measure and draft STATE.md, but it is refused `spend_scope` and blocks back on you, which costs a full round-trip. From the chat, do this:
+1. Fetch the draft from the worker's workspace (`hub-worker-exec <worker> -- cat …/STATE.md`).
+2. Attach it to the source: `hermes kanban attach <src> STATE.md --name STATE.md`.
+3. Post one comment that gives the ONE-RUN scope and what that run must not do.
+4. Run `hermes kanban promote <src> "<reason>"`, then read back the status.
+
+Once the cleanup card's step is done, archive it.
+
+**Every bounded run needs its successor scope posted before the card is released again.** The one-run grant is used up by that run, while a parent repair or a finished review can auto-promote the source. On each run-end report, post the next one-run scope as a comment on the source: fix or refute every finding in one batch, no weakened limits, then one review and stop. Do this before or while it waits, so the next run reads the new scope rather than the spent one. When concurrent
 orchestrators have changed the same card's scope or run allowance, reconcile to one scope, one budget and one
 promoting owner rather than adding overlapping allowances or overwriting a competing decision.
 
