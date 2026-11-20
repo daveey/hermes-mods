@@ -14,8 +14,15 @@ The pass checks file operations and redirects against the existing live-file and
 quarantine predicates. Conditional assignments retain possible values; an
 unconditional assignment resets them. Subshell, pipeline and background assignment
 scopes do not replace the parent's aliases. `readonly` bindings survive failed
-reassignment/unset. Nesting and possible-value expansion are bounded; exceeding a
-bound or failing to load the analyzer refuses execution. Remote analysis performs
+reassignment/unset. Local child shells inherit the analyzed working directory;
+prefix assignments enter the child environment without changing the invoking
+shell's word expansion. Redirect operators are split before variable expansion,
+including `>path`, `1>path` and `>|path`; quoted/escaped operators remain data.
+Local directory targets retain the existing `_dir_like` policy; remote directory
+targets require explicit directory syntax or a recognized home root, never a local
+stat. Nesting and possible-value expansion are bounded, with one aggregate work
+budget shared by all variants and nested scripts; exceeding a bound or failing to
+load the analyzer refuses execution. Remote analysis performs
 no local SQLite version probe, directory stat or quarantine-directory inspection.
 A detected raw replacement is refused in favor of the existing `swap_db.py`
 preservation/ownership policy; this pass never installs a database itself.
