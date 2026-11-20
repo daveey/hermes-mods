@@ -152,6 +152,47 @@ How to run it from an agent:
 
 If failed-only rerun is refused, read `references/refused-failed-only-rerun.md` before diagnosing a broken workflow.
 
+## External-run cards: structured poll output
+
+When parking CI/release work, set `awaiting.kind` to `ci` (or `deploy` for a deploy) and
+`awaiting.ref` to the actual GitHub run/PR URL. Keep the exact-head acceptance probe as
+`wake_check`: the native GitHub adapter supplies service/job health, not review or landing
+approval. A green run is not permission to merge. Default native polling is 300 seconds.
+
+For an opaque shell/commit-containment probe, **each poll must print one unfiltered
+`HERMES_WATCH {json}` line to stdout**, including pending and error paths, before exiting.
+Emit it in the wake-check producer, not once in the park reason or agent chat. Use a JSON
+serializer on the structured response already read by that producer; never interpolate raw
+stderr or credentials into JSON. Contract (illustrative pending response, not live evidence):
+
+```text
+HERMES_WATCH {"job":"queued","service":"ok","service_name":"GitHub Actions","detail":"waiting for a runner","url":"https://github.com/OWNER/REPO/actions/runs/RUN_ID"}
+```
+
+- `job`: `queued|running|succeeded|failed|cancelled|unknown`, from the observed run/jobs.
+- `service`: `ok|degraded|down|unreachable|auth_failed|rate_limited|probe_broken` is
+  **service health**, not the display name; `service_name` is `GitHub Actions`.
+- `detail`: concise observed status/error (no secrets); `url`: actual run/PR URL or null.
+- `retry_after`: nonnegative integer seconds on rate limits. Do not call a 429 an outage.
+- The dispatcher stamps `observed_at` and `next_due_at`; do not invent last/next checks.
+
+A completed failed/cancelled job is `job=failed|cancelled, service=ok`: wake the worker to
+handle that result; it is not service-down red. A timeout/5xx is `job=unknown,
+service=unreachable`; authentication failure is `auth_failed`; a broken local probe is
+`probe_broken`. Use only an error classification the actual response supports.
+
+Keep wake semantics: exit 0 when finished (green **or red**), 1 pending, 3 unreadable/unknown.
+A typed terminal job also wakes the card. Unexpected exit codes override the typed line as
+probe failure. Never pass `wait_for_ci.py --once` exit 2 straight through: that means pending
+to the waiter but broken to the shell watcher. Its exit 1 conflates stalled CI and read/auth
+failure, so it alone cannot justify `job=failed` or `service=ok`; inspect the response before
+emitting a terminal result. Preserve the original verdict/exit in the wrapper and do not hide
+it behind a filter pipeline. `wait_for_ci.py` itself does not park cards and retains its
+existing CLI exit contract; the wake-check wrapper owns translation and structured output.
+
+On resume, reconcile the real exact-head checks and review/landing gates. The blue external
+state and its hover (service, status, last/next check, URL) are visibility, not acceptance.
+
 ## Done means
 - [ ] The sha was copied from `git`/`gh` output and passed positionally (not `--sha`; `--head-sha` only with `--run-id`), and `--once` ran with the same arguments before any "waiting on CI"?
 - [ ] Ordinary waits use `wait_for_ci.py`; input-specific controls additionally verify exact dispatch/job execution, not a skipped same-head success?
