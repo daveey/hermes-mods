@@ -99,12 +99,18 @@ def test_scattered_changes_compare_each_state_only_once(env, monkeypatch):
     for row in newer['runners'][::20]:
         row['labels'] = ['changed']
     calls = []
+    reductions = []
+    original_counts = S._row_counts
+    monkeypatch.setattr(S, '_row_counts',
+                        lambda rows, *args: reductions.append(len(rows)) or original_counts(rows, *args))
     same = S._same_state
     monkeypatch.setattr(S, '_same_state', lambda *a: calls.append(1) or same(*a))
     actual, built = service._inventory(newer, None, copy_rows=False, carry=carry, now=1002)
+    reduced_rows = sum(reductions)
     assert comparable(actual) == comparable(service._inventory(newer, None))
     assert built.computed == len(newer['runners'][::20])
     assert calls == [], 'dirty blocks must not repeat normalized state comparisons'
+    assert reduced_rows <= len(newer['runners']) // 2, 'sparse refresh must not recount the whole fleet'
 
 
 @pytest.mark.parametrize('change', ['source', 'state', 'host', 'order', 'remove', 'add', 'rewind', 'expiry', 'ceiling', 'maintenance'])
@@ -163,7 +169,7 @@ def test_multigeneration_mixed_age_blocks_keep_original_deadlines(env):
         if at == 2300: assert carry.computed == 127
 
 
-@pytest.mark.parametrize('change', ['missing', 'unknown', 'duplicate'])
+@pytest.mark.parametrize('change', ['missing', 'unknown', 'replacement', 'liveness_replacement', 'duplicate'])
 def test_state_shape_and_duplicate_fallback(env, change):
     cfg, path, *_ = env
     snap = fleet(cfg, path)
@@ -173,8 +179,10 @@ def test_state_shape_and_duplicate_fallback(env, change):
     state = newer['states'][newer['runners'][64]['id']]
     if change == 'missing': state.pop('offline_count')
     if change == 'unknown': state['unknown_field'] = True
+    if change in ('replacement', 'liveness_replacement'):
+        state['unknown_field'] = state.pop('offline_count' if change == 'replacement' else 'healthy_cycles')
     if change == 'duplicate': newer['runners'].insert(63, deepcopy(newer['runners'][64]))
-    if change == 'unknown':
+    if change in ('unknown', 'replacement', 'liveness_replacement'):
         with pytest.raises(TypeError):
             service._inventory(newer, None, copy_rows=False, carry=carry, now=1002)
         return
