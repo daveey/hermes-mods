@@ -111,7 +111,7 @@ _QUOTA_MARKERS = ('quota', 'rate_limit', 'usage_limit', 'billing', 'exhausted')
 
 @router.get('/ping')
 def ping() -> Dict[str, Any]:
-    return {'api': 2, 'features': ['reconnect_status', 'auth_launch']}
+    return {'api': 2, 'features': ['reconnect_status', 'auth_launch', 'reconnect_removed']}
 
 
 class ReconnectBody(BaseModel):
@@ -149,8 +149,15 @@ def _looks_quota(text: str) -> bool:
     return any(m in text for m in _QUOTA_MARKERS) and not _looks_dead(text)
 
 
-def classify_refresh(*, refreshed: Any, entry: Any, status_dead: Any, exc: BaseException | None = None) -> str:
-    """Map one credential refresh to a reconnect status. Never echoes secrets."""
+def classify_refresh(*, refreshed: Any, entry: Any, status_dead: Any, exc: BaseException | None = None,
+                     removed: bool = False) -> str:
+    """Map one credential refresh to a reconnect status. Never echoes secrets.
+
+    ``removed``: the row left the pool during the refresh. Core quarantines a singleton-seeded row
+    (Codex ``device_code``) whose refresh token was terminally rejected by dropping it and returning
+    None, so no DEAD row survives to read: that is a dead grant, not a transient error."""
+    if removed and refreshed is None:
+        return 'needs_sign_in'
     if exc is not None:
         text = _blob(type(exc).__name__, exc)
         if _looks_dead(text):
@@ -210,7 +217,7 @@ def reconnect_account(provider: str, account_id: str, tools=None) -> Dict[str, A
         raise HTTPException(503, detail='Credential pool is unavailable; retry') from None
     if not matches:
         raise HTTPException(404, detail='Account not found; refresh the panel')
-    renewed = 0
+    renewed = removed = 0
     statuses: list[str] = []
     for item in matches:
         if getattr(item, 'auth_type', None) != 'oauth' or not getattr(item, 'refresh_token', None):
@@ -223,8 +230,15 @@ def reconnect_account(provider: str, account_id: str, tools=None) -> Dict[str, A
             refreshed = pool.try_refresh_matching(credential_id=item.id)
         except Exception as err:  # noqa: BLE001 - classified, never echoed
             refreshed, exc = None, err
-        current = next((e for e in pool.entries() if getattr(e, 'id', None) == item.id), item)
-        status = classify_refresh(refreshed=refreshed, entry=current, status_dead=status_dead, exc=exc)
+        # Re-read: core swallows refresh errors and records the outcome on the pool row (or drops it).
+        try:
+            current = next((e for e in pool.entries() if getattr(e, 'id', None) == item.id), None)
+            gone = current is None
+        except Exception:  # noqa: BLE001 - an unreadable pool proves nothing about the grant
+            current, gone = item, False
+        status = classify_refresh(refreshed=refreshed, entry=current if current is not None else item,
+                                  status_dead=status_dead, exc=exc, removed=gone)
+        removed += 1 if gone and status == 'needs_sign_in' else 0
         statuses.append(status)
         if status == 'renewed':
             renewed += 1
@@ -234,6 +248,8 @@ def reconnect_account(provider: str, account_id: str, tools=None) -> Dict[str, A
         'status': overall,
         'renewed': renewed,
         'needs_sign_in': overall == 'needs_sign_in',
+        # Rows core dropped for a dead grant: the account may vanish from the panel's next read.
+        'removed': removed,
         'account_id': account_id,
         'provider': provider,
         'label': str(getattr(matches[0], 'label', '') or ''),

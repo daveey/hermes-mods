@@ -14,7 +14,7 @@ const desktopApi=async (req)=>{
  }
  if(path.includes('/oauth/') && path.includes('/poll/')){
   const status=window.fixture.oauthStatus||'approved'
-  if(status==='approved') window.fixture.reviveDead=true
+  if(status==='approved'){ if(window.fixture.vanished) window.fixture.reviveVanished=true; else window.fixture.reviveDead=true }
   return {session_id:'oauth-sess-1',status}
  }
  if(path.includes('/oauth/sessions/') && req.method==='DELETE'){ window.fixture.oauthCancelled=true; return {ok:true} }
@@ -31,7 +31,9 @@ const ctx={onDispose(){},setTimeout(){},setInterval(){},os:{openExternal:async u
  if(path==='/reconnect'){
   const account=opts.body.account_id
   if(account==='inventory-dead') return {ok:false,renewed:0,status:'needs_sign_in',needs_sign_in:true,auth_flow:'device_code',provider:'openai-codex',account_id:account,label:'Dead account'}
-  if(account==='inventory-expired') return {ok:true,renewed:1,status:'renewed',needs_sign_in:false}
+  // Core quarantine: the dead-grant row leaves the pool; the next model.options no longer lists it.
+  if(account==='inventory-vanish'){ window.fixture.vanished=true; return {ok:false,renewed:0,removed:1,status:'needs_sign_in',needs_sign_in:true,auth_flow:'device_code',provider:'openai-codex',account_id:account,label:'Vanishing account'} }
+  if(account==='inventory-expired'){ window.fixture.reviveExpired=true; return {ok:true,renewed:1,status:'renewed',needs_sign_in:false} }
   return {ok:true,renewed:1,status:'renewed',needs_sign_in:false}
  }
  let result=row(id)

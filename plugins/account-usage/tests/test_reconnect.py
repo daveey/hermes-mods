@@ -73,6 +73,44 @@ class ReconnectTests(unittest.TestCase):
         self.assertEqual(out['status'], 'transient')
         self.assertEqual(out['needs_sign_in'], False)
 
+    def test_row_quarantined_out_of_the_pool_by_a_dead_grant_is_sign_in_not_transient(self):
+        # Core's Codex path: terminal refresh error -> _quarantine_sources drops the device_code row,
+        # try_refresh_matching returns None. No DEAD row is left to read.
+        for before in (None, 'ok', 'exhausted'):
+            with self.subTest(before=before):
+                pool = Pool([entry('a', 'X', last_status=before), entry('b', 'Y')], None)
+
+                def drop(cid, pool=pool):
+                    pool._entries = [e for e in pool._entries if e.id != cid]
+                    return None
+                pool._refresh = drop
+                out = api.reconnect_account('openai-codex', 'X', tools(pool))
+                self.assertEqual(out['status'], 'needs_sign_in')
+                self.assertEqual(out['needs_sign_in'], True)
+                self.assertEqual(out['removed'], 1)
+                self.assertEqual(out['auth_flow'], 'device_code')
+                self.assertEqual([e.id for e in pool.entries()], ['b'])
+
+    def test_surviving_row_is_not_reported_removed(self):
+        pool = Pool([entry('a', 'X', last_status=DEAD)], lambda cid: None)
+        self.assertEqual(api.reconnect_account('openai-codex', 'X', tools(pool))['removed'], 0)
+        pool = Pool([entry('a', 'X', last_status='ok')], lambda cid: None)
+        out = api.reconnect_account('openai-codex', 'X', tools(pool))
+        self.assertEqual((out['status'], out['removed']), ('transient', 0))
+
+    def test_unreadable_pool_after_refresh_stays_transient(self):
+        pool = Pool([entry('a', 'X', last_status='ok')], lambda cid: None)
+        reads = []
+
+        def entries():
+            reads.append(1)
+            if len(reads) > 1:
+                raise OSError('pool busy')
+            return list(pool._entries)
+        pool.entries = entries
+        out = api.reconnect_account('openai-codex', 'X', tools(pool))
+        self.assertEqual((out['status'], out['removed']), ('transient', 0))
+
     def test_dead_grant_is_not_quota_even_if_entry_was_exhausted(self):
         pool = Pool(
             [entry('a', 'X', last_status='exhausted', last_error_code=429, last_error_reason='quota')],
@@ -161,6 +199,7 @@ class ReconnectTests(unittest.TestCase):
         self.assertGreaterEqual(r.json()['api'], 2)
         self.assertIn('reconnect_status', r.json()['features'])
         self.assertIn('auth_launch', r.json()['features'])
+        self.assertIn('reconnect_removed', r.json()['features'])
 
 
 if __name__ == '__main__':

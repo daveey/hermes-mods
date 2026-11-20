@@ -167,7 +167,7 @@ test('reconnect POSTs the account, refreshes on success, offers sign-in when the
  assert.match(r.$state.get()[r.key('anthropic','acct-5')].message,/Reconnect failed: 503/)
 })
 test('dead grant sign-in launches device-code auth on the account gateway, not Settings', async () => {
- const {plugin}=await setup(); const apiCalls=[]; const opened=[]
+ const {plugin,state}=await setup(); state.connectionId.set("gw-hub"); state.profile.set("work"); const apiCalls=[]; const opened=[]
  let pollStatus='approved'
  const ctx={onDispose(){}, os:{openExternal:async url=>{opened.push(url); return true}}, api:async req=>{apiCalls.push(req)
   if(String(req.path).endsWith('/start')) return {flow:'device_code',session_id:'sess-1',verification_url:'https://auth.example.com/device',user_code:'WXYZ'}
@@ -193,10 +193,249 @@ test('dead grant sign-in launches device-code auth on the account gateway, not S
  await p
  assert.ok(apiCalls.some(c=>c.method==='DELETE' && String(c.path).includes('sess-1')))
  assert.match(r2.$state.get()[r2.key('openai-codex','acct-8')].message,/cancelled/i)
- const before=apiCalls.length
+ const before=apiCalls.length; const nav=[]; globalThis.__auTestHost.navigate=p=>nav.push(p)
  await r2.signIn('anthropic',{id:'acct-7'})
- assert.equal(apiCalls.length,before)
- assert.match(r2.$state.get()[r2.key('anthropic','acct-7')].message,/cannot be re-signed/i)
+ assert.equal(apiCalls.length,before,'Anthropic never calls the in-app OAuth start')
+ assert.deepEqual(nav,['/settings?tab=providers&pview=accounts'])
+ const ext=r2.$state.get()[r2.key('anthropic','acct-7')]
+ assert.equal(ext.needsSignIn,true); assert.equal(ext.authFlow,'external'); assert.equal(ext.opened,true)
+ assert.match(ext.message,/Settings › Accounts/)
+})
+
+// ── review round 1 regressions ───────────────────────────────────────────────
+const deviceCtx=(over={})=>{ const apiCalls=[], opened=[]; let n=0
+ const ctx={onDispose(){}, os:{openExternal:async url=>{opened.push(url); return true}}, api:async req=>{apiCalls.push(req)
+  if(String(req.path).endsWith('/start')) return {flow:'device_code',session_id:`sess-${++n}`,verification_url:'https://auth.example.com/device',user_code:'WXYZ'}
+  if(String(req.path).includes('/poll/')) return over.poll ? over.poll(req) : {status:'approved'}
+  if(req.method==='DELETE') return {ok:true}
+  throw new Error('unexpected '+req.path)
+ }, async rest(){return over.reply||{ok:false,status:'needs_sign_in',auth_flow:'device_code'}}}
+ return {ctx,apiCalls,opened}
+}
+test('completion readback: only a healthy read-back account says Reconnected', async () => {
+ const {plugin,state}=await setup(); state.connectionId.set('gw'); state.profile.set('p'); const acct={id:'acct-1',label:'one'}
+ const run=async onDone=>{ const {ctx}=deviceCtx(); const r=plugin.createReconnectStore(ctx,onDone); await r.signIn('openai-codex',acct,{connectionId:'gw',profile:'p'}); return {r,st:r.$state.get()[r.key('openai-codex','acct-1')]} }
+ const groups=a=>[{slug:'openai-codex',accounts:a}]
+ let {st}=await run(async()=>{throw new Error('model.options 503')})
+ assert.notEqual(st.done,true); assert.equal(st.unverified,true); assert.equal(st.check,true); assert.match(st.message,/Could not confirm/); assert.doesNotMatch(st.message,/Reconnected/)
+ ;({st}=await run(async()=>null))
+ assert.notEqual(st.done,true); assert.match(st.message,/Could not confirm/)
+ ;({st}=await run(async()=>groups([{id:'other',label:'two',state:'ready'}])))
+ assert.notEqual(st.done,true); assert.equal(st.unverified,true); assert.equal(st.needsSignIn,true); assert.match(st.message,/not in the pool/)
+ ;({st}=await run(async()=>groups([{id:'acct-1',label:'one',state:'unavailable',reason:'auth'}])))
+ assert.notEqual(st.done,true); assert.equal(st.needsSignIn,true); assert.equal(st.message,'Still needs sign-in')
+ ;({st}=await run(async()=>groups([{id:'acct-1',label:'one',state:'limited',limit_kind:'cooldown',reason:'auth'}])))
+ assert.notEqual(st.done,true); assert.equal(st.retry,true); assert.match(st.message,/still disconnected/)
+ ;({st}=await run(async()=>groups([{id:'acct-1',label:'one',state:'limited',limit_kind:'quota',reason:'usage_limit'}])))
+ assert.equal(st.done,true); assert.match(st.message,/out of quota/); assert.doesNotMatch(st.message,/Reconnected/)
+ ;({st}=await run(async()=>groups([{id:'acct-1',label:'one',state:'unknown'}])))
+ assert.match(st.message,/not checked yet/); assert.doesNotMatch(st.message,/Reconnected/)
+ // A failed readback is recoverable: Check reads again and only then confirms.
+ let fail=true; const out=await run(async()=>{ if(fail) throw new Error('x'); return groups([{id:'acct-1',label:'one',state:'ready'}]) })
+ assert.match(out.st.message,/Could not confirm/); fail=false
+ await out.r.check('openai-codex',acct)
+ assert.deepEqual([out.r.$state.get()[out.r.key('openai-codex','acct-1')].done,out.r.$state.get()[out.r.key('openai-codex','acct-1')].message],[true,'Reconnected'])
+ assert.deepEqual(['ready','limited','unknown'].map(state=>plugin.accountHealth(groups([{id:'a',state,limit_kind:'cooldown'}]),'openai-codex','a')),['ok','ok','unchecked'])
+})
+test('cancel then immediate re-sign-in: the cancelled poll loop never writes over the new flow', async () => {
+ const {plugin,state}=await setup(); state.connectionId.set('gw'); state.profile.set('p'); const waiting=[]; let verified=0
+ const {ctx,apiCalls}=deviceCtx({poll:()=>new Promise(ok=>waiting.push(ok))})
+ const r=plugin.createReconnectStore(ctx,async()=>{verified++; return [{slug:'openai-codex',accounts:[{id:'a',state:'ready'}]}]})
+ const acct={id:'a',label:'A'}, k=r.key('openai-codex','a'), tick=()=>new Promise(ok=>setTimeout(ok,5))
+ const first=r.signIn('openai-codex',acct,{connectionId:'gw',profile:'p'}); await tick()
+ assert.equal(r.$state.get()[k].sessionId,'sess-1'); assert.equal(waiting.length,1)
+ await r.cancelAuth('openai-codex',acct,{connectionId:'gw',profile:'p'})
+ assert.equal(r.$state.get()[k].needsSignIn,true,'cancel keeps the sign-in action')
+ assert.ok(apiCalls.some(c=>c.method==='DELETE'&&String(c.path).includes('sess-1')))
+ const second=r.signIn('openai-codex',acct,{connectionId:'gw',profile:'p'}); await tick()
+ assert.equal(r.$state.get()[k].sessionId,'sess-2'); assert.equal(waiting.length,2)
+ waiting[0]({status:'approved'}); await first
+ const st=r.$state.get()[k]
+ assert.equal(st.sessionId,'sess-2'); assert.equal(st.launching,true); assert.notEqual(st.done,true); assert.equal(verified,0,'old flow must not run the readback')
+ waiting[1]({status:'approved'}); await second
+ assert.equal(r.$state.get()[k].done,true); assert.equal(verified,1)
+})
+test('refreshable expiry reads "disconnected"; "sign-in needed" only once a dead grant is confirmed', async () => {
+ const {plugin}=await setup()
+ const dead={id:'d',state:'unavailable',reason:'auth'}, benched={id:'b',state:'limited',limit_kind:'cooldown',reason:'auth'}, quota={id:'q',state:'limited',limit_kind:'quota',reason:'usage_limit'}
+ assert.equal(plugin.signInConfirmed(dead,undefined,'openai-codex'),true)
+ assert.equal(plugin.signInConfirmed(benched,undefined,'openai-codex'),false)
+ assert.equal(plugin.signInConfirmed(benched,{needsSignIn:true},'openai-codex'),true,'a reconnect result confirms it')
+ assert.equal(plugin.signInConfirmed(quota,{needsSignIn:true},'openai-codex'),false)
+ assert.equal(plugin.signInConfirmed({...dead,disabled:true},undefined,'openai-codex'),false)
+ const g={slug:'openai-codex',accounts:[dead,benched,quota,{id:'r',state:'ready'},{...dead,id:'off',disabled:true}]}
+ assert.deepEqual(plugin.authCounts(g,{}),{signIn:1,disconnected:1})
+ assert.equal(plugin.authLabel(plugin.authCounts(g,{})),'sign-in · disconnected')
+ assert.deepEqual(plugin.authCounts(g,{['openai-codex\u0000b']:{needsSignIn:true}}),{signIn:2,disconnected:0})
+ assert.equal(plugin.authLabel({signIn:2,disconnected:0}),'2 sign-in'); assert.equal(plugin.authLabel({signIn:0,disconnected:3}),'3 disconnected'); assert.equal(plugin.authLabel({signIn:0,disconnected:0}),'')
+ assert.equal(plugin.signInCount([g]),1)
+ // A rejected Gemini key / xAI block carries reason 'auth' but is not a sign-in the panel can renew.
+ const [gem]=plugin.summarize({providers:[{slug:'gemini',usage:{accounts:[{id:'k',label:'k',state:'limited',limit_kind:'quota',windows:[]}]}}]})
+ assert.equal(gem.accounts[0].reason,'auth'); assert.equal(plugin.needsReconnect(gem.accounts[0],gem.slug),false)
+ assert.deepEqual(plugin.authCounts(gem,{}),{signIn:0,disconnected:0})
+ assert.deepEqual(plugin.authCounts({slug:'xai-oauth',accounts:[dead]},{}),{signIn:0,disconnected:0})
+})
+test('a row core removed for a dead grant stays listed as signed out until sign-in is verified', async () => {
+ const {plugin}=await setup()
+ const {ctx}=deviceCtx({reply:{ok:false,status:'needs_sign_in',needs_sign_in:true,removed:1,auth_flow:'device_code'}})
+ let groups=[{slug:'openai-codex',title:'ChatGPT (Codex)',total:1,ready:1,accounts:[{id:'keep',label:'keep',state:'ready'}]}]
+ const r=plugin.createReconnectStore(ctx,async()=>groups)
+ const acct={id:'gone',label:'Gone acct'}, k=r.key('openai-codex','gone')
+ await r.reconnect('openai-codex',acct)
+ assert.equal(r.$state.get()[k].needsSignIn,true); assert.equal(r.$state.get()[k].removed,true)
+ let [g]=plugin.withSignedOut(groups,r.$state.get())
+ assert.deepEqual(g.accounts.map(a=>[a.id,a.state,!!a.signedOut]),[['keep','ready',false],['gone','unavailable',true]]); assert.equal(g.total,2)
+ assert.equal(plugin.signInConfirmed(g.accounts[1],r.$state.get()[k],g.slug),true)
+ assert.deepEqual(plugin.authCounts(g,r.$state.get()),{signIn:1,disconnected:0})
+ assert.match(plugin.describe(g.accounts[1]),/signed out/)
+ // The provider's last account: the chip itself must not vanish.
+ const alone=plugin.withSignedOut([{slug:'anthropic',accounts:[{id:'c',label:'c',state:'ready'}],total:1}],r.$state.get())
+ assert.deepEqual(alone.map(x=>x.slug),['anthropic','openai-codex']); assert.equal(alone[1].accounts[0].signedOut,true); assert.equal(alone[1].tag,'GPT')
+ // Still listed by the backend (by id or by label): no ghost, no duplicate row.
+ assert.equal(plugin.withSignedOut([{slug:'openai-codex',total:1,accounts:[{id:'gone',label:'x',state:'unavailable'}]}],r.$state.get())[0].accounts.length,1)
+ assert.equal(plugin.withSignedOut([{slug:'openai-codex',total:1,accounts:[{id:'new',label:'Gone acct',state:'ready'}]}],r.$state.get())[0].accounts.length,1)
+ // Sign-in on the ghost row survives cancel, and a verified sign-in removes the ghost.
+ await r.cancelAuth('openai-codex',acct); assert.equal(r.$state.get()[k].removed,true)
+ groups=[{slug:'openai-codex',total:2,accounts:[{id:'keep',label:'keep',state:'ready'},{id:'gone',label:'Gone acct',state:'ready'}]}]
+ await r.signIn('openai-codex',acct)
+ assert.equal(r.$state.get()[k].done,true); assert.equal(r.$state.get()[k].message,'Reconnected')
+ assert.equal(plugin.withSignedOut(groups,r.$state.get())[0].accounts.length,2)
+ // Without `removed`, a needs-sign-in state never invents a row.
+ assert.equal(plugin.withSignedOut([],{x:{provider:'openai-codex',id:'z',needsSignIn:true}}).length,0)
+})
+async function setupUi() {
+ const prelude = 'const host=globalThis.__auTestHost, atom=globalThis.__auTestAtom;\nconst jsx=(type,props)=>({type,props}), jsxs=jsx;\n'
+ const state = Object.fromEntries(Object.entries({connectionId:'gw-hub',profile:'work'}).map(([k,v]) => [k,atom(v)]))
+ const nav=[]; globalThis.__auTestHost = {state, navigate:p=>nav.push(p)}; globalThis.__auTestAtom = atom
+ const mod = await import('data:text/javascript;base64,' + Buffer.from(prelude + source.replace(/^import .*$/gm, '') + '\n//' + Math.random()).toString('base64'))
+ return {mod,nav}
+}
+const controls=el=>el ? el.props.children.map(c=>c.type==='button'?['button',c.props['aria-label'],c.props.onClick]:['text',c.props.children]) : null
+test('every auth row has a supported next step: Reconnect, in-app sign-in, or Settings for Claude', async () => {
+ const {mod,nav}=await setupUi(); const calls=[]
+ const store={key:(p,id)=>`${p}\u0000${id}`,reconnect:(...x)=>calls.push(['reconnect',...x]),signIn:(...x)=>calls.push(['signIn',...x]),openSettings:(...x)=>calls.push(['openSettings',...x]),check:(...x)=>calls.push(['check',...x]),cancelAuth(){},openPage(){}}
+ const line=(slug,a,state={})=>controls(mod.ReconnectLine({g:{slug},a,reconnectStore:store,reconnectState:state}))
+ const dead={id:'d',label:'D',state:'unavailable',reason:'auth'}, benched={id:'b',label:'B',state:'limited',limit_kind:'cooldown',reason:'auth'}
+ // Codex: auth-benched -> Reconnect only; dead -> sign-in, no Reconnect.
+ let c=line('openai-codex',benched); assert.deepEqual(c.map(x=>x.slice(0,2)),[['button','Reconnect B']])
+ c[0][2](); assert.deepEqual(calls.pop().slice(0,3),['reconnect','openai-codex',benched])
+ assert.deepEqual(calls.length,0)
+ c=line('openai-codex',dead); assert.deepEqual(c.map(x=>x.slice(0,2)),[['button','Sign in to D again'],['text','Saved sign-in expired — sign in again']])
+ c[0][2](); const signed=calls.pop(); assert.deepEqual(signed.slice(0,3),['signIn','openai-codex',dead]); assert.deepEqual(signed[3],{connectionId:'gw-hub',profile:'work'},'sign-in targets the chip gateway and profile')
+ // Claude dead grant: a control, not just a message; never Reconnect, never in-app sign-in.
+ c=line('anthropic',dead); assert.deepEqual(c.map(x=>x.slice(0,2)),[['button','Open sign-in settings for D'],['text','Saved sign-in expired — sign in from Settings › Accounts']])
+ c[0][2](); assert.deepEqual(calls.pop(),['openSettings','anthropic',dead])
+ const k='anthropic\u0000b'
+ c=line('anthropic',benched,{[k]:{needsSignIn:true,authFlow:'external',message:'Saved sign-in expired — sign in from Settings › Accounts'}})
+ assert.deepEqual(c.map(x=>x[1]),['Open sign-in settings for B','Saved sign-in expired — sign in from Settings › Accounts'])
+ c=line('anthropic',benched,{[k]:{needsSignIn:true,authFlow:'external',opened:true,message:'m'}})
+ assert.deepEqual(c.map(x=>x[1]),['Open sign-in settings for B','Check sign-in for B','m'])
+ c[1][2](); assert.deepEqual(calls.pop(),['check','anthropic',benched])
+ // Finished, quota, disabled-provider rows offer no auth control.
+ assert.deepEqual(line('anthropic',{id:'b',label:'B',state:'ready'},{[k]:{done:true,message:'Reconnected'}}).map(x=>x.slice(0,2)),[['text','Reconnected']])
+ assert.equal(line('openai-codex',{id:'q',state:'limited',limit_kind:'quota',reason:'usage_limit'}),null)
+ assert.equal(line('gemini',{id:'k',state:'limited',reason:'auth'}),null)
+ // A grant that dies again after "Reconnected" gets its controls back.
+ assert.deepEqual(line('openai-codex',dead,{['openai-codex\u0000d']:{done:true,message:'Reconnected'}}).map(x=>x[1]),['Sign in to D again','Saved sign-in expired — sign in again'])
+ assert.deepEqual(nav,[])
+ // Collapsed row pill wording.
+ const pill=(slug,a,state={})=>{ const el=mod.AccountRow({g:{slug,accounts:[],markId:null},a,open:false,onToggle(){},selectionStore:{select(){}},selectionState:{busy:false,loading:false,selection:null},reconnectStore:store,reconnectState:state})
+  const p=el.props.children[0].props.children[0].props.children[1].props.children.find(x=>x&&x.props&&x.props['data-auth']); return p?[p.props.className,p.props.children,el.props.children.length>1&&!!el.props.children[1]]:null }
+ assert.deepEqual(pill('openai-codex',dead),['hermes-au-signin','sign-in needed',true])
+ assert.deepEqual(pill('openai-codex',benched),['hermes-au-disc','disconnected',true])
+ assert.deepEqual(pill('openai-codex',benched,{['openai-codex\u0000b']:{needsSignIn:true,message:'x'}}),['hermes-au-signin','sign-in needed',true])
+ assert.equal(pill('openai-codex',{id:'q',label:'Q',state:'limited',limit_kind:'quota',reason:'usage_limit'}),null)
+ assert.equal(pill('openai-codex',{...dead,disabled:true}),null)
+})
+test('Claude sign-in: Settings handoff, then Check reads health back across the token-fingerprint id change', async () => {
+ const {mod,nav}=await setupUi(); const apiCalls=[]
+ let groups=[{slug:'anthropic',accounts:[{id:'fp:old',label:'me',state:'unavailable',reason:'auth'}]}]
+ const ctx={onDispose(){},api:async req=>{apiCalls.push(req); throw new Error('no in-app Anthropic OAuth')},async rest(){return {ok:false,status:'needs_sign_in',needs_sign_in:true,auth_flow:'external'}}}
+ const r=mod.createReconnectStore(ctx,async()=>groups); const acct={id:'fp:old',label:'me'}, k=r.key('anthropic','fp:old')
+ await r.reconnect('anthropic',acct)
+ assert.equal(r.$state.get()[k].authFlow,'external'); assert.match(r.$state.get()[k].message,/Settings › Accounts/)
+ await r.signIn('anthropic',acct)
+ assert.deepEqual(nav,['/settings?tab=providers&pview=accounts']); assert.equal(apiCalls.length,0); assert.equal(r.$state.get()[k].opened,true)
+ await r.check('anthropic',acct)
+ let st=r.$state.get()[k]; assert.equal(st.message,'Still needs sign-in'); assert.equal(st.opened,true); assert.equal(st.authFlow,'external'); assert.notEqual(st.done,true)
+ groups=[{slug:'anthropic',accounts:[{id:'fp:new',label:'me',state:'ready'}]}]
+ await r.check('anthropic',acct)
+ st=r.$state.get()[k]; assert.equal(st.done,true); assert.equal(st.message,'Reconnected')
+ assert.equal(mod.rowFix(r.$state.get(),'anthropic',groups[0].accounts[0]).message,'Reconnected','result follows the account to its new id')
+ assert.deepEqual(mod.rowFix(r.$state.get(),'anthropic',{id:'fp:other',label:'someone else'}),{})
+ // Two accounts sharing a label: no guess.
+ assert.equal(mod.accountHealth([{slug:'anthropic',accounts:[{id:'1',label:'me',state:'ready'},{id:'2',label:'me',state:'ready'}]}],'anthropic','fp:old','me'),'missing')
+ // Another account that merely shares the label keeps its own dead-grant controls.
+ const twin={id:'fp:twin',label:'me',state:'unavailable',reason:'auth'}
+ assert.deepEqual(mod.rowFix(r.$state.get(),'anthropic',twin),{})
+ const store={key:r.key,openSettings(){},check(){},reconnect(){},signIn(){},cancelAuth(){},openPage(){}}
+ assert.deepEqual(controls(mod.ReconnectLine({g:{slug:'anthropic'},a:twin,reconnectStore:store,reconnectState:r.$state.get()})).map(x=>x[1]),
+  ['Open sign-in settings for me','Saved sign-in expired — sign in from Settings › Accounts'])
+})
+test('reconnect state is scoped to its gateway and profile: no ghost, result or action crosses over', async () => {
+ const {plugin,state}=await setup(); state.connectionId.set('gw-A'); state.profile.set('pA')
+ const {ctx,apiCalls}=deviceCtx({reply:{ok:false,status:'needs_sign_in',needs_sign_in:true,removed:1,auth_flow:'device_code'},poll:()=>new Promise(()=>{})})
+ let groups=[]; const r=plugin.createReconnectStore(ctx,async()=>groups)
+ const acct={id:'x',label:'X'}, k=r.key('openai-codex','x'), tick=()=>new Promise(ok=>setTimeout(ok,5))
+ await r.reconnect('openai-codex',acct)
+ assert.equal(plugin.withSignedOut([],plugin.scopedFix(r.$state.get())).length,1,'ghost on its own gateway')
+ state.connectionId.set('gw-B'); state.profile.set('pB')
+ const onB=plugin.scopedFix(r.$state.get())
+ assert.deepEqual(onB,{}); assert.equal(plugin.withSignedOut([],onB).length,0,'no ghost on another gateway')
+ assert.deepEqual(plugin.authCounts({slug:'openai-codex',accounts:[{id:'x',state:'limited',limit_kind:'cooldown',reason:'auth'}]},onB),{signIn:0,disconnected:1})
+ // Same account id on gateway B: A's state neither blocks nor colours it, and A's late readback cannot write.
+ state.connectionId.set('gw-A'); state.profile.set('pA')
+ r.signIn('openai-codex',acct); await tick()
+ assert.equal(r.$state.get()[k].sessionId,'sess-1')
+ state.connectionId.set('gw-B'); state.profile.set('pB')
+ await r.cancelAuth('openai-codex',acct)
+ assert.equal(r.$state.get()[k].sessionId,'sess-1','cancel from gateway B leaves gateway A flow alone')
+ assert.ok(!apiCalls.some(c=>c.method==='DELETE'))
+ r.signIn('openai-codex',acct); await tick()
+ const st=r.$state.get()[k]
+ assert.equal(st.scope,plugin.scopeOf({connectionId:'gw-B',profile:'pB'})); assert.equal(st.sessionId,'sess-2'); assert.notEqual(st.removed,true)
+ assert.deepEqual(apiCalls.filter(c=>String(c.path).endsWith('/start')).map(c=>[c.connectionId,c.profile]),[['gw-A','pA'],['gw-B','pB']])
+ // Taking the key over deletes gateway A's server session, on gateway A.
+ assert.deepEqual(apiCalls.filter(c=>c.method==='DELETE').map(c=>[String(c.path).split('/').pop(),c.connectionId,c.profile]),[['sess-1','gw-A','pA']])
+ // A reconnect still in flight on gateway A cannot write its late result into gateway B's state.
+ const s3=await setup(); s3.state.connectionId.set('gw-A'); s3.state.profile.set('pA')
+ const replies=[]; const ctx3={onDispose(){},async rest(){return new Promise(ok=>replies.push(ok))}}
+ const r3=s3.plugin.createReconnectStore(ctx3,async()=>[])
+ const slow=r3.reconnect('openai-codex',acct); await tick()
+ s3.state.connectionId.set('gw-B'); s3.state.profile.set('pB')
+ const fast=r3.reconnect('openai-codex',acct); await tick()
+ replies[1]({ok:false,status:'transient'}); await fast
+ replies[0]({ok:true,status:'renewed'}); await slow
+ const b=r3.$state.get()[k]
+ assert.equal(b.scope,plugin.scopeOf({connectionId:'gw-B',profile:'pB'})); assert.equal(b.message,'Reconnect failed — retry'); assert.notEqual(b.done,true)
+ // A readback that lands after the panel moved to another gateway proves nothing.
+ const s2=await setup(); s2.state.connectionId.set('gw-A'); s2.state.profile.set('pA')
+ const d=deviceCtx(); const r2=s2.plugin.createReconnectStore(d.ctx,async()=>{ s2.state.connectionId.set('gw-B'); return [{slug:'openai-codex',accounts:[{id:'x',label:'X',state:'ready'}]}] })
+ await r2.signIn('openai-codex',acct)
+ const late=r2.$state.get()[k]; assert.notEqual(late.done,true); assert.match(late.message,/Could not confirm/)
+ assert.deepEqual(s2.plugin.scopedFix(r2.$state.get()),{})
+})
+test('a started sign-in session is never abandoned: browser-launch failure keeps it cancellable, errors delete it', async () => {
+ const {plugin}=await setup(); const acct={id:'a',label:'A'}; const tick=()=>new Promise(ok=>setTimeout(ok,5))
+ // openExternal rejects: the session stays live, visible and cancellable.
+ let d=deviceCtx({poll:()=>new Promise(()=>{})}); d.ctx.os.openExternal=async()=>{throw new Error('no browser')}
+ let r=plugin.createReconnectStore(d.ctx,async()=>[]); const k=r.key('openai-codex','a')
+ r.signIn('openai-codex',acct); await tick()
+ let st=r.$state.get()[k]
+ assert.equal(st.sessionId,'sess-1'); assert.equal(st.launching,true); assert.equal(st.message,'Open the sign-in page to continue'); assert.equal(st.verificationUrl,'https://auth.example.com/device')
+ await r.cancelAuth('openai-codex',acct)
+ assert.ok(d.apiCalls.some(c=>c.method==='DELETE'&&String(c.path).includes('sess-1')))
+ // Poll keeps failing: the flow ends, the server session is deleted, sign-in stays offered.
+ d=deviceCtx({poll:()=>{throw new Error('boom')}}); r=plugin.createReconnectStore(d.ctx,async()=>[])
+ await r.signIn('openai-codex',acct)
+ st=r.$state.get()[k]
+ assert.equal(st.needsSignIn,true); assert.equal(st.error,true); assert.notEqual(st.busy,true); assert.match(st.message,/Sign-in failed/)
+ assert.ok(d.apiCalls.some(c=>c.method==='DELETE'&&String(c.path).includes('sess-1')))
+ // A start that is not a usable device-code flow but carries a session: deleted too.
+ d=deviceCtx(); const api=d.ctx.api; d.ctx.api=async req=>String(req.path).endsWith('/start')?{flow:'pkce',session_id:'sess-x'}:api(req)
+ r=plugin.createReconnectStore(d.ctx,async()=>[])
+ await r.signIn('openai-codex',acct)
+ assert.ok(d.apiCalls.some(c=>c.method==='DELETE'&&String(c.path).includes('sess-x')))
 })
 test('fmtReset rounds to the minute so a reset at 6:59:59.6 reads 7 AM, not 6 AM', async () => {
  const {plugin}=await setup()
