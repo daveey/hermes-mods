@@ -326,7 +326,7 @@ export function classify(chips, { nowMs = Date.now(), silence = new Map(), isAsk
       const detail = bu.contained
         ? `waiting on contained card ${bu.id} · release by ${auth?.id ? `card ${auth.id}` : 'unknown'} (${auth?.status || 'unknown'})`
         : `waiting on blocked parent card ${bu.id} (${bu.status})`
-      out.blockedUpstream.push({ ...item(c), blockedUpstreamRow: true, detail })
+      out.blockedUpstream.push({ ...item(c), blockedUpstreamRow: true, detail: detail + (bu.reason ? ` · ${bu.reason}` : '') })
       continue
     }
     const ev = evidence(c)
@@ -336,6 +336,7 @@ export function classify(chips, { nowMs = Date.now(), silence = new Map(), isAsk
     const board = c.boardStatus
     // The upstream leaf only when the wait text does not already name that card.
     const leaf = c.upstream?.id && !new RegExp(`\\b${String(c.upstream.id).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).test(on) ? ` → ${c.upstream.id} ${c.upstream.status || 'unknown'}` : ''
+    const upstreamReason = c.upstream?.reason ? ` · ${c.upstream.reason}` : ''
     // A stalled agent-owned wait is the board's own verdict (`wait.wait_state`), not execution evidence: it is Stuck
     // whatever the run evidence says (a fresh parked read used to take it to Waiting first, so it never showed).
     if (c.look === 'stalled') { out.stuck.push({ ...item(c), reason: 'stalled', detail: `stalled: ${on || 'agent-owned wait over 2 h'}` }); continue }
@@ -348,7 +349,7 @@ export function classify(chips, { nowMs = Date.now(), silence = new Map(), isAsk
       if (c.state === 'todo' && !c.waitingOn && !c.upstream?.id) { out.queued.push({ ...item(c), parked: true, detail: `not started · ${source}` }); continue }
       // The upstream leaf follows a published wait only: without one, parkedWaitText already names the upstream.
       const text = parkedWaitText(c, on, nowMs)
-      out.waiting.push({ ...item(c), parked: true, detail: `${text}${on && text === on ? leaf : ''} · ${source}` })
+      out.waiting.push({ ...item(c), parked: true, detail: `${text}${on && text === on ? leaf : ''}${upstreamReason} · ${source}` })
       continue
     }
     if (board && (!ev || ev.state === 'unknown') || ev?.sourced && ev.state === 'unknown' || legacyLive(c, ev)) {
@@ -363,7 +364,7 @@ export function classify(chips, { nowMs = Date.now(), silence = new Map(), isAsk
     if (c.state === 'review') { out.active.push({ ...item(c), detail: `in review${last ? ` · ${ago(last, nowMs)}` : ''}` }); continue }
     if (c.state === 'ready') { out.ready.push({ ...item(c), detail: 'ready to start' }); continue }
     if (c.state === 'todo') { out.queued.push({ ...item(c), detail: 'not started' }); continue }
-    out.waiting.push({ ...item(c), detail: (on || (c.state === 'scheduled' ? 'scheduled' : c.state === 'unknown' ? 'status unknown' : c.state)) + leaf })
+    out.waiting.push({ ...item(c), detail: (on || (c.state === 'scheduled' ? 'scheduled' : c.state === 'unknown' ? 'status unknown' : c.state)) + leaf + upstreamReason })
   }
   return out
 }

@@ -1,4 +1,6 @@
-# Session Panel
+# Session panel
+
+Upstream waiting rows include a bounded reason from the ancestor's current hold when the backend supplies it: for example, `waiting on blocked parent … (triage) · spend budget` or `… scheduled · Awaiting CI`. Structured human actions, lifecycle reasons and containment release owners remain distinct; missing reasons keep the existing status-only fallback. Reasons are plain text, not inferred from arbitrary comments. Producer-to-panel coverage lives in `test/wait-labels.test.mjs`.
 
 The panel displays the current chat's tasks and decisions using the owner-qualified session-tasks and user-steps projections.
 
