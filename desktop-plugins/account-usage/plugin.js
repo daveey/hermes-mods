@@ -286,9 +286,10 @@ export function needsReconnect(account, slug) {
 // that one is only "disconnected".
 export function signInConfirmed(account, st, slug) {
   if (!needsReconnect(account, slug)) return false
-  // The backend answered for this exact row that it is out of quota or disabled, not signed out.
-  if (st && st.settled && st.id === account.id) return false
-  return account.state === 'unavailable' || !!account.signedOut || !!(st && st.needsSignIn)
+  // The backend answered for this row that it is out of quota or disabled, not signed out.
+  if (settledFor(st, account)) return false
+  // An unconfirmed sign-in counts only on the row it was asked from, not on a row it followed to.
+  return account.state === 'unavailable' || !!account.signedOut || !!(st && st.needsSignIn && (!st.id || st.id === account.id))
 }
 
 const reconnectKey = (provider, id) => `${provider}\u0000${id}`
@@ -302,12 +303,25 @@ export function scopedFix(reconnectState, route = ownerRoute()) {
 }
 
 // The reconnect state shown on a row. An Anthropic id is a token fingerprint, so a renewed or
-// re-signed-in account comes back under a new id: a finished result follows it only to the exact
-// row the readback resolved (resolvedId), never to any row that merely shares the label.
+// re-signed-in account comes back under a new id: an answer about the stored row (finished, settled
+// as quota/disabled, or unconfirmed) follows it only to the exact account id the backend named
+// (resolvedId), never to any row that merely shares the label.
 export function rowFix(reconnectState, slug, a) {
   const own = reconnectState[reconnectKey(slug, a.id)]
   if (own) return own
-  return Object.values(reconnectState).find(st => st && st.done && st.provider === slug && st.resolvedId && st.resolvedId === a.id) || {}
+  return Object.values(reconnectState).find(st => st && (st.done || st.settled || st.unverified) && st.provider === slug && st.resolvedId && st.resolvedId === a.id) || {}
+}
+
+// Does a settled answer (the backend said the stored row is out of quota or disabled, not signed
+// out) hold for this row? Always for the row it was asked from. For the account id the backend
+// named it holds while that row needs no sign-in, or when usage already listed it as signed out at
+// the moment the backend answered (`staleAuth`: usage was behind). A named row that turns
+// signed-out afterwards is a new problem: the answer is spent and sign-in is offered again.
+export function settledFor(st, a) {
+  if (!st || !st.settled || !a) return false
+  if (st.id === a.id) return true
+  if (!st.resolvedId || st.resolvedId !== a.id) return false
+  return !needsReconnect(a) || !!st.staleAuth
 }
 
 // {signIn, disconnected} for one provider group. `reconnectState` = the reconnect store's atom value.
@@ -315,8 +329,8 @@ export function authCounts(g, reconnectState = {}) {
   let signIn = 0, disconnected = 0
   for (const a of (g && g.accounts) || []) {
     if (!needsReconnect(a, g.slug)) continue
-    const st = reconnectState[reconnectKey(g.slug, a.id)]
-    if (st && st.settled && st.id === a.id) continue // quota or disabled per the backend: no auth problem to count
+    const st = rowFix(reconnectState, g.slug, a)
+    if (settledFor(st, a)) continue // quota or disabled per the backend: no auth problem to count
     if (signInConfirmed(a, st, g.slug)) signIn++
     else disconnected++
   }
@@ -877,17 +891,22 @@ export function createReconnectStore(ctx, onDone = () => {}) {
     // state, whatever the usage panel shows (it may still hold the old account id, or a stale
     // "ready"): they are reported as such and are not a sign-in problem (`settled`).
     if (seen.status === 'quota' || seen.status === 'disabled') {
-      try { await onDone() } catch { /* the row's state is already known; the refresh is best-effort */ }
+      let groups = null
+      try { groups = await onDone() } catch { /* the row's state is already known; the refresh is best-effort */ }
       if (!live()) return
+      // Usage that already lists the named account as signed out is behind the backend's answer.
+      const listed = Array.isArray(groups) && scopeOf(ownerRoute()) === put.scope
+        ? (groups.find(g => g && g.slug === provider)?.accounts || []).find(a => a && a.id === seen.account_id) : null
       const settled = { settled: true, check: true, authFlow: 'terminal', signInRoute: bound,
-        ...(seen.account_id !== account.id ? { resolvedId: seen.account_id } : {}) }
+        ...(seen.account_id !== account.id ? { resolvedId: seen.account_id, ...(needsReconnect(listed, provider) ? { staleAuth: true } : {}) } : {}) }
       put(seen.status === 'quota' ? { ...settled, done: true, message: HEALTH.quota.message }
         : { ...settled, error: true, message: 'Account is disabled' })
       return
     }
     // Anything but `ok` (unknown, a status this panel does not know) confirms nothing.
     if (seen.status !== 'ok') {
-      put({ ...keep, error: true, unverified: true, check: true, message: 'Could not confirm the account — check again' })
+      put({ ...keep, error: true, unverified: true, check: true, message: 'Could not confirm the account — check again',
+        ...(seen.account_id !== account.id ? { resolvedId: seen.account_id } : {}) })
       return
     }
     // The backend vouched for this row and its account id; a panel that has not loaded that
@@ -1138,13 +1157,17 @@ export function ReconnectLine({ g, a, reconnectStore, reconnectState }) {
   const seen = rowFix(reconnectState, g.slug, a)
   const wanted = needsReconnect(a, g.slug)
   // A finished result is spent once the row needs action again (the grant died later in the session).
-  // A settled answer (the backend said this exact row is out of quota or disabled) is not spent by a
+  // A settled answer (the backend said this row is out of quota or disabled) is not spent by a
   // usage panel that still lists the row as signed out: it shows that answer and a re-check.
-  const settled = !!seen.settled && seen.id === a.id
-  const st = seen.done && wanted && !settled ? {} : seen
+  // An answer followed here from the row's earlier account id is spent the same way.
+  const settled = settledFor(seen, a)
+  const followed = !!seen.id && seen.id !== a.id
+  const st = wanted && !settled && (seen.done || seen.settled || followed) ? {} : seen
   if (!wanted && !st.message) return null
   const route = ownerRoute()
   const name = a.label || a.id
+  // A re-check of a followed answer asks about the stored row it was given for.
+  const asked = followed ? { id: seen.id, label: seen.label || a.label } : a
   const children = []
   const say = (text, color) => children.push(jsx('span', { className: 'hermes-au-fixmsg', style: color ? { color } : undefined, children: text }))
   if (st.terminal) {
@@ -1169,9 +1192,11 @@ export function ReconnectLine({ g, a, reconnectStore, reconnectState }) {
     if (st.verificationUrl) children.push(jsx('button', { type: 'button', 'aria-label': `Open sign-in page for ${name}`,
       onClick: () => reconnectStore.openPage(st.verificationUrl), children: 'Open sign-in page' }))
     if (st.message) say(st.message)
-  } else if (settled) {
+  } else if (settled || (followed && !st.done && !!st.message)) {
+    // Quota or disabled per the backend, or an unconfirmed answer shown on the account it named:
+    // a re-check only, never a sign-in offer.
     children.push(jsx('button', { type: 'button', 'aria-label': `Check sign-in for ${name}`, disabled: !!st.busy,
-      onClick: () => reconnectStore.check(g.slug, a), children: st.busy ? 'Checking…' : 'Check again' }))
+      onClick: () => reconnectStore.check(g.slug, asked), children: st.busy ? 'Checking…' : 'Check again' }))
     say(st.message, st.done ? COLORS.ready : COLORS.limited)
   } else if (st.done) {
     say(st.message, COLORS.ready)
@@ -1208,7 +1233,7 @@ export function AccountRow({ g, a, open, onToggle, selectionStore, selectionStat
   const signIn = needsReconnect(a, g.slug)
   // The backend answered for this exact row (quota or disabled, not signed out): a usage panel that
   // still lists it as signed out must not label it so.
-  const settled = !!fix.settled && fix.id === a.id
+  const settled = settledFor(fix, a)
   const confirmed = signInConfirmed(a, fix, g.slug)
   const shown = (details && (open || signIn)) || !!fix.message || !!(disableStore && disableState[disableStore.key(g.slug, a.id)]?.message)
   const cue = t === 'ready' || t === 'unknown' ? undefined : COLORS[t]
