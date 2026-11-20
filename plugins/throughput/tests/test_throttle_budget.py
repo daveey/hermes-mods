@@ -650,14 +650,21 @@ def test_on_after_more_than_an_hour_off_stays_pending_while_the_fold_travels(tmp
     for t in (NOW + 60, NOW + T.PENDING_S + 1, NOW + 8 * 60, NOW + T.PENDING_MAX_S - 1):
         assert T.status(worker, db, t, hub_db)["pacing"]["state"] == "pending", t
     assert T.status(worker, db, NOW + T.PENDING_MAX_S, hub_db)["pacing"]["state"] == "unavailable"
-    # the same On where no budget (nor an Off) was seen in the last day: unavailable after PENDING_S
+    # the same On where no budget (nor an Off) was seen in the last day: the On clicked here is itself the evidence
+    # a publisher is expected (the switch stays visible, pending), until PENDING_MAX_S; then unavailable, unseen
     alone = tmp_path / "alone"
     db2 = _series(alone, me="solo")
     T.set_pacing(alone, {"mode": "manual", "percent": 0.0, "cap_per_s": None, "set_at": NOW - 2 * T.BUDGET_SEEN_S},
                  True, NOW)
-    assert T.status(alone, db2, NOW + T.PENDING_S - 1)["pacing"]["state"] == "pending"
-    assert T.status(alone, db2, NOW + T.PENDING_S)["pacing"] == {"state": "unavailable", "publisher": None,
-                                                                 "budget_seen": False}
+    for t in (NOW + T.PENDING_S, NOW + T.PENDING_MAX_S - 1):
+        assert T.status(alone, db2, t)["pacing"] == {"state": "pending", "publisher": None, "budget_seen": True}, t
+    assert T.status(alone, db2, NOW + T.PENDING_MAX_S + 1)["pacing"] == {"state": "unavailable", "publisher": None,
+                                                                         "budget_seen": False}
+    # a gateway that did not click On, reading only that plain level, still goes unavailable after PENDING_S
+    other = tmp_path / "other"
+    db3 = _series(other, me="peer")
+    T._write_json(T.level_path(other), json.loads(T.level_path(alone).read_text()))
+    assert T.status(other, db3, NOW + T.PENDING_S)["pacing"]["state"] == "unavailable"
 
 
 def test_off_without_a_reference_paces_at_this_gateways_own_reference(tmp_path):

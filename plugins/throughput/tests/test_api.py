@@ -420,7 +420,7 @@ def test_pacing_route_switches_budget_pacing_off_and_on(api, tmp_path, monkeypat
     on = c.put("/p/v1/throttle/pacing", json={"on": True}).json()
     stored = json.loads(throttle.level_path(root).read_text())
     assert "mode" not in stored and stored["percent"] == 50.0 and stored["set_at"] > again["set_at"]
-    assert on["pacing"] == {"state": "pending", "publisher": None, "budget_seen": False}
+    assert on["pacing"] == {"state": "pending", "publisher": None, "budget_seen": True}  # the On just clicked here
 
 
 def test_budget_view_endpoint_shape(api, tmp_path, monkeypatch):

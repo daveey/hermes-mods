@@ -121,6 +121,11 @@ def level_path(root: Path) -> Path:
     return Path(root) / "cache" / "throughput" / LEVEL_FILE
 
 
+def on_request_path(root: Path) -> Path:
+    """Local only (never published): when this gateway last switched budget pacing on (``set_pacing(on=True)``)."""
+    return Path(root) / "cache" / "throughput" / "pacing-on-request.json"
+
+
 def clamp(percent) -> float:
     """A finite number clamped to 0..100; anything else is 0 (no throttle)."""
     try:
@@ -386,6 +391,10 @@ def set_pacing(root: Path, level: dict, on, now: float, reference: Optional[floa
             data["percent"], data["cap_per_s"] = _off_cap(root, level, now)
         data = {"mode": MANUAL, **data}
     _write_json(level_path(root), data)
+    if on:
+        # An On after more than BUDGET_SEEN_S off finds no recent budget record anywhere, so without this the
+        # panel that was just clicked would read "unavailable" and hide the switch until the publisher's fold arrives.
+        _write_json(on_request_path(root), {"at": set_at})
     return set_at
 
 
@@ -701,6 +710,9 @@ def pacing_status(root: Path, level: dict, records: dict, now: float, me: Option
     one; None when there is none. A slider or burst set on another gateway copies the budget level there, so that
     gateway can be named until the publisher's next write (about a minute)."""
     best, best_key, seen = None, None, False
+    asked = _number((_read_json(on_request_path(root)) or {}).get("at"))
+    if asked is not None and 0 <= now - asked <= PENDING_MAX_S:
+        seen = True  # this gateway switched pacing on moments ago: a publisher is expected to answer
     candidates = [(me, read_record(root))] + [(gw, _record(e.get("throttle"))) for gw, e in sorted(records.items())]
     for gw, rec in candidates:
         if rec is None or rec["set_at"] > now + FUTURE_SLACK_S:

@@ -235,7 +235,9 @@ and a body that is not a JSON object a 422, and neither changes anything.
       else: an expired budget, or a level nothing folded in, i.e. no publisher is running or reaching this gateway.
       `budget_seen` is true when any level read here (its own or a published one) is a budget level with `budget_at`
       in the last 24 hours, expired or not (after a long Off the publisher's last budget level has expired but is
-      still there), or an Off set in the last 24 hours (an Off set on the publish host replaces its budget level).
+      still there), or an Off set in the last 24 hours (an Off set on the publish host replaces its budget level),
+      or this gateway switched pacing On in the last 10 minutes (local `cache/throughput/pacing-on-request.json`,
+      never published), so an On after more than a day Off keeps its switch visible while the fold travels.
       The panel hides the switch on `unavailable` with `budget_seen` false: that fleet has no budget publisher. `publisher` is the gateway
       whose unexpired budget level is newest by `budget_at` (then `set_at`) among this gateway's own and every
       published one, or null; a slider or burst set on another gateway copies the budget level there, so that
