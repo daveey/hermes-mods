@@ -49,3 +49,13 @@ Historical incidents require live or preserved renderer state for exact attribut
 ## Waiting is folded to counts
 
 The **Waiting** section shows only its heading by default: `Waiting · N` followed by what the rows wait on, `P on parent · S on schedule · U unknown` (plus `· K other` when a row fits none, such as a card in triage). Clicking the heading opens the rows for that chat; the choice is not kept across chats or relaunches. *On parent* = a `todo` card or one waiting on another card; *on schedule* = a scheduled card or any other named wait (timer, CI run, deploy); *unknown* = the row's status could not be read (stale read, missing or expired evidence, a sub-agent or process without evidence), never guessed from its last known state. The status row of a still-blocked card whose request was retired stays visible while folded, because nothing else shows it.
+
+## Running rows are one line
+
+A running card, sub-agent, process or rented machine is one line: its state box, the title (truncated), and on the right where it runs and for how long (`hub · 14 min`, `worker-1 · 2 h`, `pool · 3 h`, `in review · 2 h`, `sub-agent · 14 tools`). A running card with no event for 20 minutes reads `quiet N min` in the waiting colour (Stuck still takes over at 2 h). The tooltip says the same in words (`running on hub · for 14 min · last event heartbeat just now`).
+
+Clicking the row opens its details: card id, assignee, board and gateway; start time and last event; the full execution-evidence line; and **Open card**. A row reaches In progress only with running evidence, so nothing hidden by default changes what the user would do; unknown evidence still lists under Waiting and counts as `evidence unknown` in the header.
+
+The **In progress** heading shows only when another section shares the body; alone, the header's `N running` and blue boxes already name it.
+
+`test/panel.test.mjs` covers the one-line row (the card from the 2026-11-20 screenshot), the click-open details and Open card, quiet/pool/worker/review/sub-agent meta; `test/evidence.test.mjs` covers evidence moving into the details.

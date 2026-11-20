@@ -34,7 +34,7 @@ import { useEffect, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'session-panel'
-const VERSION = 'session-panel-v6-blocked-upstream'
+const VERSION = 'session-panel-v7-running-one-line'
 export const STUCK_CARD_S = 2 * 3600 // running card with no event this long
 export const STUCK_SUB_MS = 30 * 60_000 // sub-agent with no new tool call this long
 const DONE_POLL_MS = 30_000
@@ -686,6 +686,87 @@ function Row({ i, k }) {
   ] })
 }
 
+// ── running rows ───────────────────────────────────────────────────────────
+// A running row is one line: box · title · where it runs and for how long. Everything else (card id, assignee,
+// board, last event kind, the full execution-evidence line) is one click away in the row's details: on a card the
+// header already counts as running, "running · default · just now" plus a 200-character evidence line spent three
+// lines restating what the blue box says. A row reaches In progress only with running evidence, so the default
+// view hides nothing that changes what the user would do; unknown evidence still lists under Waiting.
+export const QUIET_S = 20 * 60 // a running card with no event this long reads "quiet" (Stuck takes over at STUCK_CARD_S)
+
+/** Where a row's work runs, in one short word: hub, a worker name, pool, or the owning gateway. */
+export function whereText(c) {
+  const m = str(c?.runMachine)
+  if (m === 'worker-pool') return 'pool'
+  if (m) return m
+  return str(c?.gateway) && c.gateway !== 'local' ? c.gateway : ''
+}
+
+/** The right-hand meta of a running row: `{ text, quiet, tip }`. `text` is short (`hub · 12 min`); `tip` says the
+ *  same in full words for the tooltip. `quiet` = a running card whose newest event is older than QUIET_S. */
+export function runningMeta(i, nowMs = Date.now()) {
+  const c = i?.chip || {}, now = nowMs / 1000
+  const join = (...p) => p.filter(Boolean).join(' · ')
+  if (i?.kind === 'sub') {
+    const tools = Number(c.toolCount) || 0
+    return { text: join('sub-agent', tools ? `${tools} tool${tools === 1 ? '' : 's'}` : ''), quiet: false, tip: join('sub-agent', c.lastTool ? `last tool ${c.lastTool}` : '') }
+  }
+  if (i?.kind === 'bg') return { text: 'process', quiet: false, tip: 'background process' }
+  if (i?.kind === 'machine') return { text: 'rented machine', quiet: false, tip: 'rented machine' }
+  const where = whereText(c)
+  const progress = Number(c.activityAt) || Number(c.progressAt) || 0
+  const since = Number(c.since) || 0
+  const lastEvent = progress ? `last event${c.activity ? ` ${c.activity}` : ''} ${ago(progress, nowMs)}` : 'last event unknown'
+  if (c.state === 'review') {
+    const at = progress || since
+    return { text: join('in review', at ? span(now - at) : ''), quiet: false, tip: join('in review', where && `on ${where}`, lastEvent) }
+  }
+  const quiet = !!progress && now - progress >= QUIET_S
+  const runFor = since ? span(now - since) : ''
+  return {
+    text: join(where, quiet ? `quiet ${span(now - progress)}` : runFor || (progress ? ago(progress, nowMs) : '')),
+    quiet,
+    tip: join(where ? `running on ${where}` : 'running', runFor && `for ${runFor}`, lastEvent)
+  }
+}
+
+/** The details a running row reveals on click, as plain lines (exported for tests). */
+export function runningDetails(i, nowMs = Date.now()) {
+  const c = i?.chip || {}
+  const progress = Number(c.activityAt) || Number(c.progressAt) || 0
+  const lines = []
+  if (i?.kind === 'kanban') {
+    lines.push([i.id && `card ${i.id}`, c.assignee && `assignee ${c.assignee}`, c.board && c.board !== 'default' && `board ${c.board}`, c.gateway && `on ${c.gateway}`].filter(Boolean).join(' · '))
+    lines.push([c.since && `started ${ago(c.since, nowMs)}`, progress ? `last event${c.activity ? ` ${c.activity}` : ''} ${ago(progress, nowMs)}` : 'last event unknown'].filter(Boolean).join(' · '))
+  } else if (i?.kind === 'sub' && c.lastTool) lines.push(`last tool ${c.lastTool}`)
+  return lines.filter(Boolean)
+}
+
+function RunningRow({ i, now }) {
+  const [open, setOpen] = useState(false)
+  const st = typeof window !== 'undefined' ? window.__sessionTasks : null
+  const hub = onHub(i)
+  const k = 'running'
+  const meta = runningMeta(i, now)
+  const canOpen = i.kind === 'kanban' && !!i.chip?.connectionId && !!i.chip?.profile && typeof st?.openTaskChip === 'function'
+  const details = runningDetails(i, now)
+  const expandable = details.length > 0 || !!i.evidenceText || canOpen
+  const title = `${str(i.chip?.label) || i.label}\n${meta.tip}${expandable ? `\n${open ? 'Click to hide details' : 'Click for details'}` : ''}`
+  return jsxs('div', { 'data-panel-row': i.key, 'data-running-row': '', style: { fontSize: 13 }, children: [
+    jsxs(expandable ? 'button' : 'div', { ...(expandable ? { type: 'button', 'aria-expanded': open, onClick: () => setOpen(v => !v) } : {}), title,
+      style: { display: 'grid', gridTemplateColumns: '12px minmax(0,1fr) auto', columnGap: 8, alignItems: 'center', width: '100%', padding: '3px 0', background: 'transparent', border: 0, font: 'inherit', color: 'inherit', textAlign: 'left', cursor: expandable ? 'pointer' : 'default' }, children: [
+        jsx('span', { 'aria-hidden': true, 'data-row-pip': k, ...(hub ? { 'data-row-pip-hub': '' } : {}), style: { ...pipStyle(k, hub), justifySelf: 'center' }, children: hub ? 'H' : undefined }),
+        jsx('span', { 'data-running-title': '', style: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, children: i.label }),
+        meta.text && jsx('span', { 'data-running-meta': '', ...(meta.quiet ? { 'data-quiet': '' } : {}), style: { ...muted, whiteSpace: 'nowrap', fontVariantNumeric: 'tabular-nums', ...(meta.quiet ? { color: C.waiting } : {}) }, children: meta.text })
+      ] }),
+    open && jsxs('div', { 'data-running-details': '', style: { ...muted, fontSize: 11.5, lineHeight: 1.5, padding: '2px 0 6px 20px', overflowWrap: 'anywhere' }, children: [
+      ...details.map((d, n) => jsx('div', { children: d }, n)),
+      i.evidenceText && jsx('div', { 'data-evidence': i.evidenceState || '', children: `evidence: ${i.evidenceText}` }),
+      canOpen && jsx('button', { type: 'button', 'data-open-card': '', style: { ...btn, minHeight: 26, marginTop: 4, fontSize: 12 }, onClick: () => st.openTaskChip(i.chip), children: 'Open card' })
+    ] })
+  ] })
+}
+
 function CardStatusRow({ i }) {
   const st = typeof window !== 'undefined' ? window.__sessionTasks : null
   const canOpen = !!i.chip.connectionId && !!i.chip.profile && typeof st?.openTaskChip === 'function'
@@ -838,6 +919,7 @@ export function Panel() {
     legacy
   ].filter(Boolean)
   const summaryParts = PIP_ORDER.filter(k => n[k]).map(k => ({ k, text: `${n[k]} ${LABEL[k]}` }))
+  const otherSections = asks + sorted.unasked.length + sorted.stuck.length + sorted.blockedUpstream.length + sorted.waiting.length > 0
   // Rows whose source evidence is unknown (expired, missing from an older producer, or SDK projector absent) are
   // counted apart: they are neither green nor zero.
   if (reported.length) summaryParts.push({ k: 'reported', text: `${reported.length} reported finished, unconfirmed` })
@@ -866,8 +948,11 @@ export function Panel() {
       ...sorted.stuck.map(i => jsx(StuckCard, { i, session: route.session, now }, i.key)),
       sorted.blockedUpstream.length > 0 && jsx('h3', { 'data-section': 'blocked-upstream', style: heading(C.blockedUpstream), children: `Blocked upstream · ${sorted.blockedUpstream.length}` }),
       ...sorted.blockedUpstream.map(i => jsx(Row, { i, k: 'blockedUpstream' }, i.key)),
-      sorted.active.length > 0 && jsx('h3', { 'data-section': 'in-progress', style: heading('var(--muted-foreground)'), children: `In progress · ${sorted.active.length}` }),
-      ...sorted.active.map(i => jsx(Row, { i, k: 'running' }, i.key)),
+      // The header already says "N running" with N blue boxes: the heading only earns its line when other
+      // sections share the body and the running rows need telling apart from them.
+      sorted.active.length > 0 && otherSections &&
+        jsx('h3', { 'data-section': 'in-progress', style: heading('var(--muted-foreground)'), children: `In progress · ${sorted.active.length}` }),
+      sorted.active.length > 0 && jsx('div', { 'data-running-list': '', style: { paddingTop: otherSections ? 0 : 4 }, children: sorted.active.map(i => jsx(RunningRow, { i, now }, i.key)) }),
       sorted.waiting.length > 0 && jsxs('button', { type: 'button', 'data-waiting-toggle': '', 'aria-expanded': waitingOpen, onClick: toggleWaiting, title: waitingOpen ? 'Hide waiting cards' : 'Show waiting cards', style: { display: 'flex', alignItems: 'baseline', flexWrap: 'wrap', gap: 8, width: '100%', margin: '12px 0 6px', padding: 0, background: 'transparent', border: 0, cursor: 'pointer', font: 'inherit', textAlign: 'left', color: 'var(--muted-foreground)' }, children: [
         jsx('span', { 'aria-hidden': true, style: { fontSize: 10, width: 10 }, children: waitingOpen ? '▾' : '▸' }),
         jsx('h3', { 'data-section': 'waiting', style: { ...heading('var(--muted-foreground)'), margin: 0 }, children: `Waiting · ${sorted.waiting.length}` }),

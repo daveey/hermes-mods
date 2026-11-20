@@ -53,12 +53,13 @@ test('real process/subagent adapter records survive RPC chips, both consumers an
     assert.equal(m.chipObservation(chip, 1001).progress, null)
   }
   const html = render(chips, 1001)
-  assert.match(html, /In progress · 2/)
-  assert.match(html, /process\.registry/)
+  // Running rows are one line each; the evidence line (with its source) is in the row's click-open details.
+  assert.equal(html.match(/data-running-row=/g)?.length, 2)
+  assert.match(panel.chipEvidenceLine(procs[0], 1001), /process\.registry/)
   const expired = render(chips, 1180)
-  assert.doesNotMatch(expired, /In progress ·/)
+  assert.doesNotMatch(expired, /In progress ·|data-running-row=/)
   assert.match(expired, /2 evidence unknown/)
-  assert.match(expired, /source expired/)
+  assert.match(panel.chipEvidenceLine(procs[0], 1180), /source expired/)
   const strip = renderToStaticMarkup(React.createElement(tasks.Chip, { chip: procs[0], now: 1180000 }))
   assert.match(strip, /unknown/)
   assert.doesNotMatch(strip, /session-tasks-pulse/)
@@ -76,7 +77,8 @@ test('initial mixed-version and partial source stay visible beside running; no t
   assert.equal(panel.annotateEvidence(sorted, 1001000), 1)
   const html = render(chips, 1001)
   assert.match(html, /In progress · 1/)
-  assert.match(html, /producer sent no observations/)
+  // Waiting rows are folded to counts by default; the unknown row's evidence still names why.
+  assert.match(sorted.waiting[0].evidenceText, /producer sent no observations/)
   assert.match(html, /1 evidence unknown/)
   assert.doesNotMatch(html, /Nudge agent/)
 })

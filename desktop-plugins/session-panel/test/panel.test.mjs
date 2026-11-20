@@ -631,7 +631,7 @@ test('rows lead with their state box, not a dot; hub cards carry the H there too
   const rows = [...el().querySelectorAll('[data-panel-row]')]
   assert.ok(rows.length >= 4)
   assert.ok(!rows.some(r => r.textContent.includes('●')), 'no bullet dots left in rows')
-  const marks = Object.fromEntries(rows.map(r => { const x = r.firstChild; return [r.getAttribute('data-panel-row'), [x.dataset.rowPip, x.hasAttribute('data-row-pip-hub'), x.textContent]] }))
+  const marks = Object.fromEntries(rows.map(r => { const x = r.querySelector('[data-row-pip]'); return [r.getAttribute('data-panel-row'), [x.dataset.rowPip, x.hasAttribute('data-row-pip-hub'), x.textContent]] }))
   assert.deepEqual(marks['kb:t_hub_run'], ['running', true, 'H'])
   assert.deepEqual(marks['kb:t_w_run'], ['running', false, ''])
   assert.deepEqual(marks['kb:t_hub_wait'], ['waiting', true, 'H'])
@@ -792,4 +792,57 @@ test('reported cards render collapsed under their own count and expand on click'
   await React.act(async () => { button.click(); await flush() })
   assert.equal(el().querySelectorAll('[data-reported-cards] [data-panel-row]').length, 2)
   assert.match(el().querySelector('[data-reported-cards]').textContent, /reported done by worker-5 · not confirmed by its owner/)
+})
+
+// The screenshot David flagged (2026-11-20): one running hub card took three lines, "running · default · just now"
+// and a 230-character evidence line. A running row is now one line: box, title, where + how long.
+test('a running card is one line: title, where it runs and for how long; details on click', async () => {
+  const realNow = Date.now
+  Date.now = () => NOW
+  try {
+    const title = 'Fix: prompt queued behind core-update hold is stranded when the old backend outlives the update'
+    host.state.focusedStoredSessionId.value = 'S1'
+    const b = bridges({ chips: [card('t_01a1f6400580d812', 'running', { label: title, runMachine: 'hub', assignee: 'default', gateway: 'hub', since: S - 12 * 60, activityAt: S - 30, activity: 'heartbeat' })] })
+    await show(React.createElement(m.Panel, { key: 'running-one-line' }))
+    const row = el().querySelector('[data-running-row]')
+    assert.equal(row.querySelector('[data-running-title]').textContent, title)
+    assert.equal(row.querySelector('[data-running-meta]').textContent, 'hub · 12 min')
+    assert.equal(row.textContent, `H${title}hub · 12 min`, 'nothing else on the row: no state word, no assignee, no evidence')
+    assert.equal(el().querySelector('[data-section="in-progress"]'), null, 'the header already counts it')
+    assert.equal(el().querySelector('[data-evidence]'), null)
+    assert.match(row.querySelector('button').title, /running on hub · for 12 min · last event heartbeat just now/)
+    await React.act(async () => { row.querySelector('button').click(); await flush() })
+    const details = el().querySelector('[data-running-details]').textContent
+    assert.match(details, /card t_01a1f6400580d812 · assignee default · on hub/)
+    assert.match(details, /started 12 min ago · last event heartbeat just now/)
+    assert.match(details, /evidence: /)
+    await React.act(async () => { el().querySelector('[data-running-details] [data-open-card]').click(); await flush() })
+    assert.deepEqual(b.opened, ['t_01a1f6400580d812'])
+    await React.act(async () => { row.querySelector('button').click(); await flush() })
+    assert.equal(el().querySelector('[data-running-details]'), null, 'second click folds it again')
+  } finally { Date.now = realNow }
+})
+
+test('running meta: quiet after 20 min without an event, pool and worker names, review, sub-agents', () => {
+  const at = (extra, kind = 'kanban') => ({ kind, chip: card('t', 'running', extra) })
+  assert.deepEqual(m.runningMeta(at({ runMachine: 'worker-pool', since: S - 3 * 3600, activityAt: S - 60 }), NOW).text, 'pool · 3 h')
+  const quiet = m.runningMeta(at({ runMachine: 'worker-1', since: S - 3600, activityAt: S - 25 * 60 }), NOW)
+  assert.deepEqual([quiet.text, quiet.quiet], ['worker-1 · quiet 25 min', true])
+  assert.equal(m.runningMeta(at({ runMachine: null, gateway: '', since: 0, activityAt: 0, progressAt: 0 }), NOW).text, '')
+  assert.equal(m.runningMeta({ kind: 'kanban', chip: card('t', 'review', { activityAt: S - 7200 }) }, NOW).text, 'in review · 2 h')
+  assert.equal(m.runningMeta({ kind: 'sub', chip: { toolCount: 14, lastTool: 'terminal' } }, NOW).text, 'sub-agent · 14 tools')
+  assert.equal(m.runningMeta({ kind: 'bg', chip: {} }, NOW).text, 'process')
+})
+
+test('a quiet running card renders its meta in the waiting colour, still one line', async () => {
+  const realNow = Date.now
+  Date.now = () => NOW
+  try {
+    host.state.focusedStoredSessionId.value = 'S1'
+    bridges({ chips: [card('t_q', 'running', { runMachine: 'worker-1', since: S - 3600, activityAt: S - 40 * 60 })] })
+    await show(React.createElement(m.Panel, { key: 'running-quiet' }))
+    const meta = el().querySelector('[data-running-meta]')
+    assert.equal(meta.textContent, 'worker-1 · quiet 40 min')
+    assert.ok(meta.hasAttribute('data-quiet'))
+  } finally { Date.now = realNow }
 })
