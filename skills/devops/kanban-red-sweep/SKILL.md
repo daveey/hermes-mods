@@ -118,10 +118,10 @@ Read `references/prevent-decision-blocks.md` (apply-the-recommendation rule, `IF
 - Unblock: `kanban_unblock` (or `hermes kanban unblock <id>` for triage/scheduled), always after a comment that says what changed.
   A `triage` card with a `spend_budget_triaged` event needs `hermes kanban promote <id>` after a re-scope comment:
   `unblock` prints "released", then the next tick silently re-triages it.  Read back status a tick later.
-  A `triage` card whose newest lifecycle event is `contained` is neither: unblock/promote can't release it. Only a
-  live run of the task named in that event's `policy.authority` (or a new completed run of its `policy.producer`)
-  can, via `kanban_resume_contained` with the episode uid (`tasks.containment_episode` on the home board). Read the
-  authority's status first: a `done` authority (e.g. a review card that finished without resuming) leaves it parked forever.
+  A `triage` card whose newest lifecycle event is `contained` ends most "N on parent" chains with no parent visibly
+  running or blocked (the panel counts it as "other"): walk open ancestors to it. Unblock/promote can't release it; only
+  a live run of its event's `policy.authority` (or a new completed `policy.producer` run) can, via
+  `kanban_resume_contained` with the episode uid (`tasks.containment_episode`). A `done` authority leaves it parked forever.
   Any card comment (unblock, move, correction) cites only facts you checked this turn. Another card's "PR landed" is a
   self-report until `gh pr view <N> -R <repo> --json state,mergedAt` shows it merged, and the owner acts on your comment as fact.
 - A PR completion contract runs `pr_acceptance` with the **assignee profile's** `gh` login, not yours, so wrapping
