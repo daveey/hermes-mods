@@ -362,3 +362,15 @@ def test_a_long_wait_writes_the_pace_file_about_once_a_minute(tmp_path, monkeypa
     assert 3 <= len(writes) <= 4  # 36 polls, one write per minute turned and one at the end
     state = json.loads(T.pace_path(tmp_path).read_text())
     assert sum(cell["t_long"] for cell in state["waits"].values()) == pytest.approx(180.0)
+
+
+def test_carried_pool_caps_expire_like_the_budget_they_came_from(tmp_path):
+    """No publisher folds the cap in: after BUDGET_EXPIRE_S the carried reserve hold ends; the person's cap stays."""
+    T._write_json(T.level_path(tmp_path), {"mode": "auto", "percent": 0.0, "cap_per_s": 1000.0,
+                                           "pool_caps": {"anthropic": 0.0}, "budget_at": NOW - 60, "set_at": NOW - 30})
+    T.write_cap(tmp_path, 250.0, NOW, T.effective(tmp_path, None, NOW))
+    gate = T.Gate(tmp_path, tmp_path / "series.sqlite", clock=lambda: float(NOW))
+    assert gate.plan(NOW, "anthropic") == ("hold",)
+    later = NOW + 2 * 3600
+    plan = gate.plan(later, "anthropic")
+    assert plan[0] == "pace" and len(plan) == 3 and plan[1] == pytest.approx(T.DEFAULT_CALL_TOKENS / 250.0)
