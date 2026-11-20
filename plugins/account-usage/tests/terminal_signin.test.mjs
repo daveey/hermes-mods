@@ -313,10 +313,16 @@ const NEW = { ready: { id: 'fp:new', label: 'me', state: 'ready' },
   limited: { id: 'fp:new', label: 'me', state: 'limited', limit_kind: 'quota', reason: 'usage_limit' },
   unavailable: { id: 'fp:new', label: 'me', state: 'unavailable', reason: 'auth' } }
 async function recovered(status, usage, cancel = false) {
-  const term = fakeTerminal()
-  let groups = [{ slug: 'anthropic', accounts: [DEAD] }], answer = status, named = 'fp:new'
-  const r = await setup({ term, groups: () => groups,
-    rest: path => path === '/reconnect' ? deadGrant() : { found: true, account_id: named, ...(answer ? { status: answer } : {}) } })
+  let starts = 0
+  const term = fakeTerminal(() => refuse ? { unavailable: refuse } : { id: `pty-${++starts}`, recovery: true, connectionId: 'gw-hub' })
+  let groups = [{ slug: 'anthropic', accounts: [DEAD] }], answer = status, named = 'fp:new', refuse = null, down = false, hold = null, noUsage = false
+  const r = await setup({ term, groups: () => { if (noUsage) throw new Error('usage down'); return groups },
+    rest: async path => {
+      if (path === '/reconnect') return deadGrant()
+      if (hold) await hold
+      if (down) throw new Error('gateway down')
+      return answer === 'gone' ? { found: false } : { found: true, account_id: named, ...(answer ? { status: answer } : {}) }
+    } })
   const flow = r.store.signIn('anthropic', DEAD, ROUTE)
   await tick(); await tick(); await tick()
   if (usage) groups = [{ slug: 'anthropic', accounts: [NEW[usage]] }]
@@ -329,7 +335,10 @@ async function recovered(status, usage, cancel = false) {
     return { ...render(r.mod.AccountRow({ g, a, open: false, onToggle() {}, selectionStore: { select() {} }, selectionState: {}, reconnectStore: r.store, reconnectState: state })),
       line: controls(r.mod.ReconnectLine({ g, a, reconnectStore: r.store, reconnectState: state })), counts: r.mod.authCounts(g, state) }
   }
-  return { ...r, term, row, answer: (s, id = 'fp:new') => { answer = s; named = id }, usage: u => { groups = [{ slug: 'anthropic', accounts: [NEW[u]] }] } }
+  return { ...r, term, row, answer: (s, id = 'fp:new') => { answer = s; named = id }, usage: u => { groups = [{ slug: 'anthropic', accounts: [NEW[u]] }] },
+    down: v => { down = v }, refuse: v => { refuse = v }, noUsage: v => { noUsage = v },
+    // Park the next /credential-health call until the returned function is called.
+    hold: () => { let go; hold = new Promise(ok => { go = ok }); return () => { hold = null; go() } } }
 }
 
 test('the new account row shows the backend answer: disabled or quota is said on fp:new and never offers sign-in', async t => {
@@ -389,9 +398,9 @@ test('a disabled or quota answer does not hide a sign-in that dies afterwards', 
 // its new account id: that answer must show on the visible row, not vanish with the old id.
 test('a still-signed-out answer follows the row to its new account id instead of reading as healthy', async t => {
   const MSG = 'Sign-in did not finish — nothing was saved'
-  for (const first of ['disabled', 'quota', 'unknown']) for (const id of ['fp:new', null]) await t.test(`${first} on stale-ready fp:new, then Check again says needs_sign_in (account id ${id})`, async () => {
+  for (const first of ['disabled', 'quota', 'unknown']) await t.test(`${first} on stale-ready fp:new, then Check again says needs_sign_in for fp:new`, async () => {
     const r = await recovered(first, 'ready')
-    r.answer('needs_sign_in', id)
+    r.answer('needs_sign_in', 'fp:new')
     await r.row(NEW.ready).buttons[0][1]()
     const asked = r.restCalls.filter(c => c.path === '/credential-health')
     assert.deepEqual(asked[asked.length - 1].body, { provider: 'anthropic', credential_id: 'pool-9' })
@@ -426,13 +435,14 @@ test('a still-signed-out answer follows the row to its new account id instead of
     assert.ok(seen.text.includes(MSG), JSON.stringify(seen.text))
     assert.deepEqual(seen.buttons.map(b => b[0]), ['Sign in to me again', 'Check sign-in for me'])
     assert.deepEqual(seen.auth, ['sign-in']); assert.deepEqual(seen.counts, { signIn: 1, disconnected: 0 })
-    // Sign in again from the visible row starts the recovery for the stored row the backend binds it to.
-    const before = r.term.calls.length
+    // Sign in again from the visible row starts the recovery for the stored row the answer is
+    // about, already bound to pool-9: /reconnect is not asked about the new fingerprint.
+    const before = r.term.calls.length, asked = r.restCalls.filter(c => c.path === '/reconnect').length
     const flow = seen.buttons[0][1]()
     await tick(); await tick(); await tick()
     assert.equal(r.term.calls.length, before + 1); assert.equal(r.term.calls[before].credentialId, 'pool-9')
-    assert.equal(r.restCalls.filter(c => c.path === '/reconnect').pop().body.account_id, 'fp:new')
-    r.answer('ok'); r.term.end(0); await flow
+    assert.equal(r.restCalls.filter(c => c.path === '/reconnect').length, asked)
+    r.answer('ok'); r.term.end(0, 'pty-2'); await flow
     assert.ok(r.row(NEW.ready).text.includes('Reconnected')); assert.deepEqual(r.row(NEW.ready).counts, { signIn: 0, disconnected: 0 })
   })
   await t.test('cancel with the row still signed out is shown on the stale-ready new row too', async () => {
@@ -448,6 +458,14 @@ test('a still-signed-out answer follows the row to its new account id instead of
     await r.row(NEW.ready).buttons[0][1]()
     const seen = r.row(NEW.ready)
     assert.ok(seen.text.includes(MSG)); assert.deepEqual(seen.buttons.map(b => b[0]), ['Check sign-in for me'])
+    assert.deepEqual(seen.auth, []); assert.deepEqual(seen.counts, { signIn: 0, disconnected: 0 })
+  })
+  for (const first of ['disabled', 'quota', 'unknown', 'needs_sign_in']) await t.test(`${first} on stale-ready fp:new, then needs_sign_in naming no account id: message and re-check only`, async () => {
+    const r = await recovered(first, 'ready')
+    r.answer('needs_sign_in', null)
+    await r.row(NEW.ready).buttons.pop()[1]()
+    const seen = r.row(NEW.ready)
+    assert.ok(seen.text.includes(MSG), JSON.stringify(seen.text)); assert.deepEqual(seen.buttons.map(b => b[0]), ['Check sign-in for me'])
     assert.deepEqual(seen.auth, []); assert.deepEqual(seen.counts, { signIn: 0, disconnected: 0 })
   })
   await t.test('usage still lists the old id: that row keeps its sign-in offer and badge', async () => {
@@ -473,6 +491,107 @@ test('answers from two stored rows naming one account id: the latest answer is t
   const first = Object.values(r.store.$state.get())[0].seq
   r.answer('quota'); await r.row(NEW.ready).buttons[0][1]()
   assert.ok(Object.values(r.store.$state.get())[0].seq > first)
+})
+
+// A re-check that never reaches the backend, or is still running, has learned nothing: the visible
+// row keeps what the last answer said (label, count, re-check) instead of reading as healthy.
+test('a re-check that fails or is still running keeps the last answer on the visible row', async t => {
+  const FAIL = 'Could not confirm the account — check again'
+  const WAS = { disabled: { auth: [], counts: { signIn: 0, disconnected: 0 }, buttons: ['Check sign-in for me'] },
+    quota: { auth: [], counts: { signIn: 0, disconnected: 0 }, buttons: ['Check sign-in for me'] },
+    unknown: { auth: [], counts: { signIn: 0, disconnected: 0 }, buttons: ['Check sign-in for me'] },
+    needs_sign_in: { auth: ['sign-in'], counts: { signIn: 1, disconnected: 0 }, buttons: ['Sign in to me again', 'Check sign-in for me'] } }
+  for (const [first, was] of Object.entries(WAS)) await t.test(`${first} followed onto stale-ready fp:new, then the re-check throws`, async () => {
+    const r = await recovered(first, 'ready')
+    const same = (seen, text) => {
+      assert.ok(seen.text.includes(text), `${text} is on the visible row: ${JSON.stringify(seen.text)}`)
+      assert.deepEqual(seen.auth, was.auth); assert.deepEqual(seen.counts, was.counts); assert.deepEqual(seen.buttons.map(b => b[0]), was.buttons)
+      assert.ok(!seen.text.includes('Reconnected'))
+    }
+    // While the request is out the row is not healthy either.
+    const go = r.hold(); r.down(true)
+    const pending = r.row(NEW.ready).buttons.pop()[1]()
+    await tick()
+    same(r.row(NEW.ready), 'Checking account…')
+    go(); await pending
+    same(r.row(NEW.ready), FAIL)
+    // Again, still down; then the backend answers and the row follows that answer.
+    await r.row(NEW.ready).buttons.pop()[1]()
+    same(r.row(NEW.ready), FAIL)
+    assert.equal(r.restCalls.filter(c => c.path === '/credential-health').every(c => c.body.credential_id === 'pool-9'), true)
+    r.down(false); r.answer('ok')
+    await r.row(NEW.ready).buttons.pop()[1]()
+    const ok = r.row(NEW.ready)
+    assert.ok(ok.text.includes('Reconnected')); assert.deepEqual(ok.auth, []); assert.deepEqual(ok.counts, { signIn: 0, disconnected: 0 })
+  })
+  await t.test('backend ok but usage cannot be read: the caveat is on the visible row, not Reconnected', async () => {
+    const r = await recovered('disabled', 'ready')
+    r.answer('ok'); r.noUsage(true)
+    await r.row(NEW.ready).buttons[0][1]()
+    const seen = r.row(NEW.ready)
+    assert.ok(seen.text.includes(FAIL), JSON.stringify(seen.text)); assert.ok(!seen.text.includes('Reconnected'))
+    assert.deepEqual(seen.buttons.map(b => b[0]), ['Check sign-in for me'])
+    r.noUsage(false)
+    await seen.buttons[0][1]()
+    assert.ok(r.row(NEW.ready).text.includes('Reconnected'))
+  })
+  await t.test('the stored row left the pool: the answer stays on its own line and follows nowhere', async () => {
+    const r = await recovered('disabled', 'ready')
+    r.answer('gone')
+    await r.row(NEW.ready).buttons[0][1]()
+    const state = r.store.$state.get()
+    const groups = r.mod.withSignedOut([{ slug: 'anthropic', accounts: [NEW.ready], total: 1 }], state)
+    assert.deepEqual(groups[0].accounts.map(a => a.id), ['fp:new', 'fp:old'])
+    assert.ok(r.row(groups[0].accounts[1]).text.includes('This account is no longer in the pool — nothing was saved'))
+    assert.deepEqual(r.row(NEW.ready).buttons, [])
+  })
+})
+
+// Sign in again on the followed row acts on the stored row: whatever happens to that sign-in is
+// shown on the visible row, and a failure never hides that the row is still signed out.
+test('Sign in again from a followed signed-out row keeps the label and count through every outcome', async t => {
+  const dead = async () => {
+    const r = await recovered('needs_sign_in', 'ready')
+    return { r, calls: r.restCalls.filter(c => c.path === '/reconnect').length }
+  }
+  const labelled = seen => { assert.deepEqual(seen.auth, ['sign-in']); assert.deepEqual(seen.counts, { signIn: 1, disconnected: 0 }) }
+  await t.test('Desktop refuses to start the recovery', async () => {
+    const { r, calls } = await dead()
+    r.refuse('no-shell')
+    await r.row(NEW.ready).buttons[0][1]()
+    const seen = r.row(NEW.ready)
+    labelled(seen); assert.deepEqual(seen.buttons.map(b => b[0]), ['Sign in to me again', 'Check sign-in for me'])
+    assert.equal(seen.line.length, 3); assert.ok(seen.line[2][1] && seen.line[2][1] !== 'Sign-in did not finish — nothing was saved', 'the refusal is said')
+    assert.equal(r.restCalls.filter(c => c.path === '/reconnect').length, calls, '/reconnect is never asked about the new fingerprint')
+    assert.equal(Object.keys(r.store.$state.get()).length, 1, 'no entry is written under the visible account id')
+  })
+  await t.test('the terminal runs on the visible row; input and cancel reach it; the readback then fails', async () => {
+    const { r, calls } = await dead()
+    const flow = r.row(NEW.ready).buttons[0][1]()
+    await tick(); await tick(); await tick()
+    assert.equal(r.term.calls.at(-1).credentialId, 'pool-9')
+    let seen = r.row(NEW.ready)
+    labelled(seen); assert.deepEqual(seen.buttons.map(b => b[0]), ['Cancel sign-in for me', 'Send answer for me'])
+    assert.ok(await r.store.sendInput('anthropic', { id: 'fp:old' }, 'yes')); assert.deepEqual(r.term.written.at(-1), ['pty-2', 'yes\r'])
+    r.down(true)
+    const exit = r.term.exit.get('pty-2')
+    await seen.buttons[0][1]() // Cancel sign-in, from the visible row
+    assert.ok(r.term.disposed.includes('pty-2'))
+    exit({ code: 130, signal: null }); await flow
+    seen = r.row(NEW.ready)
+    labelled(seen); assert.deepEqual(seen.buttons.map(b => b[0]), ['Sign in to me again', 'Check sign-in for me'])
+    assert.ok(seen.text.includes('Could not confirm the account — check again'))
+    assert.equal(r.restCalls.filter(c => c.path === '/reconnect').length, calls)
+    assert.equal(Object.keys(r.store.$state.get()).length, 1)
+  })
+  await t.test('usage lists both the old and the new account id: one count, and one line when the old id is only a ghost', async () => {
+    const { r } = await dead()
+    const state = r.store.$state.get()
+    assert.deepEqual(r.mod.authCounts({ slug: 'anthropic', accounts: [DEAD, NEW.ready] }, state), { signIn: 1, disconnected: 0 })
+    const removed = Object.fromEntries(Object.entries(state).map(([k, st]) => [k, { ...st, removed: true }]))
+    assert.deepEqual(r.mod.withSignedOut([{ slug: 'anthropic', accounts: [NEW.ready], total: 1 }], removed)[0].accounts.map(a => a.id), ['fp:new'])
+    assert.deepEqual(r.mod.withSignedOut([{ slug: 'anthropic', accounts: [], total: 0 }], removed)[0].accounts.map(a => a.id), ['fp:old'])
+  })
 })
 
 test('terminal text helpers: plain text only, bounded, https links only', async () => {

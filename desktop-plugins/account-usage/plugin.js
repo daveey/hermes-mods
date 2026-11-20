@@ -311,7 +311,8 @@ export function rowFix(reconnectState, slug, a) {
   const own = reconnectState[reconnectKey(slug, a.id)]
   if (own) return own
   // Several stored rows can name one account id: the most recent answer (`seq`) is the one shown.
-  return Object.values(reconnectState).filter(st => st && (st.done || st.settled || st.unverified) && st.provider === slug && st.resolvedId && st.resolvedId === a.id)
+  // An in-flight re-check or sign-in of the stored row keeps following (see `followOf`).
+  return Object.values(reconnectState).filter(st => st && st.provider === slug && st.resolvedId && st.resolvedId === a.id)
     .reduce((best, st) => !best || (st.seq || 0) > (best.seq || 0) ? st : best, null) || {}
 }
 
@@ -340,8 +341,11 @@ export function authCounts(g, reconnectState = {}) {
   let signIn = 0, disconnected = 0
   for (const a of (g && g.accounts) || []) {
     const st = rowFix(reconnectState, g.slug, a)
-    if (!needsReconnect(a, g.slug) && !deadFollowed(st, a, g.slug)) continue
+    const dead = deadFollowed(st, a, g.slug)
+    if (!needsReconnect(a, g.slug) && !dead) continue
     if (settledFor(st, a)) continue // quota or disabled per the backend: no auth problem to count
+    // Usage lists the stored row under both its old and its new account id: counted once, on the old.
+    if (dead && g.accounts.some(b => b && b.id === st.id && needsReconnect(b, g.slug))) continue
     if (signInConfirmed(a, st, g.slug)) signIn++
     else disconnected++
   }
@@ -366,7 +370,8 @@ export function withSignedOut(groups, reconnectState = {}) {
   for (const st of Object.values(reconnectState)) {
     if (!st || !st.removed || st.done || !st.provider || !RECONNECT_SLUGS.has(st.provider)) continue
     const g = out.find(row => row.slug === st.provider)
-    const taken = g && g.accounts.some(a => a.id === st.id)
+    // Listed under its own id, or under the account id its answer followed to: no second row.
+    const taken = g && g.accounts.some(a => a.id === st.id || (!!st.resolvedId && a.id === st.resolvedId))
     if (taken) continue
     const ghost = { id: st.id, label: st.label || 'Signed-out account', state: 'unavailable', reason: 'auth', signedOut: true, selectable: false, windows: [] }
     if (g) out = out.map(row => (row === g ? { ...g, accounts: [...g.accounts, ghost], total: g.total + 1 } : row))
@@ -721,6 +726,16 @@ const HEALTH = {
 }
 const POLL_GAP_MS = 500
 
+// What an in-flight action on a stored row keeps from the last answer about it: the account id
+// that answer is shown on, and what it said (still signed out / quota or disabled). A re-check or
+// a sign-in that is running, fails to reach the backend, or cannot start has learned nothing new,
+// so the visible row keeps its label, count and re-check until a newer answer replaces them.
+export function followOf(prior, accountId) {
+  if (!prior) return {}
+  return { ...(prior.resolvedId && prior.resolvedId !== accountId ? { resolvedId: prior.resolvedId } : {}),
+    ...(prior.rowDead ? { rowDead: true } : {}), ...(prior.settled ? { settled: true } : {}), ...(prior.staleAuth ? { staleAuth: true } : {}) }
+}
+
 export function createReconnectStore(ctx, onDone = () => {}) {
   const $state = atom({})
   const key = reconnectKey
@@ -882,17 +897,21 @@ export function createReconnectStore(ctx, onDone = () => {}) {
   const afterRecovery = async (put, provider, account, route, bound, live, cancelled = false) => {
     const keep = { needsSignIn: true, authFlow: 'terminal', signInRoute: bound }
     // The account id an earlier answer about this stored row was shown on (a re-check from that row).
-    const shownOn = cur(reconnectKey(provider, account.id), route)?.resolvedId
-    put({ ...keep, busy: true, message: 'Checking account…' })
+    const prior = cur(reconnectKey(provider, account.id), route)
+    const shownOn = prior?.resolvedId
+    const follow = followOf(prior, account.id)
+    put({ ...keep, ...follow, busy: true, message: 'Checking account…' })
     let seen = null
     try {
       seen = await ctx.rest('/credential-health', { method: 'POST', body: { provider, credential_id: bound.credentialId }, ...restOpts(route) })
     } catch {
-      if (live()) put({ ...keep, error: true, unverified: true, check: true, message: 'Could not confirm the account — check again' })
+      if (live()) put({ ...keep, ...follow, error: true, unverified: true, check: true, message: 'Could not confirm the account — check again' })
       return
     }
     if (!live()) return
     if (!seen || seen.found !== true) {
+      // The pool no longer has the stored row, so no listed account id is known to be it: the
+      // answer stays on the stored row's own (ghost) line and follows nowhere.
       put({ error: true, needsSignIn: true, authFlow: 'terminal', unverified: true, removed: true, signInRoute: { mode: 'unsupported' },
         message: 'This account is no longer in the pool — nothing was saved' })
       return
@@ -900,10 +919,11 @@ export function createReconnectStore(ctx, onDone = () => {}) {
     if (seen.status === 'needs_sign_in' || !seen.account_id) {
       // Still signed out. If usage lists this stored row under another account id (the one the
       // backend names now, else the one an earlier answer was shown on), the answer is shown on
-      // that row: labelled sign-in needed, with sign-in and a re-check (`rowDead`). Never settled.
+      // that row with a re-check. Only an account id the backend itself names for a needs_sign_in
+      // row is labelled sign-in needed and offered sign-in (`rowDead`). Never settled.
       const named = seen.account_id || shownOn
       put({ ...keep, ...(cancelled ? { cancelled: true } : { error: true }), message: cancelled ? 'Sign-in cancelled' : 'Sign-in did not finish — nothing was saved',
-        ...(named && named !== account.id ? { resolvedId: named, unverified: true, check: true, ...(seen.status === 'needs_sign_in' ? { rowDead: true } : {}) } : {}) })
+        ...(named && named !== account.id ? { resolvedId: named, unverified: true, check: true, ...(seen.account_id && seen.status === 'needs_sign_in' ? { rowDead: true } : {}) } : {}) })
       return
     }
     // The backend's row status decides what may be said. Quota and disabled are that row's own
@@ -930,8 +950,10 @@ export function createReconnectStore(ctx, onDone = () => {}) {
     }
     // The backend vouched for this row and its account id; a panel that has not loaded that
     // account yet is waiting for usage, not looking at a different account.
-    const report = st => put(st.removed && !st.done
-      ? { ...keep, check: true, message: 'Signed in — usage has not updated yet, check again' } : st)
+    // Until usage confirms it, the caveat shows on the account id the backend named.
+    const at = seen.account_id !== account.id ? { resolvedId: seen.account_id } : {}
+    const report = st => put(st.done ? st : st.removed
+      ? { ...keep, ...at, check: true, message: 'Signed in — usage has not updated yet, check again' } : { ...st, ...at })
     report.scope = put.scope
     await verify(report, provider, account, live, { ...keep, check: true }, seen.account_id)
   }
@@ -948,9 +970,11 @@ export function createReconnectStore(ctx, onDone = () => {}) {
     await verify(put, provider, account, () => true, keep)
   }
   const signInTerminal = async (provider, account, route, bound) => {
+    const prior = cur(reconnectKey(provider, account.id), route)
     const k = begin(provider, account, route)
     const put = writer(k)
-    const keep = { needsSignIn: true, authFlow: 'terminal', signInRoute: bound }
+    // Started from the account id an answer followed to: every state of this sign-in shows there.
+    const keep = { ...followOf(prior, account.id), needsSignIn: true, authFlow: 'terminal', signInRoute: bound }
     if (bound.mode !== 'target') {
       put({ ...keep, error: true, message: bound.mode === 'unknown'
         ? 'Restart this gateway to sign in to this account again'
@@ -1011,6 +1035,8 @@ export function createReconnectStore(ctx, onDone = () => {}) {
     // The backend names the stored row a sign-in must repair. Without that answer nothing is
     // started: an unbound login could add a second row beside the dead one.
     if (!seen?.signInRoute) {
+      // A followed answer without a bound row cannot be re-asked by this (old) account id.
+      if (seen?.resolvedId && seen.resolvedId !== account.id) return
       await reconnect(provider, account, route)
       seen = cur(reconnectKey(provider, account.id), route)
       if (!seen?.needsSignIn || !seen.signInRoute) return
@@ -1194,9 +1220,9 @@ export function ReconnectLine({ g, a, reconnectStore, reconnectState }) {
   if (st.terminal) {
     // The recovery command's own prompts, and one masked field for the answers it asks for.
     const url = signInUrl(st.output)
-    const send = input => { if (!input) return; const value = input.value; input.value = ''; void reconnectStore.sendInput(g.slug, a, value) }
+    const send = input => { if (!input) return; const value = input.value; input.value = ''; void reconnectStore.sendInput(g.slug, asked, value) }
     children.push(jsx('button', { type: 'button', 'aria-label': `Cancel sign-in for ${name}`,
-      onClick: () => reconnectStore.cancelAuth(g.slug, a, route), children: 'Cancel sign-in' }))
+      onClick: () => reconnectStore.cancelAuth(g.slug, asked, route), children: 'Cancel sign-in' }))
     if (url) children.push(jsx('button', { type: 'button', 'aria-label': `Open sign-in page for ${name}`,
       onClick: () => reconnectStore.openPage(url), children: 'Open sign-in page' }))
     if (st.message) say(st.message)
@@ -1214,9 +1240,10 @@ export function ReconnectLine({ g, a, reconnectStore, reconnectState }) {
       onClick: () => reconnectStore.openPage(st.verificationUrl), children: 'Open sign-in page' }))
     if (st.message) say(st.message)
   } else if (dead) {
-    // Sign-in starts from the visible row; the re-check asks about the stored row.
+    // Sign-in and the re-check both act on the stored row this answer is about (it is already
+    // bound to that row's id): a failure then lands on that row's state, which this line shows.
     children.push(jsx('button', { type: 'button', 'aria-label': `Sign in to ${name} again`, disabled: !!st.busy,
-      onClick: () => reconnectStore.signIn(g.slug, a, route), children: 'Sign in again…' }))
+      onClick: () => reconnectStore.signIn(g.slug, asked, route), children: 'Sign in again…' }))
     children.push(jsx('button', { type: 'button', 'aria-label': `Check sign-in for ${name}`, disabled: !!st.busy,
       onClick: () => reconnectStore.check(g.slug, asked), children: 'Check sign-in' }))
     say(st.message, COLORS.limited)
