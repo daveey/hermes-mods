@@ -1937,6 +1937,8 @@ FIX_TITLE = "self-heal fix:"
 DEFECT_BUDGET = FIX_BUDGET  # the one card does the fix's work; triage and verify ride inside it
 DAILY_CARD_CAP = 40  # self-heal-created cards per board per UTC day (cfg daily_card_cap, env COACH_SELFHEAL_DAILY_CAP)
 DIGEST_KEY = "selfheal-digest:"  # + YYYY-MM-DD: the day's over-cap digest card; never counted against the cap
+BACKLOG_KEY = "selfheal-backlog:"
+BACKLOG_REPORT_STATE = "selfheal-backlog-report.json"
 DIGEST_BUDGET = 2
 DIGEST_RUNTIME = 1800
 DIGEST_STATE = "selfheal-digest.json"  # <coach>/: {day, boards: {board: {card, fps}}}: one comment per fp per day
@@ -3817,6 +3819,61 @@ def backlog_report(store, now: float, board: str = "default", *, filed_today=Non
     return {"board": board, "counts": counts, "top": top, "body": "\n".join(lines)}
 
 
+def refresh_backlog_report(store, now: float, board: str = "default", runner=None) -> dict:
+    """Replace the standing body, then rearm its 48-hour dead-man alarm.
+
+    Called under the drain lock. A failed edit must not extend the old deadline.
+    The brief also parks an early claimant across the create/schedule CLI gap.
+    """
+    state = _json_state(store, BACKLOG_REPORT_STATE)
+    slot = state.get(board) or {}
+    tid = slot.get("card")
+    gen = int(slot.get("gen") or 1)
+    wake = _iso(now + 48 * 3600)
+    body = (f"## Drain dead-man alarm (wake {wake})\n"
+            f"Before {wake}, schedule this card to {wake} with clock_only=true and stop.\n"
+            "If you are running this card after that deadline, the self-heal backlog drain has not "
+            "refreshed it in 48 h. Diagnose why cron()'s drain stopped (hub selfheal_lane.py cron, "
+            "log.jsonl selfheal_backlog_* events), fix it or file one card for the cause, then "
+            "re-arm this card (schedule +48 h) and stop. Never edit the backlog rows or file defects "
+            "from here.\n\n" + backlog_report(store, now, board)["body"])
+    try:
+        if tid and _card_ended(board, tid):
+            gen, tid = gen + 1, None
+        if not tid:
+            for _ in range(3):
+                key = f"{BACKLOG_KEY}{board}" + (f":{gen}" if gen > 1 else "")
+                args = {"title": f"self-heal backlog: {board}", "body": body,
+                        "idempotency_key": key, "max_runtime": DIGEST_RUNTIME,
+                        "board": board, "assignee": "default", "created_by": CREATED_BY,
+                        "model": TRIAGE_MODEL, "provider": TRIAGE_PROVIDER,
+                        "skills": [], "requires": [], "home_pin": False, "runs_on": []}
+                rc, out, err = _run_card(args, runner)
+                tid = _task_id(out) if rc == 0 else None
+                if not tid:
+                    raise RuntimeError((err or out)[-300:] or "report create failed")
+                if not _card_ended(board, tid):
+                    break
+                gen, tid = gen + 1, None
+            if not tid:
+                raise RuntimeError("report keys returned closed cards")
+            state[board] = {"card": tid, "gen": gen}
+            _save_json_state(store, BACKLOG_REPORT_STATE, state)
+        rc, out, err = _run(_kanban_board_argv(board) + ["edit", tid, "--body", body], runner)
+        if rc:
+            raise RuntimeError("report edit failed: " + (err or out)[-300:])
+        rc, out, err = _run(_kanban_board_argv(board) + ["schedule", tid,
+            f"SCHEDULED_UNTIL={wake} self-heal drain dead-man alarm", "--clock-only"], runner)
+        if rc:
+            raise RuntimeError("report schedule failed: " + (err or out)[-300:])
+    except Exception as exc:  # health: allow BLE001 -- report failure never discards queue evidence
+        store.log({"event": "selfheal_backlog_report_error", "board": board,
+                   "card": tid, "error": str(exc)[:400]})
+        return {"ok": False, "card": tid, "error": str(exc)}
+    store.log({"event": "selfheal_backlog_report", "board": board, "card": tid, "wake": wake})
+    return {"ok": True, "card": tid, "wake": wake}
+
+
 def backlog_shadow(store, now: float) -> list:
     """Observe the proposed ranking without changing admission, retries or lane state."""
     db = _pending_db(store)
@@ -3842,7 +3899,8 @@ def backlog_shadow(store, now: float) -> list:
     return out
 
 
-def retry_deferred(store=None, now: Optional[float] = None, filer=None, hourly: bool = False) -> list:
+def retry_deferred(store=None, now: Optional[float] = None, filer=None, hourly: bool = False,
+                   report_runner=None) -> list:
     """Serialize drains; the existing five-minute cron requests hourly gating."""
     store = _store(store)
     now = time.time() if now is None else now
@@ -3863,7 +3921,19 @@ def retry_deferred(store=None, now: Optional[float] = None, filer=None, hourly: 
         if hourly and now - last < 3600:
             return []
         stamp.write_text(str(now))
-        return _retry_deferred(store, now, filer)
+        boards = {"default", *_json_state(store, BACKLOG_REPORT_STATE)}
+        pending_path = Path(store.root) / "selfheal_pending.sqlite"
+        if pending_path.exists():
+            with contextlib.closing(_ro_state(pending_path)) as db:
+                boards.update(json.loads(row[0]).get("board") or "default"
+                              for row in db.execute("SELECT payload FROM pending"))
+        results = _retry_deferred(store, now, filer)
+        for board in sorted(boards):
+            try:
+                refresh_backlog_report(store, now, board, report_runner)
+            except Exception as exc:  # health: allow BLE001 -- retain queue and retry report next drain
+                store.log({"event": "selfheal_backlog_report_error", "board": board, "error": str(exc)[:400]})
+        return results
 
 
 def _retry_deferred(store=None, now: Optional[float] = None, filer=None) -> list:
@@ -5929,8 +5999,9 @@ def cards_created_today(board: Optional[str], now: float, home: Optional[Path] =
         key = "coalesce(idempotency_key, '')" if "idempotency_key" in cols else "''"
         return int(con.execute(f"SELECT count(*) FROM tasks WHERE created_by = ? AND created_at >= ? "
                                f"AND typeof(created_at) IN ('integer', 'real') "
-                               f"AND substr({key}, 1, ?) != ?",
-                               (CREATED_BY, int(now) // 86400 * 86400, len(DIGEST_KEY), DIGEST_KEY)).fetchone()[0])
+                               f"AND substr({key}, 1, ?) != ? AND substr({key}, 1, ?) != ?",
+                               (CREATED_BY, int(now) // 86400 * 86400, len(DIGEST_KEY), DIGEST_KEY,
+                                len(BACKLOG_KEY), BACKLOG_KEY)).fetchone()[0])
     finally:
         con.close()
 
