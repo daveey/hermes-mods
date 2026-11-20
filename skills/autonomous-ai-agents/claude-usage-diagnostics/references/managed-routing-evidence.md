@@ -10,6 +10,10 @@ When repeated starts fail with `No eligible deep review model distinct from [...
 3. If live completions disprove the provider-wide wall, use the scoped operator recovery from SKILL.md §3e. Where installed, prefer `kanban_provider_walls.drop_wall(provider, not_after=<observed-wall-deadline>)` over rewriting the walls file: it preserves a later wall recorded since inspection. This is recovery of the disproved hold, not a waiver of reviewer independence or proof the wall's producer is fixed.
 4. Comment the evidence on the existing review card and promote on its home gateway with `--seen <latest-read-comment-id>`. Read back there: a synced replica can still show triage after promotion. Verify a new normal-dispatch run and worker PID before claiming pickup; use the result evidence below before claiming review completion.
 
+## Complete custody declarations versus actual admission
+
+Before treating an `implementer-models` marker as enforced, run `declared_implementers` against the effective assignee policy and inspect the actual `model_tier.implementer_models`. A single rejected name voids the whole declaration. In particular, generic provider inference can classify a configured Codex model as `openai-api`, causing registry validation to reject that name despite its real subscription route being configured. Preserve the complete authenticated author set independently, record the mismatch on the existing resolver owner, and never call marker prose enforced exclusions. A mandatory, live-proven independent subscription pin can constrain the current review without changing global routing; require canonical ship to accept its actual completed receipt before releasing delivery, and refuse author-model fallback or retry. Keep systemic repair separate unless the supported original-delivery path actually requires it.
+
 ## Allocation and completion evidence
 
 Read effective `kanban_llm_pacing_dispatch.load_config().pace_starts` before expecting a PACED pool to block or reroute starts: with paced-start limits disabled, PACED is not HELD. Preserve the approved governor policy; never manufacture a wall to satisfy a live proof.
