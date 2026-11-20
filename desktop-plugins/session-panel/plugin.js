@@ -320,8 +320,8 @@ export function classify(chips, { nowMs = Date.now(), silence = new Map(), isAsk
     // explicit unknown with its last known state; its waits and asks keep their sections.
     if (c.blockedUpstream && c.look !== 'stalled') {
       const bu = c.blockedUpstream, auth = bu.contained?.authority
-      const detail = auth?.id
-        ? `waiting on contained card ${bu.id} · release by ${auth.id} (${auth.status})`
+      const detail = bu.contained
+        ? `waiting on contained card ${bu.id} · release by ${auth?.id || 'unknown'} (${auth?.status || 'unknown'})`
         : `waiting on blocked parent ${bu.id} (${bu.status})`
       out.blockedUpstream.push({ ...item(c), detail })
       continue
@@ -331,9 +331,10 @@ export function classify(chips, { nowMs = Date.now(), silence = new Map(), isAsk
     // Keep the independent execution verdict below (including unknown progress); never
     // turn a recent list read into a heartbeat or claim a running worker is alive.
     const board = c.boardStatus
+    const leaf = c.upstream?.id ? ` → ${c.upstream.id} ${c.upstream.status || 'unknown'}` : ''
     if ((!ev || ev.state === 'unknown') && board && board.state === c.state && ['scheduled', 'blocked', 'triage', 'review', 'ready', 'todo'].includes(c.state) &&
         Number.isFinite(board.readAt) && nowMs >= board.readAt && nowMs - board.readAt <= 60_000) {
-      out.waiting.push({ ...item(c), detail: `${c.state} · ${board.source === 'replica' ? 'reported board status' : 'board status'}${on ? ` · ${on}` : ''}` })
+      out.waiting.push({ ...item(c), detail: `${c.state} · ${board.source === 'replica' ? 'reported board status' : 'board status'}${on ? ` · ${on}` : ''}${leaf}` })
       continue
     }
     if (board && (!ev || ev.state === 'unknown') || ev?.sourced && ev.state === 'unknown' || legacyLive(c, ev)) {
@@ -349,7 +350,6 @@ export function classify(chips, { nowMs = Date.now(), silence = new Map(), isAsk
     if (c.state === 'review') { out.active.push({ ...item(c), detail: `in review${last ? ` · ${ago(last, nowMs)}` : ''}` }); continue }
     if (c.state === 'ready') { out.ready.push({ ...item(c), detail: 'ready to start' }); continue }
     if (c.state === 'todo') { out.queued.push({ ...item(c), detail: 'not started' }); continue }
-    const leaf = c.upstream?.id ? ` → ${c.upstream.id} ${c.upstream.status}` : ''
     out.waiting.push({ ...item(c), detail: (on || (c.state === 'scheduled' ? 'scheduled' : c.state === 'unknown' ? 'status unknown' : c.state)) + leaf })
   }
   return out
