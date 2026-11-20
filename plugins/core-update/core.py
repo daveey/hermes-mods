@@ -95,16 +95,20 @@ def status(home: Optional[Path] = None, checkout: Optional[Path] = None,
         "started_at": st.get("started_at"), "error": st.get("error"),
         "waiter": {"pid": waiter.get("pid"), "state": waiter.get("state"),
                    "alive": bool(waiter.get("pid")) and _pid_alive(waiter.get("pid"))} if waiter else None,
-        "can_restart": False,
+        "can_restart": False, "can_build": False,
+        "reason": st.get("peer_blocked_reason"),
     }
-    if not sha or not running or sha == running:
+    if not sha or not running or (sha == running and st.get("status") not in ("needs-local-build", "building")):
         return out
     ahead = git(root, "merge-base", "--is-ancestor", running, sha) is not None
     if not ahead:
         return out  # stale record (the checkout moved past it, or diverged)
     out["commits"] = int(git(root, "rev-list", "--count", f"{running}..{sha}") or 0) or None
     s = st.get("status")
-    if s == "building":
+    if s == "needs-local-build":
+        out["state"] = "needs-local-build"
+        out["can_build"] = bool(_local_build_cmd(st, sha))
+    elif s == "building":
         if _pid_alive(st.get("pid")) or _age_s(st.get("updated_at")) < BUILD_STALE_S:
             out["state"] = "building"
     elif s == "ready" and st.get("app_path") and Path(str(st["app_path"])).is_dir():
@@ -122,6 +126,30 @@ def _age_s(iso: Any) -> float:
         return time.time() - datetime.fromisoformat(str(iso)).timestamp()
     except Exception:
         return float("inf")
+
+
+def _local_build_cmd(st: Dict[str, Any], sha: str) -> List[str]:
+    cmd = st.get("local_build_cmd")
+    if (isinstance(cmd, list) and len(cmd) == 5 and all(isinstance(c, str) and c for c in cmd)
+            and len(sha) == 40 and all(c in "0123456789abcdef" for c in sha)
+            and cmd[2:] == ["core-prebuild", sha, "--local-now"]):
+        return cmd
+    return []
+
+
+def build(home: Optional[Path] = None, *, popen: Callable[..., Any] = subprocess.Popen,
+          checkout: Optional[Path] = None, git: Callable[..., Optional[str]] = _git) -> Dict[str, Any]:
+    """Explicit consent to a local build, not to a Desktop quit or an update-gate bypass."""
+    s = status(home, checkout=checkout, git=git)
+    st = _read_json(state_dir(home) / "state.json")
+    cmd = _local_build_cmd(st, s.get("sha") or "")
+    if s["state"] != "needs-local-build" or not cmd or st.get("sha") != s["sha"]:
+        return {"ok": False, "reason": "no local build is awaiting consent"}
+    with (state_dir(home) / "build.log").open("ab") as log:
+        popen(cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+              start_new_session=True, close_fds=True,
+              env={**os.environ, "HERMES_HOME": str(home or hermes_home())})
+    return {"ok": True, "sha": s["sha"]}
 
 
 def restart(home: Optional[Path] = None, *, popen: Callable[..., Any] = subprocess.Popen,
