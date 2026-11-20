@@ -682,3 +682,17 @@ test('stale-code model.options refusal reads "backend on old code: restart"; oth
   assert.deepEqual(other, { label: 'usage ?', title: 'Account usage unavailable: Error: 502: gateway timeout' })
   delete globalThis.__auTestHost.request
 })
+test('the in-use mark follows the account id the backend names, never a shared label', async () => {
+ const {plugin}=await setup(); const now=Date.now(), at=Math.floor(now/1000)-5
+ const payload={providers:[{slug:'anthropic',usage:{accounts:[{id:'fp:one',label:'Work',state:'ready',windows:[]},{id:'fp:two',label:'Work',state:'ready',windows:[]},{id:'fp:three',label:'Home',state:'ready',windows:[]}]}}]}
+ const g=last=>plugin.summarize(payload,{anthropic:last},now)[0]
+ // Two rows share the label: the named id decides, whichever row is listed first.
+ assert.equal(g({account_id:'fp:two',label:'Work',at}).markId,'fp:two')
+ assert.equal(g({account_id:'fp:two',label:'Work',at}).mark,'active')
+ // A named id that is not listed marks nothing; its label is not used instead.
+ assert.equal(g({account_id:'fp:gone',label:'Home',at}).markId,null)
+ // Label-only record (older backend): an ambiguous label marks no row, a unique one still does.
+ assert.equal(g({label:'Work',at}).markId,null)
+ assert.equal(g({label:'Work',at}).mark,null)
+ assert.equal(g({label:'Home',at}).markId,'fp:three')
+})
