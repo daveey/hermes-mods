@@ -870,7 +870,9 @@ class Gate:
                 limit = limit_of(level, None, now)
                 if limit is not None and limit <= 0:
                     return ("hold",)
-                pools = level.get("pool_caps") or {}
+                carried_at = level.get("budget_at")
+                live = isinstance(carried_at, (int, float)) and now - carried_at <= BUDGET_EXPIRE_S
+                pools = (level.get("pool_caps") or {}) if live else {}  # an old budget's holds expire, as a budget's do
                 if isinstance(provider, str) and provider in pools and pools[provider] is not None:
                     pool = pools[provider]  # the budget's pool cap, carried and scaled when the cap was set
                     if pool <= 0:
