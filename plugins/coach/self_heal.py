@@ -2582,14 +2582,16 @@ Post nothing to the Inbox. Budget for this card <= ${INVESTIGATION_BUDGET}.
 2. `core_change` set? File one core card with `kanban_create`, assignee="default",
    idempotency_key="selfheal-core:{fp}", body = that decided spec plus "land with `hermes-core-wt ship` after a
    green 'All required checks pass (v2)' and an independent exact-head review". Use `kanban_link` to make that
-   core card this VERIFY card's parent, then `kanban_schedule` until it lands. On resume, read its handoff and
+   core card this VERIFY card's parent, then `kanban_schedule` with awaiting={{kind:'card', ref:'<core card id>',
+   why:'core fix lands'}} until it lands. On resume, read its handoff and
    include its merge sha in the deploy check below and the recorded fix shas. Reuse the idempotent card, never
    file another core owner for this defect.
 3. `not_defect` set? Confirm the cited sha is on the deployed checkout, run
    `{SELF_EVENT} not_defect {fp} --card {fix_card} --note "<its not_defect text>"` and complete. Stop.
 4. Confirm each fix sha is deployed here (`git -C <checkout> merge-base --is-ancestor <sha> HEAD` for the live
    checkout that runs it; a hermes-mods change deploys within 10 min, core through hermes-sync). Not yet deployed
-   after 30 min? kanban_schedule a re-check; don't record fixed on undeployed code.
+   after 30 min? kanban_schedule a re-check with awaiting={{kind:'deploy', ref:'<fix sha>', why:'fix not deployed
+   yet'}}; don't record fixed on undeployed code.
 5. Run every `host_steps` entry. Verify live on the real path (the surface/command/session type where it
    happened) as `live_check` says, and capture the proof. A live probe that makes a detector fire on purpose starts
    its first prompt with `[selfheal-probe]` (e.g. `hermes chat -q '[selfheal-probe] ...'`): the lane then logs
@@ -2633,15 +2635,16 @@ Post nothing to the Inbox. Budget for this card <= ${INVESTIGATION_BUDGET}.
 2. `core_change` set? File one core card with `kanban_create`, assignee="default",
    idempotency_key="selfheal-core:{fp}", body = that decided spec plus "land with `hermes-core-wt ship` after a
    green 'All required checks pass (v2)' and an independent exact-head review". Use `kanban_link` to make that
-   core card this VERIFY card's parent, then `kanban_schedule` until it lands. On resume, read its handoff and
+   core card this VERIFY card's parent, then `kanban_schedule` with awaiting={{kind:'card', ref:'<core card id>',
+   why:'core fix lands'}} until it lands. On resume, read its handoff and
    include its merge sha in the deploy check below and the recorded fix shas. Reuse the idempotent card, never
    file another core owner for this defect.
 3. `not_defect` set? Confirm the cited sha is deployed (step 4's command), run
    `hub-admin '{SELF_EVENT} not_defect {fp} --card {fix_card} --note "<its not_defect text>"'` and complete. Stop.
 4. Confirm each fix sha is deployed on the gateway: `hub-admin 'git -C <checkout> merge-base --is-ancestor <sha>
    HEAD'` (exit 0) for the live checkout that runs it (`~/code/hermes-mods` for a hermes-mods change, which deploys
-   within 10 min; the core checkout for core). Not yet deployed after 30 min? kanban_schedule a re-check; don't
-   record fixed on undeployed code.
+   within 10 min; the core checkout for core). Not yet deployed after 30 min? kanban_schedule a re-check with
+   awaiting={{kind:'deploy', ref:'<fix sha>', why:'fix not deployed yet'}}; don't record fixed on undeployed code.
 5. Run every `host_steps` entry through `hub-admin '<command>'`. Verify live on the real path (the
    surface/command/session type where it happened) as `live_check` says, through `hub-admin`, and capture the
    proof. A live probe that makes a detector fire on purpose starts its first prompt with `[selfheal-probe]`
@@ -2761,7 +2764,8 @@ Budget for this card <= ${DEFECT_BUDGET}.
 5. {ship}
    {SELFHEAL_KEY_RULE}
 6. Verify live; a completed push is not proof that this symptom is fixed. Confirm each fix sha is deployed where it
-   runs: {deployed}. Not deployed after 30 min? kanban_schedule a re-check; never record fixed on undeployed code.
+   runs: {deployed}. Not deployed after 30 min? kanban_schedule a re-check with awaiting={{kind:'deploy',
+   ref:'<fix sha>', why:'fix not deployed yet'}}; never record fixed on undeployed code.
    Then check on the real path (the surface/command/session type where it happened) and capture the proof. A live
    probe that makes a detector fire on purpose starts its first prompt with `[selfheal-probe]`: the lane then logs
    `selfheal_skip why=probe` and files nothing; never delete selfheal_pending rows by hand. The check fails? Comment
@@ -3831,7 +3835,8 @@ def refresh_backlog_report(store, now: float, board: str = "default", runner=Non
     day = _utc_day(now)
     wake = _iso((int(now) // 86400 + 1) * 86400 + 48 * 3600)
     body = (f"## Drain dead-man alarm (wake {wake})\n"
-            f"Before {wake}, schedule this card to {wake} with clock_only=true and stop.\n"
+            f"Before {wake}, schedule this card to {wake} with clock_only=true and awaiting={{kind:'clock', why:'drain "
+            f"dead-man alarm: runs only if the self-heal backlog drain stops refreshing it'}} and stop.\n"
             "If you are running this card after that deadline, the self-heal backlog drain has not "
             "refreshed it in 48 h. Diagnose why cron()'s drain stopped (hub selfheal_lane.py cron, "
             "log.jsonl selfheal_backlog_* events), fix it or file one card for the cause, then "
@@ -6127,7 +6132,8 @@ refiles on its own after 00:00Z (the open-owner dedupe and the next day's cap st
 fix from you. Post nothing to the Inbox. Budget for this card <= ${DIGEST_BUDGET}.
 
 When this card runs:
-1. Before {wake}: `kanban_schedule` it with reason `SCHEDULED_UNTIL={wake}` and `clock_only=true`, then stop.
+1. Before {wake}: `kanban_schedule` it with reason `SCHEDULED_UNTIL={wake}`, `clock_only=true` and
+   awaiting={{kind:'clock', why:'the {day} self-heal cap window closes at {wake}'}}, then stop.
 2. After that: count the comments and complete with the summary
    "<n> self-heal defects over the cap on {day}: <fingerprints>". Do not file or fix anything from this card.
 """

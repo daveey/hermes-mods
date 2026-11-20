@@ -4276,7 +4276,7 @@ REPORT_ONLY_WHOLE_REPLY = (" The re-check reads your whole reply: any other prob
 REPORT_ONLY_KANBAN_PARKS = (
     " If the card forbids both doing it here and re-placing it, end with one of two parks. When a clock gates it "
     "(a quota reset, a release window), park on that real time: kanban_schedule or kanban_block(kind='time', "
-    "reason='SCHEDULED_UNTIL=<the real reset, ISO> — …'). When lifting the gate is David's call (e.g. exceeding a "
+    "reason='SCHEDULED_UNTIL=<the real reset, ISO> — …', awaiting={kind:'clock', why:'<what resets then>'}). When lifting the gate is David's call (e.g. exceeding a "
     "quota reserve), kanban_block(kind='needs_input', human_request={action, why_human, interaction, scope, "
     "evidence}). A dependency park behind a stalled card is not an ending.")
 
