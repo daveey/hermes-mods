@@ -59,7 +59,8 @@ gateway only; cards cover every gateway.
 ## Throttle and runway
 
 `GET /v1/throttle` returns `{percent, reference_per_s, cap_per_s, rate_per_s, holding, set_at, set_by, mode, budget,
-scope, fleet, gateways, pools, now}`; `PUT /v1/throttle` with `{"percent": 0..100}` sets the level; any other `percent` is a 400
+user_cap_per_s, scope, fleet, gateways, pools, slots, slot_gate, now}`; `PUT /v1/throttle` with `{"cap_per_min": N | null}`
+sets a person's cap (below), with `{"percent": 0..100}` the slider level; any other `percent` is a 400
 and a body that is not a JSON object a 422, and neither changes anything.
 
 - **Level**: 0 = no cap, 100 = a cap of zero, between = `(1 - percent/100) x reference_per_s`, where the reference is
@@ -109,11 +110,34 @@ and a body that is not a JSON object a 422, and neither changes anything.
   minute they start. A stored stamp more than one interval ahead is treated as now. During rollout an older
   process sharing the file books its slot after the `next_at` a new process writes on each start, and a new
   process honours an older process's `next_at` only while it is at most one interval ahead.
-- **Card starts** follow the same cap. On a core with the `kanban_start_gate` hook the dispatcher asks the plugin
-  before each claim, and a card stays ready (guard reason `start_gate:token_throttle`) while the fleet's measured
-  rate is over the cap, or the level is 100 %. The answer is cached for 15 s and fails open. Pacing alone only
-  slows the calls of running cards; without the gate the dispatcher keeps starting cards whose calls then queue,
-  filling worker slots with runs that wait. A core without the hook starts cards as before.
+- **A person's cap** (`write_cap`; `PUT /v1/throttle {"cap_per_min": N | null}`, `hermes throttle set 150k|0|off`,
+  the Runners panel's "Token cap" field): an absolute fleet cap in tokens, stored as a `mode: "manual"` level
+  (`cap_per_s`; a cap of 0 is stored at `percent: 100`, so older gateways hold too; null = no cap of one's own). It
+  reaches the fleet like any level. Without a budget host every gateway paces at it. The budget-publish host
+  records the newest person-set level in `cache/throughput/user-cap.json` (a manual level as is; a slider level,
+  or an older panel's slider on the budget level, as its percent of the budget) and writes its budget level with
+  `percent` such that the cap is the lower of the person's cap and the budget (`percent_for`), so pool caps scale
+  with it and older gateways enforce it unchanged. Its own writes are recognised by `published_set_at`.
+  `user_cap_per_s` in the payload is that cap as far as this gateway can tell. Tests: `tests/test_slotgate.py`
+  (manual pacing, fold, lower-of, removal, older slider), `tests/test_api.py::test_put_cap_per_min_*` (REST),
+  `tests/test_cli.py` (CLI and its registration), Runners `tests/throttle.test.mjs` (panel field).
+- **Card starts: the slot gate** (`slotgate.py`, `Gate.start_gate`). Each gateway opens only as many card slots as
+  its share of the cap pays for: `allowed = floor(share x cap / tokens per slot)`, at least 1 while the cap is
+  above 0, 0 at a cap of 0, no limit without a cap, 2 before the gateway has measured itself. `share` is the same
+  share its calls are paced at. Tokens per slot is a running estimate (1-hour half-life, dropped after 6 hours
+  without a measurement, `cache/throughput/slot-estimate.json`) of this gateway's tokens over the last 15 minutes
+  divided by its busy slot-seconds **minus the seconds its cards' calls were held by the throttle**: the sampler
+  stores core's running card count (`slot:busy`) and the held seconds (`slot:wait`, per card and minute at most
+  60, counted by `Gate.wait` for card runs only) each minute. Held time is left out because a throttled slot burns
+  few tokens; counting it would make slots look cheap and keep open as many as already run. On a core with the
+  `kanban_start_gate` hook a card stays ready (guard reason `start_gate:token_slots`) while running cards plus the
+  starts let through since the last read (every 15 s) reach `allowed`. Running cards are never stopped. Without a
+  slot limit or a card count (no cap, or outside a Hermes runtime) the older rule holds starts
+  (`start_gate:token_throttle`) while the fleet's measured rate is over the cap. Any failed read starts the card.
+  The payload's `slot_gate` is `{allowed, share, per_slot_per_s, source, estimate_at, cap_per_s, running}`, and
+  this gateway's row in `slots.gateways` carries the enforced numbers (`enforced: true`); other gateways' rows
+  stay advisory estimates (their held time is not published). Tests: `tests/test_slotgate.py`. **Not tested**:
+  a live dispatcher tick and core's `active_card_runs` on a worker.
 - **A held turn stays alive.** Core gives middleware no activity API, so the gate finds the agent behind the call it
   wraps (the closure of core's `_perform_api_call`) and stamps its activity clock every poll, as core's own offline
   wait does: the gateway's idle watchdog and the turn liveness watchdog see a waiting turn, and a Kanban card's

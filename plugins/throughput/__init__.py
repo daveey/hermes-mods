@@ -57,6 +57,13 @@ def register(ctx):
         _register_throttle(ctx)
     except Exception:  # never break plugin loading
         log.exception("throughput: throttle failed to register")
+    register_cli = getattr(ctx, "register_cli_command", None)
+    if callable(register_cli):
+        try:
+            from . import cli
+            register_cli("throttle", "Read or set the fleet's token cap (tokens/min)", cli.setup, cli.handler)
+        except Exception:  # never break plugin loading
+            log.debug("throughput: CLI command registration failed", exc_info=True)
     if sampler.eligible_process():
         try:
             sampler.start()

@@ -158,8 +158,39 @@ def throttle_payload(now: float | None = None) -> Dict[str, Any]:
                                      now=now)
     except Exception:
         out["slots"] = None
+    try:  # this gateway's enforced slot limit (slotgate.py): what its start gate obeys
+        slotgate = importlib.import_module(pkg().__name__ + ".slotgate")
+        gate = slotgate.local(root, sampler.series_path(root), out["cap_per_s"], now)
+        gate["running"] = slotgate.active_runs()
+        out["slot_gate"] = gate
+        # This gateway's crossed-out slots are the ones its gate enforces; other rows stay advisory estimates
+        # (their held time is not published, so their cost per slot counts throttled slots too).
+        for name, row in ((out.get("slots") or {}).get("gateways") or {}).items():
+            row["enforced"] = name == out["scope"]
+            if row["enforced"]:
+                row.update(allowed=gate["allowed"], tokens_per_slot_per_s=gate["per_slot_per_s"],
+                           cost_source=gate["source"])
+    except Exception:
+        out["slot_gate"] = None
     out["now"] = now
     return out
+
+
+def set_cap(cap_per_min: Any) -> Dict[str, Any]:
+    """A person sets the fleet's token cap in tokens per minute (None = no cap of their own; the budget alone
+    then caps on a budget fleet). Stored as a ``manual`` level stamped after the level in force."""
+    if cap_per_min is not None and (isinstance(cap_per_min, bool) or not isinstance(cap_per_min, (int, float))
+                                    or cap_per_min != cap_per_min or not 0 <= cap_per_min < 1e12):
+        raise ValueError("cap_per_min must be a number of tokens per minute >= 0, or null for no cap")
+    sampler, _ = _services()
+    import importlib
+    throttle = importlib.import_module(pkg().__name__ + ".throttle")
+    root, hub_db, now = _state["root"], throttle.hub_db_path(), time.time()
+    level = throttle.effective(root, hub_db, now)
+    stamp = max(now, level["set_at"] + 0.002)  # 2 ms: stamps round to 1 ms
+    throttle.write_cap(root, None if cap_per_min is None else cap_per_min / 60.0, stamp)
+    throttle.note_seen(root, hub_db, stamp)
+    return throttle_payload()
 
 
 def set_throttle(percent: Any) -> Dict[str, Any]:
@@ -186,6 +217,8 @@ async def get_throttle() -> Dict[str, Any]:
 @router.put("/v1/throttle")
 async def put_throttle(body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
     try:
+        if "cap_per_min" in body:  # a person's absolute cap (the Runners panel's tokens/min field, the CLI)
+            return await asyncio.to_thread(set_cap, body.get("cap_per_min"))
         return await asyncio.to_thread(set_throttle, body.get("percent"))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))

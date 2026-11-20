@@ -571,6 +571,16 @@ class Sampler:
                     continue
                 self.store.observe_counter(name, metric, minute, float(value), at_f)
 
+    def sample_slots(self, me: str, now: float) -> None:
+        """Busy and throttle-held card slot time for the slot gate's tokens-per-slot estimate (slotgate.py)."""
+        from . import slotgate
+        slotgate.sample(self.root, self.store, me, now, running=self.running())
+
+    def running(self) -> Optional[int]:
+        """This machine's running card count (core's count; None outside a Hermes runtime)."""
+        from . import slotgate
+        return slotgate.active_runs()
+
     def tick(self) -> None:
         now = self.clock()
         minute = minute_of(now)
@@ -581,7 +591,7 @@ class Sampler:
             reg = None
         me = self.me(reg)
         for step in (lambda: self.sample_local_tokens(me, minute), lambda: self.sample_local_sessions(me, minute),
-                     lambda: self.sample_registry(reg, me, minute)):
+                     lambda: self.sample_registry(reg, me, minute), lambda: self.sample_slots(me, now)):
             try:
                 step()
             except Exception:
