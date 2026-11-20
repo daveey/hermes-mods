@@ -63,7 +63,7 @@ Probe **all models on all credentials** and report the matrix. Partial availabil
 - After an exact account×model completion succeeds despite a local cooldown, use `hermes auth reset <provider> <exact-entry-id>` (`anthropic` or `openai-codex`), not a token rotation or whole-pool reset. Read back the affected worker profile's effective auth store; confirm the target cleared and genuinely exhausted entries stayed unchanged. Run a one-turn smoke through that profile with the tested provider/model and verify no fallback. Output followed by a teardown timeout proves a response, not successful job completion; worker recovery additionally requires a normal-gate run with served-model, tool activity and result evidence.
 - An enabled `fast-rate-limit-fallback` plugin may still be inactive: run its `check.py` with the managed Hermes Python and inspect `wrappers_active`. After upgrades, AST compatibility guards can disable wrappers while the plugin list still reports enabled. Do not replace compatibility fingerprints without auditing changed core behavior and rerunning regression tests.
 
-Before proving managed routing, read `references/managed-routing-evidence.md` (PACED versus HELD, allocation rows, actual run results).
+For managed routing or unavailable independent reviewers, read `references/managed-routing-evidence.md`.
 
 ### Managed workers versus direct CLI
 
