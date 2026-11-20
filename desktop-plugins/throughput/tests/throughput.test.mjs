@@ -639,3 +639,183 @@ test('budget mode: the slider scales the published budget; stale and expired bud
   assert.equal(moved.budget.cap_per_s, 5)
   assert.match(P.throttleText(moved, 's'), /^Budget −50% · cap 5\.0 tok\/s/)
 })
+
+// ── burst + budget chart ────────────────────────────────────────────────────
+
+// Budget fixture (hand-computed): two pools; history = 3 hourly buckets ending at END; curves from END.
+// anthropic: spent 100, 300, 600 cumulative; capacity 1000 now, +500 at END+7200; plan 0 -> 400 at END+7200.
+// openai-codex: spent 0, 0, 60; capacity 200 flat to END+3600; plan 0 -> 200 at END+3600.
+const budgetFixture = (over = {}) => ({
+  now: END, computed_at: END, margin_s: 10800, global_rate_tokens_per_s: 30,
+  pools: { anthropic: { rate_tokens_per_s: 10, remaining_tokens: 1000, exhaust_plan_at: END + 7200, at_reserve: false, accounts: 2 },
+    'openai-codex': { rate_tokens_per_s: 20, remaining_tokens: 200, exhaust_plan_at: END + 3600, at_reserve: false, accounts: 1 } },
+  events: [{ ts: END - 5400, provider: 'anthropic', type: 'reset_early', kind: 'five_hour' },
+    { ts: END - 1800, provider: 'openai-codex', type: 'account_added', kind: null },
+    { ts: END - 30 * 86400, provider: 'anthropic', type: 'reset', kind: 'seven_day' }],
+  curve: { anthropic: [[END, 1000, 0], [END + 7200, 1500, 400]], 'openai-codex': [[END, 200, 0], [END + 3600, 200, 200]] },
+  history: { bucket_s: 3600, since: END - 10800, until: END, t: [END - 10800, END - 7200, END - 3600],
+    providers: { anthropic: { rate: [0.03, 0.06, 0.08], cumulative: [100, 300, 600] }, 'openai-codex': { rate: [0, 0, 0.02], cumulative: [0, 0, 60] },
+      unknown: { rate: [1, 1, 1], cumulative: [3600, 7200, 10800] } } },
+  burst: null,
+  projection: { factor: 2, hours: 1, pools: {
+    anthropic: { rate_now: 10, extra_tokens: 36000, exhausts_during_burst_at: null, earlier_s: 3600, rate_after: 4.5 },
+    'openai-codex': { rate_now: 20, extra_tokens: 200, exhausts_during_burst_at: END + 300, earlier_s: 10, rate_after: 0 } } },
+  ...over
+})
+
+test('burst maths: factor in force, preview and labels scale by it; projection text and reserve warning', () => {
+  const auto = (over = {}) => throttle({ mode: 'auto', percent: 50, cap_per_s: 10, holding: false,
+    budget: { state: 'fresh', age_s: 60, budget_per_s: 10, pool_budgets: { anthropic: 4, 'openai-codex': 0 }, burst_factor: 2 },
+    burst: { factor: 2, until: END + 2400, set_at: END - 1200, remaining_s: 2400, active: true }, ...over })
+  assert.equal(P.burstFactor(auto()), 2)
+  assert.equal(P.burstFactor(auto({ budget: {} })), 2) // an older payload: the burst's own `active`
+  assert.equal(P.burstFactor(auto({ budget: {}, burst: { factor: 2, active: false } })), 1)
+  assert.equal(P.burstFactor(throttle()), 1)
+  // the slider preview keeps the burst: 10 x (1 - 0.25) x 2 = 15; a reserve 0 stays 0; 100 % is 0
+  const moved = P.previewThrottle(auto(), 25)
+  assert.equal(moved.cap_per_s, 15)
+  assert.deepEqual(moved.budget.pool_caps, { anthropic: 6, 'openai-codex': 0 })
+  assert.equal(P.previewThrottle(auto(), 100).cap_per_s, 0)
+  assert.equal(P.throttleText(auto(), 's'), 'Budget −50% · burst 2× · cap 10 tok/s')
+  assert.equal(P.burstText(auto().burst, END), 'Burst 2× · 40 min left')
+  assert.equal(P.burstText(auto().burst, END + 2400), null)
+  assert.equal(P.burstText(null, END), null)
+  assert.equal(P.fmtHours(0.5), '30 min')
+  assert.equal(P.fmtHours(4), '4 h')
+  const pr = budgetFixture().projection.pools
+  assert.deepEqual(P.projectionText('anthropic', pr.anthropic),
+    { text: 'Claude: runs out ~60 min earlier at today’s rate · after the burst the planner slows to 4.5 tok/s (now 10)', warn: null })
+  const gpt = P.projectionText('openai-codex', pr['openai-codex'])
+  assert.match(gpt.text, /^GPT: runs out ~1 min earlier/)
+  assert.match(gpt.warn, /^GPT would hit its reserve during the burst, at \S+ \d\d:\d\d$/)
+  assert.match(P.projectionText('anthropic', { rate_now: 0, extra_tokens: 0, earlier_s: 0, rate_after: 0 }).text, /a burst adds nothing/)
+  assert.match(P.projectionText('xai-oauth', { rate_now: null }).text, /^Grok: rate unknown/)
+})
+
+test('budget chart series: history to now, forward curve lifted by the spend so far, marks (hand-computed)', () => {
+  const b = budgetFixture()
+  const a = P.chartSeries(b, 'anthropic', { now: END })
+  assert.deepEqual(a.hist, [[END - 10800, 0], [END - 7200, 100], [END - 3600, 300], [END, 600]])
+  assert.equal(a.base, 600)
+  assert.deepEqual(a.cap, [[END, 1600], [END + 7200, 2100]])
+  assert.deepEqual(a.plan, [[END, 600], [END + 7200, 1000]])
+  assert.equal(a.x0, END - 10800)
+  assert.equal(a.x1, END + 7200) // the furthest reset in the curve
+  assert.equal(a.ymax, 2100)
+  // events of this pool inside the window, plus the curve's future reset; nothing of the other pool, nothing 30 d old
+  assert.deepEqual(a.marks.map((m) => [m.t, m.type]), [[END - 5400, 'reset_early'], [END + 7200, 'reset']])
+  assert.equal(a.marks[0].label, 'Claude early reset (5 h window)')
+  // the total: both pools (never the unattributed `unknown` provider); the curves merge on their union of times:
+  // capacity steps (1000 + 200 = 1200 now, 1500 + 200 at END+7200), plan interpolates (anthropic 200 at END+3600)
+  const t = P.chartSeries(b, null, { now: END })
+  assert.deepEqual(t.hist.map((p) => p[1]), [0, 100, 300, 660])
+  assert.deepEqual(t.cap, [[END, 1860], [END + 3600, 1860], [END + 7200, 2360]])
+  assert.deepEqual(t.plan, [[END, 660], [END + 3600, 1060], [END + 7200, 1260]])
+  assert.deepEqual(t.marks.map((m) => m.type), ['reset_early', 'account_added', 'reset'])
+  // a running burst marks its own span; a previewed one starts now and is drawn dashed
+  const run = P.chartSeries(b, 'anthropic', { now: END, burst: { factor: 2, set_at: END - 600, until: END + 1800 } })
+  assert.deepEqual(run.burst, [END - 600, END + 1800])
+  assert.deepEqual(run.marks.filter((m) => m.type.startsWith('burst')).map((m) => [m.t, m.preview]), [[END - 600, false], [END + 1800, false]])
+  const pre = P.chartSeries(b, 'anthropic', { now: END, preview: { factor: 3, hours: 2 } })
+  assert.deepEqual(pre.burst, [END, END + 7200])
+  assert.ok(pre.marks.filter((m) => m.type.startsWith('burst')).every((m) => m.preview))
+  // no curve, no history: an empty chart still spans 7 days back to a day ahead
+  const empty = P.chartSeries({ pools: { anthropic: {} } }, 'anthropic', { now: END })
+  assert.deepEqual([empty.hist, empty.cap, empty.plan, empty.x0, empty.x1], [[], [], [], END - 7 * 86400, END + 86400])
+})
+
+test('panel: budget charts per pool and total, burst projection, start and end, slider relabelled', async () => {
+  P.saveView(V())
+  const autoThrottle = (burst = null) => throttle({
+    mode: 'auto', percent: 20, cap_per_s: 8, holding: false, burst,
+    budget: { state: 'fresh', age_s: 60, budget_per_s: 10, cap_per_s: 8, pool_budgets: { anthropic: 4, 'openai-codex': 6 }, pool_caps: {}, burst_factor: burst?.active ? burst.factor : 1 }
+  })
+  const state = { throttle: autoThrottle() }
+  const calls = []
+  const ctx = {
+    calls,
+    rest: async (path, opts) => {
+      calls.push([path, opts])
+      if (path === '/v1/throttle') return state.throttle
+      if (path === '/v1/throttle/burst') {
+        if (opts.method === 'PUT') state.throttle = autoThrottle({ factor: opts.body.factor, until: Date.now() / 1000 + opts.body.hours * 3600, set_at: Date.now() / 1000, remaining_s: opts.body.hours * 3600, active: true })
+        else state.throttle = autoThrottle()
+        return state.throttle
+      }
+      if (path.startsWith('/v1/budget')) {
+        const q = new URL('http://x' + path).searchParams
+        const factor = Number(q.get('factor')), hours = Number(q.get('hours'))
+        return budgetFixture({ projection: { ...budgetFixture().projection, factor, hours } })
+      }
+      return forRange(path)
+    }
+  }
+  const ui = await mount(React.createElement(P.Throughput, { ctx }))
+  try {
+    await ui.click(button('Show throughput'))
+    await ui.flush()
+    assert.ok(calls.some(([p]) => p === '/v1/budget?factor=2&hours=1'), 'the default 2x / 1 h burst is costed')
+    const charts = [...document.querySelectorAll('[data-budget-chart]')].map((e) => e.dataset.budgetChart)
+    assert.deepEqual(charts, ['total', 'anthropic', 'openai-codex'])
+    const claude = document.querySelector('[data-budget-chart="anthropic"]')
+    for (const line of ['spent', 'plan', 'capacity']) assert.ok(claude.querySelector(`path[data-line="${line}"]`), line)
+    assert.ok(claude.querySelector('line[data-now-line]'))
+    assert.ok(claude.querySelector('line[data-mark="reset_early"]'))
+    assert.ok(claude.querySelector('line[data-mark="reset"]'))
+    assert.ok(claude.querySelector('rect[data-mark="burst"]'), 'the burst being considered is shaded')
+    assert.equal(claude.querySelector('line[data-mark="burst_start"]').getAttribute('stroke-dasharray'), '2 2')
+    assert.ok(document.querySelector('[data-budget-chart="openai-codex"] line[data-mark="account_added"]'))
+    // the panel's own charts are themed by CSS variables; the budget lines by fixed mid-tone colours
+    assert.equal(claude.querySelector('line[data-now-line]').getAttribute('stroke'), 'var(--ui-text-secondary, #8a909c)')
+    // the slider stays, relabelled for budget mode
+    assert.equal(document.querySelector('[data-slider-label]').textContent, 'Hold back 20%')
+    assert.equal(document.querySelector('[data-slot="throttle"] input[type=range]').getAttribute('aria-label'), 'Hold back percent of the budget')
+    // projection per pool, with the reserve warning on GPT
+    assert.match(document.querySelector('[data-projection="anthropic"]').textContent, /^Claude: runs out ~60 min earlier at today’s rate · after the burst the planner slows to 4\.5 tok\/s/)
+    assert.match(document.querySelector('[data-warn="openai-codex"]').textContent, /GPT would hit its reserve during the burst/)
+    assert.equal(document.querySelector('[data-warn="anthropic"]'), null)
+    // another factor and duration: costed again before it can start
+    await ui.click(button('3×'))
+    await ui.click(button('4 h'))
+    assert.ok(calls.some(([p]) => p === '/v1/budget?factor=3&hours=4'))
+    const start = button('Start 3× for 4 h')
+    assert.equal(start.disabled, false)
+    await ui.click(start)
+    const put = calls.find(([p, o]) => p === '/v1/throttle/burst' && o?.method === 'PUT')
+    assert.deepEqual(put[1].body, { factor: 3, hours: 4 })
+    assert.match(document.querySelector('[data-burst]').textContent, /^Burst 3× · 4\.0 h left$/)
+    assert.match(document.querySelector('[data-slot="throttle"]').textContent, /Budget −20% · burst 3×/)
+    assert.equal(document.querySelector('[data-projection]'), null, 'no projection while a burst runs')
+    await ui.click(button('End burst'))
+    assert.ok(calls.some(([p, o]) => p === '/v1/throttle/burst' && o?.method === 'DELETE'))
+    assert.equal(document.querySelector('[data-burst]'), null)
+    assert.ok(button('Start 3× for 4 h'))
+  } finally {
+    await ui.close()
+  }
+})
+
+test('manual mode: budget charts without a burst control; no budget endpoint: no budget section', async () => {
+  P.saveView(V())
+  const ctx = ctxWith((path) => (path === '/v1/throttle' ? throttle() : path.startsWith('/v1/budget') ? budgetFixture({ projection: null }) : forRange(path)))
+  const ui = await mount(React.createElement(P.Throughput, { ctx }))
+  try {
+    await ui.click(button('Show throughput'))
+    await ui.flush()
+    assert.ok(ctx.calls.some(([p]) => p === '/v1/budget'), 'no burst is costed on a manual level')
+    assert.match(document.querySelector('[data-slot="burst"]').textContent, /Burst needs budget mode/)
+    assert.equal(document.querySelectorAll('[data-budget-chart]').length, 3)
+    assert.equal(document.querySelector('[data-slider-label]'), null)
+    assert.equal(document.querySelector('[data-slot="throttle"] input[type=range]').getAttribute('aria-label'), 'Token throttle percent')
+  } finally {
+    await ui.close()
+  }
+  const ui2 = await mount(React.createElement(P.Throughput, { ctx: ctxWith(withThrottle({ value: throttle() })) }))
+  try {
+    await ui2.click(button('Show throughput'))
+    assert.equal(document.querySelector('[data-slot="budget"]'), null)
+    assert.equal(document.querySelectorAll('[data-chart]').length, 3)
+  } finally {
+    await ui2.close()
+  }
+})

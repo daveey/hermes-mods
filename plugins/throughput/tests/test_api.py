@@ -338,3 +338,95 @@ def test_put_on_a_budget_level_keeps_its_pool_caps(api, tmp_path, monkeypatch):
     assert put["budget"]["pool_caps"] == {"anthropic": 0.0, "openai-codex": pytest.approx(450.0)}
     gate = throttle.Gate(root, tmp_path / "none.sqlite")
     assert gate.plan(time.time(), "anthropic") == ("hold",)
+
+
+def _isolated(api, tmp_path, monkeypatch):
+    import importlib
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(api, "_registry", lambda: {"me": "hub", "machines": {"hub": {}}})
+    monkeypatch.setattr(api, "_known_machines", lambda: None)
+    api._services()
+    assert str(tmp_path) in str(api._state["store"].path), api._state["store"].path  # never the real series db
+    runway = importlib.import_module(api.pkg().__name__ + ".runway")
+    monkeypatch.setattr(runway, "pacing_path", lambda _root: tmp_path / "llm_pacing.json")
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    app = FastAPI()
+    app.include_router(api.router, prefix="/p")
+    return TestClient(app), importlib.import_module(api.pkg().__name__ + ".throttle"), api._state["root"]
+
+
+def test_burst_routes_set_end_and_refuse(api, tmp_path, monkeypatch):
+    """PUT/DELETE /v1/throttle/burst: refused (409) on a manual level, validated (400), stored on a budget level with
+    newest-wins stamping, shown in the payload, ended at once by DELETE; the slider keeps it."""
+    import json
+    c, throttle, root = _isolated(api, tmp_path, monkeypatch)
+    manual = c.put("/p/v1/throttle/burst", json={"factor": 2, "hours": 1})
+    assert manual.status_code == 409 and "manual" in manual.json()["detail"]
+    assert c.get("/p/v1/throttle").json()["burst"] is None
+    now = time.time()
+    level = {"mode": "auto", "percent": 0, "cap_per_s": 1000.0, "pool_caps": {"anthropic": 0.0, "openai-codex": 600.0},
+             "budget_at": now - 60, "set_at": now - 30}
+    throttle.level_path(root).write_text(json.dumps(level))
+    for bad in ({"factor": 1, "hours": 1}, {"factor": 4.5, "hours": 1}, {"factor": 2, "hours": 0},
+                {"factor": 2, "hours": 25}, {"factor": "2", "hours": 1}, {"factor": True, "hours": 1}, {"factor": 2}, {}):
+        assert c.put("/p/v1/throttle/burst", json=bad).status_code == 400, bad
+    got = c.put("/p/v1/throttle/burst", json={"factor": 2, "hours": 1}).json()
+    stored = json.loads(throttle.level_path(root).read_text())
+    assert stored["set_at"] > level["set_at"] and stored["pool_caps"] == level["pool_caps"]
+    assert stored["burst"]["factor"] == 2.0 and stored["burst"]["until"] == pytest.approx(stored["set_at"] + 3600)
+    assert got["burst"]["active"] is True and got["burst"]["remaining_s"] == pytest.approx(3600, abs=5)
+    assert got["cap_per_s"] == pytest.approx(2000.0)
+    assert got["budget"]["pool_caps"] == {"anthropic": 0.0, "openai-codex": pytest.approx(1200.0)}
+    moved = c.put("/p/v1/throttle", json={"percent": 50}).json()  # the slider keeps the burst
+    assert moved["burst"]["factor"] == 2.0 and moved["cap_per_s"] == pytest.approx(1000.0)
+    ended = c.delete("/p/v1/throttle/burst").json()
+    assert ended["burst"] is None and ended["cap_per_s"] == pytest.approx(500.0) and ended["percent"] == 50
+    assert "burst" not in json.loads(throttle.level_path(root).read_text())
+    assert c.delete("/p/v1/throttle/burst").status_code == 200  # nothing to end: unchanged
+
+
+def test_budget_view_endpoint_shape(api, tmp_path, monkeypatch):
+    """GET /v1/budget: this host's v2 for the chart (no account readings), 7 days of hourly spend per provider, the
+    burst in force, and the burst projection when factor and hours are given."""
+    import json
+    c, throttle, root = _isolated(api, tmp_path, monkeypatch)
+    now = time.time()
+    until = int(now // 60 * 60)
+    store = api._state["store"]
+    store.put("hub", "tokens_io:claude-opus-5-5", [(until - 120, 7200.0)])
+    store.put("hub", "tokens_io:unreported", [(until - 120, 0.0)])
+    v2 = {"computed_at": now - 30, "margin_s": 10800, "global_rate_tokens_per_s": 100.0,
+          "pools": {"anthropic": {"rate_tokens_per_s": 100.0, "remaining_tokens": 1_000_000.0,
+                                  "exhaust_plan_at": now + 10_000, "at_reserve": False,
+                                  "accounts": [{"id": "0123abcd", "used": 50.0}]}},
+          "events": [{"ts": now - 600, "provider": "anthropic", "account": "0123abcd", "type": "reset",
+                      "detail": {"kind": "seven_day"}}],
+          "curve": {"anthropic": [[now - 30, 1_000_000.0, 0.0], [now + 10_000, 2_000_000.0, 1_000_000.0]]}}
+    (tmp_path / "llm_pacing.json").write_text(json.dumps({"anthropic": {"samples": []}, "v2": v2}))
+    throttle.level_path(root).parent.mkdir(parents=True, exist_ok=True)
+    throttle.level_path(root).write_text(json.dumps({
+        "mode": "auto", "percent": 0, "cap_per_s": 100.0, "pool_caps": {"anthropic": 100.0}, "budget_at": now - 30,
+        "set_at": now - 20, "burst": {"factor": 2.0, "until": now + 1800, "set_at": now - 20}}))
+    started = time.monotonic()
+    got = c.get("/p/v1/budget").json()
+    assert time.monotonic() - started < 2.0
+    assert set(got) == {"now", "computed_at", "margin_s", "global_rate_tokens_per_s", "pools", "events", "curve",
+                        "history", "burst", "projection"}
+    assert got["pools"]["anthropic"]["accounts"] == 1 and got["pools"]["anthropic"]["rate_tokens_per_s"] == 100.0
+    assert got["events"] == [{"ts": pytest.approx(now - 600), "provider": "anthropic", "type": "reset",
+                              "kind": "seven_day"}]
+    assert len(got["curve"]["anthropic"]) == 2 and got["projection"] is None
+    h = got["history"]
+    assert h["bucket_s"] == 3600 and len(h["t"]) == len(h["providers"]["anthropic"]["rate"]) in (168, 169)
+    assert h["providers"]["anthropic"]["cumulative"][-1] == 7200.0
+    assert got["burst"]["factor"] == 2.0 and got["burst"]["active"] is True
+    proj = c.get("/p/v1/budget?factor=2&hours=1").json()["projection"]
+    assert proj["factor"] == 2.0 and proj["hours"] == 1.0
+    assert proj["pools"]["anthropic"]["extra_tokens"] == pytest.approx(360_000.0)
+    assert proj["pools"]["anthropic"]["earlier_s"] == pytest.approx(3600.0)
+    for bad in ("factor=2", "hours=1", "factor=1&hours=1", "factor=2&hours=30", "factor=x&hours=1"):
+        assert c.get("/p/v1/budget?" + bad).status_code in (400, 422), bad
+    (tmp_path / "llm_pacing.json").unlink()  # a host without core's capacity model: empty, never an error
+    bare = c.get("/p/v1/budget?factor=2&hours=1").json()
+    assert bare["pools"] == {} and bare["curve"] == {} and bare["projection"]["pools"] == {}

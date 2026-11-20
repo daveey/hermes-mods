@@ -48,6 +48,12 @@
   (``governed_load``); the slider keeps a budget level a budget level (``set_level``). A budget older than
   ``BUDGET_STALE_S`` is stale (caps kept), older than ``BUDGET_EXPIRE_S`` expired: no cap from it (fail open). A
   level without ``mode`` (or ``mode: "manual"``) is the slider level above, unchanged.
+* Burst: a budget level may carry ``burst: {factor, until, set_at}`` (``1 < factor <= 4``, ``until`` at most 24 h
+  after ``set_at``). While ``now < until`` every budget cap (global and each positive pool cap) is multiplied by
+  ``factor`` on top of the slider's scaling; a pool cap of 0 (reserve) stays 0 and 100 % still holds everything.
+  It rides on the level (``set_burst`` / ``clear_burst``, newest wins like the slider); ``set_level`` and the
+  publisher keep it, a manual ``write_level`` drops it. An expired or malformed burst, or one on a manual level, is
+  ignored everywhere: expiry needs no action.
 """
 from __future__ import annotations
 
@@ -90,6 +96,8 @@ BUDGET_STALE_S = 20 * 60.0  # a budget computed longer ago than this is stale: i
 BUDGET_EXPIRE_S = 60 * 60.0  # ... and longer ago than this, expired: no cap from it (fail open)
 BUDGET_REWRITE_S = 15 * 60.0  # the publisher rewrites an unchanged budget this often (under BUDGET_STALE_S)
 BUDGET_MOVE = 0.05  # ... and at once when any cap moves by more than this fraction
+BURST_MAX_FACTOR = 4.0  # a burst multiplies the budget caps by 1 < factor <= this
+BURST_MAX_S = 24 * 3600.0  # ... for at most this long after it was set
 PROVIDER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}")  # a pool key: the hub client's rule too
 
 
@@ -140,9 +148,38 @@ def pool_caps_of(raw) -> dict[str, Optional[float]]:
     return out
 
 
+def burst_of(raw) -> Optional[dict]:
+    """``{factor, until, set_at}`` from a stored or published ``burst``; None unless ``factor`` is a number with
+    ``1 < factor <= BURST_MAX_FACTOR`` and ``until`` lies after ``set_at`` by at most ``BURST_MAX_S``."""
+    if not isinstance(raw, dict):
+        return None
+    factor, until, set_at = (_number(raw.get(k)) for k in ("factor", "until", "set_at"))
+    if factor is None or until is None or set_at is None or not 1.0 < factor <= BURST_MAX_FACTOR:
+        return None
+    if not 0 < until - set_at <= BURST_MAX_S + 0.001:  # stamps round to 1 ms
+        return None
+    return {"factor": factor, "until": round(until, 3), "set_at": round(set_at, 3)}
+
+
+def burst_active(level: dict, now: float) -> Optional[dict]:
+    """The burst a level applies right now: a budget level's valid burst while ``now < until``; else None."""
+    burst = level.get("burst") if level.get("mode") == AUTO else None
+    return burst if isinstance(burst, dict) and now < burst["until"] else None
+
+
+def burst_status(level: dict, now: float) -> Optional[dict]:
+    """``{factor, until, set_at, remaining_s, active}`` for the payload; None when the level carries no (valid) burst."""
+    burst = level.get("burst") if level.get("mode") == AUTO else None
+    if not isinstance(burst, dict):
+        return None
+    left = max(0.0, burst["until"] - now)
+    return {"factor": burst["factor"], "until": burst["until"], "set_at": burst["set_at"], "remaining_s": left,
+            "active": left > 0}
+
+
 def _record(data) -> Optional[dict]:
     """``{percent, cap_per_s, set_at}`` from a stored or published level (plus ``mode``, ``budget_at`` and
-    ``pool_caps`` for a budget level, ``mode: "auto"``); None when it is not one."""
+    ``pool_caps`` for a budget level, ``mode: "auto"``, and its ``burst`` when valid); None when it is not one."""
     if not isinstance(data, dict) or _number(data.get("percent")) is None:
         return None
     limit = _number(data.get("cap_per_s"))
@@ -150,6 +187,9 @@ def _record(data) -> Optional[dict]:
            "set_at": stamp(data.get("set_at"))}
     if data.get("mode") == AUTO:
         rec.update(mode=AUTO, budget_at=_number(data.get("budget_at")), pool_caps=pool_caps_of(data.get("pool_caps")))
+        burst = burst_of(data.get("burst"))
+        if burst is not None:
+            rec["burst"] = burst
     return rec
 
 
@@ -184,22 +224,59 @@ def write_level(root: Path, percent, now: Optional[float] = None, reference: Opt
     return value
 
 
+def _budget_expired(level: dict, now: float) -> bool:
+    budget_at = level.get("budget_at")
+    return not isinstance(budget_at, (int, float)) or now - budget_at > BUDGET_EXPIRE_S
+
+
+def _write_auto(root: Path, level: dict, percent: float, set_at: float, burst: Optional[dict]) -> None:
+    data = {"mode": AUTO, "percent": percent, "cap_per_s": level.get("cap_per_s"),
+            "pool_caps": dict(level.get("pool_caps") or {}), "budget_at": level.get("budget_at"), "set_at": stamp(set_at)}
+    if burst is not None:
+        data["burst"] = dict(burst)
+    _write_json(level_path(root), data)
+
+
 def set_level(root: Path, level: dict, percent, now: float, reference: Optional[float] = None) -> float:
     """The slider: store ``percent`` at ``now``. When ``level`` (the one in force) is a budget level, the new level
-    keeps its ``mode``, ``cap_per_s``, ``pool_caps`` and ``budget_at`` and changes only ``percent`` and ``set_at``:
+    keeps its ``mode``, ``cap_per_s``, ``pool_caps``, ``budget_at`` and ``burst`` and changes only ``percent`` and
+    ``set_at``:
     a manual level there would drop every pool cap, reserve holds included, fleet-wide until the publisher folds it
     back in. Otherwise, or when that budget level has expired (no publisher is refreshing it, e.g.
     ``budget_publish`` was turned off), it is a slider level against ``reference`` (``write_level``): the slider is
     the way back to manual mode."""
-    budget_at = level.get("budget_at")
-    expired = not isinstance(budget_at, (int, float)) or now - budget_at > BUDGET_EXPIRE_S
-    if level.get("mode") != AUTO or expired:
+    if level.get("mode") != AUTO or _budget_expired(level, now):
         return write_level(root, percent, now, reference)
     value = clamp(percent)
-    _write_json(level_path(root), {"mode": AUTO, "percent": value, "cap_per_s": level.get("cap_per_s"),
-                                   "pool_caps": dict(level.get("pool_caps") or {}),
-                                   "budget_at": level.get("budget_at"), "set_at": stamp(now)})
+    _write_auto(root, level, value, now, level.get("burst"))
     return value
+
+
+class BurstRefused(ValueError):
+    """A burst asked of a level that cannot carry one (a manual level, or an expired budget)."""
+
+
+def set_burst(root: Path, level: dict, factor, duration_s, now: float) -> dict:
+    """Store ``level`` (the budget level in force) with ``burst = {factor, until: now + duration_s, set_at: now}`` at
+    ``now``; percent and caps unchanged. ``ValueError`` for a factor outside ``(1, 4]`` or a duration outside
+    ``(0, 24 h]``; ``BurstRefused`` when ``level`` is not a live budget level (a burst scales budget caps only)."""
+    burst = burst_of({"factor": factor, "until": stamp(now) + (_number(duration_s) or 0.0), "set_at": stamp(now)})
+    if burst is None:
+        raise ValueError("factor must be a number above 1 and at most 4, and hours above 0 and at most 24")
+    if level.get("mode") != AUTO:
+        raise BurstRefused("a burst multiplies the budget caps: the level in force is manual (no budget to burst)")
+    if _budget_expired(level, now):
+        raise BurstRefused("a burst multiplies the budget caps: the budget in force has expired")
+    _write_auto(root, level, level["percent"], now, burst)
+    return burst
+
+
+def clear_burst(root: Path, level: dict, now: float) -> bool:
+    """End a burst now: store ``level`` without it at ``now``. False (nothing written) when it carries none."""
+    if level.get("mode") != AUTO or "burst" not in level:
+        return False
+    _write_auto(root, level, level["percent"], now, None)
+    return True
 
 
 # --- the fleet's level: every gateway's published setting, newest wins ---------------------------------------
@@ -363,18 +440,22 @@ def fleet_rate(series_db: Path, now: float) -> Optional[float]:
 def budget(level: dict, now: float) -> Optional[dict]:
     """What a budget level (``mode: "auto"``) caps right now; None for a slider level. ``state`` is ``fresh``,
     ``stale`` (older than ``BUDGET_STALE_S``: the caps are kept) or ``expired`` (older than ``BUDGET_EXPIRE_S``, or
-    no ``budget_at``: no cap, fail open). ``cap_per_s`` and ``pool_caps`` are scaled by the slider,
-    ``budget x (1 - percent/100)``; ``budget_per_s`` and ``pool_budgets`` are the unscaled budgets."""
+    no ``budget_at``: no cap, fail open). ``cap_per_s`` and ``pool_caps`` are scaled by the slider and an active
+    burst, ``budget x (1 - percent/100) x factor``; ``budget_per_s`` and ``pool_budgets`` are the unscaled budgets,
+    ``burst_factor`` the factor in force (1.0 without a burst)."""
     if level.get("mode") != AUTO:
         return None
     at = level.get("budget_at")
     age = None if at is None else now - at
     state = "expired" if age is None or age > BUDGET_EXPIRE_S else "stale" if age > BUDGET_STALE_S else "fresh"
+    burst = burst_active(level, now)
     out = {"state": state, "budget_at": at, "age_s": age, "budget_per_s": level.get("cap_per_s"),
-           "pool_budgets": dict(level.get("pool_caps") or {}), "cap_per_s": None, "pool_caps": {}}
+           "pool_budgets": dict(level.get("pool_caps") or {}), "cap_per_s": None, "pool_caps": {},
+           "burst_factor": burst["factor"] if burst else 1.0}
     if state == "expired":
         return out
-    scale = 1.0 - clamp(level["percent"]) / 100.0
+    # The burst multiplies on top of the slider; a reserve cap of 0 stays 0 and 100 % stays 0.
+    scale = (1.0 - clamp(level["percent"]) / 100.0) * (burst["factor"] if burst else 1.0)
     if level.get("cap_per_s") is not None:
         out["cap_per_s"] = level["cap_per_s"] * scale
     out["pool_caps"] = {p: None if v is None else v * scale for p, v in (level.get("pool_caps") or {}).items()}
@@ -474,7 +555,7 @@ def status(root: Path, series_db: Path, now: Optional[float] = None, hub_db: Opt
                                      and governed_rate > governed_cap)
     return {"percent": percent, "reference_per_s": reference, "cap_per_s": limit, "rate_per_s": rate,
             "holding": holding, "set_at": level["set_at"] or None, "set_by": level["source"],
-            "mode": level.get("mode") or "manual", "budget": b}
+            "mode": level.get("mode") or "manual", "budget": b, "burst": burst_status(level, now)}
 
 
 def pace_path(root: Path) -> Path:
@@ -869,7 +950,8 @@ def publish_budget(root: Path, hub_db: Optional[Path], pacing_file: Path, now: O
     ``percent`` (the newest level any gateway set). Rewrites only when the level it obeys is not its own budget
     (a slider moved somewhere), any cap moved by more than ``BUDGET_MOVE``, or ``BUDGET_REWRITE_S`` passed since
     the last write. A missing or malformed ``v2`` writes nothing. ``set_at`` is the obeyed level's plus 1 ms, not
-    the clock: a newer slider setting on another gateway then still outranks this write until it is folded in."""
+    the clock: a newer slider setting on another gateway then still outranks this write until it is folded in. An
+    active ``burst`` on the obeyed budget level is kept; an expired one is dropped."""
     now = time.time() if now is None else now
     data = _read_json(pacing_file)
     new = budget_of_v2(data.get("v2") if isinstance(data, dict) else None)
@@ -888,8 +970,11 @@ def publish_budget(root: Path, hub_db: Optional[Path], pacing_file: Path, now: O
         if not moved and age < BUDGET_REWRITE_S:
             return False
     set_at = stamp(level["set_at"] + 0.001) if level["set_at"] > 0 else stamp(now)
-    _write_json(path, {"mode": AUTO, "percent": level["percent"], "cap_per_s": new["cap_per_s"],
-                       "pool_caps": new["pool_caps"], "budget_at": round(new["budget_at"], 3), "set_at": set_at})
+    data = {"mode": AUTO, "percent": level["percent"], "cap_per_s": new["cap_per_s"],
+            "pool_caps": new["pool_caps"], "budget_at": round(new["budget_at"], 3), "set_at": set_at}
+    if burst_active(level, now) is not None:  # a running burst rides on: only its expiry ends it
+        data["burst"] = dict(level["burst"])
+    _write_json(path, data)
     return True
 
 

@@ -1,6 +1,10 @@
 """GET /api/plugins/throughput/v1/series?range=1h|6h|24h|7d[&by=gateway|model] (see ../series.py for the payload).
 GET / PUT /api/plugins/throughput/v1/throttle: the fleet's token throttle level (../throttle.py) and the
 subscription pools' runway (../runway.py). PUT body ``{"percent": 0..100}``.
+PUT / DELETE /api/plugins/throughput/v1/throttle/burst: start a burst on the budget level (body ``{"factor": 1 < f <= 4,
+"hours": 0 < h <= 24}``; 409 on a manual or expired level) or end it now.
+GET /api/plugins/throughput/v1/budget[?factor=&hours=]: this host's capacity model, the measured spend per provider
+over 7 days and the current burst, plus the cost of the given burst (../budget_view.py).
 
 Loaded by path by the dashboard, outside its package: the plugin package is imported under a private name.
 Single-flight per (range, by) for 15 s; the slow work (sqlite reads, registry fetch) runs in a worker thread.
@@ -166,7 +170,7 @@ def set_throttle(percent: Any) -> Dict[str, Any]:
     root, hub_db, now = _state["root"], throttle.hub_db_path(), time.time()
     # Stamp it after the level in force, so a gateway whose clock runs ahead cannot outrank this newer setting.
     level = throttle.effective(root, hub_db, now)
-    stamp = max(now, level["set_at"] + 0.002)  # 2 ms: stamps round to 1 ms
+    stamp = _stamp_after(level, now)
     # On a budget level only percent and set_at change: the pool caps (reserve holds) stay in force fleet-wide.
     throttle.set_level(root, level, percent, stamp, throttle.reference_rate(sampler.series_path(root), now))
     throttle.note_seen(root, hub_db, stamp)
@@ -184,3 +188,100 @@ async def put_throttle(body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
         return await asyncio.to_thread(set_throttle, body.get("percent"))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+
+def _stamp_after(level, now: float) -> float:
+    """A ``set_at`` after the level in force (2 ms: stamps round to 1 ms), so a gateway whose clock runs ahead
+    cannot outrank this newer setting."""
+    return max(now, level["set_at"] + 0.002)
+
+
+def _burst_args(factor: Any, hours: Any) -> tuple[float, float]:
+    for value in (factor, hours):
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value != value:
+            raise ValueError("factor and hours must be numbers")
+    if not 1 < factor <= 4:
+        raise ValueError("factor must be above 1 and at most 4")
+    if not 0 < hours <= 24:
+        raise ValueError("hours must be above 0 and at most 24")
+    return float(factor), float(hours)
+
+
+def set_burst(factor: Any, hours: Any) -> Dict[str, Any]:
+    factor, hours = _burst_args(factor, hours)
+    _services()
+    import importlib
+    throttle = importlib.import_module(pkg().__name__ + ".throttle")
+    root, hub_db, now = _state["root"], throttle.hub_db_path(), time.time()
+    level = throttle.effective(root, hub_db, now)
+    stamp = _stamp_after(level, now)
+    throttle.set_burst(root, level, factor, hours * 3600.0, stamp)  # BurstRefused on a manual or expired level
+    throttle.note_seen(root, hub_db, stamp)
+    return throttle_payload()
+
+
+def clear_burst() -> Dict[str, Any]:
+    _services()
+    import importlib
+    throttle = importlib.import_module(pkg().__name__ + ".throttle")
+    root, hub_db, now = _state["root"], throttle.hub_db_path(), time.time()
+    level = throttle.effective(root, hub_db, now)
+    stamp = _stamp_after(level, now)
+    if throttle.clear_burst(root, level, stamp):
+        throttle.note_seen(root, hub_db, stamp)
+    return throttle_payload()
+
+
+@router.put("/v1/throttle/burst")
+async def put_burst(body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    import importlib
+    throttle = importlib.import_module(pkg().__name__ + ".throttle")
+    try:
+        return await asyncio.to_thread(set_burst, body.get("factor"), body.get("hours"))
+    except throttle.BurstRefused as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.delete("/v1/throttle/burst")
+async def delete_burst() -> Dict[str, Any]:
+    return await asyncio.to_thread(clear_burst)
+
+
+def budget_payload(factor: float | None = None, hours: float | None = None, now: float | None = None) -> Dict[str, Any]:
+    """``{now, computed_at, margin_s, global_rate_tokens_per_s, pools, events, curve, history, burst, projection}``:
+    one read of this host's ``llm_pacing.json`` and one 7-day slice of the series. ``projection`` is the cost of a
+    ``factor`` x burst for ``hours`` (``budget_view.project``), or None when no burst was asked about."""
+    sampler, _ = _services()
+    import importlib
+    import json
+    throttle = importlib.import_module(pkg().__name__ + ".throttle")
+    runway = importlib.import_module(pkg().__name__ + ".runway")
+    view = importlib.import_module(pkg().__name__ + ".budget_view")
+    root = _state["root"]
+    now = time.time() if now is None else now
+    try:
+        data = json.loads(runway.pacing_path(root).read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        data = None
+    v2 = data.get("v2") if isinstance(data, dict) else None
+    out: Dict[str, Any] = {"now": now, **view.chart_v2(v2)}
+    out["history"] = view.history(sampler.series_path(root), now)
+    out["burst"] = throttle.burst_status(throttle.effective(root, throttle.hub_db_path(), now), now)
+    out["projection"] = None
+    if factor is not None:
+        out["projection"] = {"factor": factor, "hours": hours, "pools": view.project(v2, factor, hours * 3600.0, now)}
+    return out
+
+
+@router.get("/v1/budget")
+async def get_budget(factor: float | None = Query(None), hours: float | None = Query(None)) -> Dict[str, Any]:
+    if (factor is None) != (hours is None):
+        raise HTTPException(status_code=400, detail="give both factor and hours, or neither")
+    if factor is not None:
+        try:
+            factor, hours = _burst_args(factor, hours)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+    return await asyncio.to_thread(budget_payload, factor, hours)
