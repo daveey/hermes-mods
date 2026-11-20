@@ -1,6 +1,9 @@
 """GET /api/plugins/lanes/v1/lanes?hours=6: per lane target and actual share of run-hours, running, ready, held at
 the gate, open, done, tokens and estimated cost over the window (core ``kanban_lanes_cli.snapshot``).
-PUT /api/plugins/lanes/v1/lanes/{lane}: body ``{"share": n, "paused": bool, "admit_per_day": n}`` (any subset).
+PUT /api/plugins/lanes/v1/lanes/{lane}: body ``{"share": n, "paused": bool, "admit_per_day": n, "cards_per_day": n,
+"usd_per_day": n}`` (any subset; the last two need a core that has them).
+GET /api/plugins/lanes/v1/lanes/flow?window=6h: every open card with step/reason/source plus per-lane done, run-hours,
+cost, limits and today's usage (core ``kanban_lanes_flow.snapshot``, the data of ``hermes kanban lanes flow --json``).
 GET /api/plugins/lanes/v1/held?lane=x: cards waiting at a lane gate. POST /api/plugins/lanes/v1/held/{card}/admit.
 
 Without lanes: ``GET /v1/lanes`` answers ``{"configured": false, "reason": ...}`` on a core without lanes support or
@@ -21,6 +24,9 @@ from fastapi import APIRouter, Body, HTTPException, Query
 router = APIRouter()
 CACHE_S = 10
 WINDOWS = (1.0, 6.0, 24.0, 168.0)
+FLOW_WINDOWS = ("1h", "6h", "24h", "7d")
+LIMIT_FIELDS = ("cards_per_day", "usd_per_day")
+_flow_cache: Dict[str, tuple] = {}
 _lock = threading.Lock()
 _cache: Dict[float, tuple] = {}
 _generation = 0
@@ -64,6 +70,42 @@ def _written() -> None:
     with _lock:
         _generation += 1
         _cache.clear()
+        _flow_cache.clear()
+
+
+def flow_core():
+    """Core's connect module and flow module, or None on a core that predates ``lanes flow``."""
+    try:
+        from hermes_cli import kanban_db_connect, kanban_lanes_flow
+    except ImportError:
+        return None
+    return kanban_db_connect, kanban_lanes_flow
+
+
+def flow(window: str, now: Optional[float] = None) -> Dict[str, Any]:
+    """Open cards by step and reason; ``{"configured": false, ...}`` where flow is not available."""
+    mods = flow_core()
+    if mods is None:
+        return {"configured": False, "reason": "this Hermes core has no lanes flow support yet"}
+    kbc, kanban_lanes_flow = mods
+    now = time.time() if now is None else now
+    with _lock:
+        hit = _flow_cache.get(window)
+        if hit and now - hit[0] < CACHE_S:
+            return hit[1]
+        generation = _generation
+    try:
+        with kbc.connect_closing() as conn:
+            body = dict(kanban_lanes_flow.snapshot(conn, window=window))
+    except Exception as exc:
+        return {"configured": False, "reason": f"lanes flow is unavailable: {exc}"}
+    body["configured"] = bool(body.get("lanes"))
+    if not body["configured"]:
+        body["reason"] = "no lanes are configured (kanban.admission.lanes)"
+    with _lock:
+        if generation == _generation:
+            _flow_cache[window] = (now, body)
+    return body
 
 
 def _need_core():
@@ -82,12 +124,14 @@ def _need_core():
 
 def change(lane: str, body: Dict[str, Any]) -> Dict[str, Any]:
     _kbc, _lanes, cli = _need_core()
-    unknown = sorted(set(body) - {"share", "paused", "admit_per_day"})
+    unknown = sorted(set(body) - {"share", "paused", "admit_per_day", *LIMIT_FIELDS})
     if unknown:
         raise ValueError(f"unknown field(s): {', '.join(unknown)}")
     if "paused" in body and type(body["paused"]) is not bool:
         raise ValueError("paused must be true or false")
-    cli.set_lane(lane, share=body.get("share"), admit_per_day=body.get("admit_per_day"), paused=body.get("paused"))
+    extra = {k: body[k] for k in LIMIT_FIELDS if k in body}
+    cli.set_lane(lane, share=body.get("share"), admit_per_day=body.get("admit_per_day"), paused=body.get("paused"),
+                 **extra)
     _written()
     return read(6.0)
 
@@ -113,6 +157,13 @@ async def get_lanes(hours: float = Query(6.0)) -> Dict[str, Any]:
     if hours not in WINDOWS:
         raise HTTPException(status_code=400, detail=f"hours must be one of {', '.join(f'{w:g}' for w in WINDOWS)}")
     return await asyncio.to_thread(read, hours)
+
+
+@router.get("/v1/lanes/flow")
+async def get_flow(window: str = Query("6h")) -> Dict[str, Any]:
+    if window not in FLOW_WINDOWS:
+        raise HTTPException(status_code=400, detail=f"window must be one of {', '.join(FLOW_WINDOWS)}")
+    return await asyncio.to_thread(flow, window)
 
 
 @router.put("/v1/lanes/{lane}")

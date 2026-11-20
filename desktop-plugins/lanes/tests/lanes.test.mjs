@@ -90,7 +90,6 @@ test('slider and pause become one PUT per changed lane; Reset drops the draft', 
   const applied = []
   const view = await mount(React.createElement(P.Panel, { snap: snap(), windowHours: 6, onWindow() {}, onApply: (p) => { applied.push(p); return false } }))
   assert.match(view.container.textContent, /gated · 12\/50 admitted today/)
-  assert.match(view.container.textContent, /120 ready · oldest 2h/)
   assert.match(view.container.textContent, /product: nothing ready/)
   assert.equal(button('Apply').disabled, true)
   const slider = view.container.querySelector('[data-lane="product"] input[type=range]')
@@ -130,7 +129,8 @@ test('the event opens the panel, fetches the saved window, and Apply PUTs', asyn
   assert.equal(calls.at(-1)[1], 'GET', 'a successful Apply refetches')
   assert.equal(button('Apply').disabled, true, 'and clears the draft')
   await view.click(button('24h'))
-  assert.equal(calls.at(-1)[0], '/v1/lanes?hours=24')
+  assert.ok(calls.some((c) => c[0] === '/v1/lanes?hours=24'), 'the new window is fetched')
+  assert.ok(calls.some((c) => c[0] === '/v1/lanes/flow?window=24h'), 'and so are its cards')
   await view.click(button('Board'))
   assert.deepEqual(host.navigated, ['/kanban'], 'the panel still leads to the board')
   assert.equal(document.querySelector('[data-lane="product"]'), null, 'and collapses')
@@ -416,4 +416,215 @@ test('clicking a lane pill expands and scrolls to that row', async () => {
   } finally {
     HTMLElement.prototype.scrollIntoView = orig
   }
+})
+
+// ── Floor and Flow ─────────────────────────────────────────────────────────
+const card = (id, lane, step, reason, over = {}) => ({ id, title: `card ${id}`, lane, step, reason, age_h: 2, pr: null, source: { kind: 'session', id: 'sess-a', project: 'Hermes' }, ...over })
+
+function flowSnap(over = {}) {
+  const cards = [
+    card('t1', 'product', 'intake', 'triage', { source: { kind: 'automation', id: 'bb-tuner', project: null } }),
+    card('t2', 'product', 'waiting', 'dep', { pr: 'https://example.com/o/r/pull/12' }),
+    card('t3', 'product', 'waiting', 'you', { age_h: 30 }),
+    card('t4', 'product', 'ready', 'slot'),
+    card('t5', 'infra', 'waiting', 'dep', { pr: 'https://example.com/o/r/pull/12' }),
+    card('t6', 'infra', 'waiting', 'dep', { pr: 'https://example.com/o/r/pull/12' }),
+    card('t7', 'infra', 'waiting', 'dep'),
+    card('t8', 'infra', 'waiting', 'dep'),
+    card('t9', 'infra', 'running', 'run'),
+    card('t10', 'infra', 'ci', 'review', { source: { kind: 'user', id: 'user', project: 'Baby Bear' } }),
+    card('t11', 'infra', 'intake', 'limit:cards_per_day')
+  ]
+  return {
+    window: '6h', configured: true, cards,
+    lanes: {
+      product: { done: 4, run_hours: 1.8, cost_usd: 15.04, limits: { cards_per_day: 20, usd_per_day: null }, usage: { cards_today: 3, usd_today: 1.5 } },
+      infra: { done: 33, run_hours: 4.2, cost_usd: 45.2, limits: { cards_per_day: 50, usd_per_day: 40 }, usage: { cards_today: 50, usd_today: 45.21 } }
+    },
+    ...over
+  }
+}
+const withUnclassified = () => { const f = flowSnap(); f.cards.push(card('tu', 'infra', 'landing_unclassified', 'review')); return f }
+const panelProps = (over = {}) => ({ snap: snap(), flow: flowSnap(), windowHours: 6, onWindow() {}, onApply() {}, ...over })
+const cell = (lane, step) => document.querySelector(`[data-lane="${lane}"] [data-step="${step}"]`)
+
+test('tab switch shows Floor or Flow and the last tab is remembered', async () => {
+  const view = await mount(React.createElement(P.Panel, panelProps()))
+  assert.ok(document.querySelector('[data-view=floor]'), 'Floor is the default')
+  assert.equal(document.querySelector('[data-view=flow]'), null)
+  await view.click(button('Flow'))
+  assert.ok(document.querySelector('[data-view=flow]'))
+  assert.equal(document.querySelector('[data-view=floor]'), null)
+  assert.equal(localStorage.getItem(P.TAB_KEY), 'flow')
+  assert.equal(button('Flow').getAttribute('aria-selected'), 'true')
+  await view.close()
+  const again = await mount(React.createElement(P.Panel, panelProps()))
+  assert.ok(document.querySelector('[data-view=flow]'), 'a remount restores the Flow tab')
+  await again.click(button('Floor'))
+  assert.equal(localStorage.getItem(P.TAB_KEY), 'floor')
+  localStorage.setItem(P.TAB_KEY, 'nonsense')
+  assert.equal(P.loadTab(), 'floor')
+})
+
+test('Floor: cell counts, box per card, and hatching only where cards pile up', async () => {
+  await mount(React.createElement(P.Panel, panelProps()))
+  const count = (lane, step) => Number(cell(lane, step).getAttribute('data-count'))
+  assert.equal(count('product', 'waiting'), 2)
+  assert.equal(count('infra', 'waiting'), 4)
+  assert.equal(count('infra', 'running'), 1)
+  assert.equal(count('product', 'ci'), 0)
+  assert.equal(cell('infra', 'waiting').querySelectorAll('.hermes-lanes-box').length, 4)
+  assert.equal(cell('infra', 'waiting').getAttribute('data-piling'), '1', '4 cards pile up')
+  assert.equal(cell('product', 'waiting').getAttribute('data-piling'), '1', 'any card that needs you piles up')
+  assert.equal(cell('product', 'intake').getAttribute('data-piling'), '0')
+  assert.equal(cell('infra', 'running').getAttribute('data-piling'), '0')
+  assert.ok(cell('infra', 'waiting').classList.contains('is-piling'))
+  assert.equal(cell('infra', 'done').textContent.includes('33'), true, 'Done shows the window throughput')
+  assert.equal(document.querySelectorAll('.hermes-lanes-box').length, flowSnap().cards.length, 'one box per open card')
+  const box = cell('product', 'waiting').querySelector('[data-reason=you]')
+  assert.match(box.getAttribute('title'), /card t3\nneeds you · 30h old/)
+  assert.equal(cell('product', 'waiting').querySelector('.hermes-lanes-box').getAttribute('data-reason'), 'you', 'needs-you boxes come first')
+})
+
+test('Floor: the unclassified column exists only while a card is in it', async () => {
+  const view = await mount(React.createElement(P.Panel, panelProps()))
+  assert.equal(document.querySelector('[data-column=landing_unclassified]'), null)
+  assert.equal(document.querySelectorAll('[data-column]').length, 10)
+  assert.equal(P.hasUnclassified(flowSnap()), false)
+  await view.close()
+  await mount(React.createElement(P.Panel, panelProps({ flow: withUnclassified() })))
+  assert.ok(document.querySelector('[data-column=landing_unclassified]'))
+  assert.equal(document.querySelectorAll('[data-column]').length, 11)
+  assert.equal(cell('infra', 'landing_unclassified').getAttribute('data-count'), '1')
+  assert.equal(cell('product', 'landing_unclassified').getAttribute('data-count'), '0')
+  // A step this panel has no column for is not dropped: it lands in the unclassified column.
+  assert.equal(P.stepOf({ step: 'mystery' }), 'landing_unclassified')
+})
+
+test('clicking a box opens that card', async () => {
+  const opened = []
+  await mount(React.createElement(P.Panel, panelProps({ onOpenCard: (id) => opened.push(id) })))
+  await React.act(async () => cell('infra', 'running').querySelector('.hermes-lanes-box').click())
+  assert.deepEqual(opened, ['t9'])
+  const hooks = []
+  assert.equal(P.openCard('t9', 'hub', { __hermesKanbanOpenTask: (...a) => (hooks.push(a), true) }), 'drawer')
+  assert.deepEqual(hooks, [['t9', undefined, 'hub']])
+  const nav = []
+  assert.equal(P.openCard('t9', undefined, {}, (p) => nav.push(p)), 'page')
+  assert.deepEqual(nav, ['/kanban'])
+})
+
+test('valve Apply calls lanes set with the changed share and daily caps, per lane', async () => {
+  const applied = []
+  const view = await mount(React.createElement(P.Panel, panelProps({ onApply: (p) => { applied.push(p); return false } })))
+  assert.equal(button('Apply').disabled, true)
+  const type = async (selector, value) => {
+    const input = document.querySelector(selector)
+    await React.act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, value)
+      input.dispatchEvent(new window.Event('input', { bubbles: true }))
+    })
+    await view.flush()
+  }
+  assert.equal(document.querySelector('[data-lane=infra] [data-valve=cards_per_day] input').value, '50', 'saved cap shown')
+  assert.equal(document.querySelector('[data-lane=product] [data-valve=usd_per_day] input').value, '', 'unset cap is empty')
+  assert.match(document.querySelector('[data-lane=infra] [data-valve=cards_per_day]').textContent, /50 today/)
+  await type('[data-lane=infra] [data-valve=cards_per_day] input', '60')
+  await type('[data-lane=product] [data-valve=usd_per_day] input', '12.5')
+  await type('[data-lane=product] [data-valve=cards_per_day] input', '20') // equals the saved value: no change
+  await view.click(button('Apply'))
+  assert.deepEqual(applied, [[['infra', { cards_per_day: 60 }], ['product', { usd_per_day: 12.5 }]]])
+  await view.click(button('Reset'))
+  assert.equal(button('Apply').disabled, true)
+  assert.equal(document.querySelector('[data-lane=infra] [data-valve=cards_per_day] input').value, '50', 'Reset restores the saved cap')
+  assert.deepEqual(P.changes(snap(), { infra: { cards_per_day: 50, usd_per_day: null } }, flowSnap()), [])
+})
+
+test('Apply from the expanded strip PUTs the caps to the lanes API', async () => {
+  const calls = []
+  const ctx = ctxWith(calls, (path) => (path.startsWith('/v1/lanes/flow') ? flowSnap() : snap()))
+  const view = await mount(React.createElement(P.Lanes, { ctx }))
+  await React.act(async () => window.dispatchEvent(new window.Event('hermes-show-lanes')))
+  await view.flush()
+  assert.ok(calls.some((c) => c[0] === '/v1/lanes/flow?window=6h'), 'cards are read once the strip is open')
+  const input = document.querySelector('[data-lane=product] [data-valve=usd_per_day] input')
+  await React.act(async () => {
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, '9')
+    input.dispatchEvent(new window.Event('input', { bubbles: true }))
+  })
+  await view.flush()
+  await view.click(button('Apply'))
+  assert.deepEqual(calls.filter((c) => c[1] === 'PUT'), [['/v1/lanes/product', 'PUT', { usd_per_day: 9 }]])
+})
+
+test('Flow: node and edge totals in every layer equal the card count', async () => {
+  const flow = withUnclassified()
+  for (const by of ['project', 'source']) {
+    const g = P.flowGraph(flow, by)
+    const sum = (list) => list.reduce((s, n) => s + n.count, 0)
+    assert.equal(g.total, flow.cards.length)
+    assert.equal(sum(g.sources), flow.cards.length, `${by}: sources`)
+    assert.equal(sum(g.lanes), flow.cards.length, `${by}: lanes`)
+    assert.equal(sum(g.sinks), flow.cards.length, `${by}: sinks`)
+    assert.equal(sum(g.edges.sourceLane), flow.cards.length, `${by}: source→lane edges`)
+    assert.equal(sum(g.edges.laneSink), flow.cards.length, `${by}: lane→sink edges`)
+    const into = (edges, key) => sum(edges.filter((e) => e.to === key))
+    for (const n of g.lanes) assert.equal(into(g.edges.sourceLane, n.key), n.count)
+    for (const n of g.sinks) assert.equal(into(g.edges.laneSink, n.key), n.count)
+    const geo = P.sankey(g)
+    assert.equal(geo.links.reduce((s, l) => s + l.count, 0), 2 * flow.cards.length)
+    assert.ok(geo.columns.flat().every((n) => Number.isFinite(n.y) && n.h > 0))
+  }
+  assert.deepEqual(P.flowGraph(flow, 'project').sources.map((s) => s.key).sort(), ['Baby Bear', 'Hermes', 'automations'])
+  assert.ok(P.flowGraph(flow, 'source').sources.some((s) => s.key === 'you (manual)'))
+  const view = await mount(React.createElement(P.Panel, panelProps({ flow })))
+  await view.click(button('Flow'))
+  for (const kind of ['source', 'lane', 'sink']) {
+    const nodes = [...document.querySelectorAll(`[data-flow-node=${kind}]`)]
+    assert.equal(nodes.reduce((s, n) => s + Number(n.getAttribute('data-count')), 0), flow.cards.length, `${kind} nodes in the DOM`)
+  }
+  const edges = [...document.querySelectorAll('[data-edge]')]
+  assert.equal(edges.reduce((s, e) => s + Number(e.getAttribute('data-count')), 0), 2 * flow.cards.length)
+})
+
+test('Flow: flowing steps vs dams, what clears each dam, the project/source toggle and the limits line', async () => {
+  const view = await mount(React.createElement(P.Panel, panelProps()))
+  await view.click(button('Flow'))
+  const sink = (key) => document.querySelector(`[data-flow-node=sink][data-key="${key}"]`)
+  assert.ok(sink('step:running') && sink('step:ci'), 'running and CI work flows')
+  assert.ok(sink('dam:dep') && sink('dam:you') && sink('dam:limit:cards_per_day'), 'waiting work is a dam named by its reason')
+  assert.equal(sink('dam:dep').getAttribute('data-count'), '5')
+  const hint = (key) => document.querySelector(`[data-hint="${key}"]`).textContent
+  assert.equal(hint('dam:dep'), 'land #12 → frees 3 · oldest 2h')
+  assert.equal(hint('dam:you'), 'answer 1 ask · oldest 30h')
+  assert.match(hint('dam:limit:cards_per_day'), /raise cards\/day, or wait for local midnight/)
+  assert.match(hint('dam:slot'), /1 card needs a free worker/)
+  assert.equal(document.querySelector('[data-hint="step:running"]'), null, 'flowing work has nothing to clear')
+  assert.ok(document.querySelector('[data-flow-node=source][data-key=Hermes]'))
+  await view.click(button('by source'))
+  assert.ok(document.querySelector('[data-flow-node=source][data-key="session sess-a"]'))
+  assert.equal(localStorage.getItem(P.BY_KEY), 'source')
+  assert.match(document.querySelector('[data-limit-lane=infra]').textContent, /50\/50 cards.*\$45\.21\/\$40/)
+  assert.ok(document.querySelector('[data-limit-lane=infra] .hermes-lanes-warn'), 'a cap that is reached is flagged')
+  assert.equal(document.querySelector('[data-limit-lane=product] .hermes-lanes-warn'), null)
+  await view.click(button('Edit limits'))
+  assert.ok(document.querySelector('[data-view=floor]'), 'Edit limits goes to the valves')
+})
+
+test('an unavailable flow says so on both tabs and the lane rows still show their valves', async () => {
+  const view = await mount(React.createElement(P.Panel, panelProps({ flow: undefined, flowError: 'this Hermes core has no lanes flow support yet' })))
+  assert.match(view.container.textContent, /Cards unavailable: this Hermes core has no lanes flow support yet/)
+  assert.ok(document.querySelector('[data-lane=product] input[type=range]'))
+  await view.click(button('Flow'))
+  assert.match(view.container.textContent, /Flow unavailable: this Hermes core has no lanes flow support yet/)
+})
+
+test('cards are read only while the strip is open, from the window picked', async () => {
+  const calls = []
+  const view = await mount(React.createElement(P.Lanes, { ctx: ctxWith(calls, (path) => (path.startsWith('/v1/lanes/flow') ? flowSnap() : snap())) }))
+  assert.equal(calls.filter((c) => c[0].startsWith('/v1/lanes/flow')).length, 0, 'collapsed: no flow request')
+  await view.click(button('Expand lanes'))
+  await view.click(button('7d'))
+  assert.ok(calls.some((c) => c[0] === '/v1/lanes/flow?window=7d'))
+  assert.equal(P.flowWindow(1), '1h')
 })

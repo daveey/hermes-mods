@@ -97,6 +97,40 @@ def test_reads_are_cached_per_window_and_a_write_drops_the_cache(api, core):
     assert core.snapshots == 4  # the write returned a fresh read
 
 
+def test_daily_limits_reach_core_and_flow_is_served_cached(api, core, monkeypatch):
+    api.change("product", {"cards_per_day": 20, "usd_per_day": 12.5})
+    assert core.sets == [("product", {"share": None, "admit_per_day": None, "paused": None,
+                                      "cards_per_day": 20, "usd_per_day": 12.5})]
+    calls = []
+
+    class Flow:
+        def snapshot(self, _conn, *, window):
+            calls.append(window)
+            return {"window": window, "cards": [], "lanes": {"product": {"done": 1}}}
+
+    monkeypatch.setattr(api, "flow_core", lambda: (core, Flow()))
+    assert api.flow("6h", now=100)["configured"] is True
+    api.flow("6h", now=101)
+    assert calls == ["6h"]
+    api.change("product", {"share": 5})
+    api.flow("6h", now=102)
+    assert calls == ["6h", "6h"]  # a write drops the cached flow
+    monkeypatch.setattr(api, "flow_core", lambda: None)
+    assert api.flow("1h")["configured"] is False
+
+
+def test_flow_route_validates_the_window(api, core, monkeypatch):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setattr(api, "flow_core", lambda: None)
+    app = FastAPI()
+    app.include_router(api.router)
+    client = TestClient(app)
+    assert client.get("/v1/lanes/flow?window=2h").status_code == 400
+    assert client.get("/v1/lanes/flow?window=24h").json()["configured"] is False
+
+
 @pytest.mark.parametrize("body", [{"weight": 3}, {"paused": "yes"}])
 def test_bad_write_bodies_are_refused(api, core, body):
     with pytest.raises(ValueError):

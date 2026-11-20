@@ -1,6 +1,8 @@
 // Lanes: how worker time is split between project lanes, and the controls for it.
 // Lanes live on one gateway; the strip finds it (createSource below) and reads and writes there.
 // Docked at the top of the window (shell.topStrip). Collapsed by default: one line of per-lane pills.
+// Expanded = two tabs, Floor (lanes × steps grid of cards, hatched where they pile up, with the lane valves) and
+// Flow (Sankey of sources → lanes → flowing steps / dams); both read GET /v1/lanes/flow?window= only while open.
 // The status-bar task pill (KANBAN_CHIP_EVENT) and the palette "Show lanes" command expand it.
 // Data: GET /v1/lanes?hours=… (plugins/lanes): per lane target and actual share of run-hours, running,
 // ready, held at the gate, blocked_on_you (human asks), open, done, tokens and estimated cost.
@@ -102,7 +104,14 @@ export function createSource(ctx, hostRef = host, clock = () => Date.now()) {
     if (!target) throw Error('No gateway with lanes configured')
     return ctx.rest(`/v1/lanes/${encodeURIComponent(lane)}`, opts(target, { method: 'PUT', body }))
   }
-  return { read, write, target: () => chosen }
+  // Open cards by step and reason, from the gateway that steers lanes; only asked while the panel is open.
+  async function flow(window, target = chosen) {
+    if (!target) throw Error('No gateway with lanes configured')
+    const body = await ctx.rest(`/v1/lanes/flow?window=${encodeURIComponent(window)}`, opts(target))
+    if (body?.configured === false) throw Error(body.reason || 'lanes flow is not available')
+    return body
+  }
+  return { read, write, flow, target: () => chosen }
 }
 
 // One source per plugin ctx, not per mount: the status bar remounts contributions often.
@@ -197,14 +206,214 @@ export function cost(row) {
   }
 }
 
-/** The PUT bodies a draft needs, one per changed lane. */
-export function changes(snap, draft) {
+/** The PUT bodies a draft needs, one per changed lane. `flow` supplies the saved cards/day and $/day to compare with. */
+export function changes(snap, draft, flow) {
   return Object.entries(draft).map(([name, d]) => {
     const body = {}
     if (d.share != null && d.share !== snap.lanes[name]?.share) body.share = d.share
     if (d.paused != null && d.paused !== snap.lanes[name]?.paused) body.paused = d.paused
+    for (const key of LIMIT_KEYS) if (d[key] != null && d[key] !== flow?.lanes?.[name]?.limits?.[key]) body[key] = d[key]
     return [name, body]
   }).filter(([, body]) => Object.keys(body).length)
+}
+
+// ── Floor and Flow: pure helpers ──────────────────────────────────────────
+// Data is `GET /v1/lanes/flow?window=` (core `hermes kanban lanes flow --json`): open cards
+// {id,title,lane,step,reason,source{kind,id,project},age_h,pr} and per lane {done,run_hours,cost_usd,limits,usage}.
+
+export const LIMIT_KEYS = ['cards_per_day', 'usd_per_day']
+export const TAB_KEY = 'hermes-lanes-tab'
+export const BY_KEY = 'hermes-lanes-flow-by'
+export const TABS = [['floor', 'Floor'], ['flow', 'Flow']]
+export const UNCLASSIFIED = 'landing_unclassified'
+export const PILE_AT = 4
+export const STEPS = [
+  ['intake', 'Intake', 'triage + lane gate'], ['waiting', 'Waiting', 'on a card, time or you'], ['ready', 'Ready', 'needs a worker'],
+  ['running', 'Running', 'on a worker'], ['review', 'Review', 'PR review'], ['ci', 'CI', 'required checks'],
+  ['merge', 'Merge', 'approved + green'], ['deploy', 'Deploy', 'merged, not live'], ['test', 'Test', 'live verification'],
+  ['done', 'Done', 'this window']
+]
+const STEP_KEYS = STEPS.map(([key]) => key)
+// Semantic colours (status, not chrome), so they do not follow the theme.
+export const REASONS = {
+  you: ['needs you', '#ff5d5d'], dep: ['waits on a card', '#f5c542'], gate: ['held at gate', '#c49bff'], time: ['scheduled', '#6b7280'],
+  slot: ['no free worker', '#ff9f43'], quota: ['model quota', '#ff9f43'], triage: ['unspecified', '#9aa3b2'],
+  run: ['running', '#4c9bff'], review: ['review / CI', '#3ddc97'],
+  'limit:cards_per_day': ['over cards/day', '#e08bd0'], 'limit:usd_per_day': ['over $/day', '#e08bd0']
+}
+const REASON_ORDER = Object.keys(REASONS)
+export function reasonInfo(reason) {
+  const [label, color] = REASONS[reason] || (String(reason).startsWith('limit:') ? ['over limit', '#e08bd0'] : [String(reason || 'unknown'), '#9aa3b2'])
+  return { label, color }
+}
+
+export function loadTab(storage = globalThis.localStorage) {
+  try { const v = storage?.getItem(TAB_KEY); return TABS.some(([key]) => key === v) ? v : 'floor' } catch { return 'floor' }
+}
+export function saveTab(tab, storage = globalThis.localStorage) { try { storage?.setItem(TAB_KEY, tab) } catch {} }
+export function loadBy(storage = globalThis.localStorage) {
+  try { return storage?.getItem(BY_KEY) === 'source' ? 'source' : 'project' } catch { return 'project' }
+}
+export function saveBy(by, storage = globalThis.localStorage) { try { storage?.setItem(BY_KEY, by) } catch {} }
+
+/** A card's column: any step core sent that this panel has no column for is shown as unclassified, never dropped. */
+export const stepOf = (card) => (STEP_KEYS.includes(card?.step) ? card.step : UNCLASSIFIED)
+
+export const hasUnclassified = (flow) => (flow?.cards || []).some((c) => stepOf(c) === UNCLASSIFIED)
+
+/** Columns of the Floor: the ten steps, plus the unclassified column only while a card sits in it. */
+export function floorColumns(flow) {
+  const cols = STEPS.map(([key, label, hint]) => ({ key, label, hint }))
+  if (hasUnclassified(flow)) cols.push({ key: UNCLASSIFIED, label: 'Unclassified', hint: 'landing stage not provable' })
+  return cols
+}
+
+const reasonRank = (r) => { const i = REASON_ORDER.indexOf(r); return i < 0 ? REASON_ORDER.length : i }
+
+/** { lane: { step: [cards] } }, a cell sorted by reason (you first) then oldest first. */
+export function floorGrid(flow, names = []) {
+  const grid = {}
+  for (const n of names) grid[n] = {}
+  for (const card of flow?.cards || []) ((grid[card.lane] ||= {})[stepOf(card)] ||= []).push(card)
+  for (const cells of Object.values(grid)) {
+    for (const list of Object.values(cells)) list.sort((a, b) => reasonRank(a.reason) - reasonRank(b.reason) || (b.age_h || 0) - (a.age_h || 0))
+  }
+  return grid
+}
+
+/** A cell is piling up when it holds PILE_AT or more cards, or any card that needs you. */
+export const piling = (cards) => (cards?.length || 0) >= PILE_AT || (cards || []).some((c) => c.reason === 'you')
+
+export function ageHours(hours) {
+  const h = Number(hours) || 0
+  if (h < 1) return `${Math.max(1, Math.round(h * 60))}m`
+  if (h < 48) return `${Math.round(h)}h`
+  return `${Math.round(h / 24)}d`
+}
+
+const prLabel = (url) => { const m = /\/pull\/(\d+)/.exec(String(url || '')); return m ? `#${m[1]}` : String(url || '').split('/').filter(Boolean).pop() || '' }
+
+/** What clears a dam: the PR whose merge frees the most cards, the asks to answer, the cap to raise. */
+export function damHint(reason, cards) {
+  const n = cards.length
+  const plural = (word) => `${n} ${word}${n === 1 ? '' : 's'}`
+  const oldest = ageHours(Math.max(0, ...cards.map((c) => Number(c.age_h) || 0)))
+  let text
+  if (reason === 'you') text = `answer ${plural('ask')}`
+  else if (reason === 'dep') {
+    const byPr = new Map()
+    for (const c of cards) if (c.pr) byPr.set(c.pr, (byPr.get(c.pr) || 0) + 1)
+    const top = [...byPr.entries()].sort((a, b) => b[1] - a[1])[0]
+    text = top ? `land ${prLabel(top[0])} → frees ${top[1]}` : `${plural('card')} wait on an open parent`
+  } else if (reason === 'gate') text = `admit or release ${n} held`
+  else if (reason === 'limit:cards_per_day') text = 'raise cards/day, or wait for local midnight'
+  else if (reason === 'limit:usd_per_day') text = 'raise $/day, or wait for local midnight'
+  else if (reason === 'slot') text = `${plural('card')} ${n === 1 ? 'needs' : 'need'} a free worker`
+  else if (reason === 'quota') text = 'waits for model quota'
+  else if (reason === 'time') text = 'wakes on its schedule'
+  else if (reason === 'triage') text = `specify ${plural('card')}`
+  else text = `${plural('card')} held`
+  return `${text} · oldest ${oldest}`
+}
+
+const FLOWING = new Set(['run', 'review'])
+const shortId = (id) => (String(id).length > 22 ? `${String(id).slice(0, 21)}…` : String(id))
+
+/** The source node a card is drawn from: its project, or the session / automation that created it. */
+export function sourceLabel(card, by) {
+  const s = card.source || {}
+  if (by === 'project') return s.project || (s.kind === 'automation' ? 'automations' : s.kind === 'user' ? 'you (manual)' : 'no project')
+  if (s.kind === 'user') return 'you (manual)'
+  return `${s.kind === 'session' ? 'session' : 'auto'} ${shortId(s.id || '?')}`
+}
+
+const SOURCE_CAP = 6
+
+/**
+ * Sankey data: sources → lanes → sinks. A sink is a flowing step (running, review…) or a dam named by its reason.
+ * Every card is in exactly one source, lane and sink, so each layer's totals equal the card count.
+ */
+export function flowGraph(flow, by = 'project') {
+  const cards = flow?.cards || []
+  const counts = new Map()
+  for (const c of cards) counts.set(sourceLabel(c, by), (counts.get(sourceLabel(c, by)) || 0) + 1)
+  const keep = new Set([...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, SOURCE_CAP).map(([k]) => k))
+  const src = (c) => { const label = sourceLabel(c, by); return keep.has(label) ? label : 'other' }
+  const sinkKey = (c) => (FLOWING.has(c.reason) ? `step:${stepOf(c)}` : `dam:${c.reason}`)
+  const nodes = { source: new Map(), lane: new Map(), sink: new Map() }
+  const edges = { sl: new Map(), lk: new Map() }
+  const bump = (map, key, by1 = 1) => map.set(key, (map.get(key) || 0) + by1)
+  for (const c of cards) {
+    const s = src(c)
+    const k = sinkKey(c)
+    bump(nodes.source, s); bump(nodes.lane, c.lane); bump(nodes.sink, k)
+    bump(edges.sl, `${s}\u0000${c.lane}`); bump(edges.lk, `${c.lane}\u0000${k}`)
+  }
+  const bySink = {}
+  for (const c of cards) (bySink[sinkKey(c)] ||= []).push(c)
+  const sinkOrder = (key) => (key.startsWith('step:') ? STEP_KEYS.indexOf(key.slice(5)) - 100 : reasonRank(key.slice(4)))
+  const laneOrder = Object.keys(flow?.lanes || {})
+  const list = (map, order) => [...map.entries()].map(([key, count]) => ({ key, count })).sort(order)
+  const edgeList = (map) => [...map.entries()].map(([k, count]) => { const [from, to] = k.split('\u0000'); return { from, to, count } })
+  return {
+    total: cards.length,
+    sources: list(nodes.source, (a, b) => b.count - a.count || a.key.localeCompare(b.key)),
+    lanes: list(nodes.lane, (a, b) => laneOrder.indexOf(a.key) - laneOrder.indexOf(b.key) || a.key.localeCompare(b.key)),
+    sinks: list(nodes.sink, (a, b) => sinkOrder(a.key) - sinkOrder(b.key)).map((n) => {
+      const dam = n.key.startsWith('dam:')
+      const reason = dam ? n.key.slice(4) : null
+      return { ...n, dam, label: dam ? reasonInfo(reason).label : STEPS.find(([k]) => k === n.key.slice(5))?.[1] || n.key.slice(5),
+        color: dam ? reasonInfo(reason).color : reasonInfo(n.key.slice(5) === 'running' ? 'run' : 'review').color,
+        hint: dam ? damHint(reason, bySink[n.key]) : '' }
+    }),
+    edges: { sourceLane: edgeList(edges.sl), laneSink: edgeList(edges.lk) }
+  }
+}
+
+/** Geometry for the Sankey: node boxes per column and one stroked curve per edge. Pure, so tests can check it. */
+export function sankey(graph, { width = 960, height = 300, nodeW = 14, gap = 6, minH = 10, cols = [0, 330, 640] } = {}) {
+  const place = (list, x) => {
+    const free = height - gap * Math.max(0, list.length - 1) - minH * list.length
+    const total = list.reduce((s, n) => s + n.count, 0) || 1
+    let y = 0
+    return list.map((n) => {
+      const h = minH + (Math.max(0, free) * n.count) / total
+      const box = { ...n, x, y, h, outY: y, inY: y }
+      y += h + gap
+      return box
+    })
+  }
+  const columns = [place(graph.sources, cols[0]), place(graph.lanes, cols[1]), place(graph.sinks, cols[2])]
+  const find = (col, key) => columns[col].find((n) => n.key === key)
+  const link = (from, to, count, lane) => {
+    const w1 = (from.h * count) / from.count
+    const w2 = (to.h * count) / to.count
+    const y1 = from.outY + w1 / 2
+    const y2 = to.inY + w2 / 2
+    from.outY += w1; to.inY += w2
+    const x1 = from.x + nodeW
+    const x2 = to.x
+    const mid = (x1 + x2) / 2
+    return { from: from.key, to: to.key, count, lane, width: Math.max(1, (w1 + w2) / 2), d: `M${x1},${y1} C${mid},${y1} ${mid},${y2} ${x2},${y2}` }
+  }
+  const order = (edges, ci) => [...edges].sort((a, b) => columns[ci + 1].findIndex((n) => n.key === a.to) - columns[ci + 1].findIndex((n) => n.key === b.to))
+  const links = [
+    ...order(graph.edges.sourceLane, 0).map((e) => link(find(0, e.from), find(1, e.to), e.count, e.to)),
+    ...order(graph.edges.laneSink, 1).map((e) => link(find(1, e.from), find(2, e.to), e.count, e.from))
+  ]
+  return { width, height, nodeW, columns, links }
+}
+
+const HOUR_WINDOW = new Map(WINDOWS.map(([hours, label]) => [hours, label]))
+/** The flow API names windows `1h|6h|24h|7d`; the panel keeps hours. */
+export const flowWindow = (hours) => HOUR_WINDOW.get(hours) || '6h'
+
+/** Open the card's drawer where Desktop has the hook, then the task popup, then the Kanban page. */
+export function openCard(id, connectionId, win = typeof window !== 'undefined' ? window : {}, nav = (p) => host.navigate?.(p)) {
+  if (typeof win.__hermesKanbanOpenTask === 'function' && win.__hermesKanbanOpenTask(id, undefined, connectionId)) return 'drawer'
+  if (typeof win.__taskMentionsOpen === 'function') { win.__taskMentionsOpen(id); return 'popup' }
+  nav('/kanban')
+  return 'page'
 }
 
 /** Open-card mix for a mini pill: blue running, yellow not ready, red human-blocked. Older cores omit blocked_on_you. */
@@ -223,46 +432,146 @@ function laneSelector(name) {
 
 // ── components ────────────────────────────────────────────────────────────
 
-function Split({ label, list, field }) {
-  return h('div', { className: 'hermes-lanes-split' },
-    h('span', { className: 'hermes-lanes-splitlabel' }, label),
-    h('div', { className: 'hermes-lanes-bar', role: 'img', 'aria-label': `${label} split: ${list.map((r) => `${r.name} ${pct(r[field])}`).join(', ')}` },
-      list.map((r) => h('span', { key: r.name, title: `${r.name} ${pct(r[field])}`, style: { flex: `${Math.max(r[field], 0)} 1 0`, background: r.color } }))))
-}
+const num = (v) => (v == null ? '' : String(v))
+const usd = (v) => `$${Number(v) >= 100 ? Math.round(v) : Number(v || 0).toFixed(Number(v) % 1 ? 2 : 0)}`
 
-function Row({ row, maxOpen, onShare, onPause, saving }) {
+/** One lane's four valves. Share and the two daily caps are editable; workers is a gauge (core has no write for it). */
+function Valves({ row, limits, usage, draft, saving, onShare, onPause, onLimit }) {
   const note = drift(row)
-  const c = cost(row)
-  return h('div', { className: 'hermes-lanes-row', 'data-lane': row.name },
-    h('div', { className: 'hermes-lanes-name' },
-      h('span', { className: 'hermes-lanes-dot', style: { background: row.color }, 'aria-hidden': 'true' }),
-      h('div', null,
-        h('div', { className: 'hermes-lanes-title' }, row.name),
-        h('div', { className: 'hermes-lanes-sub', title: row.describe || undefined },
-          row.gated ? `gated · ${row.admitted_today}${row.admit_per_day == null ? '' : `/${row.admit_per_day}`} admitted today` : (row.describe || '')))),
+  const cap = (key, label, step, used, fmt) => {
+    const value = draft?.[key] !== undefined ? draft[key] : limits?.[key]
+    return h('label', { className: 'hermes-lanes-valve', 'data-valve': key },
+      h('span', { className: 'hermes-lanes-valvename' }, label),
+      h('input', { type: 'number', min: 0, step, placeholder: '∞', value: num(value), 'aria-label': `${row.name} ${label}`, disabled: saving,
+        onChange: (e) => onLimit(row.name, key, e.target.value === '' ? null : Number(e.target.value)) }),
+      h('span', { className: 'hermes-lanes-dim' }, usage?.[used] == null ? '' : `${fmt(usage[used])} today`))
+  }
+  return h('div', { className: 'hermes-lanes-valves' },
     h('div', { className: 'hermes-lanes-volume' },
       h('input', { type: 'range', min: 0, max: 100, step: 5, value: row.share, 'aria-label': `${row.name} volume`, disabled: saving, onChange: (e) => onShare(row.name, Number(e.target.value)) }),
       h('button', { type: 'button', className: row.paused ? 'is-paused' : '', 'aria-pressed': row.paused, disabled: saving, onClick: () => onPause(row.name, !row.paused) }, row.paused ? 'Paused' : 'Pause')),
-    h('div', null,
-      h('div', null, h('span', { className: 'hermes-lanes-big' }, pct(row.target)), h('span', { className: 'hermes-lanes-dim' }, ' target')),
-      h('div', { className: note ? 'hermes-lanes-warn' : 'hermes-lanes-dim' }, `${pct(row.actual)} actual${note ? ` · ${note}` : ''}`)),
-    h('div', null,
-      h('div', null, h('span', { className: 'hermes-lanes-big' }, row.ready), h('span', { className: 'hermes-lanes-dim' }, ` ready${row.oldest_ready_s != null ? ` · oldest ${age(row.oldest_ready_s)}` : ''}`)),
-      h('div', { className: 'hermes-lanes-dim' }, `${row.running} running · ${row.held} held · ${row.open} open`),
-      h('div', { className: 'hermes-lanes-meter', 'aria-hidden': 'true' }, h('span', { style: { width: `${Math.round((row.open / maxOpen) * 100)}%`, background: row.color } }))),
-    h('div', null,
-      h('div', null, `${row.done} done · ${hours(row.run_seconds)} run-h`),
-      h('div', { className: 'hermes-lanes-dim' }, `${row.runs} runs`)),
-    h('div', { className: 'hermes-lanes-cost', title: c.title }, c.text))
+    h('div', { className: 'hermes-lanes-dim' }, h('span', { className: 'hermes-lanes-big' }, pct(row.target)), ' target',
+      h('span', { className: note ? 'hermes-lanes-warn' : '' }, ` · ${pct(row.actual)} actual${note ? ` · ${note}` : ''}`)),
+    h('div', { className: 'hermes-lanes-dim', 'data-valve': 'workers' }, `workers ${row.running}${limits?.max_workers == null ? '' : `/${limits.max_workers}`} running`),
+    cap('cards_per_day', 'cards/day', 1, 'cards_today', (v) => String(v)),
+    cap('usd_per_day', '$/day', 0.5, 'usd_today', usd))
 }
 
-export function Panel({ snap, windowHours, onWindow, onApply, saving, error, onBoard }) {
+function Cell({ column, cards, lane, flowLane, onOpen }) {
+  const pile = piling(cards)
+  const shown = cards.slice(0, 16)
+  if (column.key === 'done') {
+    return h('div', { className: 'hermes-lanes-cell', 'data-step': 'done', 'data-count': flowLane?.done ?? 0 },
+      h('div', { className: 'hermes-lanes-count' }, flowLane?.done ?? 0),
+      h('div', { className: 'hermes-lanes-dim' }, flowLane ? `${flowLane.run_hours ?? 0} run-h${flowLane.cost_usd ? ` · ${usd(flowLane.cost_usd)}` : ''}` : ''))
+  }
+  const tally = {}
+  for (const c of cards) tally[c.reason] = (tally[c.reason] || 0) + 1
+  return h('div', { className: `hermes-lanes-cell${pile ? ' is-piling' : ''}`, 'data-step': column.key, 'data-count': cards.length, 'data-piling': pile ? '1' : '0' },
+    h('div', { className: 'hermes-lanes-count' }, cards.length || '·'),
+    h('div', { className: 'hermes-lanes-boxes' }, shown.map((c) => {
+      const info = reasonInfo(c.reason)
+      return h('button', {
+        key: c.id, type: 'button', className: 'hermes-lanes-box', 'data-card': c.id, 'data-reason': c.reason,
+        title: `${c.title || c.id}\n${info.label} · ${ageHours(c.age_h)} old${c.pr ? ` · ${prLabel(c.pr)}` : ''}`, 'aria-label': `${c.title || c.id}, ${info.label}`,
+        style: { background: info.color }, onClick: () => onOpen(c.id)
+      })
+    }), cards.length > shown.length ? h('span', { className: 'hermes-lanes-dim' }, `+${cards.length - shown.length}`) : null),
+    cards.length ? h('div', { className: 'hermes-lanes-dim hermes-lanes-why' }, Object.entries(tally).sort((a, b) => reasonRank(a[0]) - reasonRank(b[0])).slice(0, 2)
+      .map(([r, n]) => `${n} ${reasonInfo(r).label}`).join(' · ')) : null)
+}
+
+/** Mockup A: lanes are rows, steps are columns, one box per card coloured by why it waits; piled-up cells are hatched. */
+export function Floor({ list, flow, flowError, draft, saving, edit, onOpen }) {
+  const columns = floorColumns(flow)
+  const names = [...new Set([...list.map((r) => r.name), ...Object.keys(flow?.lanes || {}), ...(flow?.cards || []).map((c) => c.lane)])]
+  const grid = floorGrid(flow, names)
+  const byName = Object.fromEntries(list.map((r) => [r.name, r]))
+  const style = { gridTemplateColumns: `240px repeat(${columns.length}, minmax(86px, 1fr))` }
+  return h('div', { className: 'hermes-lanes-floor', 'data-view': 'floor' },
+    flowError ? h('div', { className: 'hermes-lanes-warn' }, `Cards unavailable: ${flowError}`) : null,
+    h('div', { className: 'hermes-lanes-frow hermes-lanes-fhead', style },
+      h('span', null, 'Lane'),
+      columns.map((col) => h('span', { key: col.key, title: col.hint, 'data-column': col.key }, col.label))),
+    names.map((name) => {
+      const row = byName[name]
+      const flowLane = flow?.lanes?.[name]
+      return h('div', { key: name, className: 'hermes-lanes-frow', 'data-lane': name, style },
+        h('div', { className: 'hermes-lanes-lanecell' },
+          h('div', { className: 'hermes-lanes-name' },
+            h('span', { className: 'hermes-lanes-dot', style: { background: row?.color || '#b4bac6' }, 'aria-hidden': 'true' }),
+            h('div', null,
+              h('div', { className: 'hermes-lanes-title' }, name),
+              row ? h('div', { className: 'hermes-lanes-sub', title: row.describe || undefined },
+                row.gated ? `gated · ${row.admitted_today}${row.admit_per_day == null ? '' : `/${row.admit_per_day}`} admitted today` : (row.describe || '')) : null)),
+          row ? h(Valves, {
+            row, limits: flowLane?.limits, usage: flowLane?.usage, draft: draft[name], saving,
+            onShare: (n, share) => edit(n, { share }), onPause: (n, paused) => edit(n, { paused }), onLimit: (n, key, value) => edit(n, { [key]: value })
+          }) : null),
+        columns.map((col) => h(Cell, { key: col.key, column: col, cards: grid[name]?.[col.key] || [], lane: name, flowLane, onOpen })))
+    }),
+    h('div', { className: 'hermes-lanes-legend' }, ['you', 'dep', 'gate', 'limit:usd_per_day', 'time', 'slot', 'triage', 'run', 'review'].map((r) => h('span', { key: r },
+      h('i', { style: { background: reasonInfo(r).color } }), reasonInfo(r).label)), h('span', { className: 'hermes-lanes-dim' }, 'Hatched = piling up (4+ cards, or any that need you).')))
+}
+
+/** Mockup B: sources → lanes → flowing steps or dams, a dam labelled with what clears it. */
+export function Flow({ flow, flowError, by, onBy, list, onEditLimits }) {
+  if (!flow) return h('div', { className: 'hermes-lanes-note', 'data-view': 'flow' }, flowError ? `Flow unavailable: ${flowError}` : 'Loading…')
+  const graph = flowGraph(flow, by)
+  const geo = sankey(graph)
+  const color = Object.fromEntries(list.map((r) => [r.name, r.color]))
+  const laneColor = (name) => color[name] || '#b4bac6'
+  const hints = Object.fromEntries(graph.sinks.map((s) => [s.key, s.hint]))
+  const W = geo.width + 340
+  return h('div', { className: 'hermes-lanes-flow', 'data-view': 'flow' },
+    h('div', { className: 'hermes-lanes-head' },
+      h('span', { className: 'hermes-lanes-dim' }, `${graph.total} open cards: where each came from, which lane took it, and what holds it (dashed = dam)`),
+      h('span', { className: 'hermes-lanes-grow' }),
+      h('div', { className: 'hermes-lanes-seg', role: 'group', 'aria-label': 'Group sources' },
+        [['project', 'by project'], ['source', 'by source']].map(([value, label]) => h('button', { key: value, type: 'button', className: value === by ? 'is-on' : '', 'aria-pressed': value === by, onClick: () => onBy(value) }, label)))),
+    graph.total === 0 ? h('div', { className: 'hermes-lanes-note' }, 'No open cards in any lane.') : h('svg', {
+      className: 'hermes-lanes-sankey', viewBox: `0 0 ${W} ${geo.height + 16}`, width: '100%', role: 'img', 'aria-label': `${graph.total} open cards by source, lane and step`
+    },
+      h('g', { transform: 'translate(0,16)' },
+        h('text', { x: 0, y: -4, className: 'hermes-lanes-svglabel' }, 'SOURCES'),
+        h('text', { x: geo.columns[1][0]?.x ?? 330, y: -4, className: 'hermes-lanes-svglabel' }, 'LANES'),
+        h('text', { x: geo.columns[2][0]?.x ?? 640, y: -4, className: 'hermes-lanes-svglabel' }, 'FLOWING / DAMMED BY'),
+        geo.links.map((l, i) => h('path', { key: i, d: l.d, fill: 'none', stroke: laneColor(l.lane), strokeOpacity: 0.35, strokeWidth: l.width, 'data-edge': `${l.from}>${l.to}`, 'data-count': l.count })),
+        geo.columns.map((col, ci) => col.map((n) => {
+          const fill = ci === 1 ? laneColor(n.key) : ci === 2 ? n.color : 'var(--ui-stroke-secondary)'
+          return h('g', { key: `${ci}:${n.key}`, 'data-flow-node': ci === 0 ? 'source' : ci === 1 ? 'lane' : 'sink', 'data-key': n.key, 'data-count': n.count },
+            h('rect', { x: n.x, y: n.y, width: geo.nodeW, height: n.h, rx: 2, fill, stroke: ci === 2 && n.dam ? n.color : 'none', strokeDasharray: ci === 2 && n.dam ? '3 2' : undefined, fillOpacity: ci === 2 && n.dam ? 0.45 : 1 }),
+            ci === 0
+              ? h('text', { x: n.x + geo.nodeW + 6, y: n.y + Math.min(n.h, 14) - 3, className: 'hermes-lanes-svgtext' }, `${n.key} · ${n.count}`)
+              : h('text', { x: n.x + geo.nodeW + 6, y: n.y + Math.min(n.h, 14) - 3, className: 'hermes-lanes-svgtext' }, ci === 1 ? `${n.key} ${n.count}` : `${n.dam ? '⤓' : '→'} ${n.label} ${n.count}`),
+            ci === 2 && hints[n.key] ? h('text', { x: n.x + 190, y: n.y + Math.min(n.h, 14) - 3, className: 'hermes-lanes-svgtext hermes-lanes-dim', 'data-hint': n.key }, hints[n.key]) : null)
+        })))),
+    h('div', { className: 'hermes-lanes-limits' },
+      list.map((r) => {
+        const fl = flow.lanes?.[r.name]
+        const lim = fl?.limits || {}
+        const use = fl?.usage || {}
+        const over = (cap, used) => cap != null && Number(used) >= cap
+        return h('span', { key: r.name, className: 'hermes-lanes-limit', 'data-limit-lane': r.name },
+          h('span', { className: 'hermes-lanes-dot', style: { background: r.color }, 'aria-hidden': 'true' }),
+          h('b', null, r.name), h('span', { className: 'hermes-lanes-dim' }, pct(r.target)),
+          lim.max_workers == null ? null : h('span', null, `${r.running}/${lim.max_workers}w`),
+          lim.cards_per_day == null ? null : h('span', { className: over(lim.cards_per_day, use.cards_today) ? 'hermes-lanes-warn' : '' }, `${use.cards_today ?? 0}/${lim.cards_per_day} cards`),
+          lim.usd_per_day == null ? null : h('span', { className: over(lim.usd_per_day, use.usd_today) ? 'hermes-lanes-warn' : '' }, `${usd(use.usd_today ?? 0)}/${usd(lim.usd_per_day)}`))
+      }),
+      h('span', { className: 'hermes-lanes-grow' }),
+      h('button', { type: 'button', onClick: onEditLimits }, 'Edit limits')))
+}
+
+export function Panel({ snap, flow, flowError, windowHours, onWindow, onApply, saving, error, onBoard, onOpenCard, storage }) {
   const [draft, setDraft] = useState({})
+  const [tab, setTabState] = useState(() => loadTab(storage))
+  const [by, setByState] = useState(() => loadBy(storage))
   if (!snap) return h('div', { className: 'hermes-lanes-note' }, error ? `Unavailable: ${error}` : 'Loading…')
   if (!snap.configured) return h('div', { className: 'hermes-lanes-note' }, snap.reason || 'No lanes are configured.')
   const list = rows(snap, draft)
-  const pending = changes(snap, draft)
-  const maxOpen = Math.max(1, ...list.map((r) => r.open))
+  const pending = changes(snap, draft, flow)
+  const setTab = (value) => { setTabState(value); saveTab(value, storage) }
   const edit = (name, patch) => setDraft((d) => ({ ...d, [name]: { ...d[name], ...patch } }))
   const notes = snap.planner?.notes || []
   return h('div', { className: 'hermes-lanes' },
@@ -270,15 +579,15 @@ export function Panel({ snap, windowHours, onWindow, onApply, saving, error, onB
       h('strong', null, 'Lanes'),
       h('span', { className: 'hermes-lanes-dim' }, `${list.reduce((s, r) => s + r.running, 0)} running · ${list.reduce((s, r) => s + r.open, 0)} open · ${snap.scope === 'fleet' ? 'whole fleet' : 'this board'}`),
       snap.shadow ? h('span', { className: 'hermes-lanes-warn', title: 'kanban.admission.lane_shadow is on: cards are classified and counted, but nothing is held, capped, reordered or paused' }, 'Shadow mode: reporting only') : null,
+      h('div', { className: 'hermes-lanes-seg', role: 'tablist', 'aria-label': 'View' },
+        TABS.map(([value, label]) => h('button', { key: value, type: 'button', role: 'tab', className: value === tab ? 'is-on' : '', 'aria-selected': value === tab, onClick: () => setTab(value) }, label))),
       h('span', { className: 'hermes-lanes-grow' }),
       onBoard ? h('button', { type: 'button', onClick: onBoard }, 'Board') : null,
       h('div', { className: 'hermes-lanes-seg', role: 'group', 'aria-label': 'Window' },
         WINDOWS.map(([value, label]) => h('button', { key: value, type: 'button', className: value === windowHours ? 'is-on' : '', 'aria-pressed': value === windowHours, onClick: () => onWindow(value) }, label)))),
-    h(Split, { label: 'Target', list, field: 'target' }),
-    h(Split, { label: 'Actual', list, field: 'actual' }),
-    h('div', { className: 'hermes-lanes-row hermes-lanes-cols' },
-      h('span', null, 'Lane'), h('span', null, 'Volume'), h('span', null, 'Share of run-hours'), h('span', null, 'Backed up'), h('span', null, 'Throughput'), h('span', { className: 'hermes-lanes-cost' }, 'Cost')),
-    list.map((row) => h(Row, { key: row.name, row, maxOpen, saving, onShare: (name, share) => edit(name, { share }), onPause: (name, paused) => edit(name, { paused }) })),
+    tab === 'flow'
+      ? h(Flow, { flow, flowError, by, list, onBy: (value) => { setByState(value); saveBy(value, storage) }, onEditLimits: () => setTab('floor') })
+      : h(Floor, { list, flow, flowError, draft, saving, edit, onOpen: onOpenCard || (() => {}) }),
     h('div', { className: 'hermes-lanes-foot' },
       h('div', { className: 'hermes-lanes-notes' },
         notes.length ? notes.map((n, i) => h('div', { key: i }, h('strong', null, `${n.lane}: `), n.text))
@@ -346,6 +655,18 @@ export function Lanes({ ctx }) {
   // The task pill expands this strip only where lanes are configured and the API answers; anywhere else its
   // click is left alone and opens the board as before.
   const working = query.data?.configured === true
+  // Cards for Floor and Flow: only while the strip is expanded, so a collapsed strip costs one request.
+  const flowLabel = flowWindow(windowHours)
+  const flowQuery = useQuery({
+    queryKey: ['lanes-flow', flowLabel],
+    queryFn: () => source.flow(flowLabel),
+    enabled: open && working,
+    refetchInterval: POLL_MS,
+    refetchIntervalInBackground: false,
+    refetchOnWindowFocus: false,
+    retry: false,
+    placeholderData: (prev) => prev
+  })
   useEffect(() => {
     if (!working) return undefined
     const take = (event) => { event.preventDefault(); setOpen(true) }
@@ -369,10 +690,12 @@ export function Lanes({ ctx }) {
         await source.write(name, body, target)
       }
       await query.refetch()
+      if (open) await flowQuery.refetch().catch(() => {})
       return true
     } catch (e) {
       setError(`${at}: ${String(e?.message || e).slice(0, 180)}`)
       await query.refetch().catch(() => {})
+      if (open) await flowQuery.refetch().catch(() => {})
       return false
     } finally { setSaving(false) }
   }
@@ -388,7 +711,9 @@ export function Lanes({ ctx }) {
       }, open ? '▴' : '▾')),
     open ? h('div', { ref: bodyRef, className: 'hermes-lanes-body', style: { maxHeight: '60vh', overflow: 'auto' } },
       h(Panel, {
-        snap: query.data, windowHours, saving, error: error || (query.error ? String(query.error.message).slice(0, 200) : ''),
+        snap: query.data, flow: flowQuery.data, flowError: flowQuery.error ? String(flowQuery.error.message).slice(0, 200) : '',
+        windowHours, saving, error: error || (query.error ? String(query.error.message).slice(0, 200) : ''),
+        onOpenCard: (id) => openCard(id, source.target()?.connectionId || undefined),
         onWindow: (v) => { setWindowState(v); saveWindow(v) }, onApply: apply,
         onBoard: () => { setOpen(false); host.navigate('/kanban') }
       })) : null)
@@ -417,23 +742,37 @@ const CSS = `
 .hermes-lanes button.is-paused{border-color:#f0a43a;color:#f6c477}
 .hermes-lanes-seg{display:flex;gap:2px}
 .hermes-lanes-seg button.is-on{background:var(--chrome-action-hover);border-color:var(--ui-text-tertiary)}
-.hermes-lanes-split{display:flex;align-items:center;gap:10px}
-.hermes-lanes-splitlabel{width:48px;color:var(--ui-text-tertiary)}
-.hermes-lanes-bar{flex:1 1 0;display:flex;gap:2px;height:10px;border-radius:3px;overflow:hidden}
-.hermes-lanes-bar>span{min-width:0}
-.hermes-lanes-row{display:grid;grid-template-columns:150px 230px 180px 200px 150px 70px;column-gap:16px;align-items:center;padding:8px 0;border-top:1px solid var(--ui-stroke-secondary);font-variant-numeric:tabular-nums}
-.hermes-lanes-cols{border-top:0;padding:2px 0;color:var(--ui-text-tertiary);font-size:10.5px;text-transform:uppercase;letter-spacing:.04em}
 .hermes-lanes-name{display:flex;align-items:center;gap:8px;min-width:0}
 .hermes-lanes-dot{width:9px;height:9px;border-radius:3px;flex:none}
 .hermes-lanes-title{font-weight:600;font-size:13px}
 .hermes-lanes-sub{color:var(--ui-text-tertiary);font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:125px}
 .hermes-lanes-volume{display:flex;align-items:center;gap:8px}
 .hermes-lanes-volume input{flex:1 1 0;min-width:0;accent-color:#8fb0ff}
-.hermes-lanes-meter{height:3px;border-radius:2px;background:var(--ui-stroke-secondary);margin-top:4px}
-.hermes-lanes-meter>span{display:block;height:100%;border-radius:2px}
-.hermes-lanes-cost{text-align:right}
 .hermes-lanes-notes{flex:1 1 320px;min-width:0}
 .hermes-lanes-note{padding:10px;font-size:12px;color:var(--ui-text-secondary)}
+.hermes-lanes-floor{display:flex;flex-direction:column;overflow-x:auto}
+.hermes-lanes-frow{display:grid;column-gap:0;align-items:stretch;border-top:1px solid var(--ui-stroke-secondary);min-width:1120px}
+.hermes-lanes-fhead{border-top:0;color:var(--ui-text-tertiary);font-size:10.5px;text-transform:uppercase;letter-spacing:.04em;padding:2px 0}
+.hermes-lanes-fhead>span{padding:0 6px}
+.hermes-lanes-lanecell{display:flex;flex-direction:column;gap:6px;padding:8px 10px 8px 0}
+.hermes-lanes-valves{display:flex;flex-direction:column;gap:4px}
+.hermes-lanes-valve{display:grid;grid-template-columns:62px 62px 1fr;gap:6px;align-items:center;color:var(--ui-text-tertiary)}
+.hermes-lanes-valve input{height:22px;width:62px;border:1px solid var(--ui-stroke-secondary);border-radius:5px;background:transparent;color:inherit;font:inherit;padding:0 4px;font-variant-numeric:tabular-nums}
+.hermes-lanes-cell{padding:8px 6px;border-left:1px solid var(--ui-stroke-secondary);display:flex;flex-direction:column;gap:4px;min-width:0}
+.hermes-lanes-cell.is-piling{background:repeating-linear-gradient(135deg,rgba(255,93,93,.14) 0 6px,transparent 6px 12px)}
+.hermes-lanes-count{font-size:15px;font-weight:600;font-variant-numeric:tabular-nums}
+.hermes-lanes-boxes{display:flex;flex-wrap:wrap;gap:3px;align-items:center}
+.hermes-lanes .hermes-lanes-box{width:11px;height:11px;min-width:11px;padding:0;border:0;border-radius:3px}
+.hermes-lanes .hermes-lanes-box:hover{outline:2px solid var(--ui-text-secondary)}
+.hermes-lanes-why{font-size:10.5px}
+.hermes-lanes-legend{display:flex;flex-wrap:wrap;gap:12px;align-items:center;padding-top:8px;border-top:1px solid var(--ui-stroke-secondary);color:var(--ui-text-tertiary);font-size:11px}
+.hermes-lanes-legend i{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:4px}
+.hermes-lanes-sankey{display:block;max-height:420px}
+.hermes-lanes-svgtext{font-size:11px;fill:var(--ui-text-secondary)}
+.hermes-lanes-svglabel{font-size:9.5px;fill:var(--ui-text-tertiary);font-family:monospace}
+.hermes-lanes-svgtext.hermes-lanes-dim{fill:var(--ui-text-tertiary)}
+.hermes-lanes-limits{display:flex;flex-wrap:wrap;gap:14px;align-items:center}
+.hermes-lanes-limit{display:inline-flex;gap:6px;align-items:center;font-variant-numeric:tabular-nums}
 `
 
 export default {
