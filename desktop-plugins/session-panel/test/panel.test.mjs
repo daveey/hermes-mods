@@ -700,6 +700,7 @@ test('panel: folded Waiting lists 3 one-liners then "+N more"; ready / plain tod
   window.__userSteps.presentationForSource = s => (s.id === 't_ask' ? { representedInQueue: false, dismissed: true } : null)
   await show(React.createElement(m.Panel, { key: 'fold-more' }))
   const folded = el().querySelector('[data-folded-waiting]')
+  assert.equal(folded.querySelectorAll('[data-line-pip="waiting"]').length, 3, 'each one-liner carries the yellow waiting box')
   assert.deepEqual([...folded.querySelectorAll('[data-waiting-line]')].map(e => e.textContent.split(' · ')[0]), ['A', 'B', 'C'])
   assert.match(folded.textContent, /\+1 more waiting$/, 'D only: the retired ask is not a one-liner')
   assert.doesNotMatch(folded.textContent, /Retired ask/)
@@ -769,6 +770,25 @@ test('panel: collapsed, the waiting line\'s card link opens that card; a retired
   await React.act(async () => { line.querySelector('[data-wait-card]').click() })
   assert.deepEqual(b.opened, ['t_cccccccc'])
   assert.equal(el().querySelector('[data-collapsed-waiting] [data-waiting-line="kb:t_0123abcd"] [data-wait-card]'), null)
+})
+
+test('panel: one-line rows carry their full row\'s box: yellow waiting, pink blocked upstream, hub "H"', async () => {
+  window.localStorage.clear()
+  bridges({ chips: [
+    card('t_w', 'scheduled', { look: 'waiting', waitingOn: 'clock 11:00', label: 'Waits' }),
+    card('t_h', 'scheduled', { look: 'waiting', waitingOn: 'clock 12:00', label: 'Hub waits', runMachine: 'hub' }),
+    card('t_bu', 'todo', { label: 'Held', blockedUpstream: { id: 't_par', status: 'blocked' } })
+  ] })
+  await show(React.createElement(m.Panel, { key: 'line-pips' }))
+  const folded = el().querySelector('[data-folded-waiting]')
+  assert.equal(folded.querySelector('[data-waiting-line="kb:t_w"] [data-line-pip]').getAttribute('data-line-pip'), 'waiting')
+  const hub = folded.querySelector('[data-waiting-line="kb:t_h"] [data-line-pip]')
+  assert.equal(hub.hasAttribute('data-line-pip-hub'), true)
+  assert.equal(hub.textContent, 'H')
+  await React.act(async () => el().querySelector('[data-panel-toggle]').click())
+  const collapsed = el().querySelector('[data-collapsed-waiting]')
+  assert.equal(collapsed.querySelector('[data-waiting-line="kb:t_bu"] [data-line-pip]').getAttribute('data-line-pip'), 'blockedUpstream')
+  assert.equal(collapsed.querySelector('[data-waiting-line="kb:t_w"] [data-line-pip]').getAttribute('data-line-pip'), 'waiting')
 })
 
 // [daveey] Switching chats shows the panel at once: last-known data paints first, reads replace it.

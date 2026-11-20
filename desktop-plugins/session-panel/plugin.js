@@ -323,7 +323,7 @@ export function classify(chips, { nowMs = Date.now(), silence = new Map(), isAsk
       const detail = bu.contained
         ? `waiting on contained card ${bu.id} · release by ${auth?.id ? `card ${auth.id}` : 'unknown'} (${auth?.status || 'unknown'})`
         : `waiting on blocked parent card ${bu.id} (${bu.status})`
-      out.blockedUpstream.push({ ...item(c), detail })
+      out.blockedUpstream.push({ ...item(c), blockedUpstreamRow: true, detail })
       continue
     }
     const ev = evidence(c)
@@ -344,7 +344,7 @@ export function classify(chips, { nowMs = Date.now(), silence = new Map(), isAsk
       if (c.state === 'ready') { out.ready.push({ ...item(c), parked: true, detail: `ready · waiting for a worker to claim it · ${source}` }); continue }
       if (c.state === 'todo' && !c.waitingOn && !c.upstream?.id) { out.queued.push({ ...item(c), parked: true, detail: `not started · ${source}` }); continue }
       // The upstream leaf follows a published wait only: without one, parkedWaitText already names the upstream.
-      const text = parkedWaitText(c, on)
+      const text = parkedWaitText(c, on, nowMs)
       out.waiting.push({ ...item(c), parked: true, detail: `${text}${on && text === on ? leaf : ''} · ${source}` })
       continue
     }
@@ -518,15 +518,26 @@ function WaitText({ text, chip, plain }) {
   })
 }
 
+/** A card in `review` with no running review: say that no reviewer is on it, and what last happened (the newest
+ *  event, e.g. `review route deferred 12m ago` when the review provider is walled). The review is a run on the card
+ *  itself (core `review_required`), not a separate card. */
+export function reviewWaitText(c, nowMs = Date.now()) {
+  // Same event words as session-tasks' task rows (`continued` -> `checkpointed`); plain spacing on an older bridge.
+  const label = typeof window !== 'undefined' ? window.__sessionTasks?.activityLabel : null
+  const kind = (typeof label === 'function' ? str(label(c?.activity)) : str(c?.activity).replace(/_/g, ' ')).trim()
+  const at = Number(c?.activityAt)
+  return `waiting for a reviewer (none running)${kind ? ` · last: ${kind}${at > 0 ? ` ${shortDur(nowMs / 1000 - at)} ago` : ''}` : ''}`
+}
+
 /** What a parked card (fresh board status, no run) waits on, in plain words. `on` is its published wait
  *  ("waiting on …"); without one the row says what its lifecycle state means and that no reason was published,
  *  never a bare state name. A producer's placeholder ("a producer the owner did not publish") is said plainly. */
-export function parkedWaitText(c, on) {
+export function parkedWaitText(c, on, nowMs = Date.now()) {
   const w = str(c?.waitingOn), up = c?.upstream?.id ? `card ${c.upstream.id} (${c.upstream.status || 'status unknown'})` : ''
   const unpublished = !w || /did not publish/i.test(w)
   switch (c?.state) {
     case 'triage': return unpublished || w === 'triage' ? 'in triage · waiting to be specified and promoted' : on
-    case 'review': return unpublished ? 'waiting on review' : on
+    case 'review': return unpublished ? reviewWaitText(c, nowMs) : on
     case 'todo': return !unpublished ? on : up ? `waiting on ${up}` : 'waiting on its parent cards'
     case 'scheduled': return !unpublished ? on : up ? `scheduled · waiting on ${up}` : 'scheduled · its owner has not published what wakes it'
     case 'blocked': return !unpublished ? on : up ? `blocked · waiting on ${up}` : 'blocked · no reason published'
@@ -836,6 +847,13 @@ const btn = { minHeight: 32, padding: '4px 10px', borderRadius: 6, border: '1px 
 const PIP_ORDER = ['needsYou', 'stuck', 'blockedUpstream', 'running', 'ready', 'waiting', 'queued', 'done']
 export const PIPS_MAX = 24 // boxes drawn before the rest fold into "+N"
 // A hub-scheduled card's box is a little larger and carries an "H" (running and waiting work alike).
+// A one-line waiting row carries the same box as its full row, so its colour says what it is (yellow = waiting).
+const lineKind = i => (i.blockedUpstreamRow ? 'blockedUpstream' : 'waiting')
+/** The one-line row's box: the full row's box (a hub card's is larger and carries an "H"). */
+const linePip = i => {
+  const k = lineKind(i), hub = onHub(i)
+  return jsx('span', { 'aria-hidden': true, 'data-line-pip': k, ...(hub ? { 'data-line-pip-hub': '' } : {}), style: { ...pipStyle(k, hub), display: 'inline-flex', marginRight: 6, verticalAlign: hub ? '-2px' : '-1px' }, children: hub ? 'H' : undefined }, 'p')
+}
 const pipStyle = (k, hub = false) => {
   const base = { width: 9, height: 9, borderRadius: 2, boxSizing: 'border-box', flex: 'none' }
   const h = hub ? { width: 12, height: 12, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', fontSize: 8.5, fontWeight: 700, lineHeight: 1 } : {}
@@ -1145,7 +1163,7 @@ export function Panel() {
     ] }) }),
     // Collapsed, a bare "2 waiting" left the user asking "on what?": keep one short line per waiting card.
     collapsed && waitLines.length > 0 && jsxs('div', { 'data-collapsed-waiting': '', style: { ...muted, padding: '0 8px 0 30px', minWidth: 0 }, children: [
-      ...waitLines.map(i => jsx('div', { 'data-waiting-line': i.key, title: `${str(i.chip?.title) || i.label}${i.detail ? `\n${i.cardStatus ? i.detail : waitLabel(i.detail, i.chip)}` : ''}`, style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, children: [`${i.label} · `, i.detail ? jsx(WaitText, { text: i.detail, chip: i.chip, plain: i.cardStatus }, 'w') : 'waiting'] }, i.key)),
+      ...waitLines.map(i => jsx('div', { 'data-waiting-line': i.key, title: `${str(i.chip?.title) || i.label}${i.detail ? `\n${i.cardStatus ? i.detail : waitLabel(i.detail, i.chip)}` : ''}`, style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, children: [linePip(i), `${i.label} · `, i.detail ? jsx(WaitText, { text: i.detail, chip: i.chip, plain: i.cardStatus }, 'w') : 'waiting'] }, i.key)),
       waitMore > 0 && jsx('div', { children: `+${waitMore} more waiting` }, 'more')
     ] }),
     !collapsed && jsxs('div', { 'data-panel-body': '', className: 'status-section-body', style: { maxHeight: '55vh', overflowY: 'auto', minWidth: 0, padding: '0 10px 0 12px' }, children: [
@@ -1167,7 +1185,7 @@ export function Panel() {
       // Folded, the counts alone ("1 other") left the user asking "on what?": name up to 3 cards and what each
       // waits on, one line each, as the collapsed panel does. Opening the fold shows the full rows.
       !waitingOpen && foldLines.length > 0 && jsxs('div', { 'data-folded-waiting': '', style: { ...muted, padding: '0 0 4px 18px', minWidth: 0 }, children: [
-        ...foldLines.map(i => jsx('div', { 'data-waiting-line': i.key, title: `${str(i.chip?.title) || i.label}${i.detail ? `\n${i.cardStatus ? i.detail : waitLabel(i.detail, i.chip)}` : ''}`, style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, children: [`${i.label} · `, i.detail ? jsx(WaitText, { text: i.detail, chip: i.chip, plain: i.cardStatus }, 'w') : 'waiting'] }, i.key)),
+        ...foldLines.map(i => jsx('div', { 'data-waiting-line': i.key, title: `${str(i.chip?.title) || i.label}${i.detail ? `\n${i.cardStatus ? i.detail : waitLabel(i.detail, i.chip)}` : ''}`, style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, children: [linePip(i), `${i.label} · `, i.detail ? jsx(WaitText, { text: i.detail, chip: i.chip, plain: i.cardStatus }, 'w') : 'waiting'] }, i.key)),
         foldMore > 0 && jsx('div', { children: `+${foldMore} more waiting` }, 'more')
       ] }),
       // A still-blocked owner whose ask was retired has no other surface: its status row is never folded away.

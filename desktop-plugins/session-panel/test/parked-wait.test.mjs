@@ -46,7 +46,7 @@ test('each parked state leads with what it waits on, never a bare state name', (
   const cases = [
     [waitFor('triage', { wait: { wait_state: 'waiting', waiting_on: 'triage' } }), 'in triage · waiting to be specified and promoted · board status', 'triage'],
     [waitFor('triage'), 'in triage · waiting to be specified and promoted · board status', 'triage'],
-    [waitFor('review'), 'waiting on review · board status', 'review'],
+    [waitFor('review'), 'waiting for a reviewer (none running) · board status', 'review'],
     [waitFor('blocked'), 'blocked · no reason published · board status', 'blocked'],
     [waitFor('scheduled'), 'scheduled · its owner has not published what wakes it · board status', 'schedule'],
     [waitFor('scheduled', { wait: { wait_state: 'waiting', waiting_on: 'a producer the owner did not publish' } }), 'scheduled · its owner has not published what wakes it · board status', 'schedule'],
@@ -179,5 +179,23 @@ test('the real title read: owner route, the waiting card\'s board first, then de
     assert.equal(hangs, 1)
     m.cardRef(chip, 't_88888888', 31_001, hang)
     assert.equal(hangs, 2)
+  } finally { delete globalThis.window }
+})
+
+test('a review card names that no reviewer is running and its newest event', () => {
+  const NOW = Date.parse('2026-11-20T21:54:00Z')
+  assert.equal(m.reviewWaitText({ activity: 'review_route_deferred', activityAt: NOW / 1000 - 600 }, NOW), 'waiting for a reviewer (none running) · last: review route deferred 10m ago')
+  assert.equal(m.reviewWaitText({}, NOW), 'waiting for a reviewer (none running)')
+})
+
+test('a review card through the real projection: no reviewer running, newest event and its age on the classify clock', () => {
+  const NOW = Date.parse('2026-11-20T12:00:00Z')
+  const out = parked([waitFor('review', { activity_kind: 'review_route_deferred', activity_at: NOW / 1000 - 600 })], {}, NOW)
+  assert.equal(out.waiting[0].detail, 'waiting for a reviewer (none running) · last: review route deferred 10m ago · board status')
+  // With the session-tasks bridge, the event reads in the task rows' words.
+  globalThis.window = { __sessionTasks: { activityLabel: tasks.activityLabel } }
+  try {
+    const cont = parked([waitFor('review', { activity_kind: 'continued', activity_at: NOW / 1000 - 60 })], {}, NOW)
+    assert.equal(cont.waiting[0].detail, 'waiting for a reviewer (none running) · last: checkpointed 1m ago · board status')
   } finally { delete globalThis.window }
 })

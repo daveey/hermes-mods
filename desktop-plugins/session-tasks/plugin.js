@@ -1182,9 +1182,12 @@ const ACTIVITY_LABEL = {
   reclaimed: 'reclaimed', crashed: 'crashed', timed_out: 'timed out', heartbeat: 'working'
 }
 
+/** An event kind in the words the task rows use (`continued` -> `checkpointed`); session-panel reads it via the bridge. */
+export const activityLabel = kind => (kind ? (ACTIVITY_LABEL[kind] || String(kind).replace(/_/g, ' ')) : '')
+
 /** One linked card as a readable row (exported for tests): status, full title, who, what happened last, PR. */
 export function cardRowModel(chip, now = Date.now()) {
-  const activity = chip.activity ? (ACTIVITY_LABEL[chip.activity] || chip.activity.replace(/_/g, ' ')) : ''
+  const activity = activityLabel(chip.activity)
   const age = elapsed(chip.activityAt || chip.since, now)
   const pr = chip.prUrl ? chip.prUrl.match(/\/pull\/(\d+)$/) : null
   return {
@@ -1342,7 +1345,7 @@ export default {
     })
     const onVis = () => document.hidden || void refresh()
     document.addEventListener('visibilitychange', onVis)
-    window.__sessionTasks = { version: 'wait-visible-v1', get snapshot() { return snapshot }, refresh, subscribe, openTaskChip, lineageIds, focusedRoute, warm }
+    window.__sessionTasks = { version: 'wait-visible-v1', get snapshot() { return snapshot }, refresh, subscribe, openTaskChip, lineageIds, focusedRoute, warm, activityLabel }
     return () => {
       for (const stop of stops) stop?.()
       document.removeEventListener('visibilitychange', onVis)
