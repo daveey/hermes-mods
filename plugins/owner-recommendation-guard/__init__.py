@@ -132,10 +132,14 @@ def _brief_hold(name: str, args: dict, request: dict, session_id: str) -> dict |
             if name == "kanban_create" else "")
         key = (session_id or "", name, card)
         n = _BRIEF_HELD.get(key, 0)
-        if n >= rule.MAX_HOLDS:
+        total_key = (session_id or "", name, "<creates>")
+        creates = _BRIEF_HELD.get(total_key, 0) if name == "kanban_create" else 0
+        if n >= rule.MAX_HOLDS or creates >= rule.MAX_CREATE_HOLDS:
             _log("unblock_card_released", tool=name, session=session_id, card=card, holds=n, missing=hit["missing"])
             return None
         _BRIEF_HELD[key] = n + 1
+        if name == "kanban_create":
+            _BRIEF_HELD[total_key] = creates + 1
         _log("unblock_card_hold", tool=name, session=session_id, card=card, attempt=n, missing=hit["missing"])
         return {"action": "block", "message": hit["message"]}
     except Exception as e:

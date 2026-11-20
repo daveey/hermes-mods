@@ -273,12 +273,17 @@ the missing parts, the label format and both skills.
   a sentence end on the same line. "we weighed the options: …" mid-sentence is prose. The first occurrence counts;
   a part runs to the next label or a physical contract line.
 - Contract scopes are exempt from the brief parts (`Tried:` and the single `(recommended)` still apply): a PR
-  approval scope (`pr_approval_request.SCOPE`) and a physical-ask scope (`DEVICE:` / `HUMAN_STEP:` /
-  `OBSERVATION:` / `EVIDENCE:` lines). Rewriting those scopes into a brief would break their parsers.
+  approval scope naming a PR number (`pr_approval_request.SCOPE`) and a physical-ask scope (`DEVICE:` or
+  `HUMAN_STEP:` lines). Rewriting those scopes into a brief would break their parsers, so their hold message
+  (`CONTRACT_MESSAGE`) says to keep the scope and fix only why_human and choices. A bare `owner/repo` or an
+  `EVIDENCE:` line alone is not a contract.
+- Options: with two or more line-start markers only those count ("A) Use plan B: restart" is one option); a
+  single-line part splits at sentence ends. CRLF is normalised; part lengths count after markup is removed.
 - Order: after `owner_recommendation_hold` (an in-limits pick is applied, not briefed), the PR-filing and
   superseding holds, approval reconciliation and retirement (an approved/retired ask gets that answer), and
   before the evidence check and judge. Hold budgets are per rule, so one ask can meet several bounded holds in turn.
-- Bounded to 2 holds per (session, tool, card); a blocked create is keyed by its idempotency key or title. Then
+- Bounded to 2 holds per (session, tool, card); a blocked create is keyed by its idempotency key or title, and
+  all blocked creates of a session share a cap of 4 (`MAX_CREATE_HOLDS`), since a rewrite changes the title. Then
   released (`unblock_card_released`); errors fail open (`unblock_card_error`).
 - owner-recommendation-guard runs the same file on hosts without ask-gate (pool workers). The session panel
   renders the brief with the same parse (session-tasks `briefOf`/`briefOptions`; change both together).

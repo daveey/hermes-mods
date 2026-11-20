@@ -871,3 +871,13 @@ test('humanRequestOf: the hub replica JSON text carries the brief too', () => {
   const r = m.humanRequestOf(JSON.stringify({ action: 'Choose; unblock = A; archive = B.', why_human: 'Tried: x.', interaction: 'approval', scope }))
   assert.deepEqual(r.brief.options, ['A) run', 'B) accept'])
 })
+
+test('briefOf parity: option over-split, double spaces, CRLF (review of ask-gate unblock_card_quality)', () => {
+  assert.deepEqual(m.briefOptions('A) Use plan B: restart once\nB) accept'), ['A) Use plan B: restart once', 'B) accept'])
+  assert.deepEqual(m.briefOptions('A) I prefer option A. It is cheap.\nB) Python 3. Then rerun.'), ['A) I prefer option A. It is cheap.', 'B) Python 3. Then rerun.'])
+  assert.deepEqual(m.briefOptions('I prefer option A. It is cheap.'), [])
+  const b = m.briefOf('Situation: The fix is installed and one check is open.  Options: A) x. B) y.  Recommend: A - cheap and covers it.')
+  assert.deepEqual(b, { situation: 'The fix is installed and one check is open.', options: ['A) x.', 'B) y.'], recommend: 'A - cheap and covers it.' })
+  assert.equal(m.briefOf('## Situation\r\nThe app closed so the last check cannot attach.\r\n').situation, 'The app closed so the last check cannot attach.')
+  assert.equal(m.briefOf('Situation: **short** __x__'), null, 'length counts after markup is removed')
+})

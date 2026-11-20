@@ -345,28 +345,46 @@ export function humanRequestOf(raw) {
 }
 
 // The decision brief generate-unblock-card writes into human_request.scope. Same parse as ask-gate's
-// unblock_card_quality.py (sections/options), which enforces it: change both together. A label is a markdown heading
-// (colon optional) or the word + colon at line start (after a bullet) or after a sentence end; the first occurrence
-// of each counts; a part runs to the next label or a physical-ask contract line (DEVICE:/HUMAN_STEP:/...).
+// unblock_card_quality.py (sections/options/_at_boundary), which enforces it: change both together. A label is a
+// markdown heading (colon optional) or the word + colon at a line start (after a bullet) or after a sentence end;
+// the first occurrence of each counts; a part runs to the next label or a physical-ask contract line.
 const BRIEF_NAMES = '(situation|options?|recommend(?:ation|ed)?)'
-const BRIEF_LABEL = new RegExp(`(?:^[ \\t]*#{1,6}[ \\t]*(?:\\*\\*|__)?${BRIEF_NAMES}(?:\\*\\*|__)?[ \\t]*:?(?:\\*\\*|__)?[ \\t]*$` +
-  `|(?:^[ \\t]*(?:[-*>][ \\t]*)?|(?<=[.!?;][ \\t]))(?:\\*\\*|__)?${BRIEF_NAMES}(?:\\*\\*|__)?[ \\t]*:(?:\\*\\*|__)?)`, 'gim')
+const BRIEF_HEADING = new RegExp(`^[ \\t]*#{1,6}[ \\t]*(?:\\*\\*|__)?${BRIEF_NAMES}(?:\\*\\*|__)?[ \\t]*:?(?:\\*\\*|__)?[ \\t]*$`, 'gim')
+const BRIEF_WORD = new RegExp(`(?<![\\w])(?:\\*\\*|__)?${BRIEF_NAMES}(?:\\*\\*|__)?[ \\t]*:(?:\\*\\*|__)?`, 'gi')
 const BRIEF_CONTRACT = /^[ \t]*(?:DEVICE|HUMAN_STEP|OBSERVATION|EVIDENCE)[ \t]*:/gm
-const BRIEF_OPTION = /(?:^|(?<=\s))(?:[-*][ \t]+)?(?:\*\*)?(?:[Oo]ption[ \t]+)?\(?(?:[A-F](?:\)|\.(?=\s)|:|[ \t]+[-—–](?=\s))|[1-9](?:\)|\.(?=\s)))(?:\*\*)?/gm
+const BRIEF_OPTION = /(?<!\S)(?:[-*][ \t]+)?(?:\*\*)?(?:[Oo]ption[ \t]+)?\(?(?:[A-F](?:\)|\.(?=\s)|:|[ \t]+[-—–](?=\s))|[1-9](?:\)|\.(?=\s)))(?:\*\*)?/g
 const BRIEF_MIN = 20
 const flatText = t => t.replace(/\*\*|__/g, '').replace(/\s+/g, ' ').trim()
-/** Option items of an Options part: each marker to the next; text before the first marker is dropped. */
+const cleanText = t => String(t || '').replace(/\r\n?/g, '\n')
+const skipBack = (t, i) => { while (i >= 0 && (t[i] === ' ' || t[i] === '\t')) i--; return i }
+const lineStart = (t, pos) => { const i = skipBack(t, pos - 1); return i < 0 || t[i] === '\n' }
+/** pos starts a line (after spaces, a bullet/quote) or follows a sentence end (. ! ? ;) and spaces. */
+function atBoundary(t, pos) {
+  const i = skipBack(t, pos - 1)
+  if (i < 0 || t[i] === '\n') return true
+  if ('-*>'.includes(t[i])) { const j = skipBack(t, i - 1); if (j < 0 || t[j] === '\n') return true }
+  return '.!?;'.includes(t[i]) && i < pos - 1
+}
+const briefName = n => { n = n.toLowerCase(); return n.startsWith('situation') ? 'situation' : n.startsWith('option') ? 'options' : 'recommend' }
+/** Option items of an Options part: each marker to the next; text before the first is dropped. With two or more
+ *  line-start markers only those count; a single-line part splits at line starts and sentence ends. */
 export function briefOptions(text) {
-  const starts = [...String(text || '').matchAll(BRIEF_OPTION)].map(m => m.index)
+  text = cleanText(text)
+  const cands = [...text.matchAll(BRIEF_OPTION)].map(m => m.index)
+  const line = cands.filter(s => lineStart(text, s))
+  const starts = line.length >= 2 ? line : cands.filter(s => atBoundary(text, s))
   return starts.map((s, i) => flatText(text.slice(s, starts[i + 1] ?? text.length)).replace(/^[-*]\s*/, '')).filter(Boolean)
 }
 /** {situation, options[], recommend} from a scope with a Situation part (>= 20 chars), else null. Exported for tests. */
 export function briefOf(scope) {
   if (typeof scope !== 'string' || !scope.trim()) return null
-  const marks = [...scope.matchAll(BRIEF_LABEL)].map(m => {
-    const n = (m[1] || m[2]).toLowerCase()
-    return { start: m.index, end: m.index + m[0].length, name: n.startsWith('situation') ? 'situation' : n.startsWith('option') ? 'options' : 'recommend' }
-  })
+  scope = cleanText(scope)
+  const marks = [...scope.matchAll(BRIEF_HEADING)].map(m => ({ start: m.index, end: m.index + m[0].length, name: briefName(m[1]) }))
+  const taken = marks.map(m => [m.start, m.end])
+  for (const m of scope.matchAll(BRIEF_WORD)) {
+    if (atBoundary(scope, m.index) && !taken.some(([s, e]) => s <= m.index && m.index < e)) marks.push({ start: m.index, end: m.index + m[0].length, name: briefName(m[1]) })
+  }
+  marks.sort((x, y) => x.start - y.start)
   const stops = [...marks.map(m => m.start), ...[...scope.matchAll(BRIEF_CONTRACT)].map(m => m.index)].sort((x, y) => x - y)
   const parts = {}
   for (const m of marks) {

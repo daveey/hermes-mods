@@ -90,3 +90,14 @@ def test_owner_rule_runs_before_the_brief(guard):
     in_limits = dict(GOOD, scope=GOOD["scope"].replace("lowers the card's acceptance criteria; ", ""))
     r = _block(guard, dict(in_limits, why_human="no tried line"), "t_own")
     assert r and "owner_recommendation_hold" in r["message"]
+
+
+def test_retitled_creates_are_capped_per_session(guard):
+    held = sum(bool(guard.pre_tool_call(tool_name="kanban_create", session_id="w9", args={
+        "title": f"retitle {i}", "initial_status": "blocked", "human_request": INCIDENT})) for i in range(8))
+    assert held == 4
+
+
+def test_contract_scope_message_on_workers(guard):
+    r = _block(guard, dict(INCIDENT, scope="acme/widgets#12 head abcdef1"), "t_pr")
+    assert r and "keep scope exactly as it is" in r["message"]

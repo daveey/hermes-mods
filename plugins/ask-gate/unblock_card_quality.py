@@ -15,11 +15,12 @@ Deterministic, no model call. Checked, on kanban_block / blocked kanban_create w
   or as ``choices`` when given.
 - when ``choices`` are given, exactly one label carries ``(recommended)``.
 Labels may be bold, bulleted, a markdown heading (``## Situation``) or follow a sentence end on the same line.
+Options: with two or more line-start markers only those count; a single-line part splits at sentence ends.
 
 Scope that is already a machine contract keeps its grammar and is not asked for the brief parts: a PR approval
-scope (pr_approval_request.SCOPE, e.g. ``owner/repo#12 head abc1234``) or a physical-ask scope (``DEVICE:``,
-``HUMAN_STEP:``, ``OBSERVATION:``, ``EVIDENCE:`` lines). ``Tried:`` and the single ``(recommended)`` choice still
-apply there.
+scope naming a PR number (pr_approval_request.SCOPE, e.g. ``owner/repo#12 head abc1234``) or a physical-ask scope
+(``DEVICE:`` or ``HUMAN_STEP:`` lines). ``Tried:`` and the single ``(recommended)`` choice still apply there, and
+the hold message (CONTRACT_MESSAGE) says to keep the scope.
 
 The parse mirrors desktop-plugins/session-tasks ``briefOf`` (what the panel renders); change both together.
 Callers bound holds (MAX_HOLDS per session, tool and card) and fail open on error.
@@ -33,27 +34,31 @@ import sys
 from pathlib import Path
 
 MAX_HOLDS = 2
+# Blocked creates are keyed by title/idempotency key, which a rewrite changes: cap them per (session, tool) too.
+MAX_CREATE_HOLDS = 4
 MIN_PART_CHARS = 20
 # Test isolation only, honoured only under pytest: older fixtures predate this rule (their conftest sets it).
 ENV_SWITCH = "ASK_GATE_UNBLOCK_BRIEF"
 
 _NAMES = {"situation": r"situation", "options": r"options?", "recommend": r"recommend(?:ation|ed)?"}
 _ANY_NAME = "|".join(f"(?:{v})" for v in _NAMES.values())
-# A label: a markdown heading (colon optional), or the word + colon at line start (after a bullet) or after a
-# sentence end (single-line scopes). Mid-sentence "the options: ..." is prose, not a label.
-_LABEL = re.compile(
-    r"(?:^[ \t]*#{1,6}[ \t]*(?:\*\*|__)?(" + _ANY_NAME + r")(?:\*\*|__)?[ \t]*:?(?:\*\*|__)?[ \t]*$"
-    r"|(?:^[ \t]*(?:[-*>][ \t]*)?|(?<=[.!?;][ \t]))(?:\*\*|__)?(" + _ANY_NAME + r")(?:\*\*|__)?[ \t]*:(?:\*\*|__)?)",
-    re.I | re.M)
-# A line in a machine-contract label block (physical asks); it ends a brief part.
+# Label candidates: a markdown heading (colon optional), or the word + colon. A word + colon counts only at line
+# start (after a bullet/quote) or after a sentence end (single-line scopes, any number of spaces); mid-sentence
+# "the options: ..." is prose. The context filter is _at_boundary (JS: atBoundary), not a lookbehind.
+_HEADING = re.compile(r"^[ \t]*#{1,6}[ \t]*(?:\*\*|__)?(" + _ANY_NAME + r")(?:\*\*|__)?[ \t]*:?(?:\*\*|__)?[ \t]*$",
+                      re.I | re.M)
+_WORD_LABEL = re.compile(r"(?<![\w])(?:\*\*|__)?(" + _ANY_NAME + r")(?:\*\*|__)?[ \t]*:(?:\*\*|__)?", re.I)
+# Physical-ask contract lines (physical_asks.py): any of them ends a brief part.
 _CONTRACT_LINE = re.compile(r"^[ \t]*(?:DEVICE|HUMAN_STEP|OBSERVATION|EVIDENCE)[ \t]*:", re.M)
+# A physical-ask contract scope names the device or the human step, not just an EVIDENCE: line.
+_PHYSICAL_CONTRACT = re.compile(r"^[ \t]*(?:DEVICE|HUMAN_STEP)[ \t]*:", re.M)
+_PR_NUMBER = re.compile(r"#\s*\d+|/pull/\d+", re.I)
 _TRIED = re.compile(r"\btried\s*:", re.I)
-# One option marker: A) / (A) / A. / A: / A - / 1) / 1. / Option A: , at line start (after a bullet) or after space.
+# Option marker candidates: A) / (A) / A. / A: / A - / 1) / 1. / Option A: , optionally bulleted and bold.
 _OPTION = re.compile(
-    r"(?:^|(?<=\s))(?:[-*][ \t]+)?(?:\*\*)?(?:[Oo]ption[ \t]+)?\(?"
-    r"(?:[A-F](?:\)|\.(?=\s)|:|[ \t]+[-\u2014\u2013](?=\s))|[1-9](?:\)|\.(?=\s)))(?:\*\*)?",
-    re.M)
-_PICK = re.compile(r"\b(?:[A-F]\s*(?:,\s*[A-F]\s*)*(?:or|/)\s*[A-F]|yes\s+or\s+no|choose|pick|which\s+option)\b", re.I)
+    r"(?<!\S)(?:[-*][ \t]+)?(?:\*\*)?(?:[Oo]ption[ \t]+)?\(?"
+    r"(?:[A-F](?:\)|\.(?=\s)|:|[ \t]+[-—–](?=\s))|[1-9](?:\)|\.(?=\s)))(?:\*\*)?")
+_PICK = re.compile(r"\b(?:[A-F]\s*(?:,\s*[A-F]\s*)*\s+or\s+[A-F]|yes\s+or\s+no|choose|pick|which\s+option)\b", re.I)
 _RECOMMENDED = re.compile(r"\(recommended\)", re.I)
 
 HOLD_MESSAGE = (
@@ -64,6 +69,14 @@ HOLD_MESSAGE = (
     "line per option starting 'A)', 'B)' (what happens, cost, reversible?) and 'Recommend: <option> - <reason>', "
     "each label at the start of its own line; choices mark exactly one label '(recommended)'. Then file it again."
 )
+CONTRACT_MESSAGE = (
+    "ask-gate: unblock_card_hold. This blocked card's scope is a machine contract (a PR approval target or "
+    "physical-ask DEVICE:/HUMAN_STEP: lines): keep scope exactly as it is. Missing: {missing}. Load "
+    "try-to-unblock and check whether you can clear it yourself; if David is truly needed, fix only why_human "
+    "(start it 'Tried: ...') and choices (exactly one label '(recommended)'), and put the situation and the "
+    "options' costs briefly in action/why_human (generate-unblock-card, 'Scope that is already a contract'). "
+    "Then file it again."
+)
 
 
 def _norm(name: str) -> str:
@@ -71,9 +84,39 @@ def _norm(name: str) -> str:
     return "situation" if n.startswith("situation") else "options" if n.startswith("option") else "recommend"
 
 
+def _at_boundary(text: str, pos: int) -> bool:
+    """True when pos starts a line (after spaces, a bullet/quote) or follows a sentence end (. ! ? ;) and spaces."""
+    i = pos - 1
+    while i >= 0 and text[i] in " \t":
+        i -= 1
+    if i < 0 or text[i] == "\n":
+        return True
+    if text[i] in "-*>":
+        j = i - 1
+        while j >= 0 and text[j] in " \t":
+            j -= 1
+        if j < 0 or text[j] == "\n":
+            return True
+    return text[i] in ".!?;" and i < pos - 1
+
+
+def _flat(text: str) -> str:
+    return " ".join(text.replace("**", "").replace("__", "").split())
+
+
+def _clean(scope: str) -> str:
+    return scope.replace("\r\n", "\n").replace("\r", "\n")
+
+
 def sections(scope: str) -> dict[str, str]:
-    """First occurrence of each labelled part -> its text, up to the next label or contract line."""
-    marks = [(m.start(), m.end(), _norm(m.group(1) or m.group(2))) for m in _LABEL.finditer(scope)]
+    """First occurrence of each labelled part -> its raw text, up to the next label or contract line."""
+    scope = _clean(scope)
+    marks = [(m.start(), m.end(), _norm(m.group(1))) for m in _HEADING.finditer(scope)]
+    taken = [(s, e) for s, e, _ in marks]
+    for m in _WORD_LABEL.finditer(scope):
+        if _at_boundary(scope, m.start()) and not any(s <= m.start() < e for s, e in taken):
+            marks.append((m.start(), m.end(), _norm(m.group(1))))
+    marks.sort()
     stops = sorted([s for s, _, _ in marks] + [m.start() for m in _CONTRACT_LINE.finditer(scope)])
     out: dict[str, str] = {}
     for start, end, name in marks:
@@ -84,13 +127,24 @@ def sections(scope: str) -> dict[str, str]:
     return out
 
 
+def _line_start(text: str, pos: int) -> bool:
+    i = pos - 1
+    while i >= 0 and text[i] in " \t":
+        i -= 1
+    return i < 0 or text[i] == "\n"
+
+
 def options(text: str) -> list[str]:
-    """Option items in an Options part: text from each marker to the next; text before the first is dropped."""
-    starts = [m.start() for m in _OPTION.finditer(text)]
+    """Option items in an Options part: text from each marker to the next; text before the first is dropped.
+    With two or more line-start markers only those count ("A) Use plan B: restart" stays one option); otherwise
+    (a single-line part) a marker counts at a line start or after a sentence end."""
+    text = _clean(text)
+    cands = [m.start() for m in _OPTION.finditer(text)]
+    line = [s for s in cands if _line_start(text, s)]
+    starts = line if len(line) >= 2 else [s for s in cands if _at_boundary(text, s)]
     items = []
     for i, s in enumerate(starts):
-        item = text[s: starts[i + 1] if i + 1 < len(starts) else len(text)]
-        item = " ".join(item.replace("**", "").replace("__", "").split()).lstrip("-* ").strip()
+        item = re.sub(r"^[-*]\s*", "", _flat(text[s: starts[i + 1] if i + 1 < len(starts) else len(text)]))
         if item:
             items.append(item)
     return items
@@ -114,11 +168,13 @@ def _pr_scope():
 
 
 def contract_scope(scope: str) -> bool:
-    """True when scope is a machine contract (PR approval target, physical-ask labels), not a brief."""
-    if _CONTRACT_LINE.search(scope):
+    """True when scope is a machine contract: a physical ask (DEVICE:/HUMAN_STEP: lines) or a PR approval target
+    (pr_approval_request.SCOPE naming a PR number). A bare owner/repo or an EVIDENCE: line is not one."""
+    scope = _clean(scope)
+    if _PHYSICAL_CONTRACT.search(scope):
         return True
     try:
-        return bool(scope.strip()) and bool(_pr_scope().fullmatch(scope))
+        return bool(_PR_NUMBER.search(scope)) and bool(_pr_scope().fullmatch(scope))
     except Exception:
         return False
 
@@ -141,9 +197,9 @@ def missing(request: dict) -> list[str]:
         out.append("why_human has no 'Tried:'")
     if not contract_scope(scope):
         parts = sections(scope)
-        if len(parts.get("situation", "")) < MIN_PART_CHARS:
+        if len(_flat(parts.get("situation", ""))) < MIN_PART_CHARS:
             out.append("scope has no 'Situation:' (at least a sentence)")
-        if len(parts.get("recommend", "")) < MIN_PART_CHARS:
+        if len(_flat(parts.get("recommend", ""))) < MIN_PART_CHARS:
             out.append("scope has no 'Recommend:' with a reason")
         if is_decision(request):
             n = len(options(parts["options"])) if "options" in parts else 0
@@ -163,4 +219,5 @@ def hit(request: dict) -> dict | None:
     gaps = missing(request)
     if not gaps:
         return None
-    return {"missing": gaps, "message": HOLD_MESSAGE.format(missing="; ".join(gaps))}
+    template = CONTRACT_MESSAGE if contract_scope(str(request.get("scope") or "")) else HOLD_MESSAGE
+    return {"missing": gaps, "message": template.format(missing="; ".join(gaps))}

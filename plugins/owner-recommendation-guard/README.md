@@ -25,6 +25,6 @@ Log: `$HERMES_HOME/logs/owner-recommendation-guard.jsonl` (`owner_recommendation
 The guard also runs ask-gate's `unblock_card_quality.py` (same file, loaded by path) after the owner-recommendation
 rule: a blocked card without `Tried:` / `Situation:` / `Options:` / `Recommend:` / one `(recommended)` choice is
 refused with a pointer to the try-to-unblock and generate-unblock-card skills. Same bound (2 holds per session,
-tool and card; a blocked create is keyed by its idempotency key or title), same fail-open, same step-aside when
+tool and card; a blocked create is keyed by its idempotency key or title, with a cap of 4 per session), same fail-open, same step-aside when
 ask-gate is active. Contract scopes (PR approval, physical asks) are exempt from the brief parts (ask-gate README). Log events `unblock_card_hold`,
 `_released`, `_error`.

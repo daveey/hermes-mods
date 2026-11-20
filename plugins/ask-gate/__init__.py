@@ -1036,7 +1036,7 @@ _UNBLOCK_CARD_HELD: dict[tuple[str, str, str], int] = {}
 
 def _brief_card(tool_name: str, args: dict) -> str:
     """Bound key for unblock_card_hold: the blocked card, or for a blocked create its idempotency key / title, so
-    one session's briefless creates don't share a single budget."""
+    one session's briefless creates don't share a single budget (a retitle is capped by MAX_CREATE_HOLDS)."""
     card = next(iter(_block_card(tool_name, args)), "")
     if card or tool_name != "kanban_create":
         return card
@@ -1053,11 +1053,15 @@ def _unblock_card_hold(session_id: str, tool_name: str, request: dict, card: str
             return None
         key = (session_id, tool_name, card or "")
         n = _UNBLOCK_CARD_HELD.get(key, 0)
-        if n >= unblock_card_quality.MAX_HOLDS:
+        total_key = (session_id, tool_name, "<creates>")
+        creates = _UNBLOCK_CARD_HELD.get(total_key, 0) if tool_name == "kanban_create" else 0
+        if n >= unblock_card_quality.MAX_HOLDS or creates >= unblock_card_quality.MAX_CREATE_HOLDS:
             core.log_event("unblock_card_released", tool=tool_name, session=session_id, holds=n,
                            missing=hit["missing"])
             return None
         _UNBLOCK_CARD_HELD[key] = n + 1
+        if tool_name == "kanban_create":
+            _UNBLOCK_CARD_HELD[total_key] = creates + 1
         core.log_event("unblock_card_hold", tool=tool_name, session=session_id, attempt=n,
                        task=os.environ.get("HERMES_KANBAN_TASK") or "", missing=hit["missing"])
         return {"action": "block", "message": hit["message"]}

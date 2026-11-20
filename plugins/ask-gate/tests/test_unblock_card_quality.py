@@ -224,3 +224,53 @@ def test_test_switch_needs_pytest(gate, monkeypatch):
     assert gate.unblock_card_quality.hit(INCIDENT) is None
     monkeypatch.delenv("PYTEST_CURRENT_TEST")
     assert gate.unblock_card_quality.hit(INCIDENT) is not None
+
+
+# ── second review ───────────────────────────────────────────────────────────────────────────────────────────────
+def test_contract_scope_hold_says_keep_the_scope(gate):
+    hr = dict(INCIDENT, scope="acme/widgets#12 head abcdef1", choices=None)
+    r = _block(gate, hr, task="t_33333333")
+    assert r and r["action"] == "block"
+    if "unblock_card_hold" in r["message"]:
+        assert "keep scope exactly as it is" in r["message"]
+        assert "'Situation:'" not in r["message"]
+    msg = gate.unblock_card_quality.hit(hr)["message"]
+    assert "keep scope exactly as it is" in msg and "why_human" in msg
+
+
+def test_exemption_needs_a_pr_number_or_device_lines(gate):
+    q = gate.unblock_card_quality
+    assert not q.contract_scope("hermes/desktop")
+    assert not q.contract_scope("mac-app/idle-fix")
+    assert not q.contract_scope(GOOD["scope"] + "\nEVIDENCE: ps output")
+    assert q.contract_scope("HUMAN_STEP: plug it in\nOBSERVATION: scan")
+    assert any("Situation" in g for g in q.missing(dict(INCIDENT, scope="hermes/desktop", why_human="Tried: x.")))
+
+
+@pytest.mark.parametrize("text,items", [
+    ("A) Use plan B: restart once\nB) accept", ["A) Use plan B: restart once", "B) accept"]),
+    ("A) I prefer option A. It is cheap.\nB) Python 3. Then rerun.", ["A) I prefer option A. It is cheap.", "B) Python 3. Then rerun."]),
+    ("I prefer option A. It is cheap.", []),
+    ("A) run once more, 1 min. B) accept the gap.", ["A) run once more, 1 min.", "B) accept the gap."]),
+])
+def test_options_are_not_over_split(gate, text, items):
+    assert gate.unblock_card_quality.options(text) == items
+
+
+def test_double_space_and_crlf(gate):
+    q = gate.unblock_card_quality
+    parts = q.sections("Situation: The fix is installed and one check is open.  Options: A) x. B) y.  Recommend: A - cheap.")
+    assert parts["options"] == "A) x. B) y."
+    assert q.sections("## Situation\r\nThe app closed so the last check cannot attach.\r\n")["situation"].startswith("The app")
+    assert any("Situation" in g for g in q.missing(dict(GOOD, scope="Situation: **short** __x__\nRecommend: A - fine and cheap enough.")))
+
+
+def test_retitled_creates_are_capped_per_session(gate):
+    gate.LOG.add("s9", "terminal", "evidence check", INCIDENT["evidence"])
+    gate.LLM = llm_returning([("ok", "fine")] * 12)
+    held = 0
+    for i in range(8):
+        r = gate.pre_tool_call(tool_name="kanban_create", session_id="s9",
+                               args={"title": f"retitle {i}", "initial_status": "blocked", "human_request": INCIDENT})
+        held += bool(r and "unblock_card_hold" in r.get("message", ""))
+    assert held == gate.unblock_card_quality.MAX_CREATE_HOLDS
