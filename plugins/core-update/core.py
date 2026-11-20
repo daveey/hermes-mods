@@ -9,7 +9,8 @@ An updater (for example a sync job that keeps a fork checkout current) writes
      "waiter_cmd": ["<argv that waits for Desktop to quit, then applies the update>"]}
 
 and, while it waits for Desktop to quit, ``waiter.json`` ({"pid", "state", ...}) next to it.
-This module only reads those files and the running checkout's HEAD; ``restart`` starts the
+This module only reads those files, the running checkout's HEAD and installed Desktop bundle
+stamps; ``restart`` starts the
 waiter (it is idempotent: a second waiter exits at once) and then asks Desktop to quit, so the
 update lands between quit and relaunch. Nothing here edits the checkout.
 """
@@ -75,10 +76,36 @@ def _pid_alive(pid: Any) -> bool:
         return False
 
 
+# Match the updater's desktop build-input comparison, not backend checkout HEAD.
+DESKTOP_INPUT_PATHS = ("apps/desktop", "apps/shared", "package.json", "package-lock.json", ".npmrc",
+                       "pnpm-lock.yaml", "pnpm-workspace.yaml", "pm/lock.json", "scripts/build",
+                       "scripts/generate-icons.mjs", "scripts/generate_icons.py", "assets",
+                       "pyproject.toml", "uv.lock")
+
+
+def _desktop_swap_pending(root: Path, sha: str, git: Callable[..., Optional[str]]) -> Optional[bool]:
+    """Derive swap debt from installed bundle stamps; never the staged app's stamp.
+
+    None means no installed bundle identity is available (legacy/non-Desktop host).
+    Re-read on each poll so a completed swap clears the offer without a state writer.
+    Older bundles that have identical build inputs already serve this target.
+    """
+    stamps = sorted((root / "apps/desktop/release").glob("*/Hermes.app/Contents/Resources/install-stamp.json"))
+    commits = [_read_json(p).get("commit") for p in stamps]
+    if not commits or any(not isinstance(c, str) or len(c) != 40
+                          or any(ch not in "0123456789abcdef" for ch in c) for c in commits):
+        return None
+    return any(c != sha and git(root, "diff", "--quiet", c, sha, "--", *DESKTOP_INPUT_PATHS) is None
+               for c in commits)
+
+
 def status(home: Optional[Path] = None, checkout: Optional[Path] = None,
            git: Callable[..., Optional[str]] = _git) -> Dict[str, Any]:
-    """``{"state": "building"|"ready"|"failed"|"idle", ...}``. ``ready`` only when the built sha
-    is a descendant of (ahead of) the running HEAD; a build of what already runs is ``idle``."""
+    """Offer descendants of checkout HEAD, including HEAD when its Desktop swap is owed.
+
+    Checkout equality is not proof of Desktop installation. A matching installed bundle
+    (including identical build inputs) clears same-HEAD offers after the swap.
+    """
     d = state_dir(home)
     st = _read_json(d / "state.json")
     waiter = _read_json(d / "waiter.json")
@@ -98,8 +125,18 @@ def status(home: Optional[Path] = None, checkout: Optional[Path] = None,
         "can_restart": False, "can_build": False,
         "reason": st.get("peer_blocked_reason"),
     }
-    if not sha or not running or (sha == running and st.get("status") not in ("needs-local-build", "building")):
+    if not sha or not running:
         return out
+    if sha == running:
+        pending = _desktop_swap_pending(root, sha, git)
+        out["desktop_swap_pending"] = pending
+        if pending is False:
+            return out
+        # Without installed identity, keep build/failure diagnostics but do not
+        # turn a legacy same-HEAD ready record into an endless restart offer.
+        if pending is None and st.get("status") == "ready":
+            out["reason"] = "installed Desktop bundle identity unavailable"
+            return out
     ahead = git(root, "merge-base", "--is-ancestor", running, sha) is not None
     if not ahead:
         return out  # stale record (the checkout moved past it, or diverged)
