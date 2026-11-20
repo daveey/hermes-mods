@@ -640,7 +640,7 @@ test('rows lead with their state box, not a dot; hub cards carry the H there too
 })
 
 
-test('waitKind sorts waiting rows into parent, schedule, unknown and other', () => {
+test('waitKind sorts waiting rows into named kinds, never a catch-all "other"', () => {
   const out = m.classify([
     card('t_sched', 'scheduled', { look: 'waiting', waitingOn: 'ci https://github.com/o/r/actions/runs/1' }),
     card('t_bare', 'scheduled'),
@@ -650,16 +650,16 @@ test('waitKind sorts waiting rows into parent, schedule, unknown and other', () 
     { key: 'sub:a', kind: 'sub', label: 'Legacy sub-agent' }
   ], { nowMs: NOW })
   assert.deepEqual(Object.fromEntries(out.waiting.map(i => [i.key, m.waitKind(i)])),
-    { 'kb:t_sched': 'schedule', 'kb:t_bare': 'schedule', 'kb:t_card': 'parent', 'kb:t_gone': 'unknown', 'kb:t_triage': 'other', 'sub:a': 'unknown' })
+    { 'kb:t_sched': 'schedule', 'kb:t_bare': 'schedule', 'kb:t_card': 'parent', 'kb:t_gone': 'unknown', 'kb:t_triage': 'triage', 'sub:a': 'unknown' })
   // A todo card reaches Waiting only through a fresh board read; it waits on its parents.
   assert.equal(m.waitKind({ kind: 'kanban', detail: 'todo · board status', chip: { state: 'todo' } }), 'parent')
   assert.equal(m.waitKind({ kind: 'kanban', detail: 'status unknown (missing qualified identity) · last known: running', chip: { state: 'running' } }), 'unknown',
     'a status-unknown row is never guessed from its last known state')
-  assert.equal(m.waitBreakdown(out.waiting).text, '1 on parent · 2 on schedule · 2 unknown · 1 other')
+  assert.equal(m.waitBreakdown(out.waiting).text, '1 on parent · 2 on schedule · 1 in triage · 2 unknown')
   assert.equal(m.waitBreakdown(out.waiting.filter(i => i.key === 'kb:t_gone')).text, '1 unknown', 'zero buckets are hidden')
 })
 
-test('panel: Waiting is folded to counts by default and opens per chat', async () => {
+test('panel: Waiting is folded to counts plus one line per card (what it waits on) and opens per chat', async () => {
   window.localStorage.clear()
   bridges({ chips: [
     card('t_w1', 'scheduled', { look: 'waiting', waitingOn: 'clock 11:00', label: 'Timer card' }),
@@ -671,14 +671,42 @@ test('panel: Waiting is folded to counts by default and opens per chat', async (
   assert.equal(el().querySelector('[data-section="waiting"]').textContent, 'Waiting · 3')
   assert.equal(el().querySelector('[data-waiting-breakdown]').textContent, '1 on parent · 1 on schedule · 1 unknown')
   assert.equal(toggle().getAttribute('aria-expanded'), 'false')
-  assert.equal(el().querySelectorAll('[data-row-pip="waiting"]').length, 0, 'no waiting rows while folded')
-  assert.doesNotMatch(el().querySelector('[data-panel-body]').textContent, /Timer card|Child card|Lost card/)
+  assert.equal(el().querySelectorAll('[data-row-pip="waiting"]').length, 0, 'no full waiting rows while folded')
+  // [daveey 2026-11-20] "Waiting · 1  1 other" said nothing: folded, each card still names what it waits on.
+  const lines = [...el().querySelectorAll('[data-folded-waiting] [data-waiting-line]')].map(e => e.textContent)
+  assert.deepEqual(lines.slice(0, 2), ['Timer card · waiting on clock 11:00', 'Child card · waiting on card t_x'])
+  assert.match(lines[2], /^Lost card · status unknown · last known: running \(.+\); the card could not be re-read$/)
   await React.act(async () => toggle().click())
   assert.equal(toggle().getAttribute('aria-expanded'), 'true')
+  assert.equal(el().querySelector('[data-folded-waiting]'), null, 'open: full rows replace the one-liners')
   assert.equal(el().querySelectorAll('[data-row-pip="waiting"]').length, 3)
   assert.match(el().textContent, /Timer card/)
   await React.act(async () => toggle().click())
   assert.equal(el().querySelectorAll('[data-row-pip="waiting"]').length, 0)
+})
+
+test('panel: folded Waiting lists 3 one-liners then "+N more"; ready / plain todo render in their own folds; a retired ask renders in full', async () => {
+  window.localStorage.clear()
+  const fresh = state => ({ boardStatus: { state, readAt: Date.now(), source: 'owner' } })
+  bridges({ asked: () => true, chips: [
+    card('t_a', 'scheduled', { look: 'waiting', waitingOn: 'clock 11:00', label: 'A' }),
+    card('t_b', 'scheduled', { look: 'waiting', waitingOn: 'clock 12:00', label: 'B' }),
+    card('t_c', 'scheduled', { look: 'waiting', waitingOn: 'clock 13:00', label: 'C' }),
+    card('t_d', 'scheduled', { look: 'waiting', waitingOn: 'clock 14:00', label: 'D' }),
+    card('t_ready', 'ready', { label: 'Ready one', ...fresh('ready') }),
+    card('t_todo', 'todo', { label: 'Todo one', ...fresh('todo') }),
+    card('t_ask', 'blocked', { look: 'needs-you', label: 'Retired ask' })
+  ] })
+  window.__userSteps.presentationForSource = s => (s.id === 't_ask' ? { representedInQueue: false, dismissed: true } : null)
+  await show(React.createElement(m.Panel, { key: 'fold-more' }))
+  const folded = el().querySelector('[data-folded-waiting]')
+  assert.deepEqual([...folded.querySelectorAll('[data-waiting-line]')].map(e => e.textContent.split(' · ')[0]), ['A', 'B', 'C'])
+  assert.match(folded.textContent, /\+1 more waiting$/, 'D only: the retired ask is not a one-liner')
+  assert.doesNotMatch(folded.textContent, /Retired ask/)
+  assert.match(el().querySelector('[data-card-status]').textContent, /t_ask · blocked · request dismissed/, 'retired ask status row renders in full while folded')
+  assert.match(el().querySelector('[data-fold="Ready · 1"]').textContent, /Ready one.*ready · waiting for a worker to claim it · board status/)
+  assert.match(el().querySelector('[data-fold="Not started · 1"]').textContent, /Todo one.*not started · board status/)
+  assert.doesNotMatch(el().querySelector('[data-waiting-breakdown]').textContent, /other/)
 })
 
 // [daveey] Switching chats shows the panel at once: last-known data paints first, reads replace it.

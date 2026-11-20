@@ -34,7 +34,7 @@ import { useEffect, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'session-panel'
-const VERSION = 'session-panel-v7-running-one-line'
+const VERSION = 'session-panel-v8-wait-reasons'
 export const STUCK_CARD_S = 2 * 3600 // running card with no event this long
 export const STUCK_SUB_MS = 30 * 60_000 // sub-agent with no new tool call this long
 const DONE_POLL_MS = 30_000
@@ -332,16 +332,25 @@ export function classify(chips, { nowMs = Date.now(), silence = new Map(), isAsk
     // turn a recent list read into a heartbeat or claim a running worker is alive.
     const board = c.boardStatus
     const leaf = c.upstream?.id ? ` → ${c.upstream.id} ${c.upstream.status || 'unknown'}` : ''
+    // A stalled agent-owned wait is the board's own verdict (`wait.wait_state`), not execution evidence: it is Stuck
+    // whatever the run evidence says (a fresh parked read used to take it to Waiting first, so it never showed).
+    if (c.look === 'stalled') { out.stuck.push({ ...item(c), reason: 'stalled', detail: `stalled: ${on || 'agent-owned wait over 2 h'}` }); continue }
     if ((!ev || ev.state === 'unknown') && board && board.state === c.state && ['scheduled', 'blocked', 'triage', 'review', 'ready', 'todo'].includes(c.state) &&
         Number.isFinite(board.readAt) && nowMs >= board.readAt && nowMs - board.readAt <= 60_000) {
-      out.waiting.push({ ...item(c), detail: `${c.state} · ${board.source === 'replica' ? 'reported board status' : 'board status'}${on ? ` · ${on}` : ''}${leaf}` })
+      // A parked card has no run to observe: its fresh board lifecycle is the answer, so its unknown execution
+      // evidence is not counted (`parked`). The row leads with what it waits on; the source comes last.
+      const source = board.source === 'replica' ? 'reported board status' : 'board status'
+      if (c.state === 'ready') { out.ready.push({ ...item(c), parked: true, detail: `ready · waiting for a worker to claim it · ${source}` }); continue }
+      if (c.state === 'todo' && !c.waitingOn && !c.upstream?.id) { out.queued.push({ ...item(c), parked: true, detail: `not started · ${source}` }); continue }
+      // The upstream leaf follows a published wait only: without one, parkedWaitText already names the upstream.
+      const text = parkedWaitText(c, on)
+      out.waiting.push({ ...item(c), parked: true, detail: `${text}${on && text === on ? leaf : ''} · ${source}` })
       continue
     }
     if (board && (!ev || ev.state === 'unknown') || ev?.sourced && ev.state === 'unknown' || legacyLive(c, ev)) {
       out.waiting.push({ ...item(c), detail: `status unknown${ev?.reason ? ` (${ev.reason.replace(/_/g, ' ')})` : ''} · last known: ${ev?.lastKnown || c.state || 'unknown'}${ev?.ageSec != null ? ` (observed ${span(ev.ageSec)} ago)` : ''}` })
       continue
     }
-    if (c.look === 'stalled') { out.stuck.push({ ...item(c), reason: 'stalled', detail: `stalled: ${on || 'agent-owned wait over 2 h'}` }); continue }
     if (c.state === 'running') {
       if (progress && now - progress >= STUCK_CARD_S) out.stuck.push({ ...item(c), reason: 'no-progress', lastAt: progress, detail: `running, no progress since ${clock(progress, nowMs)} (${ago(progress, nowMs)})${c.activity ? ` · last event: ${c.activity}` : ''}` })
       else out.active.push({ ...item(c), detail: `running${c.assignee ? ` · ${c.assignee}` : ''}${progress ? ` · ${ago(progress, nowMs)}` : ' · last event unknown'}` })
@@ -355,26 +364,47 @@ export function classify(chips, { nowMs = Date.now(), silence = new Map(), isAsk
   return out
 }
 
+/** What a parked card (fresh board status, no run) waits on, in plain words. `on` is its published wait
+ *  ("waiting on …"); without one the row says what its lifecycle state means and that no reason was published,
+ *  never a bare state name. A producer's placeholder ("a producer the owner did not publish") is said plainly. */
+export function parkedWaitText(c, on) {
+  const w = str(c?.waitingOn), up = c?.upstream?.id ? `card ${c.upstream.id} (${c.upstream.status || 'status unknown'})` : ''
+  const unpublished = !w || /did not publish/i.test(w)
+  switch (c?.state) {
+    case 'triage': return unpublished || w === 'triage' ? 'in triage · waiting to be specified and promoted' : on
+    case 'review': return unpublished ? 'waiting on review' : on
+    case 'todo': return !unpublished ? on : up ? `waiting on ${up}` : 'waiting on its parent cards'
+    case 'scheduled': return !unpublished ? on : up ? `scheduled · waiting on ${up}` : 'scheduled · its owner has not published what wakes it'
+    case 'blocked': return !unpublished ? on : up ? `blocked · waiting on ${up}` : 'blocked · no reason published'
+    default: return on || str(c?.state) || 'status unknown'
+  }
+}
+
 /** What a Waiting row waits on, for the folded section's counts: `parent` (another card must finish first),
- *  `schedule` (a timer, CI run, deploy or other scheduled wake), `unknown` (its status could not be read), else
- *  `other` (triage, a retired ask's blocked owner). A status-unknown row is never guessed into parent/schedule. */
-export const WAIT_KINDS = ['parent', 'schedule', 'contained', 'unknown', 'other']
-const WAIT_LABEL = { parent: 'on parent', schedule: 'on schedule', contained: 'contained', unknown: 'unknown', other: 'other' }
+ *  `schedule` (a timer, CI run, deploy or other scheduled wake), `contained`, `triage` (to be specified),
+ *  `review`, `blocked` (including a retired ask's still-blocked owner), `unknown` (its status could not be read).
+ *  There is no catch-all bucket: "1 other" told the user nothing. A status-unknown row is never guessed into
+ *  parent/schedule; any other lifecycle state is counted under its own name. */
+export const WAIT_KINDS = ['parent', 'schedule', 'contained', 'triage', 'review', 'blocked', 'unknown']
+const WAIT_LABEL = { parent: 'on parent', schedule: 'on schedule', contained: 'contained', triage: 'in triage', review: 'in review', blocked: 'blocked', unknown: 'unknown' }
 export function waitKind(i) {
   const c = i?.chip || {}
   if (c.stale || /^(status )?unknown\b/.test(str(i?.detail)) || /\bunknown \(/.test(str(i?.detail)) || c.state === 'unknown') return 'unknown'
-  if (i?.kind !== 'kanban' || i.cardStatus) return i?.kind === 'kanban' ? 'other' : 'unknown'
+  if (i?.kind !== 'kanban') return 'unknown'
+  if (i.cardStatus) return 'blocked'
   if (c.contained) return 'contained'
   const on = str(c.waitingOn)
-  if (c.state === 'todo' || /^(blocked )?(parent|card|task)s?\b/i.test(on)) return 'parent'
-  if (c.state === 'scheduled' || (on && c.state !== 'triage' && c.state !== 'blocked')) return 'schedule'
-  return 'other'
+  if (c.state === 'todo' || /^(blocked |an? )?(parent|card|task)s?\b/i.test(on)) return 'parent'
+  if (c.state === 'triage' || c.state === 'review' || c.state === 'blocked') return c.state
+  if (c.state === 'scheduled' || on) return 'schedule'
+  return str(c.state) || 'unknown'
 }
 export function waitBreakdown(rows) {
-  const n = { parent: 0, schedule: 0, contained: 0, unknown: 0, other: 0 }
-  for (const i of rows || []) n[waitKind(i)]++
-  // Only buckets with something in them show; a zero bucket is noise.
-  return { n, text: WAIT_KINDS.filter(k => n[k]).map(k => `${n[k]} ${WAIT_LABEL[k]}`).join(' · ') }
+  const n = Object.create(null)
+  for (const i of rows || []) { const k = waitKind(i); n[k] = (n[k] || 0) + 1 }
+  // Only buckets with something in them show; a zero bucket is noise. Known kinds first, any other state after.
+  const keys = [...WAIT_KINDS.filter(k => n[k]), ...Object.keys(n).filter(k => !WAIT_KINDS.includes(k))]
+  return { n, text: keys.map(k => `${n[k]} ${Object.hasOwn(WAIT_LABEL, k) ? WAIT_LABEL[k] : k}`).join(' · ') }
 }
 
 /** True when the chat has anything not finished: an ask, a card/sub-agent/process that is open, an open ledger
@@ -388,13 +418,15 @@ export function hasOpenWork(sorted, { asks = 0, steps = [], issues = [] } = {}) 
 /** Attach each work row's evidence line (projected at `nowMs`, never cached); returns how many rows have SOURCE evidence that is unknown (rows with none show their own explicit unknown line). */
 export function annotateEvidence(sorted, nowMs, opts) {
   let unknown = 0
-  for (const list of [sorted.active, sorted.stuck, sorted.blockedUpstream || [], sorted.waiting, sorted.queued, sorted.unasked]) {
+  for (const list of [sorted.active, sorted.stuck, sorted.blockedUpstream || [], sorted.waiting, sorted.ready || [], sorted.queued, sorted.unasked]) {
     for (const i of list) {
       if (!['kanban', 'bg', 'sub'].includes(i.kind)) continue
       const v = chipObservation(i.chip, nowMs / 1000, opts)
       i.evidenceText = chipEvidenceLine(i.chip, nowMs / 1000, opts)
       i.evidenceState = v.state
-      if (v.state === 'unknown' && (v.sourced || i.kind === 'bg' || i.kind === 'sub' || legacyLive(i.chip, v))) unknown++
+      // A parked card read fresh from its board has no run to observe: unknown execution evidence there is
+      // expected, not a gap (it read "1 waiting · 1 evidence unknown" as if the evidence were the wait).
+      if (!i.parked && v.state === 'unknown' && (v.sourced || i.kind === 'bg' || i.kind === 'sub' || legacyLive(i.chip, v))) unknown++
     }
   }
   return unknown
@@ -927,6 +959,9 @@ export function Panel() {
   const waitingRows = [...sorted.blockedUpstream, ...sorted.waiting]
   const waitLines = waitingRows.slice(0, WAIT_LINES_COLLAPSED)
   const waitMore = waitingRows.length - waitLines.length
+  const foldRows = sorted.waiting.filter(i => !i.cardStatus) // cardStatus rows always render in full
+  const foldLines = foldRows.slice(0, WAIT_LINES_COLLAPSED)
+  const foldMore = foldRows.length - foldLines.length
   const needsYou = [
     (asks > 0 || sorted.unasked.length > 0) && jsx('h3', { 'data-section': 'needs-you', style: heading(C.needsYou), children: `Needs you · ${asks + sorted.unasked.length}` }, 'h-needs-you'),
     US?.ActionQueue && jsx(US.ActionQueue, { embedded: true }, 'queue'),
@@ -972,6 +1007,12 @@ export function Panel() {
         jsx('span', { 'aria-hidden': true, style: { fontSize: 10, width: 10 }, children: waitingOpen ? '▾' : '▸' }),
         jsx('h3', { 'data-section': 'waiting', style: { ...heading('var(--muted-foreground)'), margin: 0 }, children: `Waiting · ${sorted.waiting.length}` }),
         jsx('span', { 'data-waiting-breakdown': '', style: muted, children: waitingBreakdown.text })
+      ] }),
+      // Folded, the counts alone ("1 other") left the user asking "on what?": name up to 3 cards and what each
+      // waits on, one line each, as the collapsed panel does. Opening the fold shows the full rows.
+      !waitingOpen && foldLines.length > 0 && jsxs('div', { 'data-folded-waiting': '', style: { ...muted, padding: '0 0 4px 18px', minWidth: 0 }, children: [
+        ...foldLines.map(i => jsx('div', { 'data-waiting-line': i.key, title: `${str(i.chip?.title) || i.label}${i.detail ? `\n${i.detail}` : ''}`, style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, children: `${i.label} · ${i.detail || 'waiting'}` }, i.key)),
+        foldMore > 0 && jsx('div', { children: `+${foldMore} more waiting` }, 'more')
       ] }),
       // A still-blocked owner whose ask was retired has no other surface: its status row is never folded away.
       ...sorted.waiting.filter(i => waitingOpen || i.cardStatus).map(i => jsx(Row, { i, k: 'waiting' }, i.key)),

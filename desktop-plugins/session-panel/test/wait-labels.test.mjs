@@ -48,6 +48,6 @@ for (const status of ['todo', 'scheduled']) {
     }], { connectionId: 'C1', profile: 'default' })
     const result = m.classify(chips, { evidence: c => tasks.chipObservation(c, Date.now() / 1000) })
     assert.equal(result.waiting.length, 1)
-    assert.match(result.waiting[0].detail, / → t_run running$/)
+    assert.match(result.waiting[0].detail, /^waiting on card t_run since \d\d:\d\d → t_run running · board status$/)
   })
 }

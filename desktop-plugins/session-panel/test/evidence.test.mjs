@@ -28,7 +28,7 @@ const root = createRoot(document.getElementById('root'))
 const el = () => document.getElementById('root')
 const flush = () => new Promise(r => setTimeout(r, 0))
 const show = async node => React.act(async () => { root.render(node); await flush() })
-// Waiting rows are folded by default (README "Waiting is folded to counts"): open the fold before reading them.
+// Waiting rows are folded by default (README "Waiting says what each card waits on"): open the fold before reading them.
 const openWaiting = async () => { const t = el().querySelector('[data-waiting-toggle]'); if (t && t.getAttribute('aria-expanded') !== 'true') await React.act(async () => { t.click(); await flush() }) }
 afterEach(async () => { await show(null) })
 after(async () => { await React.act(async () => { root.unmount() }); dom.window.close() })
@@ -40,19 +40,22 @@ test('fresh board status survives a parked card with no execution generation', {
   const b = bridges({ chips })
   await show(React.createElement(m.Panel, { key: 'board-status' }))
   await openWaiting()
-  assert.match(el().querySelector('[data-panel-row]').textContent, /scheduled · board status/)
+  assert.match(el().querySelector('[data-panel-row]').textContent, /scheduled · its owner has not published what wakes it · board status/)
   assert.match(el().querySelector('[data-evidence]').textContent, /hub\/default\/default\/card:t_x/)
+  // A parked card has no run: its unknown execution evidence is not a counted gap (README).
+  assert.doesNotMatch(el().querySelector('[data-status-summary]').textContent, /evidence unknown/)
   assert.equal(m.chipObservation(chips[0], BASE_AT + 10).state, 'unknown', 'no fake execution generation')
   at(71)
   await React.act(async () => { b.tick(); await flush() })
   assert.match(el().querySelector('[data-panel-row]').textContent, /status unknown/)
+  assert.match(el().querySelector('[data-status-summary]').textContent, /1 evidence unknown/, 'once the board read expires the gap counts again')
 })
 
 test('a fresh replica labels its board status as reported, and failed reads cannot reuse it', { skip: !projector }, () => {
   at(10)
   const chips = tasks.sessionTaskChips([{ id: 't_x', title: 'Remote wait', gateway: 'worker', profile: 'default', board: 'default', remote: true, status: 'scheduled', execution_observations: [record('t_x', { set: { 'identity.gateway': 'worker', 'identity.profile': 'default', 'identity.board': 'default', state: 'waiting', source: 'kanban.card', observed_at: null, valid_until: null, source_revision: null, evidence_refs: [] }, delete: ['identity.run_id'] })] }])
   const opts = { nowMs: Date.now(), evidence: c => m.chipObservation(c, Date.now() / 1000) }
-  assert.match(m.classify(chips, opts).waiting[0].detail, /scheduled · reported board status/)
+  assert.match(m.classify(chips, opts).waiting[0].detail, /scheduled · its owner has not published what wakes it · reported board status$/)
   assert.match(m.classify(chips.map(c => ({ ...c, stale: true })), opts).waiting[0].detail, /status unknown/)
 })
 
@@ -61,7 +64,7 @@ test('board freshness expires even without execution observations or an SDK verd
   for (const observations of [undefined, []]) {
     const chips = tasks.sessionTaskChips([{ id: 't_x', title: 'Parked', status: 'scheduled', execution_observations: observations }])
     for (const evidence of [c => m.chipObservation(c, Date.now() / 1000), () => null]) {
-      assert.match(m.classify(chips, { nowMs: Date.now(), evidence }).waiting[0].detail, /scheduled · board status/)
+      assert.match(m.classify(chips, { nowMs: Date.now(), evidence }).waiting[0].detail, /^scheduled · its owner has not published what wakes it · board status$/)
       assert.match(m.classify(chips, { nowMs: Date.now() + 60_001, evidence }).waiting[0].detail, /status unknown/)
       for (const boardStatus of [{ ...chips[0].boardStatus, readAt: NaN }, { ...chips[0].boardStatus, state: 'ready' }, { ...chips[0].boardStatus, readAt: Date.now() + 1 }]) {
         assert.match(m.classify([{ ...chips[0], boardStatus }], { nowMs: Date.now(), evidence }).waiting[0].detail, /status unknown/)
