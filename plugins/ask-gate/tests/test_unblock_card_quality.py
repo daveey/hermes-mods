@@ -21,7 +21,7 @@ INCIDENT = dict(
 )
 
 GOOD = dict(
-    action="Choose how to finish verifying the fix. Unblock = A (one supervised test run). Archive = B.",
+    action="Choose how to finish verifying the fix. Unblock = A (one supervised test run); archive = B.",
     why_human=("Tried: the original test app exited, so I can't attach to it; a Desktop restart with debugging is "
                "outside this card's approval. Only you can: allow a Desktop restart, or accept less proof."),
     interaction="approval",
@@ -121,22 +121,106 @@ def test_blocked_create_is_held(gate):
 
 
 def test_good_brief_is_not_held_by_this_rule(gate, tmp_path):
-    r = _block(gate, GOOD, task="t_good")
+    r = _block(gate, GOOD, task="t_11111111")
     assert r is None or "unblock_card_hold" not in r.get("message", "")
     assert not _events(tmp_path, "unblock_card_hold")
 
 
 def test_hold_is_bounded_then_released(gate, tmp_path):
     for _ in range(2):
-        r = _block(gate, INCIDENT, task="t_bound")
+        r = _block(gate, INCIDENT, task="t_0123456789abcdef")
         assert r and "unblock_card_hold" in r["message"]
-    r = _block(gate, INCIDENT, task="t_bound")
+    r = _block(gate, INCIDENT, task="t_0123456789abcdef")
     assert r is None or "unblock_card_hold" not in r.get("message", "")
     assert _events(tmp_path, "unblock_card_released")
 
 
 def test_rule_error_fails_open(gate, tmp_path, monkeypatch):
     monkeypatch.setattr(gate.unblock_card_quality, "hit", lambda r: 1 / 0)
-    r = _block(gate, INCIDENT, task="t_err")
+    r = _block(gate, INCIDENT, task="t_00000000")
     assert r is None or "unblock_card_hold" not in r.get("message", "")
     assert _events(tmp_path, "unblock_card_error")
+
+
+# ── review fixes ────────────────────────────────────────────────────────────────────────────────────────────────
+def test_single_line_scope_with_sentence_labels(gate):
+    scope = ("Situation: The fix is installed and one check remains open here. Options: A) run once more, 1 min. "
+             "B) accept the gap. Recommend: A - cheap and covers the real bug.")
+    assert gate.unblock_card_quality.missing(dict(GOOD, scope=scope)) == []
+
+
+def test_headings_and_numbered_options(gate):
+    scope = ("## Situation\nThe app closed so the last check cannot attach anymore.\n## Options\n1. restart once\n"
+             "2. accept the gap\n## Recommendation\nOption 1 because it is a one minute restart.")
+    assert gate.unblock_card_quality.missing(dict(GOOD, scope=scope)) == []
+    assert gate.unblock_card_quality.options("Option A: restart\nOption B: accept") == ["Option A: restart", "Option B: accept"]
+
+
+def test_eg_and_ranges_are_not_options(gate):
+    assert gate.unblock_card_quality.options("E.g. a restart for 2 - 3 min") == []
+
+
+def test_mid_sentence_word_is_not_a_label(gate):
+    parts = gate.unblock_card_quality.sections("Situation: we weighed the options: none are cheap here at all.")
+    assert "options" not in parts
+
+
+def test_open_reply_question_needs_no_options(gate):
+    hr = dict(PHYSICAL, interaction="reply", action="What is the guest Wi-Fi SSID? Unblock = I configure it; archive = skip.")
+    assert gate.unblock_card_quality.missing(hr) == []
+    pick = dict(hr, action="Reply A or B: which network should the hub join?")
+    assert any("Options" in g for g in gate.unblock_card_quality.missing(pick))
+
+
+def test_pr_approval_scope_keeps_its_grammar(gate):
+    hr = dict(INCIDENT, scope="acme/widgets#12 head abcdef1", why_human="Tried: the merge queue; review is required.")
+    assert gate.unblock_card_quality.contract_scope(hr["scope"])
+    assert gate.unblock_card_quality.missing(hr) == []
+    assert any("Tried" in g for g in gate.unblock_card_quality.missing(dict(hr, why_human="Needs review.")))
+
+
+def test_physical_contract_scope_keeps_its_labels(gate):
+    hr = dict(PHYSICAL, scope="DEVICE: ring\nHUMAN_STEP: plug the charger in\nOBSERVATION: ble scan sees ring")
+    assert gate.unblock_card_quality.missing(hr) == []
+    brief = "Situation: The ring has been asleep since last night here.\nRecommend: plug it in at the desk now.\n"
+    parts = gate.unblock_card_quality.sections(brief + hr["scope"])
+    assert parts["recommend"] == "plug it in at the desk now."
+
+
+def test_owner_recommendation_hold_runs_first(gate):
+    # An in-limits pick with a full brief: owner_recommendation applies it; the brief rule never speaks.
+    hr = dict(GOOD, scope=GOOD["scope"].replace("lowers the acceptance criteria to 3 of 4 checks", "marks 3 of 4 done"),
+              why_human="Tried: attaching to the closed app. Only you can: decide.")
+    r = _block(gate, dict(hr, why_human="no tried line"), task="t_22222222")
+    assert r and "owner_recommendation_hold" in r["message"]
+
+
+def test_reconciled_approval_answers_before_the_brief(gate):
+    """An already-approved ask gets 'already approved', not 'rewrite the brief' (rule on)."""
+    import test_approval_reconciliation as rec
+    dispose = rec.setup(gate, lambda target: rec.snapshot())
+    try:
+        r = rec.call(gate)
+        assert r["action"] == "block" and "already approved" in r["message"]
+        assert "unblock_card_hold" not in r["message"]
+    finally:
+        dispose()
+
+
+def test_blocked_creates_have_their_own_bound(gate):
+    gate.LOG.add("s1", "terminal", "evidence check", INCIDENT["evidence"])
+    gate.LLM = llm_returning([("ok", "fine")] * 8)
+    def create(title):
+        return gate.pre_tool_call(tool_name="kanban_create", session_id="s1",
+                                  args={"title": title, "initial_status": "blocked", "human_request": INCIDENT})
+    for _ in range(2):
+        assert "unblock_card_hold" in create("first card")["message"]
+    r = create("second card")
+    assert r and "unblock_card_hold" in r["message"], "a second card does not inherit the first card's spent budget"
+
+
+def test_test_switch_needs_pytest(gate, monkeypatch):
+    monkeypatch.setenv("ASK_GATE_UNBLOCK_BRIEF", "0")
+    assert gate.unblock_card_quality.hit(INCIDENT) is None
+    monkeypatch.delenv("PYTEST_CURRENT_TEST")
+    assert gate.unblock_card_quality.hit(INCIDENT) is not None

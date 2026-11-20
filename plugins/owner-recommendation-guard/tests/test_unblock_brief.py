@@ -11,7 +11,7 @@ INCIDENT = dict(
     why_human="The proven app process is gone and no inspector is available.",
     interaction="approval", scope="PR1697 Mac delivery acceptance", evidence="ps: no process 5198")
 GOOD = dict(
-    action="Choose how to finish verifying the fix. Unblock = A. Archive = B.",
+    action="Choose how to finish verifying the fix. Unblock = A; archive = B.",
     why_human="Tried: attaching to the closed app; a restart is outside approval. Only you can: allow a restart.",
     interaction="approval",
     scope=("Situation: The Mac app fix is installed; one of four checks still needs a debug run.\n"
@@ -68,3 +68,25 @@ def test_steps_aside_when_ask_gate_active(guard, monkeypatch):
 def test_non_blocked_create_is_ignored(guard):
     assert guard.pre_tool_call(tool_name="kanban_create", session_id="w1",
                                args={"title": "x", "human_request": INCIDENT}) is None
+
+
+def test_blocked_create_is_held_per_title(guard):
+    def create(title):
+        return guard.pre_tool_call(tool_name="kanban_create", session_id="w1",
+                                   args={"title": title, "initial_status": "blocked", "human_request": INCIDENT})
+    assert "unblock_card_hold" in create("one")["message"]
+    assert "unblock_card_hold" in create("one")["message"]
+    assert create("one") is None
+    assert "unblock_card_hold" in create("two")["message"]
+
+
+def test_brief_rule_error_fails_open(guard, tmp_path, monkeypatch):
+    monkeypatch.setattr(guard, "_brief_rule", lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+    assert _block(guard, INCIDENT, "t_err") is None
+    assert _events(tmp_path, "unblock_card_error")
+
+
+def test_owner_rule_runs_before_the_brief(guard):
+    in_limits = dict(GOOD, scope=GOOD["scope"].replace("lowers the card's acceptance criteria; ", ""))
+    r = _block(guard, dict(in_limits, why_human="no tried line"), "t_own")
+    assert r and "owner_recommendation_hold" in r["message"]

@@ -262,17 +262,33 @@ that runs no agent.
 
 `unblock_card_hold` (`unblock_card_quality.py`): a `kanban_block` or blocked `kanban_create` whose `human_request`
 lacks the brief the skills try-to-unblock and generate-unblock-card produce is refused, with a message that names
-the missing parts and both skills. Required: `why_human` contains `Tried:`; `scope` has `Situation:` and
-`Recommend:` parts (each at least 20 chars); a decision (`approval`/`reply`) also has `Options:` with two or more
-option lines (`A) …`, `- B: …`) or two or more `choices`; when `choices` are given, exactly one label carries
-`(recommended)`. Runs after `owner_recommendation_hold` (an in-limits pick is applied, not briefed) and before the
-judge. Bounded to 2 holds per (session, tool, card), then released (`unblock_card_released`); errors fail open
-(`unblock_card_error`). owner-recommendation-guard runs the same file on hosts without ask-gate (pool workers).
-The session panel renders the brief (session-tasks `briefOf`). Why: 2026-11-20 session summaries showed blocked
-cards (t_01a1f8b56d1a69fc) with jargon, no situation, no per-option cost and no recommendation; the judge checks
-whether an ask should exist, not whether David can answer it. Tests: `tests/test_unblock_card_quality.py`,
-`owner-recommendation-guard/tests/test_unblock_brief.py`. Older fixtures run with `ASK_GATE_UNBLOCK_BRIEF=0`
-(conftest), a test-only switch.
+the missing parts, the label format and both skills.
+
+- Required: `why_human` contains `Tried:`; `scope` has `Situation:` and `Recommend:` parts (each at least 20 chars);
+  a decision also has `Options:` with two or more options (`A)`, `- B:`, `1.`, `Option C:`, own lines or inline)
+  or two or more `choices`; when `choices` are given, exactly one label carries `(recommended)`. A decision is
+  interaction `approval`, any request with `choices`, or a `reply` whose action asks for a pick ("A or B",
+  "yes or no", "choose"); an open question ("what's the SSID?") needs no Options.
+- Labels: a markdown heading (`## Situation`), or the word + colon at line start (bold/bulleted allowed) or after
+  a sentence end on the same line. "we weighed the options: …" mid-sentence is prose. The first occurrence counts;
+  a part runs to the next label or a physical contract line.
+- Contract scopes are exempt from the brief parts (`Tried:` and the single `(recommended)` still apply): a PR
+  approval scope (`pr_approval_request.SCOPE`) and a physical-ask scope (`DEVICE:` / `HUMAN_STEP:` /
+  `OBSERVATION:` / `EVIDENCE:` lines). Rewriting those scopes into a brief would break their parsers.
+- Order: after `owner_recommendation_hold` (an in-limits pick is applied, not briefed), the PR-filing and
+  superseding holds, approval reconciliation and retirement (an approved/retired ask gets that answer), and
+  before the evidence check and judge. Hold budgets are per rule, so one ask can meet several bounded holds in turn.
+- Bounded to 2 holds per (session, tool, card); a blocked create is keyed by its idempotency key or title. Then
+  released (`unblock_card_released`); errors fail open (`unblock_card_error`).
+- owner-recommendation-guard runs the same file on hosts without ask-gate (pool workers). The session panel
+  renders the brief with the same parse (session-tasks `briefOf`/`briefOptions`; change both together).
+
+Why: 2026-11-20 session summaries showed blocked cards (t_01a1f8b56d1a69fc) with jargon, no situation, no
+per-option cost and no recommendation; the judge checks whether an ask should exist, not whether David can answer
+it. Tests: `tests/test_unblock_card_quality.py` (rule, L3 order incl. reconciliation, contract scopes, bounds),
+`owner-recommendation-guard/tests/test_unblock_brief.py`, session-tasks `projections.test.mjs` (parser parity),
+session-panel `evidence.test.mjs` (rendered row). Older fixtures run with `ASK_GATE_UNBLOCK_BRIEF=0` from conftest;
+the switch is honoured only under pytest (`PYTEST_CURRENT_TEST`).
 
 ## Requires compatible core before plugin rollout
 

@@ -136,6 +136,17 @@ test('needs-you shows the plain card title next to the action', async () => {
   assert.match(el().querySelector('[data-ask-step]').textContent, /Choose A or B/)
 })
 
+test('needs-you renders a generate-unblock-card brief: situation, options, recommended pick', async () => {
+  const brief = { situation: 'The fix is installed; one check needs a debug run.', options: ['A) One supervised run', 'B) Accept the gap'], recommend: 'A — covers the bug you hit.' }
+  bridges({ chips: [card('t_x', 'blocked', { label: 'Decide how to finish testing the fix', look: 'needs-you',
+    humanRequest: { action: 'Choose how to finish. Unblock = A (one run). Archive = B (accept the gap).', why: 'Tried: attach.', brief } })] })
+  await show(React.createElement(m.Panel, { key: 'ask-brief' }))
+  assert.equal(el().querySelector('[data-ask-situation]')?.textContent, brief.situation)
+  assert.deepEqual([...el().querySelectorAll('[data-ask-options] li')].map(li => li.textContent), brief.options)
+  assert.equal(el().querySelector('[data-ask-recommend]')?.textContent, 'Recommended: A — covers the bug you hit.')
+  assert.match(el().querySelector('[data-ask-next]').textContent, /press Unblock \(A \(one run\)\), or Archive if you don’t want it \(B \(accept the gap\)\)/)
+})
+
 const { fixture } = loadFixture()
 const skip = projector ? false : 'no core checkout: set HERMES_CORE_SOURCE'
 const realNow = Date.now

@@ -1034,6 +1034,15 @@ def _owner_recommendation_hold(session_id: str, tool_name: str, request: dict, c
 _UNBLOCK_CARD_HELD: dict[tuple[str, str, str], int] = {}
 
 
+def _brief_card(tool_name: str, args: dict) -> str:
+    """Bound key for unblock_card_hold: the blocked card, or for a blocked create its idempotency key / title, so
+    one session's briefless creates don't share a single budget."""
+    card = next(iter(_block_card(tool_name, args)), "")
+    if card or tool_name != "kanban_create":
+        return card
+    return "create:" + str(args.get("idempotency_key") or args.get("title") or "").strip()[:200]
+
+
 def _unblock_card_hold(session_id: str, tool_name: str, request: dict, card: str = "") -> dict | None:
     """Hold a blocked card whose human_request lacks the decision brief (Tried / Situation / Options / Recommend,
     one '(recommended)' choice) that try-to-unblock + generate-unblock-card produce. Deterministic, bounded to
@@ -1108,11 +1117,6 @@ def _human_request_gate(session_id: str, tool_name: str, args: dict) -> dict | N
             card=next(iter(_block_card(tool_name, args)), ""))
         if recommended is not None:
             return recommended
-        briefless = _unblock_card_hold(session_id, tool_name, dict(
-            request, choices=raw.get("choices") if isinstance(raw, dict) else None),
-            card=next(iter(_block_card(tool_name, args)), ""))
-        if briefless is not None:
-            return briefless
         filing = _pr_filing_hold(session_id, tool_name, args, request)
         if filing is not None:
             return filing
@@ -1128,6 +1132,12 @@ def _human_request_gate(session_id: str, tool_name: str, args: dict) -> dict | N
         retired = _retired_block(session_id, [request["action"]], cards)
         if retired is not None:
             return retired
+        # After reconciliation/retirement (an approved or retired ask gets that answer, not "rewrite the brief"),
+        # before the evidence check and judge.
+        briefless = _unblock_card_hold(session_id, tool_name, dict(
+            request, choices=raw.get("choices") if isinstance(raw, dict) else None), card=_brief_card(tool_name, args))
+        if briefless is not None:
+            return briefless
         tools = _tools_now(session_id)
         evidence = request["evidence"]
         claim = core.checked_line(evidence) or evidence

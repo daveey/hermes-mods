@@ -48,7 +48,7 @@ Answer each in your notes first:
 | Field | What goes in it |
 |---|---|
 | card `title` | Plain outcome, ≤ 80 chars, no internal jargon: "Decide how to finish testing the Mac app fix (PR 1697)". |
-| `action` | One or two sentences: the step itself + "Unblock = <recommended>. Archive = <stop path>." Never "reply in this chat". |
+| `action` | One or two sentences: the step itself + "Unblock = <recommended>; archive = <stop path>." Never "reply in this chat". |
 | `why_human` | `Tried: <rungs from try-to-unblock and why each failed>. Only you can: <the human-only part>.` |
 | `interaction` | `approval` / `reply` for a decision; `physical`, `user_terminal`, `external` for a step. |
 | `scope` | The decision brief, three labelled parts (the panel renders them; the guard checks them): |
@@ -72,9 +72,15 @@ Before filing, reread title + action + scope as if you had never seen this work:
 - Is the recommendation obvious and is the reason a real tradeoff?
 - Do Unblock and Archive each do something he can predict?
 
-Fix whatever fails, then file. The `unblock-card-quality` guard (ask-gate / owner-recommendation-guard) refuses a
-request without `Tried:`, `Situation:`, `Options:` (decisions), `Recommend:` or exactly one `(recommended)`
-choice; it can't judge clarity, so the cold read is yours.
+Fix whatever fails, then file. The `unblock_card_hold` (ask-gate, and owner-recommendation-guard on workers) refuses a request without
+`Tried:`, `Situation:`, `Options:` (decisions: approval, any `choices`, or a reply asking for a pick),
+`Recommend:` or exactly one `(recommended)` choice. Put each label at the start of its own line and letter the
+options `A)`, `B)`. It can't judge clarity, so the cold read is yours.
+
+**Scope that is already a contract.** A PR approval (`scope` = `owner/repo#12 head abc1234`, pr-approval grammar)
+or a physical ask (`DEVICE:` / `HUMAN_STEP:` / `OBSERVATION:` / `EVIDENCE:` lines) keeps that scope exactly; the
+guard then asks only for `Tried:` and the single `(recommended)` choice. Put the situation, options and
+recommendation in `action` and `why_human` instead, briefly.
 
 ## Worked example
 
@@ -95,7 +101,7 @@ After:
 title: "Decide how to finish testing the Mac app fix (PR 1697)"
 human_request:
   interaction: approval
-  action: "Choose how to finish verifying the fix. Unblock = A (one supervised test run). Archive = B (accept with the known gaps)."
+  action: "Choose how to finish verifying the fix. Unblock = A (one supervised test run); archive = B (accept with the known gap)."
   why_human: "Tried: the original test app process exited, so I can't attach to it; restarting Hermes Desktop with debugging on is outside what you approved for this card. Only you can: allow a Desktop restart, or accept less proof than the card asked for."
   scope: |
     Situation: The fix for the Mac app's idle/frozen screen is merged and installed. Three of four checks passed. The last one (the screen recovers after a timeout while idle) needs a debug connection to the running app, and the app instance it was testing has since closed.

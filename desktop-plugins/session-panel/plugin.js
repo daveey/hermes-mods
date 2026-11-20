@@ -604,7 +604,8 @@ function item(c) {
 export const ASK_MAX = 400 // characters of a step shown inline; the full text stays in the tooltip
 const clip = (s, n = ASK_MAX) => { const t = str(s).replace(/\s+/g, ' ').trim(); return t.length > n ? `${t.slice(0, n - 1).trimEnd()}…` : t }
 const clause = (text, word) => {
-  const m = new RegExp(`\\b${word}\\s*(?:\\([^)]*\\))?\\s*=\\s*([^;]+?)\\s*(?:;|$)`, 'i').exec(text)
+  // A clause ends at ';' or at '. <next outcome> =' ("Unblock = A. Archive = B." as well as "...; archive = B").
+  const m = new RegExp(`\\b${word}\\s*(?:\\([^)]*\\))?\\s*=\\s*([^;]+?)\\s*(?:;|\\.\\s+(?=(?:unblock|yes|archive|no)\\s*(?:\\([^)]*\\))?\\s*=)|$)`, 'i').exec(text)
   return m ? m[1].replace(/[.\s]+$/, '') : ''
 }
 

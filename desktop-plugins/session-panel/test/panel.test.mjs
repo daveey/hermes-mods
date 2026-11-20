@@ -1064,3 +1064,9 @@ test('askView: a brief from generate-unblock-card is passed through for the Need
   assert.equal(m.askView({ humanRequest: { action: 'Plug it in.' } }).brief, null)
   assert.equal(m.askView({ humanRequest: { action: 'Plug it in.', brief: { situation: '', options: [] } } }).brief, null)
 })
+
+test('askView: "Unblock = A. Archive = B." splits like "Unblock = A; archive = B"', () => {
+  for (const action of ['Choose. Unblock = A (one run). Archive = B (accept).', 'Choose. Unblock = A (one run); archive = B (accept).']) {
+    assert.equal(m.askView({ humanRequest: { action } }).next, 'When done, open the card and press Unblock (A (one run)), or Archive if you don’t want it (B (accept)). You can also reply in chat.')
+  }
+})

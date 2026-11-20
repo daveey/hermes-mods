@@ -344,27 +344,39 @@ export function humanRequestOf(raw) {
   return out.action ? out : null
 }
 
-// The decision brief generate-unblock-card writes into human_request.scope (labelled parts; ask-gate's
-// unblock_card_quality.py checks the same labels): "Situation: …", "Options:" + one line per option, "Recommend: …".
-const BRIEF_LABEL = /^[ \t]*(?:[-*>][ \t]*)?(?:\*\*|__)?(situation|options?|recommend(?:ation|ed)?)(?:\*\*|__)?[ \t]*:(?:\*\*|__)?[ \t]*/i
-/** {situation, options[], recommend} from a scope with at least a Situation part, else null. Exported for tests. */
+// The decision brief generate-unblock-card writes into human_request.scope. Same parse as ask-gate's
+// unblock_card_quality.py (sections/options), which enforces it: change both together. A label is a markdown heading
+// (colon optional) or the word + colon at line start (after a bullet) or after a sentence end; the first occurrence
+// of each counts; a part runs to the next label or a physical-ask contract line (DEVICE:/HUMAN_STEP:/...).
+const BRIEF_NAMES = '(situation|options?|recommend(?:ation|ed)?)'
+const BRIEF_LABEL = new RegExp(`(?:^[ \\t]*#{1,6}[ \\t]*(?:\\*\\*|__)?${BRIEF_NAMES}(?:\\*\\*|__)?[ \\t]*:?(?:\\*\\*|__)?[ \\t]*$` +
+  `|(?:^[ \\t]*(?:[-*>][ \\t]*)?|(?<=[.!?;][ \\t]))(?:\\*\\*|__)?${BRIEF_NAMES}(?:\\*\\*|__)?[ \\t]*:(?:\\*\\*|__)?)`, 'gim')
+const BRIEF_CONTRACT = /^[ \t]*(?:DEVICE|HUMAN_STEP|OBSERVATION|EVIDENCE)[ \t]*:/gm
+const BRIEF_OPTION = /(?:^|(?<=\s))(?:[-*][ \t]+)?(?:\*\*)?(?:[Oo]ption[ \t]+)?\(?(?:[A-F](?:\)|\.(?=\s)|:|[ \t]+[-—–](?=\s))|[1-9](?:\)|\.(?=\s)))(?:\*\*)?/gm
+const BRIEF_MIN = 20
+const flatText = t => t.replace(/\*\*|__/g, '').replace(/\s+/g, ' ').trim()
+/** Option items of an Options part: each marker to the next; text before the first marker is dropped. */
+export function briefOptions(text) {
+  const starts = [...String(text || '').matchAll(BRIEF_OPTION)].map(m => m.index)
+  return starts.map((s, i) => flatText(text.slice(s, starts[i + 1] ?? text.length)).replace(/^[-*]\s*/, '')).filter(Boolean)
+}
+/** {situation, options[], recommend} from a scope with a Situation part (>= 20 chars), else null. Exported for tests. */
 export function briefOf(scope) {
   if (typeof scope !== 'string' || !scope.trim()) return null
+  const marks = [...scope.matchAll(BRIEF_LABEL)].map(m => {
+    const n = (m[1] || m[2]).toLowerCase()
+    return { start: m.index, end: m.index + m[0].length, name: n.startsWith('situation') ? 'situation' : n.startsWith('option') ? 'options' : 'recommend' }
+  })
+  const stops = [...marks.map(m => m.start), ...[...scope.matchAll(BRIEF_CONTRACT)].map(m => m.index)].sort((x, y) => x - y)
   const parts = {}
-  let cur = null
-  for (const line of scope.split(/\r?\n/)) {
-    const m = BRIEF_LABEL.exec(line)
-    if (m) {
-      const k = m[1].toLowerCase()
-      cur = k.startsWith('situation') ? 'situation' : k.startsWith('option') ? 'options' : 'recommend'
-      parts[cur] = [line.slice(m[0].length)]
-    } else if (cur) parts[cur].push(line)
+  for (const m of marks) {
+    if (m.name in parts) continue
+    const next = stops.find(s => s >= m.end) ?? scope.length
+    parts[m.name] = scope.slice(m.end, next).trim()
   }
-  const flat = k => (parts[k] || []).join(' ').replace(/\s+/g, ' ').trim()
-  const situation = flat('situation')
-  if (!situation) return null
-  const options = (parts.options || []).map(l => l.replace(/^[ \t]*[-*][ \t]*/, '').trim()).filter(Boolean)
-  return { situation, options, recommend: flat('recommend') }
+  const situation = flatText(parts.situation || '')
+  if (situation.length < BRIEF_MIN) return null
+  return { situation, options: briefOptions(parts.options || ''), recommend: flatText(parts.recommend || '') }
 }
 
 function taskChip(t, status) {

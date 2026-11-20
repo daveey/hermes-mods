@@ -851,3 +851,23 @@ test('humanRequestOf: a generate-unblock-card scope carries its brief (situation
   assert.equal(m.briefOf('just a scope line'), null)
   assert.equal(m.briefOf('Options:\nA) x\nB) y'), null, 'no situation, no brief')
 })
+
+test('briefOf: same parse as ask-gate unblock_card_quality (single line, headings, wrapped options, contract lines)', () => {
+  assert.deepEqual(m.briefOf('Situation: The fix is installed and one check remains open. Options: A) run once more, 1 min. B) accept the gap. Recommend: A - cheap and covers the real bug.'), {
+    situation: 'The fix is installed and one check remains open.',
+    options: ['A) run once more, 1 min.', 'B) accept the gap.'], recommend: 'A - cheap and covers the real bug.' })
+  assert.deepEqual(m.briefOf('## Situation\nThe app closed so the last check cannot attach anymore.\n## Options\n- **A)** restart\n  wrapped line\n- **B)** accept\n## Recommendation\nA because it is a one minute restart.'), {
+    situation: 'The app closed so the last check cannot attach anymore.',
+    options: ['A) restart wrapped line', 'B) accept'], recommend: 'A because it is a one minute restart.' })
+  const phys = m.briefOf('Situation: The ring has been asleep since last night here.\nRecommend: plug it in at the desk.\nDEVICE: ring\nHUMAN_STEP: plug')
+  assert.equal(phys.recommend, 'plug it in at the desk.', 'contract lines end the part')
+  assert.equal(m.briefOf('Situation: we weighed the options: none are cheap here at all.').situation, 'we weighed the options: none are cheap here at all.', 'mid-sentence word is prose')
+  assert.deepEqual(m.briefOptions('see the buttons.\n1. first for 2 - 3 min\n2. second'), ['1. first for 2 - 3 min', '2. second'])
+  assert.equal(m.briefOf('Situation: short'), null)
+})
+
+test('humanRequestOf: the hub replica JSON text carries the brief too', () => {
+  const scope = 'Situation: The Mac app fix is installed; one check needs a debug run.\nOptions:\nA) run\nB) accept\nRecommend: A — covers the bug you hit.'
+  const r = m.humanRequestOf(JSON.stringify({ action: 'Choose; unblock = A; archive = B.', why_human: 'Tried: x.', interaction: 'approval', scope }))
+  assert.deepEqual(r.brief.options, ['A) run', 'B) accept'])
+})

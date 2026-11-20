@@ -127,7 +127,9 @@ def _brief_hold(name: str, args: dict, request: dict, session_id: str) -> dict |
         hit = rule.hit(request)
         if hit is None:
             return None
-        card = _card(name, args)
+        card = _card(name, args) or (
+            "create:" + str(args.get("idempotency_key") or args.get("title") or "").strip()[:200]
+            if name == "kanban_create" else "")
         key = (session_id or "", name, card)
         n = _BRIEF_HELD.get(key, 0)
         if n >= rule.MAX_HOLDS:
