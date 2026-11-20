@@ -152,6 +152,14 @@ export function countColor(g) {
   return COLORS.unknown
 }
 
+// Status-only chips (Grok, Gemini) stay out of the bar while healthy: they appear only when an enabled
+// account is red (blocked) or yellow (warn / cooling down). Not-checked and sign-in states stay hidden too.
+// The popover table always lists every provider. Usage providers (Claude, GPT) always show.
+export function chipVisible(g) {
+  if (!g.statusOnly) return true
+  return (g.accounts || []).some(a => !a.disabled && ['limited', 'cooldown', 'warn'].includes(tone(a)))
+}
+
 // The one- or two-word status a status-only row shows in its table cell; statusHint is the detail.
 export function statusLabel(g, a) {
   if (a.state === 'ready') return 'ok'
@@ -729,7 +737,7 @@ function UsageBar({ store, selectionStore, reconnectStore, disableStore }) {
         else if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') { e.preventDefault(); if (!open) show(null); step(e.key === 'ArrowRight' ? 1 : -1) }
       },
       children:
-      groups.map(g => {
+      groups.filter(chipVisible).map(g => {
         const f = g.forecast
         const tip = `${g.title}: ${g.ready} of ${g.total} ready${g.limited ? ` · ${g.limited} ${g.statusBad || 'out of quota'}` : ''}${g.cooling ? ` · ${g.cooling} cooling down` : ''}${g.disabled ? ` · ${g.disabled} disabled` : ''}${f && !g.statusOnly ? ` · ${leftText(f)} left · ${forecastText(f)}` : ''}${g.markId ? ` · ${g.mark === 'active' ? 'in use' : 'last used'}: ${(g.accounts.find(a => a.id === g.markId) || {}).label} (${since(g.markAt)})` : ''}${g.nextBack ? ` · next back ${fmtReset(g.nextBack)}` : ''}`
         return jsxs('span', { key: g.slug, className: 'hermes-au-chip', 'data-provider': g.slug, 'data-hl': open && g.slug === shown.slug ? 'true' : undefined,

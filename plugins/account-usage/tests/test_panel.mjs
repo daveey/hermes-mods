@@ -218,6 +218,18 @@ test('status-only unchecked key (state unknown, no windows) reads "not checked y
  const [x]=plugin.summarize({providers:[{slug:'xai-oauth',usage:{accounts:[{id:'a',label:'a',state:'unknown',windows:[]}]}}]})
  assert.doesNotMatch(plugin.statusHint(x,x.accounts[0]),/blocked/)
 })
+test('status-only chips hide from the bar unless red or yellow; usage chips always show', async () => {
+ const {plugin}=await setup()
+ const g=(slug,accts)=>plugin.summarize({providers:[{slug,usage:{accounts:accts}}]})[0]
+ const a=(state,extra={})=>({id:state,label:state,state,windows:[],...extra})
+ assert.equal(plugin.chipVisible(g('gemini',[a('ready')])),false)
+ assert.equal(plugin.chipVisible(g('xai-oauth',[a('ready')])),false)
+ assert.equal(plugin.chipVisible(g('xai-oauth',[a('unknown')])),false)
+ assert.equal(plugin.chipVisible(g('gemini',[a('ready'),a('limited',{limit_kind:'quota'})])),true)
+ assert.equal(plugin.chipVisible(g('xai-oauth',[a('limited',{limit_kind:'cooldown'})])),true)
+ assert.equal(plugin.chipVisible(g('xai-oauth',[a('ready',{windows:[{label:'API',used_percent:95,scope:'account'}]})])),true)
+ assert.equal(plugin.chipVisible(g('anthropic',[a('ready')])),true)
+})
 test('clean table: only rows with something to say get a chevron; status-only cells use a short label', async () => {
  const {plugin}=await setup()
  const g={statusOnly:false}
