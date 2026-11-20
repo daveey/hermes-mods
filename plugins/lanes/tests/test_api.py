@@ -70,6 +70,43 @@ def core(api, monkeypatch):
     return fake
 
 
+def test_worker_limit_and_null_clear_supported(api, core):
+    core.UNSET = object()
+    api.change("product", {"max_workers": 2, "cards_per_day": None, "usd_per_day": None})
+    assert core.sets[-1][1] == {"share": None, "admit_per_day": None, "paused": None,
+                                "max_workers": 2, "cards_per_day": None, "usd_per_day": None}
+
+
+@pytest.mark.parametrize("body", [{"max_workers": 0}, {"max_workers": None},
+                                   {"cards_per_day": None, "usd_per_day": None}])
+def test_nullable_valves_through_rest(api, core, body):
+    from fastapi.testclient import TestClient
+    core.UNSET = object()
+    app = fastapi.FastAPI()
+    app.include_router(api.router)
+    with TestClient(app) as client:
+        response = client.put("/v1/lanes/product", json=body)
+    assert response.status_code == 200
+    assert all(core.sets[-1][1][key] == value for key, value in body.items())
+
+
+def test_old_core_null_clear_rejected_before_any_write(api, core):
+    with pytest.raises(fastapi.HTTPException) as err:
+        api.change("product", {"share": 40, "cards_per_day": None})
+    assert err.value.status_code == 409
+    assert not core.sets
+
+
+def test_old_core_workers_rejected_before_any_write(api, core):
+    def old(lane, *, share=None, admit_per_day=None, paused=None, cards_per_day=None, usd_per_day=None):
+        core.sets.append((lane, share))
+    core.set_lane = old
+    with pytest.raises(fastapi.HTTPException) as err:
+        api.change("product", {"share": 40, "max_workers": 2})
+    assert err.value.status_code == 409
+    assert not core.sets
+
+
 def test_core_without_lanes_says_so(api, monkeypatch):
     monkeypatch.setattr(api, "core", lambda: None)
     assert api.read(6.0) == {"configured": False, "reason": "this Hermes core has no lanes support yet"}
@@ -171,7 +208,7 @@ def test_old_core_caps_return_clear_409_without_writing(api, core, monkeypatch, 
     with TestClient(app, raise_server_exceptions=False) as client:
         response = client.put("/v1/lanes/product", json={field: 20, "share": 5})
         assert response.status_code == 409
-        assert response.json()["detail"] == "this Hermes core has no daily lane caps yet"
+        assert response.json()["detail"] == "this Hermes core does not support the requested lane limits yet"
         assert not core.sets
         assert client.put("/v1/lanes/product", json={"share": 5}).status_code == 200
 

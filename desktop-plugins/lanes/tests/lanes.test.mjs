@@ -561,7 +561,42 @@ test('valve Apply calls lanes set with the changed share and daily caps, per lan
   await view.click(button('Reset'))
   assert.equal(button('Apply').disabled, true)
   assert.equal(document.querySelector('[data-lane=infra] [data-valve=cards_per_day] input').value, '50', 'Reset restores the saved cap')
-  assert.deepEqual(P.changes(snap(), { infra: { cards_per_day: 50, usd_per_day: null } }, flowSnap()), [])
+  assert.deepEqual(P.changes(snap(), { infra: { cards_per_day: 50, usd_per_day: null } }, flowSnap()), [['infra', { usd_per_day: null }]])
+})
+
+test('worker valve and blank caps Apply explicit null; Reset restores values; old core stays read-only', async () => {
+  const flow = flowSnap()
+  flow.lanes.product.limits.max_workers = 4
+  const applied = []
+  const view = await mount(React.createElement(P.Panel, panelProps({ flow, onApply: (p) => { applied.push(p); return false } })))
+  const type = async (selector, value) => {
+    const input = document.querySelector(selector)
+    assert.ok(input, selector)
+    await React.act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, value)
+      input.dispatchEvent(new window.Event('input', { bubbles: true }))
+    })
+    await view.flush()
+  }
+  assert.equal(document.querySelector('[data-lane=infra] [data-valve=workers] input'), null, 'older core worker gauge')
+  await type('[data-lane=product] [data-valve=max_workers] input', '2')
+  await type('[data-lane=product] [data-valve=cards_per_day] input', '')
+  await view.click(button('Apply'))
+  assert.deepEqual(applied, [[['product', { max_workers: 2, cards_per_day: null }]]])
+  await view.click(button('Reset'))
+  assert.equal(document.querySelector('[data-lane=product] [data-valve=max_workers] input').value, '4')
+  assert.equal(document.querySelector('[data-lane=product] [data-valve=cards_per_day] input').value, '20')
+  assert.equal(button('Apply').disabled, true)
+  assert.deepEqual(P.changes(snap(), { product: { max_workers: null } }, flow), [['product', { max_workers: null }]])
+})
+
+test('dependency hints group actual blockers, never own PR; multiple parents do not promise full release', () => {
+  const b = { id: 'parent', pr: 'https://github.com/example/repo/pull/42' }
+  const cards = [{ id: 'c1', blockers: [b] }, { id: 'c2', blocker: b }]
+  assert.match(P.damHint('dep', cards), /land PR #42 → frees 2/)
+  assert.match(P.damHint('dep', [{ id: 'c1', blockers: [b, { id: 'p2', pr: null }] }]), /unblocks 1 dependency/)
+  assert.match(P.damHint('dep', [{ id: 'legacy', pr: b.pr }]), /1 card waits on an open parent/)
+  assert.doesNotMatch(P.damHint('dep', [{ id: 'legacy', pr: b.pr }]), /#42/)
 })
 
 test('Apply from the expanded strip PUTs the caps to the lanes API', async () => {

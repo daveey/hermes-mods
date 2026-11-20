@@ -212,7 +212,7 @@ export function changes(snap, draft, flow) {
     const body = {}
     if (d.share != null && d.share !== snap.lanes[name]?.share) body.share = d.share
     if (d.paused != null && d.paused !== snap.lanes[name]?.paused) body.paused = d.paused
-    for (const key of LIMIT_KEYS) if (d[key] != null && d[key] !== flow?.lanes?.[name]?.limits?.[key]) body[key] = d[key]
+    for (const key of LIMIT_KEYS) if (d[key] !== undefined && d[key] !== (flow?.lanes?.[name]?.limits?.[key] ?? null)) body[key] = d[key]
     return [name, body]
   }).filter(([, body]) => Object.keys(body).length)
 }
@@ -221,7 +221,7 @@ export function changes(snap, draft, flow) {
 // Data is `GET /v1/lanes/flow?window=` (core `hermes kanban lanes flow --json`): open cards
 // {id,title,lane,step,reason,source{kind,id,project},age_h,pr} and per lane {done,run_hours,cost_usd,limits,usage}.
 
-export const LIMIT_KEYS = ['cards_per_day', 'usd_per_day']
+export const LIMIT_KEYS = ['max_workers', 'cards_per_day', 'usd_per_day']
 export const TAB_KEY = 'hermes-lanes-tab'
 export const BY_KEY = 'hermes-lanes-flow-by'
 export const TABS = [['floor', 'Floor'], ['flow', 'Flow']]
@@ -301,8 +301,24 @@ export function damHint(reason, cards) {
   let text
   if (reason === 'you') text = `answer ${plural('ask')}`
   else if (reason === 'dep') {
-    // The payload's pr belongs to this card; it does not identify its blocker.
-    text = `${plural('card')} ${n === 1 ? 'waits' : 'wait'} on an open parent`
+    const groups = new Map()
+    let unknown = 0
+    for (const card of cards) {
+      const blockers = Array.isArray(card.blockers) ? card.blockers : card.blocker ? [card.blocker] : []
+      const valid = [...new Map(blockers.filter((b) => b && typeof b.id === 'string' && b.id).map((b) => [b.id, b])).values()]
+      if (!valid.length) unknown++
+      for (const b of valid) {
+        const key = b.pr || b.id
+        const group = groups.get(key) || { blocker: b, cards: new Set(), partial: false }
+        group.cards.add(card.id || card)
+        group.partial ||= valid.length > 1
+        groups.set(key, group)
+      }
+    }
+    const hints = [...groups.values()].sort((a, b) => b.cards.size - a.cards.size).map(({ blocker, cards, partial }) =>
+      `${blocker.pr ? `land PR ${prLabel(blocker.pr)}` : `finish ${blocker.id}`} → ${partial ? `unblocks ${cards.size} dependency waits` : `frees ${cards.size}`}`)
+    if (unknown) hints.push(`${unknown} card${unknown === 1 ? ' waits' : 's wait'} on an open parent`)
+    text = hints.join('; ') || `${plural('card')} ${n === 1 ? 'waits' : 'wait'} on an open parent`
   } else if (reason === 'gate') text = `admit or release ${n} held`
   else if (reason === 'limit:cards_per_day') text = 'raise cards/day, or wait for local midnight'
   else if (reason === 'limit:usd_per_day') text = 'raise $/day, or wait for local midnight'
@@ -433,7 +449,7 @@ function laneSelector(name) {
 const num = (v) => (v == null ? '' : String(v))
 const usd = (v) => `$${Number(v) >= 100 ? Math.round(v) : Number(v || 0).toFixed(Number(v) % 1 ? 2 : 0)}`
 
-/** One lane's four valves. Share and the two daily caps are editable; workers is a gauge (core has no write for it). */
+/** Four valves; older cores without max_workers keep the running-worker gauge. */
 function Valves({ row, limits, usage, draft, saving, onShare, onPause, onLimit }) {
   const note = drift(row)
   const cap = (key, label, step, used, fmt) => {
@@ -450,7 +466,9 @@ function Valves({ row, limits, usage, draft, saving, onShare, onPause, onLimit }
       h('button', { type: 'button', className: row.paused ? 'is-paused' : '', 'aria-pressed': row.paused, disabled: saving, onClick: () => onPause(row.name, !row.paused) }, row.paused ? 'Paused' : 'Pause')),
     h('div', { className: 'hermes-lanes-dim' }, h('span', { className: 'hermes-lanes-big' }, pct(row.target)), ' target',
       h('span', { className: note ? 'hermes-lanes-warn' : '' }, ` · ${pct(row.actual)} actual${note ? ` · ${note}` : ''}`)),
-    h('div', { className: 'hermes-lanes-dim', 'data-valve': 'workers' }, `workers ${row.running}${limits?.max_workers == null ? '' : `/${limits.max_workers}`} running`),
+    limits && Object.hasOwn(limits, 'max_workers')
+      ? h('div', null, cap('max_workers', 'max workers', 1, 'running', String), h('span', { className: 'hermes-lanes-dim' }, `${row.running} running`))
+      : h('div', { className: 'hermes-lanes-dim', 'data-valve': 'workers' }, `workers ${row.running} running`),
     cap('cards_per_day', 'cards/day', 1, 'cards_today', (v) => String(v)),
     cap('usd_per_day', '$/day', 0.5, 'usd_today', usd))
 }

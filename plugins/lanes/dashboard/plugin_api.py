@@ -1,7 +1,8 @@
 """GET /api/plugins/lanes/v1/lanes?hours=6: per lane target and actual share of run-hours, running, ready, held at
 the gate, open, done, tokens and estimated cost over the window (core ``kanban_lanes_cli.snapshot``).
-PUT /api/plugins/lanes/v1/lanes/{lane}: body ``{"share": n, "paused": bool, "admit_per_day": n, "cards_per_day": n,
-"usd_per_day": n}`` (any subset; the last two need a core that has them).
+PUT /api/plugins/lanes/v1/lanes/{lane}: body ``{"share": n, "paused": bool, "admit_per_day": n,
+"max_workers": n|null, "cards_per_day": n|null, "usd_per_day": n|null}`` (any subset;
+unsupported worker ceilings or null clears return 409 before any write).
 GET /api/plugins/lanes/v1/lanes/flow?window=6h: every open card with step/reason/source plus per-lane done, run-hours,
 cost, limits and today's usage (core ``kanban_lanes_flow.snapshot``, the data of ``hermes kanban lanes flow --json``).
 GET /api/plugins/lanes/v1/held?lane=x: cards waiting at a lane gate. POST /api/plugins/lanes/v1/held/{card}/admit.
@@ -26,7 +27,7 @@ router = APIRouter()
 CACHE_S = 10
 WINDOWS = (1.0, 6.0, 24.0, 168.0)
 FLOW_WINDOWS = ("1h", "6h", "24h", "7d")
-LIMIT_FIELDS = ("cards_per_day", "usd_per_day")
+LIMIT_FIELDS = ("cards_per_day", "usd_per_day", "max_workers")
 _flow_cache: Dict[str, tuple] = {}
 _lock = threading.Lock()
 _cache: Dict[float, tuple] = {}
@@ -140,6 +141,8 @@ def change(lane: str, body: Dict[str, Any]) -> Dict[str, Any]:
     if "paused" in body and type(body["paused"]) is not bool:
         raise ValueError("paused must be true or false")
     extra = {k: body[k] for k in LIMIT_FIELDS if k in body}
+    if any(value is None for value in extra.values()) and not hasattr(cli, "UNSET"):
+        raise HTTPException(status_code=409, detail="this Hermes core cannot clear lane limits yet")
     if extra:
         # Check before writing; catching TypeError from inside set_lane could hide a bug
         # or report failure after a partial write on an otherwise supported core.
@@ -148,7 +151,7 @@ def change(lane: str, body: Dict[str, Any]) -> Dict[str, Any]:
                                                 admit_per_day=body.get("admit_per_day"),
                                                 paused=body.get("paused"), **extra)
         except TypeError:
-            raise HTTPException(status_code=409, detail="this Hermes core has no daily lane caps yet")
+            raise HTTPException(status_code=409, detail="this Hermes core does not support the requested lane limits yet")
     cli.set_lane(lane, share=body.get("share"), admit_per_day=body.get("admit_per_day"), paused=body.get("paused"),
                  **extra)
     _written()
