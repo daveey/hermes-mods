@@ -119,6 +119,9 @@ say what's running, never what needs the user.
   /api/plugins/kanban/workflow` lists `archived -> ready/todo/triage`, then `PATCH
   /api/plugins/kanban/tasks/<id>?profile=<p>&board=<b>` with `{"status":"triage"}` restores the same card (body,
   parents, run allowance intact), so a restorable card needs no successor card.
+- A `❓ parked until you decide` notice on another chat's card is that origin's decision: don't answer it, and
+  before relaying it (or filing a relay follow-up card) read the card's comments newer than the ask, because the
+  origin gets the same notice and usually answers first, and a relay of an answered ask reads as a fresh ask.
 - David wants execution on workers and the hub kept for sessions. Before accepting "it runs on the hub", read
   the card's `requires` (a `host_repo` entry pins it to the dispatcher host), `placement_policy`/`runs_on`, and
   any `moved` events back to the hub. Give the concrete reason: an old card made before worker-first, a missing
