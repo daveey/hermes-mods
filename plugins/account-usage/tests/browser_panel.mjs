@@ -36,7 +36,7 @@ try {
  assert.deepEqual(table.map(t=>t.replace(/out \S+ [^→]+ → .+$/,'out <when> → <when>')),['Claude | 2/4 | — | no forecast (backend too old)','GPT | 1/3 | 0.8 acct | out <when> → <when>'])
  await page.screenshot({path:path.join(artifacts,'account-usage-hover.png'),fullPage:true})
  await page.mouse.move(5,5); await page.waitForTimeout(300); assert.equal(await pop.count(),1,'pointer leaving keeps it open')
- await gptChip.click(); await pop.waitFor({state:'detached'}); evidence.push('Click opens on that provider (highlighted, its accounts); clicking it again closes; hover does nothing')
+ await page.locator('.hermes-au-chip[data-provider="anthropic"]').click(); await pop.waitFor({state:'detached'}); evidence.push('Click opens on that provider (highlighted, its accounts); any click on the bar closes; hover does nothing')
  // Keyboard: focus + arrows switch provider, Escape closes.
  await page.getByRole('button',{name:'Account usage',exact:true}).focus(); await page.keyboard.press('ArrowRight'); await pop.waitFor()
  await page.keyboard.press('Escape'); await pop.waitFor({state:'detached'}); evidence.push('Keyboard: arrows open/switch, Escape closes')

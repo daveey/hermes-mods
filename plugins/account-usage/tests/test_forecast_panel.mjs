@@ -27,7 +27,7 @@ test('verdict and forecast wording', () => {
   assert.equal(plugin.verdictText({ verdict: 'short', runout_h: 0, gaps: [{ start_h: 0, end_h: 1 }] }), 'back 1h')
   assert.equal(plugin.verdictText({ verdict: 'short', runout_h: 0, gaps: [{ start_h: 0, end_h: 168 }] }), 'out')
   assert.equal(plugin.verdictText({ verdict: 'learning' }), 'learning…')
-  assert.equal(plugin.verdictText({ verdict: 'ok' }), 'ok')
+  assert.equal(plugin.verdictText({ verdict: 'ok' }), ''); assert.equal(plugin.verdictText({ verdict: 'tight' }), '')
   assert.equal(plugin.verdictText(null), '')
   assert.match(plugin.forecastText({ verdict: 'learning', history_h: 1.25 }), /^learning… 1.3h of 2h history$/)
   assert.match(plugin.forecastText({ verdict: 'ok', pace: 0.42 }), /^lasts the week · 42% of supply$/)

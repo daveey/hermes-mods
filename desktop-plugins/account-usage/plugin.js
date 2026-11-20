@@ -283,8 +283,7 @@ export function verdictText(f) {
     if (Number.isFinite(end) && end > 0 && end < 168) return `back ${fmtHours(end)}`
     return 'out'
   }
-  if (f.verdict === 'tight') return 'tight'
-  if (f.verdict === 'ok') return 'ok'
+  // tight / ok: the sparkline colour (yellow / green) already says it; no word in the bar.
   return ''
 }
 
@@ -738,12 +737,11 @@ function UsageBar({ store, selectionStore, reconnectStore, disableStore }) {
   return jsxs(Popover, { open, onOpenChange: v => { if (v) show(null); else close() }, children: [
     jsx(PopoverTrigger, { asChild: true, children: jsx('button', { type: 'button', className: cn(BAR_CLASS, open && 'text-foreground'), 'aria-label': 'Account usage',
       'aria-expanded': open,
-      // Click opens on the clicked provider; clicking the shown provider again closes. Radix skips its
+      // Click opens on the clicked provider; any click on the bar while open closes. Radix skips its
       // own toggle when the click is default-prevented.
       onClick: e => {
         e.preventDefault()
-        const slug = e.target.closest?.('.hermes-au-chip')?.dataset.provider || null
-        if (open && (!slug || slug === shown.slug)) close(); else show(slug)
+        if (open) close(); else show(e.target.closest?.('.hermes-au-chip')?.dataset.provider || null)
       },
       onKeyDown: e => {
         if (e.key === 'Escape' && open) { e.preventDefault(); close() }
@@ -768,6 +766,8 @@ function UsageBar({ store, selectionStore, reconnectStore, disableStore }) {
     jsx(PopoverContent, { side: 'top', align: 'end', className: 'w-[480px]', style: PANEL_STYLE,
       // Never steal focus from the composer on open; closing never refocuses the bar.
       onOpenAutoFocus: e => e.preventDefault(), onCloseAutoFocus: e => e.preventDefault(),
+      // Focus moving elsewhere (e.g. back to the composer) never closes it: only a click (bar or outside) or Esc.
+      onFocusOutside: e => e.preventDefault(),
       children:
       jsxs('div', { style: { display: 'flex', flexDirection: 'column', gap: 10, padding: 4, fontSize: 12 }, children: [
         jsx(ForecastTable, { groups, hl: shown.slug, onPick: setHl }),
