@@ -230,7 +230,7 @@ test('legacy needs-you ask keeps its actionable row even when its evidence expir
   at(500) // record long expired
   await show(React.createElement(m.Panel, { key: 'c' }))
   assert.equal(el().querySelector('[data-section="needs-you"]').textContent, 'Needs you · 1')
-  assert.match(el().querySelector('[data-ask-step]').textContent, /^Do this: Pick one\./)
+  assert.equal(el().querySelector('[data-ask-step]').textContent, 'Pick one.')
   assert.ok(el().querySelector('[data-open-card]'), 'Open card stays')
   assert.match(el().querySelector('[data-evidence]').textContent, /unknown \(source expired\)/)
 })

@@ -56,6 +56,16 @@ for (const [status, reason] of [['blocked', 'Awaiting human approval'], ['triage
 }
 
 for (const status of ['todo', 'scheduled']) {
+  test(`${status} card wait retains reason without duplicating the named parent`, () => {
+    const chips = tasks.sessionTaskChips([{
+      id: 't_child', title: 'Child', status, board: 'default',
+      upstream: { id: 't_run', status: 'scheduled', reason: 'Awaiting CI' },
+      wait: { wait_state: 'waiting', waiting_on: 'card t_run', waiting_since: Date.now() / 1000 - 60 },
+    }], { connectionId: 'C1', profile: 'default' })
+    const result = m.classify(chips, { evidence: c => tasks.chipObservation(c, Date.now() / 1000) })
+    assert.equal(result.waiting[0].detail, 'waiting on card t_run for 1m · Awaiting CI · board status')
+    assert.equal(result.unasked.length, 0)
+  })
   test(`real ${status} projection names upstream on the board-status path`, () => {
     const chips = tasks.sessionTaskChips([{
       id: 't_child', title: 'Child', status, board: 'default',
