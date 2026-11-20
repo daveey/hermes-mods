@@ -10,3 +10,10 @@ Use this procedure to verify a runner/host with the runner tools, whether you ar
 6. Report the verdict first, then a compact dimension-by-cycle table, the supported why-chain, and the unmet acceptance gates. Give freshness as of the readback time, not as a permanent health claim. If verification remains pending or readiness/build proof is missing, explicitly leave success unproven.
 
 Two completed collections can demonstrate persistence of an evidence gap without establishing its root cause. To distinguish absent production from ingestion or mapping failures, obtain authorized evidence from those specific stages rather than inferring a cause from null timestamps alone.
+
+## Reconciling a dynamic worker pool
+
+- Verify instance-to-gateway identity before treating a successful instance listing as exhaustive absence evidence: an ASG can give several slot identities the same generic Name tag.
+- Compose enrollment and periodic label-publisher transitions in tests; independent green suites do not prove compatible label ownership.
+- Retain the exact admission/removal reason before cleanup overwrites the slot, and distinguish a successful canary from successful pool admission.
+- Exercise both initial admission and planned idle-drain cancellation across a publisher pass: a held row may correctly lose its admission marker, so returning demand must revalidate and restore the owner-controlled marker before declaring ACTIVE; initial scale-up coverage alone misses this return path.

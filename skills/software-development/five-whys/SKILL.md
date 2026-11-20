@@ -62,9 +62,7 @@ system is idle.
 
 When David confirms he replaced the recovery plan through another operator, adopt that intended end-state before further remediation; absent retired services are not an outage to reverse. Stop obsolete restoration work, notify its owners and retire superseded tracking in the same turn—not merely promise reconciliation. Record supersession separately from successful implementation: for withdrawn Kanban goals, comment the changed mandate, use `hermes kanban archive <task-id>`, then read back status. Do not force completion against unmet original acceptance criteria or claim queued remote notices have stopped remote work.
 
-When reconciling dynamic workers, verify instance-to-gateway identity before treating a successful instance listing as exhaustive absence evidence: an ASG can give several slot identities the same generic Name tag. Compose enrollment and periodic label-publisher transitions in tests; independent green suites do not prove compatible label ownership. Retain the exact admission/removal reason before cleanup overwrites the slot, and distinguish a successful canary from successful pool admission. Exercise both initial admission and planned idle-drain cancellation across a publisher pass: a held row may correctly lose its admission marker, so returning demand must revalidate and restore the owner-controlled marker before declaring ACTIVE; initial scale-up coverage alone misses this return path.
-
-Separate registration, host/service health, operational readiness, job activity, and successful workload execution. Unknown or expired observations prove neither health nor idleness; an empty bounded job query cannot override a busy signal. Runner success needs two fresh collection cycles plus an attributable build: [Runner verification evidence](references/runner-verification.md).
+Separate registration, host/service health, operational readiness, job activity, and successful workload execution. Unknown or expired observations prove neither health nor idleness; an empty bounded job query cannot override a busy signal. Runner success needs two fresh collection cycles plus an attributable build; reconciling a dynamic worker pool (slot identity, admission markers) has its own checks: [Runner verification evidence](references/runner-verification.md).
 
 ### 1. State the problem as an observed fact
 
@@ -147,6 +145,7 @@ Never stop at these. Each is a symptom that needs another why:
 - "not a bug" or "expected behavior": then why was it filed as a failure, and why will it be filed again?
 - "bad data" or "misconfigured": why was that data or config accepted?
 - "it was already like that": why didn't anything notice?
+- "the quota is full" or "these two limits can't both hold": who else draws on that quota? Break its usage down by consumer (size, last access) before offering a trade-off between limits: a competing consumer is usually removable, and under least-recently-used eviction it pushes out whichever consumer is touched least often (GitHub Actions: `gh api repos/<o>/<r>/actions/caches --paginate`, grouped by key prefix and ref; Docker `type=gha` layer blobs can fill a repo's whole cache alone).
 - a sweeper that deletes the symptom (a cron, timer or cronjob that archives, deletes or kills leftovers): why does
   the producer leak? Read the producer's session or card when no file shows it, fix it there, and remove the job.
 
