@@ -13,3 +13,12 @@ concurrent additions. Existing accepted digests are retained for mixed rollout.
 Core regression coverage exercises a peer process deleting rows before a stale
 cooldown flush, repeated flushes, concurrent login, tokenless rows and explicit
 addition. The existing profile-singleton tests cover unsaved ephemeral rows.
+
+## Revision: write-target scoping
+
+The follow-up digest only changes how `load_pool` seeds the deletion baseline: a
+profile reading a provider through the global-root fallback no longer treats
+those root rows as known rows of its own store (they are additions there), and
+a store with no `credential_pool` section (missing or corrupt) is no evidence of
+peer deletions. Signatures, selection hook points, disablement gates and refresh
+boundaries are unchanged. The earlier digest stays accepted for mixed rollout.
