@@ -45,6 +45,9 @@ const CSS = `
 .hermes-au-fix button { color: var(--ui-accent, var(--accent)); border: 1px solid currentColor; border-radius: 3px; padding: 1px 7px; background: transparent; cursor: pointer; font-size: 10.5px }
 .hermes-au-fix button:disabled { cursor: wait; opacity: .6 }
 .hermes-au-fix code { overflow-wrap: anywhere; opacity: .8 }
+.hermes-au-term { flex-basis: 100%; margin: 2px 0; padding: 5px 7px; max-height: 190px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font: 10.5px/1.35 var(--font-mono, ui-monospace, monospace); border: 1px solid color-mix(in srgb, currentColor 22%, transparent); border-radius: 4px; user-select: text }
+.hermes-au-termin { display: flex; gap: 6px; flex-basis: 100% }
+.hermes-au-termin input { flex: 1; min-width: 0; font: inherit; padding: 2px 6px; color: inherit; background: transparent; border: 1px solid color-mix(in srgb, currentColor 30%, transparent); border-radius: 3px }
 .hermes-au-line { display: flex; align-items: center; gap: 2px }
 .hermes-au-line > .hermes-au-row { flex: 1; min-width: 0 }
 .hermes-au-more { flex: none; width: 18px; height: 18px; border: 0; border-radius: 3px; padding: 0; background: transparent; color: var(--au-c, currentColor); cursor: pointer; font-size: 10px; line-height: 18px; opacity: .8; transition: transform .12s }
@@ -236,10 +239,39 @@ export function summarize(payload, last = {}, now = Date.now(), disabled = null)
 // Providers the backend can reconnect (plugin_api RECONNECT_PROVIDERS). A rejected Gemini key or an
 // xAI block also carries reason 'auth' but is not a sign-in the panel can renew.
 const RECONNECT_SLUGS = new Set(['anthropic', 'openai-codex'])
-// Core forbids an in-app Anthropic login (web_routers/oauth.py: flow 'external'); Desktop's own
-// supported sign-in for it lives in Settings › Accounts.
-const EXTERNAL_SLUGS = new Set(['anthropic'])
-const ACCOUNTS_SETTINGS = '/settings?tab=providers&pview=accounts'
+// Core forbids a dashboard Anthropic login (web_routers/oauth.py: flow 'external'): its sign-in is
+// the interactive `hermes auth reauth` CLI. Desktop runs exactly that command for one stored row,
+// on the gateway that owns it (window.hermesDesktop.terminal.startRecovery); the panel shows its
+// prompts and passes the user's answers straight to it. Never Settings, never a pasted command.
+const TERMINAL_SLUGS = new Set(['anthropic'])
+const OUTPUT_KEEP = 6000
+
+// PTY output as plain text for the panel: escape sequences and control bytes dropped, bounded.
+export function appendOutput(text, chunk) {
+  const clean = String(chunk || '')
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '')
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
+    .replace(/\x1b[@-_]/g, '')
+    .replace(/\r\n?/g, '\n')
+    .replace(/[^\n\t\x20-\x7e\u00a0-\uffff]/g, '')
+  return (String(text || '') + clean).slice(-OUTPUT_KEEP)
+}
+
+// The sign-in page the CLI printed, if any: only an https URL is ever opened.
+export function signInUrl(text) {
+  const m = /https:\/\/[^\s<>"']+/.exec(String(text || ''))
+  return m ? m[0] : null
+}
+
+// Why Desktop started nothing, in words. A gateway without a terminal is said so; nothing is run
+// on another machine in its place.
+export function recoveryRefusal(reason) {
+  if (reason === 'no-shell') return 'This gateway has no terminal connection from Desktop — connect to it over SSH (Settings › Gateway) to sign in from here'
+  if (reason === 'missing') return 'This gateway is no longer configured in Desktop'
+  if (reason === 'no-runtime') return 'Hermes is not installed on this device yet'
+  if (reason === 'unsupported') return 'Sign-in from the panel is not available for this gateway\'s system'
+  return 'Sign-in could not start for this account'
+}
 
 // A disconnected account: dead grant, or benched for an auth error. These get a Reconnect/sign-in action.
 // `slug` (when given) keeps providers the backend cannot reconnect out.
@@ -646,8 +678,8 @@ export function createSelectionStore(ctx) {
 
 // Reconnect = renew the account's OAuth grant in place (backend force-refresh). A dead grant
 // launches the provider's supported sign-in on the gateway that owns the chips: Codex device-code
-// in the panel, Anthropic through Desktop's Settings › Accounts (core forbids an in-app login).
-// Never a CLI command, never a typed code. "Reconnected" is only shown for a health the backend
+// in the panel, Anthropic through Desktop's recovery terminal for that one stored row (core forbids
+// a dashboard login). Never a pasted command, never Settings, never a code typed into chat. "Reconnected" is only shown for a health the backend
 // or a fresh panel read confirmed; a failed or empty readback says so.
 const HEALTH = {
   ok: { done: true, message: 'Reconnected' },
@@ -718,7 +750,7 @@ export function createReconnectStore(ctx, onDone = () => {}) {
   }
   // Read the panel back and report the account's actual health. `keep` carries the flow fields
   // (external / opened) across a result that leaves the row needing action.
-  const verify = async (put, provider, account, live = () => true, keep = {}) => {
+  const verify = async (put, provider, account, live = () => true, keep = {}, nowId = account.id) => {
     let groups = null, failed = false
     try { groups = await onDone() } catch { failed = true }
     if (!live()) return
@@ -727,8 +759,8 @@ export function createReconnectStore(ctx, onDone = () => {}) {
       put({ ...keep, error: true, unverified: true, check: true, message: 'Could not confirm the account — check again' })
       return
     }
-    const row = findAccount(groups, provider, account.id, account.label)
-    const health = accountHealth(groups, provider, account.id, account.label)
+    const row = findAccount(groups, provider, nowId, account.label)
+    const health = accountHealth(groups, provider, nowId, account.label)
     const result = HEALTH[health]
     put(result.done ? { ...result, ...(row && row.id !== account.id ? { resolvedId: row.id } : {}) }
       : { ...keep, ...result, ...(health === 'missing' ? { removed: true } : {}) })
@@ -751,10 +783,8 @@ export function createReconnectStore(ctx, onDone = () => {}) {
       if (status === 'quota') { put({ error: true, message: 'Out of quota — not a sign-in problem' }); return }
       if (status === 'disabled') { put({ error: true, message: 'Account is disabled' }); return }
       if (status === 'needs_sign_in') {
-        const external = r?.auth_flow === 'external' || EXTERNAL_SLUGS.has(provider)
-        put({ needsSignIn: true, authFlow: external ? 'external' : r?.auth_flow, ...(r?.removed ? { removed: true } : {}),
-          ...(external ? {} : { signInRoute: signInRoute(r) }),
-          message: external ? 'Saved sign-in expired — sign in from Settings › Accounts' : 'Saved sign-in expired — sign in again' })
+        put({ needsSignIn: true, authFlow: TERMINAL_SLUGS.has(provider) ? 'terminal' : r?.auth_flow, ...(r?.removed ? { removed: true } : {}),
+          signInRoute: signInRoute(r), message: 'Saved sign-in expired — sign in again' })
         return
       }
       put({ error: true, message: 'Reconnect is not available for this account' })
@@ -806,37 +836,128 @@ export function createReconnectStore(ctx, onDone = () => {}) {
     await drop(api, sessionId, route)
     if (live()) put({ error: true, needsSignIn: true, message: 'Sign-in timed out' })
   }
-  // Anthropic: hand over to Desktop's own Accounts page; "Check sign-in" reads the result back.
-  const openSettings = (provider, account) => {
-    const put = writer(begin(provider, account, ownerRoute()))
-    if (typeof host.navigate !== 'function') {
-      put({ error: true, needsSignIn: true, authFlow: 'external', message: 'Open Settings › Accounts to sign in to this provider' })
-      return false
-    }
-    host.navigate(ACCOUNTS_SETTINGS)
-    put({ needsSignIn: true, authFlow: 'external', opened: true, message: 'Sign in under Settings › Accounts, then check here' })
-    return true
+  // ── Terminal sign-in (Anthropic): Desktop runs the fixed recovery command for one stored row ──
+  const terminalApi = () => (typeof window !== 'undefined' && window.hermesDesktop?.terminal) || null
+  const sessions = new Map() // key -> {id, off[], text}: the one live recovery terminal of a row
+  const endTerminal = async k => {
+    const session = sessions.get(k)
+    if (!session) return
+    sessions.delete(k)
+    for (const off of session.off) { try { off() } catch { /* already unsubscribed */ } }
+    session.text = ''
+    try { await terminalApi()?.dispose(session.id) } catch { /* the command may already have exited */ }
   }
-  const check = async (provider, account) => {
-    const st = cur(reconnectKey(provider, account.id)) || {}
+  // The command's exit proves nothing. Ask the backend what the stored row is now (by row id: its
+  // account id changes with the token), then read the panel back for that exact account.
+  const afterRecovery = async (put, provider, account, route, bound, live, cancelled = false) => {
+    const keep = { needsSignIn: true, authFlow: 'terminal', signInRoute: bound }
+    put({ ...keep, busy: true, message: 'Checking account…' })
+    let seen = null
+    try {
+      seen = await ctx.rest('/credential-health', { method: 'POST', body: { provider, credential_id: bound.credentialId }, ...restOpts(route) })
+    } catch {
+      if (live()) put({ ...keep, error: true, unverified: true, check: true, message: 'Could not confirm the account — check again' })
+      return
+    }
+    if (!live()) return
+    if (!seen || seen.found !== true) {
+      put({ error: true, needsSignIn: true, authFlow: 'terminal', unverified: true, removed: true, signInRoute: { mode: 'unsupported' },
+        message: 'This account is no longer in the pool — nothing was saved' })
+      return
+    }
+    if (seen.status === 'needs_sign_in' || !seen.account_id) {
+      put({ ...keep, ...(cancelled ? { cancelled: true } : { error: true }), message: cancelled ? 'Sign-in cancelled' : 'Sign-in did not finish — nothing was saved' })
+      return
+    }
+    // The backend vouched for this row and its account id; a panel that has not loaded that
+    // account yet is waiting for usage, not looking at a different account.
+    const report = st => put(st.removed && !st.done
+      ? { ...keep, check: true, message: 'Signed in — usage has not updated yet, check again' } : st)
+    report.scope = put.scope
+    await verify(report, provider, account, live, { ...keep, check: true }, seen.account_id)
+  }
+  const check = async (provider, account, route = ownerRoute()) => {
+    const st = cur(reconnectKey(provider, account.id), route) || {}
     if (st.busy) return
-    const put = writer(begin(provider, account, ownerRoute()))
-    const keep = { ...(st.needsSignIn ? { needsSignIn: true } : {}), ...(st.authFlow ? { authFlow: st.authFlow } : {}), ...(st.opened ? { opened: true } : {}) }
+    const put = writer(begin(provider, account, route))
+    if (st.authFlow === 'terminal' && st.signInRoute?.mode === 'target') {
+      await afterRecovery(put, provider, account, route, st.signInRoute, put.owned)
+      return
+    }
+    const keep = { ...(st.needsSignIn ? { needsSignIn: true } : {}), ...(st.authFlow ? { authFlow: st.authFlow } : {}), ...(st.signInRoute ? { signInRoute: st.signInRoute } : {}) }
     put({ ...keep, busy: true, message: 'Checking account…' })
     await verify(put, provider, account, () => true, keep)
+  }
+  const signInTerminal = async (provider, account, route, bound) => {
+    const k = begin(provider, account, route)
+    const put = writer(k)
+    const keep = { needsSignIn: true, authFlow: 'terminal', signInRoute: bound }
+    if (bound.mode !== 'target') {
+      put({ ...keep, error: true, message: bound.mode === 'unknown'
+        ? 'Restart this gateway to sign in to this account again'
+        : 'This sign-in is managed outside this profile — renew it where it was created' })
+      return
+    }
+    const term = terminalApi()
+    if (typeof term?.startRecovery !== 'function') {
+      put({ ...keep, error: true, message: 'Update Hermes Desktop to sign in to this account from here' })
+      return
+    }
+    if (!route?.connectionId) { put({ ...keep, error: true, message: 'Pick the gateway this account lives on, then sign in again' }); return }
+    if (sessions.has(k)) await endTerminal(k)
+    const token = {}
+    flows.set(k, token)
+    const live = () => flows.get(k) === token && put.owned()
+    put({ ...keep, busy: true, message: 'Starting sign-in…' })
+    try {
+      let started = null
+      try {
+        started = await term.startRecovery({ connectionId: route.connectionId, ...(route.profile ? { profile: route.profile } : {}),
+          provider, credentialId: bound.credentialId, cols: 96, rows: 24 })
+      } catch { started = null }
+      // Anything but a recovery session Desktop itself marked as one is ended, never shown.
+      if (!started || started.recovery !== true || !started.id || started.unavailable) {
+        if (started?.id) { try { await term.dispose(started.id) } catch { /* nothing to end */ } }
+        if (live()) put({ ...keep, error: true, message: recoveryRefusal(started?.unavailable) })
+        return
+      }
+      const session = { id: started.id, off: [], text: '' }
+      if (!live()) { try { await term.dispose(session.id) } catch { /* nothing to end */ } return }
+      sessions.set(k, session)
+      const show = () => { if (live() && sessions.get(k) === session) put({ ...keep, terminal: true, output: session.text, message: 'Follow the steps below to sign in' }) }
+      session.off.push(term.onData(session.id, chunk => { session.text = appendOutput(session.text, chunk); show() }))
+      const exited = new Promise(done => { session.off.push(term.onExit(session.id, done)) })
+      show()
+      await term.attach(session.id)
+      await exited
+      // Cancel (or a newer sign-in) already ended this terminal and reports for itself.
+      if (sessions.get(k) !== session) return
+      await endTerminal(k)
+      if (live()) await afterRecovery(put, provider, account, route, bound, live)
+    } finally {
+      if (flows.get(k) === token) flows.delete(k)
+    }
+  }
+  // The user's answer to the command's prompt (confirmation word, authorization code). It goes to
+  // the terminal and nowhere else: not into panel state, storage, logs or chat.
+  const sendInput = async (provider, account, text) => {
+    const session = sessions.get(reconnectKey(provider, account.id))
+    const term = terminalApi()
+    if (!session || !term) return false
+    try { return !!(await term.write(session.id, `${String(text ?? '')}\r`)) } catch { return false }
   }
   const signIn = async (provider, account, route = ownerRoute()) => {
     let seen = cur(reconnectKey(provider, account.id), route)
     if (seen?.busy) return
-    if (EXTERNAL_SLUGS.has(provider) || seen?.authFlow === 'external') { openSettings(provider, account); return }
     // The backend names the stored row a sign-in must repair. Without that answer nothing is
     // started: an unbound login could add a second row beside the dead one.
     if (!seen?.signInRoute) {
       await reconnect(provider, account, route)
       seen = cur(reconnectKey(provider, account.id), route)
-      if (!seen?.needsSignIn || seen.authFlow === 'external' || !seen.signInRoute) return
+      if (!seen?.needsSignIn || !seen.signInRoute) return
     }
     const bound = seen.signInRoute
+    if (TERMINAL_SLUGS.has(provider)) { await signInTerminal(provider, account, route, bound); return }
     const target = bound.mode === 'target' ? bound.credentialId : null
     const k = begin(provider, account, route)
     const put = writer(k)
@@ -865,7 +986,7 @@ export function createReconnectStore(ctx, onDone = () => {}) {
       sessionId = start?.session_id || null
       if (!live()) return
       if (start?.flow !== 'device_code' || !start.verification_url || !sessionId) {
-        put({ error: true, needsSignIn: true, authFlow: 'external', message: 'Sign-in for this provider runs from Settings › Accounts' })
+        put({ error: true, needsSignIn: true, signInRoute: bound, message: 'This gateway cannot start this sign-in' })
         return
       }
       // A gateway that ignored the target started an ordinary login. It is deleted (finally), not shown.
@@ -886,9 +1007,8 @@ export function createReconnectStore(ctx, onDone = () => {}) {
     } catch (err) {
       if (!live()) return
       const msg = String(err?.message || err)
-      put(/external CLI|Unsupported flow/i.test(msg)
-        ? { error: true, needsSignIn: true, authFlow: 'external', message: 'Sign-in for this provider runs from Settings › Accounts' }
-        : { error: true, needsSignIn: true, signInRoute: bound, message: `Sign-in failed: ${msg}` })
+      put({ error: true, needsSignIn: true, signInRoute: bound, message: /external CLI|Unsupported flow/i.test(msg)
+        ? 'This gateway cannot start this sign-in' : `Sign-in failed: ${msg}` })
     } finally {
       // Whoever leaves a started session unfinished deletes it (cancelled, superseded, taken over by
       // another gateway, failed): core would otherwise keep polling and could still save a sign-in
@@ -904,11 +1024,18 @@ export function createReconnectStore(ctx, onDone = () => {}) {
     // Retire the flow first: its poll loop may be parked in a 25 s long-poll and must not write
     // state when that returns, least of all over a sign-in started after this cancel.
     flows.delete(k)
-    writer(k)({ needsSignIn: true, cancelled: true, ...(st.signInRoute ? { signInRoute: st.signInRoute } : {}), message: 'Sign-in cancelled' })
+    if (sessions.has(k)) {
+      // Ending the terminal stops the command. If it had already saved, the readback says so.
+      await endTerminal(k)
+      const put = writer(k)
+      await afterRecovery(put, provider, account, route, st.signInRoute, put.owned, true)
+      return
+    }
+    writer(k)({ needsSignIn: true, cancelled: true, ...(st.authFlow ? { authFlow: st.authFlow } : {}), ...(st.signInRoute ? { signInRoute: st.signInRoute } : {}), message: 'Sign-in cancelled' })
     const api = desktopApi()
     if (api && st.sessionId) await drop(api, st.sessionId, route)
   }
-  return { $state, key, reconnect, signIn, cancelAuth, openSettings, check, openPage: url => ctx.os?.openExternal && url ? ctx.os.openExternal(url) : Promise.resolve(false) }
+  return { $state, key, reconnect, signIn, cancelAuth, sendInput, check, openPage: url => ctx.os?.openExternal && url ? ctx.os.openExternal(url) : Promise.resolve(false) }
 }
 
 // Disable / Enable one account (every pooled row of it). onDone refreshes the usage store.
@@ -996,7 +1123,22 @@ export function ReconnectLine({ g, a, reconnectStore, reconnectState }) {
   const name = a.label || a.id
   const children = []
   const say = (text, color) => children.push(jsx('span', { className: 'hermes-au-fixmsg', style: color ? { color } : undefined, children: text }))
-  if (st.launching && st.sessionId) {
+  if (st.terminal) {
+    // The recovery command's own prompts, and one masked field for the answers it asks for.
+    const url = signInUrl(st.output)
+    const send = input => { if (!input) return; const value = input.value; input.value = ''; void reconnectStore.sendInput(g.slug, a, value) }
+    children.push(jsx('button', { type: 'button', 'aria-label': `Cancel sign-in for ${name}`,
+      onClick: () => reconnectStore.cancelAuth(g.slug, a, route), children: 'Cancel sign-in' }))
+    if (url) children.push(jsx('button', { type: 'button', 'aria-label': `Open sign-in page for ${name}`,
+      onClick: () => reconnectStore.openPage(url), children: 'Open sign-in page' }))
+    if (st.message) say(st.message)
+    children.push(jsx('pre', { className: 'hermes-au-term', 'aria-label': `Sign-in steps for ${name}`, 'aria-live': 'polite', children: st.output || 'Starting…' }))
+    children.push(jsxs('span', { className: 'hermes-au-termin', children: [
+      jsx('input', { type: 'password', autoComplete: 'off', spellCheck: false, 'aria-label': `Answer for ${name} sign-in`, placeholder: 'Type the answer it asks for (hidden), then Enter',
+        onKeyDown: e => { if (e.key === 'Enter') { e.preventDefault(); send(e.currentTarget) } } }),
+      jsx('button', { type: 'button', 'aria-label': `Send answer for ${name}`, onClick: e => send(e.currentTarget.previousElementSibling), children: 'Send' })
+    ] }))
+  } else if (st.launching && st.sessionId) {
     children.push(jsx('button', { type: 'button', 'aria-label': `Cancel sign-in for ${name}`,
       onClick: () => reconnectStore.cancelAuth(g.slug, a, route), children: 'Cancel sign-in' }))
     if (st.userCode) children.push(jsx('span', { children: `Code ${st.userCode}` }))
@@ -1007,14 +1149,7 @@ export function ReconnectLine({ g, a, reconnectStore, reconnectState }) {
     say(st.message, COLORS.ready)
   } else {
     const confirmed = signInConfirmed(a, st, g.slug) || (!!st.needsSignIn && RECONNECT_SLUGS.has(g.slug))
-    const external = EXTERNAL_SLUGS.has(g.slug) || st.authFlow === 'external'
-    if (confirmed && external) {
-      // Anthropic: core forbids an in-app login, so the supported step is Desktop's Accounts page.
-      children.push(jsx('button', { type: 'button', 'aria-label': `Open sign-in settings for ${name}`, disabled: !!st.busy,
-        onClick: () => reconnectStore.openSettings(g.slug, a), children: 'Sign in from Settings…' }))
-      if (st.opened || st.check) children.push(jsx('button', { type: 'button', 'aria-label': `Check sign-in for ${name}`, disabled: !!st.busy,
-        onClick: () => reconnectStore.check(g.slug, a), children: st.busy ? 'Checking…' : 'Check sign-in' }))
-    } else if (confirmed) {
+    if (confirmed) {
       children.push(jsx('button', { type: 'button', 'aria-label': `Sign in to ${name} again`, disabled: !!st.busy,
         onClick: () => reconnectStore.signIn(g.slug, a, route), children: st.busy ? 'Starting…' : 'Sign in again…' }))
       if (st.check) children.push(jsx('button', { type: 'button', 'aria-label': `Check sign-in for ${name}`, disabled: !!st.busy,
@@ -1026,9 +1161,7 @@ export function ReconnectLine({ g, a, reconnectStore, reconnectState }) {
       children.push(jsx('button', { type: 'button', 'aria-label': `Reconnect ${name}`, disabled: !!st.busy,
         onClick: () => reconnectStore.reconnect(g.slug, a, route), children: st.busy ? 'Reconnecting…' : st.retry ? 'Retry' : 'Reconnect' }))
     }
-    const text = st.message || (confirmed
-      ? (external ? 'Saved sign-in expired — sign in from Settings › Accounts' : 'Saved sign-in expired — sign in again')
-      : '')
+    const text = st.message || (confirmed ? 'Saved sign-in expired — sign in again' : '')
     if (text) say(text, st.error ? COLORS.limited : undefined)
   }
   return jsxs('div', { className: 'hermes-au-fix', children })

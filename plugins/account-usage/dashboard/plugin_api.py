@@ -111,7 +111,8 @@ _QUOTA_MARKERS = ('quota', 'rate_limit', 'usage_limit', 'billing', 'exhausted')
 
 @router.get('/ping')
 def ping() -> Dict[str, Any]:
-    return {'api': 2, 'features': ['reconnect_status', 'auth_launch', 'reconnect_removed', 'sign_in_route']}
+    return {'api': 2, 'features': ['reconnect_status', 'auth_launch', 'reconnect_removed', 'sign_in_route',
+                                   'credential_health']}
 
 
 class ReconnectBody(BaseModel):
@@ -198,7 +199,7 @@ def _pick_status(renewed: int, statuses: list[str]) -> str:
     return 'unsupported'
 
 
-def sign_in_route(dead: list[tuple[Any, bool]]) -> Dict[str, Any]:
+def sign_in_route(dead: list[tuple[Any, bool]], provider: str = 'openai-codex') -> Dict[str, Any]:
     """Where a fresh sign-in for this account's dead rows must be written.
 
     ``dead``: ``(pool row, left the pool)`` for each row whose grant is dead. The wire account id
@@ -209,6 +210,9 @@ def sign_in_route(dead: list[tuple[Any, bool]]) -> Dict[str, Any]:
       or core already dropped it. The ordinary login rewrites that state and reseeds the row.
     - ``unsupported``: any other owner (env, borrowed, relayed), or several manual rows: no
       sign-in started from this panel can be bound to the right place.
+
+    Anthropic has no ordinary in-app login to fall back on (core: flow ``external``), so it is
+    ``target`` or ``unsupported``, never ``singleton``.
     """
     if not dead:
         return {'mode': 'unsupported'}
@@ -216,7 +220,7 @@ def sign_in_route(dead: list[tuple[Any, bool]]) -> Dict[str, Any]:
     seeded = [e for e, gone in dead if gone or str(getattr(e, 'source', '') or '') == 'device_code']
     if len(manual) == 1 and len(dead) == 1 and getattr(manual[0], 'id', None):
         return {'mode': 'target', 'credential_id': str(manual[0].id)}
-    if len(seeded) == len(dead):
+    if len(seeded) == len(dead) and AUTH_FLOWS.get(provider) == 'device_code':
         return {'mode': 'singleton'}
     return {'mode': 'unsupported'}
 
@@ -280,15 +284,56 @@ def reconnect_account(provider: str, account_id: str, tools=None) -> Dict[str, A
         'provider': provider,
         'label': str(getattr(matches[0], 'label', '') or ''),
         'auth_flow': AUTH_FLOWS.get(provider),
-        # Only for a dead grant on a provider with in-app sign-in: which stored row it must repair.
-        **({'sign_in': sign_in_route(dead)}
-           if overall == 'needs_sign_in' and AUTH_FLOWS.get(provider) == 'device_code' else {}),
+        # Only for a dead grant: which stored row a new sign-in must repair.
+        **({'sign_in': sign_in_route(dead, provider)} if overall == 'needs_sign_in' else {}),
     }
 
 
 @router.post('/reconnect')
 def post_reconnect(body: ReconnectBody):
     return reconnect_account(body.provider, body.account_id)
+
+
+class CredentialHealthBody(BaseModel):
+    model_config = ConfigDict(extra='forbid', strict=True)
+    provider: str = Field(min_length=1, max_length=64)
+    credential_id: str = Field(min_length=1, max_length=128, pattern=r'^[A-Za-z0-9][A-Za-z0-9_-]*$')
+
+
+def credential_health(provider: str, credential_id: str, tools=None) -> Dict[str, Any]:
+    """What one stored pool row looks like now, by its row id. No refresh, no network.
+
+    A sign-in that replaced a row in place keeps the row id but can change the wire account id
+    (an Anthropic id is a token fingerprint). The panel asks by row id after such a sign-in and
+    gets the account id that row has now, so it follows the row instead of guessing by label.
+    ``status``: ``ok`` | ``needs_sign_in`` | ``quota`` | ``disabled`` | ``unknown``.
+    Never returns tokens, raw errors or entry secrets."""
+    if provider not in RECONNECT_PROVIDERS:
+        raise HTTPException(400, detail=f'Reconnect is not supported for {provider}')
+    try:
+        load_pool, identity_for, status_dead, is_disabled = _unpack_pool_tools(tools)
+        row = next((e for e in load_pool(provider).entries() if str(getattr(e, 'id', '') or '') == credential_id), None)
+        account_id = identity_for(provider, row) if row is not None else None
+        disabled = bool(row is not None and is_disabled and is_disabled(provider, row))
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(503, detail='Credential pool is unavailable; retry') from None
+    if row is None:
+        return {'found': False, 'provider': provider, 'credential_id': credential_id, 'account_id': None,
+                'status': 'unknown'}
+    if disabled:
+        status = 'disabled'
+    else:
+        seen = classify_refresh(refreshed=row, entry=row, status_dead=status_dead)
+        status = {'renewed': 'ok', 'needs_sign_in': 'needs_sign_in', 'quota': 'quota'}.get(seen, 'unknown')
+    return {'found': True, 'provider': provider, 'credential_id': credential_id,
+            'account_id': str(account_id) if account_id else None, 'status': status}
+
+
+@router.post('/credential-health')
+def post_credential_health(body: CredentialHealthBody):
+    return credential_health(body.provider, body.credential_id)
 
 
 # ── Disable: keep an account out of use without removing it (``hermes auth disable``) ──
