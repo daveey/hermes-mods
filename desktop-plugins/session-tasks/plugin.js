@@ -389,9 +389,10 @@ export function briefOf(scope) {
   const marks = [...scope.matchAll(BRIEF_HEADING)].map(m => ({ start: m.index, end: m.index + m[0].length, name: briefName(m[1]) }))
   const taken = marks.map(m => [m.start, m.end])
   let words = [...scope.matchAll(BRIEF_WORD)].filter(m => atBoundary(scope, m.index) && !taken.some(([s, e]) => s <= m.index && m.index < e))
-  // With two or more line-start labels (headings count) the scope is laid out line by line, and a sentence-end
-  // "Recommended:" inside an option's text is prose; a single-line scope keeps its sentence-end labels.
-  if (marks.length + words.filter(m => lineStart(scope, m.index, true)).length >= 2) words = words.filter(m => lineStart(scope, m.index, true))
+  // A sentence-end label is prose when the same label also starts a line (a "Recommended:" inside an option's text,
+  // with a real "Recommend:" line below); single-line and mixed layouts keep their sentence-end labels.
+  const atLine = new Set([...marks.map(m => m.name), ...words.filter(m => lineStart(scope, m.index, true)).map(m => briefName(m[1]))])
+  words = words.filter(m => lineStart(scope, m.index, true) || !atLine.has(briefName(m[1])))
   for (const m of words) marks.push({ start: m.index, end: m.index + m[0].length, name: briefName(m[1]) })
   marks.sort((x, y) => x.start - y.start)
   const stops = [...marks.map(m => m.start), ...[...scope.matchAll(BRIEF_CONTRACT)].map(m => m.index)].sort((x, y) => x - y)

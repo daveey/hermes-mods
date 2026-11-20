@@ -890,3 +890,12 @@ test('briefOf parity: label inside option text, bullet leak, nested sub-steps (t
   assert.deepEqual(c, { situation: 'The app closed and the check is open.', options: ['A) one', 'B) two'], recommend: 'A - it is cheap enough.' })
   assert.deepEqual(m.briefOptions('A) restart\n1. stop\n2. start\nB) accept'), ['A) restart 1. stop 2. start', 'B) accept'])
 })
+
+test('briefOf parity: mixed layouts keep sentence-end labels not repeated at a line start', () => {
+  for (const scope of ['Situation: The fix is installed and one check is open.\nOptions: A) run once more. B) accept the gap. Recommend: A because it is cheap.',
+    'Situation: The fix is installed and one check is open. Options: A) run once more. B) accept the gap.\nRecommend: A because it is cheap.']) {
+    const b = m.briefOf(scope)
+    assert.deepEqual(b.options, ['A) run once more.', 'B) accept the gap.'])
+    assert.equal(b.recommend, 'A because it is cheap.')
+  }
+})

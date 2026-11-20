@@ -294,3 +294,14 @@ def test_next_labels_bullet_does_not_leak(gate):
 
 def test_numbered_substeps_stay_in_their_option(gate):
     assert gate.unblock_card_quality.options("A) restart\n1. stop\n2. start\nB) accept") == ["A) restart 1. stop 2. start", "B) accept"]
+
+
+@pytest.mark.parametrize("scope", [
+    "Situation: The fix is installed and one check is open.\nOptions: A) run once more. B) accept the gap. Recommend: A because it is cheap.",
+    "Situation: The fix is installed and one check is open. Options: A) run once more. B) accept the gap.\nRecommend: A because it is cheap.",
+])
+def test_mixed_layouts_parse(gate, scope):
+    q = gate.unblock_card_quality
+    parts = q.sections(scope)
+    assert q.options(parts["options"]) == ["A) run once more.", "B) accept the gap."]
+    assert parts["recommend"] == "A because it is cheap."

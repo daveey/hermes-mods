@@ -115,10 +115,11 @@ def sections(scope: str) -> dict[str, str]:
     taken = [(s, e) for s, e, _ in marks]
     words = [m for m in _WORD_LABEL.finditer(scope)
              if _at_boundary(scope, m.start()) and not any(s <= m.start() < e for s, e in taken)]
-    # With two or more line-start labels (headings count) the scope is laid out line by line, and a sentence-end
-    # "Recommended:" inside an option's text is prose; a single-line scope keeps its sentence-end labels.
-    if len(marks) + sum(_line_start(scope, m.start(), bullets=True) for m in words) >= 2:
-        words = [m for m in words if _line_start(scope, m.start(), bullets=True)]
+    # A sentence-end label is prose when the same label also starts a line (a "Recommended:" inside an option's
+    # text, with a real "Recommend:" line below); single-line and mixed layouts keep their sentence-end labels.
+    at_line = {name for _, _, name in marks} | {_norm(m.group(1)) for m in words
+                                                 if _line_start(scope, m.start(), bullets=True)}
+    words = [m for m in words if _line_start(scope, m.start(), bullets=True) or _norm(m.group(1)) not in at_line]
     marks += [(m.start(), m.end(), _norm(m.group(1))) for m in words]
     marks.sort()
     stops = sorted([s for s, _, _ in marks] + [m.start() for m in _CONTRACT_LINE.finditer(scope)])
