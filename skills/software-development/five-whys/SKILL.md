@@ -284,6 +284,8 @@ When fixtures depend on event chronology or expiry, read `references/clock-fixtu
   Back up to the last level you can change.
 - For a live failed-result observer, inspect the entire restart/continuation event chain before treating it as a process hang. A modern restart receipt can cease to cover the history after a successor binding; if that worker dies without its own result, strict attribution may veto both the observer and legacy expiry. Compare native claim/PID fields with replica projections, preserve real receipts/checkpoints, and reproduce restart → rebind → loss with distinct process identities. Measure admission using the host's enabled policy; an out-of-gateway cgroup census need not equal row-based admission.
 
+- For state machines that add health evidence, trace the new field through every persistence projection: successful commit, failed-action observation allowlist, multi-slot quiet updates, and dry-run shadow load/save. A decision-only regression can pass while a sibling write failure discards an unhealthy reset and the next real tick acts on pre-interruption evidence. Exercise real ticks against the ledger with fake transports; distinguish invalidation (must survive failure) from evidence consumption tied to an uncommitted lifecycle transition (must not survive failure or preview).
+
 - Checking for a parallel fix only during diagnosis. Right before you implement, fetch the repo, read its branch log
   since the incident and search open cards on every board for the same symptom: another session reading the same
   logs often lands the fix first. If one did, run your tests against its commit instead of pushing a second fix.
