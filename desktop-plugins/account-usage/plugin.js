@@ -305,7 +305,7 @@ export function withSignedOut(groups, reconnectState = {}) {
   for (const st of Object.values(reconnectState)) {
     if (!st || !st.removed || st.done || !st.provider || !RECONNECT_SLUGS.has(st.provider)) continue
     const g = out.find(row => row.slug === st.provider)
-    const taken = g && g.accounts.some(a => a.id === st.id || (st.label && a.label === st.label))
+    const taken = g && g.accounts.some(a => a.id === st.id)
     if (taken) continue
     const ghost = { id: st.id, label: st.label || 'Signed-out account', state: 'unavailable', reason: 'auth', signedOut: true, selectable: false, windows: [] }
     if (g) out = out.map(row => (row === g ? { ...g, accounts: [...g.accounts, ghost], total: g.total + 1 } : row))
@@ -329,13 +329,11 @@ export function reconnectOutcome(r) {
   return 'transient'
 }
 
-// What a fresh panel read says about one account. An Anthropic account id is a token fingerprint, so
-// it changes when the token does: fall back to the label when exactly one account carries it.
-export function findAccount(groups, provider, id, label) {
+// Display labels are neither unique nor authenticated identity. If a token-fingerprint id changes,
+// only an explicit backend identity mapping can certify its replacement; a matching label cannot.
+export function findAccount(groups, provider, id) {
   const g = (groups || []).find(row => row.slug === provider)
-  const rows = (g && g.accounts) || []
-  const named = label ? rows.filter(row => row.label === label) : []
-  return rows.find(row => row.id === id) || (named.length === 1 ? named[0] : null)
+  return (g?.accounts || []).find(row => row.id === id) || null
 }
 export function accountHealth(groups, provider, id, label) {
   const a = findAccount(groups, provider, id, label)
@@ -717,8 +715,10 @@ export function createReconnectStore(ctx, onDone = () => {}) {
       return
     }
     const row = findAccount(groups, provider, account.id, account.label)
-    const result = HEALTH[accountHealth(groups, provider, account.id, account.label)]
-    put(result.done ? { ...result, ...(row && row.id !== account.id ? { resolvedId: row.id } : {}) } : { ...keep, ...result })
+    const health = accountHealth(groups, provider, account.id, account.label)
+    const result = HEALTH[health]
+    put(result.done ? { ...result, ...(row && row.id !== account.id ? { resolvedId: row.id } : {}) }
+      : { ...keep, ...result, ...(health === 'missing' ? { removed: true } : {}) })
   }
   const reconnect = async (provider, account, route = ownerRoute()) => {
     if (cur(reconnectKey(provider, account.id), route)?.busy) return
