@@ -166,6 +166,8 @@ untouched.
 
 ## Pitfalls
 
+- When an owner freezes scope and excludes a dependency, distinguish an honest partial deliverable from whole-contract acceptance before review. If source demonstrates the excluded dependency can destroy supported results, report the exact path and stop for the scope owner; do not grow another certification subsystem or replay unchanged review cycles. Process/lease zero proves no active work, not delivery of completed results: a direct run-end lease release can succeed while the completion outbox remains pending. Check whether an existing manual preflight actually runs on the autoscaler path and inspects finished rows before treating it as mitigation.
+
 - Passing your rationale "so they understand" defeats the method. If the spec needs it, put it in the spec.
 - Include the target repository's root and affected-area AGENTS/contribution rules in the readiness reading list. For observer APIs, identify the concrete production consumer and activation/readback path before calling the slice shippable; real-caller tests alone do not satisfy a repository ban on unconsumed hooks. Keep privacy-reduced diagnostic envelopes separate from lossless replay evidence.
 - Line numbers go stale after any edit; cite headings, and re-read before assigning a location.
