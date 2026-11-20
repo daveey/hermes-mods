@@ -1,0 +1,3 @@
+# Model-specific weekly rejection despite account headroom
+
+Distinguish model-specific overage-included exhaustion from account-wide headroom. A correctly shaped, calibrated completion can return429 with `anthropic-ratelimit-unified-7d_oi-status: rejected`, `7d_oi-utilization: 1.0` and a weekly reset, while ordinary `7d-status` and `5h-status` remain allowed and a different model on the exact account returns200. Preserve that model's cooldown: ordinary OAuth usage headroom does not disprove the model-specific wall. Capture sanitized response headers, never credentials. A generic rate-limit message is insufficient to classify the failure; the unified bucket evidence and working same-account control are decisive.
