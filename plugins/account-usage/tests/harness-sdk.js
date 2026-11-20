@@ -9,7 +9,8 @@ host.request=async (...args)=>{
  const f=window.fixture||{}
  if(f.extra && payload?.providers){
   // Claude dead grant (core: no in-app Anthropic login) and a Codex row core drops when its grant dies.
-  payload.providers[0].usage.accounts.push(f.claudeRevived
+  // claudeNewListed: usage already lists the row under its new account id (stale "ready").
+  payload.providers[0].usage.accounts.push(f.claudeRevived || f.claudeNewListed
    ? {id:'inventory-claude-new',label:'Claude dead',state:'ready',windows:[]}
    : {id:'inventory-claude-dead',label:'Claude dead',state:'unavailable',reason:'auth',windows:[]})
   if(f.reviveVanished) payload.providers[1].usage.accounts.push({id:'inventory-vanish',label:'Vanishing account',state:'ready',windows:[]})

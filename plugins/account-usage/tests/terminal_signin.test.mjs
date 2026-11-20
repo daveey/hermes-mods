@@ -296,6 +296,92 @@ test('Check again after an unconfirmed readback applies the same rule', async ()
   assert.equal(store.$state.get()[k].message, 'Reconnected'); assert.equal(store.$state.get()[k].settled, undefined)
 })
 
+// What the user sees. The usage panel replaces the pre-recovery id with the account id the backend
+// named, so the backend's answer has to show on THAT row: rendered here through AccountRow and
+// ReconnectLine for fp:new, not read from the store entry kept under fp:old.
+function render(el, out = { text: [], buttons: [], auth: [] }) {
+  if (el == null || el === false) return out
+  if (Array.isArray(el)) { el.forEach(c => render(c, out)); return out }
+  if (typeof el !== 'object') { out.text.push(String(el)); return out }
+  if (typeof el.type === 'function') return render(el.type(el.props || {}), out)
+  const p = el.props || {}
+  if (p['data-auth']) out.auth.push(p['data-auth'])
+  if (el.type === 'button' && p.onClick && p['aria-label'] && !/^(Try|Details for|Disable|Enable) /.test(p['aria-label'])) out.buttons.push([p['aria-label'], p.onClick])
+  return render(p.children, out)
+}
+const NEW = { ready: { id: 'fp:new', label: 'me', state: 'ready' },
+  limited: { id: 'fp:new', label: 'me', state: 'limited', limit_kind: 'quota', reason: 'usage_limit' },
+  unavailable: { id: 'fp:new', label: 'me', state: 'unavailable', reason: 'auth' } }
+async function recovered(status, usage) {
+  const term = fakeTerminal()
+  let groups = [{ slug: 'anthropic', accounts: [DEAD] }], answer = status
+  const r = await setup({ term, groups: () => groups,
+    rest: path => path === '/reconnect' ? deadGrant() : { found: true, account_id: 'fp:new', ...(answer ? { status: answer } : {}) } })
+  const flow = r.store.signIn('anthropic', DEAD, ROUTE)
+  await tick(); await tick(); await tick()
+  if (usage) groups = [{ slug: 'anthropic', accounts: [NEW[usage]] }]
+  term.end(0); await flow
+  const row = a => {
+    const state = r.store.$state.get(), g = { slug: 'anthropic', accounts: [a] }
+    return { ...render(r.mod.AccountRow({ g, a, open: false, onToggle() {}, selectionStore: { select() {} }, selectionState: {}, reconnectStore: r.store, reconnectState: state })),
+      line: controls(r.mod.ReconnectLine({ g, a, reconnectStore: r.store, reconnectState: state })), counts: r.mod.authCounts(g, state) }
+  }
+  return { ...r, row, answer: s => { answer = s }, usage: u => { groups = [{ slug: 'anthropic', accounts: [NEW[u]] }] } }
+}
+
+test('the new account row shows the backend answer: disabled or quota is said on fp:new and never offers sign-in', async t => {
+  for (const [status, message] of [['disabled', 'Account is disabled'], ['quota', 'Signed in · out of quota until it resets']]) {
+    for (const usage of ['ready', 'limited', 'unavailable']) await t.test(`backend ${status} + usage lists fp:new ${usage}`, async () => {
+      const r = await recovered(status, usage)
+      const seen = r.row(NEW[usage])
+      assert.ok(seen.text.includes(message), `${message} is on the visible row: ${JSON.stringify(seen.text)}`)
+      assert.deepEqual(seen.auth, [], 'no sign-in or disconnected badge')
+      assert.deepEqual(seen.buttons.map(b => b[0]), ['Check sign-in for me'])
+      assert.deepEqual(seen.line.map(x => x[1]), ['Check sign-in for me', message])
+      assert.deepEqual(seen.counts, { signIn: 0, disconnected: 0 })
+      assert.ok(!seen.text.includes('Reconnected'))
+      // Check again on the new row asks the backend about the stored row, not the fingerprint.
+      r.answer('ok'); r.usage('ready')
+      await seen.buttons[0][1]()
+      const asked = r.restCalls.filter(c => c.path === '/credential-health')
+      assert.equal(asked.length, 2); assert.deepEqual(asked[1].body, { provider: 'anthropic', credential_id: 'pool-9' })
+      assert.ok(r.row(NEW.ready).text.includes('Reconnected'))
+    })
+  }
+})
+
+test('the new account row shows an unconfirmed answer as a caveat with a re-check, not as healthy', async t => {
+  for (const status of ['unknown', undefined, 'renewed']) await t.test(`backend ${status} + usage lists fp:new ready`, async () => {
+    const r = await recovered(status, 'ready')
+    const seen = r.row(NEW.ready)
+    assert.ok(seen.text.includes('Could not confirm the account — check again'), JSON.stringify(seen.text))
+    assert.ok(!seen.text.includes('Reconnected'))
+    assert.deepEqual(seen.buttons.map(b => b[0]), ['Check sign-in for me'])
+    assert.deepEqual(seen.counts, { signIn: 0, disconnected: 0 })
+    r.answer('disabled')
+    await seen.buttons[0][1]()
+    assert.ok(r.row(NEW.ready).text.includes('Account is disabled'))
+  })
+  // Usage has not loaded the new id: the old row keeps its sign-in offer and the re-check.
+  let r = await recovered('unknown', null)
+  assert.deepEqual(r.row(DEAD).line.map(x => x[1]), ['Sign in to me again', 'Check sign-in for me', 'Could not confirm the account — check again'])
+  // Nothing confirmed and usage says the new id is signed out: that row offers its own sign-in.
+  r = await recovered('unknown', 'unavailable')
+  const dead = r.row(NEW.unavailable)
+  assert.equal(dead.line[0][1], 'Sign in to me again'); assert.deepEqual(dead.auth, ['sign-in']); assert.deepEqual(dead.counts, { signIn: 1, disconnected: 0 })
+  assert.ok(!dead.text.includes('Could not confirm the account — check again'))
+})
+
+test('a disabled or quota answer does not hide a sign-in that dies afterwards', async t => {
+  for (const status of ['disabled', 'quota']) for (const usage of [null, 'ready', 'limited']) await t.test(`backend ${status}, usage ${usage} at the answer, fp:new signed out later`, async () => {
+    const r = await recovered(status, usage)
+    const later = r.row(NEW.unavailable)
+    assert.equal(later.line[0][1], 'Sign in to me again')
+    assert.deepEqual(later.auth, ['sign-in']); assert.deepEqual(later.counts, { signIn: 1, disconnected: 0 })
+    assert.ok(!later.text.includes('Account is disabled') && !later.text.includes('Signed in · out of quota until it resets'))
+  })
+})
+
 test('terminal text helpers: plain text only, bounded, https links only', async () => {
   const { mod } = await setup({ term: null, groups: () => [], rest: () => ({}) })
   assert.equal(mod.appendOutput('', '\x1b]0;title\x07a\x1b[31mb\x1b[0m\r\nc\x08\x00'), 'ab\nc')
