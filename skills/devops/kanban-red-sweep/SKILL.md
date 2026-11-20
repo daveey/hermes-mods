@@ -116,8 +116,8 @@ Read `references/prevent-decision-blocks.md` (apply-the-recommendation rule, `IF
 ## 3. Act
 
 - Unblock: `kanban_unblock` (or `hermes kanban unblock <id>` for triage/scheduled), always after a comment that says what changed.
-  A `triage` card with a `spend_budget_triaged` event needs `hermes kanban promote <id>` after a re-scope comment:
-  `unblock` prints "released", then the next tick silently re-triages it.  Read back status a tick later.
+  Spend-triaged card (`spend_budget_triaged`): re-scope comment, then `hermes kanban promote <id> --seen <newest comment id> <reason>`;
+  `unblock` only re-triages it. Read back status.
   A `triage` card whose newest lifecycle event is `contained` ends most "N on parent" chains with no parent visibly
   running or blocked (the panel counts it as "other"): walk open ancestors to it. Unblock/promote can't release it; only
   a live run of its event's `policy.authority` (or a new completed `policy.producer` run) can, via
