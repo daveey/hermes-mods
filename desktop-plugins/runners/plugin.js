@@ -1069,19 +1069,22 @@ export function ScalerControls({ client }) {
   const timer = useRef(null), revision = useRef(0), alive = useRef(false)
   useEffect(() => {
     alive.current = true
+    let disposed = false, readSequence = 0
     const load = async () => {
       if (busy.current || pending.current || document.visibilityState === 'hidden') return
-      const rev = revision.current
+      const rev = revision.current, read = ++readSequence
+      // Fence both overlapping polls and reads from a replaced effect/client.
+      const isCurrent = () => !disposed && read === readSequence && rev === revision.current
       try {
         const next = await client.read()
-        if (alive.current && rev === revision.current) { current.current = next; setSource(next); setError(null) }
+        if (isCurrent()) { current.current = next; setSource(next); setError(null) }
       } catch (e) {
-        if (alive.current && rev === revision.current) { setError(text(e?.message || e)); current.current = null; setSource(null) }
+        if (isCurrent()) { setError(text(e?.message || e)); current.current = null; setSource(null) }
       }
     }
     load()
     const poll = setInterval(load, POLL_OPEN_MS)
-    return () => { alive.current = false; clearInterval(poll); clearTimeout(timer.current) }
+    return () => { disposed = true; alive.current = false; clearInterval(poll); clearTimeout(timer.current) }
   }, [client])
   const change = (key, value) => {
     if (busy.current || !current.current) return
