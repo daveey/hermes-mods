@@ -6,6 +6,8 @@ observes pool burn and stops claims for genuinely held pools. Check effective `k
 
 ## Check
 
+On reserve-only installed cores, first read `kanban_llm_pacing_dispatch.reserve_hold` and execute it against the existing snapshot. Such cores removed `pace_starts` and proportional start limits entirely: the authoritative hold is fresh `v2.pools[provider].at_reserve=true`, not legacy `pace.state=paced`. Corroborate `at_reserve=false` / no hold with recent provider-specific worker results before attributing idle slots to capacity. Repeatedly waking an old capacity incident at individual account resets does not fix an agent-owned fault when the collector is advancing and provider runs succeed. Report the obsolete alert premise separately from literal legacy `open` recovery; do not claim the latter or silently waive the original owner's acceptance. The proportional-limit guidance below applies only to older installed cores.
+
 1. **Who is held, and who still claims.** On the hub, read the Board replica; it holds every gateway's events with
    the gateway that wrote them:
 
