@@ -474,6 +474,9 @@ def test_put_cap_per_min_sets_a_persons_absolute_cap(api, tmp_path, monkeypatch)
     assert c.put("/p/v1/throttle", json={"cap_per_min": 0}).json()["slot_gate"]["allowed"] == 0
     off = c.put("/p/v1/throttle", json={"cap_per_min": None}).json()
     assert off["cap_per_s"] is None and off["slot_gate"]["allowed"] is None
+    nolimit = c.put("/p/v1/throttle", json={"no_limit": True}).json()
+    assert nolimit["limit_mode"] == "no_limit" and nolimit["cap_per_s"] is None
+    assert json.loads(throttle.level_path(root).read_text())["cap_per_s"] == throttle.UNLIMITED
     for bad in ({"cap_per_min": -5}, {"cap_per_min": "lots"}, {"cap_per_min": True}, {"cap_per_min": 1e13}):
         assert c.put("/p/v1/throttle", json=bad).status_code == 400, bad
     assert c.get("/p/v1/throttle").json()["cap_per_s"] is None  # a refused write changes nothing

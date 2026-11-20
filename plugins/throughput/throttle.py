@@ -260,6 +260,7 @@ def cap_value(cap_per_s) -> Optional[float]:
     return number
 
 
+UNLIMITED = 1e12  # tokens/s: a person's "no limit", which also overrides the budget (older code: a cap never reached)
 MANUAL_MIN_PERCENT = 0.001  # a manual cap above 0 is never stored at 0 %: older code reads 0 % as "no throttle"
 
 
@@ -276,8 +277,8 @@ def write_cap(root: Path, cap_per_s, now: float, level: Optional[dict] = None) -
     value = cap_value(cap_per_s)
     record: dict = {"mode": MANUAL, "set_at": stamp(now)}
     budget_total = None
-    if (level is not None and level.get("mode") == AUTO and level.get("percent", 0) < 100
-            and budget(level, now)["state"] != "expired"):
+    if (value is None or value < UNLIMITED) and level is not None and level.get("mode") == AUTO \
+            and level.get("percent", 0) < 100 and budget(level, now)["state"] != "expired":
         budget_total = level.get("cap_per_s")
         scale = 1.0 if value is None or not budget_total else min(1.0, value / budget_total)
         record["pool_caps"] = {p: None if v is None else v * scale for p, v in (level.get("pool_caps") or {}).items()}
@@ -529,7 +530,10 @@ def limit_of(level: dict, reference: Optional[float], now: Optional[float] = Non
             return 0.0
         return budget(level, time.time() if now is None else now)["cap_per_s"]
     if level.get("mode") == MANUAL:
-        return 0.0 if percent >= 100 else level.get("cap_per_s")
+        if percent >= 100:
+            return 0.0
+        cap_ = level.get("cap_per_s")
+        return None if cap_ is not None and cap_ >= UNLIMITED else cap_
     if 0 < percent < 100 and level.get("cap_per_s") is not None:
         return level["cap_per_s"]
     return cap(percent, reference)
@@ -615,7 +619,27 @@ def status(root: Path, series_db: Path, now: Optional[float] = None, hub_db: Opt
     return {"percent": percent, "reference_per_s": reference, "cap_per_s": limit, "rate_per_s": rate,
             "holding": holding, "set_at": level["set_at"] or None, "set_by": level["source"],
             "mode": level.get("mode") or "manual", "budget": b, "burst": burst_status(level, now),
-            "user_cap_per_s": shown_user_cap(root, level, now)}
+            "user_cap_per_s": shown_user_cap(root, level, now), "limit_mode": limit_mode(root, level, now)}
+
+
+def limit_mode(root: Path, level: dict, now: float) -> str:
+    """What caps the fleet, for people: ``no_limit`` (a person chose no limit), ``hold`` (every call held),
+    ``limit`` (a person's cap is the one in force), ``budget`` (the subscription budget caps) or ``none`` (no cap
+    at all: no budget host and no person's cap, or an expired budget)."""
+    if level["percent"] >= 100:
+        return "hold"
+    if level.get("mode") == MANUAL:
+        cap_ = level.get("cap_per_s")
+        if cap_ is not None and cap_ >= UNLIMITED:
+            return "no_limit"
+        if cap_ is not None:
+            return "limit"
+        return "budget" if level.get("pool_caps") else "none"
+    if level.get("mode") == AUTO:
+        if budget(level, now)["state"] == "expired":
+            return "none"
+        return "limit" if shown_user_cap(root, level, now) is not None and level["percent"] > 0 else "budget"
+    return "limit" if level["percent"] > 0 else "none"
 
 
 def shown_user_cap(root: Path, level: dict, now: float) -> Optional[float]:
@@ -628,7 +652,8 @@ def shown_user_cap(root: Path, level: dict, now: float) -> Optional[float]:
         return person_cap(level, now)
     recorded = read_user_cap(root)
     if recorded["set_at"] > 0:
-        return recorded["cap_per_s"]
+        cap_ = recorded["cap_per_s"]
+        return None if cap_ is not None and cap_ >= UNLIMITED else cap_
     return person_cap(level, now)
 
 
@@ -1149,6 +1174,9 @@ def person_cap(level: dict, now: float, budget_per_s: Optional[float] = None) ->
     budget level, its percent against that level's budget; a plain slider level, its percent against
     ``budget_per_s`` (what the slider showed on a budget fleet), else its stored cap. 0 % = no cap of their own."""
     if level.get("mode") == MANUAL:
+        cap_ = level.get("cap_per_s")
+        if cap_ is not None and cap_ >= UNLIMITED and level["percent"] < 100:
+            return UNLIMITED  # "no limit" is a choice, not the absence of one
         return limit_of(level, None, now)
     percent = level["percent"]
     if percent <= 0:
@@ -1198,6 +1226,8 @@ def publish_budget(root: Path, hub_db: Optional[Path], pacing_file: Path, now: O
     if not own and not same_percent and level["set_at"] > user["set_at"]:
         user = {"cap_per_s": person_cap(level, now, new["cap_per_s"]), "set_at": level["set_at"]}
         _write_json(user_cap_path(root), user)
+    if user["cap_per_s"] is not None and user["cap_per_s"] >= UNLIMITED:
+        return False  # a person chose no limit: the budget is not published until they choose a limit or the budget
     percent = percent_for(user["cap_per_s"], new["cap_per_s"])
     path = level_path(root)
     if level["source"] is None and level.get("mode") == AUTO:

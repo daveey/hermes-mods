@@ -300,22 +300,24 @@ and a body that is not a JSON object a 422, and neither changes anything.
   (`open`, `paced`, `held`; `pacing_until` for a hold's known end): with `paced` or `held`, Kanban starts fewer or
   no cards on that pool whatever the throttle level is, and the panel says so on the pool's line.
 
-The Desktop panel shows the slider under Tokens ("applies to all gateways · 3 of 4 have this level"), the cap as a red line on the Tokens chart (hidden with `+cache` or
-a legend filter, which the in+out fleet cap cannot be compared with) and one runway line per pool, rescaled by
-`cap / rate` when the cap is under the measured rate.
+The Desktop panel opens on **Token spend**: the fleet's rate now against what limits it (`limit_mode`: your limit,
+the subscription budget, no limit, holding), a meter and a state ("under the limit", "at the limit: calls wait their
+turn"); the control **Budget / Limit / No limit** (`PUT {"cap_per_min": null}`, `{"cap_per_min": N}` in thousands
+typed as tokens per minute, `{"no_limit": true}`); **Raise for a while** (the burst, only with a budget to raise,
+costed per pool before it starts); one row per subscription (accounts usable of all, how long what is left lasts at
+this pace or at the limit, the next refill, and a state: ok, tight = runs out before the refill, paced, unavailable);
+and this gateway's open card slots (`slot_gate`). The limit is a red line on the Tokens chart (hidden with `+cache` or
+a legend filter, which the in+out fleet limit cannot be compared with). The 7-day **Forecast** (used, planned,
+available, refills, raises; per pool and in total) is folded away below. No percent slider. Tests:
+`desktop-plugins/throughput/tests/throughput.test.mjs`.
 
-Under it, the **Budget** section (when this host has core's `v2`): one chart per pool plus a total ("All pools"),
-from 7 days ago to the furthest reset in the curve. Left of the "now" line, the measured cumulative spend; right of
-it, core's capacity steps (green) and planned cumulative spend (dashed), both lifted by the spend so far so they
-continue the measured line. Ticks along the bottom mark resets (and the curve's planned weekly resets), early
-resets, accounts added or removed; a red shaded span marks the burst (dashed edges while it is only being
-considered). The burst control (budget mode) picks 1.5x, 2x or 3x for 30 min, 1, 2 or 4 h and, before it can be
-started, lists each pool's cost ("runs out ~X earlier at today's rate · after the burst the planner slows to Y
-tok/s") with a warning when a pool would hit its reserve during the burst or run over its 5-hour cap; a running burst shows its time left and
-an End button. In budget mode the slider stays, labelled "Hold back N%" (the share of the budget held back), and the
-cap text shows the burst ("Budget −20% · burst 2x · cap ..."). Lines and text use the theme's variables
-(`--ui-blue`, `--ui-green`, `--ui-orange`, `--ui-purple`, `--ui-red`, `--ui-text-*`), with fallbacks of at least 3:1
-contrast on white and on near-black, so the charts read in light and dark themes. Tests: `desktop-plugins/throughput/tests/throughput.test.mjs`.
+- **No limit** (`write_cap(root, UNLIMITED)`, `hermes throttle set unlimited`): a manual level whose `cap_per_s` is
+  `UNLIMITED` (1e12 tokens/s, stored at a percent just above 0 so older code reads a cap it never reaches). Nothing
+  paces, no slot limit, no reserve holds carried; the budget-publish host records it and stops publishing the
+  budget until a person chooses a limit or the budget again (`publish_budget` returns without writing). Core's own
+  quota governor (`kanban.llm_pacing`) still holds card starts on a pool whose every account is at its reserve.
+  Tests: `tests/test_slotgate.py` (override and return to the budget, `limit_mode`), `tests/test_cli.py`,
+  `tests/test_api.py::test_put_cap_per_min_*`.
 
 ## Sampler
 

@@ -393,3 +393,45 @@ def test_a_burst_set_and_ended_never_moves_the_persons_cap(tmp_path, cap):
     T.publish_budget(tmp_path, None, pacing, NOW + 50)
     assert T.read_user_cap(tmp_path)["cap_per_s"] == cap
     assert T.budget(T.effective(tmp_path, None, NOW + 50), NOW + 50)["cap_per_s"] == pytest.approx(min(cap, 1000.0))
+
+
+# --- no limit: a person's override of the budget, and limit_mode ---------------------------------------------
+
+def test_no_limit_overrides_the_budget_until_a_person_chooses_otherwise(tmp_path):
+    pacing = _pacing(tmp_path, 1000.0)
+    T.publish_budget(tmp_path, None, pacing, NOW)
+    assert T.status(tmp_path, tmp_path / "s.sqlite", NOW)["limit_mode"] == "budget"
+    T.write_cap(tmp_path, T.UNLIMITED, NOW + 10, T.effective(tmp_path, None, NOW + 10))
+    data = json.loads(T.level_path(tmp_path).read_text())
+    assert "pool_caps" not in data and 0 < data["percent"] < 1  # no reserve holds carried; older code: a cap never hit
+    for t in (NOW + 20, NOW + 80, NOW + 3600):  # the publisher leaves it in force, however often it runs
+        assert T.publish_budget(tmp_path, None, pacing, t) is False
+    level = T.effective(tmp_path, None, NOW + 3600)
+    assert level["mode"] == "manual"
+    gate = T.Gate(tmp_path, tmp_path / "s.sqlite", clock=lambda: float(NOW + 3600))
+    assert gate.plan(NOW + 3600, "anthropic") == ("pass",) and gate.plan(NOW + 3600) == ("pass",)
+    st = T.status(tmp_path, tmp_path / "s.sqlite", NOW + 3600)
+    assert st["limit_mode"] == "no_limit" and st["cap_per_s"] is None and st["user_cap_per_s"] is None
+    assert S.local(tmp_path, tmp_path / "s.sqlite", st["cap_per_s"], NOW + 3600)["allowed"] is None
+    # choosing the budget again: the publisher takes over at once
+    T.write_cap(tmp_path, None, NOW + 3700, level)
+    fresh = json.loads(pacing.read_text())
+    fresh["v2"]["computed_at"] = NOW + 3690  # the hub recomputes its budget every few minutes
+    pacing.write_text(json.dumps(fresh))
+    assert T.publish_budget(tmp_path, None, pacing, NOW + 3710) is True
+    assert T.status(tmp_path, tmp_path / "s.sqlite", NOW + 3710)["limit_mode"] == "budget"
+
+
+def test_limit_mode_names_what_caps_the_fleet(tmp_path):
+    pacing = _pacing(tmp_path, 1000.0)
+    st = lambda t: T.status(tmp_path, tmp_path / "s.sqlite", t)["limit_mode"]
+    assert st(NOW) == "none"  # nothing set, no budget host
+    T.write_cap(tmp_path, 250.0, NOW)
+    assert st(NOW) == "limit"
+    T.publish_budget(tmp_path, None, pacing, NOW + 10)
+    assert st(NOW + 10) == "limit"  # folded: the person's 250 is under the budget
+    T.write_cap(tmp_path, 5000.0, NOW + 20, T.effective(tmp_path, None, NOW + 20))
+    T.publish_budget(tmp_path, None, pacing, NOW + 30)
+    assert st(NOW + 30) == "budget"  # theirs is above the budget: the budget caps
+    T.write_cap(tmp_path, 0, NOW + 40)
+    assert st(NOW + 40) == "hold"

@@ -176,7 +176,7 @@ def throttle_payload(now: float | None = None) -> Dict[str, Any]:
     return out
 
 
-def set_cap(cap_per_min: Any) -> Dict[str, Any]:
+def set_cap(cap_per_min: Any, no_limit: bool = False) -> Dict[str, Any]:
     """A person sets the fleet's token cap in tokens per minute (None = no cap of their own; the budget alone
     then caps on a budget fleet). Stored as a ``manual`` level stamped after the level in force."""
     if cap_per_min is not None and (isinstance(cap_per_min, bool) or not isinstance(cap_per_min, (int, float))
@@ -188,7 +188,8 @@ def set_cap(cap_per_min: Any) -> Dict[str, Any]:
     root, hub_db, now = _state["root"], throttle.hub_db_path(), time.time()
     level = throttle.effective(root, hub_db, now)
     stamp = max(now, level["set_at"] + 0.002)  # 2 ms: stamps round to 1 ms
-    throttle.write_cap(root, None if cap_per_min is None else cap_per_min / 60.0, stamp, level)
+    per_s = throttle.UNLIMITED if no_limit else None if cap_per_min is None else cap_per_min / 60.0
+    throttle.write_cap(root, per_s, stamp, level)
     throttle.note_seen(root, hub_db, stamp)
     return throttle_payload()
 
@@ -217,6 +218,8 @@ async def get_throttle() -> Dict[str, Any]:
 @router.put("/v1/throttle")
 async def put_throttle(body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
     try:
+        if body.get("no_limit") is True:  # no limit at all: overrides the subscription budget too
+            return await asyncio.to_thread(set_cap, None, True)
         if "cap_per_min" in body:  # a person's absolute cap (the Runners panel's tokens/min field, the CLI)
             return await asyncio.to_thread(set_cap, body.get("cap_per_min"))
         return await asyncio.to_thread(set_throttle, body.get("percent"))

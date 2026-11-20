@@ -24,6 +24,9 @@ def test_amounts():
     assert C.parse_per_min("0") == 0
     for word in ("off", "None", "auto", "budget"):
         assert C.parse_per_min(word) is None
+    import math
+    for word in ("unlimited", "nolimit", "No-Limit"):
+        assert math.isinf(C.parse_per_min(word))
     for bad in ("-5k", "lots", "5g", ""):
         with pytest.raises(ValueError):
             C.parse_per_min(bad)
@@ -74,3 +77,12 @@ def test_register_adds_the_throttle_cli_command(monkeypatch, tmp_path):
     monkeypatch.setattr(sampler, "eligible_process", lambda *a, **k: False)
     plugin.register(ctx)
     assert [(n, s, h) for n, s, h in commands] == [("throttle", C.setup, C.handler)]
+
+
+def test_set_unlimited_stores_no_limit_and_status_says_so(home, capsys):
+    assert _run("set", "unlimited") == 0
+    stored = json.loads(T.level_path(home).read_text())
+    assert stored["mode"] == "manual" and stored["cap_per_s"] == T.UNLIMITED
+    out = capsys.readouterr().out
+    assert "token cap set to no limit" in out and "limited by:     no limit (budget overridden)" in out
+    assert "cap in force:   none" in out
