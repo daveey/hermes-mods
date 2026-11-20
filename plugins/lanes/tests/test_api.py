@@ -30,6 +30,10 @@ class Core:
     def connect_closing(self):
         yield object()
 
+    def _fleet(self, conn, local):
+        assert local is False
+        return None
+
     def policy(self):
         if self.broken:
             raise self.broken
@@ -117,6 +121,59 @@ def test_daily_limits_reach_core_and_flow_is_served_cached(api, core, monkeypatc
     assert calls == ["6h", "6h"]  # a write drops the cached flow
     monkeypatch.setattr(api, "flow_core", lambda: None)
     assert api.flow("1h")["configured"] is False
+
+
+@pytest.mark.parametrize("replicated,broken", [(True, False), (False, False), (True, True)])
+def test_flow_uses_fleet_and_closes_replica(api, core, monkeypatch, replicated, broken):
+    from types import SimpleNamespace
+
+    closed, seen = [], []
+    replica = SimpleNamespace(close=lambda: closed.append(True)) if replicated else None
+    local = object()
+
+    @contextlib.contextmanager
+    def connect():
+        yield local
+
+    def fleet(conn, local):
+        assert local is False
+        seen.append(conn)
+        return replica
+
+    def snapshot(conn, *, window):
+        assert conn is (replica if replicated else local)
+        if broken:
+            raise ValueError("snapshot failed")
+        return {"cards": [{"id": "worker-card"}], "lanes": {"product": {}}}
+
+    monkeypatch.setattr(core, "connect_closing", connect)
+    monkeypatch.setattr(core, "_fleet", fleet)
+    monkeypatch.setattr(api, "flow_core", lambda: (core, SimpleNamespace(snapshot=snapshot)))
+    result = api.flow("6h")
+    assert seen == [local]
+    assert closed == ([True] if replicated else [])
+    assert result["configured"] is (not broken)
+    if not broken:
+        assert result["cards"] == [{"id": "worker-card"}]
+
+
+@pytest.mark.parametrize("field", ["cards_per_day", "usd_per_day"])
+def test_old_core_caps_return_clear_409_without_writing(api, core, monkeypatch, field):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    def old_set(lane, *, share, admit_per_day, paused):
+        core.sets.append(lane)
+
+    monkeypatch.setattr(core, "set_lane", old_set)
+    app = FastAPI()
+    app.include_router(api.router)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.put("/v1/lanes/product", json={field: 20, "share": 5})
+        assert response.status_code == 409
+        assert response.json()["detail"] == "this Hermes core has no daily lane caps yet"
+        assert not core.sets
+        assert client.put("/v1/lanes/product", json={"share": 5}).status_code == 200
 
 
 def test_flow_route_validates_the_window(api, core, monkeypatch):

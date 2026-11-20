@@ -293,7 +293,7 @@ export function ageHours(hours) {
 
 const prLabel = (url) => { const m = /\/pull\/(\d+)/.exec(String(url || '')); return m ? `#${m[1]}` : String(url || '').split('/').filter(Boolean).pop() || '' }
 
-/** What clears a dam: the PR whose merge frees the most cards, the asks to answer, the cap to raise. */
+/** What clears a dam, without inferring blocker identity from a card's own PR. */
 export function damHint(reason, cards) {
   const n = cards.length
   const plural = (word) => `${n} ${word}${n === 1 ? '' : 's'}`
@@ -301,10 +301,8 @@ export function damHint(reason, cards) {
   let text
   if (reason === 'you') text = `answer ${plural('ask')}`
   else if (reason === 'dep') {
-    const byPr = new Map()
-    for (const c of cards) if (c.pr) byPr.set(c.pr, (byPr.get(c.pr) || 0) + 1)
-    const top = [...byPr.entries()].sort((a, b) => b[1] - a[1])[0]
-    text = top ? `land ${prLabel(top[0])} → frees ${top[1]}` : `${plural('card')} wait on an open parent`
+    // The payload's pr belongs to this card; it does not identify its blocker.
+    text = `${plural('card')} ${n === 1 ? 'waits' : 'wait'} on an open parent`
   } else if (reason === 'gate') text = `admit or release ${n} held`
   else if (reason === 'limit:cards_per_day') text = 'raise cards/day, or wait for local midnight'
   else if (reason === 'limit:usd_per_day') text = 'raise $/day, or wait for local midnight'

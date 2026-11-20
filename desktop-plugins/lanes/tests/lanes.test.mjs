@@ -427,8 +427,9 @@ function flowSnap(over = {}) {
     card('t2', 'product', 'waiting', 'dep', { pr: 'https://example.com/o/r/pull/12' }),
     card('t3', 'product', 'waiting', 'you', { age_h: 30 }),
     card('t4', 'product', 'ready', 'slot'),
-    card('t5', 'infra', 'waiting', 'dep', { pr: 'https://example.com/o/r/pull/12' }),
-    card('t6', 'infra', 'waiting', 'dep', { pr: 'https://example.com/o/r/pull/12' }),
+    // pr is each card's own PR, not its blocking parent's PR.
+    card('t5', 'infra', 'waiting', 'dep', { pr: 'https://example.com/o/r/pull/13' }),
+    card('t6', 'infra', 'waiting', 'dep', { pr: 'https://example.com/o/r/pull/14' }),
     card('t7', 'infra', 'waiting', 'dep'),
     card('t8', 'infra', 'waiting', 'dep'),
     card('t9', 'infra', 'running', 'run'),
@@ -595,7 +596,7 @@ test('Flow: flowing steps vs dams, what clears each dam, the project/source togg
   assert.ok(sink('dam:dep') && sink('dam:you') && sink('dam:limit:cards_per_day'), 'waiting work is a dam named by its reason')
   assert.equal(sink('dam:dep').getAttribute('data-count'), '5')
   const hint = (key) => document.querySelector(`[data-hint="${key}"]`).textContent
-  assert.equal(hint('dam:dep'), 'land #12 → frees 3 · oldest 2h')
+  assert.equal(hint('dam:dep'), '5 cards wait on an open parent · oldest 2h')
   assert.equal(hint('dam:you'), 'answer 1 ask · oldest 30h')
   assert.match(hint('dam:limit:cards_per_day'), /raise cards\/day, or wait for local midnight/)
   assert.match(hint('dam:slot'), /1 card needs a free worker/)

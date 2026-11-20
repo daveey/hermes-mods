@@ -15,6 +15,7 @@ cores omit it and the Desktop strip treats a missing count as 0.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import threading
 import time
 from typing import Any, Dict, Optional
@@ -96,7 +97,16 @@ def flow(window: str, now: Optional[float] = None) -> Dict[str, Any]:
         generation = _generation
     try:
         with kbc.connect_closing() as conn:
-            body = dict(kanban_lanes_flow.snapshot(conn, window=window))
+            # Match the CLI's fleet/local selection and ownership of its replica.
+            fleet_modules = core()
+            if fleet_modules is None:
+                raise RuntimeError("this Hermes core has no lanes support yet")
+            replica = fleet_modules[2]._fleet(conn, local=False)
+            try:
+                body = dict(kanban_lanes_flow.snapshot(replica if replica is not None else conn, window=window))
+            finally:
+                if replica is not None:
+                    replica.close()
     except Exception as exc:
         return {"configured": False, "reason": f"lanes flow is unavailable: {exc}"}
     body["configured"] = bool(body.get("lanes"))
@@ -130,6 +140,15 @@ def change(lane: str, body: Dict[str, Any]) -> Dict[str, Any]:
     if "paused" in body and type(body["paused"]) is not bool:
         raise ValueError("paused must be true or false")
     extra = {k: body[k] for k in LIMIT_FIELDS if k in body}
+    if extra:
+        # Check before writing; catching TypeError from inside set_lane could hide a bug
+        # or report failure after a partial write on an otherwise supported core.
+        try:
+            inspect.signature(cli.set_lane).bind(lane, share=body.get("share"),
+                                                admit_per_day=body.get("admit_per_day"),
+                                                paused=body.get("paused"), **extra)
+        except TypeError:
+            raise HTTPException(status_code=409, detail="this Hermes core has no daily lane caps yet")
     cli.set_lane(lane, share=body.get("share"), admit_per_day=body.get("admit_per_day"), paused=body.get("paused"),
                  **extra)
     _written()
