@@ -467,3 +467,17 @@ def test_limit_mode_of_a_carried_budget_that_expired_is_none(tmp_path):
     T._write_json(T.level_path(tmp_path), {"mode": "manual", "percent": 0.0, "pool_caps": {"anthropic": 0.0},
                                            "budget_at": NOW - 2 * 3600, "set_at": NOW - 10})
     assert T.status(tmp_path, tmp_path / "s.sqlite", NOW)["limit_mode"] == "none"
+
+
+def test_a_new_publish_host_does_not_turn_the_above_budget_marker_into_a_cap(tmp_path):
+    """Host A published a person's cap above the budget (the marker percent); host B takes over publishing with no
+    record of its own and a much larger budget: no cap at the old budget is recorded."""
+    a, b = tmp_path / "a", tmp_path / "b"
+    T.write_cap(a, 5000.0, NOW)
+    T.publish_budget(a, None, _pacing(a, 1000.0), NOW + 10)
+    assert T.effective(a, None, NOW + 10)["percent"] == T.MANUAL_MIN_PERCENT
+    b.mkdir()
+    T._write_json(T.level_path(b), json.loads(T.level_path(a).read_text()))
+    T.publish_budget(b, None, _pacing(b, 8000.0), NOW + 20)
+    assert T.read_user_cap(b)["cap_per_s"] is None
+    assert T.budget(T.effective(b, None, NOW + 20), NOW + 20)["cap_per_s"] == pytest.approx(8000.0)

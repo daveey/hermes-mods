@@ -1208,6 +1208,8 @@ def person_cap(level: dict, now: float, budget_per_s: Optional[float] = None) ->
     if percent >= 100:
         return 0.0
     if level.get("mode") == AUTO:  # the budget it was set against, without any burst factor
+        if percent <= MANUAL_MIN_PERCENT * 1.5:
+            return None  # the marker: theirs was above that budget, its value is unknown here (not a cap at it)
         base = level.get("cap_per_s")
         return None if base is None else base * (1.0 - percent / 100.0)
     if budget_per_s is not None:
