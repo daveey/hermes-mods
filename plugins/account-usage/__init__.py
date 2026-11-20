@@ -4,7 +4,8 @@ Hermes' ``post_api_request`` hook does not pass the agent, so we find the callin
 stack (the hook runs synchronously on the agent thread) and read the dispatched credential id the
 same way core's rate-limit recovery does (``agent._credential_pool_entry_id``, else
 ``pool.current()``). Result goes to ``$HERMES_HOME/account_usage_last.json``:
-``{provider: {"entry_id", "label", "at"}}``. Fail-open: any error is swallowed.
+``{provider: {"entry_id", "account_id", "label", "at"}}`` (``account_id`` = the usage panel's
+row id, when core can name it). Fail-open: any error is swallowed.
 """
 from __future__ import annotations
 
@@ -65,6 +66,19 @@ def _find_agent(session_id: str):
     return found
 
 
+def _wire_account_id(provider, entry):
+    """The usage panel's ``accounts[].id`` for this pool row, or None when core cannot name it.
+
+    Labels are not unique, so the panel marks the "in use" row by this id.
+    """
+    try:
+        from agent.account_usage_cache import _identity_id_for
+        found = _identity_id_for(provider, entry)
+        return found if isinstance(found, str) and found else None
+    except Exception:
+        return None
+
+
 def _on_api(**kw):
     try:
         request_id = kw.get('api_request_id')
@@ -90,6 +104,9 @@ def _on_api(**kw):
             return None
         now = time.time()
         rec = {"entry_id": entry.id, "label": str(entry.label or ""), "at": now}
+        account_id = _wire_account_id(provider, entry)
+        if account_id:
+            rec["account_id"] = account_id
         with _lock:
             path = _state_path()
             prev = _last.get((path, provider))

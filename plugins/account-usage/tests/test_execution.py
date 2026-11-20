@@ -265,6 +265,20 @@ class Execution(unittest.TestCase):
         with patch.object(plugin, '_find_agent', return_value=a):
             hooks['post_api_request'](session_id=a.session_id, provider=a.provider, api_request_id='next-A')
         self.assertEqual(json.loads((self.home / 'account_usage_last.json').read_text())['anthropic']['entry_id'], 'A')
+        # The ordinary observer names the wire account id too: the panel marks by it, not by label.
+        plugin._last.clear()
+        with patch.object(plugin, '_find_agent', return_value=a), \
+                patch('agent.account_usage_cache._identity_id_for', lambda provider, e: f'wire-{e.id}'):
+            hooks['post_api_request'](session_id=a.session_id, provider=a.provider, api_request_id='named-A')
+        named = json.loads((self.home / 'account_usage_last.json').read_text())['anthropic']
+        self.assertEqual((named['entry_id'], named['account_id']), ('A', 'wire-A'))
+        plugin._last.clear()
+        with patch.object(plugin, '_find_agent', return_value=a), \
+                patch('agent.account_usage_cache._identity_id_for', side_effect=RuntimeError('no identity')):
+            hooks['post_api_request'](session_id=a.session_id, provider=a.provider, api_request_id='unnamed-A')
+        unnamed = json.loads((self.home / 'account_usage_last.json').read_text())['anthropic']
+        self.assertEqual(unnamed['entry_id'], 'A')
+        self.assertNotIn('account_id', unnamed)
         for fn in reversed(cleanup):
             fn()
         self.assertIs(ClientLifecycleMixin._create_request_anthropic_client, original)

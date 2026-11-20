@@ -225,8 +225,12 @@ export function summarize(payload, last = {}, now = Date.now(), disabled = null)
     const rec = last && last[p.slug]
     let markId = null
     let mark = null
-    if (rec && rec.label) {
-      const hit = accounts.find(a => a.label === rec.label)
+    // The backend names the account id that served the call. A label is not an identity: an older
+    // backend's label-only record marks a row only when exactly one row carries that label.
+    const named = rec && typeof rec.account_id === 'string' && rec.account_id ? rec.account_id : null
+    if (rec && (named || rec.label)) {
+      const same = named ? accounts.filter(a => a.id === named) : accounts.filter(a => a.label === rec.label)
+      const hit = same.length === 1 ? same[0] : null
       if (hit) {
         markId = hit.id
         mark = now - rec.at * 1000 < ACTIVE_MS ? 'active' : 'last'
