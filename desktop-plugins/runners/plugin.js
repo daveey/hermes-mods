@@ -418,10 +418,11 @@ export function ago(ms) {
 }
 
 const isHub = (m) => m.name === 'hub' || (m.labels || []).includes('machine:hub')
+const isLaunching = (m) => m.state === 'launching' || holdWord(m) === 'enrolling'
 
 export function summarize(view, throttle = null) {
   // A stopped machine (held and off) has no capacity: it is left out of every slot total.
-  const g = (view.gateways.machines || []).filter((m) => !['stopped', 'launching'].includes(m.state)), c = view.ci.machines || []
+  const g = (view.gateways.machines || []).filter((m) => m.state !== 'stopped' && !isLaunching(m)), c = view.ci.machines || []
   const gBusy = g.reduce((n, m) => n + m.running.length, 0)
   const gSlots = g.reduce((n, m) => n + (m.slots ?? m.running.length), 0)
   const slots = c.flatMap((m) => m.slots)
@@ -1001,24 +1002,25 @@ export function pipGroups(view, throttle = null, now = Date.now()) {
     .filter((m) => m.state !== 'stopped' && Number.isInteger(m.slots) && m.slots > 0)
     .sort((a, b) => Number(isHub(b)) - Number(isHub(a)) || a.name.localeCompare(b.name))
     .map((m) => {
-      const hub = isHub(m), busy = m.running.length
+      const hub = isHub(m), busy = m.running.length, launching = isLaunching(m)
       const limit = slotLimit(m, limitRow(throttle, m.name))
       const throttled = limit?.throttled || 0
-      const age = Math.max(0, now / 1000 - (m.launched_at ?? now / 1000))
+      const launchEvent = (view.gateways.events || []).filter((e) => e.worker === m.name && e.kind === 'launched').sort((a, b) => b.at - a.at)[0]
+      const age = Math.max(0, now / 1000 - (m.launched_at ?? launchEvent?.at ?? now / 1000))
       const lit = Math.round(Math.min(1, age / typical) * m.slots)
       const full = meterTone(hub ? totals.hub : totals.workers) === 'full'
       const pips = Array.from({ length: m.slots }, (_, i) => {
-        if (m.state === 'launching') return i < lit ? 'booted' : 'boot'
+        if (launching) return i < lit ? 'booted' : 'boot'
         if (i < busy) return m.state === 'draining' ? 'drain' : m.state === 'lost' || full ? 'lost' : 'busy'
         if (m.state === 'draining') return 'gone'
         return i >= m.slots - throttled ? 'thr' : 'free'
       })
-      const title = m.state === 'launching'
+      const title = launching
         ? `${m.name}: launching, ${Math.floor(age / 60)} min in (ready in ~${Math.max(0, Math.round((typical - age) / 60))})`
         : m.state === 'draining' ? `${m.name}: draining, ${busy} card${busy === 1 ? '' : 's'} finishing`
           : m.state === 'lost' ? `${m.name}: lost, holding ${busy} cards`
             : `${m.name}: ${busy}/${m.slots} busy${throttled ? `, ${throttled} throttled` : ''}`
-      return { name: m.name, hub, state: m.state, lost: m.state === 'lost', pips, title }
+      return { name: m.name, hub, state: launching ? 'launching' : m.state, lost: m.state === 'lost', pips, title }
     })
 }
 

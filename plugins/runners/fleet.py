@@ -100,7 +100,16 @@ def with_worker_events(section, ledger_path, now_s):
     since = now_s - EVENTS_WINDOW_S
     events = worker_events(ledger_path, since, now_s)
     launching, typical = launching_workers(section.get('machines', []), events)
-    return dict(section, machines=[*section.get('machines', []), *launching],
+    # Registration precedes readiness: retain the registry hold/popover state,
+    # but carry the boot clock through NODE/VERIFY until the enrolling hold lifts.
+    latest = {e['worker']: e for e in sorted(events, key=lambda e: e['at'])}
+    machines = []
+    for m in section.get('machines', []):
+        event = latest.get(m['name'], {})
+        enrolling = m.get('state') == 'draining' and str(m.get('hold_reason', '')).startswith('worker-scaler: enrolling ')
+        machines.append(dict(m, launched_at=event['at'])
+                        if enrolling and event.get('kind') == 'launched' else m)
+    return dict(section, machines=[*machines, *launching],
                 events=events, events_since=since, launch_ready_s=typical)
 
 
