@@ -362,11 +362,20 @@ and a body that is not a JSON object a 422, and neither changes anything.
   (`open`, `paced`, `held`; `pacing_until` for a hold's known end): with `paced` or `held`, Kanban starts fewer or
   no cards on that pool whatever the throttle level is, and the panel says so on the pool's line.
 
-The Desktop panel shows the slider under Tokens ("applies to all gateways · 3 of 4 have this level"), the cap as a red line on the Tokens chart (hidden with `+cache` or
-a legend filter, which the in+out fleet cap cannot be compared with) and one runway line per pool, rescaled by
-`cap / rate` when the cap is under the measured rate.
+The Desktop panel opens on three **tiles**: spending now, the limit (whose: your limit, the subscription budget or
+no limit; orange at the limit) and this gateway's card slots (running / open, from `slot_gate`). Under them,
+**Budget / Limit / No limit**: Budget clears an own cap and switches budget pacing on (`PUT /v1/throttle
+{"cap_per_min": null}`, then `PUT /v1/throttle/pacing {"on": true}` when it was off); Limit sends a number in
+thousands of tokens per minute on Enter or Set (`{"cap_per_min": N}`; with pacing on the lower of it and the budget
+applies); No limit clears the cap and switches pacing off. Budget is offered only where a budget publisher exists.
+Beside it **Raise 2× · 1 h** (the burst, only on a live budget level; "…" picks factor and duration; the cost per
+pool is the hover text, a reserve or 5-hour warning one line). Then one row per subscription: a block per account
+(filled = still usable), "3 of 7 · 9.4 d" (at the limit or this pace) and the state colour (tight, paced, held, used
+up). The limit is a red line on the Tokens chart (hidden with `+cache` or a legend filter). Right-clicking the
+status-bar chip opens the same choices and a raise (2× or 3× for an hour, or End). Tests:
+`desktop-plugins/throughput/tests/throughput.test.mjs`.
 
-Under it, the **Budget** section (when this host has core's `v2`): one chart per pool plus a total ("All pools"),
+Below the charts, the folded **Forecast · 7 days** (when this host has core's `v2`): one chart per pool plus a total ("All subscriptions"),
 from 7 days ago to the furthest reset in the curve. Left of the "now" line, the measured cumulative spend; right of
 it, core's capacity steps (green) and planned cumulative spend (dashed), both lifted by the spend so far so they
 continue the measured line. Ticks along the bottom mark resets (and the curve's planned weekly resets), early
