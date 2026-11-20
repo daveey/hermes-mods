@@ -449,7 +449,10 @@ def _step_identities(us, session_id: str, steps: list[dict]) -> list[dict]:
 
 
 def _open_linked_cards(session_id: str) -> list[dict]:
-    """Open (todo/ready/running/scheduled/review) cards this chat created or shepherds, incl. parked watches.
+    """Open (todo/ready/running/scheduled/review) cards this chat created or shepherds.
+
+    Same membership as core's close-out gate (``session_tasks``): a ``watch=true`` park is left out by design,
+    because the chat row shows done with a watch mark naming it (hermes_cli/kanban_watch.py).
 
     20261119_073752_746173: the chat was declared done twice while it still owed a staging check after someone
     else's merge; the sidebar said done. A chat with an open linked card is waiting, not done. Fails open: an
@@ -481,7 +484,8 @@ def handle(args: dict, session_id: str = "", tool_call_id: str = "", **_: Any) -
                 ids = ", ".join(t["id"] for t in owed[:6])
                 return _err(
                     f"done refused: this chat still has open linked cards ({ids}). Done means nothing is owed by "
-                    "anyone, including a check you parked. Declare "
+                    "anyone, you included. (A kanban_schedule(watch=true) park is allowed: the chat shows done "
+                    "with its watch mark.) Declare "
                     '{"kind": "wait", "on": [{"kind": "card", "id": "<card>", "label": "..."}]} for them instead, '
                     "or archive a card that is truly not needed, then declare done.")
         result: dict[str, Any] = {"ok": True}
