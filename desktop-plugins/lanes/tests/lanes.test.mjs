@@ -133,7 +133,7 @@ test('the event opens the panel, fetches the saved window, and Apply PUTs', asyn
   assert.ok(calls.some((c) => c[0] === '/v1/lanes/flow?window=24h'), 'and so are its cards')
   await view.click(button('Board'))
   assert.deepEqual(host.navigated, ['/kanban'], 'the panel still leads to the board')
-  assert.equal(document.querySelector('[data-lane="product"]'), null, 'and collapses')
+  assert.ok(document.querySelector('[data-lane="product"]'), 'body navigation leaves the persistent strip open')
   await view.close()
   assert.equal(pillOpensBoard(), true, 'unmounted: the pill opens the board again')
 })

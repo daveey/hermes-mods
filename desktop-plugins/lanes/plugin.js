@@ -1,6 +1,6 @@
 // Lanes: how worker time is split between project lanes, and the controls for it.
 // Lanes live on one gateway; the strip finds it (createSource below) and reads and writes there.
-// Docked at the top of the window (shell.topStrip). Collapsed by default: one line of per-lane pills.
+// Docked above the chat zone (older hosts: shell.topStrip). Collapsed by default: one line of per-lane pills.
 // Expanded = two tabs, Floor (lanes × steps grid of cards, hatched where they pile up, with the lane valves) and
 // Flow (Sankey of sources → lanes → flowing steps / dams); both read GET /v1/lanes/flow?window= only while open.
 // The status-bar task pill (KANBAN_CHIP_EVENT) and the palette "Show lanes" command expand it.
@@ -16,6 +16,7 @@ import { createElement as h, useState, useEffect, useMemo, useRef } from 'react'
 const { host, useQuery, PALETTE_AREA } = sdk
 // Older Desktops do not export TOP_STRIP_AREA; a named import would throw at load and skip activation.
 export const TOP_STRIP_AREA = sdk.TOP_STRIP_AREA || 'shell.topStrip'
+export const STRIP_AREA = sdk.MAIN_PANE_TOP_AREA || TOP_STRIP_AREA
 
 export const POLL_MS = 15000
 export const IDLE_POLL_MS = 300000
@@ -625,11 +626,12 @@ function MiniBar({ row }) {
   }, seg('running', m.running), seg('notReady', m.notReady), seg('blocked', m.blocked))
 }
 
-function MiniPill({ row, onOpen }) {
+function MiniPill({ row, onOpen, expanded }) {
   return h('button', {
     type: 'button', className: 'hermes-lanes-pill', 'data-lane-pill': row.name,
     title: `${row.name}: ${row.running} running · ${row.ready} ready · ${Number(row.blocked_on_you) || 0} blocked on you · ${row.open} open`,
-    onClick: () => onOpen(row.name)
+    'aria-expanded': expanded,
+    onClick: (event) => { event.stopPropagation(); onOpen(row.name) }
   },
     h('span', { className: 'hermes-lanes-dot', style: { background: row.color }, 'aria-hidden': 'true' }),
     h('span', { className: 'hermes-lanes-pill-name' }, row.name),
@@ -644,6 +646,8 @@ export function Lanes({ ctx }) {
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
   const bodyRef = useRef(null)
+  const stripRef = useRef(null)
+  const [bodyMaxHeight, setBodyMaxHeight] = useState('60vh')
   const source = useMemo(() => sourceFor(ctx), [ctx])
   const setOpen = (value) => {
     setOpenState((prev) => {
@@ -671,6 +675,16 @@ export function Lanes({ ctx }) {
   // The task pill expands this strip only where lanes are configured and the API answers; anywhere else its
   // click is left alone and opens the board as before.
   const working = query.data?.configured === true
+  useEffect(() => {
+    const zone = stripRef.current?.closest('[data-tree-group]')
+    if (!zone) return undefined // Older hosts use the full-window shell area.
+    const measure = () => setBodyMaxHeight(`${Math.max(0, zone.getBoundingClientRect().height) * 0.6}px`)
+    measure()
+    if (typeof ResizeObserver === 'undefined') return undefined
+    const observer = new ResizeObserver(measure)
+    observer.observe(zone)
+    return () => observer.disconnect()
+  }, [working])
   // Cards for Floor and Flow: only while the strip is expanded, so a collapsed strip costs one request.
   const flowLabel = flowWindow(windowHours)
   const flowQuery = useQuery({
@@ -717,27 +731,36 @@ export function Lanes({ ctx }) {
   }
   if (!working) return null
   const list = rows(query.data)
-  const openLane = (name) => { setFocus(name); setOpen(true) }
-  return h('div', { className: 'hermes-lanes-strip', 'data-slot': 'lanes-strip', 'data-open': open ? '1' : '0' },
-    h('div', { className: 'hermes-lanes-mini' },
-      list.map((row) => h(MiniPill, { key: row.name, row, onOpen: openLane })),
+  const openLane = (name) => { setFocus(name); setOpen(!open || name !== focus) }
+  const toggle = () => setOpen((value) => !value)
+  return h('div', { ref: stripRef, className: 'hermes-lanes-strip', 'data-slot': 'lanes-strip', 'data-open': open ? '1' : '0' },
+    h('div', {
+      className: 'hermes-lanes-mini', role: 'button', tabIndex: 0,
+      'aria-label': 'Toggle lanes', 'aria-expanded': open, onClick: toggle,
+      onKeyDown: (event) => {
+        if (event.target === event.currentTarget && (event.key === 'Enter' || event.key === ' ')) {
+          event.preventDefault(); toggle()
+        }
+      }
+    },
+      list.map((row) => h(MiniPill, { key: row.name, row, onOpen: openLane, expanded: open && focus === row.name })),
       h('button', {
         type: 'button', className: 'hermes-lanes-toggle', 'aria-expanded': open,
-        'aria-label': open ? 'Collapse lanes' : 'Expand lanes', onClick: () => setOpen((v) => !v)
+        'aria-label': open ? 'Collapse lanes' : 'Expand lanes', onClick: (event) => { event.stopPropagation(); toggle() }
       }, open ? '▴' : '▾')),
-    open ? h('div', { ref: bodyRef, className: 'hermes-lanes-body', style: { maxHeight: '60vh', overflow: 'auto' } },
+    open ? h('div', { ref: bodyRef, className: 'hermes-lanes-body', style: { maxHeight: bodyMaxHeight, overflow: 'auto' } },
       h(Panel, {
         snap: query.data, flow: flowQuery.data, flowError: flowQuery.error ? String(flowQuery.error.message).slice(0, 200) : '',
         windowHours, saving, error: error || (query.error ? String(query.error.message).slice(0, 200) : ''),
         onOpenCard: (id) => openCard(id, source.target()?.connectionId || undefined),
         onWindow: (v) => { setWindowState(v); saveWindow(v) }, onApply: apply,
-        onBoard: () => { setOpen(false); host.navigate('/kanban') }
+        onBoard: () => host.navigate('/kanban')
       })) : null)
 }
 
 const CSS = `
 .hermes-lanes-strip{display:flex;flex-direction:column;min-width:0;width:100%}
-.hermes-lanes-mini{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:4px 8px;min-height:28px}
+.hermes-lanes-mini{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:4px 8px;min-height:28px;cursor:pointer}
 .hermes-lanes-pill{display:inline-flex;align-items:center;gap:6px;height:22px;padding:0 8px;border:1px solid var(--ui-stroke-secondary);border-radius:999px;background:transparent;color:inherit;font:inherit;cursor:pointer}
 .hermes-lanes-pill-name{font-weight:600;font-size:12px}
 .hermes-lanes-pill-open{font-variant-numeric:tabular-nums;font-size:11px;color:var(--ui-text-tertiary)}
@@ -800,7 +823,7 @@ export default {
     style.textContent = CSS
     document.head.append(style)
     ctx.onDispose(() => style.remove())
-    ctx.register({ id: 'strip', area: TOP_STRIP_AREA, order: 10, render: () => h(Lanes, { ctx }) })
+    ctx.register({ id: 'strip', area: STRIP_AREA, order: 10, render: () => h(Lanes, { ctx }) })
     ctx.register({
       id: 'show-lanes',
       area: PALETTE_AREA,

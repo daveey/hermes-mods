@@ -31,10 +31,13 @@ const sdk = {
   PopoverContent: P.Content
 }
 globalThis.__lanesSdk = sdk
-const sdkURL = `data:text/javascript;base64,${Buffer.from(
-  Object.keys(sdk).map((k) => `export const ${k}=globalThis.__lanesSdk.${k}`).join(';')
-).toString('base64')}`
-export async function loadPlugin() {
+export async function loadPlugin(extraSdk = {}) {
+  const current = { ...sdk, ...extraSdk }
+  const key = `__lanesSdk${Object.keys(extraSdk).join('_')}`
+  globalThis[key] = current
+  const sdkURL = `data:text/javascript;base64,${Buffer.from(
+    Object.keys(current).map((k) => `export const ${k}=globalThis[${JSON.stringify(key)}].${k}`).join(';')
+  ).toString('base64')}`
   let source = await readFile(new URL('../plugin.js', import.meta.url), 'utf8')
   source = source.replace(/from ['"](@hermes\/plugin-sdk|react)['"]/g,
     (_, s) => `from '${s === 'react' ? pathToFileURL(require.resolve('react')).href : sdkURL}'`)
