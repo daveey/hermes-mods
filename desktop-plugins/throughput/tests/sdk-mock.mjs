@@ -17,7 +17,7 @@ globalThis.requestAnimationFrame = (callback) => setTimeout(callback, 0)
 globalThis.cancelAnimationFrame = clearTimeout
 const { createRoot } = require('react-dom/client')
 const query = require('@tanstack/react-query')
-const { Popover: P } = require('radix-ui')
+const { Popover: P, ContextMenu: C } = require('radix-ui')
 const sdk = {
   useQuery: query.useQuery,
   useQueryClient: query.useQueryClient,
@@ -25,7 +25,13 @@ const sdk = {
   PALETTE_AREA: 'palette',
   Popover: P.Root,
   PopoverTrigger: P.Trigger,
-  PopoverContent: P.Content
+  PopoverContent: P.Content,
+  ContextMenu: C.Root,
+  ContextMenuTrigger: C.Trigger,
+  ContextMenuContent: C.Content,
+  ContextMenuItem: C.Item,
+  ContextMenuCheckboxItem: C.CheckboxItem,
+  ContextMenuSeparator: C.Separator
 }
 globalThis.__throughputSdk = sdk
 const sdkURL = `data:text/javascript;base64,${Buffer.from(
