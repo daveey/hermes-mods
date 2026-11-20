@@ -33,7 +33,7 @@
  */
 import { Codicon, COMPOSER_AREAS, DisclosureCaret, host, useValue } from '@hermes/plugin-sdk'
 import * as SDK from '@hermes/plugin-sdk' // namespace: the optional projector exports are absent on older hosts
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'session-panel'
@@ -732,6 +732,9 @@ export function askView(c) {
   return { known: true, step: clip(step), full: step, why: typeof r.why === 'string' ? clip(r.why, 300) : '', next, brief,
     yes, no, decision: !!brief && options.length >= 2,
     options: options.map(o => (rec.letter && o.letter === rec.letter ? { ...o, recommended: true, reason: rec.reason } : { ...o, recommended: false })),
+    // A recommendation no tile carries (no letter, or a letter not in the list) is shown as its own line.
+    recommendLine: b?.recommend && !(rec.letter && options.some(o => o.letter === rec.letter)) ? clip(b.recommend, 300) : '',
+    single: options.length === 1 ? options[0] : null,
     reason: rec.reason, whyLine: why.line, tried: why.tried }
 }
 
@@ -749,20 +752,27 @@ export function optionParts(text) {
   return { letter, name: cap(name.trim()), detail: cap(detail.trim()), full }
 }
 
-/** "A - two reloads buy the check" → {letter: 'A', reason: 'two reloads buy the check'}; no leading letter → reason only. */
+/** "A - two reloads buy the check" → {letter: 'A', reason: 'two reloads buy the check'}; no single leading letter
+ *  ("Roll back because…", "A, B both ok", "I recommend A") → {letter: '', reason: the whole text}. */
 export function recommendParts(text) {
-  const t = str(text).trim()
-  const m = /^(?:[Oo]ption\s+)?\(?([A-F1-9])\)?(?=[\s:,.\u2014\u2013-]|$)\s*(?:[-\u2014\u2013:,]|because)?\s*/.exec(t)
-  return m ? { letter: m[1].toUpperCase(), reason: t.slice(m[0].length).replace(/^because\s+/i, '').trim() } : { letter: '', reason: t }
+  const t = str(text).replace(/^\s*recommend(?:ation|ed)?\s*:\s*/i, '').trim()
+  const m = /^(?:[Oo]ption\s+)?\(?([A-F1-9])\)?(?=[\s:.—–-]|$)/.exec(t)
+  if (!m || /^\s*(?:,|and\b|or\b|\/)\s*/i.test(t.slice(m[0].length))) return { letter: '', reason: t }
+  const reason = t.slice(m[0].length).replace(/^[\s.:,—–-]+/, '').replace(/^because\s+/i, '').trim()
+  return { letter: m[1], reason }
 }
 
-/** why_human split: "Tried: … Only you can: …" → the user-facing line ("Only you can: …", or "Why you: …" for an
- *  older free-text reason) and the agent's trail for Details. */
+/** why_human split: "Tried: … Only you can: …" → the user-facing line and the agent's trail for Details. Without an
+ *  "Only you can" part the line is the free-text reason ("Why you: …"), or what was tried when that is all there is. */
 export function whyParts(text) {
   const t = str(text).replace(/\s+/g, ' ').trim()
-  const i = t.search(/\bonly you can\s*:/i)
-  if (i >= 0) return { line: `Only you can: ${t.slice(i).replace(/^only you can\s*:\s*/i, '').trim()}`, tried: t.slice(0, i).replace(/^tried\s*:\s*/i, '').trim() }
-  return /^tried\s*:/i.test(t) ? { line: '', tried: t.replace(/^tried\s*:\s*/i, '') } : { line: t ? `Why you: ${clip(t, 300)}` : '', tried: '' }
+  const i = t.search(/\bonly you can\b/i)
+  if (i >= 0) {
+    const part = t.slice(i).replace(/^only you can\s*:?\s*/i, '').trim()
+    return { line: `Only you can: ${part}`, tried: t.slice(0, i).replace(/^tried\s*:\s*/i, '').trim() }
+  }
+  if (/^tried\s*:/i.test(t)) { const tried = t.replace(/^tried\s*:\s*/i, ''); return { line: `Agent tried: ${clip(tried, 300)}`, tried } }
+  return { line: t ? `Why you: ${clip(t, 300)}` : '', tried: '' }
 }
 
 /** Composer draft for an option tile: the user's pick, sent only when they press send. */
@@ -980,6 +990,9 @@ export const C = {
 }
 const LABEL = { done: 'done', running: 'running', needsYou: 'needs you', stuck: 'stuck', blockedUpstream: 'blocked upstream', ready: 'ready', waiting: 'waiting', queued: 'not started' }
 const muted = { color: 'var(--muted-foreground)', fontSize: 12 }
+// Text colours with >= 4.5:1 contrast on both themes (light-dark needs the host's color-scheme; the first value is
+// the fallback where light-dark is unsupported). ACCENT_FILL carries white text in either theme.
+const ACCENT_TEXT = 'light-dark(#0969da, #58a6ff)', ALERT_TEXT = 'light-dark(#cf222e, #ff7b72)', ACCENT_FILL = '#0969da'
 const heading = color => ({ margin: '12px 0 6px', fontSize: 12, fontWeight: 600, color })
 const btn = { minHeight: 32, padding: '4px 10px', borderRadius: 6, border: '1px solid var(--border)', background: 'transparent', color: 'var(--foreground)', font: 'inherit', fontSize: 12.5, cursor: 'pointer' }
 
@@ -1413,22 +1426,39 @@ function CardStatusRow({ i }) {
 }
 
 const clamp = n => ({ display: '-webkit-box', WebkitLineClamp: n, WebkitBoxOrient: 'vertical', overflow: 'hidden' })
-const pill = color => ({ fontSize: 10, fontWeight: 700, letterSpacing: 0.4, textTransform: 'uppercase', color, border: `1px solid color-mix(in srgb, ${color} 55%, transparent)`, borderRadius: 999, padding: '1px 6px', whiteSpace: 'nowrap' })
+const pill = color => ({ fontSize: 10, fontWeight: 700, letterSpacing: 0.4, textTransform: 'uppercase', color, border: '1px solid currentColor', borderRadius: 999, padding: '1px 6px', whiteSpace: 'nowrap' })
+const askLinkBtn = { background: 'none', border: 0, padding: 0, font: 'inherit', fontSize: 12, color: ACCENT_TEXT, cursor: 'pointer' }
+export const SITUATION_MORE_AT = 140 // characters; without layout (tests, first paint) More shows from here
+
+/** Text clamped to `lines` with a More/Less toggle shown when it actually overflows (measured after paint), or from
+ *  SITUATION_MORE_AT characters when layout can't be measured. */
+function Clamped({ text, lines, attr }) {
+  const ref = useRef(null)
+  const [more, setMore] = useState(false)
+  const [over, setOver] = useState(text.length > SITUATION_MORE_AT)
+  useEffect(() => {
+    const el = ref.current
+    if (el && el.clientHeight > 0 && !more) setOver(el.scrollHeight > el.clientHeight + 1)
+  }, [text, more])
+  return jsxs('div', { children: [
+    jsx('div', { ref, [attr]: '', style: { fontSize: 12.5, lineHeight: 1.5, overflowWrap: 'anywhere', ...(more ? {} : clamp(lines)) }, children: text }),
+    (over || more) && jsx('button', { type: 'button', 'data-ask-more': '', 'aria-expanded': more, onClick: () => setMore(m => !m), style: askLinkBtn, children: more ? 'Less' : 'More' })
+  ] })
+}
 
 function OptionTile({ o, onChoose }) {
-  const accent = o.recommended ? C.running : 'var(--border)'
-  return jsxs('div', { 'data-ask-option': o.letter || '', ...(o.recommended ? { 'data-recommended': '' } : {}), style: { display: 'grid', gridTemplateColumns: '22px minmax(0,1fr) auto', columnGap: 10, alignItems: 'start', padding: '8px 10px', borderRadius: 6, border: `1px solid ${accent}`, background: o.recommended ? `color-mix(in srgb, ${C.running} 8%, transparent)` : 'transparent' }, children: [
-    jsx('span', { 'aria-hidden': true, style: { width: 22, height: 22, borderRadius: 999, display: 'grid', placeItems: 'center', fontSize: 11.5, fontWeight: 700, background: o.recommended ? C.running : 'color-mix(in srgb, var(--foreground) 12%, transparent)', color: o.recommended ? '#fff' : 'var(--foreground)' }, children: o.letter || '•' }),
+  return jsxs('div', { 'data-ask-option': o.letter || '', ...(o.recommended ? { 'data-recommended': '' } : {}), style: { display: 'grid', gridTemplateColumns: '22px minmax(0,1fr) auto', columnGap: 10, alignItems: 'start', padding: '8px 10px', borderRadius: 6, border: `1px solid ${o.recommended ? ACCENT_FILL : 'var(--border)'}`, background: o.recommended ? `color-mix(in srgb, ${ACCENT_FILL} 9%, transparent)` : 'transparent' }, children: [
+    jsx('span', { 'aria-hidden': true, style: { width: 22, height: 22, borderRadius: 999, display: 'grid', placeItems: 'center', fontSize: 11.5, fontWeight: 700, background: o.recommended ? ACCENT_FILL : 'color-mix(in srgb, var(--foreground) 12%, transparent)', color: o.recommended ? '#fff' : 'var(--foreground)' }, children: o.letter || '•' }),
     jsxs('div', { style: { minWidth: 0 }, children: [
       jsxs('div', { style: { display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }, children: [
         jsx('span', { 'data-ask-option-name': '', style: { fontWeight: 600, fontSize: 13 }, children: o.name }),
-        o.recommended && jsx('span', { style: pill(C.running), children: 'Recommended' })
+        o.recommended && jsx('span', { style: pill(ACCENT_TEXT), children: 'Recommended' })
       ] }),
-      o.detail && jsx('div', { 'data-ask-option-detail': '', title: o.detail, style: { ...clamp(2), fontSize: 12, lineHeight: 1.45, color: 'var(--muted-foreground)', marginTop: 2 }, children: o.detail }),
-      o.recommended && o.reason && jsx('div', { 'data-ask-reason': '', style: { fontSize: 12, lineHeight: 1.45, marginTop: 3, color: C.running }, children: `Why: ${o.reason}` })
+      o.detail && jsx('div', { 'data-ask-option-detail': '', title: o.detail, style: { ...clamp(3), fontSize: 12, lineHeight: 1.45, color: 'var(--muted-foreground)', marginTop: 2 }, children: o.detail }),
+      o.recommended && o.reason && jsx('div', { 'data-ask-reason': '', style: { fontSize: 12, lineHeight: 1.45, marginTop: 3, color: ACCENT_TEXT }, children: `Why: ${o.reason}` })
     ] }),
-    jsx('button', { type: 'button', 'data-ask-choose': o.letter || '', title: 'Drafts your answer in the composer; nothing happens until you send it', onClick: onChoose,
-      style: { ...btn, minHeight: 28, alignSelf: 'center', ...(o.recommended ? { background: C.running, borderColor: C.running, color: '#fff', fontWeight: 600 } : {}) }, children: `Choose${o.letter ? ` ${o.letter}` : ''}` })
+    jsx('button', { type: 'button', 'data-ask-choose': o.letter || '', 'aria-label': `Choose ${o.letter ? `option ${o.letter}: ` : ''}${o.name}`, title: 'Drafts your answer in the chat box; nothing happens until you send it', onClick: onChoose,
+      style: { ...btn, minHeight: 28, alignSelf: 'center', ...(o.recommended ? { background: ACCENT_FILL, borderColor: ACCENT_FILL, color: '#fff', fontWeight: 600 } : {}) }, children: `Choose${o.letter ? ` ${o.letter}` : ''}` })
   ] })
 }
 
@@ -1436,48 +1466,50 @@ function AskRow({ i, session }) {
   const st = typeof window !== 'undefined' ? window.__sessionTasks : null
   const canOpen = i.kind === 'kanban' && !!i.chip.connectionId && !!i.chip.profile && typeof st?.openTaskChip === 'function'
   const v = askView(i.chip)
-  const [more, setMore] = useState(false)
   const draft = text => { void host.composer?.setDraft?.(session, text); host.composer?.focus?.(session) }
   const small = { fontSize: 12, lineHeight: 1.45, overflowWrap: 'anywhere', minWidth: 0 }
   const situation = v.brief?.situation || ''
-  const long = situation.length > 220
   const kind = v.decision ? 'Needs your decision' : v.known ? 'Needs you' : 'Needs you · step not shown'
   const details = [
+    v.decision && v.options.length > 0 && ['Options in full', v.options.map(o => o.full).join('  ·  ')],
     v.tried && ['What the agent tried', v.tried],
     v.known && (v.yes || v.no) && ['Card buttons', `Unblock = ${v.yes || 'continue'}; Archive = ${v.no || 'drop it'}`],
     v.decision && v.full && ['Ask as filed', v.full],
-    !v.decision && v.brief?.recommend && ['Recommendation', v.brief.recommend],
     i.evidenceText && ['Evidence', i.evidenceText]
   ].filter(Boolean)
+  const recLine = text => jsx('div', { 'data-ask-recommend': '', style: { ...small, color: ACCENT_TEXT }, children: `Recommended: ${text}` })
   return jsxs('div', { 'data-panel-row': i.key, 'data-ask-row': v.known ? (v.decision ? 'decision' : 'known') : 'unknown', style: { border: '1px solid var(--border)', borderLeft: `3px solid ${C.needsYou}`, borderRadius: 8, padding: '10px 12px', marginBottom: 8, minWidth: 0, display: 'grid', gap: 8 }, children: [
     jsxs('div', { style: { display: 'flex', alignItems: 'baseline', gap: 8, minWidth: 0 }, children: [
-      jsx('span', { 'data-ask-kind': '', style: { fontSize: 10.5, fontWeight: 700, letterSpacing: 0.5, textTransform: 'uppercase', color: C.needsYou, whiteSpace: 'nowrap' }, children: kind }),
+      jsx('span', { 'data-ask-kind': '', style: { fontSize: 10.5, fontWeight: 700, letterSpacing: 0.5, textTransform: 'uppercase', color: ALERT_TEXT, whiteSpace: 'nowrap' }, children: kind }),
       jsx('span', { 'data-ask-card': '', title: str(i.chip?.title) || i.label, style: { ...muted, marginLeft: 'auto', fontSize: 10.5, fontFamily: 'var(--font-mono, ui-monospace, monospace)', whiteSpace: 'nowrap' }, children: i.id || '' })
     ] }),
     jsx('div', { 'data-ask-title': '', style: { fontWeight: 600, fontSize: 14, lineHeight: 1.35, overflowWrap: 'anywhere', marginTop: -4 }, children: i.label }),
-    situation && jsxs('div', { 'data-ask-situation-wrap': '', style: small, children: [
-      jsx('div', { 'data-ask-situation': '', style: { fontSize: 12.5, lineHeight: 1.5, ...(more ? {} : clamp(2)) }, children: situation }),
-      long && jsx('button', { type: 'button', 'data-ask-more': '', onClick: () => setMore(m => !m), style: { background: 'none', border: 0, padding: 0, font: 'inherit', fontSize: 12, color: C.running, cursor: 'pointer' }, children: more ? 'Less' : 'More' })
-    ] }),
+    situation && jsx(Clamped, { text: situation, lines: 2, attr: 'data-ask-situation' }),
     v.decision && jsxs('div', { 'data-ask-options': '', style: { display: 'grid', gap: 6 }, children: [
       ...v.options.map((o, n) => jsx(OptionTile, { o, onChoose: () => draft(chooseText(i, o)) }, n)),
+      v.recommendLine && recLine(v.recommendLine),
       jsx('div', { 'data-ask-next': '', style: { ...muted, fontSize: 11 }, children: 'Choose drafts your answer in the chat box; send it to decide.' })
     ] }),
-    !v.decision && jsxs('div', { 'data-ask-step-box': '', style: { borderRadius: 6, padding: '8px 10px', background: 'color-mix(in srgb, var(--foreground) 6%, transparent)' }, children: [
-      jsx('div', { style: { fontSize: 10.5, fontWeight: 700, letterSpacing: 0.4, textTransform: 'uppercase', color: 'var(--muted-foreground)', marginBottom: 2 }, children: v.known ? 'Your step' : 'Step' }),
+    !v.decision && jsxs('div', { 'data-ask-step-box': '', style: { borderRadius: 6, padding: '8px 10px', background: 'color-mix(in srgb, var(--foreground) 6%, transparent)', display: 'grid', gap: 4 }, children: [
+      jsx('div', { style: { fontSize: 10.5, fontWeight: 700, letterSpacing: 0.4, textTransform: 'uppercase', color: 'var(--muted-foreground)' }, children: v.known ? 'Your step' : 'Step' }),
       jsx('div', { 'data-ask-step': '', title: v.full || undefined, style: { fontSize: 13, lineHeight: 1.45, fontWeight: 500, overflowWrap: 'anywhere' }, children: v.step }),
-      v.brief?.recommend && v.reason && jsx('div', { 'data-ask-recommend': '', style: { ...small, marginTop: 4, color: C.running }, children: `Recommended: ${v.brief.recommend}` })
+      v.single && jsx('div', { 'data-ask-single-option': '', style: { ...small, color: 'var(--muted-foreground)' }, children: v.single.full }),
+      v.brief?.recommend && recLine(v.brief.recommend),
+      !v.known && jsx('div', { 'data-ask-hint': '', style: { ...small, color: 'var(--muted-foreground)' }, children: v.next })
     ] }),
     v.whyLine && jsx('div', { 'data-ask-why': '', style: { ...small, color: 'var(--muted-foreground)' }, children: v.whyLine }),
-    (!v.decision || !v.known) && jsxs('div', { style: { display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 6 }, children: [
-      v.known && !v.decision && jsx('button', { type: 'button', 'data-ask-done': '', style: { ...btn, minHeight: 28, background: C.running, borderColor: C.running, color: '#fff', fontWeight: 600 }, title: 'Drafts "done" to the agent in the composer; nothing is sent until you send it', onClick: () => draft(doneText(i)), children: 'I did it' }),
-      v.known && !v.decision && jsx('button', { type: 'button', 'data-ask-skip': '', style: { ...btn, minHeight: 28 }, title: 'Drafts "skip" to the agent in the composer', onClick: () => draft(skipText(i)), children: 'Skip it' }),
-      !v.known && jsx('button', { type: 'button', 'data-ask-agent': '', style: { ...btn, minHeight: 28 }, title: 'Drafts a question to the agent in the composer; nothing is sent until you send it', onClick: () => draft(askAgentText(i)), children: 'Ask agent' }),
-      v.known && !v.decision && jsx('span', { 'data-ask-next': '', style: { ...muted, fontSize: 11 }, children: 'Buttons draft your answer in the chat box; send it to decide.' })
+    !v.decision && jsxs('div', { style: { display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 6 }, children: [
+      v.known && jsx('button', { type: 'button', 'data-ask-done': '', style: { ...btn, minHeight: 28, background: ACCENT_FILL, borderColor: ACCENT_FILL, color: '#fff', fontWeight: 600 }, title: 'Drafts "done" to the agent in the chat box; nothing is sent until you send it', onClick: () => draft(doneText(i)), children: 'I did it' }),
+      v.known && jsx('button', { type: 'button', 'data-ask-skip': '', style: { ...btn, minHeight: 28 }, title: 'Drafts "skip" to the agent in the chat box', onClick: () => draft(skipText(i)), children: 'Skip it' }),
+      !v.known && jsx('button', { type: 'button', 'data-ask-agent': '', style: { ...btn, minHeight: 28 }, title: 'Drafts a question to the agent in the chat box; nothing is sent until you send it', onClick: () => draft(askAgentText(i)), children: 'Ask agent' }),
+      v.known && jsx('span', { 'data-ask-next': '', style: { ...muted, fontSize: 11 }, children: 'Buttons draft your answer in the chat box; send it to decide.' })
     ] }),
-    (details.length > 0 || canOpen) && jsxs('details', { 'data-ask-details': '', style: { ...small, color: 'var(--muted-foreground)' }, children: [
-      jsxs('summary', { style: { cursor: 'pointer', fontSize: 11.5 }, children: ['Details', canOpen && jsx('button', { type: 'button', 'data-open-card': '', style: { background: 'none', border: 0, padding: 0, marginLeft: 12, font: 'inherit', fontSize: 11.5, color: C.running, cursor: 'pointer' }, onClick: e => { e.preventDefault(); st.openTaskChip(i.chip) }, children: 'Open card' })] }),
-      ...details.map(([k, t], n) => jsxs('div', { ...(k === 'Evidence' ? { 'data-evidence': i.evidenceState || '' } : {}), style: { marginTop: 4, fontSize: 11.5 }, children: [jsx('span', { style: { fontWeight: 600 }, children: `${k}: ` }), t] }, n))
+    (details.length > 0 || canOpen) && jsxs('div', { style: { display: 'flex', alignItems: 'flex-start', gap: 12, minWidth: 0 }, children: [
+      details.length > 0 && jsxs('details', { 'data-ask-details': '', style: { ...small, color: 'var(--muted-foreground)', flex: 1, minWidth: 0 }, children: [
+        jsx('summary', { style: { cursor: 'pointer', fontSize: 11.5 }, children: 'Details' }),
+        ...details.map(([k, t], n) => jsxs('div', { ...(k === 'Evidence' ? { 'data-evidence': i.evidenceState || '' } : {}), style: { marginTop: 4, fontSize: 11.5 }, children: [jsx('span', { style: { fontWeight: 600 }, children: `${k}: ` }), t] }, n))
+      ] }),
+      canOpen && jsx('button', { type: 'button', 'data-open-card': '', style: { ...askLinkBtn, fontSize: 11.5, ...(details.length ? {} : { marginRight: 'auto' }) }, onClick: () => st.openTaskChip(i.chip), children: 'Open card' })
     ] })
   ] })
 }

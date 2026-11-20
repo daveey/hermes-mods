@@ -1105,3 +1105,72 @@ test('askView parts: option tiles, recommended letter, why split (redesigned dec
   assert.deepEqual(m.whyParts('Spend needs the owner.'), { line: 'Why you: Spend needs the owner.', tried: '' })
   assert.equal(m.chooseText({ id: 't_x' }, { letter: 'A', name: 'One run' }), 'Card t_x: go with option A (One run).\n')
 })
+
+test('decision card DOM: Choose drafts the pick; an unmatched recommendation still shows; unlettered options work', async () => {
+  window.localStorage.clear()
+  drafts.length = 0
+  const brief = (options, recommend) => ({ situation: 'The release is staged and one approval is missing before it ships.', options, recommend })
+  bridges({ chips: [
+    card('t_dec', 'blocked', { look: 'needs-you', label: 'Pick the release path', humanRequest: { action: 'Pick. Unblock = A; archive = B.', why: 'Tried: x. Only you can: approve a release.', brief: brief(['A) Ship now: today; reversible.', 'B) Wait a week: nothing ships.'], 'A - it is ready') } }),
+    card('t_free', 'blocked', { look: 'needs-you', label: 'Pick a fix', humanRequest: { action: 'Pick one.', why: 'Only you can: decide.', brief: brief(['Roll back: safe and slow.', 'Hotfix: fast and risky.'], 'Roll back because it is safe') } }),
+    card('t_one', 'blocked', { look: 'needs-you', label: 'Plug in the ring', humanRequest: { action: 'Plug the ring charger in.', why: 'Only you can: touch the ring.', interaction: 'physical', brief: brief(['A) Plug it in: 1 minute.'], 'A') } }),
+    card('t_none', 'blocked', { look: 'needs-you', label: 'No request' })
+  ] })
+  await show(React.createElement(m.Panel, { key: 'decision-dom' }))
+  try {
+    const row = id => el().querySelector(`[data-panel-row="kb:${id}"]`)
+    await React.act(async () => { row('t_dec').querySelector('[data-ask-choose="B"]').click(); await flush() })
+    assert.deepEqual(drafts.at(-1), ['S1', 'Card t_dec: go with option B (Wait a week).\n'])
+    assert.equal(row('t_dec').querySelector('[data-ask-choose="A"]').getAttribute('aria-label'), 'Choose option A: Ship now')
+    // unlettered options: tiles without letters, the recommendation shown as its own line
+    const free = row('t_free')
+    assert.equal(free.getAttribute('data-ask-row'), 'decision')
+    assert.deepEqual([...free.querySelectorAll('[data-ask-option-name]')].map(n => n.textContent), ['Roll back', 'Hotfix'])
+    assert.equal(free.querySelectorAll('[data-recommended]').length, 0)
+    assert.equal(free.querySelector('[data-ask-recommend]').textContent, 'Recommended: Roll back because it is safe')
+    await React.act(async () => { free.querySelectorAll('[data-ask-choose]')[0].click(); await flush() })
+    assert.deepEqual(drafts.at(-1), ['S1', 'Card t_free: go with this option (Roll back).\n'])
+    // full option text is reachable without hover
+    assert.match(row('t_dec').querySelector('[data-ask-details]').textContent, /Options in full: A\) Ship now: today; reversible\./)
+    // one option: a step card that still shows the option and the recommendation
+    const one = row('t_one')
+    assert.equal(one.getAttribute('data-ask-row'), 'known')
+    assert.equal(one.querySelector('[data-ask-single-option]').textContent, 'A) Plug it in: 1 minute.')
+    assert.equal(one.querySelector('[data-ask-recommend]').textContent, 'Recommended: A')
+    // no request: the hint is visible, not hidden in an empty Details
+    const none = row('t_none')
+    assert.match(none.querySelector('[data-ask-hint]').textContent, /Ask agent/)
+    const nd = none.querySelector('[data-ask-details]')
+    assert.equal(!nd || nd.querySelectorAll('div').length > 0, true, 'Details, when present, is never empty')
+    // Open card is a sibling of Details, never inside <summary>
+    assert.equal(el().querySelectorAll('summary [data-open-card]').length, 0)
+    assert.ok(el().querySelectorAll('[data-open-card]').length > 0)
+  } finally { await show(null) }
+})
+
+test('situation More: offered for long text, toggles, and is absent for short text', async () => {
+  window.localStorage.clear()
+  const long = 'The release is staged and one approval is missing before it ships. '.repeat(4).trim()
+  bridges({ chips: [
+    card('t_long', 'blocked', { look: 'needs-you', label: 'Long', humanRequest: { action: 'Do it.', why: 'Only you can: x.', brief: { situation: long, options: [], recommend: '' } } }),
+    card('t_short', 'blocked', { look: 'needs-you', label: 'Short', humanRequest: { action: 'Do it.', why: 'Only you can: x.', brief: { situation: 'Short situation text that fits on a line.', options: [], recommend: '' } } })
+  ] })
+  await show(React.createElement(m.Panel, { key: 'more' }))
+  try {
+    const more = el().querySelector('[data-panel-row="kb:t_long"] [data-ask-more]')
+    assert.equal(more.textContent, 'More')
+    await React.act(async () => { more.click(); await flush() })
+    assert.equal(more.textContent, 'Less')
+    assert.equal(more.getAttribute('aria-expanded'), 'true')
+    assert.equal(el().querySelector('[data-panel-row="kb:t_short"] [data-ask-more]'), null)
+  } finally { await show(null) }
+})
+
+test('recommendParts / whyParts edge cases', () => {
+  assert.deepEqual(m.recommendParts('A, B both ok'), { letter: '', reason: 'A, B both ok' })
+  assert.deepEqual(m.recommendParts('B.'), { letter: 'B', reason: '' })
+  assert.deepEqual(m.recommendParts('Recommendation: A - cheap'), { letter: 'A', reason: 'cheap' })
+  assert.deepEqual(m.recommendParts('I recommend A'), { letter: '', reason: 'I recommend A' })
+  assert.deepEqual(m.whyParts('Tried: x, y'), { line: 'Agent tried: x, y', tried: 'x, y' })
+  assert.deepEqual(m.whyParts('Only you can approve the spend.'), { line: 'Only you can: approve the spend.', tried: '' })
+})
