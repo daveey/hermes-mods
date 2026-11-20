@@ -1014,6 +1014,78 @@ def test_trusted_directory_match_needs_a_path_boundary(monkeypatch):
     assert not plugin.guard._trusted("/binaries/sqlite3")
 
 
+@pytest.mark.parametrize("command", [
+    "cp ~/.hermes/state.db ~/.hermes/state.db.bak",
+    "cp -p ~/.hermes/kanban.db ~/.hermes/kanban.db.manual-backup",
+    "cd ~/.hermes; cp state.db state.db.bak",
+    "cp /work/state.db ~/.hermes/foo",
+    "H=/work; H=/home/u/.hermes mv /work/new $H/state.db",
+    "H=/home/u/.hermes; D=$H mv /work/new $D/state.db",
+])
+def test_review_local_backup_and_prefix_controls(command):
+    assert plugin.guard.check_shell(command) is None, command
+
+
+@pytest.mark.parametrize("command", [
+    "ssh remote 'cp /home/u/.hermes/state.db /home/u/.hermes/state.db.bak'",
+    "ssh remote 'echo \"x>/home/u/.hermes/state.db\"'",
+    r"ssh remote 'echo x\>/home/u/.hermes/state.db'",
+    "ssh remote 'R=\">/home/u/.hermes/state.db\"; echo $R'",
+])
+def test_review_remote_data_controls_without_local_stat(monkeypatch, command):
+    def forbidden(*args, **kwargs):
+        raise AssertionError("remote path used local directory observations")
+    monkeypatch.setattr(plugin.guard, "_dir_like", forbidden)
+    assert plugin.guard.check_shell(command) is None, command
+
+
+@pytest.mark.parametrize("body", [
+    "cat r >/home/u/.hermes/state.db",
+    "cat r 1>/home/u/.hermes/state.db",
+    "echo x>/home/u/.hermes/state.db",
+    "cat r >|/home/u/.hermes/state.db",
+    "cat r &>/home/u/.hermes/state.db",
+    "cat r >>/home/u/.hermes/state.db",
+])
+@pytest.mark.parametrize("wrapper", ["ssh remote", "bash -c"])
+def test_review_real_hook_attached_redirects(tmp_path, body, wrapper):
+    import json
+    import shlex
+    result = subprocess.run(
+        [sys.executable, str(HERE / "claude_hook.py")],
+        input=json.dumps({"tool_input": {"command": wrapper + " " + shlex.quote(body)},
+                          "cwd": str(tmp_path), "session_id": "test-review"}),
+        capture_output=True, text=True, timeout=5,
+    )
+    assert result.returncode == 2, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("command", [
+    "cd ~/.hermes; bash -c 'mv /work/new state.db'",
+    "cd ~/.hermes; bash -c -- 'mv /work/new state.db'",
+    "cd ~/.hermes; bash <<'EOF'\nmv /work/new state.db\nEOF",
+])
+def test_review_child_shell_inherits_cwd(command):
+    assert plugin.guard.check_shell(command), command
+
+
+def test_review_aggregate_work_budget():
+    # Each level is below the per-token 256-value cap, but repeating its child
+    # for every possible value used to take longer than Claude's hook timeout.
+    import json
+    import shlex
+    code = "echo benign"
+    for level in range(4):
+        assigns = "; ".join(f"if c; then V{i}=a; else V{i}=b; fi" for i in range(4))
+        code = assigns + "; bash -c " + shlex.quote(code) + " " + " ".join(f"$V{i}" for i in range(4))
+    result = subprocess.run(
+        [sys.executable, str(HERE / "claude_hook.py")],
+        input=json.dumps({"tool_input": {"command": code}, "cwd": "/work", "session_id": "test-budget"}),
+        capture_output=True, text=True, timeout=5,
+    )
+    assert result.returncode == 2 and "bounded" in result.stderr, result.stderr
+
+
 # A recovery built from an earlier cut must go through swap_db's canonical
 # preservation check. A remote shell and path aliases must not hide a raw swap.
 REMOTE_ROLLBACK_SWAP = (

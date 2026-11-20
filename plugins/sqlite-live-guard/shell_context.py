@@ -15,6 +15,17 @@ _FILES = {"rm", "unlink", "shred", "truncate", "mv", "cp", "install", "rsync", "
 _CONTROL = {"if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done", "case", "esac"}
 
 
+class _Budget:
+    """One aggregate budget shared by every variant and execution boundary."""
+    def __init__(self):
+        self.remaining = 32768
+
+    def spend(self, amount):
+        self.remaining -= amount
+        if self.remaining < 0:
+            raise ValueError("aggregate shell analysis budget exhausted")
+
+
 def _raw_segments(text):
     """Keep raw quote provenance and split only literal command punctuation."""
     seg, word, quote, escaped, i = [], [], "", False, 0
@@ -36,6 +47,17 @@ def _raw_segments(text):
         elif c == "#" and not word:
             end = text.find("\n", i)
             i = len(text) if end < 0 else end - 1
+        elif c in "<>" or text.startswith("&>", i):
+            # Split syntax before expansion; quoted/expanded '>' stays data.
+            if word:
+                if not "".join(word).isdigit():
+                    seg.append("".join(word))
+                word = []
+            match = re.match(r"(?:&>>?|>>>|>>|>\||>&|<>|<<|<&|[<>])", text[i:])
+            assert match is not None
+            op = match.group()
+            seg.append(op)
+            i += len(op) - 1
         elif c.isspace() or c in ";&|()":
             if word:
                 seg.append("".join(word))
@@ -199,26 +221,30 @@ def _values(raw, env):
                      for combination in itertools.product(*choices))
 
 
-def check(text, guard, cwd="", depth=0, inherited=None):
+def check(text, guard, cwd="", depth=0, inherited=None, *, remote=False, in_home=None, budget=None):
+    budget = budget if budget is not None else _Budget()
     try:
-        return _check(text, guard, cwd, depth, inherited)
+        budget.spend(len(text))
+        return _check(text, guard, cwd, depth, inherited, remote, in_home, budget)
     except (ValueError, RecursionError):
         return "shell syntax exceeds the bounded live-database safety analysis; use explicit paths and swap_db.py"
 
 
-def _check(text, guard, cwd="", depth=0, inherited=None):
+def _check(text, guard, cwd, depth, inherited, remote, in_home, budget):
     if depth > 8:
         return "shell execution nesting exceeds the bounded live-database safety analysis"
     env = dict(inherited or {})
     exported = set(env)
     readonly = set()
     text = text.replace("\\\n", "")
-    in_home = bool(cwd) and guard._expand(cwd).rstrip("/") == guard._home().rstrip("/")
+    if in_home is None:
+        in_home = bool(cwd) and guard._expand(cwd).rstrip("/") == guard._home().rstrip("/")
     text, bodies = _heredocs(text)
     blocks, rhs = 0, False
     scopes, braces, pipeline = [], [], None
     segments = list(_raw_segments(text))
     for index, raw in enumerate(segments):
+        budget.spend(1)
         if raw in (["&&"], ["||"]):
             rhs = True
             continue
@@ -294,16 +320,18 @@ def _check(text, guard, cwd="", depth=0, inherited=None):
         if i == len(raw) or export:
             env = local
             continue
-        choices = [_values(token, local) for token in raw[i:]]
+        # Prefix assignments reach the child, not this command's word expansion.
+        choices = [_values(token, env) for token in raw[i:]]
         count = 1
         for choice in choices:
             count *= len(choice)
         if count > 256:
             raise ValueError("too many command variants")
         for variant in itertools.product(*choices):
-            argv = [guard._Quoted(value) if token[:1] in {"'", '"', "\\"} else value
+            budget.spend(32)
+            argv = [guard._Quoted(value) if token[:1] in {"'", '"', "\\"} or token != value else value
                     for token, value in zip(raw[i:], variant)]
-            why, next_home = _command(argv, guard, in_home, depth, local, exported | assigned, bodies)
+            why, next_home = _command(argv, guard, in_home, depth, local, exported | assigned, bodies, remote, budget)
             if why:
                 return why
             in_home = in_home or next_home if conditional else next_home
@@ -314,7 +342,7 @@ def _check(text, guard, cwd="", depth=0, inherited=None):
     return None
 
 
-def _command(argv, guard, in_home, depth, local, inherited_names, bodies):
+def _command(argv, guard, in_home, depth, local, inherited_names, bodies, remote, budget):
     why = guard._check_redirects(argv, in_home)
     if why:
         return why, in_home
@@ -339,6 +367,7 @@ def _command(argv, guard, in_home, depth, local, inherited_names, bodies):
                 raise ValueError("too many heredoc expansion variants")
             stdin = []
             for variant in itertools.product(*choices):
+                budget.spend(32 + len(code))
                 values = dict(zip(names, variant))
                 stdin.append(_VAR.sub(lambda m: values[m.group(1) or m.group(2)], code))
     args = [a for a in args if a not in bodies]
@@ -346,15 +375,15 @@ def _command(argv, guard, in_home, depth, local, inherited_names, bodies):
     if word == "ssh":
         body = _ssh_body(args)
         if body:
-            why = check(body, guard, depth=depth + 1)
+            why = check(body, guard, depth=depth + 1, remote=True, budget=budget)
             if why:
                 return why, in_home
         # Only stdin consumed as code by a shell (or the login shell) is code.
-        remote = list(_raw_segments(body))
-        remote_word = os.path.basename(remote[0][0]) if remote and remote[0] else ""
+        remote_segments = list(_raw_segments(body))
+        remote_word = os.path.basename(remote_segments[0][0]) if remote_segments and remote_segments[0] else ""
         if not body or remote_word in {"sh", "bash", "dash", "zsh", "ksh"}:
             for code in stdin:
-                why = check(code, guard, depth=depth + 1)
+                why = check(code, guard, depth=depth + 1, remote=True, budget=budget)
                 if why:
                     return why, in_home
     elif word in {"sh", "bash", "dash", "zsh", "ksh"}:
@@ -362,13 +391,18 @@ def _command(argv, guard, in_home, depth, local, inherited_names, bodies):
         for j, arg in enumerate(args[:-1]):
             if re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", arg):
                 explicit = True
-                why = check(args[j + 1], guard, depth=depth + 1, inherited=child_env)
+                k = j + 1
+                if args[k] == "--" and k + 1 < len(args):
+                    k += 1
+                why = check(args[k], guard, depth=depth + 1, inherited=child_env,
+                            remote=remote, in_home=in_home, budget=budget)
                 if why:
                     return why, in_home
                 break
         if not explicit:
             for code in stdin:
-                why = check(code, guard, depth=depth + 1, inherited=child_env)
+                why = check(code, guard, depth=depth + 1, inherited=child_env,
+                            remote=remote, in_home=in_home, budget=budget)
                 if why:
                     return why, in_home
     elif word == "cd":
@@ -382,19 +416,25 @@ def _command(argv, guard, in_home, depth, local, inherited_names, bodies):
             hit = next((p[3:] for p in args if p.startswith("of=") and guard.is_live(p[3:], in_home)), None)
         else:
             hit = ops[-1] if ops and guard.is_live(ops[-1], in_home) else None
-        # Lexical directory targets only: never stat a remote path locally.
+        # Preserve local directory policy; never stat a remote path locally.
         if not hit and word in {"mv", "cp", "install", "rsync", "ln"} and len(ops) > 1:
-            dest = ops[-1].rstrip("/")
+            dest = ops[-1]
             sources = ops[:-1]
+            explicit_dir = False
             for j, arg in enumerate(args):
                 if arg in {"-t", "--target-directory"} and j + 1 < len(args):
                     dest = args[j + 1].rstrip("/")
                     sources = [p for p in ops if p != args[j + 1]]
+                    explicit_dir = True
                 elif arg.startswith("--target-directory="):
                     dest = arg.split("=", 1)[1].rstrip("/")
                     sources = ops
-            hit = next((dest + "/" + os.path.basename(src) for src in sources
-                        if guard.is_live(dest + "/" + os.path.basename(src), in_home)), None)
+                    explicit_dir = True
+            directory = (explicit_dir or dest.endswith("/") or guard._HOME_PREFIX.sub("", dest).rstrip("/") == "") if remote else guard._dir_like(dest)
+            if directory:
+                dest = dest.rstrip("/")
+                hit = next((dest + "/" + os.path.basename(src) for src in sources
+                            if guard.is_live(dest + "/" + os.path.basename(src), in_home)), None)
         if hit:
             return f"`{word}` would modify live database file {hit}; use swap_db.py for a guarded replacement", in_home
     return None, in_home
