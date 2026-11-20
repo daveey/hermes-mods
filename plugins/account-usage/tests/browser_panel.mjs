@@ -236,6 +236,15 @@ try {
  await page.getByText('Could not confirm the account — check again',{exact:true}).waitFor()
  assert.match(await claudeRow.getAttribute('title'),/^Claude dead · ready/); assert.equal(await claude.count(),0,'an unconfirmed ready row is re-checked, not signed in')
  assert.equal(await page.getByText('Reconnected',{exact:true}).count(),reconnectedEarly,'unknown on the new row is not Reconnected')
+ // The backend then says the stored row is still signed out while usage keeps the stale "ready" row:
+ // the visible row is labelled sign-in needed and offers sign-in and the re-check; it does not read as healthy.
+ await page.evaluate(()=>{window.fixture.claudeHealth='needs_sign_in'}); await recheck.click()
+ await page.getByText('Sign-in did not finish — nothing was saved',{exact:true}).waitFor()
+ assert.match(await claudeRow.getAttribute('title'),/^Claude dead · ready/,'usage still lists the new account id as ready')
+ assert.equal(await claudeLine.locator('[data-auth="sign-in"]').count(),1,'a still-signed-out stored row is labelled on its visible row')
+ assert.equal(await claude.count(),1,'sign-in is offered on the visible row'); assert.equal(await recheck.count(),1,'the re-check stays on the visible row')
+ await page.screenshot({path:path.join(artifacts,'account-usage-claude-signed-out-new-id.png'),fullPage:true})
+ evidence.push('Claude recovery readback: a still-signed-out answer follows the row to its new account id (sign-in needed, sign-in and re-check offered)')
  await page.evaluate(()=>{window.fixture.claudeNewListed=false; window.fixture.claudeHealth='disabled'}); await recheck.click()
  await page.waitForFunction(()=>![...document.querySelectorAll('.hermes-au-row')].some(b=>/^Claude dead · ready/.test(b.title)))
  await page.getByText('Account is disabled',{exact:true}).waitFor()
