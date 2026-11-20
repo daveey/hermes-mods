@@ -2367,7 +2367,14 @@ _PROMISE = re.compile(
     r"keep(?:ing)? an eye on)\b[^.\n]{0,80}?\b(?:until|till|til)\b"
     r"|\b(?:when|once) (?:it|they|that|this|the (?:card|cards|job|build|run|worker|task)s?) "
     r"(?:finish(?:es)?|complete[sd]?|land[s]?|(?:is|are) done)\b"
-    r"|\brunning (?:now|in the background)\b",
+    r"|\brunning (?:now|in the background)\b"
+    # 20261119_073752_746173: "Once she has, I'll run the staging checks." and "then I'll run the staging checks"
+    # passed with nothing tracking them, and the chat was declared done. A future action of ours gated on someone
+    # else's step is a promise too.
+    r"|\b(?:then|once|after|when)\b[^.\n]{0,80}?\b(?:I'?ll|I will|I’ll|we'?ll|we will)\s+(?:then\s+)?"
+    r"(?:run|do|check|verify|test|deploy|send|post|start|finish|re-?run|merge|redeploy)\b"
+    r"|\b(?:I'?ll|I will|I’ll|we'?ll|we will)\s+(?:run|do|check|verify|test|deploy|send|post|start|finish|re-?run|"
+    r"merge|redeploy)\b[^.\n]{0,80}?\b(?:once|after|when)\s+(?:she|he|they|it|you|eve|the|that|this|#?\d)",
     re.IGNORECASE)
 _QUOTE_STRIP = re.compile(r"```.*?```|`[^`]*`|^>.*$", re.DOTALL | re.MULTILINE)
 

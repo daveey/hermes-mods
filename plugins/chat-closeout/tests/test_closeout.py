@@ -29,6 +29,18 @@ def test_promise_detection_catches_watch_until():
     assert core.find_promise("Watch it until it finishes, then run the tests.") is None
 
 
+def test_find_promise_conditional_future_action():
+    # 20261119_073752_746173: the chat was declared done while both of these sat in the reply, untracked.
+    assert core.find_promise("Once she has, I'll run the staging checks.")
+    assert core.find_promise("Eve merges it, redeploys, then I'll run the staging checks.")
+    assert core.find_promise("I'll run the staging checks once she merges #594.")
+    assert core.find_promise("I'll verify the deploy after the PR lands.")
+    # Past tense, plain instructions and present-turn results are not promises.
+    assert core.find_promise("Once she merged it, I ran the staging checks; all passed.") is None
+    assert core.find_promise("Run the staging checks once she merges.") is None
+    assert core.find_promise("I'll be honest: the tests pass.") is None
+
+
 def test_midturn_completion_needs_closeout(tmp_path):
     led = core.Ledger(tmp_path / 'ledger.db')
     core.record_turn_end(led, 'chat', ['t_one'], lambda _: {'t_one': {'status': 'running'}}, now=1)
