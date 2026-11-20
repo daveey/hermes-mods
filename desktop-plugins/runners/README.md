@@ -67,6 +67,34 @@ Slot styles: filled = busy, outline = free, dotted = offline/unknown, hatched = 
 red = lost (machine holds cards but the Board has not seen it for 10 min). An asleep machine with nothing
 running is grey with "not seen for N min". A section the gateway cannot read says Unknown/Stale with the reason.
 
+## Worker autoscaler limits
+
+On the autoscaler's gateway, the panel shows **Min workers** and **Max workers** sliders
+(0–5), their confirmed values, and the number of autoscaler slots in **ACTIVE** state
+(not card execution slots). Raising min above max raises max; lowering max below min lowers min.
+Dragging previews only. Pointer/key release or blur commits after a 200 ms debounce; saving disables
+the controls. The returned CLI read-back replaces the draft. An unconfirmed write shows an error and
+removes the controls until the next successful read; it is never retried automatically.
+
+The authenticated `/api/plugins/runners/v1/scaler/limits` endpoint supports GET and POST
+`{"min":1,"max":5}`. Both use the installed `hermes-workers` CLI: GET runs `status --json`, POST
+runs `scale --min N --max M --json` (the CLI owns the tick lock and atomic configuration/ASG write).
+Booleans, floats, extra/missing fields, min > max and values outside 0–5 are rejected. CLI exit 2
+maps to HTTP 400 with its error; missing CLI or exit 3 means 404 unsupported; broken output,
+timeouts and other failures mean 503. Successful responses carry `contract_version:1`, `ok:true`,
+`min`, `max`, `active`, `asg_max`. Limits are machine-wide, not per UI profile.
+
+The Desktop discovers one route per connection, preferring its default profile, ignores 404s,
+and pins POSTs to the route that answered GET. Multiple responding autoscalers prevent writes
+rather than guessing an owner. An unrelated unreachable gateway does not block a responding
+autoscaler; when none responds, non-404 errors are shown. Older/non-scaler gateways show no controls.
+The API inherits the fleet route's token/cookie authentication and mutation Origin checks.
+
+Regression coverage: `plugins/runners/tests/test_scaler_limits.py` exercises authenticated HTTP,
+validation, unsupported hosts, CLI argv/read-back and failure mapping;
+`desktop-plugins/runners/tests/scaler.test.mjs` exercises the real panel slider-to-POST path,
+release debounce, keyboard/zero bounds, owner routing, errors and unmount cancellation.
+
 ## Token throttle and crossed-out slots
 
 With the throughput plugin on the gateway, the panel shows its token throttle above the gateway table: the same
