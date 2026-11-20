@@ -8666,6 +8666,9 @@ def cron(data: Path, store=None, now: Optional[float] = None, backstop_every: fl
         return lines
     store = _store(store)
     now = now or time.time()
+    # Refresh this host's recorded Board identity: `self_heal.py file` forwarded over ssh runs under a bare python3
+    # that cannot import core, and reads it to route like this pass does (placement_evidence, t_01a1f71e279b7d22).
+    remote_verify()
     perr = (pull_fn or pull_data)(data)
     if perr is not None:
         # Fix filing, queue drain and Inbox outcomes need no digests: only the digest backstop is skipped (stale

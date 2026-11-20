@@ -295,3 +295,80 @@ def test_refused_create_is_classified_and_files_one_lane_card(store, monkeypatch
 ])
 def test_placement_refusal_classifier(text, refused):
     assert sh.placement_refused(text) is refused
+
+
+# ── a defect forwarded from another host is filed by a core-less python3 (t_01a1f71e279b7d22) ─────────────────────
+# A Mac or the mini hands its defect to the hub as `ssh hub "python3 self_heal.py file --mode live"`: the hub's
+# /usr/bin/python3 cannot import core, so placement_evidence answered "unsynced". The hub's bb defect then kept the
+# named bb board with no pool labels and the home-pin sentence, and core (via the synced `hermes` CLI that creates
+# the card) judged and refused it: "hub_admission_denied" for bb-3d0045437a at 04:01Z 2026-11-20.
+def _coreless(monkeypatch):
+    """This process can no longer import core, exactly like the hub's bare python3 for a forwarded `file`."""
+    monkeypatch.setitem(sys.modules, "hermes_cli", None)
+
+
+def _needs_real_identity():
+    """The recording half runs inside placement_evidence's real _core_identity; core-free CI replaces that seam."""
+    pytest.importorskip("hermes_cli.kanban_sync_client")
+
+
+def _bb_argv():
+    return sh.kanban_argv(sh.card_args(defect(component="bb"), "k", cfg={"bb_board": "bb"}))
+
+
+def test_forwarded_bb_defect_without_a_recorded_identity_is_refused(store, gate, monkeypatch):
+    """RED proof of the incident: the argv a core-less `file` built is judged and refused by core's admission."""
+    with monkeypatch.context() as m:
+        _coreless(m)
+        argv = _bb_argv()
+    f = fields(argv)
+    assert f["board"] == "bb" and f["runs_on"] is None and sh.HOME_PIN_PREFIX in f["body"]
+    gate.verdict = gate.judge.Verdict(why="producer's own placement assertion")
+    out = gate.decide(argv)
+    assert out["where"] == "refuse" and gate.calls
+
+
+def test_forwarded_bb_defect_routes_like_the_hub_cron_and_passes_admission(store, gate, monkeypatch):
+    _needs_real_identity()
+    sh.remote_verify()  # a core-visible process on this host (the lane cron) reads and records the Board identity
+    with monkeypatch.context() as m:
+        _coreless(m)
+        assert sh.remote_verify() is True
+        argv = _bb_argv()
+    f = fields(argv)
+    assert f["board"] is None and f["runs_on"] == ",".join(sh.POOL_LABELS)
+    assert sh.HOME_PIN_PREFIX not in f["body"] and sh.REMOTE_NOTE in f["body"]
+    out = gate.decide(argv)
+    assert out.get("where") != "refuse" and "hub_admission" not in out, out
+    assert gate.calls == []
+
+
+def test_the_cron_pass_records_the_identity_for_forwarded_files(store, monkeypatch):
+    _needs_real_identity()
+    monkeypatch.setattr(sh, "mode", lambda: "off")  # the pass returns before any lane work...
+    sh.cron(store.root, store=store, now=NOW)
+    assert not sh._placement_evidence._identity_cache_path().exists()  # ...and an off lane records nothing
+    monkeypatch.setattr(sh, "mode", lambda: "shadow")
+    monkeypatch.setattr(sh, "pull_data", lambda data: (_ for _ in ()).throw(RuntimeError("stop after refresh")))
+    with pytest.raises(RuntimeError, match="stop after refresh"):
+        sh.cron(store.root, store=store, now=NOW)
+    with monkeypatch.context() as m:
+        _coreless(m)
+        assert sh._placement_evidence._core_identity() == (True, "hub")
+
+
+def test_a_recorded_identity_from_another_host_or_too_old_is_ignored(store, monkeypatch):
+    _needs_real_identity()
+    pe = sh._placement_evidence
+    sh.remote_verify()
+    path = pe._identity_cache_path()
+    rec = json.loads(path.read_text())
+    with monkeypatch.context() as m:
+        _coreless(m)
+        assert pe._core_identity() == (True, "hub")
+        path.write_text(json.dumps({**rec, "host": "some-other-host"}))
+        assert pe._core_identity() == (False, None)  # hermes-sync must never hand one host's identity to another
+        path.write_text(json.dumps({**rec, "at": rec["at"] - pe.IDENTITY_CACHE_MAX_AGE_S - 1}))
+        assert pe._core_identity() == (False, None)
+        path.write_text("{not json")
+        assert pe._core_identity() == (False, None)

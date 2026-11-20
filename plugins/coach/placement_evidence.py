@@ -39,21 +39,90 @@ class HomePinUnresolved(RuntimeError):
     not be filed, since an unpinned home-bound card would silently become portable."""
 
 
+# The Board identity the last core-visible process on this host read (t_01a1f71e279b7d22). A producer that runs
+# under a bare interpreter (the hub's `ssh hub "python3 self_heal.py file"` for a Mac's or the mini's defect) cannot
+# import core, but the card it files is created by the `hermes` CLI, which IS synced. Answering "unsynced" there
+# put the hub's bb defects on the named bb board with no pool labels, and core's hub admission refused them.
+IDENTITY_CACHE = ("cache", "board-identity.json")
+IDENTITY_CACHE_MAX_AGE_S = 24 * 3600  # the hub lane cron refreshes it every 5 min
+IDENTITY_CACHE_REWRITE_S = 3600
+
+
+def _identity_cache_path(root=None):
+    import os
+    from pathlib import Path
+    if root is None:
+        home = os.environ.get("HERMES_HOME", "").strip()
+        root = Path(home).expanduser() if home else Path.home() / ".hermes"
+        if root.parent.name == "profiles":  # a profile home: the Board identity is the root's
+            root = root.parent.parent
+    return Path(root).joinpath(*IDENTITY_CACHE)
+
+
+def _record_identity(gateway, now=None):
+    """Remember the synced Board gateway core reported, for this host's core-less producers. Fail-open."""
+    import json
+    import os
+    import socket
+    import time
+    if not gateway:
+        return
+    try:
+        from hermes_constants import get_default_hermes_root
+        path = _identity_cache_path(get_default_hermes_root())
+        now = time.time() if now is None else now
+        rec = {"synced": True, "gateway": str(gateway), "host": socket.gethostname()}
+        try:
+            old = json.loads(path.read_text())
+            if {k: old.get(k) for k in rec} == rec and now - float(old.get("at") or 0) < IDENTITY_CACHE_REWRITE_S:
+                return
+        except Exception:
+            pass
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps({**rec, "at": now}))
+        os.replace(tmp, path)
+    except Exception:  # health: allow BLE001 -- the cache is an optimisation for core-less processes only
+        pass
+
+
+def _cached_identity(now=None):
+    """``(synced, gateway)`` a core-visible process on THIS host recorded within the max age, else None."""
+    import json
+    import socket
+    import time
+    try:
+        rec = json.loads(_identity_cache_path().read_text())
+        now = time.time() if now is None else now
+        if rec.get("host") != socket.gethostname() or now - float(rec.get("at") or 0) > IDENTITY_CACHE_MAX_AGE_S:
+            return None
+        if rec.get("synced") is not True or not rec.get("gateway"):
+            return None
+        return True, str(rec["gateway"])
+    except Exception:  # health: allow BLE001 -- absent/unreadable cache: the core-free answer below
+        return None
+
+
 def _core_identity():
     """``(synced, gateway)`` from core's own config/enrollment (``kanban.sync`` + hub identity). Raises on failure.
 
-    No Hermes core importable at all (core-free CI, a bare interpreter) means no Board sync client exists in this
-    process, so the card can only land on the local board: ``(False, None)``. A core that IS installed but fails to
-    report its identity still raises (fail closed)."""
+    No Hermes core importable in this process (a bare interpreter): the identity a core-visible process on this host
+    recorded (:func:`_cached_identity`), since the card is still created by this host's `hermes` CLI; with none
+    (core-free CI) no Board sync client exists, so the card can only land on the local board: ``(False, None)``.
+    A core that IS installed but fails to report its identity still raises (fail closed)."""
     try:
         from hermes_cli import kanban_db_sync, kanban_sync_client
     except ModuleNotFoundError as exc:
         if exc.name != "hermes_cli":
             raise
-        return False, None
+        return _cached_identity() or (False, None)
     if not kanban_db_sync.sync_enabled():
+        # Not recorded: an unreadable config also reads as off here, and a core-less process with no record already
+        # answers unsynced. Only a positive identity is worth handing on.
         return False, None
-    return True, kanban_sync_client.load_identity().gateway
+    gateway = kanban_sync_client.load_identity().gateway
+    _record_identity(gateway)
+    return True, gateway
 
 
 def home_machine():
