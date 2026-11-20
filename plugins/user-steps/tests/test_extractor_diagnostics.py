@@ -26,6 +26,8 @@ def home(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setitem(sys.modules, "hermes_cli.install_identity", types.SimpleNamespace(get_install_id=lambda: "t"))
     monkeypatch.setitem(sys.modules, "hermes_cli.profiles", types.SimpleNamespace(current_profile_name=lambda: "default"))
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_USER_STEPS_OFF", raising=False)
     db = sqlite3.connect(tmp_path / "state.db")
     db.execute("create table sessions (id text primary key, parent_session_id text, end_reason text, source text)")
     db.execute("insert into sessions values ('S1', null, null, 'desktop')")
@@ -240,3 +242,43 @@ def test_add_step_over_four_choices_not_silently_shortened(home):
     assert step["kind"] == "input" and step["choices"] == [] and step["options"] == []
     step = core.add_step("S1", "Which other plan?", [f"Plan {i}" for i in range(4)], ledger=lg)
     assert step["kind"] == "choose" and len(step["choices"]) == 4
+
+
+MIX_SPAN = "Alpha plan, or Beta plan?"
+MIX_REPLY = ("We can ship any of these.\n\n"
+             "Alpha plan, or Beta plan? Also consider Gamma plan, Delta plan, and Epsilon plan.")
+MIX_OPTS = ["Gamma plan", "Delta plan", "Epsilon plan"]
+MIX_LABELS = ["Alpha plan", "Beta plan", "Gamma plan", "Delta plan", "Epsilon plan"]
+
+
+def test_mixed_derived_and_literal_options_over_four_become_input(home):
+    """2 derived alternatives plus 3 literal model options used to be sliced to 4 buttons."""
+    step = {"text": "Pick a plan", "kind": "choose", "verbatim_span": MIX_SPAN,
+            "options": MIX_OPTS, "paragraph": MIX_REPLY}
+    assert core.literal_options(step) == []
+    out = run(home, llm_of({"steps": [{"text": "Pick a plan", "kind": "choose",
+                                       "verbatim_span": MIX_SPAN, "options": MIX_OPTS}]}),
+              reply=MIX_REPLY)
+    assert len(out["steps"]) == 1
+    published = out["steps"][0]
+    assert published["kind"] == "input" and published["options"] == []
+    text = published.get("paragraph") or MIX_REPLY
+    for label in MIX_LABELS:
+        assert label in text
+
+
+def test_transform_llm_output_trace_carries_diagnostics(home, monkeypatch):
+    monkeypatch.setitem(sys.modules, "user_steps_core", core)
+    spec = importlib.util.spec_from_file_location("diag_plugin", ROOT / "__init__.py")
+    plugin = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(plugin)
+    monkeypatch.setattr(plugin.core, "home", lambda: home)
+    monkeypatch.setattr(plugin, "aux_llm", llm_of({"steps": [STEP], "resolved": []}))
+    plugin.transform_llm_output(REPLY, "S1", "desktop")
+    rows = [json.loads(line) for line in (home / "cache" / "user-steps" / "trace.jsonl").read_text().splitlines()
+            if line.strip()]
+    trans = [row for row in rows if row.get("hook") == "transform" and "diagnostics" in row]
+    assert trans, rows
+    d = trans[-1]["diagnostics"]
+    assert d["raw_steps"] == 1 and d["validated"] == 1 and d["published"] == 1
+    assert d["validation_drops"] == [] and d["publication_drops"] == []

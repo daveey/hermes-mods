@@ -1595,6 +1595,11 @@ def _process_reply(reply: str, session_id: str, *, user_msg: str, llm: Optional[
                 step = {**candidate, "id": new_step_id(), "status": "open", "created": now,
                         "session": session_id,
                         "paragraph": shown + ("\n\n" + candidate["payload"] if candidate.get("payload") else "")}
+                if step.get("kind") == "choose" and len(_menu_labels(step)) > MAX_OPTIONS:
+                    # 2 derived alternatives plus extra literal model options: same rule as
+                    # options-over-4 — free-text input, every label left in the paragraph.
+                    step["kind"] = "input"
+                    step["options"] = []
                 if action_store is not None:
                     canonical = action_store.migrate_step(action_owner, step)
                     step.update(requestId=canonical["requestId"], requestOwner=canonical["owner"],
@@ -3442,8 +3447,8 @@ def _whether_alternatives(text: str) -> list[str]:
     return [_cap(p) for p in out]
 
 
-def literal_options(step: dict) -> list[str]:
-    """Answer buttons for a legacy clarification: only text literally in the source.
+def _menu_labels(step: dict) -> list[str]:
+    """Uncapped unique button candidates for a legacy clarification.
 
     The question's own 'A, or B?' alternatives come first, then any model option found
     verbatim. An 'other' tail ('something else', 'neither') is never a button: the
@@ -3457,10 +3462,14 @@ def literal_options(step: dict) -> list[str]:
         if o and o.casefold() in low and not _ALT_OTHER.match(o.strip(' .!?')):
             i = low.index(o.casefold())
             found.append(source[i:i + len(o)])
+    alts = _question_alternatives(_ws(step.get('verbatim_span') or step.get('paragraph')), source)
     if len(found) >= 2:
-        out = found
+        # Mixed menu: 2 derived alternatives plus 3+ literal model options used to be
+        # built as found-only then sliced to 4, silently dropping a real option.
+        out = (alts + [x for x in found if not any(x.casefold() in y.casefold() for y in alts)]
+               if alts else found)
     else:
-        out = _question_alternatives(_ws(step.get('verbatim_span') or step.get('paragraph')), source)
+        out = alts
         # The agent's own options were paraphrases (dropped above), but the card's title states both: use them.
         # Live repro (hermes-hub 2026-10-28, gen-3/gen-4 spot): only 'keep spot' survived and Approve had no button.
         if len(out) < 2 and len(whether := _whether_alternatives(step.get('text'))) == 2:
@@ -3477,7 +3486,18 @@ def literal_options(step: dict) -> list[str]:
             out = [label for _, label in items]
         if len(out) < 2 and yes_no_question(step):
             out = ['Yes', 'No']
-    return list(dict.fromkeys(out))[:4]
+    return list(dict.fromkeys(out))
+
+
+def literal_options(step: dict) -> list[str]:
+    """Answer buttons for a legacy clarification: only text literally in the source.
+
+    More than MAX_OPTIONS unique labels is not a button menu: return none so the
+    caller mints as free-text ``input`` and every label stays in the paragraph."""
+    labels = _menu_labels(step)
+    if len(labels) > MAX_OPTIONS:
+        return []
+    return labels
 
 
 _LETTERED_LINE = re.compile(r"^[ \t]*(?:[-*\u2022][ \t]+)?(\*\*|__)?\(([A-Za-z])\)[ \t]+(.+?)[ \t]*$", re.M)
@@ -3726,7 +3746,13 @@ def legacy_request(owner: dict, step: dict, ref: dict) -> dict:
     no_grant = 'This does not grant execution permission.'
     if kind in ('choice', 'input'):
         # Completeness here describes the QUESTION, never executable scope.
-        r['choices'] = explained_choices(literal_options(step), step) + [dict(ANSWER_TEXT)]
+        labels = _menu_labels(step)
+        if kind == 'choice' and len(labels) > MAX_OPTIONS:
+            # Same rule as validate/add_step: do not offer a truncated button menu.
+            r['kind'] = 'input'
+            kind = 'input'
+            labels = []
+        r['choices'] = explained_choices(labels if kind == 'choice' else literal_options(step), step) + [dict(ANSWER_TEXT)]
         go = authorizing_answers(step, r['choices'])
         for c in go or []:
             c['authorizes'] = True
