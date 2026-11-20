@@ -457,7 +457,7 @@ function Valves({ row, limits, usage, draft, saving, onShare, onPause, onLimit }
 
 function Cell({ column, cards, lane, flowLane, onOpen }) {
   const pile = piling(cards)
-  const shown = cards.slice(0, 16)
+
   if (column.key === 'done') {
     return h('div', { className: 'hermes-lanes-cell', 'data-step': 'done', 'data-count': flowLane?.done ?? 0 },
       h('div', { className: 'hermes-lanes-count' }, flowLane?.done ?? 0),
@@ -467,14 +467,14 @@ function Cell({ column, cards, lane, flowLane, onOpen }) {
   for (const c of cards) tally[c.reason] = (tally[c.reason] || 0) + 1
   return h('div', { className: `hermes-lanes-cell${pile ? ' is-piling' : ''}`, 'data-step': column.key, 'data-count': cards.length, 'data-piling': pile ? '1' : '0' },
     h('div', { className: 'hermes-lanes-count' }, cards.length || '·'),
-    h('div', { className: 'hermes-lanes-boxes' }, shown.map((c) => {
+    h('div', { className: 'hermes-lanes-boxes' }, cards.map((c) => {
       const info = reasonInfo(c.reason)
       return h('button', {
         key: c.id, type: 'button', className: 'hermes-lanes-box', 'data-card': c.id, 'data-reason': c.reason,
         title: `${c.title || c.id}\n${info.label} · ${ageHours(c.age_h)} old${c.pr ? ` · ${prLabel(c.pr)}` : ''}`, 'aria-label': `${c.title || c.id}, ${info.label}`,
         style: { background: info.color }, onClick: () => onOpen(c.id)
       })
-    }), cards.length > shown.length ? h('span', { className: 'hermes-lanes-dim' }, `+${cards.length - shown.length}`) : null),
+    })),
     cards.length ? h('div', { className: 'hermes-lanes-dim hermes-lanes-why' }, Object.entries(tally).sort((a, b) => reasonRank(a[0]) - reasonRank(b[0])).slice(0, 2)
       .map(([r, n]) => `${n} ${reasonInfo(r).label}`).join(' · ')) : null)
 }

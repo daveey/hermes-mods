@@ -487,6 +487,29 @@ test('Floor: cell counts, box per card, and hatching only where cards pile up', 
   assert.equal(cell('product', 'waiting').querySelector('.hermes-lanes-box').getAttribute('data-reason'), 'you', 'needs-you boxes come first')
 })
 
+test('Floor: crowded cells expose every card title and click target beyond sixteen', async () => {
+  const cards = Array.from({ length: 37 }, (_, i) => card(`crowded-${i}`, 'product', 'waiting', 'dep'))
+  const opened = []
+  const view = await mount(React.createElement(P.Panel, panelProps({
+    flow: flowSnap({ cards }), onOpenCard: (id) => opened.push(id)
+  })))
+  const waiting = cell('product', 'waiting')
+  assert.equal(waiting.getAttribute('data-count'), String(cards.length))
+  assert.equal(waiting.querySelector('.hermes-lanes-count').textContent, String(cards.length))
+  assert.equal(waiting.getAttribute('data-piling'), '1')
+  assert.ok(waiting.classList.contains('is-piling'))
+  const boxes = [...waiting.querySelectorAll('button[data-card]')]
+  assert.equal(boxes.length, cards.length)
+  assert.deepEqual(boxes.map((box) => box.dataset.card).sort(), cards.map((c) => c.id).sort())
+  for (const c of cards) {
+    const box = boxes.find((b) => b.dataset.card === c.id)
+    assert.ok(box.title.startsWith(`${c.title}\n`), `hover title for ${c.id}`)
+    assert.ok(box.getAttribute('aria-label').startsWith(c.title), `accessible name for ${c.id}`)
+    await view.click(box)
+  }
+  assert.deepEqual(opened, cards.map((c) => c.id))
+})
+
 test('Floor: the unclassified column exists only while a card is in it', async () => {
   const view = await mount(React.createElement(P.Panel, panelProps()))
   assert.equal(document.querySelector('[data-column=landing_unclassified]'), null)
