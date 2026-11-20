@@ -20,7 +20,7 @@ def home(tmp_path, monkeypatch):
 def test_amounts():
     assert C.parse_per_min("150k") == 150_000
     assert C.parse_per_min("1.5M") == 1_500_000
-    assert C.parse_per_min("90000") == 90_000
+    assert C.parse_per_min("90") == 90_000  # a plain number is thousands, as in the panel
     assert C.parse_per_min("0") == 0
     for word in ("off", "None", "auto", "budget"):
         assert C.parse_per_min(word) is None

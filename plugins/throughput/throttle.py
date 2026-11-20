@@ -200,6 +200,8 @@ def _record(data) -> Optional[dict]:
             rec["burst"] = burst
     elif data.get("mode") == MANUAL:
         rec["mode"] = MANUAL
+        if isinstance(data.get("pool_caps"), dict):  # carried from the budget in force when the cap was set
+            rec.update(budget_at=_number(data.get("budget_at")), pool_caps=pool_caps_of(data.get("pool_caps")))
     return rec
 
 
@@ -258,12 +260,34 @@ def cap_value(cap_per_s) -> Optional[float]:
     return number
 
 
-def write_cap(root: Path, cap_per_s, now: float) -> Optional[float]:
+MANUAL_MIN_PERCENT = 0.001  # a manual cap above 0 is never stored at 0 %: older code reads 0 % as "no throttle"
+
+
+def write_cap(root: Path, cap_per_s, now: float, level: Optional[dict] = None) -> Optional[float]:
     """A person sets the fleet's token cap (tokens/s, None = no cap of their own): a ``mode: "manual"`` level. Every
     gateway obeys it as an absolute cap; the budget-publish host folds it into its budget level as the lower of the
-    two (``publish_budget``). A cap of 0 is stored at 100 %, so older gateways hold every call too."""
+    two (``publish_budget``).
+
+    Read by older code too: a cap of 0 is stored at 100 % (every call held), any other cap at a percent strictly
+    between 0 and 100 (older code applies a stored ``cap_per_s`` only there). When ``level`` (the one in force) is a
+    live budget level, its ``pool_caps`` and ``budget_at`` are carried, scaled down to the person's cap, so reserve
+    holds stay in force until the publisher folds the cap in; the percent is then the share of the budget it cuts
+    (``percent_for``), which an older publisher keeps."""
     value = cap_value(cap_per_s)
-    record = {"mode": MANUAL, "percent": 100.0 if value == 0 else 0.0, "set_at": stamp(now)}
+    record: dict = {"mode": MANUAL, "set_at": stamp(now)}
+    budget_total = None
+    if (level is not None and level.get("mode") == AUTO and level.get("percent", 0) < 100
+            and budget(level, now)["state"] != "expired"):
+        budget_total = level.get("cap_per_s")
+        scale = 1.0 if value is None or not budget_total else min(1.0, value / budget_total)
+        record["pool_caps"] = {p: None if v is None else v * scale for p, v in (level.get("pool_caps") or {}).items()}
+        record["budget_at"] = level.get("budget_at")
+    if value is None:
+        record["percent"] = 0.0
+    elif value == 0:
+        record["percent"] = 100.0
+    else:
+        record["percent"] = min(99.999, max(MANUAL_MIN_PERCENT, percent_for(value, budget_total)))
     if value is not None:
         record["cap_per_s"] = value
     _write_json(level_path(root), record)
@@ -844,10 +868,17 @@ class Gate:
                 return self._budget_plan(level, now, provider)
             if level.get("mode") == MANUAL:
                 limit = limit_of(level, None, now)
+                if limit is not None and limit <= 0:
+                    return ("hold",)
+                pools = level.get("pool_caps") or {}
+                if isinstance(provider, str) and provider in pools and pools[provider] is not None:
+                    pool = pools[provider]  # the budget's pool cap, carried and scaled when the cap was set
+                    if pool <= 0:
+                        return ("hold",)  # that pool is at reserve
+                    share, tokens = self._share_and_tokens(now)
+                    return ("pace", min(MAX_INTERVAL_S, tokens / (share * pool)), level["set_at"], provider)
                 if limit is None:
                     return ("pass",)  # a person removed their cap and no budget host folds it: no throttle
-                if limit <= 0:
-                    return ("hold",)
                 share, tokens = self._share_and_tokens(now)
                 return ("pace", min(MAX_INTERVAL_S, tokens / (share * limit)), level["set_at"])
             if percent <= 0:
@@ -904,6 +935,29 @@ class Gate:
         each poll and is stamped only when it starts, so a wait holds no slot and a level change books nothing."""
         started = self._clock()
         announced = False
+        held = [0.0]  # held seconds not yet counted (+ when): written to the pace file once a minute
+        try:
+            return self._wait(started, announced, held, beat, stop, max_s, provider)
+        finally:
+            self._held_flush(held)
+
+    def _held_add(self, minute, held: list, now: float, seconds: float):
+        """Add ``seconds`` held at ``now``; count the pending ones in the pace file when the minute turns, so a
+        waiting call takes the lock once a minute, not every poll."""
+        this = int(now) // 60
+        if minute is not None and this != minute:
+            self._held_flush(held)
+        held[0] += max(0.0, seconds)
+        held.append(now) if len(held) == 1 else held.__setitem__(1, now)
+        return this
+
+    def _held_flush(self, held: list) -> None:
+        if held[0] > 0 and len(held) > 1:
+            self._note_wait(held[1], held[0])
+        held[0] = 0.0
+
+    def _wait(self, started, announced, held, beat, stop, max_s, provider) -> float:
+        held_minute = None
         while True:
             now = self._clock()
             plan = self.plan(now) if provider is None else self.plan(now, provider)
@@ -938,7 +992,7 @@ class Gate:
             before = self._clock()
             self._sleep(nap)
             after = self._clock()
-            self._note_wait(after, after - before)
+            held_minute = self._held_add(held_minute, held, after, after - before)
             waited = after - started
             if (max_s is not None and waited >= max_s) or (stop is not None and _true(stop)):
                 log.info("throughput throttle: wait ended after %.0fs before its start", waited)
@@ -955,10 +1009,10 @@ class Gate:
         st = status(self.root, self.series_db, now, self.hub_db)
         slots = slotgate.local(self.root, self.series_db, st["cap_per_s"], now)
         running = self._running()
-        return {"at": now, "allowed": slots["allowed"], "running": running, "granted": 0,
+        return {"at": now, "allowed": slots["allowed"], "running": running, "granted": set(),
                 "rate_hold": bool(st["holding"])}
 
-    def start_gate(self, **_card) -> Optional[dict]:
+    def start_gate(self, task_id=None, **_card) -> Optional[dict]:
         """``kanban_start_gate``: hold a card start while this gateway already runs the card slots its share of the
         token cap pays for (``slotgate``): its running cards plus the starts let through since the last read reach
         the allowed count. Without a slot limit (no cap) or a card count, the older rule holds: the fleet's token
@@ -971,15 +1025,20 @@ class Gate:
                 hit = self._read_start(now)
             except Exception:  # fail open: a broken read must never stop the dispatcher starting cards
                 log.debug("throughput throttle: start gate read failed", exc_info=True)
-                hit = {"at": now, "allowed": None, "running": None, "granted": 0, "rate_hold": False}
+                hit = {"at": now, "allowed": None, "running": None, "granted": set(), "rate_hold": False}
             with self._lock:
                 self._start = hit
         with self._lock:
             if hit["allowed"] is None or hit["running"] is None:
                 return {"hold": True, "reason": START_GATE_REASON} if hit["rate_hold"] else None
-            if hit["running"] + hit["granted"] >= hit["allowed"]:
+            # Grants are counted per card: core asks about the same card more than once per tick (pickup's
+            # would-it-start probe, then the claim), and a card asked again must not take a second slot.
+            key = task_id if task_id is not None else object()
+            if key in hit["granted"]:
+                return None
+            if hit["running"] + len(hit["granted"]) >= hit["allowed"]:
                 return {"hold": True, "reason": SLOT_GATE_REASON}
-            hit["granted"] += 1  # counted until the next read sees it running
+            hit["granted"].add(key)  # counted until the next read sees it running
             return None
 
     def _exempt(self, platform) -> bool:

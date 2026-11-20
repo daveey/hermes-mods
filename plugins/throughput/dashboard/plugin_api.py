@@ -188,7 +188,7 @@ def set_cap(cap_per_min: Any) -> Dict[str, Any]:
     root, hub_db, now = _state["root"], throttle.hub_db_path(), time.time()
     level = throttle.effective(root, hub_db, now)
     stamp = max(now, level["set_at"] + 0.002)  # 2 ms: stamps round to 1 ms
-    throttle.write_cap(root, None if cap_per_min is None else cap_per_min / 60.0, stamp)
+    throttle.write_cap(root, None if cap_per_min is None else cap_per_min / 60.0, stamp, level)
     throttle.note_seen(root, hub_db, stamp)
     return throttle_payload()
 

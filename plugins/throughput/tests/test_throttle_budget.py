@@ -255,7 +255,9 @@ def test_legacy_level_without_mode_behaves_as_before(tmp_path):
     out = T.status(tmp_path, db, NOW)
     assert out["mode"] == "manual" and out["budget"] is None and out["cap_per_s"] == 1000.0
     T.level_path(tmp_path).write_text(json.dumps({**legacy, "mode": "manual"}))
-    assert T.status(tmp_path, db, NOW)["mode"] == "manual" and gate.plan(NOW + 31, "anthropic")[0] == "pace"
+    # a person's cap (``mode: "manual"``) carries the budget's pool caps it was set under: a reserve still holds
+    assert T.status(tmp_path, db, NOW)["mode"] == "manual" and gate.plan(NOW + 31, "anthropic")[0] == "hold"
+    assert gate.plan(NOW + 31, "openai-codex")[0] == "pace"
 
 
 def test_malformed_pool_caps_values_are_ignored(tmp_path):

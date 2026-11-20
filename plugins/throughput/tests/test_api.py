@@ -465,7 +465,7 @@ def test_put_cap_per_min_sets_a_persons_absolute_cap(api, tmp_path, monkeypatch)
 
     put = c.put("/p/v1/throttle", json={"cap_per_min": 18_000}).json()  # 300 tokens/s
     stored = json.loads(throttle.level_path(root).read_text())
-    assert stored["mode"] == "manual" and stored["cap_per_s"] == pytest.approx(300.0) and stored["percent"] == 0
+    assert stored["mode"] == "manual" and stored["cap_per_s"] == pytest.approx(300.0) and 0 < stored["percent"] < 1  # older code reads 0 % as off
     assert put["cap_per_s"] == pytest.approx(300.0) and put["user_cap_per_s"] == pytest.approx(300.0)
     assert put["mode"] == "manual" and put["gateways"] == [{"name": "hub", "seen": True}]
     gate = put["slot_gate"]

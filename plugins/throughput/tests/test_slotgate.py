@@ -165,7 +165,7 @@ def test_start_gate_opens_only_the_allowed_slots(tmp_path):
     T.write_cap(tmp_path, 300.0, NOW - 10)  # 300 tokens/s
     T._write_json(S.estimate_path(tmp_path), {"per_s": 100.0, "at": NOW - 60})  # 3 slots
     gate, _ = _gate(tmp_path, 1)
-    answers = [gate.start_gate(**CARD) for _ in range(4)]
+    answers = [gate.start_gate(**dict(CARD, task_id=f"t_{n}")) for n in range(4)]
     assert answers[:2] == [None, None]  # running 1 + 2 starts = 3
     assert answers[2:] == [{"hold": True, "reason": "token_slots"}] * 2
 
@@ -303,3 +303,62 @@ def test_percent_for():
     assert T.percent_for(250.0, 1000.0) == 75.0
     assert T.percent_for(2000.0, 1000.0) == 0.0
     assert T.percent_for(250.0, None) == 0.0
+
+
+# --- review fixes: per-card grants, rollout compatibility, reserve holds, batched wait writes ------------------
+
+def test_asking_twice_about_the_same_card_takes_one_slot(tmp_path):
+    """Core's pickup asks whether a card would start, then the claim asks again: one slot, not two."""
+    st = _store(tmp_path, me="w1")
+    st.put("w1", "tokens_io", [(END - 60, 1.0)])
+    T.write_cap(tmp_path, 300.0, NOW - 10)
+    T._write_json(S.estimate_path(tmp_path), {"per_s": 100.0, "at": NOW - 60})  # 3 slots
+    gate, _ = _gate(tmp_path, 1)
+    a = dict(CARD, task_id="t_a")
+    b = dict(CARD, task_id="t_b")
+    c = dict(CARD, task_id="t_c")
+    assert [gate.start_gate(**x) for x in (a, b, a, b)] == [None] * 4  # pickup probe, then the claims
+    assert gate.start_gate(**c) == {"hold": True, "reason": "token_slots"}
+
+
+def test_a_manual_cap_is_never_stored_at_0_percent_so_older_code_enforces_it(tmp_path):
+    T.write_cap(tmp_path, 500.0, NOW)
+    data = json.loads(T.level_path(tmp_path).read_text())
+    assert 0 < data["percent"] < 100 and data["cap_per_s"] == 500.0
+    # what code before the manual mode does with it: a slider level whose stored cap is in force
+    legacy = {k: v for k, v in data.items() if k != "mode"}
+    T.level_path(tmp_path).write_text(json.dumps(legacy))
+    assert T.limit_of(T.read_record(tmp_path), None, NOW) == 500.0
+
+
+def test_a_cap_set_under_a_budget_keeps_reserve_holds_and_scales_the_pools(tmp_path):
+    budget_level = {"mode": "auto", "percent": 0.0, "cap_per_s": 1000.0, "pool_caps": {"anthropic": 0.0,
+                    "openai-codex": 600.0, "xai-oauth": 400.0}, "budget_at": NOW - 60, "set_at": NOW - 30}
+    T._write_json(T.level_path(tmp_path), budget_level)
+    level = T.effective(tmp_path, None, NOW)
+    T.write_cap(tmp_path, 250.0, NOW, level)
+    data = json.loads(T.level_path(tmp_path).read_text())
+    assert data["mode"] == "manual" and data["percent"] == pytest.approx(75.0)  # an older publisher keeps 75 %
+    assert data["pool_caps"] == {"anthropic": 0.0, "openai-codex": pytest.approx(150.0), "xai-oauth": pytest.approx(100.0)}
+    gate = T.Gate(tmp_path, tmp_path / "series.sqlite", clock=lambda: float(NOW))
+    assert gate.plan(NOW, "anthropic") == ("hold",)  # still at reserve
+    plan = gate.plan(NOW, "openai-codex")
+    assert plan[0] == "pace" and plan[3] == "openai-codex" and plan[1] == pytest.approx(T.DEFAULT_CALL_TOKENS / 150.0)
+    assert gate.plan(NOW, "other")[0] == "pace"  # an ungoverned provider: the person's global cap
+    # "off" under a budget: the budget's pools still cap until the publisher folds it in
+    T.write_cap(tmp_path, None, NOW + 1, level)
+    assert T.Gate(tmp_path, tmp_path / "series.sqlite", clock=lambda: float(NOW)).plan(NOW + 1, "anthropic") == ("hold",)
+
+
+def test_a_long_wait_writes_the_pace_file_about_once_a_minute(tmp_path, monkeypatch):
+    clock = Clock()
+    gate = T.Gate(tmp_path, tmp_path / "series.sqlite", sleep=clock.sleep, clock=clock.now)
+    T.write_cap(tmp_path, 0, NOW - 10)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_long")
+    writes = []
+    real = T.Pacer.note_wait
+    monkeypatch.setattr(T.Pacer, "note_wait", lambda self, now, task, s: (writes.append(s), real(self, now, task, s)))
+    assert gate.wait(max_s=180) == pytest.approx(180.0)
+    assert 3 <= len(writes) <= 4  # 36 polls, one write per minute turned and one at the end
+    state = json.loads(T.pace_path(tmp_path).read_text())
+    assert sum(cell["t_long"] for cell in state["waits"].values()) == pytest.approx(180.0)

@@ -110,10 +110,12 @@ and a body that is not a JSON object a 422, and neither changes anything.
   minute they start. A stored stamp more than one interval ahead is treated as now. During rollout an older
   process sharing the file books its slot after the `next_at` a new process writes on each start, and a new
   process honours an older process's `next_at` only while it is at most one interval ahead.
-- **A person's cap** (`write_cap`; `PUT /v1/throttle {"cap_per_min": N | null}`, `hermes throttle set 150k|0|off`,
+- **A person's cap** (`write_cap`; `PUT /v1/throttle {"cap_per_min": N | null}`, `hermes throttle set 150|1.5m|0|off` (a plain number is thousands, as in the panel),
   the Runners panel's "Token cap" field): an absolute fleet cap in tokens, stored as a `mode: "manual"` level
-  (`cap_per_s`; a cap of 0 is stored at `percent: 100`, so older gateways hold too; null = no cap of one's own). It
-  reaches the fleet like any level. Without a budget host every gateway paces at it. The budget-publish host
+  (`cap_per_s`; a cap of 0 is stored at `percent: 100` and any other cap at a percent strictly between 0 and 100,
+  so code from before this mode enforces the stored cap too; null = no cap of one's own). Set while a live budget
+  level is in force, it carries that budget's `pool_caps` scaled down to the cap (reserve holds stay) and stores
+  the percent of the budget it cuts, which an older publisher keeps. It reaches the fleet like any level. Without a budget host every gateway paces at it. The budget-publish host
   records the newest person-set level in `cache/throughput/user-cap.json` (a manual level as is; a slider level,
   or an older panel's slider on the budget level, as its percent of the budget) and writes its budget level with
   `percent` such that the cap is the lower of the person's cap and the budget (`percent_for`), so pool caps scale
@@ -131,13 +133,17 @@ and a body that is not a JSON object a 422, and neither changes anything.
   60, counted by `Gate.wait` for card runs only) each minute. Held time is left out because a throttled slot burns
   few tokens; counting it would make slots look cheap and keep open as many as already run. On a core with the
   `kanban_start_gate` hook a card stays ready (guard reason `start_gate:token_slots`) while running cards plus the
-  starts let through since the last read (every 15 s) reach `allowed`. Running cards are never stopped. Without a
+  starts let through since the last read (every 15 s, counted per card: core asks about a card in pickup and
+  again at the claim) reach `allowed`. Running cards are never stopped. Without a
   slot limit or a card count (no cap, or outside a Hermes runtime) the older rule holds starts
   (`start_gate:token_throttle`) while the fleet's measured rate is over the cap. Any failed read starts the card.
   The payload's `slot_gate` is `{allowed, share, per_slot_per_s, source, estimate_at, cap_per_s, running}`, and
   this gateway's row in `slots.gateways` carries the enforced numbers (`enforced: true`); other gateways' rows
-  stay advisory estimates (their held time is not published). Tests: `tests/test_slotgate.py`. **Not tested**:
-  a live dispatcher tick and core's `active_card_runs` on a worker.
+  stay advisory estimates (their held time is not published). Held seconds are written to the pace file once a
+  minute per waiting call. **Known gaps**: the token count is the gateway's whole in+out use, so chats and cron on
+  a gateway (the hub) make its slots look dearer; a gateway whose slots are held over two thirds of the time
+  stops refreshing its estimate (it expires after 6 h). Tests: `tests/test_slotgate.py`. **Not tested**: a live
+  dispatcher tick and core's `active_card_runs` on a worker.
 - **A held turn stays alive.** Core gives middleware no activity API, so the gate finds the agent behind the call it
   wraps (the closure of core's `_perform_api_call`) and stamps its activity clock every poll, as core's own offline
   wait does: the gateway's idle watchdog and the turn liveness watchdog see a waiting turn, and a Kanban card's
