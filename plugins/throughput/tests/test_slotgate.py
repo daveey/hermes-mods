@@ -393,3 +393,27 @@ def test_a_burst_set_and_ended_never_moves_the_persons_cap(tmp_path, cap):
     T.publish_budget(tmp_path, None, pacing, NOW + 50)
     assert T.read_user_cap(tmp_path)["cap_per_s"] == cap
     assert T.budget(T.effective(tmp_path, None, NOW + 50), NOW + 50)["cap_per_s"] == pytest.approx(min(cap, 1000.0))
+
+
+# --- the fleet limit file (read by the hub's worker autoscaler) -----------------------------------------------
+
+def test_fleet_limit_file_carries_the_cap_rate_and_hold(tmp_path):
+    """A person's 300 tokens/s cap with the fleet burning 600 tokens/s: the file says cap 300, rate 600, holding."""
+    st = _store(tmp_path / "s")
+    _fill(st, "w1", tokens_per_min=36_000, busy=2, held_per_min=0)
+    T.write_cap(tmp_path, 300.0, NOW - 10)
+    out = S.write_fleet_limit(tmp_path, st.path, None, NOW)
+    saved = json.loads(S.fleet_limit_path(tmp_path).read_text())
+    assert saved == out
+    assert out["version"] == 1 and out["at"] == NOW and out["mode"] == "manual"
+    assert out["cap_per_s"] == pytest.approx(300.0)
+    assert out["rate_per_s"] == pytest.approx(600.0)
+    assert out["holding"] is True
+
+
+def test_fleet_limit_file_without_a_cap_says_none(tmp_path):
+    st = _store(tmp_path / "s")
+    _fill(st, "w1", tokens_per_min=36_000, busy=2, held_per_min=0)
+    out = S.write_fleet_limit(tmp_path, st.path, None, NOW)
+    assert out["cap_per_s"] is None and out["holding"] is False
+    assert json.loads(S.fleet_limit_path(tmp_path).read_text())["cap_per_s"] is None

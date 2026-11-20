@@ -18,6 +18,10 @@ and 40 of them sat in "token throttle: waiting" for up to 70 minutes. This modul
   0. ``share`` is the same share of the cap this gateway's model calls are paced at (``throttle.local_share``),
   so the slots it opens are the ones its share pays for, and the shares of all gateways sum to the fleet cap.
   No cap: no limit. A cap of 0: no slots. A gateway that has never measured itself opens ``UNMEASURED_SLOTS``.
+* **Fleet limit file** (``write_fleet_limit``, the sampler once a minute): the cap in force, the fleet token rate and
+  whether the throttle is holding, written to ``cache/throughput/fleet-limit.json`` for the hub's worker autoscaler
+  (private state repo, ``hermes_worker_scaler.py``). The autoscaler turns it into a fleet-wide slot allowance with
+  the pool's running card counts, so it launches a machine only when the token budget can feed one.
 * **The gate** (``Gate.start_gate`` in throttle.py) holds a card start while this gateway's running cards plus
   the starts it let through since its last read reach the allowed count. Running cards are never stopped: the
   count comes down as they finish. Chats never take a slot.
@@ -33,6 +37,7 @@ from typing import Optional
 from . import throttle
 
 ESTIMATE_FILE = "slot-estimate.json"
+FLEET_FILE = "fleet-limit.json"
 BUSY_METRIC, WAIT_METRIC = "slot:busy", "slot:wait"
 WINDOW_S = 15 * 60  # the measurement window (the throttle's share window)
 MIN_ACTIVE_S = 300.0  # under five unheld slot-minutes in the window a measurement is noise
@@ -167,3 +172,18 @@ def local(root: Path, series_db: Path, cap_per_s: Optional[float], now: Optional
             "per_slot_per_s": None if per_slot is None else round(per_slot, 3),
             "source": "measured" if per_slot is not None else "unmeasured",
             "estimate_at": None if est is None else est["at"], "cap_per_s": cap_per_s}
+
+
+def fleet_limit_path(root: Path) -> Path:
+    return Path(root) / "cache" / "throughput" / FLEET_FILE
+
+
+def write_fleet_limit(root: Path, series_db: Path, hub_db: Optional[Path], now: Optional[float] = None) -> dict:
+    """Write the throttle facts the worker autoscaler reads: ``{version, at, cap_per_s, rate_per_s, holding, mode,
+    pacing}`` (``cap_per_s`` None = no cap; ``pacing`` is ``status()["pacing"]["state"]``). Returns what it wrote."""
+    now = time.time() if now is None else now
+    st = throttle.status(root, series_db, now, hub_db)
+    out = {"version": 1, "at": now, "cap_per_s": st["cap_per_s"], "rate_per_s": st["rate_per_s"],
+           "holding": bool(st["holding"]), "mode": st["mode"], "pacing": (st.get("pacing") or {}).get("state")}
+    throttle._write_json(fleet_limit_path(root), out)
+    return out

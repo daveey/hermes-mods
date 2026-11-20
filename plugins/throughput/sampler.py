@@ -576,6 +576,11 @@ class Sampler:
         from . import slotgate
         slotgate.sample(self.root, self.store, me, now, running=self.running())
 
+    def write_fleet_limit(self, now: float) -> None:
+        """The throttle facts the hub's worker autoscaler reads (slotgate.write_fleet_limit)."""
+        from . import slotgate, throttle
+        slotgate.write_fleet_limit(self.root, self.store.path, throttle.hub_db_path(), now)
+
     def running(self) -> Optional[int]:
         """This machine's running card count (core's count; None outside a Hermes runtime)."""
         from . import slotgate
@@ -591,7 +596,8 @@ class Sampler:
             reg = None
         me = self.me(reg)
         for step in (lambda: self.sample_local_tokens(me, minute), lambda: self.sample_local_sessions(me, minute),
-                     lambda: self.sample_registry(reg, me, minute), lambda: self.sample_slots(me, now)):
+                     lambda: self.sample_registry(reg, me, minute), lambda: self.sample_slots(me, now),
+                     lambda: self.write_fleet_limit(now)):
             try:
                 step()
             except Exception:

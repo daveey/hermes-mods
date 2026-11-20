@@ -218,3 +218,18 @@ def test_one_sampler_per_root(tmp_path, monkeypatch):
     for t in threads:
         t.join(5)
     assert not any(t.is_alive() for t in threads)
+
+
+def test_tick_writes_the_fleet_limit_file_for_the_worker_autoscaler(tmp_path, monkeypatch):
+    """Each sampler minute rewrites cache/throughput/fleet-limit.json (slotgate.write_fleet_limit), read by the
+    hub's worker autoscaler; a gateway without a hub link still writes its own view."""
+    import json
+    from throughput_under_test import slotgate, throttle
+    monkeypatch.setenv("HERMES_HUB_STATE", str(tmp_path / "no-hub"))
+    root = tmp_path / "home"
+    root.mkdir()
+    throttle.write_cap(root, 300.0, M - 10)
+    st = Store(tmp_path / "s.sqlite")
+    S.Sampler(root, st, registry=lambda: {"me": "hub", "machines": {}}, clock=Clock(M + 2)).tick()
+    data = json.loads(slotgate.fleet_limit_path(root).read_text())
+    assert data["at"] == M + 2 and data["cap_per_s"] == 300.0 and data["version"] == 1
