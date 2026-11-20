@@ -7,8 +7,11 @@
  *                colours: red = needs you, green = ready, yellow = not ready (waiting / not started), grey = done,
  *                blue = running, orange = stuck
  *   Needs you    user-steps' decision cards (window.__userSteps.ActionQueue, embedded) and its earlier asks; a card
- *                no ask covers shows its own human_request as "Do this / Why you / Next" (askView), with its
- *                plain card title as context; without a request it says so and offers Ask agent
+ *                no ask covers renders its own human_request (askView/AskRow): label + plain title, the
+ *                generate-unblock-card Situation (2 lines, More), one tile per option (letter, name, detail; the
+ *                recommended one highlighted with its reason) whose Choose button drafts the answer in the composer,
+ *                "Only you can: …", and everything else folded under Details. A card without options shows its step
+ *                with I did it / Skip it drafts; without a request it says so and offers Ask agent
  *   Stuck        a running card with no event for 2 h, a parked card whose agent-owned wait stalled
  *                (backend `wait.wait_state === 'stalled'`), or a sub-agent whose tool count has not moved
  *                for 30 min; each with numbered steps and Nudge agent / Open card. A stale chip (session-tasks'
@@ -720,12 +723,53 @@ export function askView(c) {
     : 'When done, open the card and press Unblock, or reply in chat. Archive the card if you don’t want it.'
   const b = r.brief && typeof r.brief === 'object' ? r.brief : null
   // generate-unblock-card's brief (session-tasks briefOf): what happened, the options with their costs, the pick.
+  const rec = recommendParts(b?.recommend)
+  const options = (b && Array.isArray(b.options) ? b.options : []).slice(0, 6).map(optionParts).filter(o => o.name)
   const brief = b && str(b.situation)
-    ? { situation: clip(b.situation, 400), options: (Array.isArray(b.options) ? b.options : []).slice(0, 6).map(o => clip(o, 240)).filter(Boolean),
-        recommend: clip(b.recommend, 240) }
+    ? { situation: clip(b.situation, 600), options: options.map(o => o.full), recommend: clip(b.recommend, 240) }
     : null
-  return { known: true, step: clip(step), full: step, why: typeof r.why === 'string' ? clip(r.why, 300) : '', next, brief }
+  const why = whyParts(r.why)
+  return { known: true, step: clip(step), full: step, why: typeof r.why === 'string' ? clip(r.why, 300) : '', next, brief,
+    yes, no, decision: !!brief && options.length >= 2,
+    options: options.map(o => (rec.letter && o.letter === rec.letter ? { ...o, recommended: true, reason: rec.reason } : { ...o, recommended: false })),
+    reason: rec.reason, whyLine: why.line, tried: why.tried }
 }
+
+/** "A) One test run: restarts the app (~1 min)" → {letter: 'A', name: 'One test run', detail: 'restarts the app (~1 min)'}.
+ *  The name ends at the first ':' / ' - ' / ' — ' within 80 chars; otherwise the first clause is the name. */
+export function optionParts(text) {
+  const full = clip(text, 400)
+  const m = /^\s*(?:[Oo]ption\s+)?\(?([A-F1-9])(?:\)|\.|:|\s+[-\u2014\u2013])\s*/.exec(full)
+  const letter = m ? m[1].toUpperCase() : ''
+  const rest = m ? full.slice(m[0].length) : full
+  const sep = /\s*(?::\s|\s[-\u2014\u2013]\s)/.exec(rest)
+  const name = sep && sep.index > 0 && sep.index <= 80 ? rest.slice(0, sep.index) : clip(rest.split(/[.;,]\s/)[0], 80)
+  const detail = sep && sep.index > 0 && sep.index <= 80 ? rest.slice(sep.index + sep[0].length) : rest.slice(name.length).replace(/^[.;,]\s*/, '')
+  const cap = t => t ? t[0].toUpperCase() + t.slice(1) : t
+  return { letter, name: cap(name.trim()), detail: cap(detail.trim()), full }
+}
+
+/** "A - two reloads buy the check" → {letter: 'A', reason: 'two reloads buy the check'}; no leading letter → reason only. */
+export function recommendParts(text) {
+  const t = str(text).trim()
+  const m = /^(?:[Oo]ption\s+)?\(?([A-F1-9])\)?(?=[\s:,.\u2014\u2013-]|$)\s*(?:[-\u2014\u2013:,]|because)?\s*/.exec(t)
+  return m ? { letter: m[1].toUpperCase(), reason: t.slice(m[0].length).replace(/^because\s+/i, '').trim() } : { letter: '', reason: t }
+}
+
+/** why_human split: "Tried: … Only you can: …" → the user-facing line ("Only you can: …", or "Why you: …" for an
+ *  older free-text reason) and the agent's trail for Details. */
+export function whyParts(text) {
+  const t = str(text).replace(/\s+/g, ' ').trim()
+  const i = t.search(/\bonly you can\s*:/i)
+  if (i >= 0) return { line: `Only you can: ${t.slice(i).replace(/^only you can\s*:\s*/i, '').trim()}`, tried: t.slice(0, i).replace(/^tried\s*:\s*/i, '').trim() }
+  return /^tried\s*:/i.test(t) ? { line: '', tried: t.replace(/^tried\s*:\s*/i, '') } : { line: t ? `Why you: ${clip(t, 300)}` : '', tried: '' }
+}
+
+/** Composer draft for an option tile: the user's pick, sent only when they press send. */
+export const chooseText = (i, o) => `Card ${i.id}: go with ${o.letter ? `option ${o.letter}` : 'this option'} (${o.name}).\n`
+/** Composer drafts for a single-step card. */
+export const doneText = i => `Card ${i.id}: done.\n`
+export const skipText = i => `Card ${i.id}: skip this one; archive it.\n`
 
 /** Composer draft for Ask agent: a plain question about one card, sent only when the user presses send. */
 export const askAgentText = i => `Card ${i.id}: what exactly do you need me to do, and where? Please answer in one or two plain sentences.\n`
@@ -1368,25 +1412,72 @@ function CardStatusRow({ i }) {
   ] })
 }
 
+const clamp = n => ({ display: '-webkit-box', WebkitLineClamp: n, WebkitBoxOrient: 'vertical', overflow: 'hidden' })
+const pill = color => ({ fontSize: 10, fontWeight: 700, letterSpacing: 0.4, textTransform: 'uppercase', color, border: `1px solid color-mix(in srgb, ${color} 55%, transparent)`, borderRadius: 999, padding: '1px 6px', whiteSpace: 'nowrap' })
+
+function OptionTile({ o, onChoose }) {
+  const accent = o.recommended ? C.running : 'var(--border)'
+  return jsxs('div', { 'data-ask-option': o.letter || '', ...(o.recommended ? { 'data-recommended': '' } : {}), style: { display: 'grid', gridTemplateColumns: '22px minmax(0,1fr) auto', columnGap: 10, alignItems: 'start', padding: '8px 10px', borderRadius: 6, border: `1px solid ${accent}`, background: o.recommended ? `color-mix(in srgb, ${C.running} 8%, transparent)` : 'transparent' }, children: [
+    jsx('span', { 'aria-hidden': true, style: { width: 22, height: 22, borderRadius: 999, display: 'grid', placeItems: 'center', fontSize: 11.5, fontWeight: 700, background: o.recommended ? C.running : 'color-mix(in srgb, var(--foreground) 12%, transparent)', color: o.recommended ? '#fff' : 'var(--foreground)' }, children: o.letter || '•' }),
+    jsxs('div', { style: { minWidth: 0 }, children: [
+      jsxs('div', { style: { display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }, children: [
+        jsx('span', { 'data-ask-option-name': '', style: { fontWeight: 600, fontSize: 13 }, children: o.name }),
+        o.recommended && jsx('span', { style: pill(C.running), children: 'Recommended' })
+      ] }),
+      o.detail && jsx('div', { 'data-ask-option-detail': '', title: o.detail, style: { ...clamp(2), fontSize: 12, lineHeight: 1.45, color: 'var(--muted-foreground)', marginTop: 2 }, children: o.detail }),
+      o.recommended && o.reason && jsx('div', { 'data-ask-reason': '', style: { fontSize: 12, lineHeight: 1.45, marginTop: 3, color: C.running }, children: `Why: ${o.reason}` })
+    ] }),
+    jsx('button', { type: 'button', 'data-ask-choose': o.letter || '', title: 'Drafts your answer in the composer; nothing happens until you send it', onClick: onChoose,
+      style: { ...btn, minHeight: 28, alignSelf: 'center', ...(o.recommended ? { background: C.running, borderColor: C.running, color: '#fff', fontWeight: 600 } : {}) }, children: `Choose${o.letter ? ` ${o.letter}` : ''}` })
+  ] })
+}
+
 function AskRow({ i, session }) {
   const st = typeof window !== 'undefined' ? window.__sessionTasks : null
   const canOpen = i.kind === 'kanban' && !!i.chip.connectionId && !!i.chip.profile && typeof st?.openTaskChip === 'function'
   const v = askView(i.chip)
-  const ask = () => { void host.composer?.setDraft?.(session, askAgentText(i)); host.composer?.focus?.(session) }
-  const line = { fontSize: 12.5, lineHeight: 1.45, overflowWrap: 'anywhere', minWidth: 0 }
-  return jsxs('div', { 'data-panel-row': i.key, 'data-ask-row': v.known ? 'known' : 'unknown', style: { border: `1px solid color-mix(in srgb, ${C.needsYou} 45%, transparent)`, borderRadius: 6, padding: '8px 10px', marginBottom: 6, minWidth: 0 }, children: [
-    jsx('div', { 'data-ask-title': '', style: { fontWeight: 600, overflowWrap: 'anywhere' }, children: i.label }),
-    v.brief && jsx('div', { 'data-ask-situation': '', style: { ...line, marginTop: 2 }, children: v.brief.situation }),
-    v.brief && v.brief.options.length > 0 && jsx('ul', { 'data-ask-options': '', style: { ...line, margin: '2px 0', paddingLeft: 18 }, children: v.brief.options.map((o, n) => jsx('li', { children: o }, n)) }),
-    v.brief && v.brief.recommend && jsx('div', { 'data-ask-recommend': '', style: { ...line, fontWeight: 600 }, children: `Recommended: ${v.brief.recommend}` }),
-    jsx('div', { 'data-ask-step': '', title: v.full || undefined, style: { fontWeight: 600, fontSize: 13, lineHeight: 1.45, overflowWrap: 'anywhere', minWidth: 0 }, children: v.known ? `Do this: ${v.step}` : v.step }),
-    v.why && jsx('div', { 'data-ask-why': '', style: { ...line, color: 'var(--muted-foreground)' }, children: `Why you: ${v.why}` }),
-    jsx('div', { 'data-ask-next': '', style: line, children: `Next: ${v.next}` }),
-    i.evidenceText && jsx('div', { 'data-evidence': i.evidenceState || '', style: { ...muted, fontSize: 11, overflowWrap: 'anywhere' }, children: `evidence: ${i.evidenceText}` }),
-    jsxs('div', { style: { display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 6, marginTop: 6 }, children: [
-      canOpen && jsx('button', { type: 'button', 'data-open-card': '', style: btn, onClick: () => st.openTaskChip(i.chip), children: 'Open card' }),
-      !v.known && jsx('button', { type: 'button', 'data-ask-agent': '', style: btn, title: 'Drafts a question to the agent in the composer; nothing is sent until you send it', onClick: ask, children: 'Ask agent' }),
-      jsx('span', { 'data-ask-card': '', title: str(i.chip?.title) || i.label, style: { ...muted, marginLeft: 'auto', fontSize: 11 }, children: i.id ? `card ${i.id}` : '' })
+  const [more, setMore] = useState(false)
+  const draft = text => { void host.composer?.setDraft?.(session, text); host.composer?.focus?.(session) }
+  const small = { fontSize: 12, lineHeight: 1.45, overflowWrap: 'anywhere', minWidth: 0 }
+  const situation = v.brief?.situation || ''
+  const long = situation.length > 220
+  const kind = v.decision ? 'Needs your decision' : v.known ? 'Needs you' : 'Needs you · step not shown'
+  const details = [
+    v.tried && ['What the agent tried', v.tried],
+    v.known && (v.yes || v.no) && ['Card buttons', `Unblock = ${v.yes || 'continue'}; Archive = ${v.no || 'drop it'}`],
+    v.decision && v.full && ['Ask as filed', v.full],
+    !v.decision && v.brief?.recommend && ['Recommendation', v.brief.recommend],
+    i.evidenceText && ['Evidence', i.evidenceText]
+  ].filter(Boolean)
+  return jsxs('div', { 'data-panel-row': i.key, 'data-ask-row': v.known ? (v.decision ? 'decision' : 'known') : 'unknown', style: { border: '1px solid var(--border)', borderLeft: `3px solid ${C.needsYou}`, borderRadius: 8, padding: '10px 12px', marginBottom: 8, minWidth: 0, display: 'grid', gap: 8 }, children: [
+    jsxs('div', { style: { display: 'flex', alignItems: 'baseline', gap: 8, minWidth: 0 }, children: [
+      jsx('span', { 'data-ask-kind': '', style: { fontSize: 10.5, fontWeight: 700, letterSpacing: 0.5, textTransform: 'uppercase', color: C.needsYou, whiteSpace: 'nowrap' }, children: kind }),
+      jsx('span', { 'data-ask-card': '', title: str(i.chip?.title) || i.label, style: { ...muted, marginLeft: 'auto', fontSize: 10.5, fontFamily: 'var(--font-mono, ui-monospace, monospace)', whiteSpace: 'nowrap' }, children: i.id || '' })
+    ] }),
+    jsx('div', { 'data-ask-title': '', style: { fontWeight: 600, fontSize: 14, lineHeight: 1.35, overflowWrap: 'anywhere', marginTop: -4 }, children: i.label }),
+    situation && jsxs('div', { 'data-ask-situation-wrap': '', style: small, children: [
+      jsx('div', { 'data-ask-situation': '', style: { fontSize: 12.5, lineHeight: 1.5, ...(more ? {} : clamp(2)) }, children: situation }),
+      long && jsx('button', { type: 'button', 'data-ask-more': '', onClick: () => setMore(m => !m), style: { background: 'none', border: 0, padding: 0, font: 'inherit', fontSize: 12, color: C.running, cursor: 'pointer' }, children: more ? 'Less' : 'More' })
+    ] }),
+    v.decision && jsxs('div', { 'data-ask-options': '', style: { display: 'grid', gap: 6 }, children: [
+      ...v.options.map((o, n) => jsx(OptionTile, { o, onChoose: () => draft(chooseText(i, o)) }, n)),
+      jsx('div', { 'data-ask-next': '', style: { ...muted, fontSize: 11 }, children: 'Choose drafts your answer in the chat box; send it to decide.' })
+    ] }),
+    !v.decision && jsxs('div', { 'data-ask-step-box': '', style: { borderRadius: 6, padding: '8px 10px', background: 'color-mix(in srgb, var(--foreground) 6%, transparent)' }, children: [
+      jsx('div', { style: { fontSize: 10.5, fontWeight: 700, letterSpacing: 0.4, textTransform: 'uppercase', color: 'var(--muted-foreground)', marginBottom: 2 }, children: v.known ? 'Your step' : 'Step' }),
+      jsx('div', { 'data-ask-step': '', title: v.full || undefined, style: { fontSize: 13, lineHeight: 1.45, fontWeight: 500, overflowWrap: 'anywhere' }, children: v.step }),
+      v.brief?.recommend && v.reason && jsx('div', { 'data-ask-recommend': '', style: { ...small, marginTop: 4, color: C.running }, children: `Recommended: ${v.brief.recommend}` })
+    ] }),
+    v.whyLine && jsx('div', { 'data-ask-why': '', style: { ...small, color: 'var(--muted-foreground)' }, children: v.whyLine }),
+    (!v.decision || !v.known) && jsxs('div', { style: { display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 6 }, children: [
+      v.known && !v.decision && jsx('button', { type: 'button', 'data-ask-done': '', style: { ...btn, minHeight: 28, background: C.running, borderColor: C.running, color: '#fff', fontWeight: 600 }, title: 'Drafts "done" to the agent in the composer; nothing is sent until you send it', onClick: () => draft(doneText(i)), children: 'I did it' }),
+      v.known && !v.decision && jsx('button', { type: 'button', 'data-ask-skip': '', style: { ...btn, minHeight: 28 }, title: 'Drafts "skip" to the agent in the composer', onClick: () => draft(skipText(i)), children: 'Skip it' }),
+      !v.known && jsx('button', { type: 'button', 'data-ask-agent': '', style: { ...btn, minHeight: 28 }, title: 'Drafts a question to the agent in the composer; nothing is sent until you send it', onClick: () => draft(askAgentText(i)), children: 'Ask agent' }),
+      v.known && !v.decision && jsx('span', { 'data-ask-next': '', style: { ...muted, fontSize: 11 }, children: 'Buttons draft your answer in the chat box; send it to decide.' })
+    ] }),
+    (details.length > 0 || canOpen) && jsxs('details', { 'data-ask-details': '', style: { ...small, color: 'var(--muted-foreground)' }, children: [
+      jsxs('summary', { style: { cursor: 'pointer', fontSize: 11.5 }, children: ['Details', canOpen && jsx('button', { type: 'button', 'data-open-card': '', style: { background: 'none', border: 0, padding: 0, marginLeft: 12, font: 'inherit', fontSize: 11.5, color: C.running, cursor: 'pointer' }, onClick: e => { e.preventDefault(); st.openTaskChip(i.chip) }, children: 'Open card' })] }),
+      ...details.map(([k, t], n) => jsxs('div', { ...(k === 'Evidence' ? { 'data-evidence': i.evidenceState || '' } : {}), style: { marginTop: 4, fontSize: 11.5 }, children: [jsx('span', { style: { fontWeight: 600 }, children: `${k}: ` }), t] }, n))
     ] })
   ] })
 }

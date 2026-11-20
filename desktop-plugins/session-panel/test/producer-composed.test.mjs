@@ -244,7 +244,7 @@ test('producer: Needs you shows the card human_request (from core TEXT rows), no
     await render('ask-copy')
     const row = el().querySelector(`[data-ask-row][data-panel-row="kb:C1:default:default:${ID}"]`)
     assert.ok(row, el().innerHTML)
-    assert.equal(row.querySelector('[data-ask-step]').textContent, 'Do this: Reply in this chat with a spend cap.')
+    assert.equal(row.querySelector('[data-ask-step]').textContent, 'Reply in this chat with a spend cap.')
     assert.equal(row.querySelector('[data-ask-why]').textContent, 'Why you: Spend needs the owner.')
     assert.equal(row.querySelector('[data-ask-step]').textContent.includes(TITLE), false)
   } finally { dispose() }

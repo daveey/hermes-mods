@@ -61,7 +61,8 @@ Stop at the first rung that works. Each rung is something agents may do without 
   reverse with <how>`. Unblock it (or never block it) and read the status back.
 - **Rung g** → you are certain David is needed. Write down, for the next skill:
   - the one-sentence blocker (step 1);
-  - what you checked (step 2) and which rungs you tried and why each failed (step 3);
+  - what you checked (step 2) and what you tried and why each failed (step 3), in plain words: the card's
+    why_human says "Tried: …", never "rung a/b/…" (rung letters belong only in your trail comment);
   - the decision David actually owns, phrased as a question he can answer without reading the card's history.
   Then load **generate-unblock-card** and file the card with it.
 

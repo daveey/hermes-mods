@@ -136,15 +136,28 @@ test('needs-you shows the plain card title next to the action', async () => {
   assert.match(el().querySelector('[data-ask-step]').textContent, /Choose A or B/)
 })
 
-test('needs-you renders a generate-unblock-card brief: situation, options, recommended pick', async () => {
-  const brief = { situation: 'The fix is installed; one check needs a debug run.', options: ['A) One supervised run', 'B) Accept the gap'], recommend: 'A — covers the bug you hit.' }
+test('needs-you renders a decision card: situation, option tiles, recommended pick highlighted, details folded', async () => {
+  const brief = { situation: 'The fix is installed; one check needs a debug run.', options: ['A) One supervised run: restarts Desktop once (~1 min). Reversible.', 'B) Accept the gap - nothing restarts.'], recommend: 'A — covers the bug you hit.' }
   bridges({ chips: [card('t_x', 'blocked', { label: 'Decide how to finish testing the fix', look: 'needs-you',
-    humanRequest: { action: 'Choose how to finish. Unblock = A (one run). Archive = B (accept the gap).', why: 'Tried: attach.', brief } })] })
+    humanRequest: { action: 'Choose how to finish. Unblock = A (one run). Archive = B (accept the gap).', why: 'Tried: attach to the old app. Only you can: allow a restart.', brief } })] })
   await show(React.createElement(m.Panel, { key: 'ask-brief' }))
-  assert.equal(el().querySelector('[data-ask-situation]')?.textContent, brief.situation)
-  assert.deepEqual([...el().querySelectorAll('[data-ask-options] li')].map(li => li.textContent), brief.options)
-  assert.equal(el().querySelector('[data-ask-recommend]')?.textContent, 'Recommended: A — covers the bug you hit.')
-  assert.match(el().querySelector('[data-ask-next]').textContent, /press Unblock \(A \(one run\)\), or Archive if you don’t want it \(B \(accept the gap\)\)/)
+  const row = el().querySelector('[data-ask-row]')
+  assert.equal(row.getAttribute('data-ask-row'), 'decision')
+  assert.equal(row.querySelector('[data-ask-kind]').textContent, 'Needs your decision')
+  assert.equal(row.querySelector('[data-ask-situation]')?.textContent, brief.situation)
+  const tiles = [...row.querySelectorAll('[data-ask-option]')]
+  assert.deepEqual(tiles.map(t => t.querySelector('[data-ask-option-name]').textContent), ['One supervised run', 'Accept the gap'])
+  assert.deepEqual(tiles.map(t => t.hasAttribute('data-recommended')), [true, false])
+  assert.equal(tiles[0].querySelector('[data-ask-option-detail]').textContent, 'Restarts Desktop once (~1 min). Reversible.')
+  assert.equal(tiles[0].querySelector('[data-ask-reason]').textContent, 'Why: covers the bug you hit.')
+  assert.deepEqual(tiles.map(t => t.querySelector('[data-ask-choose]').textContent), ['Choose A', 'Choose B'])
+  assert.equal(row.querySelector('[data-ask-why]').textContent, 'Only you can: allow a restart.')
+  assert.equal(row.querySelector('[data-ask-step]'), null, 'a decision card shows choices, not a "Do this" step')
+  const details = row.querySelector('[data-ask-details]')
+  assert.equal(details.open, false, 'agent trail is folded')
+  assert.match(details.textContent, /What the agent tried: attach to the old app\./)
+  assert.match(details.textContent, /Card buttons: Unblock = A \(one run\); Archive = B \(accept the gap\)/)
+  assert.doesNotMatch(row.textContent, /rung|Do this:|Next:/)
 })
 
 const { fixture } = loadFixture()

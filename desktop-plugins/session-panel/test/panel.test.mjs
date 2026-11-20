@@ -547,14 +547,19 @@ test('panel: unasked rows show the step for local and remote cards; missing data
   assert.deepEqual(rows.map(r => r.getAttribute('data-panel-row')), ['kb:t_local', 'kb:G2:default:default:t_remote', 'kb:t_bare'], 'canonical-covered card is not repeated')
   assert.equal(el().querySelector('[data-section="needs-you"]').textContent, 'Needs you · 4')
   const [local, remote, bare] = rows
-  assert.equal(local.querySelector('[data-ask-step]').textContent, 'Do this: Sign in to the Telnyx portal through the agent browser when opened.')
+  assert.equal(local.querySelector('[data-ask-step]').textContent, 'Sign in to the Telnyx portal through the agent browser when opened.')
   assert.equal(local.querySelector('[data-ask-why]').textContent, 'Why you: Primary portal authentication is absent from the vault.')
-  assert.match(local.querySelector('[data-ask-next]').textContent, /^Next: When done, open the card and press Unblock \(continue staged/)
+  assert.equal(local.querySelector('[data-ask-next]').textContent, 'Buttons draft your answer in the chat box; send it to decide.')
+  assert.match(local.querySelector('[data-ask-details]').textContent, /Card buttons: Unblock = continue staged/, 'button mapping lives under Details')
+  await React.act(async () => { local.querySelector('[data-ask-done]').click(); await flush() })
+  assert.deepEqual(drafts.at(-1), ['S1', 'Card t_local: done.\n'])
+  await React.act(async () => { local.querySelector('[data-ask-skip]').click(); await flush() })
+  assert.deepEqual(drafts.at(-1), ['S1', 'Card t_local: skip this one; archive it.\n'])
   for (const r of rows) assert.equal(r.querySelector('[data-ask-step]').textContent.includes('settled'), false, 'title/status never shown as the ask')
   assert.equal(el().textContent.includes('answer in chat or open the card'), false)
   // safe rendering: markup in the request is text, not elements
   assert.equal(remote.querySelector('img'), null)
-  assert.equal(remote.querySelector('[data-ask-step]').textContent, `Do this: ${xss}`)
+  assert.equal(remote.querySelector('[data-ask-step]').textContent, xss)
   assert.equal(globalThis.__pwned, undefined)
   // Open card routes the exact (remote) chip
   await React.act(async () => { remote.querySelector('[data-open-card]').click(); await flush() })
@@ -1086,4 +1091,17 @@ test('askView: "Unblock = A. Archive = B." splits like "Unblock = A; archive = B
   for (const action of ['Choose. Unblock = A (one run). Archive = B (accept).', 'Choose. Unblock = A (one run); archive = B (accept).']) {
     assert.equal(m.askView({ humanRequest: { action } }).next, 'When done, open the card and press Unblock (A (one run)), or Archive if you don’t want it (B (accept)). You can also reply in chat.')
   }
+})
+
+test('askView parts: option tiles, recommended letter, why split (redesigned decision card)', () => {
+  assert.deepEqual(m.optionParts('A) One idle-timed test run: an agent restarts Desktop (~10 min). Reversible.'),
+    { letter: 'A', name: 'One idle-timed test run', detail: 'An agent restarts Desktop (~10 min). Reversible.', full: 'A) One idle-timed test run: an agent restarts Desktop (~10 min). Reversible.' })
+  assert.deepEqual(m.optionParts('B) Accept with the known gaps — nothing restarts.').name, 'Accept with the known gaps')
+  assert.equal(m.optionParts('Option 2: keep it').letter, '2')
+  assert.deepEqual(m.recommendParts('A - two short reloads cover the bug'), { letter: 'A', reason: 'two short reloads cover the bug' })
+  assert.deepEqual(m.recommendParts('Option B because it is cheaper'), { letter: 'B', reason: 'it is cheaper' })
+  assert.deepEqual(m.recommendParts('plug it in at the desk'), { letter: '', reason: 'plug it in at the desk' })
+  assert.deepEqual(m.whyParts('Tried: rung a (x). Only you can: allow a restart.'), { line: 'Only you can: allow a restart.', tried: 'rung a (x).' })
+  assert.deepEqual(m.whyParts('Spend needs the owner.'), { line: 'Why you: Spend needs the owner.', tried: '' })
+  assert.equal(m.chooseText({ id: 't_x' }, { letter: 'A', name: 'One run' }), 'Card t_x: go with option A (One run).\n')
 })

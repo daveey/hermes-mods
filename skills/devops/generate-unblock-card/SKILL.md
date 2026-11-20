@@ -49,12 +49,12 @@ Answer each in your notes first:
 |---|---|
 | card `title` | Plain outcome, ≤ 80 chars, no internal jargon: "Decide how to finish testing the Mac app fix (PR 1697)". |
 | `action` | One or two sentences: the step itself + "Unblock = <recommended>; archive = <stop path>." Never "reply in this chat". |
-| `why_human` | `Tried: <rungs from try-to-unblock and why each failed>. Only you can: <the human-only part>.` |
+| `why_human` | `Tried: <what you tried, in plain words>. Only you can: <the human-only part, one short clause>.` Never write "rung": the panel shows only the "Only you can" part; "Tried" folds under Details. |
 | `interaction` | `approval` / `reply` for a decision; `physical`, `user_terminal`, `external` for a step. |
 | `scope` | The decision brief, three labelled parts (the panel renders them; the guard checks them): |
-| | `Situation: <2-3 plain sentences>` |
-| | `Options:` then one line per option: `A) <name> — <what happens>; <cost>; <reversible?>` |
-| | `Recommend: <letter> — <one reason naming the tradeoff>` |
+| | `Situation: <at most 2 plain sentences, ~200 characters: what happened and why it stopped>` |
+| | `Options:` then one line per option: `A) <name, ≤6 words>: <what happens>; <cost>; <reversible?>` (≤ ~140 chars after the name) |
+| | `Recommend: <letter> - <one reason naming the tradeoff, ≤ ~120 chars>` |
 | `choices` | For decisions: 2-4 buttons, `{label, value}`, label ≤ 60 chars. Exactly one label ends `(recommended)`, listed first. |
 | `evidence` | Verbatim tool output from this turn that shows the blocker (the guard refuses paraphrase). |
 | `resolved_check` | Add when his step happens outside Hermes and a probe can see it (asking-the-user / physical asks). |
@@ -62,11 +62,21 @@ Answer each in your notes first:
 A physical or terminal step with no real alternatives still gets `Situation:` and `Recommend:` (what to do and
 when); `Options:` may be the single step plus "Archive = drop it".
 
+## How the panel shows it
+
+The session panel renders the card as: a "Needs your decision" label and the title; the Situation (clamped to two
+lines, with More); one tile per option with its letter, **name** in bold and the rest of the line as a one-line
+detail; the recommended tile highlighted with your reason under it and a filled **Choose** button; then
+"Only you can: …". Everything else (what you tried, the Unblock/Archive mapping, the ask as filed, evidence) is
+folded under Details. So: the name after `A)` must stand alone as a button-sized label, the text after `:` is the
+consequence, and nothing important may live only in `action` for a decision card.
+
 ## 3. Read it back cold
 
 Before filing, reread title + action + scope as if you had never seen this work:
 
-- Could he answer from the panel alone, without opening the card? 
+- Could he answer from the panel alone, without opening the card? Is the Situation two sentences or fewer, and does
+  each option name read as a button label (≤6 words)?
 - Is every term understandable by someone who doesn't know Hermes internals?
 - Does each option say what happens *and* what it costs him?
 - Is the recommendation obvious and is the reason a real tradeoff?
@@ -102,13 +112,13 @@ title: "Decide how to finish testing the Mac app fix (PR 1697)"
 human_request:
   interaction: approval
   action: "Choose how to finish verifying the fix. Unblock = A (one supervised test run); archive = B (accept with the known gap)."
-  why_human: "Tried: the original test app process exited, so I can't attach to it; restarting Hermes Desktop with debugging on is outside what you approved for this card. Only you can: allow a Desktop restart, or accept less proof than the card asked for."
+  why_human: "Tried: attaching to the test app (it has exited) and checking without a restart (not possible). Only you can: allow a Desktop restart, or accept less proof."
   scope: |
-    Situation: The fix for the Mac app's idle/frozen screen is merged and installed. Three of four checks passed. The last one (the screen recovers after a timeout while idle) needs a debug connection to the running app, and the app instance it was testing has since closed.
+    Situation: The Mac app's idle-screen fix is merged and installed; 3 of 4 checks passed. The last check needs a debug connection to the running app.
     Options:
-    A) One supervised test run — I restart Hermes Desktop with debugging on (~1 min, your open chats reload), run the idle-timeout check, then restart it normally. Reversible.
-    B) Accept with the known gap — lower the card's acceptance criteria to 3 of 4 checks and note the untested case. Nothing restarts; the gap stays untested until it shows up in normal use.
-    Recommend: A — one minute of restart buys the only check that covers the bug you actually hit.
+    A) One supervised test run: restart Desktop with debugging while you're away; ~10 min, chats reload twice; reversible.
+    B) Accept with the known gap: lowers acceptance to 3 of 4 checks; nothing restarts; reopen the card to undo.
+    Recommend: A - two short reloads buy the only check that covers the bug you actually hit.
   choices:
     - {label: "A: one supervised test run (recommended)", value: "A"}
     - {label: "B: accept with the known gap", value: "B"}
@@ -117,7 +127,8 @@ human_request:
 
 ## Done means
 - [ ] try-to-unblock reached rung g, and `why_human` starts with what was tried.
-- [ ] Title and Situation use no unexplained internal terms.
+- [ ] Title and Situation use no unexplained internal terms; Situation is two sentences or fewer.
+- [ ] Each option is `A) <name ≤6 words>: <consequence>`; why_human never says "rung".
 - [ ] Every option says what happens, what it costs, and whether it is reversible; one is recommended with a reason.
 - [ ] Unblock and Archive each map to a stated option; nothing says "reply in this chat".
 - [ ] The cold read passed before filing.
