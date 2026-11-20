@@ -1,8 +1,16 @@
 # Runners Desktop — machines and slots
 
-Status-bar chip (order 6) and panel. The chip shows two bars, **Hub** (the hub's card slots) and **Workers**
-(every other gateway with a slot cap): the track is capacity, the fill is scheduled cards; green while there is
-room, red once every slot is taken. A status dot appears only for warn/bad (stale data, lost machine).
+Status-bar chip (order 6) and panel. The chip has one 4×4 px pip per card slot in two rows,
+with the outlined hub group first and worker machines sorted by name. There are no text labels.
+Busy pips are green, red when their hub/worker pool's usable slots are full; free pips are grey.
+Throttled slots hatch amber at the end. Draining machines have blue busy pips and faint blue
+outlines for leaving capacity; lost machines have red busy pips and a red group outline.
+Launching workers pulse amber: pips fill by elapsed boot time / median launch-to-ready time in
+the last 24-hour scaler ledger window (34 minutes without completed boots). They use the most
+common registered worker slot count (six without registry evidence), but contribute no scheduling
+capacity until registered. The chip and each group have per-machine tooltips; the accessible name
+retains hub/worker totals and names launching workers. Reduced motion disables the pulse.
+A status dot appears only for warn/bad (stale data, lost machine). The popover layout is unchanged.
 
 The panel has two groups, one row per machine, one square per slot:
 
@@ -77,8 +85,8 @@ when it differs, the fleet rate, this gateway's open slots (`here 4/6 slots at 3
 A machine the autoscaler holds while it enrolls (hold reason `worker-scaler: enrolling …`) is labelled
 "enrolling", not "draining".
 
-The chip's Workers and Hub bars hatch the right end of the track for the crossed-out share, and the bar turns
-red once the usable slots are taken, even if crossed-out ones are free.
+The chip hatches the final throttled pips per machine; busy pips turn red once the pool's
+usable slots are taken, even if throttled ones are free.
 
 Without the throughput plugin, with an older one that sends no `slots`, or when that request fails, there is no
 cap field, no column value and nothing is crossed out.

@@ -98,7 +98,42 @@ def worker_events(ledger_path, since_s, now_s, limit=EVENTS_LIMIT):
 def with_worker_events(section, ledger_path, now_s):
     """The gateway section plus ``events`` (last EVENTS_WINDOW_S) and ``events_since`` (epoch seconds)."""
     since = now_s - EVENTS_WINDOW_S
-    return dict(section, events=worker_events(ledger_path, since, now_s), events_since=since)
+    events = worker_events(ledger_path, since, now_s)
+    launching, typical = launching_workers(section.get('machines', []), events)
+    return dict(section, machines=[*section.get('machines', []), *launching],
+                events=events, events_since=since, launch_ready_s=typical)
+
+
+def launching_workers(machines, events):
+    """Pure ledger projection: booting workers and median completed boot seconds.
+
+    Events are epoch seconds. Pair within one launch lifecycle; a removal or a
+    new launch closes the previous attempt. Registry rows always take precedence.
+    """
+    from collections import Counter
+    from statistics import median
+    latest, pending, durations = {}, {}, []
+    for e in sorted(events, key=lambda e: e['at']):
+        name, kind = e['worker'], e['kind']
+        latest[name] = e
+        if kind == 'launched':
+            pending[name] = e
+        elif kind in ('ready', 'removed'):
+            launch = pending.pop(name, None)
+            if (kind == 'ready' and launch and e['at'] > launch['at']
+                    and (not launch.get('instance') or not e.get('instance')
+                         or launch['instance'] == e['instance'])):
+                durations.append(e['at'] - launch['at'])
+    counts = Counter(m['slots'] for m in machines
+                     if m.get('name') != 'hub' and 'machine:hub' not in m.get('labels', [])
+                     and isinstance(m.get('slots'), int) and m['slots'] > 0)
+    # No worker registry evidence yet: the pool's standard six-card worker.
+    slots = sorted(counts, key=lambda n: (-counts[n], n))[0] if counts else 6
+    registered = {m['name'] for m in machines}
+    rows = [dict(name=name, state='launching', launched_at=e['at'], slots=slots, running=[])
+            for name, e in sorted(latest.items())
+            if e['kind'] == 'launched' and name not in registered]
+    return rows, median(durations) if durations else None
 
 
 def live_leases(shadow_dir, now_ms):

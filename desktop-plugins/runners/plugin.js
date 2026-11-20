@@ -388,10 +388,13 @@ export function merge(sources, now = Date.now()) {
 // the freshest route that has any, so the timeline does not come and go with whichever gateway answered last.
 function withEvents(section, sources) {
   const has = (g) => Array.isArray(g?.events) && g.events.length > 0
-  if (has(section)) return section
   const from = sources.filter((s) => has(s.body?.gateways)).sort((a, b) => (b.at || 0) - (a.at || 0))[0]
   if (!from) return section
-  return { ...section, events: from.body.gateways.events, events_since: from.body.gateways.events_since }
+  const g = from.body.gateways
+  const machines = section.machines.filter((m) => m.state !== 'launching')
+  const names = new Set(machines.map((m) => m.name))
+  return { ...section, machines: [...machines, ...(g.machines || []).filter((m) => m.state === 'launching' && !names.has(m.name))],
+    events: g.events, events_since: g.events_since, launch_ready_s: g.launch_ready_s }
 }
 
 // A gateway knows its own dispatcher cap; others only see the registry. Take each machine's
@@ -418,7 +421,7 @@ const isHub = (m) => m.name === 'hub' || (m.labels || []).includes('machine:hub'
 
 export function summarize(view, throttle = null) {
   // A stopped machine (held and off) has no capacity: it is left out of every slot total.
-  const g = (view.gateways.machines || []).filter((m) => m.state !== 'stopped'), c = view.ci.machines || []
+  const g = (view.gateways.machines || []).filter((m) => !['stopped', 'launching'].includes(m.state)), c = view.ci.machines || []
   const gBusy = g.reduce((n, m) => n + m.running.length, 0)
   const gSlots = g.reduce((n, m) => n + (m.slots ?? m.running.length), 0)
   const slots = c.flatMap((m) => m.slots)
@@ -989,15 +992,43 @@ export function meterTone(m) {
   return m.busy >= Math.min(m.slots, m.usable ?? m.slots) ? 'full' : 'ok'
 }
 
-function Meter({ name, m }) {
-  const tone = meterTone(m)
-  const pct = m.slots ? Math.min(100, Math.round((m.busy / m.slots) * 100)) : 0
-  // The right end of the track is hatched for slots a token or pacing limit will not let start.
-  const cut = m.slots && typeof m.usable === 'number' ? Math.max(0, Math.min(100, Math.round(((m.slots - m.usable) / m.slots) * 100))) : 0
-  return h('span', { className: 'hermes-fleet-chipmeter', 'data-meter': name.toLowerCase(), 'data-tone': tone, 'data-throttled': cut ? String(m.slots - m.usable) : undefined },
-    h('span', null, name),
-    h('span', { className: `hermes-fleet-chipbar is-${tone}` }, h('span', { style: { width: `${pct}%` } }),
-      cut ? h('i', { className: 'hermes-fleet-chipcut', style: { width: `${cut}%` } }) : null))
+// Pure status-chip model; the panel keeps its existing slot rendering.
+export function pipGroups(view, throttle = null, now = Date.now()) {
+  const totals = summarize(view, throttle)
+  const typical = Number.isFinite(view.gateways.launch_ready_s) && view.gateways.launch_ready_s > 0
+    ? view.gateways.launch_ready_s : 34 * 60
+  return (view.gateways.machines || [])
+    .filter((m) => m.state !== 'stopped' && Number.isInteger(m.slots) && m.slots > 0)
+    .sort((a, b) => Number(isHub(b)) - Number(isHub(a)) || a.name.localeCompare(b.name))
+    .map((m) => {
+      const hub = isHub(m), busy = m.running.length
+      const limit = slotLimit(m, limitRow(throttle, m.name))
+      const throttled = limit?.throttled || 0
+      const age = Math.max(0, now / 1000 - (m.launched_at ?? now / 1000))
+      const lit = Math.round(Math.min(1, age / typical) * m.slots)
+      const full = meterTone(hub ? totals.hub : totals.workers) === 'full'
+      const pips = Array.from({ length: m.slots }, (_, i) => {
+        if (m.state === 'launching') return i < lit ? 'booted' : 'boot'
+        if (i < busy) return m.state === 'draining' ? 'drain' : m.state === 'lost' || full ? 'lost' : 'busy'
+        if (m.state === 'draining') return 'gone'
+        return i >= m.slots - throttled ? 'thr' : 'free'
+      })
+      const title = m.state === 'launching'
+        ? `${m.name}: launching, ${Math.floor(age / 60)} min in (ready in ~${Math.max(0, Math.round((typical - age) / 60))})`
+        : m.state === 'draining' ? `${m.name}: draining, ${busy} card${busy === 1 ? '' : 's'} finishing`
+          : m.state === 'lost' ? `${m.name}: lost, holding ${busy} cards`
+            : `${m.name}: ${busy}/${m.slots} busy${throttled ? `, ${throttled} throttled` : ''}`
+      return { name: m.name, hub, state: m.state, lost: m.state === 'lost', pips, title }
+    })
+}
+
+export function PipChip({ groups }) {
+  return h('span', { className: 'hermes-fleet-chipgroups', 'aria-hidden': true },
+    ...[true, false].map((hub) => h('span', { key: String(hub), className: 'hermes-fleet-chippool' },
+      ...groups.filter((g) => g.hub === hub).map((g) => h('span', {
+        key: g.name, 'data-pip-machine': g.name, title: g.title,
+        className: `hermes-fleet-chipgroup${g.hub ? ' is-hub' : ''}${g.lost ? ' is-lost' : ''}${g.state === 'launching' ? ' is-launching' : ''}`
+      }, ...g.pips.map((state, i) => h('span', { key: i, className: `hermes-fleet-pip is-${state}` })))))))
 }
 
 // The React Query cache keeps the last view across refetches (no flicker, no spinner);
@@ -1022,7 +1053,7 @@ export function Runners({ ctx }) {
     return () => window.removeEventListener('hermes-show-runners', show)
   }, [])
   useEffect(() => { if (open && visible) query.refetch() }, [open])
-  const now = useNow(open && visible)
+  const now = useNow(visible)
   const view = query.data
   // The token throttle and per-gateway slot limits (throughput plugin). Absent or failing: nothing is crossed out.
   const [throttleError, setThrottleError] = useState(null)
@@ -1046,17 +1077,17 @@ export function Runners({ ctx }) {
     tq.refetch()
   }
   const s = view ? summarize(view, throttle) : null
+  const groups = view ? pipGroups(view, throttle, now) : []
+  const launching = groups.filter((g) => g.state === 'launching').map((g) => `${g.name} launching`)
   const label = s
-    ? `Runners · hub ${s.hub.busy}/${s.hub.slots} · workers ${s.workers.busy}/${s.workers.slots}`
+    ? `hub ${s.hub.busy}/${s.hub.slots} · workers ${s.workers.busy}/${s.workers.slots}${launching.length ? ` · ${launching.join(' · ')}` : ''}`
     : 'Runners …'
-  const title = s
-    ? `Hub ${s.hub.busy}/${s.hub.slots} slots scheduled · Workers ${s.workers.busy}/${s.workers.slots}${typeof s.workers.usable === 'number' && s.workers.usable < s.workers.slots ? ` (${s.workers.slots - s.workers.usable} throttled)` : ''} · CI ${s.cBusy}/${s.cSlots} busy${s.gWaiting ? ` · ${s.gWaiting} waiting` : ''}${s.lost ? ` · ${s.lost} machine lost` : ''}`
-    : 'Loading runners'
+  const title = s ? groups.map((g) => g.title).join(' · ') : 'Loading runners'
   return h(Popover, { open, onOpenChange: setOpen },
     h(PopoverTrigger, { asChild: true },
       h('button', { type: 'button', className: BAR, 'data-slot': 'runners-chip', 'aria-label': `Show runners: ${label}`, title },
         s && (s.tone === 'bad' || s.tone === 'warn') ? h(StatusDot, { tone: s.tone }) : null,
-        s ? [h(Meter, { key: 'hub', name: 'Hub', m: s.hub }), h(Meter, { key: 'workers', name: 'Workers', m: s.workers })]
+        s ? h(PipChip, { groups })
           : h('span', null, label))),
     h(PopoverContent, {
       side: 'top', align: 'end', sticky: 'always', 'aria-label': 'Runners',
@@ -1067,12 +1098,24 @@ export function Runners({ ctx }) {
 }
 
 const CSS = `
-.hermes-fleet-chipmeter{display:inline-flex;align-items:center;gap:4px}
-.hermes-fleet-chipbar{display:inline-block;width:44px;height:6px;border-radius:3px;background:var(--ui-stroke-secondary);overflow:hidden}
-.hermes-fleet-chipbar>span{display:block;height:100%;border-radius:3px}
-.hermes-fleet-chipbar.is-ok>span{background:#2ea043}
-.hermes-fleet-chipbar.is-full{background:rgba(214,69,69,.3)}
-.hermes-fleet-chipbar.is-full>span{background:#d64545}
+[data-slot="runners-chip"]{white-space:nowrap}
+.hermes-fleet-chipgroups{display:inline-flex;align-items:center;gap:15px}
+.hermes-fleet-chippool{display:inline-flex;align-items:center;gap:4px}
+.hermes-fleet-chippool:empty{display:none}
+.hermes-fleet-chipgroup{display:inline-grid;grid-auto-flow:column;grid-template-rows:repeat(2,4px);grid-auto-columns:4px;gap:1px;padding:1px;border-radius:2px}
+.hermes-fleet-chipgroup.is-hub{box-shadow:0 0 0 1px rgba(255,255,255,.32)}
+.hermes-fleet-chipgroup.is-lost{box-shadow:0 0 0 1px #d64545}
+.hermes-fleet-pip{width:4px;height:4px;border-radius:1px;background:rgba(255,255,255,.14)}
+.hermes-fleet-pip.is-busy{background:#2ea043}
+.hermes-fleet-pip.is-lost{background:#d64545}
+.hermes-fleet-pip.is-thr{background:repeating-linear-gradient(45deg,transparent 0 1px,#d08a1e 1px 2.2px)}
+.hermes-fleet-pip.is-drain{background:#388bfd}
+.hermes-fleet-pip.is-gone{background:transparent;box-shadow:inset 0 0 0 1px rgba(56,139,253,.35)}
+.hermes-fleet-pip.is-boot{background:transparent;box-shadow:inset 0 0 0 1px #d4a72c}
+.hermes-fleet-pip.is-booted{background:#d4a72c}
+@keyframes hermes-fleet-launch-pulse{50%{opacity:.35}}
+.hermes-fleet-chipgroup.is-launching{animation:hermes-fleet-launch-pulse 1.4s ease-in-out infinite}
+@media (prefers-reduced-motion:reduce){.hermes-fleet-chipgroup.is-launching{animation:none}}
 .hermes-fleet{display:flex;flex-direction:column;gap:3px;font-size:12px;padding:4px}
 .hermes-fleet>:not(.hermes-fleet-gw){contain:inline-size}
 .hermes-fleet-head{display:flex;justify-content:space-between;margin-top:8px;font-weight:600;text-transform:uppercase;font-size:11px;color:var(--ui-text-secondary)}

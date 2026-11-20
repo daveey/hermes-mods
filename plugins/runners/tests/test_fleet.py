@@ -399,10 +399,36 @@ def test_gateway_section_carries_events_and_the_window_start(tmp_path):
     out = fleet.with_worker_events(section, path, NOW_S)
     assert out['events_since'] == NOW_S - fleet.EVENTS_WINDOW_S == NOW_S - 24 * HOUR
     assert out['events'] == [dict(at=NOW_S - 60, worker='worker-1', kind='draining', reason='idle for 20 min', instance='i-0a')]
-    assert {k: v for k, v in out.items() if k not in ('events', 'events_since')} == section  # nothing else changes
+    assert {k: v for k, v in out.items() if k not in ('events', 'events_since', 'launch_ready_s')} == section  # nothing else changes
     assert 'events' not in section  # a new dict, not a mutation
     none = fleet.with_worker_events(section, tmp_path / 'absent.db', NOW_S)
     assert (none['events'], none['events_since']) == ([], NOW_S - 24 * HOUR)
+
+
+def test_launching_workers_lifecycle_registry_precedence_and_pool_slots():
+    machines = [dict(name='hub', slots=8), dict(name='worker-1', slots=4),
+                dict(name='worker-2', slots=6), dict(name='worker-3', slots=6)]
+    def event(at, worker, kind, instance='i-example'):
+        return dict(at=at, worker=worker, kind=kind, instance=instance)
+    launch = event(100, 'worker-new', 'launched')
+    rows, typical = fleet.launching_workers(machines, [launch])
+    assert rows == [dict(name='worker-new', state='launching', launched_at=100, slots=6, running=[])]
+    assert typical is None
+    assert fleet.launching_workers(machines, [launch, event(130, 'worker-new', 'ready')]) == ([], 30)
+    assert fleet.launching_workers(machines, [launch, event(130, 'worker-new', 'removed')]) == ([], None)
+    assert fleet.launching_workers(machines, [event(100, 'worker-1', 'launched')]) == ([], None)
+    assert fleet.launching_workers(machines, []) == ([], None)
+    assert fleet.launching_workers([], [launch])[0][0]['slots'] == 6
+    # Repeated ready is not another sample; removal closes an unsuccessful attempt.
+    events = [launch, event(130, 'worker-new', 'ready'), event(135, 'worker-new', 'ready'),
+              event(140, 'worker-new', 'launched'), event(230, 'worker-new', 'ready'),
+              event(240, 'worker-new', 'launched'), event(260, 'worker-new', 'removed'),
+              event(280, 'worker-new', 'ready')]
+    assert fleet.launching_workers(machines, list(reversed(events))) == ([], 60)
+    # A relaunched worker is booting again; completed historical boots still inform the estimate.
+    rows, typical = fleet.launching_workers(machines, events + [event(300, 'worker-new', 'launched')])
+    assert rows[0]['launched_at'] == 300 and typical == 60
+    assert machines[0] == dict(name='hub', slots=8)  # no input mutation
 
 
 def test_scaler_ledger_path_env_override_else_home_state(tmp_path):
