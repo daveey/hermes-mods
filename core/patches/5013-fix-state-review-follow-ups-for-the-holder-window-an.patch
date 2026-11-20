@@ -1,0 +1,208 @@
+From 353961e52b991936a8bf6897c43c654308f608e0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 14:17:22 -0800
+Subject: [PATCH] fix(state): review follow-ups for the holder-window and
+ doctor changes
+
+- A new episode a peer started (its record begins after this handle last
+  saw a holder) no longer inherits this handle's old window.
+- Doctor advice is coherent when only non-gateway processes hold state.db,
+  and two gateways are told they block each other.
+- Holder descriptions elide inline source only for a Python interpreter's
+  -c (gateway.status_inline_source), never a shell's or a script's.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hermes_cli/doctor_state.py                    | 23 ++++++++---
+ hermes_state_holders.py                       | 10 +++--
+ hermes_state_schema.py                        |  9 +++--
+ .../test_doctor_fts_deferral_holders.py       | 35 ++++++++++++++++-
+ .../test_fts_futile_holder_churn.py           | 39 +++++++++++++++++++
+ 5 files changed, 102 insertions(+), 14 deletions(-)
+
+diff --git a/hermes_cli/doctor_state.py b/hermes_cli/doctor_state.py
+index 54903f2694c..4af162363e9 100644
+--- a/hermes_cli/doctor_state.py
++++ b/hermes_cli/doctor_state.py
+@@ -51,19 +51,30 @@ def host_gateway_note() -> str:
+     return f" ({topology.describe()})" if topology is not None else ""
+ 
+ 
++def _fts_holder_advice(others: list, gateways: list) -> str:
++    """What to stop so the blocked rebuild can run, from the live holders split into gateways and the rest."""
++    if len(gateways) > 1:
++        return (f"several gateways hold it ({', '.join(gateways)}) and each blocks the other: keep one and stop the "
++                f"rest{' and ' + ', '.join(others) if others else ''}")
++    if others and gateways:
++        return (f"stop ONLY {', '.join(others)}; keep the host gateway {gateways[0]} running: its own retry rebuilds "
++                "within a minute of them leaving")
++    if others:
++        return (f"stop {', '.join(others)}; the next Hermes process to open state.db (or the host gateway's next "
++                "retry) then rebuilds")
++    if gateways:
++        return f"only the host gateway {gateways[0]} holds it now; its next retry rebuilds"
++    return "nothing holds it now; the next Hermes process to open state.db rebuilds"
++
++
+ def _fts_deferral_row(deferral: dict, live_holders) -> tuple:
+     """The warn row for a stored FTS-rebuild deferral. The record's ``holder_pids`` is its last writer's view, which
+     leaves that writer out (often the gateway), so the advice names the processes holding the DB now
+     (*live_holders*: ``(pid, description, is_gateway)``), never telling the user to stop the gateway, whose own
+     retry does the rebuild. Without a live view it falls back to the record."""
+     if live_holders is not None:
+-        others = ", ".join(desc for _pid, desc, is_gateway in live_holders if not is_gateway)
+-        gateways = ", ".join(desc for _pid, desc, is_gateway in live_holders if is_gateway)
+         held_by = ", ".join(desc for _pid, desc, _is_gateway in live_holders) or "no other process"
+-        keep = f"keep the host gateway {gateways} running: " if gateways else "the host gateway's "
+-        stop = (f"stop ONLY {others}; {keep}its own retry rebuilds within a minute of them leaving" if others else
+-                f"only the host gateway {gateways} holds it now; its next retry rebuilds" if gateways else
+-                "nothing holds it now; the host gateway's next retry rebuilds")
++        stop = _fts_holder_advice([d for _p, d, gw in live_holders if not gw], [d for _p, d, gw in live_holders if gw])
+     else:
+         held_by = f"PID(s) {deferral.get('holder_pids') or 'unknown'}"
+         stop = ("stop ONLY the holder(s) other than the host gateway; the gateway's own retry rebuilds within a "
+diff --git a/hermes_state_holders.py b/hermes_state_holders.py
+index a7983433d0d..0e6f782fd51 100644
+--- a/hermes_state_holders.py
++++ b/hermes_state_holders.py
+@@ -65,10 +65,12 @@ def describe_holder_pid(pid: int) -> str:
+             argv = psutil.Process(pid).cmdline() or None
+         except Exception:
+             argv = None
+-    if argv and "-c" in argv[1:-1]:
+-        # Inline bootstrap code (launcher wrappers) would fill the 80 characters; the arguments after it say who.
+-        at = argv.index("-c", 1)
+-        argv = [*argv[:at + 1], "…", *argv[at + 2:]]
++    if argv and _looks_like_python_executable(argv[0]):
++        from gateway.status_inline_source import inline_source_flag_index
++        at = inline_source_flag_index(argv)
++        if at is not None and at + 1 < len(argv):
++            # An interpreter's inline source (launcher wrappers) would fill the 80 characters; its arguments follow.
++            argv = [*argv[:at + 1], "<inline code>", *argv[at + 2:]]
+     who = " ".join(" ".join([os.path.basename(argv[0]), *argv[1:]]).split())[:80] if argv else "command line unavailable"
+     return f"PID {pid} ({who})"
+ 
+diff --git a/hermes_state_schema.py b/hermes_state_schema.py
+index 0bc0e03e3e8..00a9f70ee4a 100644
+--- a/hermes_state_schema.py
++++ b/hermes_state_schema.py
+@@ -530,8 +530,8 @@ class SessionSchemaMixin:
+         holders and the remedy that works from inside a gateway session (stop only the other
+         holder; this process's own retry tick admits the rebuild). The window restarts only
+         when the last deferral saw no holder, or when the gap since it is negative or longer
+-        than twice the retry backoff cap (a new episode). This process also keeps its own copy
+-        of the window and the longer one counts, so a writer that resets the shared record (an
++        than twice the retry backoff cap (a new episode). This handle also keeps its own copy of
++        the window and the longer one counts, so a writer that resets the shared record (an
+         older release still on the store) cannot starve this process's futility decision."""
+         now = time.time()
+         try:
+@@ -552,8 +552,11 @@ class SessionSchemaMixin:
+         if first_seen > now or first_seen < 0:
+             first_seen = now
+         holder_pids = sorted({pid for pid, _path in foreign_holders if pid > 0})
+-        # No record at all is a new episode (recovery deletes it); this process's copy starts over with it.
++        # No record at all, or one whose episode began after this process last saw a holder, is a new episode
++        # (recovery deletes the record; a peer may write the next episode's first one): this copy starts over.
+         own = getattr(self, "_fts_holder_presence", None) if row else None
++        if own is not None and own[2] < first_seen:
++            own = None
+         holders_since, holders_attempts = _continue_holder_presence(shared, now)
+         own_since, own_attempts = _continue_holder_presence(own, now)
+         holders_since, holders_attempts = min(holders_since, own_since), max(holders_attempts, own_attempts)
+diff --git a/tests/hermes_cli/test_doctor_fts_deferral_holders.py b/tests/hermes_cli/test_doctor_fts_deferral_holders.py
+index e12e094ed6c..8958691bf58 100644
+--- a/tests/hermes_cli/test_doctor_fts_deferral_holders.py
++++ b/tests/hermes_cli/test_doctor_fts_deferral_holders.py
+@@ -97,7 +97,40 @@ def test_holder_description_skips_inline_bootstrap_code(tmp_path):
+     try:
+         assert proc.stdout.readline().strip() == "ready"
+         desc = describe_holder_pid(proc.pid)
+-        assert desc.endswith("-c … gateway run)"), desc
++        assert desc.endswith("-c <inline code> gateway run)"), desc
++    finally:
++        proc.stdin.close()
++        proc.wait(timeout=30)
++
++
++def test_other_holders_without_a_gateway_get_coherent_advice():
++    text = _deferral_row(
++        {"futile": False, "holder_pids": [200], "attempts": 4}, [WATCHER]
++    )
++    assert (
++        "stop PID 200 (python3 hermes_hub.py watch); the next Hermes process to open state.db"
++        in text
++    )
++    assert "gateway's its" not in text and "stop ONLY" not in text
++
++
++def test_two_gateways_are_told_they_block_each_other():
++    other_gateway = (101, "PID 101 (hermes gateway run)", True)
++    text = _deferral_row(
++        {"futile": True, "holder_pids": [101], "holders_attempts": 12},
++        [GATEWAY, other_gateway],
++    )
++    assert "several gateways hold it" in text and "keep one and stop the rest" in text
++    assert "its next retry rebuilds" not in text
++
++
++@pytest.mark.platforms("linux", "macos")
++def test_holder_description_keeps_a_non_python_dash_c():
++    from hermes_state_holders import describe_holder_pid
++
++    proc = subprocess.Popen(["sh", "-c", "read x", "sh"], stdin=subprocess.PIPE)
++    try:
++        assert "read x" in describe_holder_pid(proc.pid)
+     finally:
+         proc.stdin.close()
+         proc.wait(timeout=30)
+diff --git a/tests/hermes_state/test_fts_futile_holder_churn.py b/tests/hermes_state/test_fts_futile_holder_churn.py
+index b57b472dbb6..c85dfe26977 100644
+--- a/tests/hermes_state/test_fts_futile_holder_churn.py
++++ b/tests/hermes_state/test_fts_futile_holder_churn.py
+@@ -174,3 +174,42 @@ def test_an_older_writer_resetting_the_shared_record_cannot_starve_futility(
+     assert record.get("futile") is True and record["holders_attempts"] == attempts, (
+         record
+     )
++
++
++def test_a_new_episode_started_by_a_peer_does_not_inherit_this_handles_window(
++    stale_store,
++):
++    """A peer recovers (deleting the record), the index goes stale again and the peer writes the new episode's
++    first deferral: this handle's window from the old episode must not make the new one futile at once."""
++    db, db_path, clock = stale_store
++    attempts = hermes_state_schema._FTS_HOLDER_FUTILE_ATTEMPTS
++    step = hermes_state_schema._FTS_HOLDER_FUTILE_SECONDS / (attempts - 1)
++    record = {}
++    for _ in range(attempts):
++        record = _defer(db, clock, step)
++        if record.get("futile"):
++            break
++    assert record.get("futile") is True, record
++    clock[0] += step
++    fresh = {
++        "first_seen": clock[0],
++        "last_seen": clock[0],
++        "attempts": 1,
++        "holder_pids": [4242],
++        "holders_since": clock[0],
++        "holders_attempts": 1,
++        "futile": False,
++    }
++    raw = sqlite3.connect(str(db_path))
++    raw.execute(
++        "UPDATE state_meta SET value = ? WHERE key = ?",
++        (json.dumps(fresh), FTS_REBUILD_DEFERRAL_KEY),
++    )
++    raw.commit()
++    raw.close()
++    record = _defer(db, clock, step)
++    assert (
++        record["holders_attempts"] == 2
++        and record["holders_since"] >= fresh["first_seen"]
++    ), record
++    assert not record.get("futile"), record
+-- 
+2.43.0
+

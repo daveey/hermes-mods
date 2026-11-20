@@ -1,0 +1,1229 @@
+From 822d12e06030b628b21f062689f03f18c179405a Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 16:08:51 -0800
+Subject: [PATCH] [daveey] Show a host's own core update on the version pill
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Desktop only knew about updates it started itself. When hermes-sync updated
+the hub on its own (2020-01-01: 12 min draining, 4 min installing), the only
+sign was "Waiting for a Hermes update" on a held message.
+
+- GET /api/hermes/update/progress (hermes_cli/core_update_progress.py) reads
+  the host's published window.json, drain.json and governor-other-defers.json:
+  state (batching/draining/applying/blocked), elapsed on the host's clock,
+  the drainer's cap and what it is waiting on; null when none is owed.
+- Desktop polls it every 10 s (client pill pinned to the local backend,
+  backend pill to the remote host). The pill spins and reads
+  "v0.23.1 · updating" with a thin bar filling toward the drainer's cap
+  (a sweep once past it or while installing); the tooltip says how long and
+  what it waits on. A batched update shows "update in 31m". When the update
+  finishes the version check refreshes at once.
+- turn_marker: a message queued behind the update hold never replaces a live
+  sibling backend's running-turn marker (#00000); hermes-sync now treats
+  hold-queue markers as not running, so that marker is what keeps the drain
+  from updating over the sibling's turn.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ apps/desktop/electron/connection-config.ts    |   1 +
+ apps/desktop/src/api/system.ts                |  10 ++
+ .../shell/hooks/use-statusbar-items.test.tsx  |  77 ++++++++-
+ .../app/shell/hooks/use-statusbar-items.tsx   |  59 ++++++-
+ apps/desktop/src/i18n/en.ts                   |   2 +
+ apps/desktop/src/i18n/en_background_update.ts |  15 ++
+ apps/desktop/src/i18n/overlay-gaps.json       |  11 +-
+ apps/desktop/src/i18n/types.ts                |   3 +
+ .../src/i18n/types_background_update.ts       |  16 ++
+ .../desktop/src/lib/background-update.test.ts |  99 ++++++++++++
+ apps/desktop/src/lib/background-update.ts     | 153 ++++++++++++++++++
+ .../src/store/updates-progress.test.ts        |  95 +++++++++++
+ apps/desktop/src/store/updates.ts             |  66 +++++++-
+ apps/desktop/src/styles.css                   |  20 +++
+ hermes_cli/core_update_progress.py            |  81 ++++++++++
+ hermes_cli/web_routers/actions.py             |   9 ++
+ tests/hermes_cli/test_core_update_progress.py |  86 ++++++++++
+ .../test_hold_queue_marker_sibling.py         |  58 +++++++
+ tui_gateway/turn_marker.py                    |   6 +
+ .../docs/user-guide/features/web-dashboard.md |   1 +
+ 20 files changed, 858 insertions(+), 10 deletions(-)
+ create mode 100644 apps/desktop/src/i18n/en_background_update.ts
+ create mode 100644 apps/desktop/src/i18n/types_background_update.ts
+ create mode 100644 apps/desktop/src/lib/background-update.test.ts
+ create mode 100644 apps/desktop/src/lib/background-update.ts
+ create mode 100644 apps/desktop/src/store/updates-progress.test.ts
+ create mode 100644 hermes_cli/core_update_progress.py
+ create mode 100644 tests/hermes_cli/test_core_update_progress.py
+ create mode 100644 tests/tui_gateway/test_hold_queue_marker_sibling.py
+
+diff --git a/apps/desktop/electron/connection-config.ts b/apps/desktop/electron/connection-config.ts
+index 193447cb995..3ef08011b4d 100644
+--- a/apps/desktop/electron/connection-config.ts
++++ b/apps/desktop/electron/connection-config.ts
+@@ -708,6 +708,7 @@ const LOCAL_PRIMARY_SCOPED_ROUTES = new Set([
+   'GET /api/logs',
+   'GET /api/portal',
+   'GET /api/hermes/update/check',
++  'GET /api/hermes/update/progress',
+   'POST /api/local-models/activate',
+   'GET /api/dashboard/themes',
+   'PUT /api/dashboard/theme',
+diff --git a/apps/desktop/src/api/system.ts b/apps/desktop/src/api/system.ts
+index fd44e2d1980..cf60366098c 100644
+--- a/apps/desktop/src/api/system.ts
++++ b/apps/desktop/src/api/system.ts
+@@ -1,3 +1,4 @@
++import type { UpdateProgressResponse } from '@/lib/background-update'
+ import type {
+   ActionResponse,
+   ActionStatusResponse,
+@@ -164,6 +165,15 @@ export function updateHermes(): Promise<ActionResponse> {
+ /** Query the connected backend's own update state. In remote mode this is the
+  *  authoritative source for the backend's behind-count + "what's changed",
+  *  distinct from the Electron client clone's git state. */
++/** [daveey] The host's own background core update (hermes-sync); `{ progress: null }` when none is owed.
++ *  `scope` pins the host: `{ connectionId: 'local' }` for this machine, omitted for the active backend. */
++export function getHermesUpdateProgress(scope?: ProfileScope): Promise<UpdateProgressResponse> {
++  return hermesApi<UpdateProgressResponse>({
++    ...(scope ? capabilityScoped(scope) : profileScoped()),
++    path: '/api/hermes/update/progress'
++  })
++}
++
+ export function checkHermesUpdate(force = false): Promise<BackendUpdateCheckResponse> {
+   return hermesApi<BackendUpdateCheckResponse>({
+     ...profileScoped(),
+diff --git a/apps/desktop/src/app/shell/hooks/use-statusbar-items.test.tsx b/apps/desktop/src/app/shell/hooks/use-statusbar-items.test.tsx
+index 2c02e1868dc..c96eb1bb8e7 100644
+--- a/apps/desktop/src/app/shell/hooks/use-statusbar-items.test.tsx
++++ b/apps/desktop/src/app/shell/hooks/use-statusbar-items.test.tsx
+@@ -1,6 +1,7 @@
+ import { act, renderHook } from '@testing-library/react'
+ import type { WritableAtom } from 'nanostores'
+ import { isValidElement, type ReactNode } from 'react'
++import { renderToStaticMarkup } from 'react-dom/server'
+ import { MemoryRouter } from 'react-router'
+ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+ 
+@@ -26,7 +27,7 @@ import {
+ import { $focusedTreePaneId as $focusedTreePaneIdMock } from '@/store/session-focus'
+ import { $sessionStates, $sessionTiles } from '@/store/session-states'
+ import { $statusbarVisible, setStatusbarItemVisible } from '@/store/statusbar-prefs'
+-import { $desktopVersion, $updateStatus } from '@/store/updates'
++import { $backendUpdateProgress, $clientUpdateProgress, $desktopVersion, $updateStatus } from '@/store/updates'
+ import type { ContextBreakdown, FreeTierStatus, UsageStats } from '@/types/hermes'
+ 
+ import { useStatusbarItems } from './use-statusbar-items'
+@@ -131,6 +132,8 @@ afterEach(() => {
+   $tileSessionFocusStartedAt.set(null)
+   $desktopVersion.set(null)
+   $updateStatus.set(null)
++  $clientUpdateProgress.set(null)
++  $backendUpdateProgress.set(null)
+ })
+ 
+ describe('statusbar update channel vocabulary', () => {
+@@ -184,6 +187,78 @@ describe('statusbar update channel vocabulary', () => {
+   })
+ })
+ 
++describe('statusbar background core update (hermes-sync)', () => {
++  const desktop = {
++    appVersion: '0.23.1',
++    electronVersion: '37',
++    hermesRoot: '/h',
++    nodeVersion: '22',
++    platform: 'darwin'
++  }
++  const markup = (node: ReactNode) => renderToStaticMarkup(<>{node}</>)
++
++  it('spins the client pill, names the update and draws a bar filling toward the drainer cap', () => {
++    act(() => {
++      $desktopVersion.set(desktop)
++      $updateStatus.set({ behind: 0, supported: true })
++      $clientUpdateProgress.set({
++        state: 'draining',
++        elapsedS: 30,
++        capS: 60,
++        waitingOn: ['default:s1'],
++        fetchedAt: Date.now()
++      })
++    })
++
++    const version = renderStatusbarItems().statusbarItems.find(item => item.id === 'version-client')
++    const label = markup(version?.label)
++
++    expect(label).toContain('v0.23.1 · updating')
++    expect(label).toContain('data-slot="version-update-bar"')
++    expect(label).toMatch(/width:\s*5\d%/)
++    expect(markup(version?.icon)).toContain('animate-spin')
++    expect(version?.className).toContain('text-primary')
++    expect(version?.title).toContain(en.shell.statusbar.backgroundUpdate.waitingOn('default:s1'))
++  })
++
++  it('shows the remote host installing on the backend pill with a sweeping bar', () => {
++    act(() => {
++      $connection.set({ mode: 'remote' } as never)
++      $backendUpdateProgress.set({ state: 'applying', elapsedS: 720, capS: 60, waitingOn: [], fetchedAt: Date.now() })
++    })
++
++    const items = renderStatusbarItems().statusbarItems
++    const backend = items.find(item => item.id === 'version-backend')
++
++    // No backend version known yet in this fixture: the pill stays hidden, but carries the update state.
++    expect(markup(backend?.label)).toContain('update-bar-sweep')
++    expect(backend?.title).toContain(en.shell.statusbar.backgroundUpdate.tooltipApplying('12m'))
++  })
++
++  it('a batched update only adds when it applies; no update leaves the pill as it was', () => {
++    act(() => {
++      $desktopVersion.set(desktop)
++      $updateStatus.set({ behind: 0, supported: true })
++      $clientUpdateProgress.set({
++        state: 'batching',
++        elapsedS: -1860,
++        capS: null,
++        waitingOn: [],
++        fetchedAt: Date.now()
++      })
++    })
++
++    let version = renderStatusbarItems().statusbarItems.find(item => item.id === 'version-client')
++
++    expect(version?.label).toBe(`v0.23.1 · ${en.shell.statusbar.backgroundUpdate.dueIn('31m')}`)
++    expect(markup(version?.icon)).not.toContain('animate-spin')
++
++    act(() => $clientUpdateProgress.set(null))
++    version = renderStatusbarItems().statusbarItems.find(item => item.id === 'version-client')
++    expect(version?.label).toBe('v0.23.1')
++  })
++})
++
+ describe('statusbar workspace menu — "Open containing folder"', () => {
+   it('offers reveal for a local workspace and hides it when the connection is remote', () => {
+     $currentCwd.set('/home/me/project')
+diff --git a/apps/desktop/src/app/shell/hooks/use-statusbar-items.tsx b/apps/desktop/src/app/shell/hooks/use-statusbar-items.tsx
+index a0f3fbf7128..61004e61b7d 100644
+--- a/apps/desktop/src/app/shell/hooks/use-statusbar-items.tsx
++++ b/apps/desktop/src/app/shell/hooks/use-statusbar-items.tsx
+@@ -20,6 +20,7 @@ import { Badge } from '@/components/ui/badge'
+ import { Codicon } from '@/components/ui/codicon'
+ import { GlyphSpinner } from '@/components/ui/glyph-spinner'
+ import { useI18n } from '@/i18n'
++import { type BackgroundUpdateView, describeBackgroundUpdate } from '@/lib/background-update'
+ import { displayPath, pathLeaf } from '@/lib/display-path'
+ import { statusBarGatewayHealth } from '@/lib/gateway-health-pill'
+ import {
+@@ -74,7 +75,9 @@ import { $subagentsBySession, activeSubagentCount, failedSubagentCount } from '@
+ import { $gatewayRestarting } from '@/store/system-actions'
+ import {
+   $backendUpdateApply,
++  $backendUpdateProgress,
+   $backendUpdateStatus,
++  $clientUpdateProgress,
+   $desktopVersion,
+   $updateApply,
+   $updateStatus,
+@@ -104,25 +107,59 @@ interface StatusbarItemsOptions {
+   toggleCommandCenter: () => void
+ }
+ 
++/** [daveey] The thin bar under a version pill while its host updates itself: filling toward the drainer's
++ *  target, or a sweeping sliver when the end is not measurable (installing, or past the target). */
++function UpdateProgressBar({ fraction }: { fraction: null | number }) {
++  return (
++    <span
++      aria-hidden
++      className="pointer-events-none absolute inset-x-0 -bottom-1 h-0.5 overflow-hidden rounded-full bg-primary/20"
++      data-slot="version-update-bar"
++    >
++      {fraction === null ? (
++        <span className="update-bar-sweep block h-full w-1/3 rounded-full bg-primary" />
++      ) : (
++        <span
++          className="block h-full rounded-full bg-primary transition-[width] duration-700"
++          style={{ width: `${Math.round(fraction * 100)}%` }}
++        />
++      )}
++    </span>
++  )
++}
++
+ /** The statusbar row for one update target: the client, or the connected backend. */
+ function versionItem(
+   target: 'backend' | 'client',
+   status: ReturnType<typeof resolveVersionStatus>,
+   applying: boolean,
+   toggleLabel: string,
+-  hidden = false
++  hidden = false,
++  background: BackgroundUpdateView | null = null
+ ): StatusbarItem {
++  // An apply Desktop started owns the pill; a host's own background update shows only otherwise.
++  const bg = applying ? null : background
++  const busy = applying || Boolean(bg?.busy)
++  const text = bg ? `${status.label} · ${bg.suffix}` : status.label
++
+   return {
+-    className: status.hasUpdate ? 'text-primary hover:text-primary' : undefined,
++    className: status.hasUpdate || busy ? 'text-primary hover:text-primary' : undefined,
+     hidden: status.unknown || hidden,
+-    icon: applying ? <Loader2 className="size-3 animate-spin" /> : <Hash className="size-3" />,
++    icon: busy ? <Loader2 className="size-3 animate-spin" /> : <Hash className="size-3" />,
+     id: `version-${target}`,
+-    label: status.label,
++    label: bg?.bar ? (
++      <span className="relative inline-flex" data-slot="version-update-label">
++        {text}
++        <UpdateProgressBar fraction={bg.bar.fraction} />
++      </span>
++    ) : (
++      text
++    ),
+     // Update state is not a preference: hiding it is how a user misses that
+     // they are behind. Listed in the menu, but locked on.
+     lockedVisible: true,
+     onSelect: () => openUpdateOverlayFor(target),
+-    title: status.tooltip,
++    title: bg ? [bg.tooltip, status.tooltip].filter(Boolean).join('\n\n') : status.tooltip,
+     toggleLabel,
+     variant: 'action'
+   }
+@@ -206,6 +243,8 @@ export function useStatusbarItems({
+   const updateApply = useStore($updateApply)
+   const backendUpdateStatus = useStore($backendUpdateStatus)
+   const backendUpdateApply = useStore($backendUpdateApply)
++  const clientUpdateProgress = useStore($clientUpdateProgress)
++  const backendUpdateProgress = useStore($backendUpdateProgress)
+   const desktopVersion = useStore($desktopVersion)
+   const connection = useStore($connection)
+   const cloudOwnsUpdates = useStore($cloudOwnsUpdates)
+@@ -458,9 +497,12 @@ export function useStatusbarItems({
+       version: desktopVersion?.appVersion
+     })
+ 
++    const background = describeBackgroundUpdate(clientUpdateProgress, Date.now(), copy.backgroundUpdate)
++
+     // A Webapp served by Hermes Cloud: Cloud updates it, so there is no version/update pill to open.
+-    return versionItem('client', status, applying, copy.toggleVersion, cloudOwnsUpdates.client)
++    return versionItem('client', status, applying, copy.toggleVersion, cloudOwnsUpdates.client, background)
+   }, [
++    clientUpdateProgress,
+     cloudOwnsUpdates.client,
+     desktopVersion?.appVersion,
+     connection?.mode,
+@@ -493,8 +535,11 @@ export function useStatusbarItems({
+       version: statusSnapshot?.version
+     })
+ 
+-    return versionItem('backend', status, applying, copy.toggleBackendVersion)
++    const background = describeBackgroundUpdate(backendUpdateProgress, Date.now(), copy.backgroundUpdate)
++
++    return versionItem('backend', status, applying, copy.toggleBackendVersion, false, background)
+   }, [
++    backendUpdateProgress,
+     cloudOwnsUpdates.backend,
+     connection?.mode,
+     statusSnapshot?.version,
+diff --git a/apps/desktop/src/i18n/en.ts b/apps/desktop/src/i18n/en.ts
+index 03052da335b..9637a8dad42 100644
+--- a/apps/desktop/src/i18n/en.ts
++++ b/apps/desktop/src/i18n/en.ts
+@@ -3,6 +3,7 @@ import { FIELD_DESCRIPTIONS, FIELD_LABELS } from '@/app/settings/constants'
+ 
+ import { enArchiveTasks } from './archive-task-copy'
+ import { enAppTour } from './en_app_tour'
++import { enBackgroundUpdate } from './en_background_update'
+ import { enBilling } from './en_billing'
+ import { enBoot } from './en_boot'
+ import { enCatalog } from './en_catalog'
+@@ -4170,6 +4171,7 @@ export const en: Translations = {
+       restart: 'restart',
+       update: 'update',
+       updateInProgress: 'Update in progress',
++      backgroundUpdate: enBackgroundUpdate,
+       commitsBehind: (count, branch) => `${count} commit${count === 1 ? '' : 's'} behind ${branch}`,
+       releaseAvailable: (tag: string) => `Version ${tag} is available.`,
+       desktopVersion: version => `Hermes Desktop v${version}`,
+diff --git a/apps/desktop/src/i18n/en_background_update.ts b/apps/desktop/src/i18n/en_background_update.ts
+new file mode 100644
+index 00000000000..dc5a4377f57
+--- /dev/null
++++ b/apps/desktop/src/i18n/en_background_update.ts
+@@ -0,0 +1,15 @@
++import type { BackgroundUpdateCopy } from './types_background_update'
++
++export const enBackgroundUpdate: BackgroundUpdateCopy = {
++  updating: 'updating',
++  dueIn: duration => `update in ${duration}`,
++  blocked: 'update blocked',
++  tooltipBatching: time => `A Hermes update is batched and applies at ${time}.`,
++  tooltipDraining: elapsed =>
++    `Hermes is updating: pausing running work before the swap (${elapsed} so far). Messages you send wait and go out when it finishes.`,
++  tooltipPastCap: cap => `Past its ${cap} target: still waiting for running turns to reach a safe step.`,
++  tooltipApplying: elapsed =>
++    `Hermes is installing the update (${elapsed} since it was due). Messages you send go out when it finishes.`,
++  tooltipBlocked: 'A Hermes update is owed but cannot apply right now.',
++  waitingOn: items => `Waiting on: ${items}`
++}
+diff --git a/apps/desktop/src/i18n/overlay-gaps.json b/apps/desktop/src/i18n/overlay-gaps.json
+index b91a52d0b12..166795bece5 100644
+--- a/apps/desktop/src/i18n/overlay-gaps.json
++++ b/apps/desktop/src/i18n/overlay-gaps.json
+@@ -2368,5 +2368,14 @@
+   "profiles.newSessionsDescription": ["ar","de","es","fr","ja","ru","zh","zh-hant"],
+   "profiles.newSessionTargetUnreachable": ["ar","de","es","fr","ja","ru","zh","zh-hant"],
+   "profiles.newSessionTargetUnreachableDetail": ["ar","de","es","fr","ja","ru","zh","zh-hant"],
+-  "profiles.createOnThisDevice": ["ar","de","es","fr","ja","ru","zh","zh-hant"]
++  "profiles.createOnThisDevice": ["ar","de","es","fr","ja","ru","zh","zh-hant"],
++  "shell.statusbar.backgroundUpdate.updating": ["ar","de","es","fr","ja","ru","zh","zh-hant"],
++  "shell.statusbar.backgroundUpdate.dueIn": ["ar","de","es","fr","ja","ru","zh","zh-hant"],
++  "shell.statusbar.backgroundUpdate.blocked": ["ar","de","es","fr","ja","ru","zh","zh-hant"],
++  "shell.statusbar.backgroundUpdate.tooltipBatching": ["ar","de","es","fr","ja","ru","zh","zh-hant"],
++  "shell.statusbar.backgroundUpdate.tooltipDraining": ["ar","de","es","fr","ja","ru","zh","zh-hant"],
++  "shell.statusbar.backgroundUpdate.tooltipPastCap": ["ar","de","es","fr","ja","ru","zh","zh-hant"],
++  "shell.statusbar.backgroundUpdate.tooltipApplying": ["ar","de","es","fr","ja","ru","zh","zh-hant"],
++  "shell.statusbar.backgroundUpdate.tooltipBlocked": ["ar","de","es","fr","ja","ru","zh","zh-hant"],
++  "shell.statusbar.backgroundUpdate.waitingOn": ["ar","de","es","fr","ja","ru","zh","zh-hant"]
+ }
+diff --git a/apps/desktop/src/i18n/types.ts b/apps/desktop/src/i18n/types.ts
+index de09471f159..fd70f2016af 100644
+--- a/apps/desktop/src/i18n/types.ts
++++ b/apps/desktop/src/i18n/types.ts
+@@ -11,6 +11,7 @@ import type { TipId } from '@/lib/tips/catalog'
+ 
+ import type { ArchiveTaskCopy } from './archive-task-copy'
+ import type { AppTourTranslations } from './types_app_tour'
++import type { BackgroundUpdateCopy } from './types_background_update'
+ import type { BillingTranslations } from './types_billing'
+ import type { BootTranslations } from './types_boot'
+ import type { CatalogTranslations } from './types_catalog'
+@@ -3618,6 +3619,8 @@ export interface Translations extends NoticeTranslations {
+       restart: string
+       update: string
+       updateInProgress: string
++      /** [daveey] A core update the host runs on its own (hermes-sync). */
++      backgroundUpdate: BackgroundUpdateCopy
+       commitsBehind: (count: number, branch: string) => string
+       releaseAvailable: (tag: string) => string
+       desktopVersion: (version: string) => string
+diff --git a/apps/desktop/src/i18n/types_background_update.ts b/apps/desktop/src/i18n/types_background_update.ts
+new file mode 100644
+index 00000000000..23851935344
+--- /dev/null
++++ b/apps/desktop/src/i18n/types_background_update.ts
+@@ -0,0 +1,16 @@
++/** [daveey] Version-pill copy for a core update the host runs on its own (hermes-sync), not one Desktop started.
++ *  Part of `Translations['shell']['statusbar']`. Durations arrive pre-formatted (`45s`, `12m`, `1h 5m`). */
++export interface BackgroundUpdateCopy {
++  /** Label suffix while the update pauses work or installs. */
++  updating: string
++  /** Label suffix while the update waits for its batch window. */
++  dueIn: (duration: string) => string
++  /** Label suffix when an update is owed but nothing can apply it. */
++  blocked: string
++  tooltipBatching: (time: string) => string
++  tooltipDraining: (elapsed: string) => string
++  tooltipPastCap: (cap: string) => string
++  tooltipApplying: (elapsed: string) => string
++  tooltipBlocked: string
++  waitingOn: (items: string) => string
++}
+diff --git a/apps/desktop/src/lib/background-update.test.ts b/apps/desktop/src/lib/background-update.test.ts
+new file mode 100644
+index 00000000000..522261559f3
+--- /dev/null
++++ b/apps/desktop/src/lib/background-update.test.ts
+@@ -0,0 +1,99 @@
++import { describe, expect, it } from 'vitest'
++
++import { en } from '@/i18n/en'
++
++import {
++  describeBackgroundUpdate,
++  formatDuration,
++  mapUpdateProgress,
++  type UpdateProgressResponse
++} from './background-update'
++
++const copy = en.shell.statusbar.backgroundUpdate
++const FETCHED = 1_000_000
++
++const wire = (over: Partial<NonNullable<UpdateProgressResponse['progress']>> = {}): UpdateProgressResponse => ({
++  progress: { state: 'draining', due_at: 1, state_since: 1, elapsed_s: 30, cap_s: 60, waiting_on: [], ...over }
++})
++
++describe('mapUpdateProgress', () => {
++  it('keeps the four update states and drops everything unusable', () => {
++    expect(mapUpdateProgress(wire(), FETCHED)).toEqual({
++      state: 'draining',
++      elapsedS: 30,
++      capS: 60,
++      waitingOn: [],
++      fetchedAt: FETCHED
++    })
++    expect(mapUpdateProgress({ progress: null }, FETCHED)).toBeNull()
++    expect(mapUpdateProgress(undefined, FETCHED)).toBeNull()
++    expect(mapUpdateProgress(wire({ state: 'idle' }), FETCHED)).toBeNull()
++    expect(mapUpdateProgress(wire({ elapsed_s: Number.NaN }), FETCHED)).toBeNull()
++    expect(mapUpdateProgress(wire({ cap_s: 0 }), FETCHED)?.capS).toBeNull()
++  })
++})
++
++describe('describeBackgroundUpdate', () => {
++  it('fills the bar toward the drainer cap, advancing on the local clock since the fetch', () => {
++    const view = describeBackgroundUpdate(mapUpdateProgress(wire(), FETCHED), FETCHED + 15_000, copy)
++
++    expect(view).toMatchObject({ busy: true, suffix: 'updating', bar: { fraction: 0.75 } })
++    expect(view?.tooltip).toContain(copy.tooltipDraining('45s'))
++    expect(view?.tooltip).not.toContain('Past its')
++  })
++
++  it('past the cap: sweeps instead of a full bar and says what it is still waiting on', () => {
++    const waiting = ['default:a', 'default:b', 'default:c', 'default:d', 'default:e', 'default:f']
++
++    const view = describeBackgroundUpdate(
++      mapUpdateProgress(wire({ elapsed_s: 701, waiting_on: waiting }), FETCHED),
++      FETCHED,
++      copy
++    )
++
++    expect(view?.bar).toEqual({ fraction: null })
++    expect(view?.tooltip).toContain(copy.tooltipDraining('12m'))
++    expect(view?.tooltip).toContain(copy.tooltipPastCap('1m'))
++    expect(view?.tooltip).toContain(copy.waitingOn('default:a, default:b, default:c, default:d +2'))
++  })
++
++  it('installing is busy with an indeterminate bar; blocked and batching are quiet', () => {
++    expect(
++      describeBackgroundUpdate(mapUpdateProgress(wire({ state: 'applying', elapsed_s: 720 }), FETCHED), FETCHED, copy)
++    ).toEqual({ busy: true, suffix: 'updating', tooltip: copy.tooltipApplying('12m'), bar: { fraction: null } })
++
++    const blocked = describeBackgroundUpdate(
++      mapUpdateProgress(wire({ state: 'blocked', waiting_on: ['hold x'] }), FETCHED),
++      FETCHED,
++      copy
++    )
++
++    expect(blocked).toMatchObject({ busy: false, suffix: copy.blocked, bar: null })
++    expect(blocked?.tooltip).toContain(copy.waitingOn('hold x'))
++
++    const batching = describeBackgroundUpdate(
++      mapUpdateProgress(wire({ state: 'batching', elapsed_s: -1860 }), FETCHED),
++      FETCHED,
++      copy
++    )
++
++    expect(batching).toMatchObject({ busy: false, suffix: copy.dueIn('31m'), bar: null })
++    // A batch already due shows nothing until the drainer publishes `draining`.
++    expect(
++      describeBackgroundUpdate(
++        mapUpdateProgress(wire({ state: 'batching', elapsed_s: -5 }), FETCHED),
++        FETCHED + 10_000,
++        copy
++      )
++    ).toBeNull()
++  })
++
++  it('formats durations the way the tooltip reads them', () => {
++    expect([formatDuration(0), formatDuration(59), formatDuration(701), formatDuration(3900)]).toEqual([
++      '0s',
++      '59s',
++      '12m',
++      '1h 5m'
++    ])
++  })
++})
+diff --git a/apps/desktop/src/lib/background-update.ts b/apps/desktop/src/lib/background-update.ts
+new file mode 100644
+index 00000000000..42f7cbfeba0
+--- /dev/null
++++ b/apps/desktop/src/lib/background-update.ts
+@@ -0,0 +1,153 @@
++/**
++ * [daveey] A core update the host runs on its own (hermes-sync), as the version pill shows it.
++ *
++ * Desktop's pill only knew about updates it started itself, so a hub update that drained for 12 minutes
++ * and held a user's message showed nothing (example-gw 2020-01-01). `GET /api/hermes/update/progress`
++ * reports the host's published window; this file maps that payload and derives the pill's suffix,
++ * tooltip and bar. Pure: the store polls, the statusbar renders.
++ */
++
++import type { BackgroundUpdateCopy } from '@/i18n/types_background_update'
++
++export type BackgroundUpdateState = 'applying' | 'batching' | 'blocked' | 'draining'
++
++/** Wire shape of `GET /api/hermes/update/progress` (absent on older backends: the route 404s). */
++export interface UpdateProgressResponse {
++  progress: null | {
++    state: string
++    due_at: number
++    state_since: number
++    elapsed_s: number
++    cap_s: null | number
++    waiting_on: string[]
++  }
++}
++
++export interface BackgroundUpdateProgress {
++  state: BackgroundUpdateState
++  /** Seconds since the update was due, on the host's clock when fetched (negative while batching). */
++  elapsedS: number
++  capS: null | number
++  waitingOn: string[]
++  /** Local `Date.now()` when fetched: elapsed advances from here, so a skewed client clock never matters. */
++  fetchedAt: number
++}
++
++export interface BackgroundUpdateView {
++  /** Pausing work or installing: the pill spins. */
++  busy: boolean
++  suffix: string
++  tooltip: string
++  /** `fraction` null = no measurable end (indeterminate sweep); no bar while batching or blocked. */
++  bar: null | { fraction: null | number }
++}
++
++const STATES: readonly BackgroundUpdateState[] = ['applying', 'batching', 'blocked', 'draining']
++const MAX_WAITING_LISTED = 4
++
++export function mapUpdateProgress(
++  response: null | undefined | UpdateProgressResponse,
++  fetchedAt: number
++): BackgroundUpdateProgress | null {
++  const raw = response?.progress
++
++  if (!raw || !STATES.includes(raw.state as BackgroundUpdateState) || !Number.isFinite(raw.elapsed_s)) {
++    return null
++  }
++
++  return {
++    state: raw.state as BackgroundUpdateState,
++    elapsedS: raw.elapsed_s,
++    capS: typeof raw.cap_s === 'number' && raw.cap_s > 0 ? raw.cap_s : null,
++    waitingOn: Array.isArray(raw.waiting_on) ? raw.waiting_on.filter(item => typeof item === 'string') : [],
++    fetchedAt
++  }
++}
++
++/** `45s`, `12m`, `1h 5m`. */
++export function formatDuration(seconds: number): string {
++  const s = Math.max(0, Math.round(seconds))
++
++  if (s < 60) {
++    return `${s}s`
++  }
++
++  const minutes = Math.round(s / 60)
++
++  return minutes < 60 ? `${minutes}m` : `${Math.floor(minutes / 60)}h ${minutes % 60}m`
++}
++
++function clock(epochMs: number): string {
++  const date = new Date(epochMs)
++
++  return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`
++}
++
++function waitingLine(items: string[], copy: BackgroundUpdateCopy): string {
++  if (!items.length) {
++    return ''
++  }
++
++  const shown = items.slice(0, MAX_WAITING_LISTED).join(', ')
++  const more = items.length > MAX_WAITING_LISTED ? ` +${items.length - MAX_WAITING_LISTED}` : ''
++
++  return `\n${copy.waitingOn(shown + more)}`
++}
++
++export function describeBackgroundUpdate(
++  progress: BackgroundUpdateProgress | null,
++  now: number,
++  copy: BackgroundUpdateCopy
++): BackgroundUpdateView | null {
++  if (!progress) {
++    return null
++  }
++
++  const elapsed = progress.elapsedS + Math.max(0, now - progress.fetchedAt) / 1000
++
++  switch (progress.state) {
++    case 'batching': {
++      const dueIn = -elapsed
++
++      return dueIn > 0
++        ? {
++            busy: false,
++            suffix: copy.dueIn(formatDuration(dueIn)),
++            tooltip: copy.tooltipBatching(clock(now + dueIn * 1000)),
++            bar: null
++          }
++        : null // due: the drainer takes over within a pass and publishes `draining`
++    }
++
++    case 'draining': {
++      const cap = progress.capS
++      const pastCap = cap !== null && elapsed >= cap
++
++      return {
++        busy: true,
++        suffix: copy.updating,
++        tooltip:
++          copy.tooltipDraining(formatDuration(elapsed)) +
++          (pastCap ? `\n${copy.tooltipPastCap(formatDuration(cap))}` : '') +
++          waitingLine(progress.waitingOn, copy),
++        bar: { fraction: cap !== null && !pastCap ? Math.min(1, Math.max(0, elapsed / cap)) : null }
++      }
++    }
++
++    case 'applying':
++      return {
++        busy: true,
++        suffix: copy.updating,
++        tooltip: copy.tooltipApplying(formatDuration(elapsed)),
++        bar: { fraction: null }
++      }
++
++    case 'blocked':
++      return {
++        busy: false,
++        suffix: copy.blocked,
++        tooltip: copy.tooltipBlocked + waitingLine(progress.waitingOn, copy),
++        bar: null
++      }
++  }
++}
+diff --git a/apps/desktop/src/store/updates-progress.test.ts b/apps/desktop/src/store/updates-progress.test.ts
+new file mode 100644
+index 00000000000..955e93e2969
+--- /dev/null
++++ b/apps/desktop/src/store/updates-progress.test.ts
+@@ -0,0 +1,95 @@
++// @vitest-environment jsdom
++// [daveey] The version pills poll each host's own background core update (hermes-sync): the client pill reads
++// this machine (pinned local even while a remote backend is primary), the backend pill the remote host.
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
++
++import type { HermesConnection } from '@/global'
++
++const progressSpy = vi.fn()
++const checkHermesUpdateSpy = vi.fn()
++
++vi.mock('@/hermes', async importOriginal => ({
++  ...(await importOriginal<Record<string, unknown>>()),
++  checkHermesUpdate: (...args: unknown[]) => checkHermesUpdateSpy(...args),
++  getActionStatus: vi.fn(),
++  getHermesUpdateProgress: (...args: unknown[]) => progressSpy(...args),
++  updateHermes: vi.fn()
++}))
++vi.mock('@/store/notifications', () => ({ dismissNotification: vi.fn(), notify: vi.fn() }))
++
++const updates = await import('./updates')
++const { setConnection } = await import('./session')
++
++const remote: HermesConnection = {
++  baseUrl: 'https://hub.example',
++  isFullscreen: false,
++  logs: [],
++  mode: 'remote',
++  nativeOverlayWidth: 0,
++  remoteKind: 'ssh',
++  token: 't',
++  windowButtonPosition: null,
++  wsUrl: 'wss://hub.example'
++}
++
++const draining = {
++  progress: { state: 'draining', due_at: 1, state_since: 1, elapsed_s: 40, cap_s: 60, waiting_on: ['default:s'] }
++}
++const applying = { progress: { ...draining.progress, state: 'applying' } }
++const clientCheck = vi.fn().mockResolvedValue({ supported: true, behind: 0 })
++
++beforeEach(() => {
++  vi.clearAllMocks()
++  checkHermesUpdateSpy.mockResolvedValue({ behind: 0, can_apply: true, current_version: '1', update_available: false })
++  window.hermesDesktop = { updates: { apply: vi.fn(), check: clientCheck, onProgress: () => () => {} } } as never
++  updates.$clientUpdateProgress.set(null)
++  updates.$backendUpdateProgress.set(null)
++})
++
++afterEach(() => setConnection(null as never))
++
++describe('pollUpdateProgress', () => {
++  it('pins the client pill to this machine and reads the remote host for the backend pill', async () => {
++    setConnection(remote)
++    progressSpy.mockImplementation(async (scope?: { connectionId?: string }) =>
++      scope?.connectionId === 'local' ? { progress: null } : draining
++    )
++
++    await updates.pollUpdateProgress()
++
++    expect(progressSpy).toHaveBeenCalledWith({ connectionId: 'local' })
++    expect(progressSpy).toHaveBeenCalledWith(undefined)
++    expect(updates.$clientUpdateProgress.get()).toBeNull()
++    expect(updates.$backendUpdateProgress.get()).toMatchObject({
++      state: 'draining',
++      elapsedS: 40,
++      capS: 60,
++      waitingOn: ['default:s']
++    })
++  })
++
++  it('asks no remote host while local, and a missing route reads as no update', async () => {
++    setConnection({ ...remote, mode: 'local' })
++    updates.$backendUpdateProgress.set({ state: 'applying', elapsedS: 1, capS: null, waitingOn: [], fetchedAt: 0 })
++    progressSpy.mockRejectedValue(new Error('404'))
++
++    await updates.pollUpdateProgress()
++
++    expect(progressSpy).toHaveBeenCalledTimes(1)
++    expect(progressSpy).toHaveBeenCalledWith({ connectionId: 'local' })
++    expect(updates.$clientUpdateProgress.get()).toBeNull()
++    expect(updates.$backendUpdateProgress.get()).toBeNull()
++  })
++
++  it('refreshes the backend version check once its update finishes, not while it runs', async () => {
++    setConnection(remote)
++    progressSpy.mockImplementation(async (scope?: { connectionId?: string }) => (scope ? { progress: null } : applying))
++    await updates.pollUpdateProgress()
++    expect(checkHermesUpdateSpy).not.toHaveBeenCalled()
++
++    progressSpy.mockImplementation(async () => ({ progress: null }))
++    await updates.pollUpdateProgress()
++    await vi.waitFor(() => expect(checkHermesUpdateSpy).toHaveBeenCalledWith(true))
++    expect(updates.$backendUpdateProgress.get()).toBeNull()
++  })
++})
+diff --git a/apps/desktop/src/store/updates.ts b/apps/desktop/src/store/updates.ts
+index a25f4d14c15..2b8c7a276c1 100644
+--- a/apps/desktop/src/store/updates.ts
++++ b/apps/desktop/src/store/updates.ts
+@@ -17,8 +17,9 @@ import type {
+   DesktopVersionInfo,
+   HermesConnection
+ } from '@/global'
+-import { checkHermesUpdate, getActionStatus, updateHermes } from '@/hermes'
++import { checkHermesUpdate, getActionStatus, getHermesUpdateProgress, updateHermes } from '@/hermes'
+ import { translateNow } from '@/i18n'
++import { type BackgroundUpdateProgress, mapUpdateProgress } from '@/lib/background-update'
+ import { persistString, storedString } from '@/lib/storage'
+ import { cloudOwnsUpdates, updateTargetFor } from '@/store/cloud-updates'
+ import { $connectionsRegistry, refreshConnectionsRegistry } from '@/store/connections'
+@@ -66,6 +67,11 @@ export const $backendUpdateStatus = atom<DesktopUpdateStatus | null>(null)
+ export const $backendUpdateApply = atom<UpdateApplyState>(IDLE)
+ export const $backendUpdateChecking = atom<boolean>(false)
+ 
++// [daveey] Core updates each host runs on its own (hermes-sync), polled from GET /api/hermes/update/progress:
++// the client pill reads this machine's, the backend pill the remote host's. Null = none in progress (or unknown).
++export const $clientUpdateProgress = atom<BackgroundUpdateProgress | null>(null)
++export const $backendUpdateProgress = atom<BackgroundUpdateProgress | null>(null)
++
+ export type UpdateTarget = 'client' | 'backend'
+ export const $updateOverlayTarget = atom<UpdateTarget>('client')
+ 
+@@ -1363,6 +1369,57 @@ function ingestProgress(payload: DesktopUpdateProgress): void {
+ 
+ let pollerStarted = false
+ let backgroundTimer: ReturnType<typeof setInterval> | null = null
++let progressTimer: ReturnType<typeof setInterval> | null = null
++
++/** [daveey] How often the version pills re-read their host's background update (a few small file reads there). */
++export const UPDATE_PROGRESS_POLL_MS = 10_000
++
++const progressBusy = (p: BackgroundUpdateProgress | null): boolean => p?.state === 'draining' || p?.state === 'applying'
++
++async function pollProgressFor(target: UpdateTarget): Promise<void> {
++  const store = target === 'backend' ? $backendUpdateProgress : $clientUpdateProgress
++
++  if (cloudOwnsUpdates(target) || (target === 'backend' && !isRemoteMode())) {
++    store.set(null)
++
++    return
++  }
++
++  const requestKey = connectionKey($connection.get())
++  let next: BackgroundUpdateProgress | null
++
++  try {
++    // The client pill is this machine: pin the local backend even while a remote one is primary.
++    next = mapUpdateProgress(
++      await getHermesUpdateProgress(target === 'client' ? { connectionId: 'local' } : undefined),
++      Date.now()
++    )
++  } catch {
++    next = null // an older backend without the route, or no local backend: nothing to show
++  }
++
++  if (target === 'backend' && connectionKey($connection.get()) !== requestKey) {
++    return
++  }
++
++  const finished = progressBusy(store.get()) && !progressBusy(next)
++  store.set(next)
++
++  if (finished) {
++    // The swap just landed: refresh the version the pill names instead of waiting for the daily check.
++    void (target === 'backend' ? checkBackendUpdates({ force: true }) : checkUpdates({ force: true }))
++  }
++}
++
++/** One round for both pills; skipped while the window is hidden (the next visible tick catches up). */
++export function pollUpdateProgress(): Promise<void> {
++  if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
++    return Promise.resolve()
++  }
++
++  return Promise.all([pollProgressFor('client'), pollProgressFor('backend')]).then(() => undefined)
++}
++
+ let connectionUnsub: (() => void) | null = null
+ let lastConnectionKey: string | undefined
+ let versionScopeUnsub: (() => void) | null = null
+@@ -1456,6 +1513,8 @@ export function startUpdatePoller(): void {
+ 
+   window.addEventListener('focus', onFocus)
+   backgroundTimer = setInterval(runPassiveChecks, BACKGROUND_UPDATE_CHECK_MS)
++  void pollUpdateProgress()
++  progressTimer = setInterval(() => void pollUpdateProgress(), UPDATE_PROGRESS_POLL_MS)
+ }
+ 
+ export function stopUpdatePoller(): void {
+@@ -1464,6 +1523,11 @@ export function stopUpdatePoller(): void {
+     backgroundTimer = null
+   }
+ 
++  if (progressTimer !== null) {
++    clearInterval(progressTimer)
++    progressTimer = null
++  }
++
+   connectionUnsub?.()
+   connectionUnsub = null
+   versionScopeUnsub?.()
+diff --git a/apps/desktop/src/styles.css b/apps/desktop/src/styles.css
+index e571a847015..ec69517e60f 100644
+--- a/apps/desktop/src/styles.css
++++ b/apps/desktop/src/styles.css
+@@ -1401,6 +1401,26 @@
+ .decode-cursor-blink {
+   animation: decode-cursor 1s step-end infinite;
+ }
++/* [daveey] Background core update in progress with no measurable end: a sliver sweeping the version pill's bar. */
++@keyframes update-bar-sweep {
++  from {
++    transform: translateX(-100%);
++  }
++  to {
++    transform: translateX(300%);
++  }
++}
++.update-bar-sweep {
++  animation: update-bar-sweep 1.4s ease-in-out infinite;
++}
++@media (prefers-reduced-motion: reduce) {
++  .update-bar-sweep {
++    animation: none;
++    transform: none;
++    width: 100%;
++    opacity: 0.5;
++  }
++}
+ /* 0.001 start mirrors ZonesOverlay::GetAnimationAlpha's clamp(t / 200ms, 0.001, 1). */
+ @keyframes hermes-zone-fade {
+   from {
+diff --git a/hermes_cli/core_update_progress.py b/hermes_cli/core_update_progress.py
+new file mode 100644
+index 00000000000..6e167d89e0d
+--- /dev/null
++++ b/hermes_cli/core_update_progress.py
+@@ -0,0 +1,81 @@
++"""What this host's background core update is doing right now, for Desktop's version pill. [daveey]
++
++``hermes-sync`` updates core on its own schedule and publishes the batch it is in to
++``<root>/cache/core-update/window.json`` (read through :mod:`hermes_cli.kanban_deploy_window`), plus
++the live drainer's record ``drain.json`` and the deferral reasons ``governor-other-defers.json``. Desktop only
++knew about updates it started itself, so a hub update that held a user's message for 16 minutes showed
++nothing but "Waiting for a Hermes update" on the message (example-gw 2020-01-01).
++
++:func:`read_progress` turns those records into one small payload. Elapsed times are computed here, on the
++host's clock, so a client with a skewed clock still draws the right bar. Anything missing, stale, foreign
++or malformed answers None ("no update in progress"), never an error: the pill must not break on it.
++"""
++from __future__ import annotations
++
++import json
++import time
++from pathlib import Path
++from typing import Any, Optional
++
++ACTIVE_STATES = ("batching", "draining", "applying", "blocked")
++# governor-other-defers.json is rewritten on every deferred pass (about every 2 min while draining).
++DEFERS_FRESH_S = 600
++MAX_WAITING_ON = 8
++
++
++def _core_update_dir() -> Path:
++    from hermes_constants import get_default_hermes_root
++
++    return get_default_hermes_root() / "cache" / "core-update"
++
++
++def _read_json(path: Path) -> Optional[dict]:
++    try:
++        data = json.loads(path.read_text(encoding="utf-8-sig"))
++    except (OSError, ValueError):
++        return None
++    return data if isinstance(data, dict) else None
++
++
++def _number(value: Any) -> Optional[float]:
++    if isinstance(value, bool) or not isinstance(value, (int, float)):
++        return None
++    return float(value) if value >= 0 else None
++
++
++def _waiting_on(cu: Path, now: float) -> list[str]:
++    data = _read_json(cu / "governor-other-defers.json") or {}
++    ts = _number(data.get("ts"))
++    reasons = data.get("reasons")
++    if ts is None or now - ts > DEFERS_FRESH_S or ts > now + 60 or not isinstance(reasons, list):
++        return []
++    return [r for r in reasons if isinstance(r, str) and r][:MAX_WAITING_ON]
++
++
++def read_progress(now: Optional[float] = None) -> Optional[dict]:
++    """The background core update on this host, or None when none is owed or nothing usable is published.
++
++    ``state``      batching (waiting for its batch window) | draining (pausing work before the swap)
++                   | applying (``hermes update`` is running) | blocked (owed, but nothing can apply it)
++    ``due_at``     Unix seconds the update became (or becomes) due; ``state_since`` when ``state`` began
++    ``elapsed_s``  seconds since ``due_at`` on this host's clock (negative while batching: due in the future)
++    ``cap_s``      the drainer's own apply-over-anything cap while draining, when it published one
++    ``waiting_on`` what the latest deferral named (sessions, cron runs, holds), at most MAX_WAITING_ON
++    """
++    from hermes_cli.kanban_deploy_window import read_window
++
++    now = time.time() if now is None else now
++    window = read_window(int(now))
++    if not window or window["state"] not in ACTIVE_STATES:
++        return None
++    cu = _core_update_dir()
++    drain = _read_json(cu / "drain.json") or {}
++    cap_s = _number(drain.get("total_cap_s")) if drain.get("state") in ("draining", "applying") else None
++    return {
++        "state": window["state"],
++        "due_at": window["window_at"],
++        "state_since": window["state_since"],
++        "elapsed_s": round(now - window["window_at"], 1),
++        "cap_s": cap_s,
++        "waiting_on": _waiting_on(cu, now) if window["state"] in ("draining", "blocked") else [],
++    }
+diff --git a/hermes_cli/web_routers/actions.py b/hermes_cli/web_routers/actions.py
+index df183e424bc..cd3adb4a08a 100644
+--- a/hermes_cli/web_routers/actions.py
++++ b/hermes_cli/web_routers/actions.py
+@@ -286,6 +286,15 @@ def _source_release_label(status: dict[str, Any]) -> str:
+     return f"{status.get('channel') or 'stable'} release" + (f" v{version}" if version else "")
+ 
+ 
++@router.get("/api/hermes/update/progress")
++async def hermes_update_progress():
++    """This host's background core update (hermes-sync): ``{"progress": {...} | null}``. Cheap file reads,
++    polled by Desktop's version pill; see hermes_cli.core_update_progress (unusable records read as null)."""
++    from hermes_cli.core_update_progress import read_progress
++
++    return {"progress": await asyncio.to_thread(read_progress)}
++
++
+ @router.get("/api/hermes/update/check")
+ async def check_hermes_update(force: bool = False, profile: Optional[str] = None):
+     """Report whether a Hermes update is available, without applying it.
+diff --git a/tests/hermes_cli/test_core_update_progress.py b/tests/hermes_cli/test_core_update_progress.py
+new file mode 100644
+index 00000000000..10f9e75ad64
+--- /dev/null
++++ b/tests/hermes_cli/test_core_update_progress.py
+@@ -0,0 +1,86 @@
++"""Desktop's version pill reads the host's background core update through one route. [daveey]
++
++example-gw 2020-01-01: hermes-sync drained for 12 min before applying and Desktop showed nothing but
++"Waiting for a Hermes update" on the held message. ``GET /api/hermes/update/progress`` now reports the
++published window (``cache/core-update/window.json``), the drainer's cap (``drain.json``) and what the
++latest deferral waited on (``governor-other-defers.json``); anything unusable is ``null``, never an error.
++"""
++import asyncio
++import json
++import socket
++
++import pytest
++
++from hermes_cli import core_update_progress as cup
++
++NOW = 1_795_131_600
++
++
++@pytest.fixture
++def cu(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    (home / "cache" / "core-update").mkdir(parents=True)
++    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    return home / "cache" / "core-update"
++
++
++def window(cu, **changes):
++    data = dict(version=1, host=socket.gethostname().split(".")[0], observed_at=NOW - 5,
++                window_at=NOW - 701, state="draining", state_since=NOW - 701, drain_bound_s=7200,
++                last_update_at=NOW - 5000, writer="drainer")
++    data.update(changes)
++    (cu / "window.json").write_text(json.dumps(data))
++
++
++def test_draining_reports_elapsed_cap_and_what_it_waits_on(cu):
++    window(cu)
++    (cu / "drain.json").write_text(json.dumps({"pid": 1, "state": "draining", "total_cap_s": 60.0}))
++    reasons = [f"default:2026111{i}_000000_aaaaa{i}" for i in range(10)]
++    (cu / "governor-other-defers.json").write_text(json.dumps({"ts": NOW - 30, "reasons": reasons}))
++    assert cup.read_progress(NOW) == {
++        "state": "draining", "due_at": NOW - 701, "state_since": NOW - 701, "elapsed_s": 701.0,
++        "cap_s": 60.0, "waiting_on": reasons[:cup.MAX_WAITING_ON]}
++
++
++def test_applying_has_no_waiting_list_and_batching_is_due_in_the_future(cu):
++    window(cu, state="applying")
++    (cu / "drain.json").write_text(json.dumps({"pid": 1, "state": "applying", "total_cap_s": 60.0}))
++    (cu / "governor-other-defers.json").write_text(json.dumps({"ts": NOW, "reasons": ["default:x"]}))
++    got = cup.read_progress(NOW)
++    assert (got["state"], got["waiting_on"], got["cap_s"]) == ("applying", [], 60.0)
++
++    window(cu, state="batching", window_at=NOW + 1860)
++    (cu / "drain.json").write_text(json.dumps({"pid": 1, "state": "idle", "total_cap_s": 60.0}))
++    got = cup.read_progress(NOW)
++    assert (got["state"], got["elapsed_s"], got["cap_s"]) == ("batching", -1860.0, None)
++
++
++@pytest.mark.parametrize("change", [
++    {"state": "idle"},                       # nothing owed
++    {"host": "some-other-host"},             # another host's record
++    {"observed_at": NOW - 3600},             # stale publisher
++    {"version": 2},                          # unknown schema
++    {"window_at": "soon"},                   # malformed
++])
++def test_unusable_window_is_no_progress(cu, change):
++    window(cu, **change)
++    assert cup.read_progress(NOW) is None
++
++
++def test_missing_files_and_stale_or_junk_side_records_degrade(cu):
++    assert cup.read_progress(NOW) is None
++    window(cu)
++    (cu / "drain.json").write_text("not json")
++    (cu / "governor-other-defers.json").write_text(json.dumps({"ts": NOW - 3600, "reasons": ["old"]}))
++    got = cup.read_progress(NOW)
++    assert (got["state"], got["cap_s"], got["waiting_on"]) == ("draining", None, [])
++
++
++def test_route_serves_the_reader(cu, monkeypatch):
++    from hermes_cli.web_routers import actions
++
++    monkeypatch.setattr("time.time", lambda: NOW)
++    assert asyncio.run(actions.hermes_update_progress()) == {"progress": None}
++    window(cu)
++    assert asyncio.run(actions.hermes_update_progress())["progress"]["state"] == "draining"
+diff --git a/tests/tui_gateway/test_hold_queue_marker_sibling.py b/tests/tui_gateway/test_hold_queue_marker_sibling.py
+new file mode 100644
+index 00000000000..95a4fcef1de
+--- /dev/null
++++ b/tests/tui_gateway/test_hold_queue_marker_sibling.py
+@@ -0,0 +1,58 @@
++"""A message queued behind the update hold never replaces a live sibling backend's turn marker. [daveey]
++
++hermes-sync skips ``update_hold_queue`` markers as "not running" (a queued message waits FOR the update; counting
++it deadlocked the hub's drain on 2020-01-01). With two backends on one HERMES_HOME (#00000), backend A can be
++mid-turn on session S while the user's message reaches backend B, where S is idle and the hold refuses it. B's
++hold-queue marker used to replace A's live-turn marker under the same key, so the drain stopped seeing A's turn.
++"""
++import json
++import subprocess
++import sys
++
++import pytest
++
++from tui_gateway.turn_marker import UPDATE_HOLD_QUEUE_REASON, read_turn_marker, record_turn_start
++
++
++@pytest.fixture
++def sibling():
++    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
++    yield proc.pid
++    proc.kill()
++    proc.wait()
++
++
++def _seed(home, entry):
++    (home / "desktop").mkdir(parents=True, exist_ok=True)
++    (home / "desktop" / "interrupted_turns.json").write_text(json.dumps({"S": entry}))
++
++
++def test_hold_queue_marker_keeps_a_live_siblings_running_turn(tmp_path, sibling):
++    import time
++    _seed(tmp_path, {"attempts": 0, "prompt": "A's turn", "started_at": time.time(), "auto_continue": True,
++                     "writer_pid": sibling})
++    assert record_turn_start(tmp_path, "S", "queued on B", reason=UPDATE_HOLD_QUEUE_REASON) is False
++    kept = read_turn_marker(tmp_path, "S")
++    assert (kept["writer_pid"], kept.get("reason"), kept["prompt"]) == (sibling, None, "A's turn")
++
++
++def test_hold_queue_marker_still_replaces_dead_paused_or_own_markers(tmp_path):
++    import os
++    import time
++    dead = subprocess.Popen([sys.executable, "-c", "pass"])
++    dead.wait()
++    for prior in ({"writer_pid": dead.pid},                                        # crashed writer
++                  {"writer_pid": os.getpid()},                                     # this backend's own
++                  {"writer_pid": os.getpid() + 0, "reason": "core_update_pause"}):  # a paused turn
++        _seed(tmp_path, {"attempts": 0, "prompt": "old", "started_at": time.time(), "auto_continue": True, **prior})
++        assert record_turn_start(tmp_path, "S", "queued", reason=UPDATE_HOLD_QUEUE_REASON) is True
++        got = read_turn_marker(tmp_path, "S")
++        assert (got["reason"], got["prompt"], got["writer_pid"]) == (UPDATE_HOLD_QUEUE_REASON, "queued", os.getpid())
++
++
++def test_a_normal_turn_start_is_unchanged(tmp_path, sibling):
++    import time
++    _seed(tmp_path, {"attempts": 0, "prompt": "A's turn", "started_at": time.time(), "auto_continue": True,
++                     "writer_pid": sibling})
++    assert record_turn_start(tmp_path, "S", "B runs") is True
++    assert read_turn_marker(tmp_path, "S")["prompt"] == "B runs"
+diff --git a/tui_gateway/turn_marker.py b/tui_gateway/turn_marker.py
+index 3f7c5c2c28b..2c7d8b576b8 100644
+--- a/tui_gateway/turn_marker.py
++++ b/tui_gateway/turn_marker.py
+@@ -211,6 +211,12 @@ def record_turn_start(home: Path | str, session_key: str, prompt: str, *, attemp
+ 
+     def mutate(entries):
+         prior = entries.get(session_key)
++        if (reason == UPDATE_HOLD_QUEUE_REASON and isinstance(prior, dict) and not prior.get("reason")
++                and prior.get("writer_pid") != entry["writer_pid"] and marker_writer_state(prior) != "dead"):
++            # [daveey] A sibling backend on this HERMES_HOME (#00000) is mid-turn on this session: its live-turn
++            # marker is what keeps hermes-sync from updating over that turn, and hermes-sync skips hold-queue
++            # markers as "not running". Never replace it; that backend's own end-of-turn clears it.
++            return None
+         if isinstance(prior, dict) and prior.get("reason") == _JOBS_REASON:
+             own = {str(j.get("session_id")) for j in entry.get("killed_jobs", ()) if isinstance(j, dict)}
+             kept = [j for j in prior.get("killed_jobs") or () if isinstance(j, dict)
+diff --git a/website/docs/user-guide/features/web-dashboard.md b/website/docs/user-guide/features/web-dashboard.md
+index 138a7f6a091..9a7d573e6b3 100644
+--- a/website/docs/user-guide/features/web-dashboard.md
++++ b/website/docs/user-guide/features/web-dashboard.md
+@@ -679,6 +679,7 @@ same auth gate as the rest of `/api/`.
+ | `POST /api/ops/hooks` · `DELETE /api/ops/hooks` | Create / remove a shell hook (consent-gated) |
+ | `GET /api/system/stats` | Host stats — OS, CPU, memory, disk, uptime |
+ | `GET /api/hermes/update/check` | Report update availability (commits behind, install method) without applying. For git installs that are behind, also returns a `commits` list (`sha`, `summary`, `author`, `at`) of what's changed. `?force=1` busts the 24h cache (the check goes through the GitHub API, never `git fetch`) |
++| `GET /api/hermes/update/progress` | This host's background core update from `hermes-sync`: `{progress: null}` when none is owed, else `state` (`batching` / `draining` / `applying` / `blocked`), `due_at`, `state_since`, `elapsed_s` (host clock), the drainer's `cap_s` and what it is `waiting_on`. Polled by Desktop's version pill |
+ | `GET /api/curator` · `PUT .../paused` · `POST .../run` | Skill-curator status + pause/resume + run |
+ | `GET /api/portal` | Nous Portal auth + Tool Gateway routing (read-only) |
+ | `POST /api/ops/prompt-size` · `/dump` · `/config-migrate` | Diagnostics (backgrounded) |
+-- 
+2.43.0
+

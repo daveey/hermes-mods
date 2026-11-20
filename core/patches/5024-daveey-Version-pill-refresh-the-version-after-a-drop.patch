@@ -1,0 +1,128 @@
+From 5f26389cb234fdd305debf7b17f028e1964a22a0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 17:01:09 -0800
+Subject: [PATCH] [daveey] Version pill: refresh the version after a dropped
+ update too
+
+The pill drops a busy update state after 10 min without an answer from its
+host (UPDATE_PROGRESS_STALE_MS). The host's next "nothing in progress"
+answer then saw no busy state before it, so the post-update version
+refresh was skipped after a restart (or a Mac sleep) longer than the bound.
+A dropped busy state is now remembered per pill and the next answer that is
+not busy refreshes the version once; a connection switch forgets it, since
+the next remote is another host.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/store/updates-progress.test.ts        | 43 ++++++++++++++++++-
+ apps/desktop/src/store/updates.ts             |  8 +++-
+ 2 files changed, 48 insertions(+), 3 deletions(-)
+
+diff --git a/apps/desktop/src/store/updates-progress.test.ts b/apps/desktop/src/store/updates-progress.test.ts
+index 68e9182eb37..b821ede5093 100644
+--- a/apps/desktop/src/store/updates-progress.test.ts
++++ b/apps/desktop/src/store/updates-progress.test.ts
+@@ -114,7 +114,9 @@ describe('pollUpdateProgress', () => {
+     expect(checkHermesUpdateSpy).not.toHaveBeenCalled()
+   })
+ 
+-  it('drops a kept state once the host has been silent past the stale bound, without a refresh', async () => {
++  it('drops a kept state once the host has been silent past the stale bound, and refreshes when it answers', async () => {
++    // A restart (or a Mac asleep) longer than the bound: the busy state is dropped without a refresh, but the
++    // update it showed was never seen to finish, so the host's next "nothing in progress" still refreshes.
+     setConnection(remote)
+     progressSpy.mockImplementation(async (scope?: { connectionId?: string }) => (scope ? { progress: null } : applying))
+     await updates.pollUpdateProgress()
+@@ -130,10 +132,47 @@ describe('pollUpdateProgress', () => {
+       throw new Error('gone')
+     })
+     await updates.pollUpdateProgress()
+-    clock.mockRestore()
+ 
+     expect(updates.$backendUpdateProgress.get()).toBeNull()
+     expect(checkHermesUpdateSpy).not.toHaveBeenCalled()
++
++    progressSpy.mockImplementation(async () => ({ progress: null }))
++    await updates.pollUpdateProgress()
++    clock.mockRestore()
++
++    await vi.waitFor(() => expect(checkHermesUpdateSpy).toHaveBeenCalledWith(true))
++    expect(checkHermesUpdateSpy).toHaveBeenCalledTimes(1)
++
++    // Once answered, the next quiet answer is just quiet: no second refresh.
++    await updates.pollUpdateProgress()
++    expect(checkHermesUpdateSpy).toHaveBeenCalledTimes(1)
++  })
++
++  it('a dropped update on one remote never refreshes the next remote', async () => {
++    setConnection(remote)
++    progressSpy.mockImplementation(async (scope?: { connectionId?: string }) => (scope ? { progress: null } : applying))
++    await updates.pollUpdateProgress()
++
++    const clock = vi.spyOn(Date, 'now').mockReturnValue(Date.now() + updates.UPDATE_PROGRESS_STALE_MS + 1)
++
++    progressSpy.mockImplementation(async (scope?: { connectionId?: string }) => {
++      if (scope) {
++        return { progress: null }
++      }
++
++      throw new Error('gone')
++    })
++    await updates.pollUpdateProgress()
++    clock.mockRestore()
++    updates.startUpdatePoller()
++    setConnection({ ...remote, baseUrl: 'https://other.example', wsUrl: 'wss://other.example' })
++    await vi.waitFor(() => expect(checkHermesUpdateSpy).toHaveBeenCalled())
++    checkHermesUpdateSpy.mockClear()
++
++    progressSpy.mockImplementation(async () => ({ progress: null }))
++    await updates.pollUpdateProgress()
++    expect(checkHermesUpdateSpy).not.toHaveBeenCalled()
++    updates.stopUpdatePoller()
+   })
+ 
+   it('never stacks a second request on a host that has not answered yet', async () => {
+diff --git a/apps/desktop/src/store/updates.ts b/apps/desktop/src/store/updates.ts
+index 35f55a72042..cc04a784a27 100644
+--- a/apps/desktop/src/store/updates.ts
++++ b/apps/desktop/src/store/updates.ts
+@@ -1378,6 +1378,9 @@ const progressBusy = (p: BackgroundUpdateProgress | null): boolean => p?.state =
+ 
+ const progressInFlight: Record<UpdateTarget, boolean> = { backend: false, client: false }
+ const progressAnsweredAt: Record<UpdateTarget, number> = { backend: 0, client: 0 }
++// [daveey] A busy state dropped at the stale bound: the update it showed has not been seen to finish, so the host's
++// next answer that is not busy still refreshes the version (a long restart or a long sleep would otherwise skip it).
++const progressDroppedBusy: Record<UpdateTarget, boolean> = { backend: false, client: false }
+ 
+ /** [daveey] How long a pill keeps its last update state while its host does not answer (restarting for the update
+  *  takes a few minutes); past this the state is dropped, so a host that never comes back cannot spin forever. */
+@@ -1411,6 +1414,7 @@ async function pollProgressFor(target: UpdateTarget): Promise<void> {
+     // backend): keep what the pill shows for a while. Only a host that answers "nothing in progress" ends an
+     // update (and refreshes the version); one silent past the stale bound just drops its state.
+     if (store.get() && Date.now() - progressAnsweredAt[target] > UPDATE_PROGRESS_STALE_MS) {
++      progressDroppedBusy[target] ||= progressBusy(store.get())
+       store.set(null)
+     }
+ 
+@@ -1423,8 +1427,9 @@ async function pollProgressFor(target: UpdateTarget): Promise<void> {
+     return
+   }
+ 
+-  const finished = progressBusy(store.get()) && !progressBusy(next)
++  const finished = (progressBusy(store.get()) || progressDroppedBusy[target]) && !progressBusy(next)
+ 
++  progressDroppedBusy[target] = false // answered: the store holds the truth again
+   progressAnsweredAt[target] = Date.now()
+   store.set(next)
+ 
+@@ -1509,6 +1514,7 @@ export function startUpdatePoller(): void {
+     lastConnectionKey = key
+     // Another host now: the previous remote's update state is not this one's.
+     $backendUpdateProgress.set(null)
++    progressDroppedBusy.backend = false
+ 
+     if (conn?.mode === 'remote') {
+       void checkBackendUpdates()
+-- 
+2.43.0
+

@@ -1,0 +1,173 @@
+From f6dcd4f543343b695f06ebcf20d4d042ddce2ea8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 16:26:03 -0800
+Subject: [PATCH] [daveey] Passive no-warm-backend misses log quietly; bound
+ kept pill state
+
+Re-review of the update pill poll (subagent):
+- A passive read that finds no warm backend is the designed fail-fast, but
+  it rejected through hermes:api, so the client pill's 10 s poll printed
+  Electron's handler stack plus a remembered stack every tick while the
+  local backend was cold. It now rides the expected-failure sentinel
+  (isExpectedPassiveMiss); the renderer sees the same rejection.
+- A pill keeps its last state while its host is silent for at most 10 min
+  (UPDATE_PROGRESS_STALE_MS), so a host that never answers again can't
+  spin forever; dropping it there does not trigger the version refresh.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../desktop/electron/api-expected-404.test.ts | 16 +++++++++++++-
+ apps/desktop/electron/api-expected-404.ts     | 13 ++++++++++-
+ apps/desktop/electron/main.ts                 |  4 ++--
+ .../src/store/updates-progress.test.ts        | 22 +++++++++++++++++++
+ apps/desktop/src/store/updates.ts             | 13 ++++++++++-
+ 5 files changed, 63 insertions(+), 5 deletions(-)
+
+diff --git a/apps/desktop/electron/api-expected-404.test.ts b/apps/desktop/electron/api-expected-404.test.ts
+index bd712f54388..c5bf985d1ae 100644
+--- a/apps/desktop/electron/api-expected-404.test.ts
++++ b/apps/desktop/electron/api-expected-404.test.ts
+@@ -2,7 +2,12 @@ import assert from 'node:assert/strict'
+ 
+ import { test } from 'vitest'
+ 
+-import { HERMES_API_EXPECTED_404, isExpectedNotFoundSentinel, unwrapExpectedNotFound } from './api-expected-404'
++import {
++  HERMES_API_EXPECTED_404,
++  isExpectedNotFoundSentinel,
++  isExpectedPassiveMiss,
++  unwrapExpectedNotFound
++} from './api-expected-404'
+ 
+ test('a handler-produced sentinel is recognized', () => {
+   assert.equal(isExpectedNotFoundSentinel({ [HERMES_API_EXPECTED_404]: '404: {"detail":"Session not found"}' }), true)
+@@ -58,3 +63,12 @@ test('the rethrown message still matches the renderer 404 probe predicate', () =
+     assert.match(String((error as Error).message), /(?:^|\s)404\b/)
+   }
+ })
++
++test('a passive read that finds no warm backend is expected; the same miss on a normal read is not', () => {
++  const miss = new Error('Passive read: no warm backend for "conn:local::default"')
++
++  assert.equal(isExpectedPassiveMiss({ passive: true, path: '/api/hermes/update/progress' }, miss), true)
++  assert.equal(isExpectedPassiveMiss({ path: '/api/hermes/update/progress' }, miss), false)
++  assert.equal(isExpectedPassiveMiss({ passive: true }, new Error('connect ECONNREFUSED')), false)
++  assert.equal(isExpectedPassiveMiss(null, miss), false)
++})
+diff --git a/apps/desktop/electron/api-expected-404.ts b/apps/desktop/electron/api-expected-404.ts
+index 91482c3024e..8216b7cfcd8 100644
+--- a/apps/desktop/electron/api-expected-404.ts
++++ b/apps/desktop/electron/api-expected-404.ts
+@@ -43,4 +43,15 @@ function unwrapExpectedNotFound(value: unknown): unknown {
+   return value
+ }
+ 
+-export { HERMES_API_EXPECTED_404, isExpectedNotFoundSentinel, unwrapExpectedNotFound }
++// [daveey] A passive read (`passive: true`) is allowed to find no warm backend and fail fast: that refusal IS the
++// design (host-backend-singleton.ts), and background pollers (the version pills' 10 s update-progress read) hit it
++// on every tick while a local backend is cold. Rejecting printed Electron's full handler stack plus our own
++// remembered stack each time, so it rides the same sentinel: the renderer still gets the identical rejection.
++function isExpectedPassiveMiss(request: unknown, error: unknown): boolean {
++  return (
++    Boolean(request && typeof request === 'object' && (request as { passive?: unknown }).passive === true) &&
++    /^Passive read: no warm backend\b/.test(String((error as { message?: unknown } | null)?.message ?? error))
++  )
++}
++
++export { HERMES_API_EXPECTED_404, isExpectedNotFoundSentinel, isExpectedPassiveMiss, unwrapExpectedNotFound }
+diff --git a/apps/desktop/electron/main.ts b/apps/desktop/electron/main.ts
+index d8213eabad3..77fe940db39 100644
+--- a/apps/desktop/electron/main.ts
++++ b/apps/desktop/electron/main.ts
+@@ -45,7 +45,7 @@ import type { Session } from 'electron'
+ 
+ import { type ActiveRuntimeState, classifyActiveRuntime } from './active-runtime-state'
+ import { hideAgentTestInstance, isHiddenAgentTestInstance } from './agent-test-instance'
+-import { HERMES_API_EXPECTED_404 } from './api-expected-404'
++import { HERMES_API_EXPECTED_404, isExpectedPassiveMiss } from './api-expected-404'
+ import { formatApiRequestFailure } from './api-request-failure'
+ import { destroyKeepaliveAgents, readJsonErrorBody, readStatusCode } from './api-transport'
+ import { appIconCandidates, resolveAppIcon, shouldOverrideDockIcon } from './app-icon'
+@@ -15879,7 +15879,7 @@ ipcMain.handle('hermes:api', async (_event, request) => {
+     // a rejection with the identical `404: <body>` message. The renderer
+     // contract is unchanged; only Electron's logging is bypassed. Every other
+     // failure still rejects and still logs in full.
+-    if (isNotFoundApiError(error)) {
++    if (isNotFoundApiError(error) || isExpectedPassiveMiss(request, error)) {
+       return { [HERMES_API_EXPECTED_404]: String((error as any)?.message ?? error) }
+     }
+ 
+diff --git a/apps/desktop/src/store/updates-progress.test.ts b/apps/desktop/src/store/updates-progress.test.ts
+index a45db75bea2..68e9182eb37 100644
+--- a/apps/desktop/src/store/updates-progress.test.ts
++++ b/apps/desktop/src/store/updates-progress.test.ts
+@@ -114,6 +114,28 @@ describe('pollUpdateProgress', () => {
+     expect(checkHermesUpdateSpy).not.toHaveBeenCalled()
+   })
+ 
++  it('drops a kept state once the host has been silent past the stale bound, without a refresh', async () => {
++    setConnection(remote)
++    progressSpy.mockImplementation(async (scope?: { connectionId?: string }) => (scope ? { progress: null } : applying))
++    await updates.pollUpdateProgress()
++
++    const now = Date.now()
++    const clock = vi.spyOn(Date, 'now').mockReturnValue(now + updates.UPDATE_PROGRESS_STALE_MS + 1)
++
++    progressSpy.mockImplementation(async (scope?: { connectionId?: string }) => {
++      if (scope) {
++        return { progress: null }
++      }
++
++      throw new Error('gone')
++    })
++    await updates.pollUpdateProgress()
++    clock.mockRestore()
++
++    expect(updates.$backendUpdateProgress.get()).toBeNull()
++    expect(checkHermesUpdateSpy).not.toHaveBeenCalled()
++  })
++
+   it('never stacks a second request on a host that has not answered yet', async () => {
+     setConnection(remote)
+ 
+diff --git a/apps/desktop/src/store/updates.ts b/apps/desktop/src/store/updates.ts
+index cacaf9e38ea..35f55a72042 100644
+--- a/apps/desktop/src/store/updates.ts
++++ b/apps/desktop/src/store/updates.ts
+@@ -1377,6 +1377,11 @@ export const UPDATE_PROGRESS_POLL_MS = 10_000
+ const progressBusy = (p: BackgroundUpdateProgress | null): boolean => p?.state === 'draining' || p?.state === 'applying'
+ 
+ const progressInFlight: Record<UpdateTarget, boolean> = { backend: false, client: false }
++const progressAnsweredAt: Record<UpdateTarget, number> = { backend: 0, client: 0 }
++
++/** [daveey] How long a pill keeps its last update state while its host does not answer (restarting for the update
++ *  takes a few minutes); past this the state is dropped, so a host that never comes back cannot spin forever. */
++export const UPDATE_PROGRESS_STALE_MS = 10 * 60_000
+ 
+ async function pollProgressFor(target: UpdateTarget): Promise<void> {
+   const store = target === 'backend' ? $backendUpdateProgress : $clientUpdateProgress
+@@ -1403,7 +1408,12 @@ async function pollProgressFor(target: UpdateTarget): Promise<void> {
+     )
+   } catch {
+     // Unreachable (restarting for this very update, an older backend without the route, no warm local
+-    // backend): keep what the pill shows. Only a host that answers "nothing in progress" ends an update.
++    // backend): keep what the pill shows for a while. Only a host that answers "nothing in progress" ends an
++    // update (and refreshes the version); one silent past the stale bound just drops its state.
++    if (store.get() && Date.now() - progressAnsweredAt[target] > UPDATE_PROGRESS_STALE_MS) {
++      store.set(null)
++    }
++
+     return
+   } finally {
+     progressInFlight[target] = false
+@@ -1415,6 +1425,7 @@ async function pollProgressFor(target: UpdateTarget): Promise<void> {
+ 
+   const finished = progressBusy(store.get()) && !progressBusy(next)
+ 
++  progressAnsweredAt[target] = Date.now()
+   store.set(next)
+ 
+   if (finished) {
+-- 
+2.43.0
+

@@ -1,0 +1,206 @@
+From 2dec006b76419802c3a72d26be4b2ecffd52ef4b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 22:35:20 +0000
+Subject: [PATCH] fix(desktop): retain mute stale-page protection after ack
+ [daveey]
+
+---
+ .../src/lib/use-session-parked.test.ts        | 33 +++++++++++++++++--
+ .../desktop/src/store/session-blocked.test.ts | 24 ++++++++++++++
+ apps/desktop/src/store/session-blocked.ts     | 21 +++++++-----
+ apps/desktop/src/store/session-park-rows.ts   | 25 ++++++++++++++
+ 4 files changed, 92 insertions(+), 11 deletions(-)
+
+diff --git a/apps/desktop/src/lib/use-session-parked.test.ts b/apps/desktop/src/lib/use-session-parked.test.ts
+index a9702d8be2a..c6a7a9112f7 100644
+--- a/apps/desktop/src/lib/use-session-parked.test.ts
++++ b/apps/desktop/src/lib/use-session-parked.test.ts
+@@ -1,10 +1,37 @@
+-import { renderHook } from '@testing-library/react'
+-import { expect, it } from 'vitest'
++import { useStore } from '@nanostores/react'
++import { act, renderHook } from '@testing-library/react'
++import { afterEach, expect, it, vi } from 'vitest'
+ 
+-import { parkRowFor } from '@/store/session-blocked'
++import { $sessions, setSessions } from '@/store/session'
++import { $muteWriteGuard, MUTE_WRITE_GUARD_MS, parkRowFor, writeSessionMuted } from '@/store/session-blocked'
++import type { SessionInfo } from '@/types/hermes'
++
++afterEach(() => vi.useRealTimers())
+ 
+ import { useSessionParked } from './use-session-parked'
+ 
++it('keeps the stale-page guard after a rendered listed row acknowledges the write', async () => {
++  vi.useFakeTimers()
++  const row = { id: 'listed', muted: false, profile: 'default' } as SessionInfo
++  setSessions([row])
++
++  const { result } = renderHook(() => {
++    const rows = useStore($sessions)
++
++    return useSessionParked(row.id, rows[0])
++  })
++
++  await act(async () => writeSessionMuted(row, true, async () => ({})))
++  expect(result.current).toBe(true)
++  expect($muteWriteGuard.get().has(row.id)).toBe(true)
++  act(() => setSessions([{ ...row }]))
++  expect(result.current).toBe(true)
++  await act(async () => vi.advanceTimersByTimeAsync(MUTE_WRITE_GUARD_MS))
++  act(() => setSessions([{ ...row, muted: true }]))
++  expect(result.current).toBe(true)
++  expect($muteWriteGuard.get().has(row.id)).toBe(false)
++})
++
+ it('remembers the drawn row and refreshes its owner and muted state', () => {
+   const row = { id: 'drawn-only', connection_id: 'remote', profile: 'work', muted: false }
+ 
+diff --git a/apps/desktop/src/store/session-blocked.test.ts b/apps/desktop/src/store/session-blocked.test.ts
+index 0e168423cf1..596cd6b094f 100644
+--- a/apps/desktop/src/store/session-blocked.test.ts
++++ b/apps/desktop/src/store/session-blocked.test.ts
+@@ -20,6 +20,7 @@ import {
+   migrateLocalParks,
+   MUTE_ACK_HOLD_MS,
+   MUTE_WRITE_GUARD_MS,
++  muteWriteFor,
+   parkRowFor,
+   rememberParkRow,
+   resolveSessionParked,
+@@ -28,6 +29,7 @@ import {
+   writeSessionMuted
+ } from './session-blocked'
+ import { sessionStatusStripe } from './session-dot-state'
++import { parkRows } from './session-park-rows'
+ 
+ const row = (overrides: Partial<SessionInfo> = {}): SessionInfo =>
+   ({ id: 's1', message_count: 3, profile: 'default', ...overrides }) as unknown as SessionInfo
+@@ -161,6 +163,9 @@ describe('drawn rows outside the recent list', () => {
+     rememberParkRow(old)
+     await writeSessionMuted(old, true, async () => ({}))
+     rememberParkRow({ ...old, muted: true })
++    expect($muteWriteGuard.get().has(old.id)).toBe(true)
++    await vi.advanceTimersByTimeAsync(MUTE_WRITE_GUARD_MS)
++    rememberParkRow({ ...old, muted: true })
+     expect($muteWriteGuard.get().has(old.id)).toBe(false)
+     expect(isSessionParked(old.id, { muted: false })).toBe(false)
+   })
+@@ -186,6 +191,25 @@ describe('drawn rows outside the recent list', () => {
+     expect(notifyError).toHaveBeenCalledWith(error, 'Could not update the parked state')
+   })
+ 
++  it('reuses the remembered lineage index across unchanged lookups and invalidates on updates', () => {
++    rememberParkRow(row({ id: 'tip', _lineage_root_id: 'root' }))
++    $muteWriteGuard.set(new Map([['tip', { at: Date.now(), value: true, acked: true }]]))
++    expect(muteWriteFor('root')?.value).toBe(true)
++    const values = vi.spyOn(parkRows, 'values')
++
++    for (let i = 0; i < 300; i++) {
++      expect(muteWriteFor('root')?.value).toBe(true)
++    }
++
++    expect(values).not.toHaveBeenCalled()
++    rememberParkRow(row({ id: 'tip', _lineage_root_id: 'new-root' }))
++    expect(muteWriteFor('new-root')?.value).toBe(true)
++    expect(muteWriteFor('root')).toBeUndefined()
++    setSessions([row({ id: 'listed-tip', _lineage_root_id: 'tip' })])
++    expect(parkRowFor('listed-tip')?.id).toBe('tip')
++    values.mockRestore()
++  })
++
+   it('bounds the drawn-row registry and refreshes remembered entries', () => {
+     for (let i = 0; i < 1000; i++) {
+       rememberParkRow(row({ id: `old-${i}` }))
+diff --git a/apps/desktop/src/store/session-blocked.ts b/apps/desktop/src/store/session-blocked.ts
+index c1c2a715921..8e7b0bdcdc4 100644
+--- a/apps/desktop/src/store/session-blocked.ts
++++ b/apps/desktop/src/store/session-blocked.ts
+@@ -8,7 +8,7 @@ import type { SessionInfo } from '@/types/hermes'
+ 
+ import { notifyError } from './notifications'
+ import { $sessions, lineageAliases, setSessions } from './session'
+-import { type MuteRow, parkRows } from './session-park-rows'
++import { cacheParkRow, type MuteRow, parkLineageRows, parkRows } from './session-park-rows'
+ 
+ export { type MuteRow, resetParkRowsForTests } from './session-park-rows'
+ 
+@@ -46,26 +46,31 @@ type LineageRows = Parameters<typeof lineageAliases>[1]
+ 
+ /** Remember drawn rows outside the recent list without retaining an unbounded history. */
+ export function rememberParkRow(row: MuteRow): void {
+-  parkRows.delete(row.id)
+-  parkRows.set(row.id, row)
++  cacheParkRow(row)
+ 
+-  if (parkRows.size > 1000) {
+-    parkRows.delete(parkRows.keys().next().value!)
++  if ($muteWriteGuard.get().size === 0) {
++    return
+   }
+ 
+-  const aliases = lineageAliases(row.id, [...parkRows.values(), ...$sessions.get()])
++  const aliases = lineageAliases(row.id, parkLineageRows($sessions.get()))
+ 
+   for (const alias of aliases) {
+     const write = $muteWriteGuard.get().get(alias)
+ 
+-    if (write?.acked && (row.muted === write.value || Date.now() - write.at >= MUTE_ACK_HOLD_MS)) {
++    // Agreement can be our optimistic setRowMuted, not a fresh backend page.
++    // Keep the original stale-page window even after an agreeing render.
++    if (
++      write?.acked &&
++      Date.now() - write.at >= MUTE_WRITE_GUARD_MS &&
++      (row.muted === write.value || Date.now() - write.at >= MUTE_ACK_HOLD_MS)
++    ) {
+       setMuteWrite(alias, null)
+     }
+   }
+ }
+ 
+ export function parkRowFor(id: string): MuteRow | undefined {
+-  const rows = [...parkRows.values(), ...$sessions.get()]
++  const rows = parkLineageRows($sessions.get())
+ 
+   for (const alias of lineageAliases(id, rows)) {
+     const row = parkRows.get(alias)
+diff --git a/apps/desktop/src/store/session-park-rows.ts b/apps/desktop/src/store/session-park-rows.ts
+index cb746511986..9c585033725 100644
+--- a/apps/desktop/src/store/session-park-rows.ts
++++ b/apps/desktop/src/store/session-park-rows.ts
+@@ -4,7 +4,32 @@ export type MuteRow = Pick<SessionInfo, 'id'> &
+   Partial<Pick<SessionInfo, '_lineage_root_id' | 'connection_id' | 'muted' | 'profile'>>
+ 
+ export const parkRows = new Map<string, MuteRow>()
++let listedRows: readonly MuteRow[] | undefined
++let lineageRows: MuteRow[] | undefined
++
++/** Preserve the array identity used by lineageAliases' index memo between renders. */
++export function parkLineageRows(sessions: readonly MuteRow[]): MuteRow[] {
++  if (!lineageRows || listedRows !== sessions) {
++    listedRows = sessions
++    lineageRows = [...parkRows.values(), ...sessions]
++  }
++
++  return lineageRows
++}
++
++export function cacheParkRow(row: MuteRow): void {
++  parkRows.delete(row.id)
++  parkRows.set(row.id, row)
++
++  if (parkRows.size > 1000) {
++    parkRows.delete(parkRows.keys().next().value!)
++  }
++
++  lineageRows = undefined
++}
+ 
+ export function resetParkRowsForTests(): void {
+   parkRows.clear()
++  listedRows = undefined
++  lineageRows = undefined
+ }
+-- 
+2.43.0
+

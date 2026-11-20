@@ -58,7 +58,7 @@ lands you on the next waiting chat) → repeat. Use **⌘R** on a chat whose tur
 - **Moved binding:** upstream binds ⌘⇧]/⌘⇧[ to `profile.next`/`profile.prev`. The fork unbinds those, so
   rebind them if you step profiles from the keyboard.
 
-### ⌘B: mark blocked (0048, 0049)
+### ⌘B: mark blocked (0048, 0049, 5037–5039)
 
 - `session.toggleBlocked` (`mod+b`) flips a per-session flag on the session `currentSessionForStep()` returns
   (`store/session-blocked.ts`): since 0065 the focused tile/tab, else the main chat. The flag is a manual park: “waiting on something outside this chat”. Only ⌘B
@@ -72,6 +72,7 @@ lands you on the next waiting chat) → repeat. Use **⌘R** on a chat whose tur
   `nextSidebarSessionId` passes a not-blocked filter to the ⇧ variant and the archive → next fallback too, so
   no stepping shortcut lands on a blocked session.
 - **Moved binding:** upstream's sidebar toggle `view.toggleSidebar` moves from ⌘B to ⌥⌘B (`mod+alt+b`).
+- **Drawn rows outside the live list (5037–5039):** ⌘B on chats outside the ~50-row `$sessions` list POSTs `/mute` via a bounded drawn-row registry. Acked writes hold through the 10s stale-page window, then drop on agreement (10 min eventual expiry). Drawn-only rows that already agree when the ack lands are reconciled at the 10s deadline. Details: [mirror-5039-cmd-b-drawn-row-mute.md](mirror-5039-cmd-b-drawn-row-mute.md).
 
 ### ⌘R: resume; ⇧⌘R: reload (0022)
 

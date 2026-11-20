@@ -1,0 +1,565 @@
+From eae76cc8eaa0bc3b72d274da6526a0168ba58401 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 16:21:00 -0800
+Subject: [PATCH] [daveey] Version pill update poll: passive, keeps state on
+ error, drain clock
+
+Review of the first commit (subagent, REQUEST_CHANGES), addressed:
+- The 10 s progress poll is passive with no `foreground` priority: it never
+  cold-starts a local backend and never counts as user activity, so it can't
+  open the sleep gate (electron/power-settle.ts).
+- An unreachable host (most often: restarting for this very update) keeps
+  the pill's last state; only an answered "nothing in progress" ends an
+  update and refreshes the version. One request per host at a time; a
+  connection switch clears the old remote's state.
+- The bar rides the icon slot with the button `relative`: the label sits in
+  a truncating (overflow-hidden) span that clipped it.
+- The bar fills on the drain pass's own clock (new state_elapsed_s), which
+  the drainer's cap is measured on; the tooltip still counts from due.
+- session_auto_continue logs when a held message cannot be journaled
+  because a sibling's live turn holds the marker.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../src/api/system-update-progress.test.ts    | 28 +++++++++
+ apps/desktop/src/api/system.ts                | 12 ++--
+ .../shell/hooks/use-statusbar-items.test.tsx  | 26 +++++---
+ .../app/shell/hooks/use-statusbar-items.tsx   | 22 ++++---
+ .../desktop/src/lib/background-update.test.ts | 28 ++++++++-
+ apps/desktop/src/lib/background-update.ts     | 15 ++++-
+ .../src/store/updates-progress.test.ts        | 60 +++++++++++++++++--
+ apps/desktop/src/store/updates.ts             | 17 +++++-
+ hermes_cli/core_update_progress.py            |  2 +
+ tests/hermes_cli/test_core_update_progress.py |  6 +-
+ .../test_hold_queue_marker_sibling.py         |  2 +-
+ tui_gateway/session_auto_continue.py          |  9 ++-
+ 12 files changed, 190 insertions(+), 37 deletions(-)
+ create mode 100644 apps/desktop/src/api/system-update-progress.test.ts
+
+diff --git a/apps/desktop/src/api/system-update-progress.test.ts b/apps/desktop/src/api/system-update-progress.test.ts
+new file mode 100644
+index 00000000000..6b439f07a47
+--- /dev/null
++++ b/apps/desktop/src/api/system-update-progress.test.ts
+@@ -0,0 +1,28 @@
++// @vitest-environment jsdom
++// [daveey] The version pills poll every 10 s: the request must never cold-start a backend (passive) nor count as
++// user activity (no `foreground` priority, which opens the sleep gate in electron/power-settle.ts).
++import { afterEach, describe, expect, it, vi } from 'vitest'
++
++import { getHermesUpdateProgress } from './system'
++
++afterEach(() => {
++  delete (window as { hermesDesktop?: unknown }).hermesDesktop
++})
++
++describe('getHermesUpdateProgress', () => {
++  it('is a passive background read, pinned to this machine when asked', async () => {
++    const api = vi.fn().mockResolvedValue({ progress: null })
++
++    window.hermesDesktop = { api } as never
++
++    await getHermesUpdateProgress({ connectionId: 'local' })
++    await getHermesUpdateProgress()
++
++    const [local, ambient] = api.mock.calls.map(([request]) => request)
++
++    expect(local).toMatchObject({ connectionId: 'local', passive: true, path: '/api/hermes/update/progress' })
++    expect(local.priority).toBeUndefined()
++    expect(ambient).toMatchObject({ passive: true, path: '/api/hermes/update/progress' })
++    expect(ambient.priority).toBeUndefined()
++  })
++})
+diff --git a/apps/desktop/src/api/system.ts b/apps/desktop/src/api/system.ts
+index cf60366098c..5cb32746bc7 100644
+--- a/apps/desktop/src/api/system.ts
++++ b/apps/desktop/src/api/system.ts
+@@ -162,18 +162,22 @@ export function updateHermes(): Promise<ActionResponse> {
+   })
+ }
+ 
+-/** Query the connected backend's own update state. In remote mode this is the
+- *  authoritative source for the backend's behind-count + "what's changed",
+- *  distinct from the Electron client clone's git state. */
+ /** [daveey] The host's own background core update (hermes-sync); `{ progress: null }` when none is owed.
+- *  `scope` pins the host: `{ connectionId: 'local' }` for this machine, omitted for the active backend. */
++ *  `scope` pins the host: `{ connectionId: 'local' }` for this machine, omitted for the active backend.
++ *  A 10 s background poll: passive (never cold-starts a backend) and never `foreground` (that would count as
++ *  user activity and open the sleep gate, electron/power-settle.ts). */
+ export function getHermesUpdateProgress(scope?: ProfileScope): Promise<UpdateProgressResponse> {
+   return hermesApi<UpdateProgressResponse>({
+     ...(scope ? capabilityScoped(scope) : profileScoped()),
++    passive: true,
++    priority: undefined,
+     path: '/api/hermes/update/progress'
+   })
+ }
+ 
++/** Query the connected backend's own update state. In remote mode this is the
++ *  authoritative source for the backend's behind-count + "what's changed",
++ *  distinct from the Electron client clone's git state. */
+ export function checkHermesUpdate(force = false): Promise<BackendUpdateCheckResponse> {
+   return hermesApi<BackendUpdateCheckResponse>({
+     ...profileScoped(),
+diff --git a/apps/desktop/src/app/shell/hooks/use-statusbar-items.test.tsx b/apps/desktop/src/app/shell/hooks/use-statusbar-items.test.tsx
+index c96eb1bb8e7..560bd5cace8 100644
+--- a/apps/desktop/src/app/shell/hooks/use-statusbar-items.test.tsx
++++ b/apps/desktop/src/app/shell/hooks/use-statusbar-items.test.tsx
+@@ -195,6 +195,7 @@ describe('statusbar background core update (hermes-sync)', () => {
+     nodeVersion: '22',
+     platform: 'darwin'
+   }
++
+   const markup = (node: ReactNode) => renderToStaticMarkup(<>{node}</>)
+ 
+   it('spins the client pill, names the update and draws a bar filling toward the drainer cap', () => {
+@@ -202,6 +203,7 @@ describe('statusbar background core update (hermes-sync)', () => {
+       $desktopVersion.set(desktop)
+       $updateStatus.set({ behind: 0, supported: true })
+       $clientUpdateProgress.set({
++        stateElapsedS: 30,
+         state: 'draining',
+         elapsedS: 30,
+         capS: 60,
+@@ -211,27 +213,36 @@ describe('statusbar background core update (hermes-sync)', () => {
+     })
+ 
+     const version = renderStatusbarItems().statusbarItems.find(item => item.id === 'version-client')
+-    const label = markup(version?.label)
++    const icon = markup(version?.icon)
+ 
+-    expect(label).toContain('v0.23.1 · updating')
+-    expect(label).toContain('data-slot="version-update-bar"')
+-    expect(label).toMatch(/width:\s*5\d%/)
+-    expect(markup(version?.icon)).toContain('animate-spin')
++    // The bar rides the icon slot, outside the label's truncating (overflow-hidden) span, anchored to the button.
++    expect(version?.label).toBe('v0.23.1 · updating')
++    expect(icon).toContain('animate-spin')
++    expect(icon).toContain('data-slot="version-update-bar"')
++    expect(icon).toMatch(/width:\s*50%/)
+     expect(version?.className).toContain('text-primary')
++    expect(version?.className).toContain('relative')
+     expect(version?.title).toContain(en.shell.statusbar.backgroundUpdate.waitingOn('default:s1'))
+   })
+ 
+   it('shows the remote host installing on the backend pill with a sweeping bar', () => {
+     act(() => {
+       $connection.set({ mode: 'remote' } as never)
+-      $backendUpdateProgress.set({ state: 'applying', elapsedS: 720, capS: 60, waitingOn: [], fetchedAt: Date.now() })
++      $backendUpdateProgress.set({
++        state: 'applying',
++        stateElapsedS: 120,
++        elapsedS: 720,
++        capS: 60,
++        waitingOn: [],
++        fetchedAt: Date.now()
++      })
+     })
+ 
+     const items = renderStatusbarItems().statusbarItems
+     const backend = items.find(item => item.id === 'version-backend')
+ 
+     // No backend version known yet in this fixture: the pill stays hidden, but carries the update state.
+-    expect(markup(backend?.label)).toContain('update-bar-sweep')
++    expect(markup(backend?.icon)).toContain('update-bar-sweep')
+     expect(backend?.title).toContain(en.shell.statusbar.backgroundUpdate.tooltipApplying('12m'))
+   })
+ 
+@@ -240,6 +251,7 @@ describe('statusbar background core update (hermes-sync)', () => {
+       $desktopVersion.set(desktop)
+       $updateStatus.set({ behind: 0, supported: true })
+       $clientUpdateProgress.set({
++        stateElapsedS: 0,
+         state: 'batching',
+         elapsedS: -1860,
+         capS: null,
+diff --git a/apps/desktop/src/app/shell/hooks/use-statusbar-items.tsx b/apps/desktop/src/app/shell/hooks/use-statusbar-items.tsx
+index 61004e61b7d..832b00a82fe 100644
+--- a/apps/desktop/src/app/shell/hooks/use-statusbar-items.tsx
++++ b/apps/desktop/src/app/shell/hooks/use-statusbar-items.tsx
+@@ -113,7 +113,7 @@ function UpdateProgressBar({ fraction }: { fraction: null | number }) {
+   return (
+     <span
+       aria-hidden
+-      className="pointer-events-none absolute inset-x-0 -bottom-1 h-0.5 overflow-hidden rounded-full bg-primary/20"
++      className="pointer-events-none absolute inset-x-1.5 bottom-0.5 h-0.5 overflow-hidden rounded-full bg-primary/20"
+       data-slot="version-update-bar"
+     >
+       {fraction === null ? (
+@@ -142,19 +142,23 @@ function versionItem(
+   const busy = applying || Boolean(bg?.busy)
+   const text = bg ? `${status.label} · ${bg.suffix}` : status.label
+ 
++  const spinner = busy ? <Loader2 className="size-3 animate-spin" /> : <Hash className="size-3" />
++
+   return {
+-    className: status.hasUpdate || busy ? 'text-primary hover:text-primary' : undefined,
++    // `relative` anchors the bar to the pill's button; it rides the icon slot because the label sits in a
++    // truncating (overflow-hidden) span that would clip anything drawn under the text.
++    className: cn((status.hasUpdate || busy) && 'text-primary hover:text-primary', bg?.bar && 'relative'),
+     hidden: status.unknown || hidden,
+-    icon: busy ? <Loader2 className="size-3 animate-spin" /> : <Hash className="size-3" />,
+-    id: `version-${target}`,
+-    label: bg?.bar ? (
+-      <span className="relative inline-flex" data-slot="version-update-label">
+-        {text}
++    icon: bg?.bar ? (
++      <>
++        {spinner}
+         <UpdateProgressBar fraction={bg.bar.fraction} />
+-      </span>
++      </>
+     ) : (
+-      text
++      spinner
+     ),
++    id: `version-${target}`,
++    label: text,
+     // Update state is not a preference: hiding it is how a user misses that
+     // they are behind. Listed in the menu, but locked on.
+     lockedVisible: true,
+diff --git a/apps/desktop/src/lib/background-update.test.ts b/apps/desktop/src/lib/background-update.test.ts
+index 522261559f3..e59653006ef 100644
+--- a/apps/desktop/src/lib/background-update.test.ts
++++ b/apps/desktop/src/lib/background-update.test.ts
+@@ -13,7 +13,16 @@ const copy = en.shell.statusbar.backgroundUpdate
+ const FETCHED = 1_000_000
+ 
+ const wire = (over: Partial<NonNullable<UpdateProgressResponse['progress']>> = {}): UpdateProgressResponse => ({
+-  progress: { state: 'draining', due_at: 1, state_since: 1, elapsed_s: 30, cap_s: 60, waiting_on: [], ...over }
++  progress: {
++    state: 'draining',
++    due_at: 1,
++    state_since: 1,
++    elapsed_s: 30,
++    state_elapsed_s: 30,
++    cap_s: 60,
++    waiting_on: [],
++    ...over
++  }
+ })
+ 
+ describe('mapUpdateProgress', () => {
+@@ -21,6 +30,7 @@ describe('mapUpdateProgress', () => {
+     expect(mapUpdateProgress(wire(), FETCHED)).toEqual({
+       state: 'draining',
+       elapsedS: 30,
++      stateElapsedS: 30,
+       capS: 60,
+       waitingOn: [],
+       fetchedAt: FETCHED
+@@ -46,7 +56,7 @@ describe('describeBackgroundUpdate', () => {
+     const waiting = ['default:a', 'default:b', 'default:c', 'default:d', 'default:e', 'default:f']
+ 
+     const view = describeBackgroundUpdate(
+-      mapUpdateProgress(wire({ elapsed_s: 701, waiting_on: waiting }), FETCHED),
++      mapUpdateProgress(wire({ elapsed_s: 701, state_elapsed_s: 90, waiting_on: waiting }), FETCHED),
+       FETCHED,
+       copy
+     )
+@@ -57,6 +67,20 @@ describe('describeBackgroundUpdate', () => {
+     expect(view?.tooltip).toContain(copy.waitingOn('default:a, default:b, default:c, default:d +2'))
+   })
+ 
++  it('measures the bar on the drain pass clock, the tooltip on time since the update was due', () => {
++    // example-gw 2020-01-01: due 701 s ago, but this drain pass (and its 60 s cap) began 30 s ago.
++    const view = describeBackgroundUpdate(
++      mapUpdateProgress(wire({ elapsed_s: 701, state_elapsed_s: 30 }), FETCHED),
++      FETCHED,
++      copy
++    )
++
++    expect(view?.bar).toEqual({ fraction: 0.5 })
++    expect(view?.tooltip).toContain(copy.tooltipDraining('12m'))
++    // An older host without state_elapsed_s falls back to time since due.
++    expect(mapUpdateProgress(wire({ elapsed_s: 40, state_elapsed_s: undefined }), FETCHED)?.stateElapsedS).toBe(40)
++  })
++
+   it('installing is busy with an indeterminate bar; blocked and batching are quiet', () => {
+     expect(
+       describeBackgroundUpdate(mapUpdateProgress(wire({ state: 'applying', elapsed_s: 720 }), FETCHED), FETCHED, copy)
+diff --git a/apps/desktop/src/lib/background-update.ts b/apps/desktop/src/lib/background-update.ts
+index 42f7cbfeba0..fa58a749439 100644
+--- a/apps/desktop/src/lib/background-update.ts
++++ b/apps/desktop/src/lib/background-update.ts
+@@ -18,6 +18,8 @@ export interface UpdateProgressResponse {
+     due_at: number
+     state_since: number
+     elapsed_s: number
++    /** Seconds in the current state (the drain's own clock, which `cap_s` is measured on). Absent on older hosts. */
++    state_elapsed_s?: number
+     cap_s: null | number
+     waiting_on: string[]
+   }
+@@ -27,6 +29,8 @@ export interface BackgroundUpdateProgress {
+   state: BackgroundUpdateState
+   /** Seconds since the update was due, on the host's clock when fetched (negative while batching). */
+   elapsedS: number
++  /** Seconds in the current state when fetched; the bar measures the drainer's cap on this clock. */
++  stateElapsedS: number
+   capS: null | number
+   waitingOn: string[]
+   /** Local `Date.now()` when fetched: elapsed advances from here, so a skewed client clock never matters. */
+@@ -58,6 +62,9 @@ export function mapUpdateProgress(
+   return {
+     state: raw.state as BackgroundUpdateState,
+     elapsedS: raw.elapsed_s,
++    stateElapsedS: Number.isFinite(raw.state_elapsed_s)
++      ? Math.max(0, raw.state_elapsed_s as number)
++      : Math.max(0, raw.elapsed_s),
+     capS: typeof raw.cap_s === 'number' && raw.cap_s > 0 ? raw.cap_s : null,
+     waitingOn: Array.isArray(raw.waiting_on) ? raw.waiting_on.filter(item => typeof item === 'string') : [],
+     fetchedAt
+@@ -103,7 +110,8 @@ export function describeBackgroundUpdate(
+     return null
+   }
+ 
+-  const elapsed = progress.elapsedS + Math.max(0, now - progress.fetchedAt) / 1000
++  const since = Math.max(0, now - progress.fetchedAt) / 1000
++  const elapsed = progress.elapsedS + since
+ 
+   switch (progress.state) {
+     case 'batching': {
+@@ -121,7 +129,8 @@ export function describeBackgroundUpdate(
+ 
+     case 'draining': {
+       const cap = progress.capS
+-      const pastCap = cap !== null && elapsed >= cap
++      const drained = progress.stateElapsedS + since
++      const pastCap = cap !== null && drained >= cap
+ 
+       return {
+         busy: true,
+@@ -130,7 +139,7 @@ export function describeBackgroundUpdate(
+           copy.tooltipDraining(formatDuration(elapsed)) +
+           (pastCap ? `\n${copy.tooltipPastCap(formatDuration(cap))}` : '') +
+           waitingLine(progress.waitingOn, copy),
+-        bar: { fraction: cap !== null && !pastCap ? Math.min(1, Math.max(0, elapsed / cap)) : null }
++        bar: { fraction: cap !== null && !pastCap ? Math.min(1, Math.max(0, drained / cap)) : null }
+       }
+     }
+ 
+diff --git a/apps/desktop/src/store/updates-progress.test.ts b/apps/desktop/src/store/updates-progress.test.ts
+index 955e93e2969..a45db75bea2 100644
+--- a/apps/desktop/src/store/updates-progress.test.ts
++++ b/apps/desktop/src/store/updates-progress.test.ts
+@@ -33,8 +33,17 @@ const remote: HermesConnection = {
+ }
+ 
+ const draining = {
+-  progress: { state: 'draining', due_at: 1, state_since: 1, elapsed_s: 40, cap_s: 60, waiting_on: ['default:s'] }
++  progress: {
++    state: 'draining',
++    due_at: 1,
++    state_since: 1,
++    elapsed_s: 40,
++    state_elapsed_s: 40,
++    cap_s: 60,
++    waiting_on: ['default:s']
++  }
+ }
++
+ const applying = { progress: { ...draining.progress, state: 'applying' } }
+ const clientCheck = vi.fn().mockResolvedValue({ supported: true, behind: 0 })
+ 
+@@ -68,19 +77,60 @@ describe('pollUpdateProgress', () => {
+     })
+   })
+ 
+-  it('asks no remote host while local, and a missing route reads as no update', async () => {
++  it('asks no remote host while local', async () => {
+     setConnection({ ...remote, mode: 'local' })
+-    updates.$backendUpdateProgress.set({ state: 'applying', elapsedS: 1, capS: null, waitingOn: [], fetchedAt: 0 })
+-    progressSpy.mockRejectedValue(new Error('404'))
++    updates.$backendUpdateProgress.set({
++      state: 'applying',
++      elapsedS: 1,
++      stateElapsedS: 1,
++      capS: null,
++      waitingOn: [],
++      fetchedAt: 0
++    })
++    progressSpy.mockResolvedValue({ progress: null })
+ 
+     await updates.pollUpdateProgress()
+ 
+     expect(progressSpy).toHaveBeenCalledTimes(1)
+     expect(progressSpy).toHaveBeenCalledWith({ connectionId: 'local' })
+-    expect(updates.$clientUpdateProgress.get()).toBeNull()
+     expect(updates.$backendUpdateProgress.get()).toBeNull()
+   })
+ 
++  it('an unreachable host (restarting for this update) keeps the pill as it was and refreshes nothing', async () => {
++    setConnection(remote)
++    progressSpy.mockImplementation(async (scope?: { connectionId?: string }) => (scope ? { progress: null } : applying))
++    await updates.pollUpdateProgress()
++
++    progressSpy.mockImplementation(async (scope?: { connectionId?: string }) => {
++      if (scope) {
++        return { progress: null }
++      }
++
++      throw new Error('backend restarting')
++    })
++    await updates.pollUpdateProgress()
++
++    expect(updates.$backendUpdateProgress.get()).toMatchObject({ state: 'applying' })
++    expect(checkHermesUpdateSpy).not.toHaveBeenCalled()
++  })
++
++  it('never stacks a second request on a host that has not answered yet', async () => {
++    setConnection(remote)
++
++    let release: (value: unknown) => void = () => {}
++    progressSpy.mockImplementation((scope?: { connectionId?: string }) =>
++      scope ? Promise.resolve({ progress: null }) : new Promise(r => (release = r))
++    )
++
++    const first = updates.pollUpdateProgress()
++    await updates.pollUpdateProgress()
++    release(draining)
++    await first
++
++    expect(progressSpy.mock.calls.filter(([scope]) => scope === undefined)).toHaveLength(1)
++    expect(updates.$backendUpdateProgress.get()).toMatchObject({ state: 'draining' })
++  })
++
+   it('refreshes the backend version check once its update finishes, not while it runs', async () => {
+     setConnection(remote)
+     progressSpy.mockImplementation(async (scope?: { connectionId?: string }) => (scope ? { progress: null } : applying))
+diff --git a/apps/desktop/src/store/updates.ts b/apps/desktop/src/store/updates.ts
+index 2b8c7a276c1..cacaf9e38ea 100644
+--- a/apps/desktop/src/store/updates.ts
++++ b/apps/desktop/src/store/updates.ts
+@@ -1376,6 +1376,8 @@ export const UPDATE_PROGRESS_POLL_MS = 10_000
+ 
+ const progressBusy = (p: BackgroundUpdateProgress | null): boolean => p?.state === 'draining' || p?.state === 'applying'
+ 
++const progressInFlight: Record<UpdateTarget, boolean> = { backend: false, client: false }
++
+ async function pollProgressFor(target: UpdateTarget): Promise<void> {
+   const store = target === 'backend' ? $backendUpdateProgress : $clientUpdateProgress
+ 
+@@ -1385,6 +1387,11 @@ async function pollProgressFor(target: UpdateTarget): Promise<void> {
+     return
+   }
+ 
++  if (progressInFlight[target]) {
++    return // a slow host: never stack requests or let an older answer land after a newer one
++  }
++
++  progressInFlight[target] = true
+   const requestKey = connectionKey($connection.get())
+   let next: BackgroundUpdateProgress | null
+ 
+@@ -1395,7 +1402,11 @@ async function pollProgressFor(target: UpdateTarget): Promise<void> {
+       Date.now()
+     )
+   } catch {
+-    next = null // an older backend without the route, or no local backend: nothing to show
++    // Unreachable (restarting for this very update, an older backend without the route, no warm local
++    // backend): keep what the pill shows. Only a host that answers "nothing in progress" ends an update.
++    return
++  } finally {
++    progressInFlight[target] = false
+   }
+ 
+   if (target === 'backend' && connectionKey($connection.get()) !== requestKey) {
+@@ -1403,6 +1414,7 @@ async function pollProgressFor(target: UpdateTarget): Promise<void> {
+   }
+ 
+   const finished = progressBusy(store.get()) && !progressBusy(next)
++
+   store.set(next)
+ 
+   if (finished) {
+@@ -1484,9 +1496,12 @@ export function startUpdatePoller(): void {
+     }
+ 
+     lastConnectionKey = key
++    // Another host now: the previous remote's update state is not this one's.
++    $backendUpdateProgress.set(null)
+ 
+     if (conn?.mode === 'remote') {
+       void checkBackendUpdates()
++      void pollProgressFor('backend')
+     }
+   })
+ 
+diff --git a/hermes_cli/core_update_progress.py b/hermes_cli/core_update_progress.py
+index 6e167d89e0d..1e8f958580a 100644
+--- a/hermes_cli/core_update_progress.py
++++ b/hermes_cli/core_update_progress.py
+@@ -59,6 +59,7 @@ def read_progress(now: Optional[float] = None) -> Optional[dict]:
+                    | applying (``hermes update`` is running) | blocked (owed, but nothing can apply it)
+     ``due_at``     Unix seconds the update became (or becomes) due; ``state_since`` when ``state`` began
+     ``elapsed_s``  seconds since ``due_at`` on this host's clock (negative while batching: due in the future)
++    ``state_elapsed_s`` seconds since ``state_since``: the drain's own clock, which ``cap_s`` is measured on
+     ``cap_s``      the drainer's own apply-over-anything cap while draining, when it published one
+     ``waiting_on`` what the latest deferral named (sessions, cron runs, holds), at most MAX_WAITING_ON
+     """
+@@ -76,6 +77,7 @@ def read_progress(now: Optional[float] = None) -> Optional[dict]:
+         "due_at": window["window_at"],
+         "state_since": window["state_since"],
+         "elapsed_s": round(now - window["window_at"], 1),
++        "state_elapsed_s": round(max(0.0, now - window["state_since"]), 1),
+         "cap_s": cap_s,
+         "waiting_on": _waiting_on(cu, now) if window["state"] in ("draining", "blocked") else [],
+     }
+diff --git a/tests/hermes_cli/test_core_update_progress.py b/tests/hermes_cli/test_core_update_progress.py
+index 10f9e75ad64..f55d5c2e941 100644
+--- a/tests/hermes_cli/test_core_update_progress.py
++++ b/tests/hermes_cli/test_core_update_progress.py
+@@ -34,13 +34,13 @@ def window(cu, **changes):
+ 
+ 
+ def test_draining_reports_elapsed_cap_and_what_it_waits_on(cu):
+-    window(cu)
++    window(cu, state_since=NOW - 45)  # due 701 s ago; this drain pass began 45 s ago
+     (cu / "drain.json").write_text(json.dumps({"pid": 1, "state": "draining", "total_cap_s": 60.0}))
+     reasons = [f"default:2026111{i}_000000_aaaaa{i}" for i in range(10)]
+     (cu / "governor-other-defers.json").write_text(json.dumps({"ts": NOW - 30, "reasons": reasons}))
+     assert cup.read_progress(NOW) == {
+-        "state": "draining", "due_at": NOW - 701, "state_since": NOW - 701, "elapsed_s": 701.0,
+-        "cap_s": 60.0, "waiting_on": reasons[:cup.MAX_WAITING_ON]}
++        "state": "draining", "due_at": NOW - 701, "state_since": NOW - 45, "elapsed_s": 701.0,
++        "state_elapsed_s": 45.0, "cap_s": 60.0, "waiting_on": reasons[:cup.MAX_WAITING_ON]}
+ 
+ 
+ def test_applying_has_no_waiting_list_and_batching_is_due_in_the_future(cu):
+diff --git a/tests/tui_gateway/test_hold_queue_marker_sibling.py b/tests/tui_gateway/test_hold_queue_marker_sibling.py
+index 95a4fcef1de..48a5848b71c 100644
+--- a/tests/tui_gateway/test_hold_queue_marker_sibling.py
++++ b/tests/tui_gateway/test_hold_queue_marker_sibling.py
+@@ -43,7 +43,7 @@ def test_hold_queue_marker_still_replaces_dead_paused_or_own_markers(tmp_path):
+     dead.wait()
+     for prior in ({"writer_pid": dead.pid},                                        # crashed writer
+                   {"writer_pid": os.getpid()},                                     # this backend's own
+-                  {"writer_pid": os.getpid() + 0, "reason": "core_update_pause"}):  # a paused turn
++                  {"writer_pid": dead.pid, "reason": "core_update_pause"}):        # a crashed writer's paused turn
+         _seed(tmp_path, {"attempts": 0, "prompt": "old", "started_at": time.time(), "auto_continue": True, **prior})
+         assert record_turn_start(tmp_path, "S", "queued", reason=UPDATE_HOLD_QUEUE_REASON) is True
+         got = read_turn_marker(tmp_path, "S")
+diff --git a/tui_gateway/session_auto_continue.py b/tui_gateway/session_auto_continue.py
+index a4414c6df46..7078dc900bc 100644
+--- a/tui_gateway/session_auto_continue.py
++++ b/tui_gateway/session_auto_continue.py
+@@ -897,8 +897,13 @@ def _queue_submit_behind_update_hold(rid, sid: str, session: dict, text: Any, tr
+         # that the post-restart ``session.resume`` replays through auto-continue.
+         if envelope is not None and (queued_now := session.get("queued_prompt")):
+             from tui_gateway.turn_marker import record_turn_start
+-            record_turn_start(_session_home(session), str(session.get("session_key") or ""),
+-                              str(queued_now.get("text") or text), reason=UPDATE_HOLD_QUEUE_REASON)
++            if not record_turn_start(_session_home(session), str(session.get("session_key") or ""),
++                                     str(queued_now.get("text") or text), reason=UPDATE_HOLD_QUEUE_REASON):
++                # [daveey] Not journaled: a sibling backend's live turn holds this session's marker (it must keep
++                # the drain from updating over that turn), or the write failed. The message stays queued in memory;
++                # a restart for the update before the hold lifts leaves it "not sent" with Retry.
++                logger.warning("update-hold queue for session %s: not journaled for replay (marker held or "
++                               "unwritable); a restart before the hold lifts drops it to Retry", sid)
+         if not retry_queued_prompt(rid, sid, session) and session.get("queued_prompt"):
+             # Retirement raced in between: the queue is the client's to replay; keep the 5035.
+             logger.info("update-hold queue for session %s: retry unavailable, kept queued", sid)
+-- 
+2.43.0
+

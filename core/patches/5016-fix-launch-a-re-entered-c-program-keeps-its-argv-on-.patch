@@ -1,0 +1,190 @@
+From e14ec423efafb77c07378e04ec9b2167875cb7d7 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 15:47:24 -0800
+Subject: [PATCH] fix(launch): a re-entered -c program keeps its argv on its
+ command line
+
+venv_sync.relaunch_command rebuilt a `-c` program's re-entry as
+`python -I -c <prefix>exec(<source>)` and dropped the arguments that
+followed the source. The prefix assigns sys.argv, so the program still got
+them, but ps, /proc and `hermes doctor`'s state.db holder list showed only
+inline code for every relaunched process. On the Mac every hermes-core-python
+script relaunches into Hermes Python.app, so the mail watcher and every other
+wrapped script were unnamed there.
+
+The re-entry now appends the original trailing arguments after the source.
+They change nothing for the program (the prefix still assigns sys.argv).
+Code attestation's relaunch route admits exactly sys.argv[1:] after the
+source, where it used to admit nothing; any other trailing tokens refuse
+as before (relaunch-argv). The tamper tests address the source by position
+instead of as the last element.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hermes_cli/code_attestation.py                |  6 ++-
+ hermes_cli/venv_sync.py                       |  6 ++-
+ .../test_code_attestation_relaunch.py         | 49 +++++++++++++------
+ 3 files changed, 44 insertions(+), 17 deletions(-)
+
+diff --git a/hermes_cli/code_attestation.py b/hermes_cli/code_attestation.py
+index c9079202a3f..837e47e81d9 100644
+--- a/hermes_cli/code_attestation.py
++++ b/hermes_cli/code_attestation.py
+@@ -438,14 +438,16 @@ def _relaunch_shaped(orig, template):
+ 
+ def _detect_relaunch_route(core_root, template, own_file, orig, argv):
+     """Route ``managed-stub-relaunch``: ``orig_argv == [exe, "-I" (one or more, nothing else),
+-    "-c", src]`` with ``src == relaunch_prefix(core_root, sys.argv) + "exec(" + repr(script) + ")"``
++    "-c", src, *sys.argv[1:]]`` with ``src == relaunch_prefix(core_root, sys.argv) + "exec(" + repr(script) + ")"``
+     byte for byte, and ``script`` passing the unchanged managed-stub checks. Flags and env are
+     never evidence; ``_hermes_relaunched`` is set by these very bytes."""
+     index = orig.index("-c", 1)
+     options = orig[1:index]
+     if not options or any(option != "-I" for option in options):
+         raise _Refuse("unsupported-route:relaunch-options")
+-    if len(orig) != index + 2 or argv[:1] != ["-c"]:
++    # Anything after the source is exactly sys.argv's tail (venv_sync keeps a ``-c`` program's trailing argv for
++    # its command line); the prefix proven below assigns that same sys.argv, so the tokens are never evidence.
++    if orig[index + 2:] != argv[1:] or argv[:1] != ["-c"]:
+         raise _Refuse("unsupported-route:relaunch-argv")
+     source = orig[index + 1]
+     if len(source) > MAX_SOURCE:
+diff --git a/hermes_cli/venv_sync.py b/hermes_cli/venv_sync.py
+index 2a618000e17..d6dcf6cfe87 100644
+--- a/hermes_cli/venv_sync.py
++++ b/hermes_cli/venv_sync.py
+@@ -946,15 +946,19 @@ def relaunch_command(
+         # Python is still locating the module (a package's __init__ imported the bootstrap):
+         # argv[0] is "-m" and __main__ has no spec yet, so the module name is on the command line.
+         module = original[index + 1]
++    trailing: list[str] = []
+     if argv[0] == "-c":
+         body = f"exec({original[index + 1]!r})"
++        # The prefix assigns sys.argv itself, so these change nothing for the program; they keep the re-entered
++        # process's command line naming what it runs (ps, /proc, `hermes doctor` holder lists).
++        trailing = original[index + 2:]
+     elif module and module != "__main__":
+         body = f"runpy.run_module({module!r}, run_name='__main__', alter_sys=True)"
+     else:
+         # distlib .exe launchers are executable zip files with __main__, not
+         # importable modules named '__main__'. run_path handles both shapes.
+         body = f"runpy.run_path({str(Path(argv[0]).absolute())!r}, run_name='__main__')"
+-    return [str(python), *options, "-I", "-c", prefix + body]
++    return [str(python), *options, "-I", "-c", prefix + body, *trailing]
+ 
+ 
+ def main(argv: list | None = None) -> int:
+diff --git a/tests/hermes_cli/test_code_attestation_relaunch.py b/tests/hermes_cli/test_code_attestation_relaunch.py
+index 9741dd6cd1e..40f6d3a490d 100644
+--- a/tests/hermes_cli/test_code_attestation_relaunch.py
++++ b/tests/hermes_cli/test_code_attestation_relaunch.py
+@@ -39,6 +39,16 @@ def relaunch_command(interpreter, root, script, *, options=("-I",), args=ARGS):
+     return venv_sync.relaunch_command(Path(interpreter), root, ["-c", *args], original, None)
+ 
+ 
++def _source_at(command):
++    """Index of the inline source in a relaunch command: right after ``-c`` (the program's argv follows it)."""
++    return command.index("-c", 1) + 1
++
++
++def _with_source(command, source):
++    at = _source_at(command)
++    return [*command[:at], source, *command[at + 1:]]
++
++
+ def spaced_python(tmp_path):
+     """The test venv reached through a directory whose name has a space (the Mac's interpreter is
+     ``.../Hermes Python.app/Contents/MacOS/python3.14``); the venv itself is unchanged."""
+@@ -61,8 +71,9 @@ def test_relaunch_of_the_current_stub_is_attested_through_a_spaced_interpreter(t
+     from hermes_cli import code_attestation
+     interpreter = spaced_python(tmp_path)
+     command = relaunch_command(interpreter, core, current_script(core))
+-    # The Mac's live shape: the stub's own -I plus the relaunch's -I, then one -c source.
+-    assert command[0] == str(interpreter) and command[1:4] == ["-I", "-I", "-c"] and len(command) == 5
++    # The Mac's live shape: the stub's own -I plus the relaunch's -I, one -c source, then the program's argv
++    # (it names what the process runs in ps and `hermes doctor`; the prefix assigns the same sys.argv).
++    assert command[0] == str(interpreter) and command[1:4] == ["-I", "-I", "-c"] and command[5:] == list(ARGS)
+     probe = run(tmp_path, command)
+     assert_supported(probe, core, code_attestation.CURRENT_TEMPLATE_HEAD_DIGEST, route=RELAUNCH)
+     record = launcher(probe)
+@@ -102,14 +113,14 @@ def _prefix(core):
+ 
+ def test_module_body_refuses(tmp_path, core, python):
+     source = _prefix(core) + "runpy.run_module('hermes_cli.main', run_name='__main__', alter_sys=True)"
+-    refused(run(tmp_path, [str(python), "-I", "-I", "-c", source]), "unsupported-route:relaunch-body")
++    refused(run(tmp_path, [str(python), "-I", "-I", "-c", source, *ARGS]), "unsupported-route:relaunch-body")
+ 
+ 
+ def test_run_path_body_refuses(tmp_path, core, python):
+     stub = tmp_path / "stub.py"
+     stub.write_text(current_script(core))
+     source = _prefix(core) + f"runpy.run_path({str(stub)!r}, run_name='__main__')"
+-    refused(run(tmp_path, [str(python), "-I", "-I", "-c", source]), "unsupported-route:relaunch-body")
++    refused(run(tmp_path, [str(python), "-I", "-I", "-c", source, *ARGS]), "unsupported-route:relaunch-body")
+ 
+ 
+ def test_other_interpreter_option_refuses(tmp_path, core, python):
+@@ -123,23 +134,33 @@ def test_argv_mismatch_refuses(tmp_path, core, python):
+     refused(run(tmp_path, command), "unsupported-route:relaunch-argv")
+ 
+ 
++def test_trailing_argv_other_than_sys_argv_refuses(tmp_path, core, python):
++    """After the source only sys.argv's exact tail is admitted: dropped or reordered tokens refuse."""
++    command = relaunch_command(python, core, current_script(core))
++    at = command.index("-c", 1) + 2
++    refused(run(tmp_path, command[:at]), "unsupported-route:relaunch-argv")
++    second = tmp_path / "second"
++    second.mkdir()
++    refused(run(second, [*command[:at], *reversed(command[at:])]), "unsupported-route:relaunch-argv")
++
++
+ def test_prefix_differing_in_one_byte_refuses(tmp_path, core, python):
+     command = relaunch_command(python, core, current_script(core))
+     # Same length, same behaviour: only the bytes differ.
+-    changed = command[-1].replace("_iu, pathlib as _pl;", "_iu,pathlib as _pl ;", 1)
+-    assert changed != command[-1] and len(changed) == len(command[-1])
+-    refused(run(tmp_path, [*command[:-1], changed]), "unsupported-route:relaunch-source")
++    changed = command[_source_at(command)].replace("_iu, pathlib as _pl;", "_iu,pathlib as _pl ;", 1)
++    assert changed != command[_source_at(command)] and len(changed) == len(command[_source_at(command)])
++    refused(run(tmp_path, _with_source(command, changed)), "unsupported-route:relaunch-source")
+ 
+ 
+ def test_extra_statements_refuse(tmp_path, core, python):
+     command = relaunch_command(python, core, current_script(core))
+     prefix = _prefix(core)
+-    body = command[-1][len(prefix):]
+-    before = [*command[:-1], prefix + "pass; " + body]
++    body = command[_source_at(command)][len(prefix):]
++    before = _with_source(command, prefix + "pass; " + body)
+     refused(run(tmp_path, before), "unsupported-route:relaunch-body")
+     second = tmp_path / "second"
+     second.mkdir()
+-    refused(run(second, [*command[:-1], command[-1] + "; pass"]), "unsupported-route:relaunch-body")
++    refused(run(second, _with_source(command, command[_source_at(command)] + "; pass")), "unsupported-route:relaunch-body")
+ 
+ 
+ def test_tampered_embedded_script_refuses(tmp_path, core, python):
+@@ -160,16 +181,16 @@ def test_non_canonical_exec_literal_refuses(tmp_path, core, python):
+     """Same script, same prefix, an equivalent but non-canonical literal: not the producer's bytes."""
+     command = relaunch_command(python, core, current_script(core))
+     prefix = _prefix(core)
+-    assert command[-1].startswith(prefix + "exec(") and command[-1].endswith(")")
+-    loose = prefix + "exec( " + command[-1][len(prefix) + len("exec("):-1] + " )"
+-    refused(run(tmp_path, [*command[:-1], loose]), "unsupported-route:relaunch-source")
++    assert command[_source_at(command)].startswith(prefix + "exec(") and command[_source_at(command)].endswith(")")
++    loose = prefix + "exec( " + command[_source_at(command)][len(prefix) + len("exec("):-1] + " )"
++    refused(run(tmp_path, _with_source(command, loose)), "unsupported-route:relaunch-source")
+ 
+ 
+ def test_rewritten_orig_argv_is_not_evidence(tmp_path, core, python):
+     """A different -c program that rewrites ``sys.orig_argv`` to the genuine relaunch before the
+     bootstrap: every argv check passes, the executing frame's code does not."""
+     genuine = relaunch_command(python, core, current_script(core))
+-    lie = f"import sys; sys.orig_argv[:] = {genuine!r}; " + genuine[-1]
++    lie = f"import sys; sys.orig_argv[:] = {genuine!r}; " + genuine[_source_at(genuine)]
+     refused(run(tmp_path, [str(python), "-I", "-I", "-c", lie]), "unsupported-route:frame-code")
+ 
+ 
+-- 
+2.43.0
+

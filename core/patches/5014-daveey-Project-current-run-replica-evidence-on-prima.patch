@@ -1,0 +1,315 @@
+From 31dd6d39f8c90b90967f82566b597ccc476b8394 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 22:14:10 +0000
+Subject: [PATCH] [daveey] Project current-run replica evidence on primary
+ boards
+
+Why: primary sync mode correctly refuses local observation authority, but local card lists, counts and detail had no replica evidence path. Every running card therefore became unknown. Remote rows already use executor-stamped current-run events. Reuse that evidence contract for primary reads only, with portable run identity, matched task/run and expiry. Never derive liveness from a pull clock or task heartbeat. Mirrored heartbeat columns are absent on real running rows; synced executor events carry the clock.
+
+Proof: initial regression RED (running became unknown, heartbeat clock absent); 75 consumer files / 1051 tests pass, focused final 55 tests pass, scripts/check passes. Nine targeted guard/path mutants killed after adding a missing current-run join control. List/count parity, detail, unknown mode, missing/foreign/ended run, missing/malformed event, preserved human request, expiry, OFF/SHADOW and remote controls. Live hub read-only inspection confirmed portable current run UIDs and executor heartbeat events with NULL mirrored heartbeat columns. Deployment and Desktop readback remain post-landing gates.
+---
+ hermes_cli/kanban_execution_observations.py   |   2 +-
+ hermes_cli/kanban_primary_execution.py        |  45 +++++++
+ hermes_cli/kanban_queue_position.py           |  14 ++-
+ hermes_cli/kanban_replica_execution.py        |   3 +-
+ hermes_cli/kanban_session_activity.py         |  40 +++++--
+ .../test_kanban_primary_execution.py          | 110 ++++++++++++++++++
+ 6 files changed, 200 insertions(+), 14 deletions(-)
+ create mode 100644 hermes_cli/kanban_primary_execution.py
+ create mode 100644 tests/hermes_cli/test_kanban_primary_execution.py
+
+diff --git a/hermes_cli/kanban_execution_observations.py b/hermes_cli/kanban_execution_observations.py
+index 7d204588d7a..f1245da8797 100644
+--- a/hermes_cli/kanban_execution_observations.py
++++ b/hermes_cli/kanban_execution_observations.py
+@@ -136,7 +136,7 @@ def card(row, *, gateway=None, profile=None, now=None):
+         if row.get("stale"):
+             value.update(state="unknown", unknown_reason="source_unavailable")
+         return project(value, now=now, source_class="sidebar")
+-    if row.get("remote") and isinstance(row.get("_replica_run"), dict):
++    if isinstance(row.get("_replica_run"), dict):
+         from hermes_cli.kanban_replica_execution import raw as replica_raw
+         value = replica_raw(row)
+         if value is not None:
+diff --git a/hermes_cli/kanban_primary_execution.py b/hermes_cli/kanban_primary_execution.py
+new file mode 100644
+index 00000000000..3ed969b8aad
+--- /dev/null
++++ b/hermes_cli/kanban_primary_execution.py
+@@ -0,0 +1,45 @@
++"""Executor-owned running evidence on a PRIMARY mirror; never local read authority."""
++from hermes_cli.kanban_replica_execution import LIVENESS_KINDS, raw, run_evidence
++
++
++class PrimaryMirror(ValueError):
++    """The persisted PRIMARY mode refuses local authority, but permits replica evidence."""
++
++
++def attach(conn, rows, *, gateway, profile, board):
++    """Attach only qualified current-run evidence, in the caller's read transaction.
++
++    Integer run IDs are local joins, not portable identities. Use the matched running
++    attempt's UID and executor event; task timestamps, pull time and read time attest nothing.
++    Missing old-schema columns leave the ordinary unknown path intact.
++    """
++    tasks = {r[1] for r in conn.execute('PRAGMA table_info(tasks)')}
++    runs = {r[1] for r in conn.execute('PRAGMA table_info(task_runs)')}
++    events = {r[1] for r in conn.execute('PRAGMA table_info(task_events)')}
++    if not ({'id', 'status', 'current_run_id', 'assignee'} <= tasks
++            and {'id', 'task_id', 'uid', 'status', 'ended_at'} <= runs
++            and {'task_id', 'run_id', 'kind', 'created_at', 'uid'} <= events):
++        return {}
++    values = {}
++    ids = list(rows)
++    for start in range(0, len(ids), 500):
++        chunk = ids[start:start + 500]
++        query = (
++            'SELECT t.id, r.uid, (SELECT json_array(e.created_at, e.uid) FROM task_events e '
++            'WHERE e.run_id=t.current_run_id AND e.task_id=t.id AND e.kind IN (?, ?, ?) '
++            'ORDER BY e.created_at DESC, e.uid DESC LIMIT 1), t.assignee FROM tasks t JOIN task_runs r '
++            'ON r.id=t.current_run_id AND r.task_id=t.id '
++            "WHERE t.status='running' AND r.status='running' AND r.ended_at IS NULL "
++            f"AND t.id IN ({','.join('?' for _ in chunk)})")
++        for tid, uid, beat, assignee in conn.execute(query, (*LIVENESS_KINDS, *chunk)):
++            evidence = run_evidence({'status': 'running', 'run_uid': uid, 'run_beat': beat})
++            if evidence is None:
++                continue
++            row = rows[tid]
++            row.update(gateway=gateway, owner_profile=profile, board=board, status='running', assignee=assignee)
++            from hermes_cli.kanban_execution_observations import _request
++            row['human_request'] = _request(row.get('human_request'))
++            # Display enrichment runs only on lists; it must not change the shared evidence record.
++            row['_replica_run'] = {**evidence, 'activity_at': None, 'activity_kind': None}
++            values[tid] = raw(row)
++    return values
+diff --git a/hermes_cli/kanban_queue_position.py b/hermes_cli/kanban_queue_position.py
+index 13a7b8f677f..cc214ef5d5e 100644
+--- a/hermes_cli/kanban_queue_position.py
++++ b/hermes_cli/kanban_queue_position.py
+@@ -474,9 +474,17 @@ def _work_observations(conn, task, board):
+         row["_execution_scope"] = {"gateway": gateway, "profile": profile, "board": row["board"]}
+         with transaction(conn) as read_at:
+             from hermes_cli.kanban_session_activity import _require_local_execution_authority
+-            _require_local_execution_authority(conn)
+-            sources = assemble(conn, [task.id], board=board or "default", gateway=gateway, profile=profile,
+-                               observed_at=read_at)
++            from hermes_cli.kanban_primary_execution import PrimaryMirror, attach
++            try:
++                _require_local_execution_authority(conn)
++            except PrimaryMirror:
++                attach(conn, {task.id: row}, board=row["board"], gateway=gateway, profile=profile)
++                if "_replica_run" not in row:
++                    row["_execution_error"] = True
++                sources = {}
++            else:
++                sources = assemble(conn, [task.id], board=board or "default", gateway=gateway, profile=profile,
++                                   observed_at=read_at)
+         row["_execution_source"] = sources.get(task.id)
+         return add_cards([row])[0].get("execution_observations", [])
+     except ADAPTER_ERRORS:
+diff --git a/hermes_cli/kanban_replica_execution.py b/hermes_cli/kanban_replica_execution.py
+index a3fce956a84..07e03e94e11 100644
+--- a/hermes_cli/kanban_replica_execution.py
++++ b/hermes_cli/kanban_replica_execution.py
+@@ -82,7 +82,8 @@ def raw(row: dict) -> dict | None:
+     value = {"version": 1, "identity": identity, "owner": owner, "state": "running",
+              "source": "kanban.replica_run", "source_revision": run["ref"], "evidence_refs": [run["ref"]],
+              "observed_at": at, "valid_until": at + 180, "generation_portable": True,
+-             "last_activity": row.get("activity_at"), "last_activity_kind": row.get("activity_kind"),
++             "last_activity": run.get("activity_at", row.get("activity_at")),
++             "last_activity_kind": run.get("activity_kind", row.get("activity_kind")),
+              "last_progress": None, "last_progress_kind": None, "last_progress_ref": None, "wait": None}
+     request = row.get("human_request")
+     if isinstance(request, dict):
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index ebeddb2dd08..0c83a6afbd8 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -1285,6 +1285,9 @@ def _require_local_execution_authority(conn: sqlite3.Connection) -> None:
+     """
+     if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='kanban_sync_state'").fetchone():
+         row = conn.execute("SELECT mode FROM kanban_sync_state LIMIT 1").fetchone()
++        if row is not None and row[0] == "primary":
++            from hermes_cli.kanban_primary_execution import PrimaryMirror
++            raise PrimaryMirror("local execution authority unavailable for primary mirror")
+         if row is None or row[0] not in ("off", "shadow"):
+             raise ValueError("local execution authority unavailable for sync mirror")
+ 
+@@ -1317,11 +1320,20 @@ def _read_board(path: Path, *, parked: bool, stalled: bool) -> tuple[dict[str, A
+                 from hermes_cli.kanban_execution_source import assemble, safe_raw, unknown_raw
+                 from hermes_cli.kanban_execution_observations import ADAPTER_ERRORS, card_scope
+                 gateway, profile = card_scope(path)
++                from hermes_cli.kanban_primary_execution import PrimaryMirror, attach
+                 try:
+-                    _require_local_execution_authority(conn)
+-                    sources = assemble(conn, {tid for _, tid in reads["pairs"]}, board=_board_slug(path),
+-                                       gateway=gateway, profile=profile, observed_at=read_at)
+-                    reads["execution"] = {tid: safe_raw(source["task"], source) for tid, source in sources.items()}
++                    try:
++                        _require_local_execution_authority(conn)
++                    except PrimaryMirror:
++                        replica = attach(conn, tasks, board=_board_slug(path), gateway=gateway, profile=profile)
++                        reads["execution"] = {
++                            tid: replica.get(tid) or unknown_raw(tasks[tid], gateway=gateway, profile=profile,
++                                                                 board=_board_slug(path))
++                            for _, tid in reads["pairs"]}
++                    else:
++                        sources = assemble(conn, {tid for _, tid in reads["pairs"]}, board=_board_slug(path),
++                                           gateway=gateway, profile=profile, observed_at=read_at)
++                        reads["execution"] = {tid: safe_raw(source["task"], source) for tid, source in sources.items()}
+                 except ADAPTER_ERRORS:
+                     # Optional evidence only: legacy counts and asks stay; each card is an explicit unknown.
+                     _log.debug("kanban execution source failed for %s", path, exc_info=True)
+@@ -1562,18 +1574,28 @@ def _read_session_tasks(path: Path, ids: list[str], statuses: tuple[str, ...]) -
+         gateway, profile = card_scope(path)
+         for info in found.values():  # board-root owner scope, kept for the failure path too (C9)
+             info["_execution_scope"] = {"gateway": gateway, "profile": profile, "board": _board_slug(path)}
++        from hermes_cli.kanban_primary_execution import PrimaryMirror, attach
++        primary = False
+         try:
+             _require_local_execution_authority(conn)
+             authority = True
++        except PrimaryMirror:
++            authority, primary = False, True
+         except ADAPTER_ERRORS:
+             authority = False  # a pulled mirror attests neither open nor delivered cards
+         try:
+-            if not authority:
++            if primary:
++                attach(conn, found, board=_board_slug(path), gateway=gateway, profile=profile)
++                for info in found.values():
++                    if "_replica_run" not in info:
++                        info["_execution_error"] = True
++            elif authority:
++                sources = assemble(conn, found, board=_board_slug(path), gateway=gateway, profile=profile,
++                                   observed_at=read_at)
++                for tid, source in sources.items():
++                    found[tid]["_execution_source"] = source
++            else:
+                 raise RuntimeError("local execution authority unavailable")
+-            sources = assemble(conn, found, board=_board_slug(path), gateway=gateway, profile=profile,
+-                               observed_at=read_at)
+-            for tid, source in sources.items():
+-                found[tid]["_execution_source"] = source
+         except ADAPTER_ERRORS:
+             # Optional evidence: the task list and asks stay; each card becomes an explicit unknown.
+             _log.debug("kanban execution source failed for %s", path, exc_info=True)
+diff --git a/tests/hermes_cli/test_kanban_primary_execution.py b/tests/hermes_cli/test_kanban_primary_execution.py
+new file mode 100644
+index 00000000000..4cb47ee3e41
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_primary_execution.py
+@@ -0,0 +1,110 @@
++"""PRIMARY reads retain executor evidence without acquiring local authority."""
++import sqlite3
++from dataclasses import make_dataclass
++
++import pytest
++
++from hermes_cli import kanban_session_activity as activity
++from hermes_cli.kanban_queue_position import _work_observations
++from tests.hermes_cli import test_kanban_source_snapshot as fixtures
++
++kanban_root = fixtures.kanban_root
++board = fixtures.board
++
++
++@pytest.fixture
++def primary(board):
++    with sqlite3.connect(board) as conn:
++        conn.execute("CREATE TABLE kanban_sync_state (mode TEXT)")
++        conn.execute("INSERT INTO kanban_sync_state VALUES ('primary')")
++        for column in ('uid TEXT', 'status TEXT', 'last_heartbeat_at INTEGER', 'ended_at INTEGER'):
++            conn.execute('ALTER TABLE task_runs ADD COLUMN ' + column)
++        conn.execute("INSERT INTO task_runs VALUES (7,'card',900,'portable-run','running',990,NULL)")
++        conn.execute("ALTER TABLE task_events ADD COLUMN uid TEXT")
++        conn.execute("INSERT INTO task_events (task_id,run_id,kind,created_at,uid) VALUES ('card',7,'heartbeat',990,'beat-current')")
++        conn.execute("UPDATE tasks SET status='running',current_run_id=7")
++    return board
++
++
++def read_all(path):
++    row = {'id': 'session'}
++    activity.annotate_kanban_activity([row])
++    listed = activity.session_tasks(['session'])[0]['execution_observations'][0]
++    with sqlite3.connect(path) as conn:
++        conn.row_factory = sqlite3.Row
++        task_type = make_dataclass('Task', [('id', str), ('status', str), ('assignee', str)])
++        detailed = _work_observations(conn, task_type('card', 'running', 'agent'), 'default')[0]
++    return listed, row['execution_observations'][0], detailed
++
++
++def test_primary_missing_legacy_schema_stays_unknown(primary):
++    with sqlite3.connect(primary) as conn:
++        conn.execute('ALTER TABLE task_events DROP COLUMN uid')
++    assert all(value['state'] == 'unknown' for value in read_all(primary))
++
++
++def test_primary_ask_survives_in_list_and_counts(primary):
++    import json
++    request = {'action': 'Approve', 'why_human': 'Owner needed', 'interaction': 'approval',
++               'scope': 'fixture', 'evidence': 'fixture', 'resolved_check': 'private-probe'}
++    with sqlite3.connect(primary) as conn:
++        conn.execute('ALTER TABLE tasks ADD COLUMN human_request TEXT')
++        conn.execute('UPDATE tasks SET human_request=?', (json.dumps(request),))
++        # Production PRIMARY rows do not replicate these heartbeat columns.
++        conn.execute('UPDATE task_runs SET last_heartbeat_at=NULL')
++    listed, counted, _ = read_all(primary)
++    assert listed == counted
++    assert listed['state'] == 'running'
++    assert listed['human_request']['action'] == 'Approve'
++    assert 'private-probe' not in repr(listed)
++
++
++def test_primary_adapter_failure_does_not_fallback_to_local_authority(primary, monkeypatch):
++    from hermes_cli import kanban_primary_execution
++    def fail(*args, **kwargs):
++        raise sqlite3.OperationalError('unreadable')
++    monkeypatch.setattr(kanban_primary_execution, 'attach', fail)
++    assert all(value['state'] == 'unknown' for value in read_all(primary))
++
++
++def test_primary_current_run_projects_running_in_every_consumer(primary):
++    values = read_all(primary)
++    for value in values:
++        assert value['state'] == 'running', values
++        assert value['identity']['run_id'] == 'portable-run'
++        assert value['observed_at'] == 990
++        assert value['source'] == 'kanban.replica_run'
++        assert value['last_progress'] is None
++    assert values[0] == values[1]
++    assert values[0]['identity'] == values[2]['identity']
++
++
++@pytest.mark.parametrize('sql', [
++    "DELETE FROM task_events WHERE kind='heartbeat'",
++    "UPDATE task_events SET run_id=8 WHERE kind='heartbeat'",
++    "UPDATE task_events SET task_id='other' WHERE kind='heartbeat'",
++    "UPDATE task_events SET uid=NULL WHERE kind='heartbeat'",
++    "UPDATE task_events SET created_at=NULL WHERE kind='heartbeat'",
++    "UPDATE task_events SET kind='commented' WHERE kind='heartbeat'",
++    "UPDATE task_runs SET id=8",
++    "UPDATE task_runs SET uid=NULL",
++    "UPDATE task_runs SET task_id='other'",
++    "UPDATE task_runs SET ended_at=995",
++    "UPDATE task_runs SET status='released'",
++    "UPDATE tasks SET current_run_id=NULL",
++    "UPDATE tasks SET status='ready'",
++    "UPDATE kanban_sync_state SET mode='unrecognized'",
++])
++def test_incomplete_primary_evidence_remains_unknown(primary, sql):
++    with sqlite3.connect(primary) as conn:
++        conn.execute(sql)
++    for value in read_all(primary):
++        assert value['state'] == 'unknown'
++
++
++def test_primary_clock_expires_without_rejuvenation(primary, monkeypatch):
++    monkeypatch.setattr(activity.time, 'time', lambda: 1200)
++    for value in read_all(primary):
++        assert value['state'] == 'unknown'
++        assert value['observed_at'] == 990
++        assert value['unknown_reason'] == 'source_expired'
+-- 
+2.43.0
+

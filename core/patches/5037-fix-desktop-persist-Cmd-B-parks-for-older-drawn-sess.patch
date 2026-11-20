@@ -1,0 +1,342 @@
+From 0b3ebee3be93b42e937278a697361d76b07b3d59 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 21:59:50 +0000
+Subject: [PATCH] fix(desktop): persist Cmd-B parks for older drawn sessions
+ [daveey]
+
+The recent session store omits older rows still drawn by other sidebar
+sources, so Cmd-B used local-only state that backend muted=false outranked.
+Remember up to 1000 drawn rows with lineage-aware lookup and route writes
+through their connection/profile. Retain acknowledged writes for ten minutes
+until a refreshed row agrees; unacknowledged writes retain the ten-second TTL.
+
+Keep the registry reset in a dependency-light module: importing the full
+session-blocked store in global vitest setup preloads RPC modules before
+per-file mocks, breaking existing write-through tests.
+
+Proof: new tests failed on unchanged source before implementation (six
+failures, sixteen controls passed); extra lineage case failed before its
+lookup fix. All seven consumer suites now pass, 146 tests. Desktop tsc
+passes with a 3GiB heap, eslint passes, and scripts/check --base origin/main
+passes all 21 checks including health (zero blocking/advisory).
+---
+ .../src/lib/use-session-parked.test.ts        | 19 +++++
+ apps/desktop/src/lib/use-session-parked.ts    | 16 ++--
+ .../desktop/src/store/session-blocked.test.ts | 76 +++++++++++++++++++
+ apps/desktop/src/store/session-blocked.ts     | 55 +++++++++++---
+ apps/desktop/src/store/session-park-rows.ts   | 10 +++
+ apps/desktop/vitest.setup.ts                  |  2 +
+ 6 files changed, 164 insertions(+), 14 deletions(-)
+ create mode 100644 apps/desktop/src/lib/use-session-parked.test.ts
+ create mode 100644 apps/desktop/src/store/session-park-rows.ts
+
+diff --git a/apps/desktop/src/lib/use-session-parked.test.ts b/apps/desktop/src/lib/use-session-parked.test.ts
+new file mode 100644
+index 00000000000..a9702d8be2a
+--- /dev/null
++++ b/apps/desktop/src/lib/use-session-parked.test.ts
+@@ -0,0 +1,19 @@
++import { renderHook } from '@testing-library/react'
++import { expect, it } from 'vitest'
++
++import { parkRowFor } from '@/store/session-blocked'
++
++import { useSessionParked } from './use-session-parked'
++
++it('remembers the drawn row and refreshes its owner and muted state', () => {
++  const row = { id: 'drawn-only', connection_id: 'remote', profile: 'work', muted: false }
++
++  const { rerender } = renderHook(({ entry }) => useSessionParked(entry.id, entry), {
++    initialProps: { entry: row }
++  })
++
++  expect(parkRowFor(row.id)).toEqual(row)
++  const refreshed = { ...row, muted: true, profile: 'other' }
++  rerender({ entry: refreshed })
++  expect(parkRowFor(row.id)).toEqual(refreshed)
++})
+diff --git a/apps/desktop/src/lib/use-session-parked.ts b/apps/desktop/src/lib/use-session-parked.ts
+index 4ede8e901b3..bf9e57b24f7 100644
+--- a/apps/desktop/src/lib/use-session-parked.ts
++++ b/apps/desktop/src/lib/use-session-parked.ts
+@@ -1,21 +1,27 @@
++import { useEffect } from 'react'
++
+ import { $sessions } from '@/store/session'
+ import {
+   $blockedSessionIds,
+   $muteWriteGuard,
+   isSessionBlocked,
++  type MuteRow,
+   muteWriteFor,
++  rememberParkRow,
+   resolveSessionParked
+ } from '@/store/session-blocked'
+-import type { SessionInfo } from '@/types/hermes'
+ 
+ import { useStoresSelector } from './use-session-slice'
+ 
+ /** [daveey] Whether a row is parked (⌘B): a fresh ⌘B write, else the backend's `row.muted`, else the local list.
+  *  Re-renders only when that boolean flips. */
+-export function useSessionParked(
+-  id: null | string | undefined,
+-  row: null | Partial<Pick<SessionInfo, 'muted'>> | undefined
+-): boolean {
++export function useSessionParked(id: null | string | undefined, row: MuteRow | null | undefined): boolean {
++  useEffect(() => {
++    if (row) {
++      rememberParkRow(row)
++    }
++  }, [row])
++
+   return useStoresSelector([$blockedSessionIds, $muteWriteGuard, $sessions], () =>
+     id
+       ? resolveSessionParked(
+diff --git a/apps/desktop/src/store/session-blocked.test.ts b/apps/desktop/src/store/session-blocked.test.ts
+index c75c862046e..0e168423cf1 100644
+--- a/apps/desktop/src/store/session-blocked.test.ts
++++ b/apps/desktop/src/store/session-blocked.test.ts
+@@ -18,7 +18,10 @@ import {
+   $muteWriteGuard,
+   isSessionParked,
+   migrateLocalParks,
++  MUTE_ACK_HOLD_MS,
+   MUTE_WRITE_GUARD_MS,
++  parkRowFor,
++  rememberParkRow,
+   resolveSessionParked,
+   toggleSessionBlocked,
+   withRowMuted,
+@@ -135,6 +138,79 @@ describe('⌘B mute write-through', () => {
+   })
+ })
+ 
++describe('drawn rows outside the recent list', () => {
++  beforeEach(() => vi.useFakeTimers())
++
++  it('POSTs to the remembered owner and holds the ack over a stale drawn row', async () => {
++    const old = row({ id: 'old', muted: false, connection_id: 'remote', profile: 'work' })
++    rememberParkRow(old)
++    vi.mocked(setSessionMutedRemote).mockResolvedValue({ ok: true, muted: true })
++    expect(toggleSessionBlocked('old')).toBe(true)
++    await Promise.resolve()
++    expect(setSessionMutedRemote).toHaveBeenCalledWith(old, true)
++    expect($sessions.get()).toEqual([])
++    await vi.advanceTimersByTimeAsync(MUTE_WRITE_GUARD_MS + 1)
++    expect(isSessionParked('old', old)).toBe(true)
++    expect(toggleSessionBlocked('old')).toBe(false)
++    expect(setSessionMutedRemote).toHaveBeenLastCalledWith(old, false)
++    await Promise.resolve()
++  })
++
++  it('releases an acknowledged hold when a drawn row agrees', async () => {
++    const old = row({ muted: false })
++    rememberParkRow(old)
++    await writeSessionMuted(old, true, async () => ({}))
++    rememberParkRow({ ...old, muted: true })
++    expect($muteWriteGuard.get().has(old.id)).toBe(false)
++    expect(isSessionParked(old.id, { muted: false })).toBe(false)
++  })
++
++  it('expires an acknowledged hold after ten minutes', async () => {
++    const old = row({ muted: false })
++    await writeSessionMuted(old, true, async () => ({}))
++    await vi.advanceTimersByTimeAsync(MUTE_ACK_HOLD_MS - 1)
++    expect(isSessionParked(old.id, old)).toBe(true)
++    await vi.advanceTimersByTimeAsync(1)
++    expect(isSessionParked(old.id, old)).toBe(false)
++  })
++
++  it('rolls back and toasts when a remembered row POST fails', async () => {
++    const old = row({ muted: false })
++    rememberParkRow(old)
++    const error = new Error('offline')
++    vi.mocked(setSessionMutedRemote).mockRejectedValue(error)
++    toggleSessionBlocked(old.id)
++    await Promise.resolve()
++    expect(isSessionParked(old.id, old)).toBe(false)
++    expect($muteWriteGuard.get().size).toBe(0)
++    expect(notifyError).toHaveBeenCalledWith(error, 'Could not update the parked state')
++  })
++
++  it('bounds the drawn-row registry and refreshes remembered entries', () => {
++    for (let i = 0; i < 1000; i++) {
++      rememberParkRow(row({ id: `old-${i}` }))
++    }
++
++    rememberParkRow(row({ id: 'old-0', profile: 'updated' }))
++    rememberParkRow(row({ id: 'newest' }))
++    expect(parkRowFor('old-1')).toBeUndefined()
++    expect(parkRowFor('old-0')?.profile).toBe('updated')
++    expect(parkRowFor('newest')?.id).toBe('newest')
++  })
++
++  it('resolves lineage aliases even when neither id is in the recent list', async () => {
++    const tip = row({ id: 'tip', _lineage_root_id: 'root', muted: false })
++    rememberParkRow(tip)
++    vi.mocked(setSessionMutedRemote).mockResolvedValue({ ok: true, muted: true })
++    expect(toggleSessionBlocked('root')).toBe(true)
++    await Promise.resolve()
++    expect(setSessionMutedRemote).toHaveBeenCalledWith(tip, true)
++    expect(isSessionParked('root', tip)).toBe(true)
++    expect(toggleSessionBlocked('root')).toBe(false)
++    await Promise.resolve()
++  })
++})
++
+ describe('one-time migration of local ⌘B parks', () => {
+   beforeEach(() => {
+     $mutedMigrationDone.set([])
+diff --git a/apps/desktop/src/store/session-blocked.ts b/apps/desktop/src/store/session-blocked.ts
+index 6ccde953845..c1c2a715921 100644
+--- a/apps/desktop/src/store/session-blocked.ts
++++ b/apps/desktop/src/store/session-blocked.ts
+@@ -8,6 +8,9 @@ import type { SessionInfo } from '@/types/hermes'
+ 
+ import { notifyError } from './notifications'
+ import { $sessions, lineageAliases, setSessions } from './session'
++import { type MuteRow, parkRows } from './session-park-rows'
++
++export { type MuteRow, resetParkRowsForTests } from './session-park-rows'
+ 
+ /**
+  * [daveey] Sessions the user marked "blocked" with ⌘B — parked on something
+@@ -23,17 +26,15 @@ import { $sessions, lineageAliases, setSessions } from './session'
+  * `muted` (the row carries no `muted`, or the endpoint 404s): then ⌘B behaves
+  * exactly as before.
+  */
+-export const $blockedSessionIds = persistentAtom<string[]>(
+-  'hermes.desktop.blockedSessionIds',
+-  [],
+-  Codecs.stringArray
+-)
++export const $blockedSessionIds = persistentAtom<string[]>('hermes.desktop.blockedSessionIds', [], Codecs.stringArray)
+ 
+ /** [daveey] How long a ⌘B write outranks the row's `muted`: a list page already in flight when we POST can land
+  *  after the ack carrying the old value (same pattern as the unread write guard). */
+ export const MUTE_WRITE_GUARD_MS = 10_000
++export const MUTE_ACK_HOLD_MS = 10 * 60_000
+ 
+ export interface MuteWrite {
++  acked?: boolean
+   at: number
+   value: boolean
+ }
+@@ -42,7 +43,40 @@ export interface MuteWrite {
+ export const $muteWriteGuard = atom<ReadonlyMap<string, MuteWrite>>(new Map())
+ 
+ type LineageRows = Parameters<typeof lineageAliases>[1]
+-type MuteRow = Pick<SessionInfo, 'id'> & Partial<Pick<SessionInfo, 'connection_id' | 'muted' | 'profile'>>
++
++/** Remember drawn rows outside the recent list without retaining an unbounded history. */
++export function rememberParkRow(row: MuteRow): void {
++  parkRows.delete(row.id)
++  parkRows.set(row.id, row)
++
++  if (parkRows.size > 1000) {
++    parkRows.delete(parkRows.keys().next().value!)
++  }
++
++  const aliases = lineageAliases(row.id, [...parkRows.values(), ...$sessions.get()])
++
++  for (const alias of aliases) {
++    const write = $muteWriteGuard.get().get(alias)
++
++    if (write?.acked && (row.muted === write.value || Date.now() - write.at >= MUTE_ACK_HOLD_MS)) {
++      setMuteWrite(alias, null)
++    }
++  }
++}
++
++export function parkRowFor(id: string): MuteRow | undefined {
++  const rows = [...parkRows.values(), ...$sessions.get()]
++
++  for (const alias of lineageAliases(id, rows)) {
++    const row = parkRows.get(alias)
++
++    if (row) {
++      return row
++    }
++  }
++
++  return undefined
++}
+ 
+ export function isSessionBlocked(
+   id: string,
+@@ -64,7 +98,7 @@ export function resolveSessionParked(
+   write: MuteWrite | undefined,
+   now: number = Date.now()
+ ): boolean {
+-  if (write && now - write.at < MUTE_WRITE_GUARD_MS) {
++  if (write && now - write.at < (write.acked ? MUTE_ACK_HOLD_MS : MUTE_WRITE_GUARD_MS)) {
+     return write.value
+   }
+ 
+@@ -93,7 +127,9 @@ export function muteWriteFor(
+     }
+   }
+ 
+-  return undefined
++  const remembered = parkRowFor(id)
++
++  return remembered ? guard.get(remembered.id) : undefined
+ }
+ 
+ /** [daveey] Whether `id` is parked, reading the stores. Pass `row` when the caller holds it (a project-tree row is
+@@ -171,6 +207,7 @@ export async function writeSessionMuted(
+ 
+   try {
+     await post(row, muted)
++    setMuteWrite(row.id, { at: Date.now(), value: muted, acked: true })
+     setRowMuted(row.id, muted)
+   } catch (error) {
+     if (isMissingRestEndpoint(error)) {
+@@ -259,7 +296,7 @@ export async function migrateLocalParks(
+  *  the backend (`writeSessionMuted`); a draft with no row stays local-only. */
+ export function toggleSessionBlocked(id: string): boolean {
+   const sessions = $sessions.get()
+-  const row = sessions.find(entry => entry.id === id)
++  const row = sessions.find(entry => entry.id === id) ?? parkRowFor(id)
+   const next = !isSessionParked(id, row)
+ 
+   if (!row) {
+diff --git a/apps/desktop/src/store/session-park-rows.ts b/apps/desktop/src/store/session-park-rows.ts
+new file mode 100644
+index 00000000000..cb746511986
+--- /dev/null
++++ b/apps/desktop/src/store/session-park-rows.ts
+@@ -0,0 +1,10 @@
++import type { SessionInfo } from '@/types/hermes'
++
++export type MuteRow = Pick<SessionInfo, 'id'> &
++  Partial<Pick<SessionInfo, '_lineage_root_id' | 'connection_id' | 'muted' | 'profile'>>
++
++export const parkRows = new Map<string, MuteRow>()
++
++export function resetParkRowsForTests(): void {
++  parkRows.clear()
++}
+diff --git a/apps/desktop/vitest.setup.ts b/apps/desktop/vitest.setup.ts
+index 2cde53beb90..a91c44d92e8 100644
+--- a/apps/desktop/vitest.setup.ts
++++ b/apps/desktop/vitest.setup.ts
+@@ -3,6 +3,7 @@ import { afterAll, afterEach } from 'vitest'
+ 
+ import { resetSubmissionIdSupportForTests } from './src/app/session/hooks/use-prompt-actions/submission-identity-support'
+ import { clearPlaybackSourceCache } from './src/lib/playback-source-cache'
++import { resetParkRowsForTests } from './src/store/session-park-rows'
+ import { InertResizeObserver } from './src/test/jsdom'
+ 
+ // Shared tooltips measure their arrow through Radix's useSize hook.
+@@ -92,6 +93,7 @@ configure({ asyncUtilTimeout: 12_000 })
+ afterAll(() => new Promise<void>(resolve => setTimeout(resolve, 0)))
+ // Resolved media URLs must not leak between tests.
+ afterEach(() => clearPlaybackSourceCache())
++afterEach(() => resetParkRowsForTests())
+ // Module-global per-backend memo: a test whose backend refuses submission_id must not make the next
+ // test's send skip identity.
+ afterEach(() => resetSubmissionIdSupportForTests())
+-- 
+2.43.0
+

@@ -1,0 +1,375 @@
+From 724ee79a6c336017392bdef9af19b53240abff43 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 16:13:16 -0800
+Subject: [PATCH] Kanban ratio routing: review follow-ups (fault guards, one
+ pool load, per-pool freshness)
+
+- record_run_route keeps its never-raises promise: the ratio receipt block and
+  the in-tick start count run under their own logged guards. A failing
+  begin_tick (its PRAGMA) is logged with its traceback in run_owned_tick and
+  the tick goes on, with ratio routing failing open until a tick starts
+  cleanly (off_this_tick).
+- A pick loads each candidate credential pool once: live_pool_serving already
+  includes the quota_unavailable check live_quota_wall repeated.
+- fresh_v2 also requires each pool's own reading (its read_at, else the legacy
+  provider block's) within 20 minutes; assemble_v2 carries unread pools forward
+  under a fresh computed_at.
+- The binary-search docstring says out-of-order rows it skips are not counted.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hermes_cli/kanban_dispatch_owner.py           |  10 +-
+ hermes_cli/kanban_model_tier.py               |  25 +++-
+ hermes_cli/kanban_ratio_routing.py            |  53 ++++++---
+ tests/hermes_cli/test_kanban_ratio_routing.py | 108 +++++++++++++++++-
+ website/docs/user-guide/features/kanban.md    |   2 +-
+ 5 files changed, 174 insertions(+), 24 deletions(-)
+
+diff --git a/hermes_cli/kanban_dispatch_owner.py b/hermes_cli/kanban_dispatch_owner.py
+index e3b3e44b183..96438d5ef42 100644
+--- a/hermes_cli/kanban_dispatch_owner.py
++++ b/hermes_cli/kanban_dispatch_owner.py
+@@ -5,6 +5,7 @@ from hermes_cli import kanban_lockguard as _kanban_lockguard
+ import json
+ import os
+ from pathlib import Path
++import logging
+ import sqlite3
+ import tempfile
+ 
+@@ -140,8 +141,13 @@ def run_owned_tick(conn, tick, dispatcher_id, board, dry_run):
+             return DispatchResult(skipped_owned=True, ownership_error=str(exc))
+         if owner is not None and dispatcher_id != owner:
+             return DispatchResult(skipped_owned=True, dispatch_owner=owner)
+-        from hermes_cli.kanban_ratio_routing import begin_tick
+-        begin_tick(conn)  # ratio routing re-reads this board's start counts once per tick
++        from hermes_cli import kanban_ratio_routing as ratio
++        try:
++            ratio.begin_tick(conn)  # ratio routing re-reads this board's start counts once per tick
++        except Exception:  # health: allow BLE001 -- a memo fault must not stop the tick; ratio routing fails open
++            ratio.off_this_tick()
++            logging.getLogger(__name__).warning("kanban dispatch: ratio routing tick start failed; default cards keep "
++                                                "today's route this tick", exc_info=True)
+         result = tick()
+         result.dispatch_owner = owner
+         kbc._maybe_checkpoint_wal(conn, db_path)
+diff --git a/hermes_cli/kanban_model_tier.py b/hermes_cli/kanban_model_tier.py
+index 951fa4c94a9..b77635c3463 100644
+--- a/hermes_cli/kanban_model_tier.py
++++ b/hermes_cli/kanban_model_tier.py
+@@ -281,10 +281,8 @@ def record_run_route(conn: sqlite3.Connection, task: Any, *, lane: str, reason:
+         logger.debug("kanban model tier: route resolve failed for %s (%s)", getattr(task, "id", "?"), exc,
+                      exc_info=True)
+         model, provider, source = None, None, "unknown"
+-    from hermes_cli import kanban_ratio_routing as ratio
+     payload = {"model": model, "provider": provider, "lane": lane, "source": source, "tier_reason": reason}
+-    picked = ratio.receipt(conn, task.id, reason)
+-    if picked:
++    if picked := _ratio_receipt(conn, task, reason):
+         payload["ratio"] = picked
+     try:
+         from hermes_cli import kanban_db as _kb
+@@ -294,7 +292,23 @@ def record_run_route(conn: sqlite3.Connection, task: Any, *, lane: str, reason:
+         logger.debug("kanban model tier: route receipt failed for %s (%s)", getattr(task, "id", "?"), exc,
+                      exc_info=True)
+         return
+-    ratio.note_start(conn, provider, reason)  # the next card in this tick sees this start in its pool's share
++    try:
++        from hermes_cli.kanban_ratio_routing import note_start
++        note_start(conn, provider, reason)  # the next card in this tick sees this start in its pool's share
++    except Exception as exc:  # a missed count only skews this tick's shares; the next tick re-reads the receipts
++        logger.warning("kanban model tier: ratio start count failed for %s (%s)", getattr(task, "id", "?"), exc,
++                       exc_info=True)
++
++
++def _ratio_receipt(conn: sqlite3.Connection, task: Any, reason: str) -> Optional[dict[str, Any]]:
++    """The ratio pick's receipt block (``kanban_ratio_routing.receipt``); a fault only drops the detail (logged)."""
++    try:
++        from hermes_cli.kanban_ratio_routing import receipt
++        return receipt(conn, task.id, reason)
++    except Exception as exc:  # the tier_reason already names the pick; the detail is optional
++        logger.warning("kanban model tier: ratio receipt failed for %s (%s)", getattr(task, "id", "?"), exc,
++                       exc_info=True)
++        return None
+ 
+ 
+ def apply_model_tier(conn: sqlite3.Connection, task: Any, *, lane: str, cfg: Optional[dict[str, Any]] = None) -> str:
+@@ -496,8 +510,7 @@ def _apply_model_tier(conn: sqlite3.Connection, task: Any, *, lane: str, cfg: Op
+             payload = {"reason": reason, "model": model or _str(getattr(task, "model_override", None)) or None,
+                        "provider": provider or _str(getattr(task, "provider_override", None)) or None,
+                        "lane": lane}
+-            from hermes_cli.kanban_ratio_routing import receipt as _ratio_receipt
+-            if picked := _ratio_receipt(conn, task.id, reason):
++            if picked := _ratio_receipt(conn, task, reason):
+                 payload["ratio"] = picked
+             if is_review:
+                 payload["implementer_model"] = implementer_model
+diff --git a/hermes_cli/kanban_ratio_routing.py b/hermes_cli/kanban_ratio_routing.py
+index d7ab16f82b7..5e505c1ba1b 100644
+--- a/hermes_cli/kanban_ratio_routing.py
++++ b/hermes_cli/kanban_ratio_routing.py
+@@ -16,8 +16,8 @@ Rule (:func:`pick`), applied by ``kanban_model_tier.resolve_dispatch_tier`` to a
+    base (under a class default, the ``class:<level>``/``auto`` selector itself).
+ 2. **Eligible pools.** Governed (``kanban.llm_pacing.providers``), with a ``v2`` entry whose ``ratio`` is above 0, not
+    ``at_reserve`` and with a known ``rate_tokens_per_s``; the provider enabled; serving on this host's live pool
+-   (``live_pool_serving``: a credential here, no quota wall for the model); no provider wall
+-   (``active_walls``/``live_quota_wall``).
++   (``live_pool_serving``: a credential here and no live quota wall for the model, one pool load); no provider wall
++   (``active_walls``). Each pool's own ``v2`` reading must be fresh too (:func:`fresh_v2`).
+ 3. **Choice by deficit.** Targets are the eligible pools' ratios renormalized to 1. The share is each eligible pool's
+    part of this host+board's default-tier starts over the last :data:`SHARE_WINDOW_SECONDS` (``run_route`` receipts
+    whose ``tier_reason`` starts with ``default`` and whose run this host claimed; a receipt with no provider counts
+@@ -67,6 +67,7 @@ class _Memo:
+ 
+ _LOCK = threading.Lock()
+ _MEMOS: dict[str, _Memo] = {}
++_OFF = threading.Event()  # set when a tick could not start its memo: picks fail open until a tick starts cleanly
+ _WARNED: dict[str, float] = {}
+ 
+ 
+@@ -99,12 +100,22 @@ def begin_tick(conn: sqlite3.Connection) -> None:
+     key = _key(conn)
+     with _LOCK:
+         _MEMOS.pop(key, None)
++    _OFF.clear()
++
++
++def off_this_tick() -> None:
++    """:func:`begin_tick` failed: no pick may trust a memo it could not reset, so ratio routing fails open (every
++    board in this process) until the next tick starts cleanly."""
++    with _LOCK:
++        _MEMOS.clear()
++    _OFF.set()
+ 
+ 
+ def _first_event_id_since(conn: sqlite3.Connection, since: float) -> Optional[int]:
+     """The smallest event id whose row (or the first row after it) was created at or after ``since``: a binary search
+-    on the primary key, about log2(events) seeks. Ids grow with ``created_at`` (a replica's synced row may carry an
+-    older stamp; the scan filters ``created_at`` again)."""
++    on the primary key, about log2(events) seeks. It assumes ids grow with ``created_at``. Where they do not (a
++    replica's synced row may carry an older stamp), the bound may land late and skip in-window rows below it; those
++    rows are not refiltered or counted. The scan's own ``created_at`` filter only drops old rows above the bound."""
+     # Two statements: SQLite answers a lone MIN or MAX of the rowid from the b-tree edge, both together by a full scan.
+     hi = conn.execute("SELECT MAX(id) FROM task_events").fetchone()[0]
+     if hi is None:
+@@ -207,16 +218,30 @@ def _warn(key: str, message: str, *args: Any) -> None:
+         logger.debug(message, *args, exc_info=True)
+ 
+ 
++def _fresh(stamp: Any, now: float) -> bool:
++    value = _number(stamp)
++    return value is not None and 0 <= now - value <= STALE_SECONDS
++
++
+ def fresh_v2(now: float) -> Optional[dict]:
+-    """This home's fresh ``v2`` document (with this process's newer pools laid over it), else None."""
++    """This home's fresh ``v2`` document (with this process's newer pools laid over it), else None. Only its pools
++    read within :data:`STALE_SECONDS` are kept: ``assemble_v2`` carries every other pool's last entry forward, so a
++    fresh ``computed_at`` says nothing about a pool this home stopped reading. A pool's age is its own ``read_at``
++    (as ``reserve_hold`` judges it), else its legacy provider block's ``read_at``."""
+     from hermes_cli.kanban_llm_pacing_dispatch import _hold_state
+-    v2 = _hold_state().get("v2")
+-    if not isinstance(v2, dict) or not isinstance(v2.get("pools"), dict):
+-        return None
+-    computed = _number(v2.get("computed_at"))
+-    if computed is None or not 0 <= now - computed <= STALE_SECONDS:
++    state = _hold_state()
++    v2 = state.get("v2")
++    if not isinstance(v2, dict) or not isinstance(v2.get("pools"), dict) or not _fresh(v2.get("computed_at"), now):
+         return None
+-    return v2
++
++    def read_at(provider: str, pool: dict) -> Any:
++        if "read_at" in pool:
++            return pool["read_at"]
++        legacy = state.get(provider)
++        return legacy.get("read_at") if isinstance(legacy, dict) else None
++
++    pools = {p: v for p, v in v2["pools"].items() if isinstance(v, dict) and _fresh(read_at(p, v), now)}
++    return {**v2, "pools": pools}
+ 
+ 
+ def _pool_routes(task: Any, default_model: str) -> list[tuple[str, list[str]]]:
+@@ -264,7 +289,9 @@ def _eligible(pool: str, model: str, entry: Any, walled: dict[str, float]) -> Op
+     ratio = _number(entry.get("ratio"))
+     if ratio is None or ratio <= 0 or _number(entry.get("rate_tokens_per_s")) is None:
+         return None
+-    if pool in walled or not pw.live_pool_serving(pool, model) or pw.live_quota_wall(pool, model):
++    # ``live_pool_serving`` is the one credential-pool load per pool and pick: it is False on a quota wall for
++    # ``model`` (``quota_unavailable``, the evidence ``live_quota_wall`` reads) as well as with no live credential.
++    if pool in walled or not pw.live_pool_serving(pool, model):
+         return None
+     return ratio
+ 
+@@ -325,7 +352,7 @@ def pick(conn: sqlite3.Connection, task: Any, base: tuple, *, lane: str,
+     """``(model, pool)`` for an unpinned default ``base`` route (module rule), else None (keep ``base``). Never raises:
+     a fault keeps today's route (logged)."""
+     try:
+-        if base[2] != "default" or not enabled(cfg):
++        if base[2] != "default" or _OFF.is_set() or not enabled(cfg):
+             return None
+         if str(getattr(task, "model_override", None) or "").strip() or \
+                 str(getattr(task, "provider_override", None) or "").strip():
+diff --git a/tests/hermes_cli/test_kanban_ratio_routing.py b/tests/hermes_cli/test_kanban_ratio_routing.py
+index 946005ce866..a85e950c617 100644
+--- a/tests/hermes_cli/test_kanban_ratio_routing.py
++++ b/tests/hermes_cli/test_kanban_ratio_routing.py
+@@ -9,6 +9,8 @@ import collections
+ import json
+ import logging
+ import sqlite3
++import threading
++import types
+ 
+ import pytest
+ 
+@@ -30,6 +32,7 @@ HUB_CFG = {'default_model': ASTRA[0], 'default_provider': ASTRA[1], 'strong_mode
+            'default_model_keep_patterns': ['security']}
+ TARGETS = {'anthropic': 0.5, 'openai-codex': 0.3, 'xai-oauth': 0.2}
+ UNSERVED: set = set()  # providers this host holds no live credential for, per test
++REAL_SERVING = walls.live_pool_serving  # the hub fixture stubs it; the live-wall cases read a fake pool through it
+ 
+ 
+ @pytest.fixture
+@@ -42,6 +45,7 @@ def hub(board, monkeypatch):
+     monkeypatch.setattr(lpd, '_V2_MEMO', {})
+     monkeypatch.setattr(ratio, '_MEMOS', {})
+     monkeypatch.setattr(ratio, '_WARNED', {})
++    monkeypatch.setattr(ratio, '_OFF', threading.Event())
+     config, _ = routing(monkeypatch)
+     std = config['model_routing']['routes']['standard']
+     config['model_routing']['routes'] = {'deep': [dict(std[0], model=m, provider=p) for m, p in (FABLE, OPUS, ASTRA, GROK)]}
+@@ -131,8 +135,7 @@ def test_an_ineligible_pool_is_never_picked(hub, monkeypatch, why):
+         lpd.state_path().write_text(json.dumps(state))
+     walls_by_case = {
+         'walled': lambda: monkeypatch.setattr(walls, 'active_walls', lambda **_k: {'anthropic': clock[0] + 3600.0}),
+-        'live_wall': lambda: monkeypatch.setattr(walls, 'live_quota_wall',
+-                                                 lambda p, m: clock[0] + 3600.0 if p == 'anthropic' else None),
++        'live_wall': lambda: _live_pools(monkeypatch, walled={'anthropic': clock[0] + 3600.0}),
+         'disabled': lambda: hub['config']['providers'].update({'anthropic': {'enabled': False}}),
+         'no_credential': lambda: UNSERVED.add('anthropic'),
+         'ungoverned': lambda: hub['cfg'].update({'llm_pacing': {'providers': ['openai-codex', 'xai-oauth']}}),
+@@ -147,6 +150,107 @@ def test_an_ineligible_pool_is_never_picked(hub, monkeypatch, why):
+             ratio.note_start(conn, route[1], route[2])
+ 
+ 
++class _Pool:
++    """A provider's OAuth credential pool: every entry live; quota walls come from ``quota_unavailable``."""
++
++    def __init__(self, provider):
++        self.provider = provider
++
++    def has_available(self, model=None):
++        return True
++
++
++def _live_pools(monkeypatch, walled=None):
++    """The real ``live_pool_serving`` over fake credential pools; returns the providers whose pool was loaded."""
++    loads = []
++    walled = walled or {}
++
++    def load(provider):
++        loads.append(provider)
++        return _Pool(provider)
++    monkeypatch.setattr(walls, 'live_pool_serving', REAL_SERVING)
++    monkeypatch.setattr(walls, '_oauth_pool', load)
++    monkeypatch.setattr('agent.model_routing_unavailable.quota_unavailable', lambda pool, model: (
++        types.SimpleNamespace(resets_at=walled[pool.provider]) if pool.provider in walled else None))
++    return loads
++
++
++def test_a_pick_loads_each_candidate_credential_pool_once(hub, monkeypatch):
++    loads = _live_pools(monkeypatch)
++    _budget(hub['clock'])
++    with kbc.connect() as conn:
++        task = kb.get_task(conn, kb.create_task(conn, title='d', assignee='a'))
++        assert ratio.pick(conn, task, (*ASTRA, 'default'), lane='ready', cfg=hub['cfg']) == (FABLE[0], 'anthropic')
++    assert sorted(loads) == sorted(TARGETS)
++
++
++@pytest.mark.parametrize('where', ['pool', 'legacy'])
++def test_a_pool_whose_own_reading_is_stale_is_never_picked(hub, where):
++    """``assemble_v2`` carries a pool this home stopped reading forward under a fresh ``computed_at``: the pool's own
++    ``read_at`` (else its legacy provider block's) must be within 20 minutes too."""
++    clock = hub['clock']
++    _budget(clock, {'anthropic': 0.9, 'openai-codex': 0.1})
++    state = json.loads(lpd.state_path().read_text())
++    pool = state['v2']['pools']['anthropic']
++    if where == 'legacy':
++        del pool['read_at']
++        state['anthropic']['read_at'] = clock[0] - ratio.STALE_SECONDS - 1
++    else:
++        pool['read_at'] = clock[0] - ratio.STALE_SECONDS - 1
++    lpd.state_path().write_text(json.dumps(state))
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title='d', assignee='a')
++        assert _route(conn, tid) == (*ASTRA, 'default+ratio:openai-codex')
++        state['anthropic']['read_at'] = pool['read_at'] = clock[0] - ratio.STALE_SECONDS + 1  # just inside: eligible
++        lpd.state_path().write_text(json.dumps(state))
++        ratio.begin_tick(conn)
++        assert _route(conn, tid) == (*FABLE, 'default+ratio:anthropic')
++
++
++def test_a_tick_whose_ratio_memo_cannot_start_fails_open_and_still_runs(hub, monkeypatch, caplog,
++                                                                       all_assignees_spawnable):
++    """``begin_tick`` raising (``_key``'s PRAGMA) is logged with its traceback; that tick's default cards keep today's
++    route, and the next clean tick routes by ratio again."""
++    _budget(hub['clock'])
++    real_key, calls = ratio._key, []
++
++    def key(conn):
++        calls.append(1)
++        if len(calls) == 1:
++            raise sqlite3.OperationalError('disk I/O error')
++        return real_key(conn)
++    monkeypatch.setattr(ratio, '_key', key)
++    with kbc.connect() as conn, caplog.at_level(logging.WARNING):
++        first = kb.create_task(conn, title='one', assignee='a')
++        assert pin_tests._tick(conn) == [ASTRA]
++        assert pin_tests._events(conn, first, 'run_route')[-1]['tier_reason'] == 'default'
++        failed = [r for r in caplog.records if 'ratio routing tick start failed' in r.getMessage()]
++        assert failed and failed[0].exc_info is not None
++        kb.create_task(conn, title='two', assignee='a')
++        assert pin_tests._tick(conn) == [FABLE]
++
++
++def test_record_run_route_never_raises_when_the_ratio_memo_key_fails(hub, monkeypatch, caplog,
++                                                                     all_assignees_spawnable):
++    """``_key`` failing everywhere: picks, the receipt block and the start count all fail open; the card still runs
++    and its ``run_route`` receipt is written."""
++    _budget(hub['clock'])
++
++    def key(_conn):
++        raise sqlite3.OperationalError('disk I/O error')
++    monkeypatch.setattr(ratio, '_key', key)
++    with kbc.connect() as conn, caplog.at_level(logging.WARNING):
++        tid = kb.create_task(conn, title='d', assignee='a')
++        assert pin_tests._tick(conn) == [ASTRA]
++        assert pin_tests._events(conn, tid, 'run_route')[-1]['tier_reason'] == 'default'
++        task = kb.get_task(conn, tid)
++        task.current_run_id = conn.execute('SELECT MAX(id) FROM task_runs').fetchone()[0]
++        tier.record_run_route(conn, task, lane='ready', reason='default+ratio:anthropic')  # receipt + count: no raise
++    assert all(r.exc_info is not None for r in caplog.records
++               if r.levelno >= logging.WARNING and 'ratio' in r.getMessage())
++    assert any('ratio' in r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING)
++
++
+ def _corrupt(clock, case):
+     """Write the ``case`` state: v2 missing, stale, malformed, or stamped in the future."""
+     stamps = {'stale': 20 * 60 + 1, 'future': -120}
+diff --git a/website/docs/user-guide/features/kanban.md b/website/docs/user-guide/features/kanban.md
+index ac7d11bccab..6d3fcf2cd4b 100644
+--- a/website/docs/user-guide/features/kanban.md
++++ b/website/docs/user-guide/features/kanban.md
+@@ -1658,7 +1658,7 @@ A start waits only while its pool is **at reserve** (`v2.pools.<provider>.at_res
+ 
+ A **held** pool whose reset is more than `reroute_after_s` away (or unknown) moves the route instead of holding the card for days: a `review_unpinned` reviewer, or a non-mandatory concrete pin runs on another eligible route of the same routing class whose provider is neither held nor walled (the same eligibility as the quota-wall reroutes). The route reason is `review_unpinned+paced:<provider>` or `pinned+paced:<provider>`; the card row never changes, and the governor then judges the new provider as usual. Queue notes and stall notices name the move (`next run rerouted: pinned+paced:openai-codex -> anthropic/<model>`). A **paced** pool never moves a route, and mandatory pins, `class:*` selectors and `require_model: true` cards keep theirs. The decision reads only the pace stored in `llm_pacing.json`; it makes no usage read. Unpinned default-tier cards are placed by ratio routing (below) instead; one that still resolves onto a held pool (ratio routing off or failing open) is moved at claim time by the governor to a same-class pool with room (`default+paced:<provider>` in its `run_route` receipt), or held.
+ 
+-**Ratio routing.** An unpinned default-tier card (no model or provider override, not a review run, no `require_model: true` line) starts on the governed pool furthest below its planned budget share instead of always on `kanban.default_model`. The pools are the providers of the `model_routing.routes` class level of `kanban.default_model`: the level a `class:<level>` default names, else the one level that lists the concrete default model (registry order; each runs `ratio_route_models.<pool>` when that is one of its routes in the level, else its first route). A pick is always a concrete model and provider, also under a class default. A pool is eligible when its fresh `v2` entry has `ratio` above 0, is not `at_reserve` and has a known `rate_tokens_per_s`, its provider is enabled, this host holds a live credential that can serve the model, and no provider wall stands. Targets are the eligible pools' ratios renormalized to 1; the share is each pool's part of this host's default-tier starts on the board over the last six hours (`run_route` receipts). The pool with the largest target minus share wins (ties: registry order). The route reason is `default+ratio:<pool>` (a later wall, episode or pace move appends its own suffix), and the `model_tier` and `run_route` receipts carry a `ratio` block (`pool`, `model`, `target`, `share`, `deficit`, `starts`). Queue notes name the pick (`next run on anthropic (budget share): anthropic/<model>`). It keeps today's route when `ratio_routing` is `false`, the `v2` document is missing, malformed or older than 20 minutes, no pool is eligible, a concrete default model is in no class level (or in two), or the choice fails; under a class default the kept route is the `class:<level>` selector itself. Start counts are read once per dispatcher tick and each start in the tick is added, so a card's preview, governor check and launch agree and the next card sees the previous start.
++**Ratio routing.** An unpinned default-tier card (no model or provider override, not a review run, no `require_model: true` line) starts on the governed pool furthest below its planned budget share instead of always on `kanban.default_model`. The pools are the providers of the `model_routing.routes` class level of `kanban.default_model`: the level a `class:<level>` default names, else the one level that lists the concrete default model (registry order; each runs `ratio_route_models.<pool>` when that is one of its routes in the level, else its first route). A pick is always a concrete model and provider, also under a class default. A pool is eligible when its `v2` entry, read within the last 20 minutes (its own `read_at`), has `ratio` above 0, is not `at_reserve` and has a known `rate_tokens_per_s`, its provider is enabled, this host holds a live credential that can serve the model, and no provider wall stands. Targets are the eligible pools' ratios renormalized to 1; the share is each pool's part of this host's default-tier starts on the board over the last six hours (`run_route` receipts). The pool with the largest target minus share wins (ties: registry order). The route reason is `default+ratio:<pool>` (a later wall, episode or pace move appends its own suffix), and the `model_tier` and `run_route` receipts carry a `ratio` block (`pool`, `model`, `target`, `share`, `deficit`, `starts`). Queue notes name the pick (`next run on anthropic (budget share): anthropic/<model>`). It keeps today's route when `ratio_routing` is `false`, the `v2` document is missing, malformed or older than 20 minutes, no pool is eligible, a concrete default model is in no class level (or in two), or the choice fails; under a class default the kept route is the `class:<level>` selector itself. Start counts are read once per dispatcher tick and each start in the tick is added, so a card's preview, governor check and launch agree and the next card sees the previous start.
+ 
+ | Config key | Default | What it does |
+ |------------|---------|--------------|
+-- 
+2.43.0
+
