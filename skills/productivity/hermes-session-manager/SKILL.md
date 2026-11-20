@@ -107,7 +107,14 @@ say what's running, never what needs the user.
 - When a chain waits on a PR whose exact head is green and `CLEAN`, with no changes requested, but its owner card
   is queued, merge it yourself (`gh pr merge --rebase --match-head-commit <head>` via token-broker). Then
   `kanban_comment` each owner card that the merge step is done, so it resumes from the next step.
-  A green PR left unmerged behind a queue is a stall, not progress.
+  A green PR left unmerged behind a queue is a stall, not progress. Hermes core repos (daveey-hermes) refuse
+  a direct `gh pr merge` (ship-only-guard): land via `hermes-core-wt ship <slug> --review-task <card>`, which
+  accepts only a done Kanban review card with verdict/reviewed_sha metadata. A subagent's PR review comment does
+  not satisfy it, so file that review card first, not after a subagent review.
+- Never archive or complete a card you don't own because its checkpoint condition looks met (a wait for CI to
+  settle, later green runs): first read its current body and newest comments, since the owner may have rescoped
+  acceptance after the checkpoint. Archive is one-way: there is no unarchive, and `reopen` accepts only `done`. A
+  card you think is moot gets an evidence comment for its owner, not an archive.
 - David wants execution on workers and the hub kept for sessions. Before accepting "it runs on the hub", read
   the card's `requires` (a `host_repo` entry pins it to the dispatcher host), `placement_policy`/`runs_on`, and
   any `moved` events back to the hub. Give the concrete reason: an old card made before worker-first, a missing
