@@ -92,9 +92,16 @@ const BAR_CLASS =
 
 // ── pure helpers (exported for tests) ─────────────────────────────────────
 
+// Model-family windows (scope 'model', or a Fable label) cap one model, never the pool.
+// The sparkline is the account-wide weekly forecast; a Fable week must not become that line.
+const FABLE_WINDOW = /fable/i
+export function poolWindow(w) {
+  return !!(w && w.scope !== 'model' && !FABLE_WINDOW.test(String(w.label || '')))
+}
+
 export function pickWindow(windows, kind) {
   const re = kind === 'session' ? /session|5.?h|hour/i : /week/i
-  return (windows || []).find(w => w && w.scope !== 'model' && re.test(String(w.label || ''))) || null
+  return (windows || []).find(w => poolWindow(w) && re.test(String(w.label || ''))) || null
 }
 
 export function tone(account) {
@@ -102,7 +109,7 @@ export function tone(account) {
   // Only an explicit backend 'cooldown' verdict turns a limited account amber.
   if (account.state === 'limited') return account.limit_kind === 'cooldown' ? 'cooldown' : 'limited'
   if (account.state !== 'ready') return account.state === 'unavailable' ? 'unavailable' : 'unknown'
-  const hi = Math.max(...(account.windows || []).filter(w => w.scope !== 'model').map(w => Number(w.used_percent) || 0), 0)
+  const hi = Math.max(...(account.windows || []).filter(poolWindow).map(w => Number(w.used_percent) || 0), 0)
   return hi >= WARN_PCT ? 'warn' : 'ready'
 }
 
@@ -189,7 +196,7 @@ export function summarize(payload, last = {}, now = Date.now(), disabled = null)
     let accounts = row && row.usage && Array.isArray(row.usage.accounts) ? row.usage.accounts : null
     // Single-account provider: legacy gauge shape `usage.windows`.
     if (!accounts && row && row.usage && Array.isArray(row.usage.windows)) {
-      const limited = row.usage.windows.some(w => w.scope !== 'model' && Number(w.used_percent) >= 100)
+      const limited = row.usage.windows.some(w => poolWindow(w) && Number(w.used_percent) >= 100)
       // Status-only providers (xAI): 100% means "API blocked (no credits)", not a spent quota window.
       const reason = limited ? (p.statusBad ? 'auth' : p.statusOnly ? 'billing' : 'quota_window') : null
       accounts = [{ id: p.slug, selectable: false, label: row.name || p.title, windows: row.usage.windows, state: limited ? 'limited' : 'ready', resets_at: null, limit_kind: limited ? 'quota' : null, reason, ...(limited && p.statusBad ? { status_bad: p.statusBad } : {}) }]
@@ -268,8 +275,14 @@ function atHour(h, now) {
 export function verdictText(f) {
   if (!f) return ''
   if (f.verdict === 'learning') return 'learning…'
-  // Short: just the hours until it runs dry, in red (the tooltip and popover say the rest).
-  if (f.verdict === 'short') return f.runout_h === 0 ? 'out' : fmtHours(f.runout_h)
+  // Short: hours until it runs dry. Dry this minute is "out" only when nothing comes back
+  // inside the week; a session block with weekly quota left says when that quota returns.
+  if (f.verdict === 'short') {
+    if (f.runout_h !== 0) return fmtHours(f.runout_h)
+    const end = f.gaps && f.gaps[0] && f.gaps[0].end_h
+    if (Number.isFinite(end) && end > 0 && end < 168) return `back ${fmtHours(end)}`
+    return 'out'
+  }
   if (f.verdict === 'tight') return 'tight'
   if (f.verdict === 'ok') return 'ok'
   return ''

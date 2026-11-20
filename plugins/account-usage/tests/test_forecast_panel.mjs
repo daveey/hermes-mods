@@ -24,6 +24,8 @@ test('forecast request carries weekly used + resets for pooled providers only', 
 test('verdict and forecast wording', () => {
   assert.equal(plugin.verdictText({ verdict: 'short', runout_h: 17 }), '17h')
   assert.equal(plugin.verdictText({ verdict: 'short', runout_h: 0 }), 'out')
+  assert.equal(plugin.verdictText({ verdict: 'short', runout_h: 0, gaps: [{ start_h: 0, end_h: 1 }] }), 'back 1h')
+  assert.equal(plugin.verdictText({ verdict: 'short', runout_h: 0, gaps: [{ start_h: 0, end_h: 168 }] }), 'out')
   assert.equal(plugin.verdictText({ verdict: 'learning' }), 'learning…')
   assert.equal(plugin.verdictText({ verdict: 'ok' }), 'ok')
   assert.equal(plugin.verdictText(null), '')
@@ -36,6 +38,18 @@ test('verdict and forecast wording', () => {
   assert.equal(plugin.forecastText(null), 'no forecast (backend too old)')
   assert.equal(plugin.leftText({ left: 110 }), '1.1 acct')
   assert.equal(plugin.fmtHours(0.25), '15m'); assert.equal(plugin.fmtHours(50), '2d')
+})
+
+test('weekly sparkline ignores a Fable window', () => {
+  const fable = { label: 'Fable week', used_percent: 100, scope: 'account' }
+  const week = { label: 'Current week', used_percent: 25, scope: 'account' }
+  assert.equal(plugin.pickWindow([fable, week], 'week').label, 'Current week')
+  assert.equal(plugin.pickWindow([fable], 'week'), null)
+  assert.equal(plugin.pickWindow([{ label: 'Fable week', used_percent: 100 }], 'week'), null)
+  assert.equal(plugin.poolWindow({ label: 'Opus week', scope: 'model' }), false)
+  const req = plugin.forecastRequest(plugin.summarize({ providers: [{ slug: 'anthropic', usage: { accounts: [
+    { id: 'A', label: 'a@x', state: 'ready', windows: [fable, week] }] } }] }))
+  assert.equal(req.providers[0].accounts[0].week_used, 25)
 })
 
 test('attachForecast posts once and an old backend leaves forecast null', async () => {
