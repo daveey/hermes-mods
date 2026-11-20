@@ -174,9 +174,8 @@ Read `references/prevent-decision-blocks.md` (apply-the-recommendation rule, `IF
 - A `ready` card that already ran and has an open PR: before bumping it, read `hermes kanban show <id>`
   Diagnostics and the PR (`gh pr view <N> --json state,mergeStateStatus,statusCheckRollup`). A hold of
   `respawn_guarded: active_pr` keeps the card from restarting until its PR merges or closes, so no priority
-  starts it; when the PR in turn waits for the card to land it, do the card's stated next step here (verify
-  reviewed head = PR head and checks green, then submit it to that repo's landing path) and comment what you
-  did and what is left. A red PR check: read the failed step's log and comment the exact failure on the card.
+  starts it; when the PR in turn waits for the card (e.g. its CI wake fired), run on the hub
+  `hermes kanban resume <id> --reason "<why it continues THAT PR>"` (one continuation) and read back `running`. A red PR check: read the failed step's log and comment the exact failure on the card.
 - After each completion notice, read what the chain's other cards wait on (`task_events` kind
   `scheduled`/`continued`/`dependency_wait`, payload `awaiting`/`reason`). A card on a timed park stays parked
   until `wake_at` even when the thing it awaits is over: the sibling card it named is done, or its CI run
