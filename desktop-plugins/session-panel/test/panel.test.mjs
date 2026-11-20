@@ -1171,6 +1171,26 @@ test('recommendParts / whyParts edge cases', () => {
   assert.deepEqual(m.recommendParts('B.'), { letter: 'B', reason: '' })
   assert.deepEqual(m.recommendParts('Recommendation: A - cheap'), { letter: 'A', reason: 'cheap' })
   assert.deepEqual(m.recommendParts('I recommend A'), { letter: '', reason: 'I recommend A' })
-  assert.deepEqual(m.whyParts('Tried: x, y'), { line: 'Agent tried: x, y', tried: 'x, y' })
+  assert.deepEqual(m.whyParts('Tried: x, y'), { line: 'Agent tried: x, y', tried: '' })
+  assert.deepEqual(m.whyParts('Needs your password; only you can sign in.'), { line: 'Why you: Needs your password; only you can sign in.', tried: '' })
   assert.deepEqual(m.whyParts('Only you can approve the spend.'), { line: 'Only you can: approve the spend.', tried: '' })
+})
+
+test('situation More re-measures on resize (ResizeObserver)', async () => {
+  window.localStorage.clear()
+  const observers = []
+  const prevRO = window.ResizeObserver
+  window.ResizeObserver = class { constructor(cb) { this.cb = cb; observers.push(this) } observe(el) { this.el = el } disconnect() { this.off = true } }
+  bridges({ chips: [card('t_rs', 'blocked', { look: 'needs-you', label: 'Resize', humanRequest: { action: 'Do it.', why: 'Only you can: x.', brief: { situation: 'Short situation text that fits on one line.', options: [], recommend: '' } } })] })
+  await show(React.createElement(m.Panel, { key: 'resize' }))
+  try {
+    const sit = el().querySelector('[data-panel-row="kb:t_rs"] [data-ask-situation]')
+    assert.equal(el().querySelector('[data-panel-row="kb:t_rs"] [data-ask-more]'), null)
+    const ro = observers.find(o => o.el === sit)
+    assert.ok(ro, 'the situation is observed')
+    Object.defineProperty(sit, 'clientHeight', { configurable: true, get: () => 40 })
+    Object.defineProperty(sit, 'scrollHeight', { configurable: true, get: () => 90 })
+    await React.act(async () => { ro.cb(); await flush() })
+    assert.equal(el().querySelector('[data-panel-row="kb:t_rs"] [data-ask-more]')?.textContent, 'More')
+  } finally { await show(null); window.ResizeObserver = prevRO }
 })

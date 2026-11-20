@@ -766,12 +766,16 @@ export function recommendParts(text) {
  *  "Only you can" part the line is the free-text reason ("Why you: …"), or what was tried when that is all there is. */
 export function whyParts(text) {
   const t = str(text).replace(/\s+/g, ' ').trim()
-  const i = t.search(/\bonly you can\b/i)
+  // "Only you can" splits only where it opens the text or follows a "Tried: …" trail; inside a free-text reason
+  // ("Needs your password; only you can sign in.") the whole reason stays the reason.
+  const tried = /^tried\s*:/i.test(t)
+  const i = tried ? t.search(/\bonly you can\b/i) : (/^only you can\b/i.test(t) ? 0 : -1)
   if (i >= 0) {
     const part = t.slice(i).replace(/^only you can\s*:?\s*/i, '').trim()
     return { line: `Only you can: ${part}`, tried: t.slice(0, i).replace(/^tried\s*:\s*/i, '').trim() }
   }
-  if (/^tried\s*:/i.test(t)) { const tried = t.replace(/^tried\s*:\s*/i, ''); return { line: `Agent tried: ${clip(tried, 300)}`, tried } }
+  // A trail with no "Only you can" part: shown once, inline (Details does not repeat it).
+  if (tried) return { line: `Agent tried: ${clip(t.replace(/^tried\s*:\s*/i, ''), 300)}`, tried: '' }
   return { line: t ? `Why you: ${clip(t, 300)}` : '', tried: '' }
 }
 
@@ -990,8 +994,8 @@ export const C = {
 }
 const LABEL = { done: 'done', running: 'running', needsYou: 'needs you', stuck: 'stuck', blockedUpstream: 'blocked upstream', ready: 'ready', waiting: 'waiting', queued: 'not started' }
 const muted = { color: 'var(--muted-foreground)', fontSize: 12 }
-// Text colours with >= 4.5:1 contrast on both themes (light-dark needs the host's color-scheme; the first value is
-// the fallback where light-dark is unsupported). ACCENT_FILL carries white text in either theme.
+// Text colours with >= 4.5:1 contrast on both themes (light-dark follows the host's color-scheme; where light-dark is
+// unsupported the declaration is dropped and the text inherits the foreground colour). ACCENT_FILL carries white text.
 const ACCENT_TEXT = 'light-dark(#0969da, #58a6ff)', ALERT_TEXT = 'light-dark(#cf222e, #ff7b72)', ACCENT_FILL = '#0969da'
 const heading = color => ({ margin: '12px 0 6px', fontSize: 12, fontWeight: 600, color })
 const btn = { minHeight: 32, padding: '4px 10px', borderRadius: 6, border: '1px solid var(--border)', background: 'transparent', color: 'var(--foreground)', font: 'inherit', fontSize: 12.5, cursor: 'pointer' }
@@ -1430,15 +1434,22 @@ const pill = color => ({ fontSize: 10, fontWeight: 700, letterSpacing: 0.4, text
 const askLinkBtn = { background: 'none', border: 0, padding: 0, font: 'inherit', fontSize: 12, color: ACCENT_TEXT, cursor: 'pointer' }
 export const SITUATION_MORE_AT = 140 // characters; without layout (tests, first paint) More shows from here
 
-/** Text clamped to `lines` with a More/Less toggle shown when it actually overflows (measured after paint), or from
- *  SITUATION_MORE_AT characters when layout can't be measured. */
+/** Text clamped to `lines` with a More/Less toggle shown when it actually overflows (measured after paint and on
+ *  resize), or from SITUATION_MORE_AT characters when layout can't be measured. */
 function Clamped({ text, lines, attr }) {
   const ref = useRef(null)
   const [more, setMore] = useState(false)
   const [over, setOver] = useState(text.length > SITUATION_MORE_AT)
   useEffect(() => {
     const el = ref.current
-    if (el && el.clientHeight > 0 && !more) setOver(el.scrollHeight > el.clientHeight + 1)
+    const measure = () => { if (el && el.clientHeight > 0 && !more) setOver(el.scrollHeight > el.clientHeight + 1) }
+    measure()
+    // Re-measure when the panel is resized: a narrower panel can start clamping text that used to fit.
+    const RO = typeof window !== 'undefined' ? window.ResizeObserver : undefined
+    if (!el || typeof RO !== 'function') return undefined
+    const ro = new RO(measure)
+    ro.observe(el)
+    return () => ro.disconnect()
   }, [text, more])
   return jsxs('div', { children: [
     jsx('div', { ref, [attr]: '', style: { fontSize: 12.5, lineHeight: 1.5, overflowWrap: 'anywhere', ...(more ? {} : clamp(lines)) }, children: text }),
