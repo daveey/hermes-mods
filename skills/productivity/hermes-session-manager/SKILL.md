@@ -113,8 +113,12 @@ say what's running, never what needs the user.
   not satisfy it, so file that review card first, not after a subagent review.
 - Never archive or complete a card you don't own because its checkpoint condition looks met (a wait for CI to
   settle, later green runs): first read its current body and newest comments, since the owner may have rescoped
-  acceptance after the checkpoint. Archive is one-way: there is no unarchive, and `reopen` accepts only `done`. A
-  card you think is moot gets an evidence comment for its owner, not an archive.
+  acceptance after the checkpoint; later green runs don't satisfy a "no unfinished runs" or "this failed run
+  repaired" acceptance. A card you think is moot gets an evidence comment for its owner, not an archive. To undo
+  a mistaken archive, the CLI can't (`reopen` takes only `done`), but the Dashboard API can: `GET
+  /api/plugins/kanban/workflow` lists `archived -> ready/todo/triage`, then `PATCH
+  /api/plugins/kanban/tasks/<id>?profile=<p>&board=<b>` with `{"status":"triage"}` restores the same card (body,
+  parents, run allowance intact), so a restorable card needs no successor card.
 - David wants execution on workers and the hub kept for sessions. Before accepting "it runs on the hub", read
   the card's `requires` (a `host_repo` entry pins it to the dispatcher host), `placement_policy`/`runs_on`, and
   any `moved` events back to the hub. Give the concrete reason: an old card made before worker-first, a missing
