@@ -4,20 +4,39 @@ import plugin from '../../../desktop-plugins/account-usage/plugin.js'
 import {host} from './harness-sdk.js'
 const rows=new Map(), calls=[], deferred=[]
 const row=id=>rows.get(id)||{session_id:id,provider:'anthropic',model:'same-model',revision:0,account_id:null,state:'empty'}
+const oauthSessions=new Map(); let oauthSeq=0 // one fake server session per /start, as on a real gateway
 const desktopApi=async (req)=>{
  calls.push({kind:'api',...req})
  ;(window.__api||(window.__api=[])).push(req)
  const path=String(req.path||'')
  if(path.includes('/oauth/') && path.endsWith('/start')) {
   if(window.fixture.oauthStartError) throw new Error(window.fixture.oauthStartError)
-  return {flow:'device_code',session_id:'oauth-sess-1',verification_url:'https://auth.example.com/device',user_code:'WXYZ-1234',expires_in:900}
+  // A fake gateway with core's contract: a named pool row binds the session; an old core ignores it.
+  const target=req.body?.credential_id
+  const sid=`oauth-sess-${++oauthSeq}`
+  oauthSessions.set(sid,{target:target && !window.fixture.oldCore ? target : null,cancelled:false})
+  window.fixture.oauthCancelled=false
+  return {flow:'device_code',session_id:sid,verification_url:'https://auth.example.com/device',user_code:'WXYZ-1234',expires_in:900,
+   ...(oauthSessions.get(sid).target?{target_bound:true,credential_id:target}:{})}
  }
  if(path.includes('/oauth/') && path.includes('/poll/')){
+  const sid=path.split('/poll/')[1].split('?')[0], sess=oauthSessions.get(sid)
   const status=window.fixture.oauthStatus||'approved'
-  if(status==='approved'){ if(window.fixture.vanished) window.fixture.reviveVanished=true; else window.fixture.reviveDead=true }
-  return {session_id:'oauth-sess-1',status}
+  if(!sess || sess.cancelled) return {session_id:sid,status:'cancelled'}
+  if(status!=='approved') return {session_id:sid,status}
+  const bound=sess.target
+  if(bound){
+   // Another principal signed in: core refuses and writes nothing.
+   if(window.fixture.wrongPrincipal) return {session_id:sid,status:'error',reason:'reauth_conflict',error_message:'fixture conflict text'}
+   if(bound==='pool-dead') window.fixture.reviveDead=true
+   return {session_id:sid,status,credential_id:bound,identity_verified:true}
+  }
+  // An ordinary login rewrites the provider's own sign-in state: it reseeds a row core dropped,
+  // and beside a manual row that is still in the pool it adds a second one.
+  if(window.fixture.vanished) window.fixture.reviveVanished=true; else window.fixture.duplicate=true
+  return {session_id:sid,status}
  }
- if(path.includes('/oauth/sessions/') && req.method==='DELETE'){ window.fixture.oauthCancelled=true; return {ok:true} }
+ if(path.includes('/oauth/sessions/') && req.method==='DELETE'){ const sess=oauthSessions.get(path.split('/oauth/sessions/')[1].split('?')[0]); if(sess) sess.cancelled=true; window.fixture.oauthCancelled=true; return {ok:true} }
  throw new Error('unexpected api '+path)
 }
 const ctx={onDispose(){},setTimeout(){},setInterval(){},os:{openExternal:async url=>{(window.__opened||(window.__opened=[])).push(url); return true}},api:desktopApi,register(c){createRoot(document.getElementById('root')).render(c.render())},async rest(path,opts={}) {
@@ -30,9 +49,9 @@ const ctx={onDispose(){},setTimeout(){},setInterval(){},os:{openExternal:async u
  if(path==='/last')return {anthropic:{label:'Account A',at:Math.floor(Date.now()/1000)-3600}}
  if(path==='/reconnect'){
   const account=opts.body.account_id
-  if(account==='inventory-dead') return {ok:false,renewed:0,status:'needs_sign_in',needs_sign_in:true,auth_flow:'device_code',provider:'openai-codex',account_id:account,label:'Dead account'}
+  if(account==='inventory-dead') return {ok:false,renewed:0,status:'needs_sign_in',needs_sign_in:true,auth_flow:'device_code',sign_in:{mode:'target',credential_id:'pool-dead'},provider:'openai-codex',account_id:account,label:'Dead account'}
   // Core quarantine: the dead-grant row leaves the pool; the next model.options no longer lists it.
-  if(account==='inventory-vanish'){ window.fixture.vanished=true; return {ok:false,renewed:0,removed:1,status:'needs_sign_in',needs_sign_in:true,auth_flow:'device_code',provider:'openai-codex',account_id:account,label:'Vanishing account'} }
+  if(account==='inventory-vanish'){ window.fixture.vanished=true; return {ok:false,renewed:0,removed:1,status:'needs_sign_in',needs_sign_in:true,auth_flow:'device_code',sign_in:{mode:'singleton'},provider:'openai-codex',account_id:account,label:'Vanishing account'} }
   if(account==='inventory-expired'){ window.fixture.reviveExpired=true; return {ok:true,renewed:1,status:'renewed',needs_sign_in:false} }
   return {ok:true,renewed:1,status:'renewed',needs_sign_in:false}
  }

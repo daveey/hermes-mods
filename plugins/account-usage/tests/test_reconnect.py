@@ -189,6 +189,49 @@ class ReconnectTests(unittest.TestCase):
         r = TestClient(app).post('/reconnect', json={'provider': 'anthropic', 'account_id': 'X', 'x': 1})
         self.assertEqual(r.status_code, 422)
 
+    def test_dead_manual_row_names_itself_as_the_sign_in_target(self):
+        row = entry('pool-7', 'codex:ws:sub', last_status=DEAD)
+        row.source = 'manual:device_code'
+        pool = Pool([row, entry('other', 'Y')], lambda cid: None)
+        out = api.reconnect_account('openai-codex', 'codex:ws:sub', tools(pool))
+        self.assertEqual(out['status'], 'needs_sign_in')
+        self.assertEqual(out['sign_in'], {'mode': 'target', 'credential_id': 'pool-7'})
+        self.assertNotIn('rt', repr(out))
+
+    def test_singleton_seeded_or_removed_row_routes_to_the_ordinary_login(self):
+        seeded = entry('a', 'X', last_status=DEAD)
+        seeded.source = 'device_code'
+        out = api.reconnect_account('openai-codex', 'X', tools(Pool([seeded], lambda cid: None)))
+        self.assertEqual(out['sign_in'], {'mode': 'singleton'})
+        gone = entry('a', 'X')
+        gone.source = 'manual:device_code'  # core dropped it: no row is left to replace
+        pool = Pool([gone], None)
+        pool._refresh = lambda cid: setattr(pool, '_entries', []) or None
+        out = api.reconnect_account('openai-codex', 'X', tools(pool))
+        self.assertEqual((out['removed'], out['sign_in']), (1, {'mode': 'singleton'}))
+
+    def test_rows_this_panel_cannot_bind_are_unsupported_not_guessed(self):
+        for sources in (['env:OPENAI_TOKEN'], ['borrowed:hub'], [''], ['manual:device_code', 'manual:device_code'],
+                        ['manual:device_code', 'device_code']):
+            with self.subTest(sources=sources):
+                rows = []
+                for i, source in enumerate(sources):
+                    row = entry(f'r{i}', 'X', last_status=DEAD)
+                    row.source = source
+                    rows.append(row)
+                out = api.reconnect_account('openai-codex', 'X', tools(Pool(rows, lambda cid: None)))
+                self.assertEqual(out['sign_in'], {'mode': 'unsupported'})
+
+    def test_sign_in_route_only_accompanies_a_dead_grant_with_in_app_auth(self):
+        row = entry('a', 'X', last_status=DEAD)
+        row.source = 'manual:pkce'
+        self.assertNotIn('sign_in', api.reconnect_account('anthropic', 'X', tools(Pool([row], lambda cid: None))))
+        for refresh in (lambda cid: SimpleNamespace(last_status='ok'),
+                        lambda cid: SimpleNamespace(last_status='exhausted', last_error_code=429, last_error_reason='quota')):
+            live = entry('a', 'X')
+            live.source = 'manual:device_code'
+            self.assertNotIn('sign_in', api.reconnect_account('openai-codex', 'X', tools(Pool([live], refresh))))
+
     def test_ping_advertises_reconnect_status(self):
         from fastapi import FastAPI
         from fastapi.testclient import TestClient

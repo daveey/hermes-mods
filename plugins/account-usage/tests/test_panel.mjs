@@ -174,7 +174,7 @@ test('dead grant sign-in launches device-code auth on the account gateway, not S
   if(String(req.path).includes('/poll/')) return {status:pollStatus}
   if(req.method==='DELETE') return {ok:true}
   throw new Error('unexpected '+req.path)
- }, async rest(){return {ok:false,status:'needs_sign_in',auth_flow:'device_code'}}}
+ }, async rest(){return {ok:false,status:'needs_sign_in',auth_flow:'device_code',sign_in:{mode:'singleton'}}}}
  const groups=[{slug:'openai-codex',accounts:[{id:'acct-9',state:'ready'}]}]
  const r=plugin.createReconnectStore(ctx,async()=>groups)
  await r.signIn('openai-codex',{id:'acct-9'},{connectionId:'gw-hub',profile:'work'})
@@ -209,7 +209,7 @@ const deviceCtx=(over={})=>{ const apiCalls=[], opened=[]; let n=0
   if(String(req.path).includes('/poll/')) return over.poll ? over.poll(req) : {status:'approved'}
   if(req.method==='DELETE') return {ok:true}
   throw new Error('unexpected '+req.path)
- }, async rest(){return over.reply||{ok:false,status:'needs_sign_in',auth_flow:'device_code'}}}
+ }, async rest(path,opts){return typeof over.reply==='function'?over.reply(opts):over.reply||{ok:false,status:'needs_sign_in',auth_flow:'device_code',sign_in:{mode:'singleton'}}}}
  return {ctx,apiCalls,opened}
 }
 test('completion readback: only a healthy read-back account says Reconnected', async () => {
@@ -277,7 +277,7 @@ test('refreshable expiry reads "disconnected"; "sign-in needed" only once a dead
 })
 test('a row core removed for a dead grant stays listed as signed out until sign-in is verified', async () => {
  const {plugin}=await setup()
- const {ctx}=deviceCtx({reply:{ok:false,status:'needs_sign_in',needs_sign_in:true,removed:1,auth_flow:'device_code'}})
+ const {ctx}=deviceCtx({reply:{ok:false,status:'needs_sign_in',needs_sign_in:true,removed:1,auth_flow:'device_code',sign_in:{mode:'singleton'}}})
  let groups=[{slug:'openai-codex',title:'ChatGPT (Codex)',total:1,ready:1,accounts:[{id:'keep',label:'keep',state:'ready'}]}]
  const r=plugin.createReconnectStore(ctx,async()=>groups)
  const acct={id:'gone',label:'Gone acct'}, k=r.key('openai-codex','gone')
@@ -387,7 +387,8 @@ test('same-label siblings neither verify nor hide a removed selected account', a
 })
 test('reconnect state is scoped to its gateway and profile: no ghost, result or action crosses over', async () => {
  const {plugin,state}=await setup(); state.connectionId.set('gw-A'); state.profile.set('pA')
- const {ctx,apiCalls}=deviceCtx({reply:{ok:false,status:'needs_sign_in',needs_sign_in:true,removed:1,auth_flow:'device_code'},poll:()=>new Promise(()=>{})})
+ // Each gateway answers for its own pool: only gateway A's row was removed.
+ const {ctx,apiCalls}=deviceCtx({reply:opts=>({ok:false,status:'needs_sign_in',needs_sign_in:true,auth_flow:'device_code',sign_in:{mode:'singleton'},...(opts?.connectionId==='gw-B'?{}:{removed:1})}),poll:()=>new Promise(()=>{})})
  let groups=[]; const r=plugin.createReconnectStore(ctx,async()=>groups)
  const acct={id:'x',label:'X'}, k=r.key('openai-codex','x'), tick=()=>new Promise(ok=>setTimeout(ok,5))
  await r.reconnect('openai-codex',acct)
@@ -560,6 +561,105 @@ test('rows are non-clickable with the backend reason only when selection.unavail
 // Core's stale-code refusal of model.options after a core update (hermes-hub 2026-11-12, SSH backend on f4caf04 vs
 // ef7a9e6): the bar must say the backend needs a restart, not a bare "usage ?" (t_01a1cea849893f99).
 const STALE_503 = 'Error invoking remote method \'hermes:api\': Error: 503: {"detail":"Restart required: This process is running code from f4caf04160 but the checkout on disk is now ef7a9e6b2d. The model picker would risk a stale-module crash — restart the Desktop-owned backend to load the new code (use Restart backend in Hermes Desktop, or quit and reopen the app)"}'
+// ── selected-account sign-in: the backend names the row, the gateway binds the session ──────────
+const boundCtx=({reply,start,poll}={})=>{ const apiCalls=[], opened=[], restCalls=[]
+ const ctx={onDispose(){}, os:{openExternal:async url=>{opened.push(url); return true}}, api:async req=>{apiCalls.push(req)
+  if(String(req.path).endsWith('/start')) return start ? start(req) : {flow:'device_code',session_id:'sess-b',verification_url:'https://auth.example.com/device',user_code:'WXYZ',target_bound:true,credential_id:req.body.credential_id}
+  if(String(req.path).includes('/poll/')) return poll ? poll(req) : {status:'approved',credential_id:'row-7',identity_verified:true}
+  if(req.method==='DELETE') return {ok:true}
+  throw new Error('unexpected '+req.path)
+ }, async rest(path,opts){restCalls.push({path,...opts}); return reply||{ok:false,status:'needs_sign_in',needs_sign_in:true,auth_flow:'device_code',sign_in:{mode:'target',credential_id:'row-7'}}}}
+ return {ctx,apiCalls,opened,restCalls}
+}
+const starts=calls=>calls.filter(c=>String(c.path).endsWith('/start')), drops=calls=>calls.filter(c=>c.method==='DELETE').map(c=>String(c.path).split('/').pop())
+test('sign-in for a dead manual row is bound to that pool row on the account gateway and read back', async () => {
+ const {plugin,state}=await setup(); state.connectionId.set('gw-hub'); state.profile.set('work')
+ const acct={id:'codex:ws:sub',label:'Work'}, route={connectionId:'gw-hub',profile:'work'}
+ const {ctx,apiCalls,opened,restCalls}=boundCtx()
+ const r=plugin.createReconnectStore(ctx,async()=>[{slug:'openai-codex',accounts:[{id:'codex:ws:sub',label:'Work',state:'ready'}]}])
+ await r.signIn('openai-codex',acct,route)
+ // The wire account id is resolved to a pool row by the backend on the same gateway, never by the panel.
+ assert.deepEqual(restCalls.map(c=>[c.path,c.body,c.connectionId,c.profile]),[['/reconnect',{provider:'openai-codex',account_id:'codex:ws:sub'},'gw-hub','work']])
+ const [start]=starts(apiCalls)
+ assert.deepEqual([start.body,start.connectionId,start.profile],[{credential_id:'row-7'},'gw-hub','work'])
+ assert.deepEqual(opened,['https://auth.example.com/device'])
+ const st=r.$state.get()[r.key('openai-codex','codex:ws:sub')]
+ assert.deepEqual([st.done,st.message],[true,'Reconnected']); assert.deepEqual(drops(apiCalls),[])
+ assert.deepEqual(plugin.signInRoute({sign_in:{mode:'target',credential_id:'row-7'}}),{mode:'target',credentialId:'row-7'})
+ for (const bad of [null,{},{sign_in:{mode:'target'}},{sign_in:{mode:'target',credential_id:7}},{sign_in:{mode:'label'}}]) assert.deepEqual(plugin.signInRoute(bad),{mode:'unknown'})
+})
+test('a gateway that ignores the target never completes as an account-add: its session is deleted', async () => {
+ const {plugin}=await setup(); const acct={id:'a',label:'A'}
+ for (const reply of [{flow:'device_code',session_id:'sess-old',verification_url:'https://auth.example.com/device',user_code:'WXYZ'},
+                      {flow:'device_code',session_id:'sess-old',verification_url:'https://auth.example.com/device',user_code:'WXYZ',target_bound:true,credential_id:'other-row'}]) {
+  const {ctx,apiCalls,opened}=boundCtx({start:()=>reply}); let read=0
+  const r=plugin.createReconnectStore(ctx,async()=>{read++; return []})
+  await r.signIn('openai-codex',acct)
+  const st=r.$state.get()[r.key('openai-codex','a')]
+  assert.deepEqual(opened,[],'the unbound sign-in page is never opened'); assert.deepEqual(drops(apiCalls),['sess-old'])
+  assert.ok(!apiCalls.some(c=>String(c.path).includes('/poll/'))); assert.equal(read,0)
+  assert.notEqual(st.done,true); assert.equal(st.needsSignIn,true); assert.match(st.message,/Update this gateway/)
+ }
+})
+test('a bound sign-in that saved nothing, or saved elsewhere, is never reported as reconnected', async () => {
+ const {plugin}=await setup(); const acct={id:'a',label:'A'}; const healthy=[{slug:'openai-codex',accounts:[{id:'a',label:'A',state:'ready'}]}]
+ const run=async poll=>{ const {ctx,apiCalls}=boundCtx({poll:()=>poll}); let read=0; const r=plugin.createReconnectStore(ctx,async()=>{read++; return healthy}); await r.signIn('openai-codex',acct); return {st:r.$state.get()[r.key('openai-codex','a')],read,apiCalls,r} }
+ let out=await run({status:'error',reason:'reauth_conflict',error_message:'server text is not shown'})
+ assert.notEqual(out.st.done,true); assert.equal(out.read,0); assert.match(out.st.message,/different account.*nothing was saved/); assert.doesNotMatch(out.st.message,/server text/)
+ assert.deepEqual(out.st.signInRoute,{mode:'target',credentialId:'row-7'},'the row stays retryable against the same target')
+ for (const poll of [{status:'approved'},{status:'approved',credential_id:'other-row'}]) {
+  out=await run(poll)
+  assert.notEqual(out.st.done,true); assert.equal(out.st.unverified,true); assert.equal(out.read,0,'a healthy panel row cannot certify a sign-in saved elsewhere'); assert.match(out.st.message,/not for this account/)
+ }
+ // Retry after a conflict reuses the bound target without asking the backend to refresh a dead grant again.
+ out=await run({status:'error',reason:'reauth_conflict'}); const before=starts(out.apiCalls).length
+ await out.r.signIn('openai-codex',acct)
+ assert.deepEqual(starts(out.apiCalls).slice(before).map(c=>c.body),[{credential_id:'row-7'}])
+})
+test('sign-in is refused, with no auth call, when the backend cannot name where it belongs', async () => {
+ const {plugin}=await setup(); const acct={id:'a',label:'A'}; const base={ok:false,status:'needs_sign_in',needs_sign_in:true,auth_flow:'device_code'}
+ for (const [reply,want] of [[{...base,sign_in:{mode:'unsupported'}},/managed outside this profile/],[base,/Restart this gateway/],[{...base,sign_in:{mode:'target',credential_id:''}},/Restart this gateway/]]) {
+  const {ctx,apiCalls,opened}=boundCtx({reply}); const r=plugin.createReconnectStore(ctx,async()=>[])
+  await r.signIn('openai-codex',acct)
+  const st=r.$state.get()[r.key('openai-codex','a')]
+  assert.deepEqual([apiCalls.length,opened.length],[0,0]); assert.equal(st.needsSignIn,true); assert.notEqual(st.done,true); assert.match(st.message,want)
+ }
+})
+test('"Sign in again" on a grant that still refreshes renews it without launching auth; quota and disabled are not sign-in', async () => {
+ const {plugin}=await setup(); const acct={id:'a',label:'A'}
+ for (const [reply,check] of [[{ok:true,status:'renewed',renewed:1},st=>assert.deepEqual([st.done,st.message],[true,'Reconnected'])],
+                              [{ok:false,status:'quota'},st=>{assert.match(st.message,/quota/i); assert.equal(st.needsSignIn,undefined)}],
+                              [{ok:false,status:'disabled'},st=>{assert.match(st.message,/disabled/i); assert.equal(st.needsSignIn,undefined)}],
+                              [{ok:false,status:'transient'},st=>{assert.equal(st.retry,true); assert.equal(st.needsSignIn,undefined)}]]) {
+  const {ctx,apiCalls,opened}=boundCtx({reply}); const r=plugin.createReconnectStore(ctx,async()=>[])
+  await r.signIn('openai-codex',acct)
+  assert.deepEqual([apiCalls.length,opened.length],[0,0]); check(r.$state.get()[r.key('openai-codex','a')])
+ }
+})
+test('cancelling a bound sign-in deletes its session on the account gateway and keeps the target for a retry', async () => {
+ const {plugin,state}=await setup(); state.connectionId.set('gw-hub'); state.profile.set('work'); const acct={id:'a',label:'A'}, route={connectionId:'gw-hub',profile:'work'}
+ const {ctx,apiCalls}=boundCtx({poll:()=>new Promise(()=>{})}); let read=0
+ const r=plugin.createReconnectStore(ctx,async()=>{read++; return []})
+ r.signIn('openai-codex',acct,route); await new Promise(ok=>setTimeout(ok,20))
+ assert.equal(r.$state.get()[r.key('openai-codex','a')].sessionId,'sess-b')
+ await r.cancelAuth('openai-codex',acct,route)
+ const st=r.$state.get()[r.key('openai-codex','a')]
+ assert.deepEqual(apiCalls.filter(c=>c.method==='DELETE').map(c=>[String(c.path).split('/').pop(),c.connectionId,c.profile]),[['sess-b','gw-hub','work']])
+ assert.match(st.message,/cancelled/i); assert.notEqual(st.done,true); assert.equal(read,0)
+ assert.deepEqual(st.signInRoute,{mode:'target',credentialId:'row-7'})
+})
+test('a removed row signs in again after a cancel without asking the pool about an id it no longer has', async () => {
+ const {plugin}=await setup(); const acct={id:'gone',label:'Gone'}; let asked=0, pollStatus='pending'
+ const {ctx,apiCalls}=boundCtx({poll:()=>pollStatus==='pending'?new Promise(()=>{}):{status:'approved'}})
+ ctx.rest=async()=>{ if(asked++) throw new Error('404 Account not found; refresh the panel'); return {ok:false,status:'needs_sign_in',needs_sign_in:true,removed:1,auth_flow:'device_code',sign_in:{mode:'singleton'}} }
+ const r=plugin.createReconnectStore(ctx,async()=>[{slug:'openai-codex',accounts:[{id:'gone',label:'Gone',state:'ready'}]}]), k=r.key('openai-codex','gone')
+ await r.reconnect('openai-codex',acct)
+ r.signIn('openai-codex',acct); await new Promise(ok=>setTimeout(ok,20))
+ await r.cancelAuth('openai-codex',acct)
+ pollStatus='approved'; await r.signIn('openai-codex',acct)
+ assert.equal(asked,1); assert.deepEqual(starts(apiCalls).map(c=>c.body),[{},{}])
+ assert.deepEqual([r.$state.get()[k].done,r.$state.get()[k].message],[true,'Reconnected'])
+})
 test('stale-code model.options refusal reads "backend on old code: restart"; other errors stay "usage ?"', async () => {
   const { plugin, ctx } = await setup()
   globalThis.__auTestHost.request = async () => { throw new Error(STALE_503) }
