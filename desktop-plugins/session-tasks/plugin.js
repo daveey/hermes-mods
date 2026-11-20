@@ -355,7 +355,12 @@ function taskChip(t, status) {
   const waitTitle = waitingOn ? `\n${look === 'stalled' ? 'STALLED (agent-owned wait over 2 h): ' : ''}waiting on ${waitingOn}${waitingSince ? ` since ${sinceClock(waitingSince)}` : ''}` : ''
   return {
     look,
-    ...(t.blocked_upstream ? { blockedUpstream: { id: t.blocked_upstream.id, status: t.blocked_upstream.status } } : {}),
+    ...(t.blocked_upstream ? { blockedUpstream: {
+      id: t.blocked_upstream.id, status: t.blocked_upstream.status,
+      ...(t.blocked_upstream.contained ? { contained: t.blocked_upstream.contained } : {}),
+    } } : {}),
+    ...(t.upstream && t.upstream.id ? { upstream: { id: t.upstream.id, status: t.upstream.status } } : {}),
+    ...(wait && wait.contained ? { contained: wait.contained } : {}),
     waitingOn,
     waitingSince,
     // What the card asks the user to do, in its own words (Needs you shows this, never the card title).

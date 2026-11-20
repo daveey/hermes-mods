@@ -319,7 +319,11 @@ export function classify(chips, { nowMs = Date.now(), silence = new Map(), isAsk
     // observations array at all) cannot prove live or queued work either: its running/review/ready/todo card is
     // explicit unknown with its last known state; its waits and asks keep their sections.
     if (c.blockedUpstream && c.look !== 'stalled') {
-      out.blockedUpstream.push({ ...item(c), detail: `waiting on blocked parent ${c.blockedUpstream.id} (${c.blockedUpstream.status})` })
+      const bu = c.blockedUpstream, auth = bu.contained?.authority
+      const detail = auth?.id
+        ? `waiting on contained card ${bu.id} · release by ${auth.id} (${auth.status})`
+        : `waiting on blocked parent ${bu.id} (${bu.status})`
+      out.blockedUpstream.push({ ...item(c), detail })
       continue
     }
     const ev = evidence(c)
@@ -345,7 +349,8 @@ export function classify(chips, { nowMs = Date.now(), silence = new Map(), isAsk
     if (c.state === 'review') { out.active.push({ ...item(c), detail: `in review${last ? ` · ${ago(last, nowMs)}` : ''}` }); continue }
     if (c.state === 'ready') { out.ready.push({ ...item(c), detail: 'ready to start' }); continue }
     if (c.state === 'todo') { out.queued.push({ ...item(c), detail: 'not started' }); continue }
-    out.waiting.push({ ...item(c), detail: on || (c.state === 'scheduled' ? 'scheduled' : c.state === 'unknown' ? 'status unknown' : c.state) })
+    const leaf = c.upstream?.id ? ` → ${c.upstream.id} ${c.upstream.status}` : ''
+    out.waiting.push({ ...item(c), detail: (on || (c.state === 'scheduled' ? 'scheduled' : c.state === 'unknown' ? 'status unknown' : c.state)) + leaf })
   }
   return out
 }
@@ -353,19 +358,20 @@ export function classify(chips, { nowMs = Date.now(), silence = new Map(), isAsk
 /** What a Waiting row waits on, for the folded section's counts: `parent` (another card must finish first),
  *  `schedule` (a timer, CI run, deploy or other scheduled wake), `unknown` (its status could not be read), else
  *  `other` (triage, a retired ask's blocked owner). A status-unknown row is never guessed into parent/schedule. */
-export const WAIT_KINDS = ['parent', 'schedule', 'unknown', 'other']
-const WAIT_LABEL = { parent: 'on parent', schedule: 'on schedule', unknown: 'unknown', other: 'other' }
+export const WAIT_KINDS = ['parent', 'schedule', 'contained', 'unknown', 'other']
+const WAIT_LABEL = { parent: 'on parent', schedule: 'on schedule', contained: 'contained', unknown: 'unknown', other: 'other' }
 export function waitKind(i) {
   const c = i?.chip || {}
   if (c.stale || /^(status )?unknown\b/.test(str(i?.detail)) || /\bunknown \(/.test(str(i?.detail)) || c.state === 'unknown') return 'unknown'
   if (i?.kind !== 'kanban' || i.cardStatus) return i?.kind === 'kanban' ? 'other' : 'unknown'
+  if (c.contained) return 'contained'
   const on = str(c.waitingOn)
   if (c.state === 'todo' || /^(blocked )?(parent|card|task)s?\b/i.test(on)) return 'parent'
   if (c.state === 'scheduled' || (on && c.state !== 'triage' && c.state !== 'blocked')) return 'schedule'
   return 'other'
 }
 export function waitBreakdown(rows) {
-  const n = { parent: 0, schedule: 0, unknown: 0, other: 0 }
+  const n = { parent: 0, schedule: 0, contained: 0, unknown: 0, other: 0 }
   for (const i of rows || []) n[waitKind(i)]++
   // Only buckets with something in them show; a zero bucket is noise.
   return { n, text: WAIT_KINDS.filter(k => n[k]).map(k => `${n[k]} ${WAIT_LABEL[k]}`).join(' · ') }
