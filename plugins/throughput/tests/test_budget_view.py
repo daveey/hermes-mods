@@ -131,3 +131,15 @@ def test_history_hourly_rates_and_cumulative_per_provider(tmp_path):
     # no series: the buckets, no providers
     empty = B.history(tmp_path / "missing.sqlite", NOW)
     assert empty["providers"] == {} and len(empty["t"]) == 168
+
+
+def test_project_after_rate_never_exceeds_a_capped_plan_rate():
+    # The plan's rate is held below remaining / time-left by the 5-hour cap: 10/s with 1M left and 20 000 s to the
+    # plan's end (50/s uncapped). 2x for an hour spends 72k against the plan's 36k, so afterwards the planner has
+    # 928k where it would have had 964k: 10 x 928/964 = 9.63/s, not (1M - 72k) / 16 400 = 56.6/s (above today's 10/s).
+    v2 = _v2({"anthropic": {"rate_tokens_per_s": 10.0, "remaining_tokens": 1_000_000.0, "exhaust_plan_at": NOW + 20_000,
+                            "at_reserve": False, "rate_cap_5h": 10.0}})
+    out = B.project(v2, 2.0, 3600.0, NOW)["anthropic"]
+    assert out["rate_after"] == pytest.approx(10.0 * 928_000 / 964_000)
+    assert out["rate_after"] <= out["rate_now"]
+    assert out["exceeds_5h_cap"] is True
