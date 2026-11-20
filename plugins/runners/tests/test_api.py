@@ -568,6 +568,15 @@ def test_fleet_route_gateway_section_carries_worker_events_from_the_scaler_ledge
     assert [(e['worker'], e['kind'], e['reason'], e['instance']) for e in gateways['events']] == [
         ('worker-2', 'launched', '6 cards waiting', 'i-0b'), ('worker-2', 'ready', 'bootstrapped', 'i-0b')]
     assert gateways['machines'][0]['name'] == 'hub'
+    assert gateways['launch_ready_s'] == 60
+    db = sqlite3.connect(ledger)
+    db.execute('INSERT INTO events (at, slot, iid, kind, reason) VALUES (?,?,?,?,?)',
+               (now - 10, 'worker-3', 'i-0c', 'launched', 'more cards waiting'))
+    db.commit()
+    db.close()
+    gateways = client.get(PREFIX + '/fleet', headers=TOKEN).json()['gateways']
+    assert gateways['machines'][-1] == dict(name='worker-3', state='launching',
+                                          launched_at=now - 10, slots=6, running=[])
 
 
 def test_fleet_route_without_runner_config_still_serves_gateways(disk_api, monkeypatch):

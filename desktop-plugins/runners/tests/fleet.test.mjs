@@ -346,7 +346,7 @@ test('polls every 15s open or closed, updates the open panel in place, stops whi
   assert.equal(row().querySelectorAll('.is-busy').length, 1)
   const chip = document.querySelector('[data-slot="runners-chip"]')
   assert.match(chip.getAttribute('aria-label'), /hub 1\/4 · workers 1\/3/)
-  assert.equal(chip.querySelector('[data-meter="workers"] .hermes-fleet-chipbar>span').style.width, '33%', 'bar updated in place')
+  assert.equal(chip.querySelectorAll('[data-pip-machine="worker-1"] .is-busy').length, 1, 'pips updated in place')
   assert.equal(ctx.calls.length, 3, 'one request per poll')
   // Hidden window: polling stops (no interval left running).
   Object.defineProperty(document, 'visibilityState', { value: 'hidden', configurable: true })
@@ -360,7 +360,7 @@ test('polls every 15s open or closed, updates the open panel in place, stops whi
   }
 })
 
-test('status bar: one meter for the hub, one for worker gateways; track = capacity, fill = scheduled, red when full', async () => {
+test('status bar: per-machine slot pips; green with room, red when the pool is full', async () => {
   const v = fleet()
   const s = P.summarize(P.merge([{ route, body: v, at: NOW, failures: 0, nextAt: 0 }], NOW))
   // hub: 1 of 4; workers: worker-1 0 of 3 (the uncapped mini adds no capacity)
@@ -376,14 +376,12 @@ test('status bar: one meter for the hub, one for worker gateways; track = capaci
   const ui = await mount(React.createElement(P.Runners, { ctx: ctxWith([full]) }))
   try {
     const chip = document.querySelector('[data-slot="runners-chip"]')
-    const hub = chip.querySelector('[data-meter="hub"]'), workers = chip.querySelector('[data-meter="workers"]')
-    assert.equal(hub.dataset.tone, 'ok')
-    assert.ok(hub.querySelector('.hermes-fleet-chipbar.is-ok'))
-    assert.equal(hub.querySelector('.hermes-fleet-chipbar>span').style.width, '25%')
-    assert.equal(workers.dataset.tone, 'full')
-    assert.ok(workers.querySelector('.hermes-fleet-chipbar.is-full'))
-    assert.equal(workers.querySelector('.hermes-fleet-chipbar>span').style.width, '100%')
-    assert.match(chip.textContent, /Hub.*Workers/)
+    const hub = chip.querySelector('[data-pip-machine="hub"]'), workers = chip.querySelector('[data-pip-machine="worker-1"]')
+    assert.equal(hub.querySelectorAll('.is-busy').length, 1)
+    assert.equal(hub.querySelectorAll('.is-free').length, 3)
+    assert.equal(workers.querySelectorAll('.is-lost').length, 3)
+    assert.equal(chip.textContent, '', 'no Hub/Workers text labels')
+    assert.equal(chip.title, 'hub: 1/4 busy · worker-1: 3/3 busy')
   } finally { await ui.close() }
 })
 
@@ -502,6 +500,69 @@ test('the chip opens the runners popover, whatever other panels are loaded', asy
     window.removeEventListener('hermes-show-lanes', onLanes)
     await ui.close()
   }
+})
+
+// ── chip pip model ────────────────────────────────────────────────────────────
+const pipMachine = (name, slots, busy, state = 'active', extra = {}) => ({
+  name, slots, state, labels: [], running: Array.from({ length: busy }, () => ({})), ...extra
+})
+const pipView = (...machines) => ({ gateways: { state: 'ready', machines }, ci: { state: 'not_configured', machines: [] } })
+
+test('pips: quiet, busy, full pools, throttle at the end, hub first and stopped excluded', () => {
+  const view = pipView(pipMachine('z', 6, 0), pipMachine('a', 6, 3), pipMachine('central', 8, 1, 'active', { labels: ['machine:hub'] }), pipMachine('off', 6, 0, 'stopped'), pipMachine('uncapped', null, 0))
+  const groups = P.pipGroups(view, null, NOW)
+  assert.deepEqual(groups.map((g) => g.name), ['central', 'a', 'z'])
+  assert.deepEqual(groups[0].pips, ['busy', ...Array(7).fill('free')])
+  assert.deepEqual(groups[1].pips, [...Array(3).fill('busy'), ...Array(3).fill('free')])
+  assert.deepEqual(groups[2].pips, Array(6).fill('free'))
+  const full = pipView(pipMachine('hub', 8, 5), pipMachine('a', 6, 6), pipMachine('b', 6, 6))
+  const throttle = { slots: { gateways: { hub: { allowed: 5 } } } }
+  const p = P.pipGroups(full, throttle, NOW)
+  assert.deepEqual(p[0].pips, [...Array(5).fill('lost'), ...Array(3).fill('thr')])
+  assert.deepEqual(p[1].pips, Array(6).fill('lost'))
+  assert.equal(p[0].lost, false, 'full is red but not a lost-machine outline')
+  assert.equal(p[0].title, 'hub: 5/8 busy, 3 throttled')
+})
+
+test('pips: draining blue and leaving outlines; lost red with group outline flag and tooltips', () => {
+  const p = P.pipGroups(pipView(pipMachine('drain', 6, 2, 'draining'), pipMachine('lost', 6, 3, 'lost')), null, NOW)
+  assert.deepEqual(p[0].pips, ['drain', 'drain', ...Array(4).fill('gone')])
+  assert.equal(p[0].title, 'drain: draining, 2 cards finishing')
+  assert.deepEqual(p[1].pips, [...Array(3).fill('lost'), ...Array(3).fill('free')])
+  assert.equal(p[1].lost, true)
+  assert.equal(p[1].title, 'lost: lost, holding 3 cards')
+})
+
+test('pips: launching uses age / typical, fallback, clamp, and never adds scheduling capacity', async () => {
+  const view = pipView(pipMachine('hub', 8, 5), pipMachine('worker-a3', 6, 0, 'launching', { launched_at: NOW / 1000 - 14 * 60 }))
+  const group = () => P.pipGroups(view, null, NOW)[1]
+  assert.deepEqual(group().pips, ['booted', 'booted', ...Array(4).fill('boot')])
+  assert.equal(group().title, 'worker-a3: launching, 14 min in (ready in ~20)')
+  assert.equal(P.summarize(view).gSlots, 8)
+  assert.deepEqual(P.summarize(view).workers, { busy: 0, slots: 0 })
+  view.gateways.launch_ready_s = 28 * 60
+  assert.equal(group().pips.filter((p) => p === 'booted').length, 3)
+  view.gateways.launch_ready_s = 5 * 60
+  assert.deepEqual(group().pips, Array(6).fill('booted'))
+  view.gateways.machines[1].launched_at = NOW / 1000 + 60
+  assert.deepEqual(group().pips, Array(6).fill('boot'))
+  const ui = await render(view)
+  try { assert.ok(ui.container.querySelector('[data-machine="worker-a3"]'), 'panel tolerates launching rows') } finally { await ui.close() }
+})
+
+test('pips: merge retains launching rows and median from the ledger host, no registered duplicates', () => {
+  const ledger = fleet()
+  ledger.gateways.events = [ev(1, 'worker-a3', 'launched')]
+  ledger.gateways.launch_ready_s = 1200
+  ledger.gateways.machines.push(pipMachine('worker-a3', 6, 0, 'launching', { launched_at: NOW / 1000 - 60 }))
+  const other = fleet()
+  let v = P.merge([{ route, body: ledger, at: NOW - 1 }, { route, body: other, at: NOW }], NOW)
+  assert.equal(v.gateways.launch_ready_s, 1200)
+  assert.equal(P.pipGroups(v, null, NOW).at(-1).state, 'launching')
+  other.gateways.machines.push(pipMachine('worker-a3', 6, 0))
+  v = P.merge([{ route, body: ledger, at: NOW - 1 }, { route, body: other, at: NOW }], NOW)
+  assert.equal(v.gateways.machines.filter((m) => m.name === 'worker-a3').length, 1)
+  assert.equal(v.gateways.machines.at(-1).state, 'active')
 })
 
 // ── worker lifecycle timeline (gateways.events) ──────────────────────────────────────────────────
