@@ -146,6 +146,52 @@ test('a pending save disables both sliders and does not issue a duplicate write'
   } finally { await ui.close() }
 })
 
+for (const staleFailure of [false, true]) {
+  test(`overlapping polls ignore stale ${staleFailure ? 'failure' : 'success'} and preserve latest min on max-only POST`, async (t) => {
+    let poll
+    t.mock.method(globalThis, 'setInterval', (callback) => { poll = callback; return 0 })
+    t.mock.method(globalThis, 'clearInterval', () => {})
+    const reads = [], writes = []
+    const client = {
+      read: () => new Promise((resolve, reject) => reads.push({ resolve, reject })),
+      write: async (owner, value) => { writes.push(value); return { route, limits: limits(value) } }
+    }
+    const ui = await mount(React.createElement(P.ScalerControls, { client }))
+    try {
+      await React.act(async () => { void poll() })
+      assert.equal(reads.length, 2)
+      await React.act(async () => reads[1].resolve({ route, limits: limits({ min: 2, max: 4 }) }))
+      await React.act(async () => staleFailure
+        ? reads[0].reject(Error('older request failed'))
+        : reads[0].resolve({ route, limits: limits() }))
+      assert.equal(ui.container.querySelector('[role="alert"]') === null, true)
+      assert.equal(ui.container.querySelector('[aria-label="Min workers"]')?.value, '2')
+      const max = ui.container.querySelector('[aria-label="Max workers"]')
+      assert.equal(max.value, '4')
+      await drag(max, 3); await release(max); await waitCommit()
+      assert.deepEqual(writes, [{ min: 2, max: 3 }])
+    } finally { await ui.close() }
+  })
+}
+
+test('a replaced client cannot publish a late read into the new effect', async () => {
+  let finishOld, replaceClient
+  const oldClient = { read: () => new Promise(resolve => { finishOld = resolve }) }
+  const newClient = { read: async () => ({ route, limits: limits({ min: 2, max: 4 }) }) }
+  function Harness() {
+    const [client, setClient] = React.useState(oldClient)
+    replaceClient = () => setClient(newClient)
+    return React.createElement(P.ScalerControls, { client })
+  }
+  const ui = await mount(React.createElement(Harness))
+  try {
+    await React.act(async () => replaceClient())
+    await React.act(async () => finishOld({ route, limits: limits() }))
+    assert.equal(ui.container.querySelector('[aria-label="Min workers"]').value, '2')
+    assert.equal(ui.container.querySelector('[aria-label="Max workers"]').value, '4')
+  } finally { await ui.close() }
+})
+
 test('unmount cancels a queued commit', async () => {
   const f = fixture()
   const ui = await mount(React.createElement(P.ScalerControls, { client: f.client }))
