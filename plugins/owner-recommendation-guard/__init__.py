@@ -22,19 +22,33 @@ from typing import Any
 
 TAG = "owner-recommendation-guard"
 TOOLS = {"kanban_block", "kanban_create"}
-_RULE_PATH = Path(__file__).resolve().parent.parent / "ask-gate" / "owner_recommendation.py"
+_ASK_GATE = Path(__file__).resolve().parent.parent / "ask-gate"
+_RULE_PATH = _ASK_GATE / "owner_recommendation.py"
 _RULE_KEY = "owner_recommendation_guard_rule"
+# The unblock-card brief rule (try-to-unblock / generate-unblock-card), same file ask-gate uses:
+# plugins/ask-gate/unblock_card_quality.py
+_BRIEF_PATH = _ASK_GATE / "unblock_card_quality.py"
+_BRIEF_KEY = "owner_recommendation_guard_brief_rule"
 _HELD: dict[tuple[str, str, str], int] = {}
+_BRIEF_HELD: dict[tuple[str, str, str], int] = {}
+
+
+def _load(key: str, path: Path):
+    mod = sys.modules.get(key)
+    if mod is None:
+        spec = importlib.util.spec_from_file_location(key, path)
+        mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+        spec.loader.exec_module(mod)  # type: ignore[union-attr]
+        mod = sys.modules.setdefault(key, mod)
+    return mod
 
 
 def _rule():
-    mod = sys.modules.get(_RULE_KEY)
-    if mod is None:
-        spec = importlib.util.spec_from_file_location(_RULE_KEY, _RULE_PATH)
-        mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
-        spec.loader.exec_module(mod)  # type: ignore[union-attr]
-        mod = sys.modules.setdefault(_RULE_KEY, mod)
-    return mod
+    return _load(_RULE_KEY, _RULE_PATH)
+
+
+def _brief_rule():
+    return _load(_BRIEF_KEY, _BRIEF_PATH)
 
 
 def _log(kind: str, **fields: Any) -> None:
@@ -79,10 +93,17 @@ def pre_tool_call(tool_name: str = "", args: Any = None, session_id: str = "", *
         return None
     if name == "kanban_create" and args.get("initial_status") != "blocked":
         return None
+    if _ask_gate_active():
+        return None
+    held = _owner_hold(name, args, request, session_id)
+    return held if held is not None else _brief_hold(name, args, request, session_id)
+
+
+def _owner_hold(name: str, args: dict, request: dict, session_id: str) -> dict | None:
     try:
         rule = _rule()
         hit = rule.hit(request)
-        if hit is None or _ask_gate_active():
+        if hit is None:
             return None
         card = _card(name, args)
         key = (session_id or "", name, card)
@@ -96,6 +117,27 @@ def pre_tool_call(tool_name: str = "", args: Any = None, session_id: str = "", *
         return {"action": "block", "message": rule.HOLD_MESSAGE}
     except Exception as e:
         _log("owner_recommendation_error", tool=name, session=session_id, error=repr(e)[:300])
+        return None
+
+
+def _brief_hold(name: str, args: dict, request: dict, session_id: str) -> dict | None:
+    """unblock_card_hold: the request lacks the decision brief generate-unblock-card writes. Bounded, fails open."""
+    try:
+        rule = _brief_rule()
+        hit = rule.hit(request)
+        if hit is None:
+            return None
+        card = _card(name, args)
+        key = (session_id or "", name, card)
+        n = _BRIEF_HELD.get(key, 0)
+        if n >= rule.MAX_HOLDS:
+            _log("unblock_card_released", tool=name, session=session_id, card=card, holds=n, missing=hit["missing"])
+            return None
+        _BRIEF_HELD[key] = n + 1
+        _log("unblock_card_hold", tool=name, session=session_id, card=card, attempt=n, missing=hit["missing"])
+        return {"action": "block", "message": hit["message"]}
+    except Exception as e:
+        _log("unblock_card_error", tool=name, session=session_id, error=repr(e)[:300])
         return None
 
 

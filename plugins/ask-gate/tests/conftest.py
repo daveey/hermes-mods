@@ -123,3 +123,10 @@ def llm_returning(verdicts):
                                     for i, v in enumerate(verdicts)]})
     fn.seen = seen
     return fn
+
+
+@pytest.fixture(autouse=True)
+def _unblock_brief_off(monkeypatch):
+    """Older fixtures carry human_requests without the generate-unblock-card brief; the rule has its own suite
+    (test_unblock_card_quality.py), which turns it back on."""
+    monkeypatch.setenv("ASK_GATE_UNBLOCK_BRIEF", "0")

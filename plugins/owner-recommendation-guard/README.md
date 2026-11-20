@@ -19,3 +19,11 @@ reverse it.
   `owner_recommendation_error`.
 
 Log: `$HERMES_HOME/logs/owner-recommendation-guard.jsonl` (`owner_recommendation_hold`, `_released`, `_error`).
+
+## Unblock-card brief
+
+The guard also runs ask-gate's `unblock_card_quality.py` (same file, loaded by path) after the owner-recommendation
+rule: a blocked card without `Tried:` / `Situation:` / `Options:` / `Recommend:` / one `(recommended)` choice is
+refused with a pointer to the try-to-unblock and generate-unblock-card skills. Same bound (2 holds per session,
+tool and card), same fail-open, same step-aside when ask-gate is active. Log events `unblock_card_hold`,
+`_released`, `_error`.

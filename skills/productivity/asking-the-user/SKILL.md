@@ -20,7 +20,8 @@ metadata:
 
 The one-line rules stay in the user's `~/AGENTS.md` ("Commands That Need Me", "Proposing Work (Inbox)"). This
 skill is how to carry them out. A decision or approval that should wait on the board is a blocked Kanban card
-(`kanban-orchestrator`, "Card mechanics for this user"), not anything here.
+(`kanban-orchestrator`, "Card mechanics for this user"), not anything here: run try-to-unblock first, then write it
+with generate-unblock-card.
 
 **Look first:** check supported credentials and authenticated sessions before handing over a step. If live state
 contradicts an approved plan, use commit history and `cross_task`/`cross_session` to recover the newer setup's

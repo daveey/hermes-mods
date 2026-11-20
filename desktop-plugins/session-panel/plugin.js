@@ -627,7 +627,13 @@ export function askView(c) {
   const next = yes || no
     ? `When done, open the card and press Unblock${yes ? ` (${clip(yes, 200)})` : ''}${no ? `, or Archive if you don’t want it (${clip(no, 200)})` : ''}. You can also reply in chat.`
     : 'When done, open the card and press Unblock, or reply in chat. Archive the card if you don’t want it.'
-  return { known: true, step: clip(step), full: step, why: typeof r.why === 'string' ? clip(r.why, 300) : '', next }
+  const b = r.brief && typeof r.brief === 'object' ? r.brief : null
+  // generate-unblock-card's brief (session-tasks briefOf): what happened, the options with their costs, the pick.
+  const brief = b && str(b.situation)
+    ? { situation: clip(b.situation, 400), options: (Array.isArray(b.options) ? b.options : []).slice(0, 6).map(o => clip(o, 240)).filter(Boolean),
+        recommend: clip(b.recommend, 240) }
+    : null
+  return { known: true, step: clip(step), full: step, why: typeof r.why === 'string' ? clip(r.why, 300) : '', next, brief }
 }
 
 /** Composer draft for Ask agent: a plain question about one card, sent only when the user presses send. */
@@ -1229,6 +1235,9 @@ function AskRow({ i, session }) {
   const line = { fontSize: 12.5, lineHeight: 1.45, overflowWrap: 'anywhere', minWidth: 0 }
   return jsxs('div', { 'data-panel-row': i.key, 'data-ask-row': v.known ? 'known' : 'unknown', style: { border: `1px solid color-mix(in srgb, ${C.needsYou} 45%, transparent)`, borderRadius: 6, padding: '8px 10px', marginBottom: 6, minWidth: 0 }, children: [
     jsx('div', { 'data-ask-title': '', style: { fontWeight: 600, overflowWrap: 'anywhere' }, children: i.label }),
+    v.brief && jsx('div', { 'data-ask-situation': '', style: { ...line, marginTop: 2 }, children: v.brief.situation }),
+    v.brief && v.brief.options.length > 0 && jsx('ul', { 'data-ask-options': '', style: { ...line, margin: '2px 0', paddingLeft: 18 }, children: v.brief.options.map((o, n) => jsx('li', { children: o }, n)) }),
+    v.brief && v.brief.recommend && jsx('div', { 'data-ask-recommend': '', style: { ...line, fontWeight: 600 }, children: `Recommended: ${v.brief.recommend}` }),
     jsx('div', { 'data-ask-step': '', title: v.full || undefined, style: { fontWeight: 600, fontSize: 13, lineHeight: 1.45, overflowWrap: 'anywhere', minWidth: 0 }, children: v.known ? `Do this: ${v.step}` : v.step }),
     v.why && jsx('div', { 'data-ask-why': '', style: { ...line, color: 'var(--muted-foreground)' }, children: `Why you: ${v.why}` }),
     jsx('div', { 'data-ask-next': '', style: line, children: `Next: ${v.next}` }),

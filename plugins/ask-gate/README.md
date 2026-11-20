@@ -258,6 +258,22 @@ Use a fictional, human-only topic and `-t todo`. (10-29: a live `hermes chat --o
 edit `~/.bash_profile`.) To check the judge against the real model, call `judge.judge(..., llm=judge.aux_llm)` directly;
 that runs no agent.
 
+## Unblock-card brief (L3, no model call)
+
+`unblock_card_hold` (`unblock_card_quality.py`): a `kanban_block` or blocked `kanban_create` whose `human_request`
+lacks the brief the skills try-to-unblock and generate-unblock-card produce is refused, with a message that names
+the missing parts and both skills. Required: `why_human` contains `Tried:`; `scope` has `Situation:` and
+`Recommend:` parts (each at least 20 chars); a decision (`approval`/`reply`) also has `Options:` with two or more
+option lines (`A) …`, `- B: …`) or two or more `choices`; when `choices` are given, exactly one label carries
+`(recommended)`. Runs after `owner_recommendation_hold` (an in-limits pick is applied, not briefed) and before the
+judge. Bounded to 2 holds per (session, tool, card), then released (`unblock_card_released`); errors fail open
+(`unblock_card_error`). owner-recommendation-guard runs the same file on hosts without ask-gate (pool workers).
+The session panel renders the brief (session-tasks `briefOf`). Why: 2026-11-20 session summaries showed blocked
+cards (t_01a1f8b56d1a69fc) with jargon, no situation, no per-option cost and no recommendation; the judge checks
+whether an ask should exist, not whether David can answer it. Tests: `tests/test_unblock_card_quality.py`,
+`owner-recommendation-guard/tests/test_unblock_brief.py`. Older fixtures run with `ASK_GATE_UNBLOCK_BRIEF=0`
+(conftest), a test-only switch.
+
 ## Requires compatible core before plugin rollout
 
 Registration requires `agent.pre_final_gate.PRE_FINAL_GATE_CAPABILITIES` with integer

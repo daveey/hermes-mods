@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from . import approval_adapter_loading, approval_reconciliation, lifecycle, user_step_lifecycle, runtime_contract, core, handoff, pr_approval_request, chat_delivery, superseding, physical_asks, replan, agent_condition, owner_recommendation, merge_ask, access_scope, approval_reuse, judge as judge_mod
+    from . import approval_adapter_loading, approval_reconciliation, lifecycle, user_step_lifecycle, runtime_contract, core, handoff, pr_approval_request, chat_delivery, superseding, physical_asks, replan, agent_condition, owner_recommendation, unblock_card_quality, merge_ask, access_scope, approval_reuse, judge as judge_mod
 except ImportError:  # pytest/spec loading imports the hyphenated plugin dir without a parent package
     import importlib.util as _ilu
     import sys as _sys
@@ -44,6 +44,7 @@ except ImportError:  # pytest/spec loading imports the hyphenated plugin dir wit
     replan = _sib("replan")
     agent_condition = _sib("agent_condition")
     owner_recommendation = _sib("owner_recommendation")
+    unblock_card_quality = _sib("unblock_card_quality")
     merge_ask = _sib("merge_ask")
     access_scope = _sib("access_scope")
     approval_reuse = _sib("approval_reuse")
@@ -1030,6 +1031,32 @@ def _owner_recommendation_hold(session_id: str, tool_name: str, request: dict, c
         return None
 
 
+_UNBLOCK_CARD_HELD: dict[tuple[str, str, str], int] = {}
+
+
+def _unblock_card_hold(session_id: str, tool_name: str, request: dict, card: str = "") -> dict | None:
+    """Hold a blocked card whose human_request lacks the decision brief (Tried / Situation / Options / Recommend,
+    one '(recommended)' choice) that try-to-unblock + generate-unblock-card produce. Deterministic, bounded to
+    unblock_card_quality.MAX_HOLDS per (session, tool, card); fails open."""
+    try:
+        hit = unblock_card_quality.hit(request)
+        if hit is None:
+            return None
+        key = (session_id, tool_name, card or "")
+        n = _UNBLOCK_CARD_HELD.get(key, 0)
+        if n >= unblock_card_quality.MAX_HOLDS:
+            core.log_event("unblock_card_released", tool=tool_name, session=session_id, holds=n,
+                           missing=hit["missing"])
+            return None
+        _UNBLOCK_CARD_HELD[key] = n + 1
+        core.log_event("unblock_card_hold", tool=tool_name, session=session_id, attempt=n,
+                       task=os.environ.get("HERMES_KANBAN_TASK") or "", missing=hit["missing"])
+        return {"action": "block", "message": hit["message"]}
+    except Exception as e:
+        core.log_event("unblock_card_error", tool=tool_name, session=session_id, error=repr(e)[:300])
+        return None
+
+
 def _replan_reply_hold(session_id: str, asks: list[str], attempt: int, budget: int, reply: str = "") -> dict | None:
     """Chat-reply side of _replan_hold: bounded by the reply hold budget. An ask is read with its paragraph, since
     "Your call: which way?" carries the choice in the sentence before it."""
@@ -1081,6 +1108,11 @@ def _human_request_gate(session_id: str, tool_name: str, args: dict) -> dict | N
             card=next(iter(_block_card(tool_name, args)), ""))
         if recommended is not None:
             return recommended
+        briefless = _unblock_card_hold(session_id, tool_name, dict(
+            request, choices=raw.get("choices") if isinstance(raw, dict) else None),
+            card=next(iter(_block_card(tool_name, args)), ""))
+        if briefless is not None:
+            return briefless
         filing = _pr_filing_hold(session_id, tool_name, args, request)
         if filing is not None:
             return filing

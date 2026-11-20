@@ -839,3 +839,15 @@ test('an unreleased closed remote card keeps what its owner reported (done or ar
   assert.equal(m.sessionTaskChips([{ ...row, status: 'unknown', reported_status: 'done', stale: true }])[0].reported, null)
   assert.equal(m.sessionTaskChips([{ ...row, status: 'scheduled', reported_status: 'scheduled' }])[0].reported, null)
 })
+
+test('humanRequestOf: a generate-unblock-card scope carries its brief (situation, options, recommend)', () => {
+  const scope = 'Situation: The Mac app fix is installed; one check needs a debug run.\nOptions:\nA) One supervised run — ~1 min restart, reversible.\n- B) Accept the gap — lowers acceptance.\n**Recommend:** A — covers the bug you hit.'
+  const r = m.humanRequestOf({ action: 'Choose. Unblock = A. Archive = B.', why_human: 'Tried: x.', interaction: 'approval', scope })
+  assert.deepEqual(r.brief, {
+    situation: 'The Mac app fix is installed; one check needs a debug run.',
+    options: ['A) One supervised run — ~1 min restart, reversible.', 'B) Accept the gap — lowers acceptance.'],
+    recommend: 'A — covers the bug you hit.'
+  })
+  assert.equal(m.briefOf('just a scope line'), null)
+  assert.equal(m.briefOf('Options:\nA) x\nB) y'), null, 'no situation, no brief')
+})

@@ -339,7 +339,32 @@ export function humanRequestOf(raw) {
   if (!r || typeof r !== 'object' || Array.isArray(r)) return null
   const s = k => (typeof r[k] === 'string' ? r[k].trim() : '')
   const out = { action: s('action'), why: s('why_human'), interaction: s('interaction') }
+  const brief = briefOf(s('scope'))
+  if (brief) out.brief = brief
   return out.action ? out : null
+}
+
+// The decision brief generate-unblock-card writes into human_request.scope (labelled parts; ask-gate's
+// unblock_card_quality.py checks the same labels): "Situation: …", "Options:" + one line per option, "Recommend: …".
+const BRIEF_LABEL = /^[ \t]*(?:[-*>][ \t]*)?(?:\*\*|__)?(situation|options?|recommend(?:ation|ed)?)(?:\*\*|__)?[ \t]*:(?:\*\*|__)?[ \t]*/i
+/** {situation, options[], recommend} from a scope with at least a Situation part, else null. Exported for tests. */
+export function briefOf(scope) {
+  if (typeof scope !== 'string' || !scope.trim()) return null
+  const parts = {}
+  let cur = null
+  for (const line of scope.split(/\r?\n/)) {
+    const m = BRIEF_LABEL.exec(line)
+    if (m) {
+      const k = m[1].toLowerCase()
+      cur = k.startsWith('situation') ? 'situation' : k.startsWith('option') ? 'options' : 'recommend'
+      parts[cur] = [line.slice(m[0].length)]
+    } else if (cur) parts[cur].push(line)
+  }
+  const flat = k => (parts[k] || []).join(' ').replace(/\s+/g, ' ').trim()
+  const situation = flat('situation')
+  if (!situation) return null
+  const options = (parts.options || []).map(l => l.replace(/^[ \t]*[-*][ \t]*/, '').trim()).filter(Boolean)
+  return { situation, options, recommend: flat('recommend') }
 }
 
 function taskChip(t, status) {

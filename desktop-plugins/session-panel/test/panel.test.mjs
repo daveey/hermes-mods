@@ -1056,3 +1056,11 @@ test('a quiet running card renders its meta in the waiting colour, still one lin
     assert.ok(meta.hasAttribute('data-quiet'))
   } finally { Date.now = realNow }
 })
+
+test('askView: a brief from generate-unblock-card is passed through for the Needs you row', () => {
+  const brief = { situation: 'The fix is installed; one check needs a debug run.', options: ['A) One supervised run', 'B) Accept the gap'], recommend: 'A — covers the bug you hit.' }
+  const v = m.askView({ humanRequest: { action: 'Choose. Unblock = A. Archive = B.', why: 'Tried: x.', brief } })
+  assert.deepEqual(v.brief, brief)
+  assert.equal(m.askView({ humanRequest: { action: 'Plug it in.' } }).brief, null)
+  assert.equal(m.askView({ humanRequest: { action: 'Plug it in.', brief: { situation: '', options: [] } } }).brief, null)
+})

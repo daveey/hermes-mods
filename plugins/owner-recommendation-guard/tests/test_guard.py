@@ -35,6 +35,7 @@ def guard(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     monkeypatch.delenv("OWNER_RECOMMENDATION_GUARD_IGNORE_ASK_GATE", raising=False)
+    monkeypatch.setenv("ASK_GATE_UNBLOCK_BRIEF", "0")  # brief rule: test_unblock_brief.py
     mod = _load("owner_recommendation_guard_t")
     monkeypatch.setattr(mod, "_ask_gate_active", lambda: False)
     return mod
