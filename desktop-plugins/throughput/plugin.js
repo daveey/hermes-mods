@@ -239,8 +239,11 @@ export function tiles(throttle, unit) {
   const holding = (throttle?.percent ?? 0) >= 100 || cap === 0
   const state = holding ? 'holding' : cap == null ? 'unlimited' : rate != null && rate > cap ? 'at' : 'under'
   const f = burstFactor(throttle)
+  const ps = pacingState(throttle)
   const limitNote = state === 'holding' ? 'every call held' : state === 'at' ? 'at the limit, calls queue'
-    : state === 'unlimited' ? 'nothing limits spend' : 'under the limit'
+    : choice === 'budget' && ps === 'pending' ? 'budget starting (a few minutes)'
+      : choice === 'budget' && ps === 'unavailable' ? 'no hub is publishing a budget'
+        : state === 'unlimited' ? 'nothing limits spend' : 'under the limit'
   const g = throttle?.slot_gate
   const slots = !g ? null : g.allowed == null
     ? { big: typeof g.running === 'number' ? String(g.running) : '–', of: null, note: 'running here · no slot limit' }
@@ -248,7 +251,7 @@ export function tiles(throttle, unit) {
   return {
     choice, state, rate, cap, slots,
     limitLabel: `Limit · ${CHOICE_LABEL[choice] || 'none'}${f > 1 ? ` · raised ${fmtFactor(f)}` : ''}`,
-    limitBig: holding ? '0' : cap == null ? 'None' : fmt(cap), limitNote
+    limitBig: holding ? '0' : cap == null ? (choice === 'budget' && ps === 'pending' ? '\u2026' : 'None') : fmt(cap), limitNote
   }
 }
 
@@ -599,14 +602,15 @@ const CHOICE_TIP = { budget: 'The subscription budget decides', limit: 'Your num
 
 // Budget / Limit / No limit and the limit field. A number is sent with Enter or Set only; leaving the field or picking
 // another choice drops it. `onLimit(choice, capPerMin)`.
-export function LimitControl({ throttle, onLimit }) {
+export function LimitControl({ throttle, onLimit, busy = false }) {
   const current = limitChoice(throttle)
   const [pick, setPick] = useState(null)
   const [draft, setDraft] = useState(null)
   const [bad, setBad] = useState(false)
   const shown = pick ?? current
   const own = typeof throttle?.user_cap_per_s === 'number' ? throttle.user_cap_per_s : (throttle?.percent ?? 0) >= 100 ? 0 : null
-  const value = draft ?? (current === 'limit' && own != null ? String(Math.round((own * 60) / 1000)) : '')
+  const k = own == null ? null : (own * 60) / 1000
+  const value = draft ?? (current === 'limit' && k != null ? String(k >= 10 ? Math.round(k) : Math.round(k * 10) / 10) : '')
   const choices = CHOICES.filter(([c]) => c !== 'budget' || budgetOffered(throttle))
   const choose = (c) => {
     setBad(false); setDraft(null)
@@ -619,18 +623,18 @@ export function LimitControl({ throttle, onLimit }) {
     const v = parseLimitK(draft)
     if (v === undefined) { setBad(true); return }
     setBad(false); setDraft(null); setPick(null)
-    if (!(current === 'limit' && own != null && Math.abs(own * 60 - v) < 500)) onLimit?.('limit', v)
+    if (!(current === 'limit' && own != null && Math.abs(own * 60 - v) < 1)) onLimit?.('limit', v)
   }
   return h('div', { className: 'hermes-tp-limitctl', 'data-slot': 'limit-control' },
     h('div', { className: 'hermes-tp-seg', role: 'group', 'aria-label': 'What limits token spend' },
       choices.map(([c, label]) => h('button', {
         key: c, type: 'button', 'data-choice': c, className: c === shown ? 'is-on' : '', 'aria-pressed': c === shown,
-        title: CHOICE_TIP[c], disabled: !onLimit, onClick: () => choose(c)
+        title: CHOICE_TIP[c], disabled: !onLimit || busy, onClick: () => choose(c)
       }, label))),
     shown === 'limit' ? h('label', { className: 'hermes-tp-limit' },
       h('input', {
         type: 'text', inputMode: 'decimal', size: 6, value, placeholder: current === 'limit' && own == null ? 'above budget' : 'e.g. 150',
-        disabled: !onLimit, 'aria-label': 'Limit, thousands of tokens per minute', 'aria-invalid': bad ? 'true' : undefined,
+        disabled: !onLimit || busy, 'aria-label': 'Limit, thousands of tokens per minute', 'aria-invalid': bad ? 'true' : undefined,
         onChange: (e) => setDraft(e.target.value),
         onKeyDown: (e) => { if (e.key === 'Enter') commit(); if (e.key === 'Escape') { setDraft(null); setPick(null); setBad(false) } }
       }), h('span', { className: 'hermes-tp-lbl' }, 'k/min'),
@@ -640,7 +644,7 @@ export function LimitControl({ throttle, onLimit }) {
 
 // Design C: three tiles (spending now, the limit, card slots), the controls (choice, field, raise) and one row per
 // subscription with a block per account.
-export function TokenTiles({ throttle, unit, onLimit, error, budget, pick, setPick, onBurst, onEndBurst, burstError, now = Date.now() / 1000 }) {
+export function TokenTiles({ throttle, unit, onLimit, busy = false, error, budget, pick, setPick, onBurst, onEndBurst, burstError, now = Date.now() / 1000 }) {
   if (!throttle) return null
   const t = tiles(throttle, unit)
   const tile = (key, label, big, of, note, extra = {}) => h('div', { key, className: 'hermes-tp-tile', 'data-tile': key, ...extra },
@@ -654,9 +658,9 @@ export function TokenTiles({ throttle, unit, onLimit, error, budget, pick, setPi
       tile('limit', t.limitLabel, t.limitBig, null, t.limitNote, { title: scope ? `${scope}\n${scopeTitle(throttle)}` : undefined }),
       t.slots ? tile('slots', 'Card slots', t.slots.big, t.slots.of, t.slots.note) : null),
     h('div', { className: 'hermes-tp-ctlrow' },
-      h(LimitControl, { key: t.choice, throttle, onLimit }),
+      h(LimitControl, { key: t.choice, throttle, onLimit, busy }),
       onBurst ? h(BurstControl, { throttle, budget, pick, setPick, onStart: onBurst, onEnd: onEndBurst, error: burstError, now }) : null),
-    error ? h('div', { className: 'hermes-tp-note', role: 'alert' }, `Limit not saved: ${error}`) : null,
+    error ? h('div', { className: 'hermes-tp-note', role: 'alert' }, error.startsWith('partly saved') ? `Limit ${error}` : `Limit not saved: ${error}`) : null,
     (throttle.pools || []).length ? h('div', { className: 'hermes-tp-accts', role: 'list', 'aria-label': 'Subscriptions' },
       throttle.pools.map((pool) => {
         const r = accountRow(pool, throttle, now)
@@ -672,7 +676,7 @@ export function TokenTiles({ throttle, unit, onLimit, error, budget, pick, setPi
 // `payload` is the selected range's data, or null while it loads / after it failed (`status` says which); the
 // previous range's data is never drawn under the new range's label. `frame` (the last good payload, any range)
 // only supplies the gateway list for the legend, so the controls stay usable meanwhile.
-export function Panel({ payload, frame = payload, status = null, modelPayload = null, modelFrame = null, modelStatus = null, modelFilter = { solo: null, hidden: [] }, setModelFilter, view, setView, filter, setFilter, onHoverRange, throttle = null, onLimit = null, throttleError = null, budget = null, burstPick = DEFAULT_BURST, setBurstPick = () => {}, onBurst = null, onEndBurst = null, burstError = null }) {
+export function Panel({ payload, frame = payload, status = null, modelPayload = null, modelFrame = null, modelStatus = null, modelFilter = { solo: null, hidden: [] }, setModelFilter, view, setView, filter, setFilter, onHoverRange, throttle = null, onLimit = null, limitBusy = false, throttleError = null, budget = null, burstPick = DEFAULT_BURST, setBurstPick = () => {}, onBurst = null, onEndBurst = null, burstError = null }) {
   const colors = useMemo(() => colorFor(frame.gateways), [frame.gateways])
   const gws = visibleGateways(frame.gateways, filter)
   const models = modelFrame?.models || []
@@ -690,7 +694,7 @@ export function Panel({ payload, frame = payload, status = null, modelPayload = 
         h(Seg, { label: 'Unit', value: view.unit, options: UNITS, onPick: set('unit'), render: (u) => '/' + u }),
         h(Seg, { label: 'Range', value: view.range, options: RANGES, onPick: set('range'), onHover: onHoverRange }),
         h(Seg, { label: 'Tokens', value: view.cache, options: [false, true], onPick: set('cache'), render: (c) => (c ? '+cache' : 'in+out') }))),
-    throttle ? h(TokenTiles, { throttle, unit: view.unit, onLimit, error: throttleError, budget, pick: burstPick, setPick: setBurstPick, onBurst, onEndBurst, burstError }) : null,
+    throttle ? h(TokenTiles, { throttle, unit: view.unit, onLimit, busy: limitBusy, error: throttleError, budget, pick: burstPick, setPick: setBurstPick, onBurst, onEndBurst, burstError }) : null,
     h('div', { className: 'hermes-tp-legend' },
       h('button', { type: 'button', 'data-gw': 'all', className: !filter.solo && !filter.hidden.length ? 'is-solo' : '', onClick: () => setFilter(legendClick(filter, 'all')) }, 'All gateways'),
       frame.gateways.map((g) => h('button', {
@@ -729,17 +733,18 @@ function useVisible() {
 
 // The chip's right-click menu: what limits spend (Budget, Limit… opens the panel, No limit) and a raise of the budget
 // (2× or 3× for an hour, or End while one runs). The same actions as the panel; nothing to show until the limit loads.
-export function ChipMenu({ throttle, onLimit, onBurst, onEndBurst, openPanel }) {
-  if (!throttle) return h(ContextMenuItem, { disabled: true }, 'Loading the limit…')
+export function ChipMenu({ throttle, failed = false, busy = false, error = null, onLimit, onBurst, onEndBurst, openPanel }) {
+  if (!throttle) return h(ContextMenuItem, { disabled: true, 'data-menu': 'loading' }, failed ? 'Limit unavailable' : 'Loading the limit\u2026')
   const choice = limitChoice(throttle)
   const now = Date.now() / 1000
   const burst = throttle.burst?.active ? throttle.burst : null
   const canRaise = throttle.mode === 'auto' && !pacingIsOff(throttle) && !!onBurst
   const own = typeof throttle.user_cap_per_s === 'number' ? ` (${fmt(throttle.user_cap_per_s * 60)}/min)` : ''
   return [
-    budgetOffered(throttle) ? h(ContextMenuCheckboxItem, { key: 'budget', checked: choice === 'budget', 'data-menu': 'budget', onSelect: () => choice !== 'budget' && onLimit?.('budget', null) }, 'Budget') : null,
+    error ? h(ContextMenuItem, { key: 'err', disabled: true, 'data-menu': 'error', className: 'hermes-tp-warn' }, `\u26a0 ${error}`) : null,
+    budgetOffered(throttle) ? h(ContextMenuCheckboxItem, { key: 'budget', disabled: busy, checked: choice === 'budget', 'data-menu': 'budget', onSelect: () => choice !== 'budget' && onLimit?.('budget', null) }, 'Budget') : null,
     h(ContextMenuCheckboxItem, { key: 'limit', checked: choice === 'limit', 'data-menu': 'limit', onSelect: openPanel }, `Limit${choice === 'limit' ? own : ''}…`),
-    h(ContextMenuCheckboxItem, { key: 'no_limit', checked: choice === 'no_limit', 'data-menu': 'no_limit', onSelect: () => choice !== 'no_limit' && onLimit?.('no_limit', null) }, 'No limit'),
+    h(ContextMenuCheckboxItem, { key: 'no_limit', disabled: busy, checked: choice === 'no_limit', 'data-menu': 'no_limit', onSelect: () => choice !== 'no_limit' && onLimit?.('no_limit', null) }, 'No limit'),
     burst || canRaise ? h(ContextMenuSeparator, { key: 'sep' }) : null,
     burst ? h(ContextMenuItem, { key: 'end', 'data-menu': 'end-raise', onSelect: () => onEndBurst?.() }, `End raise (${burstText(burst, now)})`) : null,
     !burst && canRaise ? h(ContextMenuItem, { key: 'r2', 'data-menu': 'raise-2', onSelect: () => onBurst({ factor: 2, hours: 1 }) }, 'Raise 2× for 1 h') : null,
@@ -805,20 +810,37 @@ export function Throughput({ ctx }) {
     client.setQueryData(['throughput', 'throttle'], b)
     return b
   }
+  const [limitBusy, setLimitBusy] = useState(false)
+  const busyRef = useRef(false)
   const onLimit = async (choice, capPerMin) => {
+    if (busyRef.current) return // one change at a time: a second click waits for the first to land
+    busyRef.current = true
+    setLimitBusy(true)
+    let done = []
     try {
-      let t = throttleQuery.data
-      const own = typeof t?.user_cap_per_s === 'number' || (t?.mode === 'manual' && typeof t?.cap_per_s === 'number') || (t?.percent ?? 0) >= 100
-      if (choice === 'limit') t = await putThrottle('/v1/throttle', { cap_per_min: capPerMin })
+      // Decide from the limit as it is now, not from a cached copy (the menu may open on an old one).
+      let t = (await throttleQuery.refetch()).data || throttleQuery.data
+      if (!t) throw Error('limit unavailable')
+      const own = typeof t.user_cap_per_s === 'number' || (t.mode === 'manual' && typeof t.cap_per_s === 'number') || (t.percent ?? 0) >= 100
+      const state = pacingState(t)
+      const budgetHere = budgetOffered(t) || state === 'on' || state === 'pending'
+      if (choice === 'limit') { t = await putThrottle('/v1/throttle', { cap_per_min: capPerMin }); done.push('limit set') }
       else {
-        if (own) t = await putThrottle('/v1/throttle', { cap_per_min: null })
+        if (own) { t = await putThrottle('/v1/throttle', { cap_per_min: null }); done.push('your cap cleared') }
         const off = pacingIsOff(t)
+        // Pacing is only switched where a budget exists: on a fleet without a publisher an Off would fake one.
         if (choice === 'budget' && off) t = await putThrottle('/v1/throttle/pacing', { on: true })
-        if (choice === 'no_limit' && !off) t = await putThrottle('/v1/throttle/pacing', { on: false })
+        if (choice === 'no_limit' && !off && budgetHere) t = await putThrottle('/v1/throttle/pacing', { on: false })
       }
       client.invalidateQueries({ queryKey: ['throughput', 'budget'] })
       setThrottleError(null)
-    } catch (e) { setThrottleError(String(e?.message || e).slice(0, 200)) }
+    } catch (e) {
+      const msg = String(e?.message || e).slice(0, 200)
+      setThrottleError(done.length ? `partly saved (${done.join(', ')}); the rest failed: ${msg}` : msg)
+    } finally {
+      busyRef.current = false
+      setLimitBusy(false)
+    }
   }
   const [burstPick, setBurstPick] = useState(DEFAULT_BURST)
   const [burstError, setBurstError] = useState(null)
@@ -888,12 +910,12 @@ export function Throughput({ ctx }) {
     h(ContextMenu, { onOpenChange: setMenuOpen },
       h(ContextMenuTrigger, { asChild: true }, h(PopoverTrigger, { asChild: true }, chip)),
       h(ContextMenuContent, { className: 'hermes-tp-menu', 'data-slot': 'throughput-menu' },
-        h(ChipMenu, { throttle: throttleQuery.data || null, onLimit, onBurst, onEndBurst, openPanel: () => setOpen(true) }))),
+        h(ChipMenu, { throttle: throttleQuery.data || null, failed: throttleQuery.isError && !throttleQuery.data, busy: limitBusy, error: throttleError || burstError, onLimit, onBurst, onEndBurst, openPanel: () => setOpen(true) }))),
     h(PopoverContent, {
       side: 'top', align: 'end', sticky: 'always', 'aria-label': 'Throughput', className: 'hermes-tp-popover',
       style: { width: 'min(680px, calc(100vw - 24px))', maxHeight: '80vh', overflowY: 'auto' }
     }, frame
-      ? h(Panel, { payload, frame, status, modelPayload, modelFrame: lastModel.current, modelStatus, modelFilter, setModelFilter, view, setView, filter, setFilter, onHoverRange: prefetch, throttle: throttleQuery.data || null, onLimit, throttleError, budget, burstPick, setBurstPick, onBurst, onEndBurst, burstError })
+      ? h(Panel, { payload, frame, status, modelPayload, modelFrame: lastModel.current, modelStatus, modelFilter, setModelFilter, view, setView, filter, setFilter, onHoverRange: prefetch, throttle: throttleQuery.data || null, onLimit, limitBusy, throttleError, budget, burstPick, setBurstPick, onBurst, onEndBurst, burstError })
       : h('div', { className: 'hermes-tp-note' }, query.error ? `Unavailable: ${String(query.error.message || query.error).slice(0, 200)}` : 'Loading\u2026')))
 }
 

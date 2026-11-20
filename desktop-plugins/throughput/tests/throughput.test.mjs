@@ -847,3 +847,77 @@ test('chip menu: right-click the chip for Budget / Limit… / No limit and a rai
     await ui.close()
   }
 })
+
+test('review fixes: no pacing switch without a publisher; one change at a time; budget starting; menu errors; small caps', async () => {
+  P.saveView(V())
+  // a fleet without a budget publisher: No limit clears the cap and never writes a pacing Off
+  const noPub = limitBackend(limitT(5, { pacing: { state: 'unavailable', publisher: null, budget_seen: false } }))
+  let ui = await mount(React.createElement(P.Throughput, { ctx: noPub.ctx }))
+  try {
+    await ui.click(button('Show throughput'))
+    await ui.flush()
+    assert.equal(tilesEl().querySelector('[data-choice="budget"]'), null)
+    assert.equal(tilesEl().querySelector('input[aria-label^="Limit"]').value, '0.3', 'a cap under 10k shows a decimal')
+    await ui.click(tilesEl().querySelector('[data-choice="no_limit"]'))
+    await ui.flush()
+    assert.deepEqual(noPub.puts(), [['/v1/throttle', { cap_per_min: null }]])
+  } finally {
+    await ui.close()
+  }
+  // one change at a time: a click while one saves is ignored, and the controls are disabled meanwhile
+  const slow = limitBackend(limitT(5))
+  let release
+  const gate = new Promise((r) => { release = r })
+  const rest = slow.ctx.rest
+  slow.ctx.rest = async (path, opts) => { if (opts?.method === 'PUT') await gate; return rest(path, opts) }
+  ui = await mount(React.createElement(P.Throughput, { ctx: slow.ctx }))
+  try {
+    await ui.click(button('Show throughput'))
+    await ui.flush()
+    await ui.click(tilesEl().querySelector('[data-choice="no_limit"]'))
+    assert.equal(tilesEl().querySelector('[data-choice="budget"]').disabled, true)
+    await ui.click(tilesEl().querySelector('[data-choice="budget"]'))
+    release()
+    await ui.flush()
+    await ui.flush()
+    assert.deepEqual(slow.puts(), [['/v1/throttle', { cap_per_min: null }], ['/v1/throttle/pacing', { on: false }]], 'the second click was not queued behind the first')
+  } finally {
+    await ui.close()
+  }
+  // the budget while it starts
+  const pending = P.tiles(throttle({ mode: 'manual', percent: 0, cap_per_s: null, user_cap_per_s: null, pacing: { state: 'pending', publisher: 'hub', budget_seen: true } }), 'm')
+  assert.deepEqual([pending.choice, pending.limitBig, pending.limitNote], ['budget', '…', 'budget starting (a few minutes)'])
+  const nobody = P.tiles(throttle({ mode: 'manual', percent: 0, cap_per_s: null, user_cap_per_s: null, pacing: { state: 'unavailable', publisher: null, budget_seen: true } }), 'm')
+  assert.equal(nobody.limitNote, 'no hub is publishing a budget')
+  // the menu: a failed limit read and an earlier error are shown in it
+  const failing = ctxWith((path) => { if (path === '/v1/throttle') throw Error('HTTP 404'); return forRange(path) })
+  ui = await mount(React.createElement(P.Throughput, { ctx: failing }))
+  try {
+    const chip = document.querySelector('[data-slot="throughput-chip"]')
+    await React.act(async () => chip.dispatchEvent(new window.MouseEvent('contextmenu', { bubbles: true, clientX: 5, clientY: 5 })))
+    await ui.flush()
+    await ui.flush()
+    assert.equal(document.querySelector('[data-slot="throughput-menu"] [data-menu="loading"]').textContent, 'Limit unavailable')
+  } finally {
+    await ui.close()
+  }
+  // a change that failed is shown in the menu the next time it opens
+  const be = limitBackend(budgetT())
+  be.state.fail = true
+  ui = await mount(React.createElement(P.Throughput, { ctx: be.ctx }))
+  try {
+    const open = async () => {
+      const chip = document.querySelector('[data-slot="throughput-chip"]')
+      await React.act(async () => chip.dispatchEvent(new window.MouseEvent('contextmenu', { bubbles: true, clientX: 5, clientY: 5 })))
+      await ui.flush()
+      await ui.flush()
+    }
+    await open()
+    await ui.click(document.querySelector('[data-slot="throughput-menu"] [data-menu="no_limit"]'))
+    await ui.flush()
+    await open()
+    assert.equal(document.querySelector('[data-slot="throughput-menu"] [data-menu="error"]').textContent, '⚠ HTTP 400')
+  } finally {
+    await ui.close()
+  }
+})
