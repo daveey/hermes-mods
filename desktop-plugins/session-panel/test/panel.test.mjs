@@ -84,7 +84,7 @@ test('blocked upstream is a distinct open bucket with precedence controls', () =
     card('stall', 'scheduled', { blockedUpstream, look: 'stalled' })
   ], { nowMs: NOW })
   assert.deepEqual(out.blockedUpstream.map(i => i.id), ['held'])
-  assert.equal(out.blockedUpstream[0].detail, 'waiting on blocked parent parent (triage)')
+  assert.equal(out.blockedUpstream[0].detail, 'waiting on blocked parent card parent (triage)')
   assert.deepEqual(out.queued.map(i => i.id), ['plain'])
   assert.deepEqual(out.unasked.map(i => i.id), ['ask'])
   assert.deepEqual(out.stuck.map(i => i.id), ['stall'])
@@ -116,7 +116,7 @@ test('panel renders pink unfilled upstream pip and its own section', async () =>
     assert.equal(pip.style.background, '')
     assert.equal(el().querySelector('[data-section="blocked-upstream"]').style.color, 'rgb(219, 97, 162)')
     assert.match(el().querySelector('[data-status-summary]').textContent, /1 blocked upstream/)
-    assert.match(el().textContent, /waiting on blocked parent parent \(blocked\)/)
+    assert.match(el().textContent, /waiting on blocked parent card parent \(blocked\)/)
   } finally { await show(null); host.state.focusedStoredSessionId.value = 'S1' }
 })
 
@@ -145,7 +145,7 @@ test('classify sorts cards, sub-agents and processes into sections', () => {
   assert.deepEqual(ids(out.queued), ['kb:t_todo'])
   assert.deepEqual(ids(out.unasked), ['kb:t_unasked'], 'a card an ask already covers is not listed twice')
   assert.match(out.stuck[0].detail, /^running, no progress since \d\d:\d\d \(2 h ago\) · last event: heartbeat$/)
-  assert.match(out.waiting[0].detail, /^waiting on a timer since \d\d:\d\d$/)
+  assert.match(out.waiting[0].detail, /^waiting on a timer for 5m$/)
   assert.match(out.waiting[1].detail, /unknown \(sdk projector unavailable\)/)
   assert.deepEqual(m.counts(out, { asks: 1, done: 4 }), { done: 4, running: 2, needsYou: 2, stuck: 2, blockedUpstream: 0, waiting: 3, ready: 0, queued: 1 },
     'sub-agents and processes count like the rows listed under each section')
@@ -707,6 +707,68 @@ test('panel: folded Waiting lists 3 one-liners then "+N more"; ready / plain tod
   assert.match(el().querySelector('[data-fold="Ready · 1"]').textContent, /Ready one.*ready · waiting for a worker to claim it · board status/)
   assert.match(el().querySelector('[data-fold="Not started · 1"]').textContent, /Todo one.*not started · board status/)
   assert.doesNotMatch(el().querySelector('[data-waiting-breakdown]').textContent, /other/)
+})
+
+test('panel: a wait on another card reads "Title" (t_x) and the title opens that card, folded and open', async () => {
+  window.localStorage.clear()
+  const b = bridges({ chips: [
+    card('t_aaaaaaaa', 'running', { label: 'Parent build', activityAt: Date.now() / 1000 - 30 }),
+    card('t_kid', 'scheduled', { look: 'waiting', waitingOn: 'card t_aaaaaaaa', label: 'Child' })
+  ] })
+  await show(React.createElement(m.Panel, { key: 'wait-link' }))
+  const line = el().querySelector('[data-folded-waiting] [data-waiting-line]')
+  assert.equal(line.textContent, 'Child · waiting on card "Parent build" (t_aaaaaaaa)')
+  await React.act(async () => { line.querySelector('[data-wait-card="t_aaaaaaaa"]').click() })
+  assert.deepEqual(b.opened, ['t_aaaaaaaa'])
+  await React.act(async () => el().querySelector('[data-waiting-toggle]').click())
+  const detail = el().querySelector('[data-panel-row="kb:t_kid"] [data-row-detail]')
+  assert.equal(detail.textContent, 'waiting on card "Parent build" (t_aaaaaaaa)')
+  await React.act(async () => { detail.querySelector('[data-wait-card]').click() })
+  assert.deepEqual(b.opened, ['t_aaaaaaaa', 't_aaaaaaaa'])
+})
+
+test('panel: a stuck card\'s stalled wait links its card too', async () => {
+  window.localStorage.clear()
+  const b = bridges({ chips: [
+    card('t_bbbbbbbb', 'running', { label: 'Producer', activityAt: Date.now() / 1000 - 30 }),
+    card('t_st', 'scheduled', { look: 'stalled', waitingOn: 'card t_bbbbbbbb', label: 'Stalled one' })
+  ] })
+  await show(React.createElement(m.Panel, { key: 'stuck-link' }))
+  const link = el().querySelector('[data-wait-card="t_bbbbbbbb"]')
+  assert.equal(link.textContent, '"Producer" (t_bbbbbbbb)')
+  await React.act(async () => { link.click() })
+  assert.deepEqual(b.opened, ['t_bbbbbbbb'])
+})
+
+test('panel: a well-overdue clock wake is flagged in the waiting line', async () => {
+  window.localStorage.clear()
+  const now = Date.now() / 1000, due = new Date((now - 3 * 3600) * 1000)
+  const utc = `${due.toISOString().slice(0, 10)} ${due.toISOString().slice(11, 16)} UTC`
+  bridges({ chips: [card('t_late', 'scheduled', { look: 'waiting', waitingOn: `the clock until ${utc}`, waitingSince: now - 86_400, label: 'Late one' })] })
+  await show(React.createElement(m.Panel, { key: 'overdue' }))
+  const flag = el().querySelector('[data-folded-waiting] [data-overdue]')
+  assert.match(flag.textContent, /^⚠ overdue by 3h( 1m)?/)
+  assert.match(el().querySelector('[data-folded-waiting]').textContent, /^Late one · waiting 1d · ⚠ overdue by 3h( 1m)? \(was due \d{4}-\d\d-\d\d \d\d:\d\d P[SD]T\)$/)
+})
+
+test('panel: collapsed, the waiting line\'s card link opens that card; a retired ask with a real id stays plain text', async () => {
+  window.localStorage.clear()
+  const b = bridges({ asked: () => true, chips: [
+    card('t_cccccccc', 'running', { label: 'Upstream', activityAt: Date.now() / 1000 - 30 }),
+    card('t_kid2', 'scheduled', { look: 'waiting', waitingOn: 'card t_cccccccc', label: 'Kid' }),
+    card('t_0123abcd', 'blocked', { look: 'needs-you', label: 'Retired ask' })
+  ] })
+  window.__userSteps.presentationForSource = s => (s.id === 't_0123abcd' ? { representedInQueue: false, dismissed: true } : null)
+  await show(React.createElement(m.Panel, { key: 'collapsed-link' }))
+  // The full status row of a retired ask: its own id is not turned into a link to itself.
+  assert.equal(el().querySelector('[data-card-status] [data-wait-card]'), null)
+  assert.match(el().querySelector('[data-card-status]').textContent, /t_0123abcd · blocked · request dismissed/)
+  await React.act(async () => el().querySelector('[data-panel-toggle]').click())
+  const line = el().querySelector('[data-collapsed-waiting] [data-waiting-line="kb:t_kid2"]')
+  assert.equal(line.textContent, 'Kid · waiting on card "Upstream" (t_cccccccc)')
+  await React.act(async () => { line.querySelector('[data-wait-card]').click() })
+  assert.deepEqual(b.opened, ['t_cccccccc'])
+  assert.equal(el().querySelector('[data-collapsed-waiting] [data-waiting-line="kb:t_0123abcd"] [data-wait-card]'), null)
 })
 
 // [daveey] Switching chats shows the panel at once: last-known data paints first, reads replace it.

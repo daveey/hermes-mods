@@ -34,7 +34,7 @@ import { useEffect, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'session-panel'
-const VERSION = 'session-panel-v8-wait-reasons'
+const VERSION = 'session-panel-v9-readable-waits'
 export const STUCK_CARD_S = 2 * 3600 // running card with no event this long
 export const STUCK_SUB_MS = 30 * 60_000 // sub-agent with no new tool call this long
 const DONE_POLL_MS = 30_000
@@ -284,7 +284,7 @@ export function classify(chips, { nowMs = Date.now(), silence = new Map(), isAsk
     // claimed a minute ago read "no progress since <a week ago>" (kanban-f241d1f60b).
     const progress = Number(c.activityAt) || Number(c.progressAt) || 0
     const last = progress || Number(c.since) || 0
-    const on = c.waitingOn ? `waiting on ${c.waitingOn}${c.waitingSince ? ` since ${clock(c.waitingSince, nowMs)}` : ''}` : ''
+    const on = waitPhrase(c, nowMs)
     // A stale chip is session-tasks' last-known copy after a failed read: the card may have been answered,
     // re-blocked or archived since, so it is never stuck (no nudge) or needs-you, only "status unknown".
     if (c.stale) { out.waiting.push({ ...item(c), detail: `status unknown · last known: ${c.look === 'needs-you' ? 'needs you' : c.state || 'unknown'}${last ? ` (${ago(last, nowMs)})` : ''}; the card could not be re-read` }); continue }
@@ -321,8 +321,8 @@ export function classify(chips, { nowMs = Date.now(), silence = new Map(), isAsk
     if (c.blockedUpstream && c.look !== 'stalled') {
       const bu = c.blockedUpstream, auth = bu.contained?.authority
       const detail = bu.contained
-        ? `waiting on contained card ${bu.id} · release by ${auth?.id || 'unknown'} (${auth?.status || 'unknown'})`
-        : `waiting on blocked parent ${bu.id} (${bu.status})`
+        ? `waiting on contained card ${bu.id} · release by ${auth?.id ? `card ${auth.id}` : 'unknown'} (${auth?.status || 'unknown'})`
+        : `waiting on blocked parent card ${bu.id} (${bu.status})`
       out.blockedUpstream.push({ ...item(c), detail })
       continue
     }
@@ -331,7 +331,8 @@ export function classify(chips, { nowMs = Date.now(), silence = new Map(), isAsk
     // Keep the independent execution verdict below (including unknown progress); never
     // turn a recent list read into a heartbeat or claim a running worker is alive.
     const board = c.boardStatus
-    const leaf = c.upstream?.id ? ` → ${c.upstream.id} ${c.upstream.status || 'unknown'}` : ''
+    // The upstream leaf only when the wait text does not already name that card.
+    const leaf = c.upstream?.id && !new RegExp(`\\b${String(c.upstream.id).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).test(on) ? ` → ${c.upstream.id} ${c.upstream.status || 'unknown'}` : ''
     // A stalled agent-owned wait is the board's own verdict (`wait.wait_state`), not execution evidence: it is Stuck
     // whatever the run evidence says (a fresh parked read used to take it to Waiting first, so it never showed).
     if (c.look === 'stalled') { out.stuck.push({ ...item(c), reason: 'stalled', detail: `stalled: ${on || 'agent-owned wait over 2 h'}` }); continue }
@@ -362,6 +363,159 @@ export function classify(chips, { nowMs = Date.now(), silence = new Map(), isAsk
     out.waiting.push({ ...item(c), detail: (on || (c.state === 'scheduled' ? 'scheduled' : c.state === 'unknown' ? 'status unknown' : c.state)) + leaf })
   }
   return out
+}
+
+// ── wait wording ───────────────────────────────────────────────────────────
+// [daveey 2026-11-20] "waiting on card "Title Of Card" (t_xxx)", click to open; "waiting for 10m (until
+// 2026-11-23 00:00 PST)", always Pacific time. Durations are short (10m, 3h 20m, 2d 4h).
+export function shortDur(sec) {
+  const s = Math.max(0, Math.floor(Number(sec) || 0))
+  if (s < 60) return `${s}s`
+  const m = Math.floor(s / 60), h = Math.floor(m / 60), d = Math.floor(h / 24)
+  if (d) return h % 24 ? `${d}d ${h % 24}h` : `${d}d`
+  if (h) return m % 60 ? `${h}h ${m % 60}m` : `${h}h`
+  return `${m}m`
+}
+
+const PT = typeof Intl !== 'undefined' ? new Intl.DateTimeFormat('en-US', { timeZone: 'America/Los_Angeles', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23', timeZoneName: 'short' }) : null
+/** `2026-11-23 00:00 PST` (Pacific wall clock; PDT during daylight time). */
+export function pacific(sec) {
+  if (!PT || !Number.isFinite(Number(sec))) return ''
+  const p = Object.fromEntries(PT.formatToParts(new Date(Number(sec) * 1000)).map(x => [x.type, x.value]))
+  return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute} ${p.timeZoneName}`
+}
+
+/** A wake this late is flagged: past dispatcher latency, something that should have woken it did not. */
+export const OVERDUE_FLAG_S = 30 * 60
+
+/** A card's published wait in plain words: how long it has waited, how long is left, and how late it is.
+ *  Core's clock wait ("the clock until 2026-11-23 08:00 UTC (why)") reads
+ *  `waiting 2h · 8h 10m left (until 2026-11-23 00:00 PST)`, past due `waiting 1d 2h · overdue by 5m (was due …)`,
+ *  and from OVERDUE_FLAG_S late `waiting 1d 2h · ⚠ overdue by 3h (was due …)`; any other wait
+ *  `waiting on <what> for 10m`. '' = none. */
+export function waitPhrase(c, nowMs = Date.now()) {
+  const w = str(c?.waitingOn).trim()
+  if (!w) return ''
+  const now = nowMs / 1000, since = Number(c?.waitingSince)
+  const waited = since > 0 && since <= now ? `waiting ${shortDur(now - since)} · ` : ''
+  const m = /^the clock until (\d{4}-\d\d-\d\d) (\d\d:\d\d) UTC\b/.exec(w)
+  if (m) {
+    const at = Date.parse(`${m[1]}T${m[2]}:00Z`) / 1000
+    if (Number.isFinite(at)) {
+      if (at >= now) return `${waited}${shortDur(at - now)} left (until ${pacific(at)})`
+      return `${waited}${now - at >= OVERDUE_FLAG_S ? '⚠ ' : ''}overdue by ${shortDur(now - at)} (was due ${pacific(at)})`
+    }
+  }
+  return `waiting on ${w}${since > 0 ? ` for ${shortDur(now - since)}` : ''}`
+}
+
+// Card titles for ids named in wait text: this chat's own cards first, else one read of the card on the waiting
+// card's owner route, or the chat's own route when the card has none (a replica row of another gateway: that
+// gateway's board replica answers the read). The waiting card's board first, then `default` (a wait may name a
+// card on another board). Cached per route; a failed read is retried after TITLE_RETRY_MS. Resolved titles
+// re-render the panel.
+const TITLE_RETRY_MS = 5 * 60_000
+const TITLE_PENDING_MS = 30_000 // a read that never answered (bridge ignored its timeout) may be retried
+const TITLE_FRESH_MS = 30 * 60_000 // a fetched title is re-read after this (cards get renamed)
+const TITLE_MAX = 500
+const titles = new Map()
+const titleSubs = new Set()
+/** Where a card named in `chip`'s wait text is read and opened: the chip's owner route, else the chat's. */
+export function refRoute(chip, fallback = () => panelRoute()) {
+  if (chip?.connectionId) return { connectionId: chip.connectionId, profile: str(chip.profile) || 'default', board: str(chip.board) || 'default' }
+  const r = (() => { try { return fallback() } catch { return null } })()
+  return { connectionId: r?.connectionId || null, profile: str(r?.profile) || str(chip?.profile) || 'default', board: str(chip?.board) || 'default' }
+}
+const titleKey = (r, id) => [str(r.connectionId), r.profile, id].join('|')
+export function noteTitles(chips) {
+  for (const c of chips || []) {
+    if (c?.kind !== 'kanban' || !c.id || !c.connectionId || !str(c.label) || c.label === c.id) continue
+    const k = titleKey(refRoute(c), c.id)
+    titles.delete(k) // re-insert: Map order is recency, so eviction drops the least recently seen
+    titles.set(k, { title: str(c.label), board: str(c.board) || 'default', at: Date.now() })
+  }
+  while (titles.size > TITLE_MAX) titles.delete(titles.keys().next().value)
+}
+export const subscribeTitles = fn => (titleSubs.add(fn), () => titleSubs.delete(fn))
+/** One title read: `{ title, board }`, title '' when no board on that route has the card. */
+async function readTitle(route, id) {
+  const bridge = typeof window !== 'undefined' ? window.hermesDesktop?.api : null
+  if (!bridge || !route.connectionId) return { title: '', board: route.board }
+  for (const board of [...new Set([route.board, 'default'])]) {
+    try {
+      const r = await bridge({ path: `/api/plugins/kanban/tasks/${encodeURIComponent(id)}?board=${encodeURIComponent(board)}`, connectionId: route.connectionId, profile: route.profile, timeoutMs: 8_000 })
+      if (str(r?.task?.title)) return { title: str(r.task.title), board }
+    } catch {}
+  }
+  return { title: '', board: route.board }
+}
+/** `{ title, board }` for card `id` named by `chip`; '' title until (or unless) a read answers. */
+export function cardRef(chip, id, nowMs = Date.now(), read = readTitle, fallback) {
+  const route = refRoute(chip, fallback)
+  if (!route.connectionId) return { route, title: '', board: route.board }
+  const k = titleKey(route, id), hit = titles.get(k)
+  const age = hit ? nowMs - hit.at : Infinity
+  if (hit && (hit.pending ? age < TITLE_PENDING_MS : age < (hit.title ? TITLE_FRESH_MS : TITLE_RETRY_MS))) return { route, title: hit.title, board: hit.board || route.board }
+  if (titles.size >= TITLE_MAX) titles.delete(titles.keys().next().value)
+  titles.set(k, { title: hit?.title || '', board: hit?.board || route.board, at: nowMs, pending: true })
+  Promise.resolve(read(route, id)).catch(() => ({ title: '' })).then(r => {
+    const title = str(r?.title) || hit?.title || ''
+    titles.set(k, { title, board: str(r?.board) || hit?.board || route.board, at: Date.now() })
+    if (str(r?.title) && r.title !== hit?.title) titleSubs.forEach(fn => fn())
+  })
+  return { route, title: hit?.title || '', board: hit?.board || route.board }
+}
+
+const CARD_ID = /\bt_[0-9a-f]{6,}\b/g
+/** Wait text split into plain text and card references (`{ id, title, linkable, open }`, `open` = the qualified
+ *  card to open). Without any route (no owner, no chat route) a reference keeps its bare id, unlinked. */
+export function waitSegments(text, chip, nowMs = Date.now(), read = readTitle, fallback) {
+  const t = str(text), out = []
+  let last = 0
+  for (const m of t.matchAll(CARD_ID)) {
+    if (m.index > last) out.push({ text: t.slice(last, m.index) })
+    const ref = cardRef(chip, m[0], nowMs, read, fallback)
+    let end = m.index + m[0].length
+    // A status right after the id ("t_x (running)") joins the id's own parens: `"T" (t_x, running)`.
+    const st = /^ \((triage|todo|ready|running|review|blocked|scheduled|done|archived|cancelled|status unknown|unknown)\)/.exec(t.slice(end))
+    if (st) end += st[0].length
+    // A card on another gateway ("t_x on worker-a1") or a replica row (no owner connection) is not on a route this
+    // Desktop can open it from, as session-tasks also leaves such cards unclickable: titled, not linked.
+    const gw = /^ on ([\w.-]+)/.exec(t.slice(end))?.[1]
+    const own = [str(chip?.gateway), str(chip?.gatewayId)].filter(g => g && g !== 'local')
+    // A local card (gateway '' / 'local') cannot tell its own name from another's: only a known, different name is foreign.
+    const foreign = !!gw && own.length > 0 && !['its', 'the', 'hub-sync', ...own].includes(gw)
+    const linkable = !!chip?.connectionId && !foreign
+    out.push({ id: m[0], title: ref.title, status: st ? st[1] : '', linkable, open: linkable ? { kind: 'kanban', id: m[0], board: ref.board, connectionId: ref.route.connectionId, profile: ref.route.profile } : null })
+    last = end
+  }
+  if (last < t.length) out.push({ text: t.slice(last) })
+  return out
+}
+/** The same text with known titles filled in: `card "Title" (t_x)`. Tooltips use this form. */
+const refText = s => (s.title ? `"${s.title}" (${s.id}${s.status ? `, ${s.status}` : ''})` : `${s.id}${s.status ? ` (${s.status})` : ''}`)
+export const waitLabel = (text, chip, nowMs, read, fallback) => waitSegments(text, chip, nowMs, read, fallback).map(s => (s.id ? refText(s) : s.text)).join('')
+
+const linkBtn = { padding: 0, border: 0, background: 'transparent', color: 'inherit', font: 'inherit', textDecoration: 'underline', textUnderlineOffset: 2, cursor: 'pointer' }
+const OVERDUE_TEXT = /(⚠ overdue by [^(·]+)/
+/** A flagged overdue wake stands out (amber, bold); everything else stays muted. */
+function overdueSpans(text, idx) {
+  if (!OVERDUE_TEXT.test(text)) return text
+  return text.split(OVERDUE_TEXT).map((part, j) => (OVERDUE_TEXT.test(part)
+    ? jsx('span', { 'data-overdue': '', style: { color: C.stuck, fontWeight: 600 }, children: part.trimEnd() + ' ' }, `o${idx}:${j}`)
+    : part))
+}
+function WaitText({ text, chip, plain }) {
+  if (plain || chip?.kind !== 'kanban') return text
+  const st = typeof window !== 'undefined' ? window.__sessionTasks : null
+  return waitSegments(text, chip).map((s, idx) => {
+    if (!s.id) return overdueSpans(s.text, idx)
+    const label = refText(s)
+    if (!s.linkable || typeof st?.openTaskChip !== 'function') return label
+    return jsx('button', { type: 'button', 'data-wait-card': s.id, title: `Open card ${s.id}`, style: linkBtn,
+      onClick: e => { e.stopPropagation(); st.openTaskChip(s.open) },
+      children: label }, `${s.id}:${idx}`)
+  })
 }
 
 /** What a parked card (fresh board status, no run) waits on, in plain words. `on` is its published wait
@@ -718,7 +872,7 @@ function Row({ i, k }) {
     jsx('span', { 'aria-hidden': true, 'data-row-pip': k, ...(hub ? { 'data-row-pip-hub': '' } : {}), style: { ...pipStyle(k, hub), justifySelf: 'center', marginTop: hub ? 3.5 : 5 }, children: hub ? 'H' : undefined }),
     jsxs('div', { style: { minWidth: 0 }, children: [
       jsx('div', { title: str(i.chip?.title) || i.label, style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, children: i.label }),
-      i.detail && jsx('div', { style: { ...muted, overflowWrap: 'anywhere' }, children: i.detail }),
+      i.detail && jsx('div', { 'data-row-detail': '', style: { ...muted, overflowWrap: 'anywhere' }, children: jsx(WaitText, { text: i.detail, chip: i.chip }) }),
       i.evidenceText && jsx('div', { 'data-evidence': i.evidenceState || '', style: { ...muted, fontSize: 11, overflowWrap: 'anywhere' }, children: `evidence: ${i.evidenceText}` })
     ] })
   ] })
@@ -819,7 +973,7 @@ function CardStatusRow({ i }) {
   const canOpen = !!i.chip.connectionId && !!i.chip.profile && typeof st?.openTaskChip === 'function'
   const request = i.chip.humanRequest
   return jsxs('div', { 'data-card-status': i.key, style: { padding: '6px 0', overflowWrap: 'anywhere', fontSize: 13 }, children: [
-    jsx('div', { children: i.detail }),
+    jsx('div', { children: jsx(WaitText, { text: i.detail, chip: i.chip, plain: true }) }),
     jsx('div', { style: muted, children: `Previous request (reference only): ${str(request?.action) || 'Not available.'}` }),
     request?.why && jsx('div', { style: muted, children: str(request.why) }),
     jsx('div', { style: muted, children: 'The owner card still reports blocked; this does not reopen its decision.' }),
@@ -853,7 +1007,7 @@ function StuckCard({ i, session, now }) {
   const nudge = () => { void host.composer?.setDraft?.(session, nudgeText(i, now)); host.composer?.focus?.(session) }
   return jsxs('div', { 'data-stuck': i.key, style: { border: `1px solid color-mix(in srgb, ${C.stuck} 45%, transparent)`, borderRadius: 6, padding: '8px 10px', marginBottom: 6 }, children: [
     jsx('div', { style: { fontWeight: 600, fontSize: 13, overflowWrap: 'anywhere' }, children: i.label }),
-    jsx('div', { style: { ...muted, marginBottom: 4, overflowWrap: 'anywhere' }, children: i.detail }),
+    jsx('div', { style: { ...muted, marginBottom: 4, overflowWrap: 'anywhere' }, children: jsx(WaitText, { text: i.detail, chip: i.chip }) }),
     i.evidenceText && jsx('div', { 'data-evidence': i.evidenceState || '', style: { ...muted, fontSize: 11, marginBottom: 4, overflowWrap: 'anywhere' }, children: `evidence: ${i.evidenceText}` }),
     jsx('ol', { 'data-unblock-steps': '', style: { margin: '0 0 8px', paddingLeft: 18, fontSize: 12.5, lineHeight: 1.5 }, children: unblockSteps(i, now).map((s, n) => jsx('li', { children: s }, n)) }),
     jsxs('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 6 }, children: [
@@ -892,7 +1046,8 @@ export function Panel() {
     const offTasks = typeof st?.subscribe === 'function' ? st.subscribe(setTasks) : null
     const offAsks = typeof US?.subscribe === 'function' ? US.subscribe(() => setTick(t => t + 1)) : null
     const offDone = subscribeDone(setDone)
-    return () => { offTasks?.(); offAsks?.(); offDone() }
+    const offTitles = subscribeTitles(() => setTick(t => t + 1))
+    return () => { offTasks?.(); offAsks?.(); offDone(); offTitles() }
   }, [])
   // Kick every source on a switch: user-steps' queue and strip mount only once the panel shows, so a chat whose
   // only open work is an ask used to wait for user-steps' 8 s poll before its panel appeared at all.
@@ -907,6 +1062,7 @@ export function Panel() {
   // already-painted cards until session-tasks' next round (seconds after a switch).
   const chips = tasks && tasks.stored === stored ? tasks.chips || [] : []
   const silence = trackSubagents(chips, now, subMemory)
+  noteTitles(chips)
   const isAsked = c => !!US?.requestForSource?.({ gatewayId: c.gatewayId || c.gateway, profile: c.profile, type: 'kanban', board: c.board, id: c.id })
   const presentationFor = c => US?.presentationForSource?.({ gatewayId: c.gatewayId || c.gateway, profile: c.profile, type: 'kanban', board: c.board, id: c.id })
   const sorted = classify(chips, { nowMs: now, silence, isAsked, presentationFor, evidence: c => (c.kind === 'kanban' ? chipObservation(c, now / 1000) : null) })
@@ -989,7 +1145,7 @@ export function Panel() {
     ] }) }),
     // Collapsed, a bare "2 waiting" left the user asking "on what?": keep one short line per waiting card.
     collapsed && waitLines.length > 0 && jsxs('div', { 'data-collapsed-waiting': '', style: { ...muted, padding: '0 8px 0 30px', minWidth: 0 }, children: [
-      ...waitLines.map(i => jsx('div', { 'data-waiting-line': i.key, title: `${str(i.chip?.title) || i.label}${i.detail ? `\n${i.detail}` : ''}`, style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, children: `${i.label} · ${i.detail || 'waiting'}` }, i.key)),
+      ...waitLines.map(i => jsx('div', { 'data-waiting-line': i.key, title: `${str(i.chip?.title) || i.label}${i.detail ? `\n${i.cardStatus ? i.detail : waitLabel(i.detail, i.chip)}` : ''}`, style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, children: [`${i.label} · `, i.detail ? jsx(WaitText, { text: i.detail, chip: i.chip, plain: i.cardStatus }, 'w') : 'waiting'] }, i.key)),
       waitMore > 0 && jsx('div', { children: `+${waitMore} more waiting` }, 'more')
     ] }),
     !collapsed && jsxs('div', { 'data-panel-body': '', className: 'status-section-body', style: { maxHeight: '55vh', overflowY: 'auto', minWidth: 0, padding: '0 10px 0 12px' }, children: [
@@ -1011,7 +1167,7 @@ export function Panel() {
       // Folded, the counts alone ("1 other") left the user asking "on what?": name up to 3 cards and what each
       // waits on, one line each, as the collapsed panel does. Opening the fold shows the full rows.
       !waitingOpen && foldLines.length > 0 && jsxs('div', { 'data-folded-waiting': '', style: { ...muted, padding: '0 0 4px 18px', minWidth: 0 }, children: [
-        ...foldLines.map(i => jsx('div', { 'data-waiting-line': i.key, title: `${str(i.chip?.title) || i.label}${i.detail ? `\n${i.detail}` : ''}`, style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, children: `${i.label} · ${i.detail || 'waiting'}` }, i.key)),
+        ...foldLines.map(i => jsx('div', { 'data-waiting-line': i.key, title: `${str(i.chip?.title) || i.label}${i.detail ? `\n${i.cardStatus ? i.detail : waitLabel(i.detail, i.chip)}` : ''}`, style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, children: [`${i.label} · `, i.detail ? jsx(WaitText, { text: i.detail, chip: i.chip, plain: i.cardStatus }, 'w') : 'waiting'] }, i.key)),
         foldMore > 0 && jsx('div', { children: `+${foldMore} more waiting` }, 'more')
       ] }),
       // A still-blocked owner whose ask was retired has no other surface: its status row is never folded away.

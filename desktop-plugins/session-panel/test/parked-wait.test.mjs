@@ -19,9 +19,10 @@ const tasks = await import('../../session-tasks/plugin.js')
 // The hub's projection as the live sweep saw it: a parked card's only record is a kanban.card one whose
 // execution state is unknown (no run). Evidence is that unknown verdict, as the panel computes it.
 const unknownEv = () => ({ state: 'unknown', sourced: true, reason: 'missing_qualified_identity' })
-const parked = (rows, opts = {}) => {
+const parked = (rows, opts = {}, nowMs = Date.parse('2026-11-20T12:00:00Z')) => {
   const chips = tasks.sessionTaskChips(rows.map(r => ({ board: 'default', ...r })), { connectionId: 'C1', profile: 'default' })
-  return m.classify(chips, { nowMs: Date.now(), evidence: unknownEv, ...opts })
+  for (const c of chips) if (c.boardStatus) c.boardStatus.readAt = nowMs // a fixed clock: wake times never age into the past
+  return m.classify(chips, { nowMs, evidence: unknownEv, ...opts })
 }
 const waitFor = (status, extra = {}) => ({ id: `t_${status}`, title: `${status} card`, status, ...extra })
 
@@ -66,7 +67,7 @@ test('each parked state leads with what it waits on, never a bare state name', (
   assert.equal(m.waitBreakdown([{ kind: 'kanban', detail: 'x', chip: { state: 'constructor' } }]).text, '1 constructor')
   // A published wait is said as published, with its upstream leaf.
   const timed = parked([waitFor('scheduled', { wait: { wait_state: 'waiting', waiting_on: 'the clock until 2026-11-23 00:00 UTC' } })])
-  assert.match(timed.waiting[0].detail, /^waiting on the clock until 2026-11-23 00:00 UTC · board status$/)
+  assert.equal(timed.waiting[0].detail, '2d 12h left (until 2026-11-22 16:00 PST) · board status')
 })
 
 test('a replica board read is labelled reported, after the reason', () => {
@@ -103,4 +104,80 @@ test('a stalled parked card is Stuck even with a fresh board read and unknown ru
   assert.equal(out.waiting.length, 0)
   assert.equal(out.stuck.length, 1)
   assert.match(out.stuck[0].detail, /^stalled: waiting on ci run 42/)
+})
+
+test('readable waits: how long it has waited, how long is left, how late, and a flag when well overdue', () => {
+  const NOW = Date.parse('2026-11-22T23:50:00Z')
+  const c = (w, waitedS = 600) => ({ waitingOn: w, waitingSince: NOW / 1000 - waitedS })
+  assert.equal(m.waitPhrase(c('the clock until 2026-11-23 08:00 UTC'), NOW), 'waiting 10m · 8h 10m left (until 2026-11-23 00:00 PST)')
+  assert.equal(m.waitPhrase(c('the clock until 2026-11-23 08:00 UTC (Explicitly requested two-day window)', 2 * 86_400), NOW), 'waiting 2d · 8h 10m left (until 2026-11-23 00:00 PST)')
+  assert.equal(m.waitPhrase(c('the clock until 2026-11-22 23:40 UTC', 3600), NOW), 'waiting 1h · overdue by 10m (was due 2026-11-22 15:40 PST)')
+  assert.equal(m.waitPhrase(c('the clock until 2026-11-22 23:21 UTC', 3600), NOW), 'waiting 1h · overdue by 29m (was due 2026-11-22 15:21 PST)', 'under 30 min: not flagged')
+  assert.equal(m.waitPhrase(c('the clock until 2026-11-22 23:20 UTC', 3600), NOW), 'waiting 1h · ⚠ overdue by 30m (was due 2026-11-22 15:20 PST)', 'from 30 min: flagged')
+  assert.equal(m.waitPhrase(c('the clock until 2026-11-22 20:50 UTC', 86_400), NOW), 'waiting 1d · ⚠ overdue by 3h (was due 2026-11-22 12:50 PST)')
+  assert.equal(m.waitPhrase({ waitingOn: 'the clock until 2026-11-23 08:00 UTC' }, NOW), '8h 10m left (until 2026-11-23 00:00 PST)', 'no start time: no waited part')
+  assert.equal(m.waitPhrase(c('ci run 42'), NOW), 'waiting on ci run 42 for 10m')
+  assert.equal(m.waitPhrase({ waitingOn: 'ci run 42' }, NOW), 'waiting on ci run 42')
+  assert.equal(m.waitPhrase({}, NOW), '')
+  assert.equal(m.pacific(Date.parse('2026-07-01T07:00:00Z') / 1000), '2026-07-01 00:00 PDT', 'Pacific wall clock in daylight time')
+  for (const [s, x] of [[5, '5s'], [600, '10m'], [3600, '1h'], [12_000, '3h 20m'], [86_400 * 2 + 3600 * 4, '2d 4h'], [86_400, '1d']]) assert.equal(m.shortDur(s), x)
+})
+
+test('card references read "Title" (t_x): this chat\'s cards, else a read on the owner (or chat) route, board then default', async () => {
+  const chip = { kind: 'kanban', id: 't_child', connectionId: 'C9', profile: 'default', board: 'ops' }
+  m.noteTitles([{ kind: 'kanban', id: 't_aaaaaaaa', label: 'Sibling card', connectionId: 'C9', profile: 'default', board: 'default' }])
+  assert.equal(m.waitLabel('waiting on card t_aaaaaaaa for 1m', chip), 'waiting on card "Sibling card" (t_aaaaaaaa) for 1m')
+  const reads = []
+  const read = (r, id) => { reads.push([r.connectionId, r.profile, r.board, id]); return Promise.resolve(id === 't_bbbbbbbb' ? { title: 'Fetched title', board: 'default' } : { title: '' }) }
+  assert.equal(m.waitLabel('waiting on card t_bbbbbbbb', chip, Date.now(), read), 'waiting on card t_bbbbbbbb', 'first paint: id only')
+  await new Promise(r => setTimeout(r, 0))
+  const seg = m.waitSegments('waiting on card t_bbbbbbbb', chip, Date.now(), read).find(s => s.id)
+  assert.equal(seg.title, 'Fetched title')
+  assert.deepEqual(seg.open, { kind: 'kanban', id: 't_bbbbbbbb', board: 'default', connectionId: 'C9', profile: 'default' }, 'opens on the board that answered')
+  assert.deepEqual(reads, [['C9', 'default', 'ops', 't_bbbbbbbb']], 'one read, cached')
+  // A failed read is retried only after the retry window.
+  m.waitLabel('card t_cccccccc', chip, Date.now(), read); await new Promise(r => setTimeout(r, 0))
+  m.waitLabel('card t_cccccccc', chip, Date.now(), read)
+  assert.equal(reads.filter(r => r[3] === 't_cccccccc').length, 1)
+  m.waitLabel('card t_cccccccc', chip, Date.now() + 5 * 60_000 + 1, read)
+  assert.equal(reads.filter(r => r[3] === 't_cccccccc').length, 2)
+  // A replica row of another gateway (no owner connection) reads and opens through the chat's route.
+  const remote = { kind: 'kanban', id: 't_r', connectionId: null, profile: 'default', board: 'default', gateway: 'worker-a1' }
+  const viaChat = m.waitSegments('waiting on card t_dddddddd', remote, Date.now(), read, () => ({ connectionId: 'CHAT', profile: 'work' })).find(s => s.id)
+  assert.equal(viaChat.linkable, false, 'a replica row is titled through the chat route but not linked (no owner route)')
+  assert.deepEqual(reads.at(-1), ['CHAT', 'work', 'default', 't_dddddddd'])
+  // No route at all: bare id, not linked, no read.
+  const none = m.waitSegments('card t_eeeeeeee', remote, Date.now(), read, () => null).find(s => s.id)
+  assert.deepEqual([none.linkable, none.open], [false, null])
+  assert.equal(reads.filter(r => r[3] === 't_eeeeeeee').length, 0)
+})
+
+test('the real title read: owner route, the waiting card\'s board first, then default; status joins the parens', async () => {
+  const calls = []
+  globalThis.window = { hermesDesktop: { api: async a => { calls.push(a); if (a.path.includes('board=ops')) throw new Error('404: not found'); return { task: { title: 'Lives on default' } } } } }
+  try {
+    const chip = { kind: 'kanban', id: 't_k', connectionId: 'C7', profile: 'work', board: 'ops', gateway: 'G7' }
+    assert.equal(m.waitLabel('waiting on card t_77777777 (running)', chip), 'waiting on card t_77777777 (running)')
+    await new Promise(r => setTimeout(r, 0))
+    assert.deepEqual(calls.map(c => [c.path, c.connectionId, c.profile, c.timeoutMs]), [
+      ['/api/plugins/kanban/tasks/t_77777777?board=ops', 'C7', 'work', 8000],
+      ['/api/plugins/kanban/tasks/t_77777777?board=default', 'C7', 'work', 8000]])
+    const seg = m.waitSegments('waiting on card t_77777777 (running)', chip).find(s => s.id)
+    assert.equal(m.waitLabel('waiting on card t_77777777 (running)', chip), 'waiting on card "Lives on default" (t_77777777, running)')
+    assert.deepEqual(seg.open, { kind: 'kanban', id: 't_77777777', board: 'default', connectionId: 'C7', profile: 'work' })
+    // Only a lifecycle status joins the parens; other parenthesised words stay where they are.
+    assert.equal(m.waitLabel('card t_77777777 (see notes)', chip), 'card "Lives on default" (t_77777777) (see notes)')
+    // A local card (gateway unknown) cannot call another name foreign.
+    assert.equal(m.waitSegments('card t_77777777 on hub', { ...chip, gateway: 'local', gatewayId: '' }).find(s => s.id).linkable, true)
+    // Named on another gateway: titled (the chat route's replica answers) but not linked; its own gateway is linked.
+    assert.equal(m.waitSegments('card t_77777777 on worker-a1', chip).find(s => s.id).linkable, false)
+    assert.equal(m.waitSegments('card t_77777777 on G7', chip).find(s => s.id).linkable, true)
+    // A read that never answers is retried after 30 s, not never.
+    let hangs = 0
+    const hang = () => { hangs++; return new Promise(() => {}) }
+    m.cardRef(chip, 't_88888888', 1_000, hang); m.cardRef(chip, 't_88888888', 20_000, hang)
+    assert.equal(hangs, 1)
+    m.cardRef(chip, 't_88888888', 31_001, hang)
+    assert.equal(hangs, 2)
+  } finally { delete globalThis.window }
 })

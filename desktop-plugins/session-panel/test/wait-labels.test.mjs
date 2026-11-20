@@ -19,7 +19,7 @@ test('contained wait kind and blocked-upstream / on-parent labels', () => {
   const held = m.classify([card('held', 'todo', {
     blockedUpstream: { id: 't_leaf', status: 'triage', contained },
   })], { nowMs: NOW })
-  assert.equal(held.blockedUpstream[0].detail, 'waiting on contained card t_leaf · release by t_auth (done)')
+  assert.equal(held.blockedUpstream[0].detail, 'waiting on contained card t_leaf · release by card t_auth (done)')
   const waiting = m.classify([
     card('t_held', 'triage', { look: 'waiting', waitingOn: 'triage', contained }),
     card('t_card', 'scheduled', { look: 'waiting', waitingOn: 'card t_x on hub', upstream: { id: 't_run', status: 'running' } }),
@@ -35,7 +35,7 @@ test('unreadable containment authority stays explicit', () => {
       blockedUpstream: { id: 't_leaf', status: 'triage', contained: { episode: 'ep', authority } },
     })], { nowMs: NOW })
     assert.equal(result.blockedUpstream[0].detail,
-      `waiting on contained card t_leaf · release by ${authority.id || 'unknown'} (unknown)`)
+      `waiting on contained card t_leaf · release by ${authority.id ? `card ${authority.id}` : 'unknown'} (unknown)`)
   }
 })
 
@@ -48,6 +48,6 @@ for (const status of ['todo', 'scheduled']) {
     }], { connectionId: 'C1', profile: 'default' })
     const result = m.classify(chips, { evidence: c => tasks.chipObservation(c, Date.now() / 1000) })
     assert.equal(result.waiting.length, 1)
-    assert.match(result.waiting[0].detail, /^waiting on card t_run since \d\d:\d\d → t_run running · board status$/)
+    assert.match(result.waiting[0].detail, /^waiting on card t_run for 1m · board status$/)
   })
 }
