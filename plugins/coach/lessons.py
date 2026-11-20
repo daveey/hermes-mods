@@ -36,6 +36,12 @@ and the user's reply.
   (e.g. "fetch-creds-before-asking", "proceed-on-reversible-work").
 - scope: "global" or "project:<name>" (a repo/system the rule only applies to).
 
+Direction matters. The rule must remedy what the user objected to. A short observation or question about state
+("your session shows done", "why is this red?", "it's still running") points at a mismatch between what the agent
+claimed or displayed and reality: the rule makes the claim honest or finishes the work, never "accept the claim and
+do less". Only write a rule that tells the agent to stop, skip or do less when the user said so in words (stop,
+don't, no need, skip, leave it, enough).
+
 Return ONLY JSON: {"p_correction": p, "durable": p, "rule": "...", "slug": "...", "scope": "..."}"""
 
 
@@ -55,6 +61,24 @@ def prefilter(user_text: str) -> bool:
 
 def keyword_hit(user_text: str) -> bool:
     return bool(PREFILTER_RE.search((user_text or "")[:800]))
+
+
+# 20261119_073752_746173: "your session shows done" (the chat was wrongly marked done while work was owed) became
+# "When a session shows as done, treat the work as complete and do not continue ... planning remaining next steps",
+# the opposite of the correction. A do-less rule needs the user's own do-less words.
+DO_LESS_RULE_RE = re.compile(
+    r"\b(?:do not|don'?t|never|stop|avoid|no longer)\s+(?:\w+\s+){0,2}?(?:continu\w*|follow(?:ing)?[- ]up|plan\w*|"
+    r"wait\w*|check\w*|track\w*|monitor\w*|pursu\w*|work\w*)\b"
+    r"|\btreat\b[^.]{0,40}\bas (?:complete|done|finished)\b",
+    re.I)
+DO_LESS_USER_RE = re.compile(
+    r"\b(?:stop|don'?t|do not|no need|skip|leave it|enough|never mind|nevermind|forget it|drop it|that'?s fine)\b",
+    re.I)
+
+
+def inverted(rule: str, user_text: str) -> bool:
+    """A rule telling the agent to do less, from a user message that never asked for less."""
+    return bool(DO_LESS_RULE_RE.search(rule or "")) and not DO_LESS_USER_RE.search(user_text or "")
 
 
 def judge_prompt(prev_reply: str, user_text: str, known: Optional[list] = None) -> str:
@@ -149,6 +173,8 @@ def assess(prev_reply: str, user_text: str, llm: Callable[[str, str], str], th_c
         return None
     v = parse(llm(JUDGE_SYS, judge_prompt(prev_reply, user_text, known)))
     if not v or v["p_correction"] < th_corr or v["durable"] < th_durable or not v["rule"] or not v["slug"]:
+        return None
+    if inverted(v["rule"], user_text):
         return None
     return v
 

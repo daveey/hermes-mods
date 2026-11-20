@@ -41,6 +41,19 @@ def test_store_promotes_on_second_session_and_records_decisions(tmp_path):
     assert st.add(v, "s3")["status"] == "rejected"  # a rejected rule stays rejected
 
 
+def test_inverted_do_less_rule_is_dropped():
+    # 20261119_073752_746173: a "your chat is wrongly done" remark became a stop-following-up rule.
+    bad = dict(V, rule="When a session shows as done, treat the work as complete and do not continue waiting on "
+                       "downstream dependencies or planning remaining next steps.", slug="treat-done-sessions-complete")
+    assert ls.assess("Done: setup finished.", "your session shows done", lambda s, p: json.dumps(bad), wide=True) is None
+    # The same kind of rule passes when the user did ask for less.
+    stop = dict(V, rule="Do not keep checking the deploy once it is green.", slug="stop-checking-green-deploys")
+    assert ls.assess("Checking again...", "stop checking it, it's green", lambda s, p: json.dumps(stop), wide=True)
+    # Rules that ask for more are untouched.
+    assert ls.assess("Paste your token.", "no, grab it from the token broker", lambda s, p: json.dumps(V), wide=True)
+    assert "Direction matters" in ls.JUDGE_SYS
+
+
 def test_hint_text():
     v = ls.parse(json.dumps(V))
     assert "memory tool" not in ls.hint(v, promoted=False)
