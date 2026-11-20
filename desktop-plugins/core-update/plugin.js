@@ -26,6 +26,11 @@ export function chipFor(status, restarting = false) {
   const n = Number(status.commits) || 0
   const what = n ? `${n} new commit${n === 1 ? '' : 's'} (${short})` : short
   if (restarting) return { kind: 'restarting', label: 'Restarting to update…', title: `Applying ${what}`, clickable: false }
+  if (status.state === 'needs-local-build') {
+    return { kind: 'needs-local-build', label: 'Update needs a build: Build now (~26 min)',
+      title: `${what} has no build yet (${status.reason || 'peer unavailable'}). Click to build locally, even while you are active. Desktop stays open.`,
+      clickable: !!status.can_build }
+  }
   if (status.state === 'building') {
     return { kind: 'building', label: 'Building update…', title: `Packing ${what} in the background`, clickable: false }
   }
@@ -40,7 +45,7 @@ export function chipFor(status, restarting = false) {
   return null
 }
 
-function createStore(ctx) {
+export function createStore(ctx) {
   const $status = atom(null)
   const $restarting = atom(false)
   let inflight = null
@@ -53,6 +58,16 @@ function createStore(ctx) {
     return inflight
   }
   const restart = async () => {
+    if ($status.get()?.state === 'needs-local-build') {
+      try {
+        const r = await ctx.rest('/build', { method: 'POST' })
+        if (!r?.ok) host.notify({ kind: 'warning', message: 'Build not started: ' + (r?.reason || 'backend refused') })
+        await refresh()
+      } catch (e) {
+        host.notify({ kind: 'error', message: 'Build request failed: ' + String(e) })
+      }
+      return
+    }
     $restarting.set(true)
     try {
       const r = await ctx.rest('/restart', { method: 'POST' })
@@ -82,7 +97,7 @@ function Chip({ store }) {
     'data-kind': chip.kind,
     title: chip.title,
     disabled: !chip.clickable,
-    style: chip.kind === 'ready' ? { color: 'var(--ui-green, #3fb950)' } : undefined,
+    style: { whiteSpace: 'nowrap', flex: 'none', ...(chip.kind === 'ready' ? { color: 'var(--ui-green, #3fb950)' } : {}) },
     onClick: chip.clickable ? () => store.restart() : undefined,
     children: [jsx('span', { className: `codicon ${icon}`, 'aria-hidden': true }), jsx('span', { children: chip.label })]
   })

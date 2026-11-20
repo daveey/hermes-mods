@@ -4,6 +4,9 @@ Status-bar chip for a Hermes core update that is built in the background and app
 time Desktop quits.
 
 - **Building update…** while an updater packs the next version off to the side.
+- **Update needs a build: Build now (~26 min)** when a peer is unavailable and local work needs consent.
+  Clicking starts the updater's `local_build_cmd`; it does not quit Desktop. Storage, locking and host
+  safety gates still apply. The duration is an estimate, not a completion deadline.
 - **Update ready — restart to apply** once a prebuilt app newer than the running checkout is
   waiting. Clicking it starts the updater's apply-on-quit waiter (`waiter_cmd`) and then quits
   Desktop. The waiter runs the update and reopens Desktop.
@@ -14,7 +17,7 @@ time Desktop quits.
 The updater writes `$HERMES_HOME/cache/core-update/state.json`:
 
 ```json
-{"status": "building|ready|failed", "sha": "<commit>", "app_path": "<prebuilt Hermes.app>",
+{"status": "building|ready|failed|needs-local-build", "sha": "<commit>", "app_path": "<prebuilt Hermes.app>",
  "built_at": "<iso>", "started_at": "<iso>", "pid": 123, "error": null,
  "waiter_cmd": ["<argv that waits for Desktop to quit, then applies the update>"]}
 ```
@@ -25,7 +28,13 @@ packs `origin/main` in a detached worktree and passes the bundle to `hermes upda
 `HERMES_DESKTOP_PREBUILT_APP`. That env var needs the fork commit "swap in a prebuilt desktop app
 named by HERMES_DESKTOP_PREBUILT_APP" (see `core/` in this repo).
 
-API: `GET /api/plugins/core-update/status`, `POST /api/plugins/core-update/restart`, `GET /ping`.
+For `needs-local-build`, supply `peer_blocked_reason` and `local_build_cmd` as
+`["<python>", "<sync-script>", "core-prebuild", "<full sha>", "--local-now"]`.
+It is shown even when the checkout already has the target (the installed bundle may not).
+Older updaters without this command cannot offer the build action.
+
+API: `GET /api/plugins/core-update/status`, `POST /api/plugins/core-update/restart`,
+`POST /api/plugins/core-update/build` (explicit local-build consent), `GET /ping`.
 
 ## Tests
 
