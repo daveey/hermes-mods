@@ -8,7 +8,9 @@ outlines for leaving capacity; lost machines have red busy pips and a red group 
 Launching workers pulse amber: pips fill by elapsed boot time / median launch-to-ready time in
 the last 24-hour scaler ledger window (34 minutes without completed boots). They use the most
 common registered worker slot count (six without registry evidence), but contribute no scheduling
-capacity until registered. The chip and each group have per-machine tooltips; the accessible name
+capacity until ready. Registered machines under the scaler's enrolling hold keep the same amber
+boot progress (from their ledger launch timestamp), not the blue draining/leaving state. Ordinary
+holds remain draining; the popover's existing enrolling label is unchanged. The chip and each group have per-machine tooltips; the accessible name
 retains hub/worker totals and names launching workers. Reduced motion disables the pulse.
 A status dot appears only for warn/bad (stale data, lost machine). The popover layout is unchanged.
 

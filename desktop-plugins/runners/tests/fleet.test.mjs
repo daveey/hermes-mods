@@ -550,6 +550,22 @@ test('pips: launching uses age / typical, fallback, clamp, and never adds schedu
   try { assert.ok(ui.container.querySelector('[data-machine="worker-a3"]'), 'panel tolerates launching rows') } finally { await ui.close() }
 })
 
+test('pips: enrolling registry holds keep amber boot progress until ready, not draining', () => {
+  const m = pipMachine('worker-a3', 6, 0, 'draining', {
+    hold_reason: 'worker-scaler: enrolling i-example: readiness pending', launched_at: NOW / 1000 - 600
+  })
+  const view = pipView(m)
+  view.gateways.launch_ready_s = 1200
+  const g = P.pipGroups(view, null, NOW)[0]
+  assert.equal(g.state, 'launching')
+  assert.deepEqual(g.pips, [...Array(3).fill('booted'), ...Array(3).fill('boot')])
+  assert.equal(g.title, 'worker-a3: launching, 10 min in (ready in ~10)')
+  assert.equal(P.summarize(view).workers.slots, 0)
+  m.state = 'active'
+  delete m.hold_reason
+  assert.deepEqual(P.pipGroups(view, null, NOW)[0].pips, Array(6).fill('free'))
+})
+
 test('pips: merge retains launching rows and median from the ledger host, no registered duplicates', () => {
   const ledger = fleet()
   ledger.gateways.events = [ev(1, 'worker-a3', 'launched')]
@@ -563,6 +579,14 @@ test('pips: merge retains launching rows and median from the ledger host, no reg
   v = P.merge([{ route, body: ledger, at: NOW - 1 }, { route, body: other, at: NOW }], NOW)
   assert.equal(v.gateways.machines.filter((m) => m.name === 'worker-a3').length, 1)
   assert.equal(v.gateways.machines.at(-1).state, 'active')
+  // The freshest registry can arrive from a host without the scaler ledger.
+  other.gateways.machines.at(-1).state = 'draining'
+  other.gateways.machines.at(-1).hold_reason = 'worker-scaler: enrolling i-example: readiness pending'
+  v = P.merge([{ route, body: ledger, at: NOW - 1 }, { route, body: other, at: NOW }], NOW)
+  const enrolling = P.pipGroups(v, null, NOW).at(-1)
+  assert.equal(enrolling.state, 'launching')
+  assert.deepEqual(enrolling.pips, Array(6).fill('booted'))
+  assert.match(enrolling.title, /launching, 60 min in/)
 })
 
 // ── worker lifecycle timeline (gateways.events) ──────────────────────────────────────────────────

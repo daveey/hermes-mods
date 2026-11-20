@@ -405,6 +405,18 @@ def test_gateway_section_carries_events_and_the_window_start(tmp_path):
     assert (none['events'], none['events_since']) == ([], NOW_S - 24 * HOUR)
 
 
+def test_registered_enrolling_worker_keeps_launch_clock_without_duplicate(tmp_path):
+    path = _ledger(tmp_path / 'scaler.db', [
+        (NOW_S - 600, 'worker-new', 'i-example', 'launched', 'boot')])
+    row = dict(name='worker-new', slots=6, state='draining', running=[],
+               hold_reason='worker-scaler: enrolling i-example: readiness pending')
+    section = dict(machines=[row])
+    out = fleet.with_worker_events(section, path, NOW_S)
+    assert out['machines'] == [dict(row, launched_at=NOW_S - 600)]
+    assert 'launched_at' not in row  # preserve the registry and popover state
+    assert out['machines'][0]['state'] == 'draining'
+
+
 def test_launching_workers_lifecycle_registry_precedence_and_pool_slots():
     machines = [dict(name='hub', slots=8), dict(name='worker-1', slots=4),
                 dict(name='worker-2', slots=6), dict(name='worker-3', slots=6)]
