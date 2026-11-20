@@ -1093,7 +1093,6 @@ button.hermes-fleet-slot{cursor:pointer}
 .hermes-fleet-slot.is-throttled{position:relative;border-color:#d08a1e;background-image:linear-gradient(45deg,transparent calc(50% - .6px),#d08a1e calc(50% - .6px),#d08a1e calc(50% + .6px),transparent calc(50% + .6px)),linear-gradient(-45deg,transparent calc(50% - .6px),#d08a1e calc(50% - .6px),#d08a1e calc(50% + .6px),transparent calc(50% + .6px))}
 .hermes-fleet-slot.is-busy.is-throttled{background-color:var(--ui-accent);border-color:var(--ui-accent);background-image:linear-gradient(45deg,transparent calc(50% - .6px),var(--ui-bg,#fff) calc(50% - .6px),var(--ui-bg,#fff) calc(50% + .6px),transparent calc(50% + .6px)),linear-gradient(-45deg,transparent calc(50% - .6px),var(--ui-bg,#fff) calc(50% - .6px),var(--ui-bg,#fff) calc(50% + .6px),transparent calc(50% + .6px))}
 .hermes-fleet-throttle{display:flex;align-items:center;gap:8px;font-size:11px;color:var(--ui-text-secondary);margin:2px 0 4px}
-.hermes-fleet-throttle input[type=range]{width:120px;flex-shrink:0}
 .hermes-fleet-chipbar{position:relative}
 .hermes-fleet-chipcut{position:absolute;right:0;top:0;height:100%;background:repeating-linear-gradient(45deg,transparent 0 2px,#d08a1e 2px 3px)}
 .hermes-fleet-slot.is-busy{background:var(--ui-accent);border-color:var(--ui-accent)}
