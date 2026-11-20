@@ -110,7 +110,7 @@ def test_scattered_changes_compare_each_state_only_once(env, monkeypatch):
     assert comparable(actual) == comparable(service._inventory(newer, None))
     assert built.computed == len(newer['runners'][::20])
     assert calls == [], 'dirty blocks must not repeat normalized state comparisons'
-    assert reduced_rows <= len(newer['runners']) // 2, 'sparse refresh must not recount the whole fleet'
+    assert reduced_rows <= 2 * built.computed, 'sparse refresh must reduce only changed old/new rows'
 
 
 @pytest.mark.parametrize('change', ['source', 'state', 'host', 'order', 'remove', 'add', 'rewind', 'expiry', 'ceiling', 'maintenance'])
@@ -143,6 +143,67 @@ def test_block_carry_matches_full_build(env, change):
     actual, built = service._inventory(newer, overlay, copy_rows=False, carry=carry, now=at)
     assert comparable(actual) == comparable(service._inventory(newer, overlay))
     if change in ('rewind', 'ceiling'): assert built.computed == len(newer['runners'])
+
+
+def test_count_reduction_visits_projections_once(env):
+    cfg, path, *_ = env
+    snap = fleet(cfg, path)
+    service = svc(cfg, path, 1001)
+    _, carry = service._inventory(snap, None, copy_rows=False, carry=None, now=1001)
+    entries = list(carry.rows.values())
+    rows = [entry[2] for entry in entries]
+
+    class Visits(list):
+        visits = 0
+
+        def __iter__(self):
+            for value in super().__iter__():
+                self.visits += 1
+                yield value
+
+    projections = Visits(entry[3] for entry in entries)
+    counts, hosts = S._row_counts(rows, projections, snap['states'])
+    expected = service._inventory(snap, None)['data']['counts']
+    assert counts == {key: expected[key] for key in counts}
+    assert counts['registrations'] == len(rows)
+    assert hosts == {row['host_id'] for row in rows if row['host_id']}
+    assert projections.visits == len(rows), 'dirty blocks must reduce projections in one pass'
+
+
+@pytest.mark.parametrize('change', ['source_error', 'host', 'stale', 'remove_observation'])
+def test_aligned_carry_branches_do_not_mutate_parent(env, change):
+    cfg, path, *_ = env
+    snap = fleet(cfg, path)
+    service = svc(cfg, path, 1001)
+    first, carry = service._inventory(snap, None, copy_rows=False, carry=None, now=1001)
+    preserved = deepcopy(first)
+    reductions = deepcopy(carry.reduction)
+    for index in (0, 17):
+        newer = deepcopy(snap)
+        row = newer['runners'][index]
+        state = newer['states'][row['id']]
+        if change == 'source_error': state['source_error'] = 'forbidden'
+        if change == 'host': row['host_id'] = cfg['hosts'][0]['id']
+        if change == 'stale': state['at'] = 1
+        if change == 'remove_observation': state['at'] = None
+        for state in newer['states'].values(): state['cycle'] = f'branch_{index}'
+        actual, child = service._inventory(newer, None, copy_rows=False, carry=carry, now=1001)
+        assert comparable(actual) == comparable(service._inventory(newer, None))
+        assert child.computed == 1
+        assert first == preserved
+        assert carry.reduction == reductions
+    again, built = service._inventory(snap, None, copy_rows=False, carry=carry, now=1001)
+    assert comparable(again) == comparable(first)
+    assert built.computed == 0
+
+
+def test_empty_inventory_carry_remains_loading(env):
+    cfg, path, *_ = env
+    service = svc(cfg, path, 1001)
+    first, carry = service._inventory(None, None, copy_rows=False, carry=None, now=1001)
+    actual, _ = service._inventory(None, None, copy_rows=False, carry=carry, now=1002)
+    assert comparable(actual) == comparable(first)
+    assert actual['data']['state'] == 'loading'
 
 
 def test_public_memo_cannot_extend_original_row_ceiling(env):

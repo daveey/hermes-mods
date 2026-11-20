@@ -96,13 +96,15 @@ class _Carry:
     state, the output row, its projection, its provenance entry, when computed); hosts maps a host id to (its
     host result, its maintenance) as that build saw them."""
 
-    __slots__ = ('current', 'built_at', 'rows', 'hosts', 'computed', 'blocks', 'cache_epochs')
+    __slots__ = ('current', 'built_at', 'rows', 'hosts', 'computed', 'blocks', 'cache_epochs', 'vector', 'reduction')
 
     def __init__(self, current, built_at):
         self.current, self.built_at = current, built_at
         self.rows, self.hosts, self.computed = {}, {}, 0
         self.blocks = []
         self.cache_epochs = []
+        self.vector: tuple | None = None
+        self.reduction: tuple | None = None
 
 
 @dataclass
@@ -243,6 +245,55 @@ def _state_signature(state):
     return normalized
 
 
+def _carry_aligned(snap, carry, built, same_hosts, now, rows, projections, provenance):
+    """An unchanged membership/order needs no block rebuilding or per-block reduction.
+
+    Keep entries and their original leases; only changed rows go through the
+    authoritative projection. Never mutate the previous generation's arrays.
+    """
+    ids, previous = carry.vector
+    states = snap.get('states', {})
+    sources = snap['runners']
+    signatures = list(map(_state_signature, map(states.__getitem__, ids)))
+    dirty = [i for i, (entry, src, signature) in enumerate(zip(previous, sources, signatures))
+             if not (entry[5] <= now < entry[6] and now < entry[5] + ROWS_MAX_S
+                     and src.get('host_id') in same_hosts
+                     and entry[7] == signature and entry[0] == src)]
+    built.rows = carry.rows.copy()
+    offset, provenance_offset = len(rows), len(provenance)
+    for i in dirty:
+        yield sources[i]
+    # The ordinary row path appended computed rows. Reassemble in snapshot order.
+    del rows[offset:]
+    del projections[offset:]
+    del provenance[provenance_offset:]
+    entries = list(previous)
+    for i in dirty:
+        entries[i] = built.rows[ids[i]]
+    rows.extend(map(itemgetter(2), entries))
+    projections.extend(map(itemgetter(3), entries))
+    provenance.extend(p if p['collection_id'] == states[p['source_id']]['cycle']
+                      else {**p, 'collection_id': states[p['source_id']]['cycle']}
+                      for p in map(itemgetter(4), entries) if p is not None)
+    count, hosts = carry.reduction
+    if len(dirty) > len(entries) // 2:
+        # Clock/lease flips can invalidate almost the whole vector: one full
+        # reduction is cheaper than subtracting and adding two large subsets.
+        count, hosts = _row_counts(rows, projections, states)
+    elif dirty:
+        old_entries = [previous[i] for i in dirty]
+        new_entries = [entries[i] for i in dirty]
+        before, _ = _row_counts(list(map(itemgetter(2), old_entries)),
+                               list(map(itemgetter(3), old_entries)),
+                               {entry[0]['id']: entry[1] for entry in old_entries})
+        after, _ = _row_counts(list(map(itemgetter(2), new_entries)),
+                              list(map(itemgetter(3), new_entries)), states)
+        count = {key: value + after[key] - before[key] for key, value in count.items()}
+        hosts = {row['host_id'] for row in rows if row['host_id']}
+    built.vector = (ids, entries)
+    built.reduction = (count, hosts)
+
+
 def _carry_sources(snap, carry, built, host_results, maintenance, now, rows, projections, provenance):
     """Yield dirty blocks to the ordinary row path; carry equal blocks in C-sized batches.
 
@@ -262,6 +313,10 @@ def _carry_sources(snap, carry, built, host_results, maintenance, now, rows, pro
     built.hosts.update(inputs)
     same_hosts = {hid for hid, value in inputs.items()
                   if carry is not None and carry.hosts.get(hid, _NO_CARRY) == value}
+    if (snap and carry is not None and carry.vector is not None
+            and carry.vector[0] == list(map(itemgetter('id'), sources))):
+        yield from _carry_aligned(snap, carry, built, same_hosts, now, rows, projections, provenance)
+        return
     # Keep sparse refreshes from dirtying the entire fleet: a 5% scattered
     # refresh touches every 64-row block, but fewer than half of eight-row blocks.
     # Clean blocks retain their reductions/provenance; dirty ones still carry rows.
@@ -310,17 +365,24 @@ def _carry_sources(snap, carry, built, host_results, maintenance, now, rows, pro
 
 
 def _row_counts(rows, projections, states):
-    current = [p for p, row in zip(projections, rows)
-               if p.freshness == 'fresh' and not states[row['id']].get('source_error')
-               and p.registration == 'online']
-    counts = dict(registrations=len(rows), online=len(current),
-                  busy=sum(p.activity == 'busy' for p in current),
-                  verified_ready=sum(p.ready for p in projections),
-                  readiness_unverified=sum(not p.ready for p in current),
-                  issues=sum('source_unavailable' in p.reasons or p.health in
-                             ('missing', 'offline', 'unavailable', 'degraded', 'stale', 'unknown', 'suspected_offline')
-                             for p in projections))
-    return counts, {row['host_id'] for row in rows if row['host_id']}
+    # Dirty blocks need all six counts: reduce them together instead of walking
+    # the same projections once per metric and materializing a current-row list.
+    online = busy = verified = unverified = issues = 0
+    hosts = set()
+    for row, p in zip(rows, projections):
+        ready = p.ready
+        verified += ready
+        issues += ('source_unavailable' in p.reasons or p.health in
+                   ('missing', 'offline', 'unavailable', 'degraded', 'stale', 'unknown', 'suspected_offline'))
+        if (p.freshness == 'fresh' and not states[row['id']].get('source_error')
+                and p.registration == 'online'):
+            online += 1
+            busy += p.activity == 'busy'
+            unverified += not ready
+        if row['host_id']:
+            hosts.add(row['host_id'])
+    return (dict(registrations=len(rows), online=online, busy=busy, verified_ready=verified,
+                 readiness_unverified=unverified, issues=issues), hosts)
 
 
 def _file_key(path):
@@ -485,7 +547,7 @@ class Service:
             if rows.blocks:
                 until = min(until, min(block[6] for block in rows.blocks))
             elif rows.rows:
-                until = min(until, min(entry[5] + ROWS_MAX_S for entry in rows.rows.values()))
+                until = min(until, min(min(entry[6], entry[5] + ROWS_MAX_S) for entry in rows.rows.values()))
             fresh = _Result(key, now, until, result, rows)
             with _MEMO_LOCK:
                 # A concurrent cold-path read may have evicted/replaced our read
@@ -637,7 +699,9 @@ class Service:
                 meta['provenance'][provenance_index] = dict(provenance, state='stale')
         # online/busy/unverified describe CURRENT evidence (plan §3/§5: stale inventory keeps
         # last-known values per row but never counts as live); same rule as the Desktop chip.
-        if built is not None and built.blocks:
+        if built is not None and built.reduction is not None:
+            count, mapped_hosts = built.reduction
+        elif built is not None and built.blocks:
             count = dict.fromkeys(built.blocks[0][10][0], 0)
             mapped_hosts = set()
             for block in built.blocks:
@@ -647,6 +711,11 @@ class Service:
                 mapped_hosts.update(host_ids)
         else:
             count, mapped_hosts = _row_counts(rows, projections, snap['states'] if snap else {})
+        if built is not None:
+            built.reduction = (count, mapped_hosts)
+            if built.vector is None and len(built.rows) == len(rows):
+                ids = list(map(itemgetter('id'), rows))
+                built.vector = (ids, list(map(built.rows.__getitem__, ids)))
         count = dict(count, mapped_hosts=len(mapped_hosts), host_capacity=None)
         state='loading' if not snap else ('ready' if snap['collection']['state']=='complete' else 'partial')
         if snap and any(p['state']!='fresh' for p in meta['provenance']): state='partial'
