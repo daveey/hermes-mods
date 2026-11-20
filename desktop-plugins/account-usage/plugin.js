@@ -1,7 +1,10 @@
 /**
  * Account Usage — status-bar chips showing every pooled Claude / ChatGPT (Codex)
- * subscription account: ready count, a dot per account, and a click-open
- * popover with per-account 5-hour session + weekly bars and reset times.
+ * subscription pool: a 7-day weekly-quota forecast sparkline (red where it runs dry), ready count and a
+ * verdict. Hover or focus a provider (or click to pin) for a popover: the 4-provider forecast table with
+ * that provider highlighted, then its accounts with 5-hour session + weekly bars and reset times.
+ * Forecast: REST POST /forecast (plugins/account-usage/forecast.py) from the weekly windows below plus
+ * the backend's usage history; an older backend without it just shows no forecast.
  * The popover is a plain table of visual cues; why an account is limited, status
  * hints and Reconnect open from the row's chevron.
  *
@@ -17,7 +20,7 @@
  */
 
 import { atom, cn, host, Popover, PopoverContent, PopoverTrigger, STATUSBAR_AREAS, useValue } from '@hermes/plugin-sdk'
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'account-usage'
@@ -51,6 +54,18 @@ const CSS = `
 .hermes-au-details .hermes-au-fix { padding: 0 }
 .hermes-au-pill { justify-self: start; font-size: 10px; padding: 0 5px; border-radius: 3px; border: 1px solid currentColor; color: var(--au-c); white-space: nowrap }
 .hermes-au-next { display: inline-block; white-space: nowrap; color: var(--ui-accent); border: 1px solid currentColor; border-radius: 3px; padding: 0 4px; font-size: 10px; margin-left: 5px }
+.hermes-au-chip { display: inline-flex; align-items: center; gap: 5px; margin-right: 4px; padding: 0 4px; border-radius: 3px }
+.hermes-au-chip[data-hl='true'] { background: var(--chrome-action-hover); color: var(--foreground) }
+.hermes-au-fc { width: 100%; border-collapse: collapse; font-size: 11px }
+.hermes-au-fc th { font-weight: 500; text-align: left; opacity: .6; font-size: 10px; padding: 0 6px 4px 3px }
+.hermes-au-fc { table-layout: auto }
+.hermes-au-fc td { padding: 4px 6px 4px 3px; border-top: 1px solid color-mix(in srgb, var(--border) 60%, transparent); white-space: nowrap }
+.hermes-au-fc td.hermes-au-verdict { white-space: normal; min-width: 0; line-height: 1.25 }
+.hermes-au-fc tr[data-hl='true'] td { background: var(--chrome-action-hover) }
+.hermes-au-fc tr[data-hl='true'] td:first-child { box-shadow: inset 2px 0 0 var(--ui-accent, var(--accent)) }
+.hermes-au-fc tbody tr { cursor: pointer }
+.hermes-au-fc button { all: unset; cursor: pointer; font-weight: 600 }
+.hermes-au-fc button:focus-visible { outline: 2px solid var(--ui-accent); outline-offset: 1px }
 @media (prefers-reduced-motion: reduce) { .hermes-au-dot[data-mark='active'] { animation: none } }
 `
 
@@ -216,6 +231,94 @@ export function unavailableLabel(error) {
   return { label: 'usage ?', title: `Account usage unavailable: ${text}` }
 }
 
+// ── forecast (pure, exported for tests) ──────────────────────────────────
+
+const VERDICT_COLOR = { ok: COLORS.ready, tight: COLORS.warn, short: COLORS.limited }
+
+// What the backend's /forecast needs per account: weekly used % and its reset, plus the spent account's back-time.
+export function forecastRequest(groups) {
+  return { providers: groups.filter(g => !g.statusOnly).map(g => ({ slug: g.slug, accounts: g.accounts.map(a => {
+    const w = pickWindow(a.windows, 'week')
+    return { id: String(a.id || ''), label: String(a.label || ''), state: a.state, disabled: !!a.disabled,
+      week_used: w && Number.isFinite(Number(w.used_percent)) ? Number(w.used_percent) : null,
+      week_resets_at: (w && w.resets_at) || null, resets_at: a.resets_at || null }
+  }) })) }
+}
+
+export function fmtHours(h) {
+  if (h < 1) return `${Math.max(1, Math.round(h * 60))}m`
+  if (h < 48) return `${Math.round(h)}h`
+  return `${Math.round(h / 24)}d`
+}
+
+function atHour(h, now) {
+  return new Date(now + h * 3600_000).toLocaleString(undefined, { weekday: 'short', hour: 'numeric' })
+}
+
+// Short verdict for the status bar.
+export function verdictText(f) {
+  if (!f) return ''
+  if (f.verdict === 'learning') return 'learning…'
+  if (f.verdict === 'short') return f.runout_h === 0 ? 'dry now' : `dry in ${fmtHours(f.runout_h)}`
+  if (f.verdict === 'tight') return 'tight'
+  if (f.verdict === 'ok') return 'ok'
+  return ''
+}
+
+// Longer forecast sentence for the popover table.
+export function forecastText(f, now = Date.now()) {
+  if (!f) return 'no forecast (backend too old)'
+  if (f.verdict === 'error') return 'forecast failed'
+  if (f.verdict === 'learning') return `learning… ${Math.round((f.history_h || 0) * 10) / 10}h of 2h history`
+  if (f.verdict === 'short') {
+    const g = f.gaps[0]
+    return `out ${atHour(g.start_h, now)} → ${g.end_h >= 168 ? 'past 7 days' : atHour(g.end_h, now)}`
+  }
+  const pace = f.pace == null ? '' : ` · ${Math.round(f.pace * 100)}% of supply`
+  return f.verdict === 'tight' ? `tight${pace}` : `lasts the week${pace}`
+}
+
+export function leftText(f) {
+  return f && Number.isFinite(f.left) ? `${(f.left / 100).toFixed(1)} acct` : '—'
+}
+
+// Fuel curve as SVG: line + fill, red bands where it is dry, ticks at resets.
+export function Sparkline({ f, w = 64, h = 14, ticks = false }) {
+  if (!f || !Array.isArray(f.curve) || f.curve.length < 2) return null
+  const n = f.curve.length - 1
+  const max = Math.max(100, ...f.curve)
+  const x = i => (i / n) * w
+  const y = v => h - 1 - (Math.max(0, v) / max) * (h - 2)
+  const line = f.curve.map((v, i) => `${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(' ')
+  const col = VERDICT_COLOR[f.verdict] || 'currentColor'
+  return jsxs('svg', { width: w, height: h, viewBox: `0 0 ${w} ${h}`, 'aria-hidden': true, style: { flex: 'none', overflow: 'visible' }, children: [
+    jsx('polygon', { points: `0,${h} ${line} ${w},${h}`, fill: col, opacity: 0.18 }),
+    ...(f.gaps || []).map((g, i) => jsx('rect', { key: `g${i}`, x: x(g.start_h), width: Math.max(1.5, x(g.end_h) - x(g.start_h)), y: 0, height: h, fill: COLORS.limited, opacity: 0.55 })),
+    ...(ticks ? (f.resets_h || []).filter(r => r >= 0 && r <= n).map((r, i) => jsx('line', { key: `t${i}`, x1: x(r), x2: x(r), y1: h - 3, y2: h, stroke: 'currentColor', opacity: 0.5 })) : []),
+    jsx('polyline', { points: line, fill: 'none', stroke: col, strokeWidth: 1.2, opacity: f.verdict === 'learning' ? 0.45 : 1 })
+  ] })
+}
+
+function ForecastTable({ groups, hl, onPick }) {
+  const now = Date.now()
+  return jsxs('table', { className: 'hermes-au-fc', children: [
+    jsx('thead', { children: jsxs('tr', { children: ['Provider', 'Ready', 'Left', 'Next 7 days', 'Forecast'].map(t => jsx('th', { key: t, children: t })) }) }),
+    jsx('tbody', { children: groups.map(g => {
+      const f = g.forecast
+      return jsxs('tr', { key: g.slug, 'data-hl': g.slug === hl ? 'true' : undefined, 'data-provider': g.slug, onMouseEnter: () => onPick(g.slug), onClick: () => onPick(g.slug), children: [
+        jsx('td', { children: jsx('button', { type: 'button', 'aria-label': `Show ${g.title} accounts`, 'aria-pressed': g.slug === hl, onFocus: () => onPick(g.slug), children: g.name }) }),
+        jsx('td', { style: { color: countColor(g) }, children: `${g.ready}/${g.total}` }),
+        g.statusOnly
+          ? jsx('td', { colSpan: 3, style: { opacity: 0.65 }, children: g.ready ? 'up · no usage API' : g.limited ? `down · ${g.statusBad || 'blocked'}` : 'not checked yet' })
+          : null,
+        g.statusOnly ? null : jsx('td', { children: leftText(f) }),
+        g.statusOnly ? null : jsx('td', { children: jsx(Sparkline, { f, w: 96, h: 12, ticks: true }) }),
+        g.statusOnly ? null : jsx('td', { className: 'hermes-au-verdict', style: { color: VERDICT_COLOR[f?.verdict], opacity: f && VERDICT_COLOR[f.verdict] ? 1 : 0.65 }, children: forecastText(f, now) })
+      ].filter(Boolean) })
+    }) })
+  ] })
+}
+
 // ── state ─────────────────────────────────────────────────────────────────
 
 // Provider-global observation, scoped to the ambient gateway/profile. Never fall
@@ -227,6 +330,15 @@ async function readLast(ctx) {
 // Older plugin backends / cores have no /disabled: treat as unsupported (no toggle shown).
 async function readDisabled(ctx) {
   try { return await ctx.rest('/disabled') || null } catch { return null }
+}
+
+// Older plugin backends have no /forecast: no forecast is shown (never a guessed one).
+export async function attachForecast(ctx, groups) {
+  const req = forecastRequest(groups)
+  if (!req.providers.length) return groups
+  let out = null
+  try { out = await ctx.rest('/forecast', { method: 'POST', body: req }) } catch { out = null }
+  return groups.map(g => ({ ...g, forecast: (out && out[g.slug]) || null }))
 }
 
 export function createStore(ctx) {
@@ -250,7 +362,8 @@ export function createStore(ctx) {
     const current = () => { sync(); return !disposed && epoch === e }
     $state.set({ ...$state.get(), loading: true })
     inflight = Promise.all([host.request('model.options', {}, 30_000), readLast(ctx), readDisabled(ctx)])
-      .then(([payload, last, disabled]) => { if (current()) $state.set({ groups: summarize(payload, last || {}, Date.now(), disabled), fetchedAt: Date.now(), loading: false, error: null }) })
+      .then(([payload, last, disabled]) => attachForecast(ctx, summarize(payload, last || {}, Date.now(), disabled)))
+      .then(groups => { if (current()) $state.set({ groups, fetchedAt: Date.now(), loading: false, error: null }) })
       .catch(err => { if (current()) $state.set({ ...$state.get(), loading: false, error: String(err?.message || err) }) })
       .finally(() => { if (current()) inflight = null })
     return inflight
@@ -546,24 +659,66 @@ function UsageBar({ store, selectionStore, reconnectStore, disableStore }) {
   const profile = useValue(host.state.profile)
   const model = useValue(host.state.model)
   const [open, setOpen] = useState(false)
+  // How it opened: 'hover' closes when the pointer leaves; 'pin' (click, keyboard) stays until Esc / outside click.
+  const [via, setVia] = useState(null)
+  const [hl, setHl] = useState(null)
+  const timer = useRef(null)
+  const quietUntil = useRef(0)
   useEffect(() => { store.refresh() }, [connection, profile, store])
   useEffect(() => { if (open) selectionStore.refresh() }, [open, focused, owner, connection, profile, model, selectionStore])
+  useEffect(() => () => clearTimeout(timer.current), [])
   if (!groups.length) {
     if (!error) return null
     const { label, title } = unavailableLabel(error)
     return jsx('span', { className: BAR_CLASS, title, children: label })
   }
-  return jsxs(Popover, { open, onOpenChange: v => { setOpen(v); if (v) store.refresh() }, children: [
-    jsx(PopoverTrigger, { asChild: true, children: jsx('button', { type: 'button', className: cn(BAR_CLASS, open && 'text-foreground'), 'aria-label': 'Account usage', children:
-      groups.map(g => jsxs('span', { key: g.slug, style: { display: 'inline-flex', alignItems: 'center', gap: 5, marginRight: 6 },
-        title: `${g.title}: ${g.ready} of ${g.total} ready${g.limited ? ` · ${g.limited} ${g.statusBad || 'out of quota'}` : ''}${g.cooling ? ` · ${g.cooling} cooling down` : ''}${g.disabled ? ` · ${g.disabled} disabled` : ''}${g.markId ? ` · ${g.mark === 'active' ? 'in use' : 'last used'}: ${(g.accounts.find(a => a.id === g.markId) || {}).label} (${since(g.markAt)})` : ''}${g.nextBack ? ` · next back ${fmtReset(g.nextBack)}` : ''}`, children: [
+  const shown = groups.find(g => g.slug === hl) || groups[0]
+  const show = (slug, how) => {
+    clearTimeout(timer.current)
+    if (slug) setHl(slug)
+    if (!open) { setOpen(true); store.refresh() }
+    if (how === 'pin' || via !== 'pin') setVia(how)
+  }
+  const close = () => { clearTimeout(timer.current); setOpen(false); setVia(null); quietUntil.current = Date.now() + 400 }
+  const leave = () => { if (via === 'hover') { clearTimeout(timer.current); timer.current = setTimeout(close, 220) } }
+  const stay = () => clearTimeout(timer.current)
+  const step = d => { const i = groups.findIndex(g => g.slug === shown.slug); setHl(groups[(i + d + groups.length) % groups.length].slug) }
+  return jsxs(Popover, { open, onOpenChange: v => { if (v) show(null, 'pin'); else close() }, children: [
+    jsx(PopoverTrigger, { asChild: true, children: jsx('button', { type: 'button', className: cn(BAR_CLASS, open && 'text-foreground'), 'aria-label': 'Account usage',
+      'aria-expanded': open,
+      // Click pins (or unpins) the popover; Radix skips its own toggle when the click is default-prevented.
+      onClick: e => { e.preventDefault(); if (open && via === 'pin') close(); else show(null, 'pin') },
+      onMouseLeave: leave, onMouseEnter: stay,
+      onFocus: e => { if (Date.now() > quietUntil.current && e.target.matches?.(':focus-visible')) show(null, 'pin') },
+      onKeyDown: e => {
+        if (e.key === 'Escape' && open) { e.preventDefault(); close() }
+        else if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') { e.preventDefault(); if (!open) show(null, 'pin'); step(e.key === 'ArrowRight' ? 1 : -1) }
+      },
+      children:
+      groups.map(g => {
+        const f = g.forecast
+        const tip = `${g.title}: ${g.ready} of ${g.total} ready${g.limited ? ` · ${g.limited} ${g.statusBad || 'out of quota'}` : ''}${g.cooling ? ` · ${g.cooling} cooling down` : ''}${g.disabled ? ` · ${g.disabled} disabled` : ''}${f && !g.statusOnly ? ` · ${leftText(f)} left · ${forecastText(f)}` : ''}${g.markId ? ` · ${g.mark === 'active' ? 'in use' : 'last used'}: ${(g.accounts.find(a => a.id === g.markId) || {}).label} (${since(g.markAt)})` : ''}${g.nextBack ? ` · next back ${fmtReset(g.nextBack)}` : ''}`
+        return jsxs('span', { key: g.slug, className: 'hermes-au-chip', 'data-provider': g.slug, 'data-hl': open && g.slug === shown.slug ? 'true' : undefined,
+          onMouseEnter: () => show(g.slug, 'hover'), title: open ? undefined : tip, children: [
           jsx('b', { style: { fontWeight: 600 }, children: g.name }),
-          jsx('span', { style: { display: 'inline-flex', gap: 2.5 }, children: g.accounts.map(a => jsx(Dot, { key: a.id, t: tone(a), size: 6, mark: a.id === g.markId ? g.mark : null })) }),
-          jsx('span', { style: { color: countColor(g) }, children: `${g.ready}/${g.total}` })
-        ] }))
+          f && !g.statusOnly ? jsx(Sparkline, { f })
+            // No forecast (status-only provider, or a backend without /forecast): the per-account dots.
+            : jsx('span', { style: { display: 'inline-flex', gap: 2.5 }, children: g.accounts.map(a => jsx(Dot, { key: a.id, t: tone(a), size: 6, mark: a.id === g.markId ? g.mark : null })) }),
+          jsx('span', { style: { color: countColor(g) }, children: `${g.ready}/${g.total}` }),
+          f && !g.statusOnly && verdictText(f) ? jsx('span', { className: 'hermes-au-vb', style: { color: VERDICT_COLOR[f.verdict], opacity: VERDICT_COLOR[f.verdict] ? 1 : 0.6 }, children: verdictText(f) }) : null
+        ] })
+      })
     }) }),
-    jsx(PopoverContent, { side: 'top', align: 'end', className: 'w-[460px]', style: PANEL_STYLE, children:
+    jsx(PopoverContent, { side: 'top', align: 'end', className: 'w-[460px]', style: PANEL_STYLE,
+      onMouseEnter: stay, onMouseLeave: leave,
+      // A hover-opened popover never steals focus from the composer; closing never refocuses the bar (no reopen loop).
+      onOpenAutoFocus: e => { if (via !== 'pin') e.preventDefault() }, onCloseAutoFocus: e => e.preventDefault(),
+      children:
       jsxs('div', { style: { display: 'flex', flexDirection: 'column', gap: 10, padding: 4, fontSize: 12 }, children: [
+        jsx(ForecastTable, { groups, hl: shown.slug, onPick: slug => { stay(); setHl(slug) } }),
+        jsx('div', { style: { borderTop: '1px solid var(--border)' } }),
+        jsx(GroupPanel, { key: shown.slug, g: shown, selectionStore, selectionState, reconnectStore, reconnectState, disableStore, disableState }),
+        jsx('div', { style: { borderTop: '1px solid var(--border)' } }),
         jsxs('div', { role: 'status', 'aria-live': 'polite', style: { fontSize: 10.5, opacity: 0.75 },
           title: 'Click an account for this chat’s next request only. Provider and model stay unchanged; other chats and global priority are unaffected. In use / last used is a provider-global observation, not this chat’s queued account.', children: [
           selectionState.busy ? 'Saving selection…' : selectionState.loading ? 'Loading selection…' : selectionState.selection ? `${selectionState.selection.provider} · ${selectionState.selection.model}` : 'Selection not loaded.',
@@ -571,11 +726,9 @@ function UsageBar({ store, selectionStore, reconnectStore, disableStore }) {
           jsx('button', { type: 'button', disabled: selectionState.busy || selectionState.loading, onClick: () => selectionStore.refresh(), style: { marginLeft: 8, textDecoration: 'underline' }, children: 'Refresh selection' })
         ] }),
         selectionState.error ? jsx('div', { role: 'alert', style: { color: 'var(--ui-text-primary)', border: '1px solid var(--ui-stroke-secondary)', padding: 7, overflowWrap: 'anywhere' }, children: selectionState.error }) : null,
-        ...groups.flatMap((g, i) => [i ? jsx('div', { key: `sep-${g.slug}`, style: { borderTop: '1px solid var(--border)' } }) : null, jsx(GroupPanel, { key: g.slug, g, selectionStore, selectionState, reconnectStore, reconnectState, disableStore, disableState })]).filter(Boolean),
-        jsx('div', { style: { borderTop: '1px solid var(--border)' } }),
-        jsxs('div', { style: { display: 'flex', justifyContent: 'space-between', fontSize: 10.5, opacity: 0.7 }, children: [
-          jsx('span', { children: error ? `Refresh failed: ${error}` : `Updated ${ago(fetchedAt)} · auto every 30s` }),
-          jsx('button', { type: 'button', onClick: () => store.refresh(), style: { color: 'var(--accent)', cursor: 'pointer' }, children: loading ? 'Refreshing…' : '↻ Refresh' })
+        jsxs('div', { style: { display: 'flex', justifyContent: 'space-between', gap: 8, fontSize: 10.5, opacity: 0.7 }, children: [
+          jsx('span', { children: error ? `Refresh failed: ${error}` : `Updated ${ago(fetchedAt)} · forecast = weekly quota at the last-24h pace` }),
+          jsx('button', { type: 'button', onClick: () => store.refresh(), style: { color: 'var(--accent)', cursor: 'pointer', whiteSpace: 'nowrap' }, children: loading ? 'Refreshing…' : '↻ Refresh' })
         ] })
       ] })
     })

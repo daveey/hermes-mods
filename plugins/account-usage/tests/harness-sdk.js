@@ -7,5 +7,7 @@ export const cn=(...x)=>x.filter(Boolean).join(' ')
 export const STATUSBAR_AREAS={right:'statusBar.right'}
 const Context=createContext(null)
 export const Popover=({children,...props})=>React.createElement(Context.Provider,{value:props},children)
-export function PopoverTrigger({children}) {const p=useContext(Context);return React.cloneElement(children,{onClick:()=>p.onOpenChange(!p.open)})}
-export function PopoverContent({children,style}) {const p=useContext(Context);return p.open?React.createElement('section',{'aria-label':'Account usage popover',style},children):null}
+// Like Radix: the child's own onClick runs first and a default-prevented click skips the toggle.
+export function PopoverTrigger({children}) {const p=useContext(Context);return React.cloneElement(children,{onClick:e=>{children.props.onClick?.(e);if(!e.defaultPrevented)p.onOpenChange(!p.open)}})}
+// Like Radix's DismissableLayer: Escape anywhere closes an open popover.
+export function PopoverContent({children,style,onMouseEnter,onMouseLeave}) {const p=useContext(Context);React.useEffect(()=>{if(!p.open)return;const k=e=>{if(e.key==='Escape'&&!e.defaultPrevented)p.onOpenChange(false)};document.addEventListener('keydown',k);return()=>document.removeEventListener('keydown',k)},[p.open]);return p.open?React.createElement('section',{'aria-label':'Account usage popover',style,onMouseEnter,onMouseLeave},children):null}

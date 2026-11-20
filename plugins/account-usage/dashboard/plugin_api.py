@@ -246,3 +246,67 @@ def get_disabled():
 @router.post('/disabled')
 def post_disabled(body: DisableBody):
     return set_account_disabled(body.provider, body.account_id, body.disabled)
+
+
+# ── forecast (weekly quota left + whether it lasts to the resets) ─────────────
+
+def _forecast_module():
+    name = 'account_usage_forecast'
+    if name not in sys.modules:
+        spec = importlib.util.spec_from_file_location(name, Path(__file__).resolve().parents[1] / 'forecast.py')
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        sys.modules.setdefault(name, module)
+    return sys.modules[name]
+
+
+def _home() -> Path:
+    try:
+        from hermes_constants import get_hermes_home
+        return Path(str(get_hermes_home()))
+    except Exception:
+        return Path(os.path.expanduser('~/.hermes'))
+
+
+class ForecastAccount(BaseModel):
+    model_config = ConfigDict(extra='ignore')
+    label: str = Field(default='', max_length=512)
+    id: str = Field(default='', max_length=512)
+    state: str = Field(default='unknown', max_length=32)
+    disabled: bool = False
+    week_used: float | None = None
+    week_resets_at: str | None = Field(default=None, max_length=64)
+    resets_at: str | None = Field(default=None, max_length=64)
+
+
+class ForecastProvider(BaseModel):
+    model_config = ConfigDict(extra='ignore')
+    slug: str = Field(min_length=1, max_length=64)
+    accounts: list[ForecastAccount] = Field(default_factory=list, max_length=64)
+
+
+class ForecastBody(BaseModel):
+    model_config = ConfigDict(extra='ignore')
+    providers: list[ForecastProvider] = Field(default_factory=list, max_length=16)
+
+
+# ``from __future__ import annotations`` + a by-path load (no sys.modules entry): resolve the nested models here.
+ForecastProvider.model_rebuild()
+ForecastBody.model_rebuild()
+
+
+def forecasts(body: ForecastBody, home: Path | None = None, now: float | None = None) -> Dict[str, Any]:
+    """``{slug: forecast}`` for every posted provider; one failing provider never hides the others."""
+    mod, home = _forecast_module(), home or _home()
+    out: Dict[str, Any] = {}
+    for p in body.providers:
+        try:
+            out[p.slug] = mod.forecast(home, p.slug, [a.model_dump() for a in p.accounts], now)
+        except Exception as exc:  # noqa: BLE001 - surfaced per provider, never a 500 for the whole bar
+            out[p.slug] = {'verdict': 'error', 'error': type(exc).__name__}
+    return out
+
+
+@router.post('/forecast')
+def post_forecast(body: ForecastBody):
+    return forecasts(body)
