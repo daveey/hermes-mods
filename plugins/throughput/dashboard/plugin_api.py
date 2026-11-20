@@ -3,6 +3,8 @@ GET / PUT /api/plugins/throughput/v1/throttle: the fleet's token throttle level 
 subscription pools' runway (../runway.py). PUT body ``{"percent": 0..100}``.
 PUT / DELETE /api/plugins/throughput/v1/throttle/burst: start a burst on the budget level (body ``{"factor": 1 < f <= 4,
 "hours": 0 < h <= 24}``; 409 on a manual or expired level) or end it now.
+PUT /api/plugins/throughput/v1/throttle/pacing: the budget pacing switch (body ``{"on": true|false}``, anything else a
+400); answers with the GET /v1/throttle payload, whose ``pacing`` is ``{state, publisher}``.
 GET /api/plugins/throughput/v1/budget[?factor=&hours=[&projection_only=1]]: this host's capacity model, the measured
 spend per provider over 7 days (cached a minute per process) and the current burst, plus the cost of the given burst
 (../budget_view.py); ``projection_only`` returns just the burst and its cost.
@@ -146,9 +148,10 @@ def throttle_payload(now: float | None = None) -> Dict[str, Any]:
     root = _state["root"]
     now = time.time() if now is None else now
     hub_db = throttle.hub_db_path()
-    out = throttle.status(root, sampler.series_path(root), now, hub_db)
     reg = _registry()
-    out["scope"] = (reg or {}).get("me") or _state["store"].get_meta("me") or "local"
+    scope = (reg or {}).get("me") or _state["store"].get_meta("me") or "local"
+    out = throttle.status(root, sampler.series_path(root), now, hub_db, me=scope)
+    out["scope"] = scope
     out["fleet"] = hub_db.is_file()
     out["gateways"] = throttle.gateways(root, hub_db, now, out["scope"])
     out["pools"] = runway.pools(runway.pacing_path(root), now)
@@ -264,6 +267,31 @@ def clear_burst() -> Dict[str, Any]:
     if throttle.clear_burst(root, level, stamp):
         throttle.note_seen(root, hub_db, stamp)
     return throttle_payload()
+
+
+def set_pacing(on: Any) -> Dict[str, Any]:
+    """The budget pacing switch: ``on`` false stores an explicit manual level (the publisher stops), true a level the
+    publisher folds into a budget level on its next pass (``throttle.set_pacing``); asking for the state already in
+    force writes nothing. Stamped after the level in force, like the slider."""
+    if not isinstance(on, bool):
+        raise ValueError("on must be true or false")
+    sampler, _ = _services()
+    import importlib
+    throttle = importlib.import_module(pkg().__name__ + ".throttle")
+    root, hub_db, now = _state["root"], throttle.hub_db_path(), time.time()
+    level = throttle.effective(root, hub_db, now)
+    stamp = throttle.set_pacing(root, level, on, now, throttle.reference_rate(sampler.series_path(root), now))
+    if stamp is not None:
+        throttle.note_seen(root, hub_db, stamp)
+    return throttle_payload()
+
+
+@router.put("/v1/throttle/pacing")
+async def put_pacing(body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    try:
+        return await asyncio.to_thread(set_pacing, body.get("on"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @router.put("/v1/throttle/burst")

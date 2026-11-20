@@ -831,3 +831,116 @@ test('manual mode: budget charts without a burst control; no budget endpoint: no
     await ui2.close()
   }
 })
+
+test('budget pacing: state and note per state; none on an older backend', () => {
+  assert.equal(P.pacingState(throttle()), null)
+  assert.equal(P.pacingState(throttle({ pacing: { state: 'bogus' } })), null)
+  assert.equal(P.pacingNote(throttle()), null)
+  assert.match(P.pacingNote(throttle({ pacing: { state: 'off', publisher: 'hub' } })), /^Budget pacing is off: the slider is a plain manual cap/)
+  assert.match(P.pacingNote(throttle({ pacing: { state: 'pending', publisher: null } })), /turning on…/)
+  assert.match(P.pacingNote(throttle({ pacing: { state: 'unavailable', publisher: null } })), /^No hub is publishing a budget/)
+  assert.equal(P.pacingNote(throttle({ pacing: { state: 'on', publisher: 'hub' } })), 'Budget published by hub')
+  assert.equal(P.pacingNote(throttle({ pacing: { state: 'on', publisher: null } })), null)
+  assert.equal(P.pacingIsOff(throttle({ mode: 'manual', pacing: { state: 'off' } })), true)
+})
+
+test('panel: budget pacing switch, burst hidden and slider a manual cap while off, PUT on click, refused click shown', async () => {
+  P.saveView(V())
+  const autoThrottle = () => throttle({
+    mode: 'auto', percent: 20, cap_per_s: 8, holding: false, burst: null, pacing: { state: 'on', publisher: 'hub' },
+    budget: { state: 'fresh', age_s: 60, budget_per_s: 10, cap_per_s: 8, pool_budgets: { anthropic: 4, 'openai-codex': 6 }, pool_caps: {}, burst_factor: 1 }
+  })
+  const offThrottle = () => throttle({ mode: 'manual', percent: 20, cap_per_s: 16, holding: false, burst: null, budget: null, pacing: { state: 'off', publisher: 'hub' } })
+  const pendingThrottle = () => throttle({ mode: 'manual', percent: 20, cap_per_s: 16, holding: false, burst: null, budget: null, pacing: { state: 'pending', publisher: 'hub' } })
+  const state = { throttle: autoThrottle(), fail: false }
+  const calls = []
+  const ctx = {
+    calls,
+    rest: async (path, opts) => {
+      calls.push([path, opts])
+      if (path === '/v1/throttle') return state.throttle
+      if (path === '/v1/throttle/pacing') {
+        if (state.fail) throw Error('HTTP 400')
+        state.throttle = opts.body.on ? pendingThrottle() : offThrottle()
+        return state.throttle
+      }
+      if (path.startsWith('/v1/budget')) {
+        const q = new URL('http://x' + path).searchParams
+        return budgetFixture({ projection: { ...budgetFixture().projection, factor: Number(q.get('factor')), hours: Number(q.get('hours')) } })
+      }
+      return forRange(path)
+    }
+  }
+  const ui = await mount(React.createElement(P.Throughput, { ctx }))
+  const sw = () => document.querySelector('[data-slot="pacing"] button[role=switch]')
+  const puts = () => calls.filter(([p, o]) => p === '/v1/throttle/pacing' && o?.method === 'PUT')
+  try {
+    await ui.click(button('Show throughput'))
+    await ui.flush()
+    // on: the switch is checked, the burst control and "Hold back" slider are there
+    assert.equal(sw().getAttribute('aria-checked'), 'true')
+    assert.equal(document.getElementById(sw().getAttribute('aria-labelledby')).textContent, 'Budget pacing')
+    assert.equal(document.querySelector('[data-pacing-value]').textContent, 'On')
+    assert.equal(document.querySelector('[data-pacing-note]').textContent, 'Budget published by hub')
+    assert.ok(document.querySelector('[data-slot="burst"]'))
+    assert.equal(document.querySelector('[data-slider-label]').textContent, 'Hold back 20%')
+    // off
+    await ui.click(sw())
+    assert.equal(puts().length, 1)
+    assert.deepEqual(puts()[0][1].body, { on: false })
+    assert.equal(sw().getAttribute('aria-checked'), 'false')
+    assert.equal(document.querySelector('[data-pacing-value]').textContent, 'Off')
+    assert.equal(document.querySelector('[data-slot="pacing"]').dataset.pacing, 'off')
+    assert.match(document.querySelector('[data-pacing-note="off"]').textContent, /Budget pacing is off/)
+    assert.equal(document.querySelector('[data-slot="burst"]'), null, 'no burst control while budget pacing is off')
+    assert.equal(button('Start 2× for 1 h'), undefined)
+    assert.equal(document.querySelector('[data-slider-label]').textContent, 'Manual cap 20%')
+    assert.equal(document.querySelector('[data-slot="throttle"] input[type=range]').getAttribute('aria-label'), 'Manual cap percent')
+    assert.doesNotMatch(document.querySelector('[data-slot="throttle"]').textContent, /Hold back/)
+    assert.match(document.querySelector('[data-slot="throttle"]').textContent, /Throttle 20% · cap 960 tok\/m/)
+    // on again: pending says "turning on…"
+    await ui.click(sw())
+    assert.equal(puts().length, 2)
+    assert.deepEqual(puts()[1][1].body, { on: true })
+    assert.equal(sw().getAttribute('aria-checked'), 'true')
+    assert.match(document.querySelector('[data-pacing-note="pending"]').textContent, /turning on…/)
+    // a refused change is shown and the switch stays where the server has it
+    state.fail = true
+    await ui.click(sw())
+    assert.equal(puts().length, 3)
+    assert.match(document.querySelector('[data-slot="pacing"] [role=alert]').textContent, /Budget pacing not changed: HTTP 400/)
+    assert.equal(sw().getAttribute('aria-checked'), 'true')
+    assert.equal(sw().disabled, false)
+  } finally {
+    await ui.close()
+  }
+})
+
+test('panel: no hub publishing says so; an older backend without pacing shows no switch', async () => {
+  P.saveView(V())
+  const ui = await mount(React.createElement(P.Throughput, { ctx: ctxWith(withThrottle({ value: throttle({ mode: 'manual', pacing: { state: 'unavailable', publisher: null } }) })) }))
+  try {
+    await ui.click(button('Show throughput'))
+    assert.equal(document.querySelector('[data-slot="pacing"] button[role=switch]').getAttribute('aria-checked'), 'true')
+    assert.match(document.querySelector('[data-pacing-note="unavailable"]').textContent, /^No hub is publishing a budget/)
+    assert.equal(document.querySelector('[data-slider-label]'), null, 'not off: the slider keeps its plain label')
+  } finally {
+    await ui.close()
+  }
+  const ui2 = await mount(React.createElement(P.Throughput, { ctx: ctxWith(withThrottle({ value: throttle() })) }))
+  try {
+    await ui2.click(button('Show throughput'))
+    assert.ok(document.querySelector('[data-slot="throttle"]'))
+    assert.equal(document.querySelector('[data-slot="pacing"]'), null)
+  } finally {
+    await ui2.close()
+  }
+})
+
+test('pacing switch CSS: theme variables with fallbacks, checked state distinct in both themes', () => {
+  const rule = (sel) => P.CSS.split('\n').find((l) => l.startsWith(sel + '{'))
+  assert.match(rule('.hermes-tp-switch'), /border:1px solid var\(--ui-stroke-secondary,#8a909c\)/)
+  assert.match(rule('.hermes-tp-switch[aria-checked=true]'), /background:var\(--ui-green,#1f8a65\)/)
+  assert.match(rule('.hermes-tp-switch[aria-checked=true] .hermes-tp-knob'), /background:var\(--ui-bg,#fff\)/)
+  assert.match(rule('.hermes-tp-knob'), /background:var\(--ui-text-tertiary,#8a909c\)/)
+})

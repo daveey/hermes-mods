@@ -386,6 +386,43 @@ def test_burst_routes_set_end_and_refuse(api, tmp_path, monkeypatch):
     assert c.delete("/p/v1/throttle/burst").status_code == 200  # nothing to end: unchanged
 
 
+def test_pacing_route_switches_budget_pacing_off_and_on(api, tmp_path, monkeypatch):
+    """PUT /v1/throttle/pacing {on}: off stores an explicit manual level (burst and pool caps dropped, the burst route
+    then refuses, the slider keeps it off), on stores a level the publisher folds in; validated (400 / 422) without a
+    write; answers with the GET payload and its ``pacing``."""
+    import json
+    c, throttle, root = _isolated(api, tmp_path, monkeypatch)
+    now = time.time()
+    level = {"mode": "auto", "percent": 20.0, "cap_per_s": 1000.0, "pool_caps": {"anthropic": 0.0},
+             "budget_at": now - 60, "set_at": now - 30, "burst": {"factor": 2.0, "until": now + 3000, "set_at": now - 30}}
+    throttle._write_json(throttle.level_path(root), level)
+    assert c.get("/p/v1/throttle").json()["pacing"] == {"state": "on", "publisher": "hub"}
+    before = throttle.level_path(root).read_text()
+    for bad in ({}, {"on": "false"}, {"on": 1}, {"on": 0}, {"on": None}):
+        got = c.put("/p/v1/throttle/pacing", json=bad)
+        assert got.status_code == 400 and got.json()["detail"] == "on must be true or false", bad
+    assert c.put("/p/v1/throttle/pacing", json=[False]).status_code == 422
+    assert throttle.level_path(root).read_text() == before  # a refused request writes nothing
+    off = c.put("/p/v1/throttle/pacing", json={"on": False})
+    assert off.status_code == 200
+    off = off.json()
+    stored = json.loads(throttle.level_path(root).read_text())
+    assert set(stored) == {"mode", "percent", "cap_per_s", "set_at"} and stored["mode"] == "manual"
+    assert stored["percent"] == 20.0 and stored["set_at"] > level["set_at"]
+    assert off["pacing"] == {"state": "off", "publisher": None} and off["mode"] == "manual"
+    assert off["burst"] is None and off["budget"] is None and off["gateways"] == [{"name": "hub", "seen": True}]
+    assert c.put("/p/v1/throttle/burst", json={"factor": 2, "hours": 1}).status_code == 409
+    moved = c.put("/p/v1/throttle", json={"percent": 50}).json()
+    assert moved["pacing"]["state"] == "off" and json.loads(throttle.level_path(root).read_text())["mode"] == "manual"
+    again = json.loads(throttle.level_path(root).read_text())
+    assert c.put("/p/v1/throttle/pacing", json={"on": False}).json()["pacing"]["state"] == "off"
+    assert json.loads(throttle.level_path(root).read_text()) == again  # already off: nothing written
+    on = c.put("/p/v1/throttle/pacing", json={"on": True}).json()
+    stored = json.loads(throttle.level_path(root).read_text())
+    assert "mode" not in stored and stored["percent"] == 50.0 and stored["set_at"] > again["set_at"]
+    assert on["pacing"] == {"state": "pending", "publisher": None}
+
+
 def test_budget_view_endpoint_shape(api, tmp_path, monkeypatch):
     """GET /v1/budget: this host's v2 for the chart (no account readings), 7 days of hourly spend per provider, the
     burst in force, and the burst projection when factor and hours are given."""

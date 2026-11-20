@@ -215,3 +215,21 @@ def test_full_length_burst_from_a_clock_slightly_ahead_still_applies(tmp_path):
     level = T.effective(tmp_path, None, NOW)
     assert T.burst_active(level, NOW) is not None
     assert T.budget(level, NOW)["cap_per_s"] == pytest.approx(2000.0)
+
+
+def test_burst_is_dropped_by_switching_pacing_off_and_ignored_on_an_off_level(tmp_path):
+    db = _db(tmp_path)
+    _auto(tmp_path, burst=_burst())
+    T.set_pacing(tmp_path, T.effective(tmp_path, None, NOW), False, NOW, reference=2000.0)
+    data = json.loads(T.level_path(tmp_path).read_text())
+    assert data["mode"] == "manual" and "burst" not in data and "pool_caps" not in data
+    # an off level that carries a burst anyway (hand-written, or an older writer): ignored everywhere
+    T.level_path(tmp_path).write_text(json.dumps({"mode": "manual", "percent": 50, "cap_per_s": 1000.0,
+                                                  "set_at": NOW + 1, "burst": _burst()}))
+    level = T.effective(tmp_path, None, NOW + 1)
+    assert "burst" not in level and T.pacing_off(level)
+    out = T.status(tmp_path, db, NOW + 1)
+    assert out["burst"] is None and out["budget"] is None and out["cap_per_s"] == 1000.0
+    assert out["pacing"]["state"] == "off"
+    with pytest.raises(T.BurstRefused, match="manual"):
+        T.set_burst(tmp_path, level, 2.0, 3600, NOW + 2)

@@ -7,6 +7,8 @@
 // Budget: GET /v1/budget (plugins/throughput/budget_view.py). Under Tokens, one chart per budget pool plus a total:
 // the spend measured over 7 days left of "now", core's capacity steps and planned spend right of it, with resets,
 // account changes and the burst marked. PUT/DELETE /v1/throttle/burst starts or ends a burst (budget mode only).
+// Budget pacing switch: PUT /v1/throttle/pacing {on}. Off = an explicit manual level the hub's publisher leaves alone
+// (the slider is then a plain manual cap and there is no burst); `pacing.state` is on, off, pending or unavailable.
 import { useQuery, useQueryClient, STATUSBAR_AREAS, PALETTE_AREA, Popover, PopoverTrigger, PopoverContent } from '@hermes/plugin-sdk'
 import { createElement as h, useState, useEffect, useMemo, useRef } from 'react'
 
@@ -265,6 +267,26 @@ export function throttleText(throttle, unit) {
   return `Throttle ${p}% \u00b7 cap ${fmt(cap)} tok/${unit}${p >= 100 ? ' \u00b7 holding every call' : throttle?.holding ? ' \u00b7 over the cap, pacing calls' : ''}`
 }
 
+// ── budget pacing switch (pure) ───────────────────────────────────────────
+
+// The switch's state from the payload's `pacing` (null on an older backend without the switch).
+export const pacingState = (throttle) => {
+  const s = throttle?.pacing?.state
+  return ['on', 'off', 'pending', 'unavailable'].includes(s) ? s : null
+}
+export const pacingIsOff = (throttle) => pacingState(throttle) === 'off'
+
+// One line under the switch; null when there is nothing to say.
+export function pacingNote(throttle) {
+  const state = pacingState(throttle)
+  const pub = throttle?.pacing?.publisher
+  if (state === 'off') return 'Budget pacing is off: the slider is a plain manual cap and the hub\u2019s budget is not applied.'
+  if (state === 'pending') return 'Budget pacing is turning on\u2026 (the hub folds it in within a few minutes)'
+  if (state === 'unavailable') return 'No hub is publishing a budget (kanban.llm_pacing.budget_publish), so On has no effect yet.'
+  if (state === 'on' && pub) return `Budget published by ${pub}`
+  return null
+}
+
 // ── budget chart + burst (pure) ───────────────────────────────────────────
 
 export const BURST_FACTORS = [1.5, 2, 3]
@@ -521,6 +543,7 @@ export function BudgetChart({ id, title, series: s }) {
 // Burst picker (budget mode): factor and duration, each pool's cost before confirming, then the running burst with
 // its time left and an End button.
 export function BurstControl({ throttle, budget, pick, setPick, onStart, onEnd, error, now }) {
+  if (pacingIsOff(throttle)) return null // budget pacing is off: no budget to burst
   if (throttle?.mode !== 'auto') {
     return h('div', { className: 'hermes-tp-burst', 'data-slot': 'burst' },
       h('span', { className: 'hermes-tp-lbl' }, 'Burst needs budget mode (a budget published by the hub).'))
@@ -571,18 +594,46 @@ export function BudgetSection({ budget, throttle, pick, setPick, onStart, onEnd,
     pools.map((p) => h(BudgetChart, { key: p, id: p, title: poolName(p), series: chartSeries(budget, p, opts) })))
 }
 
+// The budget pacing On/Off switch with its one-line note. `onPacing(on)` saves; hidden on an older backend.
+export function PacingSwitch({ throttle, onPacing, error }) {
+  const state = pacingState(throttle)
+  const [busy, setBusy] = useState(false)
+  if (!state || !onPacing) return null
+  const on = state !== 'off'
+  const note = pacingNote(throttle)
+  const flip = async () => {
+    setBusy(true)
+    try { await onPacing(!on) } finally { setBusy(false) }
+  }
+  return h('div', { className: 'hermes-tp-pacing', 'data-slot': 'pacing', 'data-pacing': state },
+    h('div', { className: 'hermes-tp-trow' },
+      h('span', { className: 'hermes-tp-lbl hermes-tp-plabel', id: 'hermes-tp-pacing-label' }, 'Budget pacing'),
+      h('button', {
+        type: 'button', role: 'switch', 'aria-checked': on, 'aria-labelledby': 'hermes-tp-pacing-label',
+        className: 'hermes-tp-switch', disabled: busy, onClick: flip,
+        title: on ? 'Turn budget pacing off: the fleet keeps a plain manual cap' : 'Turn budget pacing on: the hub publishes the budget as the cap'
+      }, h('span', { className: 'hermes-tp-knob', 'aria-hidden': true })),
+      h('span', { className: 'hermes-tp-ttext', 'data-pacing-value': '' }, on ? 'On' : 'Off'),
+      note ? h('span', { className: 'hermes-tp-lbl', 'data-pacing-note': state }, note) : null),
+    error ? h('div', { className: 'hermes-tp-note', role: 'alert' }, `Budget pacing not changed: ${error}`) : null)
+}
+
 // Slider + runway under the Tokens chart. Dragging previews the cap locally; releasing saves it.
-export function ThrottleRow({ throttle, draft, setDraft, onCommit, unit, error }) {
+export function ThrottleRow({ throttle, draft, setDraft, onCommit, unit, error, onPacing = null, pacingError = null }) {
   const shown = draft == null ? throttle : previewThrottle(throttle, draft)
   const percent = Math.round(shown?.percent ?? 0)
   const commit = () => { if (draft != null) onCommit(draft) }
+  const off = pacingIsOff(throttle)
   return h('div', { className: 'hermes-tp-throttle', 'data-slot': 'throttle' },
+    h(PacingSwitch, { throttle, onPacing, error: pacingError }),
     h('div', { className: 'hermes-tp-trow' },
-      // In budget mode the slider holds back a share of the published budget: 0 % = the full budget.
-      throttle?.mode === 'auto' ? h('span', { className: 'hermes-tp-lbl', 'data-slider-label': '' }, `Hold back ${percent}%`) : null,
+      // In budget mode the slider holds back a share of the published budget: 0 % = the full budget. With budget
+      // pacing off it is a plain manual cap.
+      throttle?.mode === 'auto' ? h('span', { className: 'hermes-tp-lbl', 'data-slider-label': '' }, `Hold back ${percent}%`)
+        : off ? h('span', { className: 'hermes-tp-lbl', 'data-slider-label': '' }, `Manual cap ${percent}%`) : null,
       h('input', {
         type: 'range', min: 0, max: 100, step: 1, value: percent,
-        'aria-label': throttle?.mode === 'auto' ? 'Hold back percent of the budget' : 'Token throttle percent',
+        'aria-label': throttle?.mode === 'auto' ? 'Hold back percent of the budget' : off ? 'Manual cap percent' : 'Token throttle percent',
         onChange: (e) => setDraft(Number(e.target.value)), onPointerUp: commit, onKeyUp: commit, onBlur: commit
       }),
       h('span', { className: 'hermes-tp-ttext', 'data-throttle': String(percent) }, throttleText(shown, unit)),
@@ -594,7 +645,7 @@ export function ThrottleRow({ throttle, draft, setDraft, onCommit, unit, error }
 // `payload` is the selected range's data, or null while it loads / after it failed (`status` says which); the
 // previous range's data is never drawn under the new range's label. `frame` (the last good payload, any range)
 // only supplies the gateway list for the legend, so the controls stay usable meanwhile.
-export function Panel({ payload, frame = payload, status = null, modelPayload = null, modelFrame = null, modelStatus = null, modelFilter = { solo: null, hidden: [] }, setModelFilter, view, setView, filter, setFilter, onHoverRange, throttle = null, onThrottle = null, throttleError = null, budget = null, burstPick = DEFAULT_BURST, setBurstPick = () => {}, onBurst = null, onEndBurst = null, burstError = null }) {
+export function Panel({ payload, frame = payload, status = null, modelPayload = null, modelFrame = null, modelStatus = null, modelFilter = { solo: null, hidden: [] }, setModelFilter, view, setView, filter, setFilter, onHoverRange, throttle = null, onThrottle = null, throttleError = null, onPacing = null, pacingError = null, budget = null, burstPick = DEFAULT_BURST, setBurstPick = () => {}, onBurst = null, onEndBurst = null, burstError = null }) {
   const colors = useMemo(() => colorFor(frame.gateways), [frame.gateways])
   const gws = visibleGateways(frame.gateways, filter)
   const models = modelFrame?.models || []
@@ -607,7 +658,7 @@ export function Panel({ payload, frame = payload, status = null, modelPayload = 
   const filtered = view.by === 'model' ? !!modelFilter.solo || modelFilter.hidden.length > 0 : !!filter.solo || filter.hidden.length > 0
   const cap = view.cache || filtered ? null : capRate(shownThrottle, view.unit)
   const throttleRow = throttle && onThrottle ? h(ThrottleRow, {
-    key: 'throttle', throttle, draft, setDraft, unit: view.unit, error: throttleError,
+    key: 'throttle', throttle, draft, setDraft, unit: view.unit, error: throttleError, onPacing, pacingError,
     onCommit: (p) => { setDraft(null); if (p !== Math.round(throttle.percent ?? 0)) onThrottle(p) }
   }) : null
   return h('div', { className: 'hermes-tp' },
@@ -711,6 +762,16 @@ export function Throughput({ ctx }) {
       setThrottleError(null)
     } catch (e) { setThrottleError(String(e?.message || e).slice(0, 200)) }
   }
+  const [pacingError, setPacingError] = useState(null)
+  const onPacing = async (on) => {
+    try {
+      const body = await ctx.rest('/v1/throttle/pacing', { method: 'PUT', body: { on }, timeoutMs: REQUEST_TIMEOUT_MS })
+      if (!body || typeof body.percent !== 'number') throw Error('Invalid throttle response')
+      client.setQueryData(['throughput', 'throttle'], body)
+      client.invalidateQueries({ queryKey: ['throughput', 'budget'] })
+      setPacingError(null)
+    } catch (e) { setPacingError(String(e?.message || e).slice(0, 200)) }
+  }
   const [burstPick, setBurstPick] = useState(DEFAULT_BURST)
   const [burstError, setBurstError] = useState(null)
   const auto = throttleQuery.data?.mode === 'auto'
@@ -781,7 +842,7 @@ export function Throughput({ ctx }) {
       side: 'top', align: 'end', sticky: 'always', 'aria-label': 'Throughput', className: 'hermes-tp-popover',
       style: { width: 'min(680px, calc(100vw - 24px))', maxHeight: '80vh', overflowY: 'auto' }
     }, frame
-      ? h(Panel, { payload, frame, status, modelPayload, modelFrame: lastModel.current, modelStatus, modelFilter, setModelFilter, view, setView, filter, setFilter, onHoverRange: prefetch, throttle: throttleQuery.data || null, onThrottle, throttleError, budget, burstPick, setBurstPick, onBurst, onEndBurst, burstError })
+      ? h(Panel, { payload, frame, status, modelPayload, modelFrame: lastModel.current, modelStatus, modelFilter, setModelFilter, view, setView, filter, setFilter, onHoverRange: prefetch, throttle: throttleQuery.data || null, onThrottle, throttleError, onPacing, pacingError, budget, burstPick, setBurstPick, onBurst, onEndBurst, burstError })
       : h('div', { className: 'hermes-tp-note' }, query.error ? `Unavailable: ${String(query.error.message || query.error).slice(0, 200)}` : 'Loading\u2026')))
 }
 
@@ -842,6 +903,15 @@ export const CSS = `
 .hermes-tp-btn:hover:not(:disabled){background:var(--chrome-action-hover)}
 .hermes-tp-btn:disabled{opacity:.5;cursor:default}
 .hermes-tp-warn{color:var(--ui-orange,#c2410c)}
+.hermes-tp-pacing{display:flex;flex-direction:column;gap:2px;margin-bottom:2px}
+.hermes-tp-plabel{color:var(--ui-text-secondary)}
+.hermes-tp-switch{position:relative;flex-shrink:0;width:28px;height:16px;padding:0;border:1px solid var(--ui-stroke-secondary,#8a909c);border-radius:8px;background:transparent;cursor:pointer}
+.hermes-tp-switch[aria-checked=false]:hover:not(:disabled){background:var(--chrome-action-hover)}
+.hermes-tp-switch:focus-visible{outline:2px solid var(--ui-blue,#3b82f6);outline-offset:1px}
+.hermes-tp-switch:disabled{opacity:.5;cursor:default}
+.hermes-tp-knob{position:absolute;top:2px;left:2px;width:10px;height:10px;border-radius:50%;background:var(--ui-text-tertiary,#8a909c);transition:left .12s}
+.hermes-tp-switch[aria-checked=true]{background:var(--ui-green,#1f8a65);border-color:var(--ui-green,#1f8a65)}
+.hermes-tp-switch[aria-checked=true] .hermes-tp-knob{left:14px;background:var(--ui-bg,#fff)}
 `
 
 export default {
